@@ -24,6 +24,7 @@ import {
   LENS_PRESETS,
   operatorAssetLoader,
   operatorSelectionStore,
+  resolveWeaponProfile,
   ScopePassParams,
   ScopeRenderer,
   SDK_WEAPON_LIST,
@@ -979,10 +980,19 @@ export class GymEngine {
   }
 
   public selectGunsmithWeapon(weaponId: string): void {
-    this.switchWeapon(weaponId, true);
-    const baseProf = SDK_WEAPON_PROFILES[this.equippedWeaponId] ?? SDK_WEAPON_PROFILES.m4_556;
+    const resolved = resolveWeaponProfile(weaponId);
+    this.switchWeapon(resolved.id, true);
+    const baseProf = resolveWeaponProfile(this.equippedWeaponId);
     if (this.world.gunsmithBench.isOpen()) {
-      this.world.gunsmithBench.setShowcaseWeapon(baseProf, this.getAttachmentsFor(baseProf.id));
+      const att = this.getAttachmentsFor(baseProf.id);
+      this.world.gunsmithBench.setShowcaseWeapon(baseProf, att);
+      this.world.gunsmithBench.setShowcaseTurretElevation(att.zeroElevationMrad ?? 0);
+      this.world.gunsmithBench.projectPins(
+        this.camera,
+        this.container.clientWidth || 1,
+        this.container.clientHeight || 1,
+        this._pinBuffer,
+      );
     }
     this.audio.playWeaponCue('gunsmith_snap', { position: this.camera.position });
     this.emitSnapshot();
@@ -1126,7 +1136,7 @@ export class GymEngine {
   }
 
   public switchWeapon(weaponId: string, silent = false): void {
-    const prof = SDK_WEAPON_PROFILES[weaponId];
+    const prof = SDK_WEAPON_PROFILES[weaponId] ?? resolveWeaponProfile(weaponId);
     if (!prof) return;
     if (this.grenadeSystem.isDrawn()) {
       this.handleGrenadeHolsterOrToss();
@@ -1139,6 +1149,9 @@ export class GymEngine {
     this.animator.cancelAction();
     const att = this.getAttachmentsFor(prof.id);
     this.weaponRig.setWeaponProfile(prof, att);
+    if (this.world.gunsmithBench.isOpen() && prof.holdClass !== 'unarmed') {
+      this.world.gunsmithBench.setShowcaseWeapon(prof, att);
+    }
     this.input.adsMode = this.getArmedAdsMode(prof.id);
     this.syncRuntimeProfile();
     const derived = this.weaponRig.getDerivedStats();

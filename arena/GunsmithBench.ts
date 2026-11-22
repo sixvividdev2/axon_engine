@@ -538,10 +538,12 @@ export class GunsmithBench {
             ? Math.min(0.24, safeProfile.barrelLengthM * 0.20)
             : 0.12;
       asm.group.position.set(0, 0, centerZ);
+      asm.group.visible = this.active || this.blend > 0.004;
       this.cradleAnchor.add(asm.group);
       this.showcaseAssembly = asm;
     }
 
+    this.showcaseAssembly.group.visible = this.active || this.blend > 0.004;
     this.showcaseAttachments = attachments ? { ...attachments } : {};
     this.showcaseStats = WeaponAssembler.applyAttachments(
       this.showcaseAssembly,
@@ -678,10 +680,15 @@ export class GunsmithBench {
 
     for (let i = 0; i < outPins.length; i++) {
       const pin = outPins[i];
-      let socket: THREE.Object3D;
+      let socket: THREE.Object3D | null = null;
       switch (pin.slot) {
         case 'railAdapter':
-          socket = asm.railAdapterGroup;
+          socket =
+            asm.railAdapterGroup ??
+            ((asm.railType === 'dovetail_ak' && asm.weaponId !== 'mosin_m91_30') ||
+            asm.railType === 'mp5_claw'
+              ? asm.opticMountSocket
+              : null);
           break;
         case 'optic':
           socket = asm.opticMountSocket;
@@ -701,6 +708,11 @@ export class GunsmithBench {
         case 'magazine':
           socket = asm.magWellSocket;
           break;
+      }
+
+      if (!socket) {
+        pin.visible = false;
+        continue;
       }
 
       socket.getWorldPosition(this._pinWorld);

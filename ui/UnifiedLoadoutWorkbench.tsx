@@ -191,6 +191,7 @@ export const UnifiedLoadoutWorkbench: React.FC<UnifiedLoadoutWorkbenchProps> = (
 
   const [activeTab, setActiveTab] = useState<WorkbenchTab>('workbench');
   const [gearFocus, setGearFocus] = useState<ActiveGearFocus>('primary');
+  const [previewWeaponId, setPreviewWeaponId] = useState<string | null>(null);
   const [selectedSlot, setSelectedSlot] = useState<AttachmentSlot>('optic');
   const [armoryOpen, setArmoryOpen] = useState<boolean>(false);
   const [zenInspect, setZenInspect] = useState<boolean>(false);
@@ -216,12 +217,13 @@ export const UnifiedLoadoutWorkbench: React.FC<UnifiedLoadoutWorkbenchProps> = (
   const [simCamPreset, setSimCamPreset] = useState<BallisticsCameraPreset>('cutaway');
   const [simDockCollapsed, setSimDockCollapsed] = useState<boolean>(false);
 
+  const hasGymBridge = Boolean(gymBridge);
+
   // Resolve active firearm state (Gym Bridge vs. Standalone LoadoutStore)
   const focusedWeaponId = gymBridge
-    ? gymBridge.weaponId
-    : gearFocus === 'primary'
-      ? activeSlot.primaryWeaponId
-      : activeSlot.secondaryWeaponId;
+    ? resolveWeaponProfile(gymBridge.weaponId).id
+    : previewWeaponId ??
+      (gearFocus === 'primary' ? activeSlot.primaryWeaponId : activeSlot.secondaryWeaponId);
 
   const activeProfile = useMemo(() => resolveWeaponProfile(focusedWeaponId), [focusedWeaponId]);
   const storedBuild = useMemo(
@@ -313,7 +315,7 @@ export const UnifiedLoadoutWorkbench: React.FC<UnifiedLoadoutWorkbenchProps> = (
 
   // Mount / tear down Standalone CAD 3D Gunsmith Stage when not in Gym Bridge and on Workbench tab
   useEffect(() => {
-    if (gymBridge || activeTab !== 'workbench') {
+    if (hasGymBridge || activeTab !== 'workbench') {
       if (cadStageRef.current) {
         cadStageRef.current.dispose();
         cadStageRef.current = null;
@@ -336,7 +338,7 @@ export const UnifiedLoadoutWorkbench: React.FC<UnifiedLoadoutWorkbenchProps> = (
       stage.dispose();
       cadStageRef.current = null;
     };
-  }, [gymBridge, activeTab]);
+  }, [hasGymBridge, activeTab]);
 
   // Keep standalone CAD bench weapon synced live
   useEffect(() => {
@@ -345,7 +347,7 @@ export const UnifiedLoadoutWorkbench: React.FC<UnifiedLoadoutWorkbenchProps> = (
     stage.setShowcaseWeapon(activeProfile, activeAttachments);
     stage.setShowcaseTurretElevation(zeroElevationMrad);
     setStandaloneHobM(stage.getHeightOverBoreM());
-  }, [activeProfile, activeAttachments, zeroElevationMrad]);
+  }, [hasGymBridge, activeTab, activeProfile, activeAttachments, zeroElevationMrad]);
 
   // Ballistics Trajectory & Material Penetration computation
   const maxSimRangeM = useMemo(
@@ -462,19 +464,31 @@ export const UnifiedLoadoutWorkbench: React.FC<UnifiedLoadoutWorkbenchProps> = (
 
   // Handlers bridging Gym vs LoadoutStore
   const handleSelectWeapon = (wid: string) => {
-    if (isWeaponUnlocked && !isWeaponUnlocked(wid)) return;
     const prof = resolveWeaponProfile(wid);
+    const canonicalId = prof.id;
     const isSidearm = prof.category === 'pistols' || prof.category === 'revolvers';
-    if (gymBridge) {
-      gymBridge.onSelectWeapon(wid);
-    } else {
-      if (gearFocus === 'secondary' || isSidearm) {
-        loadoutStore.setSlotSecondaryWeapon(loadoutState.activeIndex, wid);
-        setGearFocus('secondary');
+    const unlocked = isWeaponUnlocked ? isWeaponUnlocked(canonicalId) : true;
+
+    if (!unlocked) {
+      // Allow 3D bench inspection & ballistics preview for locked firearms without overwriting equipped loadout slots
+      if (gymBridge) {
+        gymBridge.onSelectWeapon(canonicalId);
       } else {
-        loadoutStore.setSlotPrimaryWeapon(loadoutState.activeIndex, wid);
-        setGearFocus('primary');
+        setPreviewWeaponId(canonicalId);
       }
+      return;
+    }
+
+    setPreviewWeaponId(null);
+    if (isSidearm) {
+      loadoutStore.setSlotSecondaryWeapon(loadoutState.activeIndex, canonicalId);
+      setGearFocus('secondary');
+    } else {
+      loadoutStore.setSlotPrimaryWeapon(loadoutState.activeIndex, canonicalId);
+      setGearFocus('primary');
+    }
+    if (gymBridge) {
+      gymBridge.onSelectWeapon(canonicalId);
     }
   };
 
@@ -684,13 +698,14 @@ export const UnifiedLoadoutWorkbench: React.FC<UnifiedLoadoutWorkbenchProps> = (
                     <button
                       type="button"
                       onClick={() => {
+                        setPreviewWeaponId(null);
                         loadoutStore.setActiveIndex(idx);
                         if (gymBridge) {
                           const targetW =
                             gearFocus === 'secondary'
                               ? slot.secondaryWeaponId
                               : slot.primaryWeaponId;
-                          gymBridge.onSelectWeapon(targetW);
+                          gymBridge.onSelectWeapon(resolveWeaponProfile(targetW).id);
                         }
                       }}
                       className="cursor-pointer whitespace-nowrap px-2.5 py-1 font-mono-tabular text-[11px] font-semibold"
@@ -811,7 +826,18 @@ export const UnifiedLoadoutWorkbench: React.FC<UnifiedLoadoutWorkbenchProps> = (
               </div>
               <button
                 type="button"
-                onClick={() => loadoutStore.resetSlotToDefault(loadoutState.activeIndex)}
+                onClick={() => {
+                  setPreviewWeaponId(null);
+                  loadoutStore.resetSlotToDefault(loadoutState.activeIndex);
+                  if (gymBridge) {
+                    const resetSlot = loadoutStore.getActiveSlot();
+                    const targetW =
+                      gearFocus === 'secondary'
+                        ? resetSlot.secondaryWeaponId
+                        : resetSlot.primaryWeaponId;
+                    gymBridge.onSelectWeapon(resolveWeaponProfile(targetW).id);
+                  }
+                }}
                 className="cursor-pointer border border-slate-800 bg-slate-900/90 p-1.5 text-slate-400 hover:border-amber-400 hover:text-amber-300"
                 title="Reset loadout slot to default"
               >
@@ -822,7 +848,7 @@ export const UnifiedLoadoutWorkbench: React.FC<UnifiedLoadoutWorkbenchProps> = (
             {/* Primary Weapon Slot */}
             <div
               className={`border p-2.5 transition-colors ${
-                gearFocus === 'primary'
+                !previewWeaponId && gearFocus === 'primary'
                   ? 'border-sky-400 bg-sky-500/12'
                   : 'border-slate-800 bg-[#0b121e]/90'
               }`}
@@ -832,9 +858,12 @@ export const UnifiedLoadoutWorkbench: React.FC<UnifiedLoadoutWorkbenchProps> = (
                 <button
                   type="button"
                   onClick={() => {
+                    setPreviewWeaponId(null);
                     setGearFocus('primary');
                     setArmoryOpen(true);
-                    if (gymBridge) gymBridge.onSelectWeapon(activeSlot.primaryWeaponId);
+                    if (gymBridge) {
+                      gymBridge.onSelectWeapon(resolveWeaponProfile(activeSlot.primaryWeaponId).id);
+                    }
                   }}
                   className="cursor-pointer text-sky-300 hover:text-sky-200"
                 >
@@ -844,8 +873,11 @@ export const UnifiedLoadoutWorkbench: React.FC<UnifiedLoadoutWorkbenchProps> = (
               <button
                 type="button"
                 onClick={() => {
+                  setPreviewWeaponId(null);
                   setGearFocus('primary');
-                  if (gymBridge) gymBridge.onSelectWeapon(activeSlot.primaryWeaponId);
+                  if (gymBridge) {
+                    gymBridge.onSelectWeapon(resolveWeaponProfile(activeSlot.primaryWeaponId).id);
+                  }
                 }}
                 className="mt-1 w-full cursor-pointer text-left"
               >
@@ -861,7 +893,7 @@ export const UnifiedLoadoutWorkbench: React.FC<UnifiedLoadoutWorkbenchProps> = (
             {/* Sidearm Slot */}
             <div
               className={`border p-2.5 transition-colors ${
-                gearFocus === 'secondary'
+                !previewWeaponId && gearFocus === 'secondary'
                   ? 'border-sky-400 bg-sky-500/12'
                   : 'border-slate-800 bg-[#0b121e]/90'
               }`}
@@ -871,10 +903,13 @@ export const UnifiedLoadoutWorkbench: React.FC<UnifiedLoadoutWorkbenchProps> = (
                 <button
                   type="button"
                   onClick={() => {
+                    setPreviewWeaponId(null);
                     setGearFocus('secondary');
                     setActiveCategory('pistols');
                     setArmoryOpen(true);
-                    if (gymBridge) gymBridge.onSelectWeapon(activeSlot.secondaryWeaponId);
+                    if (gymBridge) {
+                      gymBridge.onSelectWeapon(resolveWeaponProfile(activeSlot.secondaryWeaponId).id);
+                    }
                   }}
                   className="cursor-pointer text-sky-300 hover:text-sky-200"
                 >
@@ -884,8 +919,11 @@ export const UnifiedLoadoutWorkbench: React.FC<UnifiedLoadoutWorkbenchProps> = (
               <button
                 type="button"
                 onClick={() => {
+                  setPreviewWeaponId(null);
                   setGearFocus('secondary');
-                  if (gymBridge) gymBridge.onSelectWeapon(activeSlot.secondaryWeaponId);
+                  if (gymBridge) {
+                    gymBridge.onSelectWeapon(resolveWeaponProfile(activeSlot.secondaryWeaponId).id);
+                  }
                 }}
                 className="mt-1 w-full cursor-pointer text-left"
               >
@@ -1112,8 +1150,8 @@ export const UnifiedLoadoutWorkbench: React.FC<UnifiedLoadoutWorkbenchProps> = (
               <div className="flex items-center gap-2 border border-red-900/70 bg-red-950/40 px-2.5 py-1.5 font-mono-tabular text-[10px] text-red-200">
                 <Lock className="h-3.5 w-3.5 shrink-0" />
                 <span>
-                  Unlocks at Career Rank {getWeaponUnlockRank(focusedWeaponId)} (Current: Rank{' '}
-                  {careerRank})
+                  Preview Only · Unlocks at Career Rank {getWeaponUnlockRank(focusedWeaponId)} (Current:
+                  Rank {careerRank})
                 </span>
               </div>
             )}

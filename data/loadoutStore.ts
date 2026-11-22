@@ -10,7 +10,7 @@ import {
 import { AmmoVariantId, getDefaultAmmoVariant, resolveBaseCaliberId } from './calibers';
 import { TacticalBeltSlot, TacticalEquipmentId } from './tacticalEquipment';
 import { tacticalEquipmentStore } from '../bodycam-sdk/equipment/TacticalEquipmentStore';
-import { resolveWeaponProfile } from '../bodycam-sdk/weaponProfiles';
+import { resolveWeaponProfile, SDK_WEAPON_PROFILES } from '../bodycam-sdk/weaponProfiles';
 
 export interface SavedWeaponBuild {
   weaponId: string;
@@ -42,14 +42,38 @@ export const MAX_CUSTOM_LOADOUTS = 5;
 
 const STORAGE_KEY = 'axon_unified_loadouts_v1';
 
+const LEGACY_LOADOUT_WEAPON_MAP: Readonly<Record<string, string>> = {
+  mp5a5: 'hk_mp5',
+  glock19: 'glock_17',
+  svd_dragunov: 'dragunov_svd',
+  colt_1911: 'beretta_m9',
+  m4_556: 'm4a1',
+  pm_9x19: 'makarov_pm',
+  aks74u_545: 'aks74u',
+  ak74u_545: 'aks74u',
+  mp133_12ga: 'remington_870',
+};
+
+export function normalizeLoadoutWeaponId(rawId: unknown, fallbackId = 'm4a1'): string {
+  if (typeof rawId !== 'string' || !rawId.trim()) return fallbackId;
+  const trimmed = rawId.trim();
+  const mapped = LEGACY_LOADOUT_WEAPON_MAP[trimmed] ?? trimmed;
+  const prof = SDK_WEAPON_PROFILES[mapped];
+  if (!prof || prof.holdClass === 'unarmed') {
+    return fallbackId;
+  }
+  return prof.id;
+}
+
 function createDefaultWeaponBuild(weaponId: string): SavedWeaponBuild {
-  const profile = resolveWeaponProfile(weaponId);
+  const canonicalId = normalizeLoadoutWeaponId(weaponId);
+  const profile = resolveWeaponProfile(canonicalId);
   const attachments = createBareAttachments();
   const caliberId = resolveBaseCaliberId(profile.defaultCaliberId);
   const ammoVariantId = getDefaultAmmoVariant(caliberId).id;
   const zeroDistanceM = getDefaultZeroDistanceM(profile.category);
   return {
-    weaponId,
+    weaponId: canonicalId,
     attachments,
     ammoVariantId,
     zeroDistanceM,
@@ -66,10 +90,10 @@ function createDefaultLoadoutSlots(): CustomLoadoutSlot[] {
     tactical: TacticalEquipmentId;
   }> = [
     { name: 'Assault', primary: 'm4a1', secondary: 'makarov_pm', tactical: 'm67_frag' },
-    { name: 'CQB Breacher', primary: 'mp5a5', secondary: 'glock19', tactical: 'm84_flash' },
-    { name: 'Marksman', primary: 'svd_dragunov', secondary: 'makarov_pm', tactical: 'm18_smoke' },
-    { name: 'Heavy Support', primary: 'akm_762', secondary: 'colt_1911', tactical: 'an_m14_thermite' },
-    { name: 'Recon Custom', primary: 'm4a1', secondary: 'makarov_pm', tactical: 'm67_frag' },
+    { name: 'CQB Breacher', primary: 'hk_mp5', secondary: 'nagant_m1895', tactical: 'm84_flash' },
+    { name: 'Marksman', primary: 'mosin_m91_30', secondary: 'makarov_pm', tactical: 'm18_smoke' },
+    { name: 'Heavy Support', primary: 'akm_762', secondary: 'makarov_pm', tactical: 'an_m14_thermite' },
+    { name: 'Recon Custom', primary: 'remington_870', secondary: 'nagant_m1895', tactical: 'm67_frag' },
   ];
 
   return presets.map((p, idx) => ({
@@ -109,22 +133,58 @@ class LoadoutStore {
       if (!Array.isArray(parsed.slots) || parsed.slots.length === 0) return fallback;
 
       const defaults = createDefaultLoadoutSlots();
+      let migrated = false;
       const slots: CustomLoadoutSlot[] = defaults.map((def, i) => {
         const s = parsed.slots?.[i];
-        if (!s || typeof s !== 'object') return def;
+        if (!s || typeof s !== 'object') {
+          migrated = true;
+          return def;
+        }
+        const primaryWeaponId = normalizeLoadoutWeaponId(s.primaryWeaponId, def.primaryWeaponId);
+        const secondaryWeaponId = normalizeLoadoutWeaponId(
+          s.secondaryWeaponId,
+          def.secondaryWeaponId,
+        );
+        if (primaryWeaponId !== s.primaryWeaponId || secondaryWeaponId !== s.secondaryWeaponId) {
+          migrated = true;
+        }
+
+        const normalizedBuilds: Record<string, SavedWeaponBuild> = {};
+        if (s.weaponBuilds && typeof s.weaponBuilds === 'object') {
+          for (const [rawKey, build] of Object.entries(s.weaponBuilds)) {
+            if (!build || typeof build !== 'object') continue;
+            const normKey = normalizeLoadoutWeaponId(rawKey, '');
+            if (!normKey) {
+              migrated = true;
+              continue;
+            }
+            if (normKey !== rawKey) migrated = true;
+            if (!normalizedBuilds[normKey]) {
+              normalizedBuilds[normKey] = {
+                ...build,
+                weaponId: normKey,
+                attachments: normalizeWeaponAttachments(normKey, build.attachments ?? {}),
+              };
+            }
+          }
+        }
+        if (!normalizedBuilds[primaryWeaponId]) {
+          normalizedBuilds[primaryWeaponId] = createDefaultWeaponBuild(primaryWeaponId);
+        }
+        if (!normalizedBuilds[secondaryWeaponId]) {
+          normalizedBuilds[secondaryWeaponId] = createDefaultWeaponBuild(secondaryWeaponId);
+        }
+
         return {
           id: def.id,
           name: typeof s.name === 'string' && s.name.trim() ? s.name.trim().slice(0, 22) : def.name,
-          primaryWeaponId:
-            typeof s.primaryWeaponId === 'string' ? s.primaryWeaponId : def.primaryWeaponId,
-          secondaryWeaponId:
-            typeof s.secondaryWeaponId === 'string' ? s.secondaryWeaponId : def.secondaryWeaponId,
+          primaryWeaponId,
+          secondaryWeaponId,
           tacticalEquipmentId:
             (s.tacticalEquipmentId as TacticalEquipmentId) || def.tacticalEquipmentId,
           tacticalBeltSlot: (s.tacticalBeltSlot as TacticalBeltSlot) || def.tacticalBeltSlot,
           mountOnBelt: typeof s.mountOnBelt === 'boolean' ? s.mountOnBelt : def.mountOnBelt,
-          weaponBuilds:
-            s.weaponBuilds && typeof s.weaponBuilds === 'object' ? s.weaponBuilds : def.weaponBuilds,
+          weaponBuilds: normalizedBuilds,
         };
       });
 
@@ -135,7 +195,15 @@ class LoadoutStore {
           ? Math.floor(parsed.activeIndex)
           : 0;
 
-      return { activeIndex, slots };
+      const loadedState: LoadoutStoreState = { activeIndex, slots };
+      if (migrated) {
+        try {
+          window.localStorage.setItem(STORAGE_KEY, JSON.stringify(loadedState));
+        } catch {
+          // Ignore storage quota errors
+        }
+      }
+      return loadedState;
     } catch {
       return fallback;
     }
@@ -165,15 +233,17 @@ class LoadoutStore {
   }
 
   public getWeaponBuild(slotIndex: number, weaponId: string): SavedWeaponBuild {
+    const canonicalId = normalizeLoadoutWeaponId(weaponId);
     const slot = this.state.slots[slotIndex] ?? this.state.slots[0];
-    const existing = slot.weaponBuilds[weaponId];
+    const existing = slot.weaponBuilds[canonicalId] ?? slot.weaponBuilds[weaponId];
     if (existing) {
       return {
         ...existing,
-        attachments: normalizeWeaponAttachments(weaponId, existing.attachments),
+        weaponId: canonicalId,
+        attachments: normalizeWeaponAttachments(canonicalId, existing.attachments),
       };
     }
-    return createDefaultWeaponBuild(weaponId);
+    return createDefaultWeaponBuild(canonicalId);
   }
 
   public getActiveWeaponBuild(weaponId: string): SavedWeaponBuild {
@@ -202,22 +272,24 @@ class LoadoutStore {
 
   public setSlotPrimaryWeapon(index: number, weaponId: string): void {
     if (index < 0 || index >= this.state.slots.length) return;
+    const canonicalId = normalizeLoadoutWeaponId(weaponId);
     const nextSlots = [...this.state.slots];
     const slot = nextSlots[index];
     const builds = { ...slot.weaponBuilds };
-    if (!builds[weaponId]) builds[weaponId] = createDefaultWeaponBuild(weaponId);
-    nextSlots[index] = { ...slot, primaryWeaponId: weaponId, weaponBuilds: builds };
+    if (!builds[canonicalId]) builds[canonicalId] = createDefaultWeaponBuild(canonicalId);
+    nextSlots[index] = { ...slot, primaryWeaponId: canonicalId, weaponBuilds: builds };
     this.state = { ...this.state, slots: nextSlots };
     this.saveAndEmit();
   }
 
   public setSlotSecondaryWeapon(index: number, weaponId: string): void {
     if (index < 0 || index >= this.state.slots.length) return;
+    const canonicalId = normalizeLoadoutWeaponId(weaponId, 'makarov_pm');
     const nextSlots = [...this.state.slots];
     const slot = nextSlots[index];
     const builds = { ...slot.weaponBuilds };
-    if (!builds[weaponId]) builds[weaponId] = createDefaultWeaponBuild(weaponId);
-    nextSlots[index] = { ...slot, secondaryWeaponId: weaponId, weaponBuilds: builds };
+    if (!builds[canonicalId]) builds[canonicalId] = createDefaultWeaponBuild(canonicalId);
+    nextSlots[index] = { ...slot, secondaryWeaponId: canonicalId, weaponBuilds: builds };
     this.state = { ...this.state, slots: nextSlots };
     this.saveAndEmit();
   }
@@ -252,16 +324,18 @@ class LoadoutStore {
     updater: (prev: SavedWeaponBuild) => SavedWeaponBuild,
   ): void {
     if (index < 0 || index >= this.state.slots.length) return;
+    const canonicalId = normalizeLoadoutWeaponId(weaponId);
     const nextSlots = [...this.state.slots];
     const slot = nextSlots[index];
-    const prevBuild = this.getWeaponBuild(index, weaponId);
+    const prevBuild = this.getWeaponBuild(index, canonicalId);
     const nextBuild = updater(prevBuild);
-    nextBuild.attachments = normalizeWeaponAttachments(weaponId, nextBuild.attachments);
+    nextBuild.weaponId = canonicalId;
+    nextBuild.attachments = normalizeWeaponAttachments(canonicalId, nextBuild.attachments);
     nextSlots[index] = {
       ...slot,
       weaponBuilds: {
         ...slot.weaponBuilds,
-        [weaponId]: nextBuild,
+        [canonicalId]: nextBuild,
       },
     };
     this.state = { ...this.state, slots: nextSlots };

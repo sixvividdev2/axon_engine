@@ -322,7 +322,19 @@ export class CadGunsmithStage {
     profile: BodycamWeaponProfile,
     attachments: WeaponAttachments,
   ): DerivedWeaponStats {
-    return this.bench.setShowcaseWeapon(profile, attachments);
+    const stats = this.bench.setShowcaseWeapon(profile, attachments);
+    this.pinEmitAccum = 1;
+    if (!this.disposed) {
+      this.renderer.render(this.scene, this.camera);
+      if (this.onPinsUpdate) {
+        const w = Math.max(1, this.container.clientWidth);
+        const h = Math.max(1, this.container.clientHeight);
+        this.bench.projectPins(this.camera, w, h, this.pins);
+        this.onPinsUpdate(this.pins.map((p) => ({ ...p })));
+        this.pinEmitAccum = 0;
+      }
+    }
+    return stats;
   }
 
   public setShowcaseTurretElevation(elevationMrad: number): void {
@@ -385,23 +397,25 @@ export class CadGunsmithStage {
 
   private readonly tick = (): void => {
     if (this.disposed) return;
-    const now = performance.now();
-    const dt = Math.min(0.05, Math.max(0.001, (now - this.lastTimeMs) / 1000));
-    this.lastTimeMs = now;
+    try {
+      const now = performance.now();
+      const dt = Math.min(0.05, Math.max(0.001, (now - this.lastTimeMs) / 1000));
+      this.lastTimeMs = now;
 
-    this.bench.updateCamera(dt, this.camera, this._dummyFpsPos, this._dummyFpsQuat);
-    this.renderer.render(this.scene, this.camera);
+      this.bench.updateCamera(dt, this.camera, this._dummyFpsPos, this._dummyFpsQuat);
+      this.renderer.render(this.scene, this.camera);
 
-    this.pinEmitAccum += dt;
-    if (this.onPinsUpdate && this.pinEmitAccum >= 0.032) {
-      this.pinEmitAccum = 0;
-      const w = Math.max(1, this.container.clientWidth);
-      const h = Math.max(1, this.container.clientHeight);
-      this.bench.projectPins(this.camera, w, h, this.pins);
-      this.onPinsUpdate(this.pins.map((p) => ({ ...p })));
+      this.pinEmitAccum += dt;
+      if (this.onPinsUpdate && this.pinEmitAccum >= 0.032) {
+        this.pinEmitAccum = 0;
+        const w = Math.max(1, this.container.clientWidth);
+        const h = Math.max(1, this.container.clientHeight);
+        this.bench.projectPins(this.camera, w, h, this.pins);
+        this.onPinsUpdate(this.pins.map((p) => ({ ...p })));
+      }
+    } finally {
+      this.scheduleNextFrame();
     }
-
-    this.scheduleNextFrame();
   };
 
   public dispose(): void {
