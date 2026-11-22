@@ -50,6 +50,7 @@ const ALLOWED_GAME_TYPES = new Set<string>([
   'game:zombie_damage',
   'game:barrier_repair_request',
   'game:map_interact_request',
+  'game:ping',
 ]);
 
 const VALID_AIM_STANCES = new Set<SyncedAimStance>(['HIP', 'ADS', 'POINT_AIM', 'CANTED_ADS']);
@@ -396,6 +397,32 @@ export function validateAndSanitizeGameMessage(
       matchState.unlockedZoneIds.length !== prevZones
     ) {
       matchStateChanged = true;
+    }
+  } else if (type === 'game:ping') {
+    const pingId = String(parsed.pingId ?? '').trim().slice(0, 48);
+    const kind = parsed.kind;
+    if (
+      !pingId ||
+      (kind !== 'location' && kind !== 'enemy' && kind !== 'item') ||
+      !isFiniteCoord(parsed.x) ||
+      !isFiniteCoord(parsed.y) ||
+      !isFiniteCoord(parsed.z)
+    ) {
+      return null;
+    }
+    safePayload.pingId = pingId;
+    safePayload.kind = kind;
+    safePayload.label = String(parsed.label ?? 'MARK').trim().slice(0, 36) || 'MARK';
+    safePayload.x = Number(parsed.x.toFixed(3));
+    safePayload.y = Number(parsed.y.toFixed(3));
+    safePayload.z = Number(parsed.z.toFixed(3));
+    const entityType = parsed.targetEntityType;
+    if (entityType === 'bot' || entityType === 'zombie' || entityType === 'remote_player') {
+      safePayload.targetEntityType = entityType;
+      safePayload.targetEntityId = String(parsed.targetEntityId ?? '').trim().slice(0, 64) || null;
+    } else {
+      safePayload.targetEntityType = null;
+      safePayload.targetEntityId = null;
     }
   }
 

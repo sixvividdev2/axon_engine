@@ -202,6 +202,13 @@ export class RemotePlayerManager {
     return { userId: p.userId, username: p.username, team: p.team, alive: p.alive };
   }
 
+  public getPlayerHeadPosition(userId: string, out: THREE.Vector3): boolean {
+    const p = this.players.get(userId);
+    if (!p || !p.alive) return false;
+    out.set(p.curPos.x, p.curPos.y + 1.98, p.curPos.z);
+    return true;
+  }
+
   private createNameplateTexture(username: string, team: BattleTeamId): THREE.CanvasTexture {
     const canvas = document.createElement('canvas');
     canvas.width = 256;

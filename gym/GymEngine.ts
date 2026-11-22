@@ -442,6 +442,15 @@ export class GymEngine {
     this.weaponRig.setLaserMode('visible_red');
     this.teleportToZone('spawn', true);
 
+    // Pre-compile scene shaders once at boot (hardware GL) to avoid mid-session GLSL compile hitches
+    if (!this.isSoftwareGl) {
+      try {
+        this.renderer.compile(this.scene, this.camera);
+      } catch {
+        // Non-fatal fallback
+      }
+    }
+
     this.bindEvents();
     this.emitSnapshot();
     this.scheduleNextFrame();

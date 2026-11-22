@@ -491,10 +491,8 @@ export class InfectionZombieAI {
     this.rebuildActiveHitMeshes();
 
     // Subtle spatial wood-window breach cue at the entry point
-    this.audio.playImpact(
-      new THREE.Vector3(pkt.entryPos[0], pkt.entryPos[1] + 1.0, pkt.entryPos[2]),
-      'wood',
-    );
+    this._tmpAudioPos.set(pkt.entryPos[0], pkt.entryPos[1] + 1.0, pkt.entryPos[2]);
+    this.audio.playImpact(this._tmpAudioPos, 'wood');
   }
 
   public applySyncSnapshot(pkt: GameZombiesSyncPacket): void {
@@ -980,7 +978,8 @@ export class InfectionZombieAI {
       const kb = kind === 'frag' ? 5.6 * falloff + 1.4 : 1.1;
       z.knockbackVelX += (dx / horiz) * kb;
       z.knockbackVelZ += (dz / horiz) * kb;
-      this.spawnBloodBurst(new THREE.Vector3(z.pos.x, z.pos.y + 1.05, z.pos.z), kind === 'frag' ? 8 : 4);
+      this._tmpAudioPos.set(z.pos.x, z.pos.y + 1.05, z.pos.z);
+      this.spawnBloodBurst(this._tmpAudioPos, kind === 'frag' ? 8 : 4);
 
       if (z.hp <= 0) {
         this.killZombie(z);
@@ -992,6 +991,18 @@ export class InfectionZombieAI {
     }
 
     return { hits, kills, pointsAwarded };
+  }
+
+  public getZombieHeadPosition(zombieId: string, out: THREE.Vector3): boolean {
+    for (let i = 0; i < this.zombies.length; i++) {
+      const z = this.zombies[i];
+      if (z.id === zombieId) {
+        if (!z.alive) return false;
+        out.set(z.pos.x, z.pos.y + 1.88, z.pos.z);
+        return true;
+      }
+    }
+    return false;
   }
 
   private killZombie(z: ZombieActor): void {

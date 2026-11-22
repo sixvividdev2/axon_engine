@@ -687,6 +687,18 @@ export class BattleBotAI {
     return { id: b.id, name: b.name, team: b.team, alive: b.alive };
   }
 
+  public getBotHeadPosition(botId: string, out: THREE.Vector3): boolean {
+    for (let i = 0; i < this.bots.length; i++) {
+      const b = this.bots[i];
+      if (b.id === botId) {
+        if (!b.alive) return false;
+        out.set(b.pos.x, b.pos.y + 1.98, b.pos.z);
+        return true;
+      }
+    }
+    return false;
+  }
+
   public triggerVisualFlinch(botId: string): void {
     const b = this.bots.find((item) => item.id === botId);
     if (b && b.alive) {

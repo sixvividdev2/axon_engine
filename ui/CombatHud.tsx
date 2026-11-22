@@ -106,6 +106,96 @@ export const CombatHud: React.FC<CombatHudProps> = ({
         enabled={effectiveKillfeed.enabled}
         localPlayerName={multiplayerSession?.localPlayerName ?? 'YOU'}
       />
+
+      {/* World-Projected Tactical Pings (Z Key · Auto-Detect Location / Enemy / Item · Distance Fade) */}
+      {snapshot.tacticalPings.length > 0 && (
+        <div className="pointer-events-none fixed inset-0 z-10 overflow-hidden">
+          {snapshot.tacticalPings.map((ping) => {
+            const isEnemy = ping.kind === 'enemy';
+            const isItem = ping.kind === 'item';
+            const accentHex = isEnemy ? '#ef4444' : isItem ? '#f59e0b' : '#38bdf8';
+            const textCls = isEnemy
+              ? 'text-red-400'
+              : isItem
+                ? 'text-amber-300'
+                : 'text-sky-300';
+            const borderCls = isEnemy
+              ? 'border-red-500/80 bg-neutral-950/88'
+              : isItem
+                ? 'border-amber-400/80 bg-neutral-950/88'
+                : 'border-sky-400/80 bg-neutral-950/88';
+
+            return (
+              <div
+                key={ping.id}
+                className="fixed top-0 left-0 flex flex-col items-center font-mono-tabular will-change-transform"
+                style={{
+                  transform: `translate3d(${ping.screenX}vw, ${ping.screenY}vh, 0) translate(-50%, -100%) scale(${ping.scale})`,
+                  opacity: ping.opacity,
+                }}
+              >
+                {/* Compact Tactical Tag */}
+                <div
+                  className={`flex items-center gap-1.5 border px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider whitespace-nowrap ${borderCls}`}
+                >
+                  <span className={textCls}>{ping.label}</span>
+                  <span className="text-neutral-200">{ping.distanceM}M</span>
+                </div>
+                {!ping.isLocal && (
+                  <div
+                    className="mt-0.5 text-[9px] uppercase tracking-wider text-neutral-300"
+                    style={{ textShadow: '0 1px 2px rgba(0,0,0,0.95)' }}
+                  >
+                    {ping.senderName}
+                  </div>
+                )}
+                {/* Crisp Geometric Tactical Icon */}
+                <svg
+                  width="22"
+                  height="22"
+                  viewBox="0 0 24 24"
+                  className="mt-0.5"
+                  style={{ filter: 'drop-shadow(0 1px 2px rgba(0,0,0,0.9))' }}
+                >
+                  {isEnemy ? (
+                    <>
+                      <polygon
+                        points="12,2 22,12 12,22 2,12"
+                        fill="rgba(127,29,29,0.55)"
+                        stroke={accentHex}
+                        strokeWidth="2"
+                      />
+                      <line x1="12" y1="7" x2="12" y2="17" stroke={accentHex} strokeWidth="1.6" />
+                      <line x1="7" y1="12" x2="17" y2="12" stroke={accentHex} strokeWidth="1.6" />
+                    </>
+                  ) : isItem ? (
+                    <>
+                      <polygon
+                        points="12,2 20.5,7 20.5,17 12,22 3.5,17 3.5,7"
+                        fill="rgba(120,53,15,0.52)"
+                        stroke={accentHex}
+                        strokeWidth="2"
+                      />
+                      <rect x="9.5" y="9.5" width="5" height="5" fill={accentHex} />
+                    </>
+                  ) : (
+                    <>
+                      <polygon
+                        points="12,21 3,6 12,10 21,6"
+                        fill="rgba(12,74,110,0.52)"
+                        stroke={accentHex}
+                        strokeWidth="2"
+                        strokeLinejoin="miter"
+                      />
+                    </>
+                  )}
+                </svg>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
       {/* Peripheral Damage Flash Overlay */}
       {snapshot.damageFlash > 0.02 && (
         <div
@@ -600,6 +690,7 @@ export const CombatHud: React.FC<CombatHudProps> = ({
           <span>MMB Pt-Aim</span>
           <span>V Bash</span>
           <span>X Kick</span>
+          <span className="text-sky-300">Z Ping</span>
           {isBattle && <span>Tab Scoreboard</span>}
           {isInfection && <span className="text-amber-300">F Interact · Hold F Repair</span>}
           <span>F1 Optics</span>

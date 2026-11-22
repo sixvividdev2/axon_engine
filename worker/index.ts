@@ -1607,6 +1607,6 @@ export default {
       return env.ASSETS.fetch(request);
     }
 
-    return new Response('CORDON-04 Cloudflare Worker ready.', { status: 200 });
+    return new Response('AXON ENGINE Cloudflare Worker ready.', { status: 200 });
   },
 };

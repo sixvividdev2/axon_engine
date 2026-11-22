@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import { AsyncLuminanceReader } from '../AsyncLuminanceReader';
 import { WeaponModelAssembly } from './WeaponModelFactory';
 
 const ScopeLumDownsampleShader = {
@@ -67,7 +68,7 @@ export interface ScopePassParams {
 export class ScopeRenderer {
   private readonly scopeRT: THREE.WebGLRenderTarget;
   private readonly lumTarget: THREE.WebGLRenderTarget;
-  private readonly lumBuffer = new Uint8Array(8 * 8 * 4);
+  private readonly asyncLumReader = new AsyncLuminanceReader(8, 8, 1.35, 1.8, 0.2, 8);
   private readonly scopeCamera: THREE.PerspectiveCamera;
   private readonly isSoftwareGl: boolean;
 
@@ -325,30 +326,17 @@ export class ScopeRenderer {
     renderer.clear(true, true, true);
     renderer.render(scene, this.scopeCamera);
 
-    // Independent center-weighted HDR exposure for the magnified sight picture
-    if (!this.isSoftwareGl || this.frameCount % 2 === 0) {
+    // Independent center-weighted HDR exposure for the magnified sight picture (non-blocking PBO)
+    if (!this.isSoftwareGl || this.frameCount % 8 === 0) {
       this.lumMaterial.uniforms.tHdr.value = this.scopeRT.texture;
       this.quadMesh.material = this.lumMaterial;
       renderer.setRenderTarget(this.lumTarget);
       renderer.render(this.quadScene, this.quadCamera);
-      renderer.readRenderTargetPixels(this.lumTarget, 0, 0, 8, 8, this.lumBuffer);
 
-      let weightedLogSum = 0;
-      let weightTotal = 0;
-      for (let y = 0; y < 8; y++) {
-        for (let x = 0; x < 8; x++) {
-          const idx = (y * 8 + x) * 4;
-          const encoded = this.lumBuffer[idx] / 255.0;
-          const logLuma = encoded * 12.0 - 6.0;
-          const dx = (x + 0.5) / 8 - 0.5;
-          const dy = (y + 0.5) / 8 - 0.5;
-          const w = Math.max(0.2, 1.35 - Math.hypot(dx, dy) * 1.8);
-          weightedLogSum += logLuma * w;
-          weightTotal += w;
-        }
+      const measured = this.asyncLumReader.step(renderer, this.lumTarget, this.isSoftwareGl);
+      if (measured !== null && Number.isFinite(measured)) {
+        this.avgScopeLuminance = measured;
       }
-      const meanLog = weightedLogSum / Math.max(0.001, weightTotal);
-      this.avgScopeLuminance = Math.pow(2, meanLog);
     }
 
     const targetScopeExp = THREE.MathUtils.clamp(
@@ -399,6 +387,7 @@ export class ScopeRenderer {
   }
 
   public dispose(): void {
+    this.asyncLumReader.dispose();
     this.scopeRT.dispose();
     this.lumTarget.dispose();
     this.quadMesh.geometry.dispose();

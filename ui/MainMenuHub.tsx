@@ -194,7 +194,7 @@ export const MainMenuHub: React.FC<MainMenuHubProps> = ({
         <header className="flex flex-wrap items-center justify-between gap-4 border-b border-neutral-800/80 pb-4">
           <div className="flex items-baseline gap-4">
             <h1 className="font-display text-3xl font-bold uppercase tracking-wider text-neutral-50 whitespace-nowrap shrink-0">
-              CORDON-04
+              AXON ENGINE
             </h1>
             <span
               className={`hidden font-mono-tabular text-[11px] uppercase tracking-[0.2em] xl:inline ${
@@ -231,7 +231,7 @@ export const MainMenuHub: React.FC<MainMenuHubProps> = ({
                   onClick={() => {
                     if (item.gated) {
                       requireAuth(
-                        'Multiplayer Lobbies, Special Events, and Social Hub require a signed-in CORDON-04 account. Singleplayer modes remain playable without signing in.',
+                        'Multiplayer Lobbies, Special Events, and Social Hub require a signed-in AXON ENGINE account. Singleplayer modes remain playable without signing in.',
                         () => setActiveTab('multiplayer'),
                       );
                     } else {
@@ -806,8 +806,8 @@ export const MainMenuHub: React.FC<MainMenuHubProps> = ({
         {/* Bottom Controls, 4-Mode Graphics Quality & Killfeed Toggle Footer */}
         <footer className="flex flex-wrap items-center justify-between gap-3 border-t border-neutral-800/70 pt-3 font-mono-tabular text-[11px] text-neutral-400">
           <div>
-            WASD Move · Shift Sprint · RMB ADS · MMB Point Aim · R Reload · 4 / H Grenade · F
-            Interact · F1 Settings
+            WASD Move · Shift Sprint · RMB ADS · MMB Point Aim · R Reload · 4 / H Grenade · Z Ping ·
+            F Interact · F1 Settings
           </div>
           <div className="flex flex-wrap items-center gap-3">
             <div className="flex items-center gap-1">

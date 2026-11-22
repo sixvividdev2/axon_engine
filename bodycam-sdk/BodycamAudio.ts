@@ -1825,6 +1825,15 @@ export class BodycamAudio implements IBodycamAudioSource {
     grit.connect(bp);
     bp.connect(gg);
     gg.connect(dest);
+    if (panner) {
+      ring.onended = () => {
+        try {
+          panner.disconnect();
+        } catch {
+          // already disconnected
+        }
+      };
+    }
     grit.start(t, Math.random() * 1.1, 0.065);
   }
 
@@ -1994,6 +2003,84 @@ export class BodycamAudio implements IBodycamAudioSource {
     bg.connect(dest);
     burn.start(t + 0.08);
     burn.stop(t + 2.95);
+    if (panner) {
+      burn.onended = () => {
+        try {
+          panner.disconnect();
+        } catch {
+          // already disconnected
+        }
+      };
+    }
+  }
+
+  /**
+   * Subtle tactical HUD/comms radio ping chirp with distinct timbre per ping category:
+   *  - 'location': crisp single high-tech sonar tick
+   *  - 'enemy': urgent double-pip hostile alert chime
+   *  - 'item': warm resonant supply/station lock-on tone
+   */
+  public playTacticalPing(kind: 'location' | 'enemy' | 'item'): void {
+    this.ensureInitialized();
+    if (!this.ctx || !this.dryBus) return;
+    const ctx = this.ctx;
+    const t = ctx.currentTime;
+
+    if (kind === 'enemy') {
+      // Crisp urgent double-pip
+      for (let i = 0; i < 2; i++) {
+        const start = t + i * 0.062;
+        const osc = ctx.createOscillator();
+        osc.type = 'triangle';
+        osc.frequency.setValueAtTime(i === 0 ? 1180 : 1480, start);
+        osc.frequency.exponentialRampToValueAtTime(i === 0 ? 960 : 1220, start + 0.048);
+
+        const g = ctx.createGain();
+        g.gain.setValueAtTime(0.001, start);
+        g.gain.linearRampToValueAtTime(0.11, start + 0.006);
+        g.gain.exponentialRampToValueAtTime(0.0008, start + 0.055);
+
+        osc.connect(g);
+        g.connect(this.dryBus);
+        osc.start(start);
+        osc.stop(start + 0.06);
+      }
+      return;
+    }
+
+    if (kind === 'item') {
+      const osc = ctx.createOscillator();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(740, t);
+      osc.frequency.exponentialRampToValueAtTime(1120, t + 0.085);
+
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0.001, t);
+      g.gain.linearRampToValueAtTime(0.105, t + 0.01);
+      g.gain.exponentialRampToValueAtTime(0.0008, t + 0.11);
+
+      osc.connect(g);
+      g.connect(this.dryBus);
+      osc.start(t);
+      osc.stop(t + 0.12);
+      return;
+    }
+
+    // 'location'
+    const osc = ctx.createOscillator();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(1040, t);
+    osc.frequency.exponentialRampToValueAtTime(840, t + 0.065);
+
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.001, t);
+    g.gain.linearRampToValueAtTime(0.095, t + 0.007);
+    g.gain.exponentialRampToValueAtTime(0.0008, t + 0.08);
+
+    osc.connect(g);
+    g.connect(this.dryBus);
+    osc.start(t);
+    osc.stop(t + 0.09);
   }
 
   public dispose(): void {

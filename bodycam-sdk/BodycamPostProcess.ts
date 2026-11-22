@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import { AsyncLuminanceReader } from './AsyncLuminanceReader';
 import {
   BodycamLensPresetId,
   BodycamSDKConfig,
@@ -419,7 +420,7 @@ export class BodycamPostProcess {
   private glareTargetA: THREE.WebGLRenderTarget;
   private glareTargetB: THREE.WebGLRenderTarget;
   private lensDirtTex: THREE.CanvasTexture;
-  private lumBuffer = new Uint8Array(16 * 16 * 4);
+  private readonly asyncLumReader = new AsyncLuminanceReader(16, 16, 1.2, 1.4, 0.25, 8);
 
   private quadScene: THREE.Scene;
   private quadCamera: THREE.OrthographicCamera;
@@ -733,31 +734,17 @@ export class BodycamPostProcess {
     this.renderer.shadowMap.autoUpdate = prevShadowAutoUpdate;
     this.renderer.autoClear = prevAutoClear;
 
-    // 2. Downsample HDR luminance into 16x16 target
-    if (!this.isSoftwareGl || this.frameCount % 2 === 0) {
+    // 2. Downsample HDR luminance into 16x16 target + non-blocking async WebGL2 PBO readback
+    if (!this.isSoftwareGl || this.frameCount % 8 === 0) {
       this.lumMaterial.uniforms.tHdr.value = this.hdrTarget.texture;
       this.quadMesh.material = this.lumMaterial;
       this.renderer.setRenderTarget(this.lumTarget);
       this.renderer.render(this.quadScene, this.quadCamera);
 
-      this.renderer.readRenderTargetPixels(this.lumTarget, 0, 0, 16, 16, this.lumBuffer);
-
-      let weightedLogSum = 0;
-      let weightTotal = 0;
-      for (let y = 0; y < 16; y++) {
-        for (let x = 0; x < 16; x++) {
-          const idx = (y * 16 + x) * 4;
-          const encoded = this.lumBuffer[idx] / 255.0;
-          const logLuma = encoded * 12.0 - 6.0;
-          const dx = (x + 0.5) / 16 - 0.5;
-          const dy = (y + 0.5) / 16 - 0.5;
-          const w = Math.max(0.25, 1.2 - Math.hypot(dx, dy) * 1.4);
-          weightedLogSum += logLuma * w;
-          weightTotal += w;
-        }
+      const measured = this.asyncLumReader.step(this.renderer, this.lumTarget, this.isSoftwareGl);
+      if (measured !== null && Number.isFinite(measured)) {
+        this.avgLuminance = measured;
       }
-      const meanLog = weightedLogSum / Math.max(0.001, weightTotal);
-      this.avgLuminance = Math.pow(2, meanLog);
     }
 
     // 3. Quarter-res bright-pass glare + separable blur for Lens Dirt / Smudge Flare
@@ -804,6 +791,7 @@ export class BodycamPostProcess {
   }
 
   public dispose(): void {
+    this.asyncLumReader.dispose();
     this.hdrTarget.dispose();
     this.flashBurnInTarget.dispose();
     this.lumTarget.dispose();

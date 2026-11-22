@@ -33,7 +33,7 @@ export const MainMenu: React.FC<MainMenuProps> = ({
               Perimeter Sector 04 · Overcast Clearing
             </p>
             <h1 className="mt-2 font-display text-4xl font-semibold tracking-tight text-neutral-100 uppercase">
-              Cordon-04
+              AXON ENGINE
             </h1>
             <p className="mt-3 text-sm leading-relaxed text-neutral-400">
               You wake empty-handed along the perimeter road. Scavenge gear, manage individual

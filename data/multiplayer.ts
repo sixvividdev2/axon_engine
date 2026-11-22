@@ -650,6 +650,25 @@ export interface GameMatchSyncPacket {
   ts: number;
 }
 
+export type TacticalPingKind = 'location' | 'enemy' | 'item';
+export type TacticalPingTargetType = 'bot' | 'zombie' | 'remote_player';
+
+export interface GameTacticalPingPacket {
+  type: 'game:ping';
+  senderUserId?: string;
+  senderUsername?: string;
+  senderTeam?: LobbyTeamId;
+  pingId: string;
+  kind: TacticalPingKind;
+  label: string;
+  x: number;
+  y: number;
+  z: number;
+  targetEntityType?: TacticalPingTargetType | null;
+  targetEntityId?: string | null;
+  ts: number;
+}
+
 export type GameSyncPacket =
   | GamePlayerStatePacket
   | GamePlayerFirePacket
@@ -671,6 +690,7 @@ export type GameSyncPacket =
   | GameMapInteractRequestPacket
   | GameMapInteractPacket
   | GameMapInteractRejectedPacket
-  | GameMatchSyncPacket;
+  | GameMatchSyncPacket
+  | GameTacticalPingPacket;
 
 

@@ -84,6 +84,7 @@ import {
   GamePlayerRespawnPacket,
   GamePlayerStatePacket,
   GameRoundCompletePacket,
+  GameTacticalPingPacket,
   GameZombieDamagePacket,
   GameZombieHitPlayerPacket,
   GameZombieKilledPacket,
@@ -94,6 +95,8 @@ import {
   resolveOperatorUniformId,
   SpecialEventConfig,
   SyncedAimStance,
+  TacticalPingKind,
+  TacticalPingTargetType,
 } from '../data/multiplayer';
 import {
   BattleBotAI,
@@ -138,6 +141,36 @@ export interface NearbyInteractPrompt {
   holdProgress?: number;
   planksRemaining?: number;
   maxPlanks?: number;
+}
+
+export interface ProjectedTacticalPing {
+  id: string;
+  kind: TacticalPingKind;
+  label: string;
+  senderName: string;
+  isLocal: boolean;
+  screenX: number; // 0..100 viewport %
+  screenY: number; // 0..100 viewport %
+  offscreen: boolean;
+  distanceM: number;
+  opacity: number; // 0..1 distance-faded + expiry-faded
+  scale: number; // 0.72..1.05
+  ageRatio: number; // 0..1
+}
+
+interface ActiveTacticalPing {
+  id: string;
+  senderId: string;
+  senderName: string;
+  isLocal: boolean;
+  kind: TacticalPingKind;
+  label: string;
+  worldPos: THREE.Vector3;
+  targetEntityType: TacticalPingTargetType | null;
+  targetEntityId: string | null;
+  ageSec: number;
+  durationSec: number;
+  lostTargetTimer: number;
 }
 
 export interface CombatSessionSnapshot {
@@ -234,6 +267,7 @@ export interface CombatSessionSnapshot {
   spectating: boolean;
   spectatingTargetName: string | null;
   livesRemaining: number;
+  tacticalPings: ProjectedTacticalPing[];
 }
 
 type SnapshotListener = (snap: CombatSessionSnapshot) => void;
@@ -423,6 +457,19 @@ export class CombatSessionEngine {
   private readonly _whipVel = new THREE.Vector2();
   private readonly _actorRaycaster = new THREE.Raycaster();
   private readonly _actorHits: THREE.Intersection[] = [];
+  private readonly _pingRaycaster = new THREE.Raycaster();
+  private readonly _pingCenterNdc = new THREE.Vector2(0, 0);
+  private readonly _pingHits: THREE.Intersection[] = [];
+  private readonly _pingProjVec = new THREE.Vector3();
+  private readonly _pingCamFwd = new THREE.Vector3();
+  private readonly _pingToTarget = new THREE.Vector3();
+  private readonly _pingRayOrigin = new THREE.Vector3();
+  private readonly _pingRayDir = new THREE.Vector3();
+  private readonly _pingTrackPos = new THREE.Vector3();
+  private readonly activePings: ActiveTacticalPing[] = [];
+  private projectedPings: ProjectedTacticalPing[] = [];
+  private pingCooldownSec = 0;
+  private nextLocalPingSeq = 1;
   private readonly _traumaMods: BodycamTraumaModifiers = { ...DEFAULT_TRAUMA_MODIFIERS };
   private readonly _runtimeProfile: BodycamWeaponProfile;
   private readonly _scopePassParams: ScopePassParams;
@@ -755,6 +802,15 @@ export class CombatSessionEngine {
 
     // Place player at map starting spawn
     this.spawnPlayerAtStart();
+
+    // Pre-warm WebGL shaders once at boot on hardware GPUs to eliminate mid-combat GLSL compile hitches
+    if (!this.isSoftwareGl) {
+      try {
+        this.renderer.compile(this.scene, this.camera);
+      } catch {
+        // Non-fatal fallback
+      }
+    }
 
     this.bindEvents();
     this.emitSnapshot();
@@ -1134,6 +1190,11 @@ export class CombatSessionEngine {
 
     if (type === 'game:respawn') {
       this.remotePlayers.applyRespawnPacket(raw as unknown as GamePlayerRespawnPacket);
+      return;
+    }
+
+    if (type === 'game:ping') {
+      this.handleRemoteTacticalPing(raw as unknown as GameTacticalPingPacket);
       return;
     }
 
@@ -1778,6 +1839,8 @@ export class CombatSessionEngine {
     this.spawnPlayerAtStart();
     this.botAI.resetMatch(this.controller.position);
     this.ballistics.clearEffects();
+    this.activePings.length = 0;
+    this.projectedPings = [];
     this.showToast('Match Restarted');
     this.requestLock();
   }
@@ -3533,12 +3596,359 @@ export class CombatSessionEngine {
           this.emitSnapshot();
         }
         break;
+      case 'KeyZ':
+        if (!e.repeat) {
+          this.triggerTacticalPing();
+        }
+        break;
       case 'Space':
         e.preventDefault();
         this.input.vault = true;
         break;
     }
   };
+
+  /**
+   * Tactical Ping System (Z Key): auto-detects enemies (bots, zombies, hostile remote players),
+   * interactive stations/items (wall-buys, mystery crate, perks, power, doors, barriers),
+   * or static world locations up to 120m.
+   */
+  private triggerTacticalPing(): void {
+    if (this.pingCooldownSec > 0 || !this.playerAlive || this.gameOver || this.matchOutcome !== 'active') {
+      return;
+    }
+    this.pingCooldownSec = 0.25;
+
+    this.camera.updateMatrixWorld();
+    this._pingRaycaster.setFromCamera(this._pingCenterNdc, this.camera);
+    this._pingRaycaster.near = 0.2;
+    this._pingRaycaster.far = 120;
+    this._pingRayOrigin.copy(this._pingRaycaster.ray.origin);
+    this._pingRayDir.copy(this._pingRaycaster.ray.direction);
+
+    // 1. Find closest static world surface hit to use as occlusion limit & fallback location mark
+    this._pingHits.length = 0;
+    this._pingRaycaster.intersectObjects(this.map.raycastMeshes, false, this._pingHits);
+    const worldHit = this._pingHits.length > 0 ? this._pingHits[0] : null;
+    const maxUnoccludedDist = worldHit ? worldHit.distance + 0.35 : 120;
+
+    let kind: TacticalPingKind = 'location';
+    let label = 'MARK';
+    let targetEntityType: TacticalPingTargetType | null = null;
+    let targetEntityId: string | null = null;
+    let chosenDist = Infinity;
+    const pingPos = this._pingTrackPos.set(0, 0, 0);
+    let foundHit = false;
+
+    // 2. Priority 1: Hostile combatants (AI bots, zombies, hostile remote players)
+    const testEnemyMeshes = (meshes: THREE.Object3D[]): void => {
+      if (meshes.length === 0) return;
+      this._pingHits.length = 0;
+      this._pingRaycaster.intersectObjects(meshes, false, this._pingHits);
+      for (let i = 0; i < this._pingHits.length; i++) {
+        const hit = this._pingHits[i];
+        if (hit.distance > maxUnoccludedDist || hit.distance >= chosenDist) break;
+        const ud = hit.object.userData;
+        const actorType = ud?.combatActorType as string | undefined;
+        const actorId = ud?.combatActorId as string | undefined;
+        if (!actorType || !actorId) continue;
+
+        if (actorType === 'bot' && this.botAI) {
+          const info = this.botAI.getBotInfo(actorId);
+          if (!info || !info.alive) continue;
+          // Do not mark allied bots as enemies in TDM or co-op Infection
+          if (
+            this.params.mode === 'infection' ||
+            (this.params.mode === 'battle' &&
+              this.params.battleConfig.rule === 'tdm' &&
+              info.team === this.localBattleTeam)
+          ) {
+            continue;
+          }
+          chosenDist = hit.distance;
+          kind = 'enemy';
+          label = info.name.toUpperCase().slice(0, 18) || 'HOSTILE';
+          targetEntityType = 'bot';
+          targetEntityId = info.id;
+          if (!this.botAI.getBotHeadPosition(info.id, pingPos)) {
+            pingPos.copy(hit.point);
+            pingPos.y += 0.45;
+          }
+          foundHit = true;
+          break;
+        }
+
+        if (actorType === 'zombie' && this.zombieAI) {
+          chosenDist = hit.distance;
+          kind = 'enemy';
+          label = 'INFECTED';
+          targetEntityType = 'zombie';
+          targetEntityId = actorId;
+          if (!this.zombieAI.getZombieHeadPosition(actorId, pingPos)) {
+            pingPos.copy(hit.point);
+            pingPos.y += 0.45;
+          }
+          foundHit = true;
+          break;
+        }
+
+        if (actorType === 'remote_player' && this.remotePlayers) {
+          if (this.remotePlayers.isFriendly(actorId)) continue;
+          const info = this.remotePlayers.getPlayerInfo(actorId);
+          if (!info || !info.alive) continue;
+          chosenDist = hit.distance;
+          kind = 'enemy';
+          label = info.username.toUpperCase().slice(0, 18) || 'HOSTILE';
+          targetEntityType = 'remote_player';
+          targetEntityId = info.userId;
+          if (!this.remotePlayers.getPlayerHeadPosition(info.userId, pingPos)) {
+            pingPos.copy(hit.point);
+            pingPos.y += 0.45;
+          }
+          foundHit = true;
+          break;
+        }
+      }
+    };
+
+    if (this.botAI) testEnemyMeshes(this.botAI.getHitMeshes());
+    if (this.zombieAI) testEnemyMeshes(this.zombieAI.getHitMeshes());
+    if (this.remotePlayers) testEnemyMeshes(this.remotePlayers.getHitMeshes());
+
+    // 3. Priority 2: Items, Weapon Wall-Buys, Mystery Crate, Perks, Power, Doors & Barriers
+    if (!foundHit && this.map.interactables.length > 0) {
+      let bestItem: MapInteractable | null = null;
+      let bestItemDist = Math.min(40, maxUnoccludedDist + 1.25);
+
+      for (let i = 0; i < this.map.interactables.length; i++) {
+        const it = this.map.interactables[i];
+        if (
+          it.activated &&
+          (it.kind === 'buyable_door' || it.kind === 'power_switch' || it.kind === 'perk_machine')
+        ) {
+          continue;
+        }
+        const tx = it.position[0] - this._pingRayOrigin.x;
+        const ty = it.position[1] + 0.35 - this._pingRayOrigin.y;
+        const tz = it.position[2] - this._pingRayOrigin.z;
+        const along = tx * this._pingRayDir.x + ty * this._pingRayDir.y + tz * this._pingRayDir.z;
+        if (along < 0.6 || along > bestItemDist) continue;
+
+        const perpX = tx - this._pingRayDir.x * along;
+        const perpY = ty - this._pingRayDir.y * along;
+        const perpZ = tz - this._pingRayDir.z * along;
+        const perpDistSq = perpX * perpX + perpY * perpY + perpZ * perpZ;
+        const hitRadius = Math.min(1.15, Math.max(0.55, along * 0.045));
+        if (perpDistSq <= hitRadius * hitRadius) {
+          bestItem = it;
+          bestItemDist = along;
+        }
+      }
+
+      if (bestItem) {
+        kind = 'item';
+        label = bestItem.label.toUpperCase().slice(0, 26);
+        pingPos.set(bestItem.position[0], bestItem.position[1] + 0.55, bestItem.position[2]);
+        foundHit = true;
+      }
+    }
+
+    // 4. Priority 3: Static world surface location
+    if (!foundHit) {
+      if (!worldHit) return;
+      kind = 'location';
+      label = 'MARK';
+      pingPos.copy(worldHit.point);
+      pingPos.y += 0.14;
+      foundHit = true;
+    }
+
+    const senderId = this.mp?.localUserId ?? 'local';
+    const senderName = this.mp?.localUsername ?? 'YOU';
+    const pingId = `${senderId}:${this.nextLocalPingSeq++}`;
+
+    this.upsertTacticalPing({
+      id: pingId,
+      senderId,
+      senderName,
+      isLocal: true,
+      kind,
+      label,
+      worldPos: pingPos.clone(),
+      targetEntityType,
+      targetEntityId,
+      ageSec: 0,
+      durationSec: 10.0,
+      lostTargetTimer: 0,
+    });
+
+    this.audio.playTacticalPing(kind);
+
+    if (this.mp) {
+      const pkt: GameTacticalPingPacket = {
+        type: 'game:ping',
+        pingId,
+        kind,
+        label,
+        x: pingPos.x,
+        y: pingPos.y,
+        z: pingPos.z,
+        targetEntityType,
+        targetEntityId,
+        ts: Date.now(),
+      };
+      this.mp.sendMessage(pkt as unknown as Record<string, unknown>);
+    }
+
+    this.updateAndProjectPings(0);
+    this.emitSnapshot();
+  }
+
+  private handleRemoteTacticalPing(pkt: GameTacticalPingPacket): void {
+    if (!this.mp) return;
+    if (!pkt.senderUserId || pkt.senderUserId === this.mp.localUserId) return;
+
+    // Visibility rules: FFA hides opponent pings; Battle TDM only shows teammates; Infection shows all squadmates
+    if (this.params.mode === 'battle') {
+      if (this.params.battleConfig.rule === 'ffa') return;
+      if (pkt.senderTeam && pkt.senderTeam !== this.localBattleTeam) return;
+    }
+
+    this.upsertTacticalPing({
+      id: pkt.pingId,
+      senderId: pkt.senderUserId,
+      senderName: (pkt.senderUsername ?? 'ALLY').slice(0, 16),
+      isLocal: false,
+      kind: pkt.kind,
+      label: (pkt.label || 'MARK').toUpperCase().slice(0, 26),
+      worldPos: new THREE.Vector3(pkt.x, pkt.y, pkt.z),
+      targetEntityType: pkt.targetEntityType ?? null,
+      targetEntityId: pkt.targetEntityId ?? null,
+      ageSec: 0,
+      durationSec: 10.0,
+      lostTargetTimer: 0,
+    });
+
+    this.audio.playTacticalPing(pkt.kind);
+  }
+
+  private upsertTacticalPing(nextPing: ActiveTacticalPing): void {
+    // Each operator maintains 1 active ping at a time (re-pinging cleanly moves their marker)
+    for (let i = this.activePings.length - 1; i >= 0; i--) {
+      if (this.activePings[i].senderId === nextPing.senderId) {
+        this.activePings.splice(i, 1);
+      }
+    }
+    this.activePings.push(nextPing);
+    if (this.activePings.length > 4) {
+      this.activePings.shift();
+    }
+  }
+
+  private updateAndProjectPings(dt: number): void {
+    if (this.pingCooldownSec > 0) {
+      this.pingCooldownSec = Math.max(0, this.pingCooldownSec - dt);
+    }
+
+    if (this.activePings.length === 0) {
+      if (this.projectedPings.length > 0) {
+        this.projectedPings = [];
+      }
+      return;
+    }
+
+    this.camera.getWorldDirection(this._pingCamFwd);
+    const camPos = this.camera.position;
+    const out: ProjectedTacticalPing[] = [];
+
+    for (let i = this.activePings.length - 1; i >= 0; i--) {
+      const p = this.activePings[i];
+      p.ageSec += dt;
+
+      // Live tracking for moving enemies
+      if (p.kind === 'enemy' && p.targetEntityType && p.targetEntityId) {
+        let aliveTracked = false;
+        if (p.targetEntityType === 'bot' && this.botAI) {
+          aliveTracked = this.botAI.getBotHeadPosition(p.targetEntityId, this._pingTrackPos);
+        } else if (p.targetEntityType === 'zombie' && this.zombieAI) {
+          aliveTracked = this.zombieAI.getZombieHeadPosition(p.targetEntityId, this._pingTrackPos);
+        } else if (p.targetEntityType === 'remote_player' && this.remotePlayers) {
+          aliveTracked = this.remotePlayers.getPlayerHeadPosition(
+            p.targetEntityId,
+            this._pingTrackPos,
+          );
+        }
+
+        if (aliveTracked) {
+          p.worldPos.copy(this._pingTrackPos);
+          p.lostTargetTimer = 0;
+        } else {
+          p.lostTargetTimer += dt;
+          // Clear enemy ping swiftly once target is eliminated
+          if (p.lostTargetTimer >= 0.4) {
+            this.activePings.splice(i, 1);
+            continue;
+          }
+        }
+      }
+
+      if (p.ageSec >= p.durationSec) {
+        this.activePings.splice(i, 1);
+        continue;
+      }
+
+      this._pingToTarget.subVectors(p.worldPos, camPos);
+      const distM = this._pingToTarget.length();
+      const inFront = this._pingToTarget.dot(this._pingCamFwd) > 0.05;
+
+      this._pingProjVec.copy(p.worldPos).project(this.camera);
+      let sx = (this._pingProjVec.x * 0.5 + 0.5) * 100;
+      let sy = (-this._pingProjVec.y * 0.5 + 0.5) * 100;
+      let offscreen = false;
+
+      if (!inFront || sx < 4 || sx > 96 || sy < 5 || sy > 95) {
+        offscreen = true;
+        if (!inFront) {
+          sx = 100 - sx;
+          sy = 100 - sy;
+          // Push to edge cleanly when behind camera
+          const dx = sx - 50;
+          const dy = sy - 50;
+          const len = Math.max(0.001, Math.hypot(dx, dy));
+          sx = 50 + (dx / len) * 46;
+          sy = 50 + (dy / len) * 44;
+        }
+        sx = THREE.MathUtils.clamp(sx, 4.5, 95.5);
+        sy = THREE.MathUtils.clamp(sy, 6.0, 93.0);
+      }
+
+      // Smooth distance fade (100% crisp up to 14m, fading smoothly to 24% at 95m+)
+      const distFade =
+        distM <= 14 ? 1.0 : Math.max(0.24, 1.0 - ((distM - 14) / 81) * 0.76);
+      // Graceful fade-out over the last 1.5s of lifetime
+      const timeLeft = p.durationSec - p.ageSec;
+      const expiryFade = timeLeft < 1.5 ? Math.max(0, timeLeft / 1.5) : 1.0;
+      const opacity = Number((distFade * expiryFade * (offscreen ? 0.62 : 1.0)).toFixed(3));
+      const scale = Number(THREE.MathUtils.clamp(1.04 - (distM / 110) * 0.30, 0.72, 1.04).toFixed(3));
+
+      out.push({
+        id: p.id,
+        kind: p.kind,
+        label: p.label,
+        senderName: p.senderName,
+        isLocal: p.isLocal,
+        screenX: Number(sx.toFixed(2)),
+        screenY: Number(sy.toFixed(2)),
+        offscreen,
+        distanceM: Math.round(distM),
+        opacity,
+        scale,
+        ageRatio: Number(Math.min(1, p.ageSec / p.durationSec).toFixed(3)),
+      });
+    }
+
+    this.projectedPings = out;
+  }
 
   private readonly onKeyUp = (e: KeyboardEvent): void => {
     if (e.code === 'Tab' && this.scoreboardOpen) {
@@ -4146,8 +4556,13 @@ export class CombatSessionEngine {
       dt,
     );
 
+    // Update & project active tactical pings (distance-faded screen markers)
+    this.updateAndProjectPings(dt);
+
+    // Emit HUD snapshots slightly faster (30Hz) while pings are on-screen for silky marker tracking
     this.uiEmitTimer += dt;
-    if (this.uiEmitTimer >= 0.065) {
+    const emitInterval = this.activePings.length > 0 ? 0.033 : 0.065;
+    if (this.uiEmitTimer >= emitInterval) {
       this.uiEmitTimer = 0;
       this.emitSnapshot();
     }
@@ -4286,6 +4701,7 @@ export class CombatSessionEngine {
       spectating: this.spectating,
       spectatingTargetName: this.spectatingTargetName,
       livesRemaining: this.livesRemaining,
+      tacticalPings: this.projectedPings,
     };
   }
 

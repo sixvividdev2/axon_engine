@@ -2094,7 +2094,7 @@ async function startServer() {
   }
 
   server.listen(PORT, '0.0.0.0', () => {
-    console.log(`[CORDON-04] Server running at http://0.0.0.0:${PORT}`);
+    console.log(`[AXON ENGINE] Server running at http://0.0.0.0:${PORT}`);
   });
 }
 

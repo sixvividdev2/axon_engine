@@ -89,12 +89,26 @@ interface FlyingSpoon {
   maxAge: number;
 }
 
+const MAX_EXPLOSION_POOL = 4;
+const MAX_EXPLOSION_SPARKS = 26;
+const MAX_SMOKE_POOL = 4;
+const MAX_SMOKE_PUFFS = 15;
+const MAX_THERMITE_POOL = 3;
+const MAX_THERMITE_SPARKS = 10;
+
 interface ExplosionVfx {
+  active: boolean;
   group: THREE.Group;
   light: THREE.PointLight;
   coreMesh: THREE.Mesh;
+  coreMat: THREE.MeshBasicMaterial;
   ringMesh: THREE.Mesh;
-  sparks: Array<{ mesh: THREE.Mesh; vel: THREE.Vector3 }>;
+  ringMat: THREE.MeshBasicMaterial;
+  sparkInst: THREE.InstancedMesh;
+  sparkMat: THREE.MeshBasicMaterial;
+  sparkCount: number;
+  sparkPos: THREE.Vector3[];
+  sparkVel: THREE.Vector3[];
   age: number;
   maxAge: number;
   peakIntensity: number;
@@ -103,14 +117,16 @@ interface ExplosionVfx {
 }
 
 interface SmokeCloud {
+  active: boolean;
   id: number;
   origin: THREE.Vector3;
   effectiveRadiusM: number;
   isScreeningSmoke: boolean;
   group: THREE.Group;
+  sharedMat: THREE.MeshStandardMaterial;
+  activePuffCount: number;
   puffs: Array<{
     mesh: THREE.Mesh;
-    mat: THREE.MeshStandardMaterial;
     targetPos: THREE.Vector3;
     targetScale: number;
     driftSpeed: number;
@@ -121,13 +137,16 @@ interface SmokeCloud {
 }
 
 interface ThermiteZone {
+  active: boolean;
   equipmentId: TacticalEquipmentId;
-  def: TacticalEquipmentDef;
+  def: TacticalEquipmentDef | null;
   pos: THREE.Vector3;
   group: THREE.Group;
   light: THREE.PointLight;
   emberMat: THREE.MeshStandardMaterial;
-  sparks: Array<{ mesh: THREE.Mesh; vel: THREE.Vector3; life: number; maxLife: number }>;
+  sparkInst: THREE.InstancedMesh;
+  sparkMat: THREE.MeshBasicMaterial;
+  sparks: Array<{ pos: THREE.Vector3; vel: THREE.Vector3; life: number; maxLife: number }>;
   age: number;
   duration: number;
   tickAccum: number;
@@ -226,6 +245,9 @@ export class TacticalGrenadeSystem {
   private readonly _camUp = new THREE.Vector3();
   private readonly _camFwd = new THREE.Vector3();
   private readonly _smokeInfoBuf: ActiveSmokeCloudInfo[] = [];
+  private readonly _sparkDummy = new THREE.Object3D();
+  private readonly _sparkLookTarget = new THREE.Vector3();
+  private readonly _detPosScratch = new THREE.Vector3();
 
   constructor(opts: TacticalGrenadeSystemOptions) {
     this.scene = opts.scene;
@@ -252,6 +274,200 @@ export class TacticalGrenadeSystem {
         metalness: 0.82,
       }),
     );
+
+    // Pre-allocate permanent VFX & PointLight pools so NUM_POINT_LIGHTS never mutates at runtime
+    // (avoids full-scene WebGL shader recompilation hitches on grenade detonation or expiry)
+    this.initVfxPools();
+  }
+
+  private initVfxPools(): void {
+    // 1. Explosion VFX Pool (permanent PointLights at intensity 0 + InstancedMesh sparks)
+    for (let i = 0; i < MAX_EXPLOSION_POOL; i++) {
+      const group = new THREE.Group();
+      group.visible = false;
+
+      // Light stays attached to root permanently (toggled via intensity = 0) so scene light count never changes
+      const light = new THREE.PointLight(0xff9b32, 0, 18, 1.6);
+      light.position.set(0, -100, 0);
+      this.root.add(light);
+
+      const coreMat = this.trackMat(
+        new THREE.MeshBasicMaterial({
+          color: 0xff9b32,
+          transparent: true,
+          opacity: 0.92,
+          depthWrite: false,
+        }),
+      );
+      const coreMesh = new THREE.Mesh(this.geoCore, coreMat);
+      group.add(coreMesh);
+
+      const ringMat = this.trackMat(
+        new THREE.MeshBasicMaterial({
+          color: 0xffd27a,
+          transparent: true,
+          opacity: 0.72,
+          side: THREE.DoubleSide,
+          depthWrite: false,
+        }),
+      );
+      const ringMesh = new THREE.Mesh(this.geoRing, ringMat);
+      ringMesh.rotation.x = -Math.PI * 0.5;
+      ringMesh.position.y = 0.05;
+      group.add(ringMesh);
+
+      const sparkMat = this.trackMat(
+        new THREE.MeshBasicMaterial({
+          color: 0xffd27a,
+          transparent: true,
+          opacity: 1,
+          depthWrite: false,
+        }),
+      );
+      const sparkInst = new THREE.InstancedMesh(this.geoSpark, sparkMat, MAX_EXPLOSION_SPARKS);
+      sparkInst.frustumCulled = false;
+      sparkInst.count = 0;
+      group.add(sparkInst);
+
+      const sparkPos: THREE.Vector3[] = [];
+      const sparkVel: THREE.Vector3[] = [];
+      for (let s = 0; s < MAX_EXPLOSION_SPARKS; s++) {
+        sparkPos.push(new THREE.Vector3());
+        sparkVel.push(new THREE.Vector3());
+      }
+
+      this.root.add(group);
+      this.explosions.push({
+        active: false,
+        group,
+        light,
+        coreMesh,
+        coreMat,
+        ringMesh,
+        ringMat,
+        sparkInst,
+        sparkMat,
+        sparkCount: 0,
+        sparkPos,
+        sparkVel,
+        age: 0,
+        maxAge: 0.5,
+        peakIntensity: 0,
+        maxCoreScale: 1,
+        maxRingScale: 1,
+      });
+    }
+
+    // 2. Smoke Cloud Pool
+    for (let i = 0; i < MAX_SMOKE_POOL; i++) {
+      const group = new THREE.Group();
+      group.visible = false;
+      const sharedMat = this.trackMat(
+        new THREE.MeshStandardMaterial({
+          color: 0x8a929b,
+          roughness: 0.95,
+          metalness: 0,
+          transparent: true,
+          opacity: 0.01,
+          depthWrite: false,
+        }),
+      );
+      const puffs: SmokeCloud['puffs'] = [];
+      for (let p = 0; p < MAX_SMOKE_PUFFS; p++) {
+        const mesh = new THREE.Mesh(this.geoSmokePuff, sharedMat);
+        mesh.visible = false;
+        group.add(mesh);
+        puffs.push({
+          mesh,
+          targetPos: new THREE.Vector3(),
+          targetScale: 1,
+          driftSpeed: 0.05,
+          phase: 0,
+        });
+      }
+      this.root.add(group);
+      this.smokeClouds.push({
+        active: false,
+        id: 0,
+        origin: new THREE.Vector3(),
+        effectiveRadiusM: 1.8,
+        isScreeningSmoke: false,
+        group,
+        sharedMat,
+        activePuffCount: 0,
+        puffs,
+        age: 0,
+        duration: 1,
+      });
+    }
+
+    // 3. Thermite Zone Pool (permanent PointLights at intensity 0 + InstancedMesh embers)
+    for (let i = 0; i < MAX_THERMITE_POOL; i++) {
+      const group = new THREE.Group();
+      group.visible = false;
+
+      const light = new THREE.PointLight(0xff7426, 0, 11, 1.7);
+      light.position.set(0, -100, 0);
+      this.root.add(light);
+
+      const emberMat = this.trackMat(
+        new THREE.MeshStandardMaterial({
+          color: 0xff5a12,
+          emissive: new THREE.Color(0xff6b1a),
+          emissiveIntensity: 2.5,
+          roughness: 0.7,
+          metalness: 0.1,
+          transparent: true,
+          opacity: 0.82,
+          depthWrite: false,
+          polygonOffset: true,
+          polygonOffsetFactor: -2,
+          polygonOffsetUnits: -4,
+        }),
+      );
+      const poolMesh = new THREE.Mesh(this.geoEmberPool, emberMat);
+      group.add(poolMesh);
+
+      const sparkMat = this.trackMat(
+        new THREE.MeshBasicMaterial({
+          color: 0xffc866,
+          transparent: true,
+          opacity: 0.9,
+          depthWrite: false,
+        }),
+      );
+      const sparkInst = new THREE.InstancedMesh(this.geoSpark, sparkMat, MAX_THERMITE_SPARKS);
+      sparkInst.frustumCulled = false;
+      sparkInst.count = MAX_THERMITE_SPARKS;
+      group.add(sparkInst);
+
+      const sparks: ThermiteZone['sparks'] = [];
+      for (let s = 0; s < MAX_THERMITE_SPARKS; s++) {
+        sparks.push({
+          pos: new THREE.Vector3(),
+          vel: new THREE.Vector3(0, 3, 0),
+          life: Math.random() * 0.4,
+          maxLife: 0.35 + Math.random() * 0.45,
+        });
+      }
+
+      this.root.add(group);
+      this.thermiteZones.push({
+        active: false,
+        equipmentId: 'an_m14_thermite',
+        def: null,
+        pos: new THREE.Vector3(),
+        group,
+        light,
+        emberMat,
+        sparkInst,
+        sparkMat,
+        sparks,
+        age: 0,
+        duration: 1,
+        tickAccum: 0,
+      });
+    }
   }
 
   private trackGeo<T extends THREE.BufferGeometry>(g: T): T {
@@ -707,7 +923,7 @@ export class TacticalGrenadeSystem {
 
     for (let i = 0; i < this.smokeClouds.length; i++) {
       const cloud = this.smokeClouds[i];
-      if (!cloud.isScreeningSmoke) continue;
+      if (!cloud.active || !cloud.isScreeningSmoke) continue;
       // Cloud becomes opaque enough to block vision after 0.35s bloom and until final 1.6s dissipation
       if (cloud.age < 0.35 || cloud.age > cloud.duration - 1.6) continue;
       const bloomFrac = Math.min(1, cloud.age / 1.45);
@@ -735,7 +951,7 @@ export class TacticalGrenadeSystem {
     this._smokeInfoBuf.length = 0;
     for (let i = 0; i < this.smokeClouds.length; i++) {
       const c = this.smokeClouds[i];
-      if (!c.isScreeningSmoke || c.age > c.duration - 1.2) continue;
+      if (!c.active || !c.isScreeningSmoke || c.age > c.duration - 1.2) continue;
       const bloomFrac = Math.min(1, c.age / 1.45);
       this._smokeInfoBuf.push({
         id: c.id,
@@ -915,18 +1131,19 @@ export class TacticalGrenadeSystem {
       }
 
       if (g.fuseLeft <= 0) {
-        const detPos = g.pos.clone();
+        this._detPosScratch.copy(g.pos);
         const def = g.def;
         this.root.remove(g.built.group);
         g.built.dispose();
         this.activeGrenades.splice(i, 1);
-        this.detonateAt(def, detPos);
+        this.detonateAt(def, this._detPosScratch);
       }
     }
 
-    // 3. Step Explosion VFX
-    for (let i = this.explosions.length - 1; i >= 0; i--) {
+    // 3. Step Pooled Explosion VFX (zero allocation, InstancedMesh sparks)
+    for (let i = 0; i < this.explosions.length; i++) {
       const fx = this.explosions[i];
+      if (!fx.active) continue;
       fx.age += clampedDt;
       const t = Math.min(1, fx.age / fx.maxAge);
 
@@ -934,31 +1151,39 @@ export class TacticalGrenadeSystem {
 
       const coreScale = THREE.MathUtils.lerp(0.25, fx.maxCoreScale, Math.pow(t, 0.35));
       fx.coreMesh.scale.setScalar(coreScale);
-      const coreMat = fx.coreMesh.material as THREE.MeshBasicMaterial;
-      coreMat.opacity = Math.max(0, (1 - t) * (1 - t) * 0.92);
+      fx.coreMat.opacity = Math.max(0, (1 - t) * (1 - t) * 0.92);
 
       const ringScale = THREE.MathUtils.lerp(0.3, fx.maxRingScale, Math.pow(t, 0.45));
       fx.ringMesh.scale.setScalar(ringScale);
-      const ringMat = fx.ringMesh.material as THREE.MeshBasicMaterial;
-      ringMat.opacity = Math.max(0, (1 - t) * 0.72);
+      fx.ringMat.opacity = Math.max(0, (1 - t) * 0.72);
 
-      for (let s = 0; s < fx.sparks.length; s++) {
-        const sp = fx.sparks[s];
-        sp.vel.y -= 13.0 * clampedDt;
-        sp.mesh.position.addScaledVector(sp.vel, clampedDt);
-        const sm = sp.mesh.material as THREE.MeshBasicMaterial;
-        sm.opacity = Math.max(0, 1 - t * 1.15);
+      fx.sparkMat.opacity = Math.max(0, 1 - t * 1.15);
+      for (let s = 0; s < fx.sparkCount; s++) {
+        const spPos = fx.sparkPos[s];
+        const spVel = fx.sparkVel[s];
+        spVel.y -= 13.0 * clampedDt;
+        spPos.addScaledVector(spVel, clampedDt);
+        this._sparkDummy.position.copy(spPos);
+        this._sparkLookTarget.copy(spPos).add(spVel);
+        this._sparkDummy.lookAt(this._sparkLookTarget);
+        this._sparkDummy.scale.setScalar(1);
+        this._sparkDummy.updateMatrix();
+        fx.sparkInst.setMatrixAt(s, this._sparkDummy.matrix);
       }
+      fx.sparkInst.instanceMatrix.needsUpdate = true;
 
       if (fx.age >= fx.maxAge) {
-        this.disposeExplosionVfx(fx);
-        this.explosions.splice(i, 1);
+        fx.active = false;
+        fx.group.visible = false;
+        fx.light.intensity = 0;
+        fx.sparkInst.count = 0;
       }
     }
 
-    // 4. Step Smoke Clouds
-    for (let i = this.smokeClouds.length - 1; i >= 0; i--) {
+    // 4. Step Pooled Smoke Clouds
+    for (let i = 0; i < this.smokeClouds.length; i++) {
       const cloud = this.smokeClouds[i];
+      if (!cloud.active) continue;
       cloud.age += clampedDt;
       const bloomT = Math.min(1, cloud.age / 1.45);
       const fadeOutT =
@@ -966,9 +1191,12 @@ export class TacticalGrenadeSystem {
           ? Math.max(0, (cloud.duration - cloud.age) / 2.6)
           : 1.0;
 
-      for (let p = 0; p < cloud.puffs.length; p++) {
+      const easeBloom = 1 - Math.pow(1 - bloomT, 3);
+      cloud.sharedMat.opacity =
+        (cloud.isScreeningSmoke ? 0.76 : 0.5) * Math.min(1, bloomT * 1.4) * fadeOutT;
+
+      for (let p = 0; p < cloud.activePuffCount; p++) {
         const pf = cloud.puffs[p];
-        const easeBloom = 1 - Math.pow(1 - bloomT, 3);
         pf.mesh.position.set(
           pf.targetPos.x * easeBloom + Math.sin(cloud.age * 0.7 + pf.phase) * 0.24,
           pf.targetPos.y * easeBloom + cloud.age * pf.driftSpeed,
@@ -977,19 +1205,19 @@ export class TacticalGrenadeSystem {
         const s = pf.targetScale * (0.28 + 0.72 * easeBloom) * (0.85 + 0.15 * fadeOutT);
         pf.mesh.scale.setScalar(s);
         pf.mesh.rotation.y += clampedDt * 0.18;
-        pf.mat.opacity = (cloud.isScreeningSmoke ? 0.76 : 0.5) * Math.min(1, bloomT * 1.4) * fadeOutT;
       }
 
       if (cloud.age >= cloud.duration) {
-        this.root.remove(cloud.group);
-        for (const pf of cloud.puffs) pf.mat.dispose();
-        this.smokeClouds.splice(i, 1);
+        cloud.active = false;
+        cloud.group.visible = false;
+        cloud.isScreeningSmoke = false;
       }
     }
 
-    // 5. Step Thermite Incendiary Zones
-    for (let i = this.thermiteZones.length - 1; i >= 0; i--) {
+    // 5. Step Pooled Thermite Incendiary Zones
+    for (let i = 0; i < this.thermiteZones.length; i++) {
       const tz = this.thermiteZones[i];
+      if (!tz.active || !tz.def) continue;
       tz.age += clampedDt;
       tz.tickAccum += clampedDt;
 
@@ -1001,26 +1229,36 @@ export class TacticalGrenadeSystem {
       tz.light.intensity = 10.5 * fade * flicker;
       tz.emberMat.opacity = 0.82 * fade;
       tz.emberMat.emissiveIntensity = 2.6 * fade * flicker;
+      tz.sparkMat.opacity = 0.9 * fade;
 
-      for (let s = 0; s < tz.sparks.length; s++) {
-        const sp = tz.sparks[s];
-        sp.life += clampedDt;
-        if (sp.life >= sp.maxLife) {
-          sp.life = 0;
-          sp.maxLife = 0.35 + Math.random() * 0.45;
-          const ang = Math.random() * Math.PI * 2;
-          const rad = Math.random() * 1.1;
-          sp.mesh.position.set(Math.cos(ang) * rad, 0.08, Math.sin(ang) * rad);
-          sp.vel.set(
-            (Math.random() - 0.5) * 2.2,
-            2.4 + Math.random() * 3.4,
-            (Math.random() - 0.5) * 2.2,
-          );
-        } else {
-          sp.vel.y -= 7.5 * clampedDt;
-          sp.mesh.position.addScaledVector(sp.vel, clampedDt);
-          sp.mesh.visible = fade > 0.12;
+      const showSparks = fade > 0.12;
+      tz.sparkInst.visible = showSparks;
+      if (showSparks) {
+        for (let s = 0; s < tz.sparks.length; s++) {
+          const sp = tz.sparks[s];
+          sp.life += clampedDt;
+          if (sp.life >= sp.maxLife) {
+            sp.life = 0;
+            sp.maxLife = 0.35 + Math.random() * 0.45;
+            const ang = Math.random() * Math.PI * 2;
+            const rad = Math.random() * 1.1;
+            sp.pos.set(Math.cos(ang) * rad, 0.08, Math.sin(ang) * rad);
+            sp.vel.set(
+              (Math.random() - 0.5) * 2.2,
+              2.4 + Math.random() * 3.4,
+              (Math.random() - 0.5) * 2.2,
+            );
+          } else {
+            sp.vel.y -= 7.5 * clampedDt;
+            sp.pos.addScaledVector(sp.vel, clampedDt);
+          }
+          this._sparkDummy.position.copy(sp.pos);
+          this._sparkDummy.rotation.set(0, 0, 0);
+          this._sparkDummy.scale.setScalar(0.7);
+          this._sparkDummy.updateMatrix();
+          tz.sparkInst.setMatrixAt(s, this._sparkDummy.matrix);
         }
+        tz.sparkInst.instanceMatrix.needsUpdate = true;
       }
 
       if (tz.tickAccum >= 0.35) {
@@ -1030,7 +1268,7 @@ export class TacticalGrenadeSystem {
           equipmentId: tz.equipmentId,
           def: tz.def,
           kind: 'thermite',
-          position: tz.pos.clone(),
+          position: tz.pos,
           radiusM: tz.def.blastRadiusM,
           lethalRadiusM: tz.def.lethalRadiusM,
           maxDamage: tz.def.maxDamage * tickDt,
@@ -1040,12 +1278,9 @@ export class TacticalGrenadeSystem {
       }
 
       if (tz.age >= tz.duration) {
-        this.root.remove(tz.group);
-        tz.emberMat.dispose();
-        for (const sp of tz.sparks) {
-          (sp.mesh.material as THREE.Material).dispose();
-        }
-        this.thermiteZones.splice(i, 1);
+        tz.active = false;
+        tz.group.visible = false;
+        tz.light.intensity = 0;
       }
     }
   }
@@ -1122,221 +1357,161 @@ export class TacticalGrenadeSystem {
     maxAge: number,
     sparkCount: number,
   ): void {
-    const group = new THREE.Group();
-    group.position.copy(pos);
-    group.position.y += 0.14;
-
-    const light = new THREE.PointLight(coreHex, peakIntensity, 18, 1.6);
-    group.add(light);
-
-    const coreMat = new THREE.MeshBasicMaterial({
-      color: coreHex,
-      transparent: true,
-      opacity: 0.92,
-      depthWrite: false,
-    });
-    const coreMesh = new THREE.Mesh(this.geoCore, coreMat);
-    group.add(coreMesh);
-
-    const ringMat = new THREE.MeshBasicMaterial({
-      color: sparkHex,
-      transparent: true,
-      opacity: 0.72,
-      side: THREE.DoubleSide,
-      depthWrite: false,
-    });
-    const ringMesh = new THREE.Mesh(this.geoRing, ringMat);
-    ringMesh.rotation.x = -Math.PI * 0.5;
-    ringMesh.position.y = 0.05;
-    group.add(ringMesh);
-
-    const sparks: Array<{ mesh: THREE.Mesh; vel: THREE.Vector3 }> = [];
-    for (let i = 0; i < sparkCount; i++) {
-      const sMat = new THREE.MeshBasicMaterial({
-        color: sparkHex,
-        transparent: true,
-        opacity: 1,
-        depthWrite: false,
-      });
-      const mesh = new THREE.Mesh(this.geoSpark, sMat);
-      const ang = (i / sparkCount) * Math.PI * 2 + Math.random() * 0.5;
-      const spd = 6.0 + Math.random() * 11.5;
-      const vel = new THREE.Vector3(
-        Math.cos(ang) * spd,
-        2.2 + Math.random() * 7.5,
-        Math.sin(ang) * spd,
-      );
-      mesh.lookAt(vel);
-      group.add(mesh);
-      sparks.push({ mesh, vel });
+    // Acquire inactive slot or recycle oldest active explosion slot (zero allocation)
+    let slot = this.explosions[0];
+    for (let i = 0; i < this.explosions.length; i++) {
+      if (!this.explosions[i].active) {
+        slot = this.explosions[i];
+        break;
+      }
+      if (this.explosions[i].age > slot.age) {
+        slot = this.explosions[i];
+      }
     }
 
-    this.root.add(group);
-    this.explosions.push({
-      group,
-      light,
-      coreMesh,
-      ringMesh,
-      sparks,
-      age: 0,
-      maxAge,
-      peakIntensity,
-      maxCoreScale,
-      maxRingScale,
-    });
+    slot.active = true;
+    slot.age = 0;
+    slot.maxAge = maxAge;
+    slot.peakIntensity = peakIntensity;
+    slot.maxCoreScale = maxCoreScale;
+    slot.maxRingScale = maxRingScale;
+
+    slot.group.position.set(pos.x, pos.y + 0.14, pos.z);
+    slot.group.visible = true;
+
+    slot.light.color.setHex(coreHex);
+    slot.light.position.set(pos.x, pos.y + 0.14, pos.z);
+    slot.light.intensity = peakIntensity;
+
+    slot.coreMat.color.setHex(coreHex);
+    slot.coreMat.opacity = 0.92;
+    slot.coreMesh.scale.setScalar(0.25);
+
+    slot.ringMat.color.setHex(sparkHex);
+    slot.ringMat.opacity = 0.72;
+    slot.ringMesh.scale.setScalar(0.3);
+
+    slot.sparkMat.color.setHex(sparkHex);
+    slot.sparkMat.opacity = 1;
+
+    const count = Math.min(MAX_EXPLOSION_SPARKS, sparkCount);
+    slot.sparkCount = count;
+    slot.sparkInst.count = count;
+
+    for (let i = 0; i < count; i++) {
+      const ang = (i / Math.max(1, count)) * Math.PI * 2 + Math.random() * 0.5;
+      const spd = 6.0 + Math.random() * 11.5;
+      slot.sparkPos[i].set(0, 0, 0);
+      slot.sparkVel[i].set(Math.cos(ang) * spd, 2.2 + Math.random() * 7.5, Math.sin(ang) * spd);
+      this._sparkDummy.position.set(0, 0, 0);
+      this._sparkDummy.lookAt(slot.sparkVel[i]);
+      this._sparkDummy.scale.setScalar(1);
+      this._sparkDummy.updateMatrix();
+      slot.sparkInst.setMatrixAt(i, this._sparkDummy.matrix);
+    }
+    slot.sparkInst.instanceMatrix.needsUpdate = true;
+  }
+
+  private acquireSmokeSlot(): SmokeCloud {
+    let slot = this.smokeClouds[0];
+    for (let i = 0; i < this.smokeClouds.length; i++) {
+      if (!this.smokeClouds[i].active) return this.smokeClouds[i];
+      if (this.smokeClouds[i].age > slot.age) slot = this.smokeClouds[i];
+    }
+    return slot;
   }
 
   private spawnMiniBlastSmoke(pos: Readonly<THREE.Vector3>): void {
-    const group = new THREE.Group();
-    group.position.copy(pos);
-    const puffs: SmokeCloud['puffs'] = [];
+    const slot = this.acquireSmokeSlot();
+    slot.active = true;
+    slot.id = this.nextSmokeCloudId++;
+    slot.origin.copy(pos);
+    slot.effectiveRadiusM = 1.8;
+    slot.isScreeningSmoke = false;
+    slot.age = 0;
+    slot.duration = 3.4;
+    slot.activePuffCount = 5;
+    slot.group.position.copy(pos);
+    slot.group.visible = true;
+    slot.sharedMat.color.setHex(0x2a2d30);
+    slot.sharedMat.opacity = 0.5;
 
-    for (let i = 0; i < 5; i++) {
-      const mat = new THREE.MeshStandardMaterial({
-        color: 0x2a2d30,
-        roughness: 0.96,
-        metalness: 0,
-        transparent: true,
-        opacity: 0.5,
-        depthWrite: false,
-      });
-      const mesh = new THREE.Mesh(this.geoSmokePuff, mat);
-      const ang = (i / 5) * Math.PI * 2;
-      group.add(mesh);
-      puffs.push({
-        mesh,
-        mat,
-        targetPos: new THREE.Vector3(Math.cos(ang) * 0.9, 0.8 + i * 0.25, Math.sin(ang) * 0.9),
-        targetScale: 1.05 + Math.random() * 0.5,
-        driftSpeed: 0.35 + Math.random() * 0.2,
-        phase: Math.random() * Math.PI * 2,
-      });
+    for (let i = 0; i < MAX_SMOKE_PUFFS; i++) {
+      const pf = slot.puffs[i];
+      if (i < 5) {
+        const ang = (i / 5) * Math.PI * 2;
+        pf.mesh.visible = true;
+        pf.mesh.position.set(0, 0, 0);
+        pf.targetPos.set(Math.cos(ang) * 0.9, 0.8 + i * 0.25, Math.sin(ang) * 0.9);
+        pf.targetScale = 1.05 + Math.random() * 0.5;
+        pf.driftSpeed = 0.35 + Math.random() * 0.2;
+        pf.phase = Math.random() * Math.PI * 2;
+      } else {
+        pf.mesh.visible = false;
+      }
     }
-
-    this.root.add(group);
-    this.smokeClouds.push({
-      id: this.nextSmokeCloudId++,
-      origin: pos.clone(),
-      effectiveRadiusM: 1.8,
-      isScreeningSmoke: false,
-      group,
-      puffs,
-      age: 0,
-      duration: 3.4,
-    });
   }
 
   private spawnSmokeCloud(pos: Readonly<THREE.Vector3>, duration: number, blastRadiusM = 7.5): void {
-    const group = new THREE.Group();
-    group.position.copy(pos);
-    const puffs: SmokeCloud['puffs'] = [];
+    const slot = this.acquireSmokeSlot();
+    slot.active = true;
+    slot.id = this.nextSmokeCloudId++;
+    slot.origin.copy(pos);
+    slot.effectiveRadiusM = Math.max(3.8, blastRadiusM * 0.58);
+    slot.isScreeningSmoke = true;
+    slot.age = 0;
+    slot.duration = duration;
+    slot.activePuffCount = MAX_SMOKE_PUFFS;
+    slot.group.position.copy(pos);
+    slot.group.visible = true;
+    slot.sharedMat.color.setHex(0x939ba4);
+    slot.sharedMat.opacity = 0.01;
 
-    const puffCount = 15;
-    for (let i = 0; i < puffCount; i++) {
-      const shade = 0x8a929b + (i % 3) * 0x0b0c0d;
-      const mat = new THREE.MeshStandardMaterial({
-        color: shade,
-        roughness: 0.95,
-        metalness: 0,
-        transparent: true,
-        opacity: 0.01,
-        depthWrite: false,
-      });
-      const mesh = new THREE.Mesh(this.geoSmokePuff, mat);
+    for (let i = 0; i < MAX_SMOKE_PUFFS; i++) {
+      const pf = slot.puffs[i];
       const ring = i < 5 ? 0.95 : i < 11 ? 2.45 : 1.55;
-      const ang = (i / puffCount) * Math.PI * 2 * 1.7 + Math.random() * 0.35;
+      const ang = (i / MAX_SMOKE_PUFFS) * Math.PI * 2 * 1.7 + Math.random() * 0.35;
       const yOff = i < 5 ? 1.15 : i < 11 ? 1.55 + Math.random() * 0.65 : 2.65 + Math.random() * 0.55;
-      group.add(mesh);
-      puffs.push({
-        mesh,
-        mat,
-        targetPos: new THREE.Vector3(Math.cos(ang) * ring, yOff, Math.sin(ang) * ring),
-        targetScale: 1.95 + Math.random() * 0.9,
-        driftSpeed: 0.045 + Math.random() * 0.03,
-        phase: Math.random() * Math.PI * 2,
-      });
+      pf.mesh.visible = true;
+      pf.mesh.position.set(0, 0, 0);
+      pf.targetPos.set(Math.cos(ang) * ring, yOff, Math.sin(ang) * ring);
+      pf.targetScale = 1.95 + Math.random() * 0.9;
+      pf.driftSpeed = 0.045 + Math.random() * 0.03;
+      pf.phase = Math.random() * Math.PI * 2;
     }
-
-    this.root.add(group);
-    this.smokeClouds.push({
-      id: this.nextSmokeCloudId++,
-      origin: pos.clone(),
-      effectiveRadiusM: Math.max(3.8, blastRadiusM * 0.58),
-      isScreeningSmoke: true,
-      group,
-      puffs,
-      age: 0,
-      duration,
-    });
   }
 
   private spawnThermiteZone(def: TacticalEquipmentDef, pos: THREE.Vector3): void {
-    const floorY = this.physics.getGroundHeight(pos.x, pos.z, pos.y + 0.35);
-    const grounded = new THREE.Vector3(pos.x, floorY + 0.03, pos.z);
-
-    const group = new THREE.Group();
-    group.position.copy(grounded);
-
-    const emberMat = new THREE.MeshStandardMaterial({
-      color: 0xff5a12,
-      emissive: new THREE.Color(0xff6b1a),
-      emissiveIntensity: 2.5,
-      roughness: 0.7,
-      metalness: 0.1,
-      transparent: true,
-      opacity: 0.82,
-      depthWrite: false,
-      polygonOffset: true,
-      polygonOffsetFactor: -2,
-      polygonOffsetUnits: -4,
-    });
-    const poolMesh = new THREE.Mesh(this.geoEmberPool, emberMat);
-    group.add(poolMesh);
-
-    const light = new THREE.PointLight(0xff7426, 10, 11, 1.7);
-    light.position.set(0, 0.45, 0);
-    group.add(light);
-
-    const sparks: ThermiteZone['sparks'] = [];
-    for (let i = 0; i < 10; i++) {
-      const sm = new THREE.MeshBasicMaterial({
-        color: i % 2 === 0 ? 0xfff0b3 : 0xff8533,
-        transparent: true,
-        opacity: 0.9,
-        depthWrite: false,
-      });
-      const mesh = new THREE.Mesh(this.geoSpark, sm);
-      mesh.scale.set(0.7, 0.7, 0.7);
-      group.add(mesh);
-      sparks.push({
-        mesh,
-        vel: new THREE.Vector3(0, 3, 0),
-        life: Math.random() * 0.4,
-        maxLife: 0.35 + Math.random() * 0.45,
-      });
+    let slot = this.thermiteZones[0];
+    for (let i = 0; i < this.thermiteZones.length; i++) {
+      if (!this.thermiteZones[i].active) {
+        slot = this.thermiteZones[i];
+        break;
+      }
+      if (this.thermiteZones[i].age > slot.age) {
+        slot = this.thermiteZones[i];
+      }
     }
 
-    this.root.add(group);
-    this.thermiteZones.push({
-      equipmentId: def.id,
-      def,
-      pos: grounded,
-      group,
-      light,
-      emberMat,
-      sparks,
-      age: 0,
-      duration: def.effectDurationSec,
-      tickAccum: 0,
-    });
-  }
+    const floorY = this.physics.getGroundHeight(pos.x, pos.z, pos.y + 0.35);
+    slot.active = true;
+    slot.equipmentId = def.id;
+    slot.def = def;
+    slot.pos.set(pos.x, floorY + 0.03, pos.z);
+    slot.group.position.copy(slot.pos);
+    slot.group.visible = true;
+    slot.light.position.set(slot.pos.x, slot.pos.y + 0.45, slot.pos.z);
+    slot.light.intensity = 10;
+    slot.age = 0;
+    slot.duration = def.effectDurationSec;
+    slot.tickAccum = 0;
 
-  private disposeExplosionVfx(fx: ExplosionVfx): void {
-    this.root.remove(fx.group);
-    (fx.coreMesh.material as THREE.Material).dispose();
-    (fx.ringMesh.material as THREE.Material).dispose();
-    for (const sp of fx.sparks) {
-      (sp.mesh.material as THREE.Material).dispose();
+    for (let s = 0; s < slot.sparks.length; s++) {
+      const sp = slot.sparks[s];
+      sp.pos.set(0, 0.08, 0);
+      sp.vel.set(0, 3, 0);
+      sp.life = Math.random() * 0.4;
+      sp.maxLife = 0.35 + Math.random() * 0.45;
     }
   }
 
@@ -1355,20 +1530,19 @@ export class TacticalGrenadeSystem {
     this.flyingSpoons.length = 0;
 
     for (const fx of this.explosions) {
-      this.disposeExplosionVfx(fx);
+      this.root.remove(fx.group);
+      this.root.remove(fx.light);
     }
     this.explosions.length = 0;
 
     for (const c of this.smokeClouds) {
       this.root.remove(c.group);
-      for (const pf of c.puffs) pf.mat.dispose();
     }
     this.smokeClouds.length = 0;
 
     for (const tz of this.thermiteZones) {
       this.root.remove(tz.group);
-      tz.emberMat.dispose();
-      for (const sp of tz.sparks) (sp.mesh.material as THREE.Material).dispose();
+      this.root.remove(tz.light);
     }
     this.thermiteZones.length = 0;
 
