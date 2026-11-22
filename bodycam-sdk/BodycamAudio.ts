@@ -8,12 +8,28 @@ import {
 } from './IBodycamAudioSource';
 import { BodycamMeleeAttackType, BodycamSurfaceMaterial } from './types';
 
+export type ZombieVocalKind = 'moan' | 'groan' | 'snarl' | 'lunge' | 'hurt' | 'death';
+
+export interface ZombieVocalAudioOptions {
+  distanceM?: number;
+  pitchScale?: number;
+  intensity?: number;
+}
+
+export interface ZombieFootstepAudioOptions {
+  distanceM?: number;
+  speedMps?: number;
+  surface?: BodycamSurfaceMaterial;
+  isDrag?: boolean;
+}
+
 /**
  * Self-contained Bodycam Chest-Mic Web Audio Engine:
  *  - Surface-aware procedural footsteps (concrete, wood, metal, gravel, puddle, grass, asphalt)
  *  - Tactical Gear / Plate-Carrier Vest Rattle layer scaled by movement, crouch/stand, & landing shock
  *  - Vault & Mantle surface-matched hand-slap, boot scuff, and tempered glass shatter foley
  *  - HRTF 3D spatialization, dynamic interior/exterior convolution reverb
+ *  - Horror-mix proximity-scaled spatial zombie vocalizations & footsteps with strict voice budgeting
  *  - Soft-clipping WaveShaperNode + DynamicsCompressorNode chest-mic saturation chain
  */
 export class BodycamAudio implements IBodycamAudioSource {
@@ -38,6 +54,9 @@ export class BodycamAudio implements IBodycamAudioSource {
   private masterVolume = 0.85;
   private gearRattleGain = 0.75;
   private initialized = false;
+  private readonly listenerPos = new THREE.Vector3();
+  private activeZombieVocals = 0;
+  private activeZombieSteps = 0;
 
   public ensureInitialized(): void {
     if (this.initialized) {
@@ -229,6 +248,7 @@ export class BodycamAudio implements IBodycamAudioSource {
     forward: Readonly<THREE.Vector3>,
     up: Readonly<THREE.Vector3>,
   ): void {
+    this.listenerPos.copy(position);
     if (!this.ctx) return;
     const listener = this.ctx.listener;
     if (listener.positionX) {
@@ -2083,6 +2103,422 @@ export class BodycamAudio implements IBodycamAudioSource {
     osc.stop(t + 0.09);
   }
 
+  /**
+   * Horror-mix 3D HRTF spatialized zombie vocalization with proximity-escalated intensity:
+   *  - Distant (> 16m): hollow reverberant corridor moans with air-absorption rolloff
+   *  - Mid-range (7–16m): phlegmy wet rasping groans with throat-flutter modulation
+   *  - Close-range (< 7m): aggressive snarls, wet sibilant breath hiss, and chest rumble
+   *  - Combat cues: tearing lunge shrieks, bullet/melee hurt barks, and wet collapsing death rattles
+   */
+  public playZombieVocal(
+    pos: Readonly<THREE.Vector3>,
+    kind: ZombieVocalKind,
+    opts?: ZombieVocalAudioOptions,
+  ): void {
+    this.ensureInitialized();
+    if (!this.ctx || !this.noiseBuffer || !this.dryBus || !this.wetBus) return;
+    const dist = opts?.distanceM ?? pos.distanceTo(this.listenerPos);
+    if (dist > 38) return;
+
+    const maxVoices = kind === 'lunge' || kind === 'snarl' || kind === 'death' ? 8 : 6;
+    if (this.activeZombieVocals >= maxVoices) return;
+
+    const ctx = this.ctx;
+    const t = ctx.currentTime;
+    const pitch = THREE.MathUtils.clamp(opts?.pitchScale ?? 1.0, 0.72, 1.32);
+    const intensity = THREE.MathUtils.clamp(opts?.intensity ?? 1.0, 0.4, 1.8);
+
+    // Horror-mix proximity shaping: ramps sharply inside 9.5m and surges inside 4.8m
+    const prox = THREE.MathUtils.clamp(1 - dist / 32, 0, 1);
+    const closeBoost = THREE.MathUtils.clamp(1 - dist / 9.5, 0, 1);
+    const veryClose = THREE.MathUtils.clamp(1 - dist / 4.8, 0, 1);
+    const horrorGain = (0.58 + prox * 0.48 + closeBoost * 0.65 + veryClose * 0.42) * intensity;
+
+    const isAggressive = kind === 'snarl' || kind === 'lunge';
+    const panner = this.createHRTFPanner(pos, isAggressive ? 2.6 : 2.1, 42);
+    if (!panner) return;
+    panner.rolloffFactor = 1.02;
+
+    // Air-absorption filter: distant sounds sound dark & hollow, close snarls stay razor-sharp
+    const airLp = ctx.createBiquadFilter();
+    airLp.type = 'lowpass';
+    airLp.frequency.value = THREE.MathUtils.clamp(
+      (isAggressive ? 2200 : 1450) + prox * 2500 + closeBoost * 3800,
+      1200,
+      9500,
+    );
+    airLp.Q.value = 0.7;
+
+    const drySend = ctx.createGain();
+    drySend.gain.value = 0.62 + closeBoost * 0.56;
+    const wetSend = ctx.createGain();
+    wetSend.gain.value = 0.58 - closeBoost * 0.24;
+
+    airLp.connect(panner);
+    panner.connect(drySend);
+    panner.connect(wetSend);
+    drySend.connect(this.dryBus);
+    wetSend.connect(this.wetBus);
+    if (this.interiorWetBus) {
+      wetSend.connect(this.interiorWetBus);
+    }
+
+    this.activeZombieVocals += 1;
+
+    // Per-class spectral & temporal profile
+    let dur = 0.92;
+    let f0Start = 86 * pitch;
+    let f0Mid = 78 * pitch;
+    let f0End = 64 * pitch;
+    let rattleHz = 20;
+    let rattleDepth = 0.28;
+    let f1Start = 350;
+    let f1End = 260;
+    let f2Start = 840;
+    let f2End = 620;
+    let vocalAmp = 0.24;
+    let breathAmp = 0.14;
+    let breathFreqStart = 1280;
+    let breathFreqEnd = 900;
+    let breathQ = 2.2;
+    let useDualOsc = false;
+    let useSubRumble = false;
+
+    if (kind === 'moan') {
+      dur = 0.95 + Math.random() * 0.42;
+      f0Start = (72 + Math.random() * 22) * pitch;
+      f0Mid = f0Start * (0.94 + Math.random() * 0.08);
+      f0End = f0Start * 0.74;
+      rattleHz = 15 + Math.random() * 6;
+      rattleDepth = 0.24;
+      f1Start = 330 + Math.random() * 60;
+      f1End = 245;
+      f2Start = 780 + Math.random() * 110;
+      f2End = 560;
+      vocalAmp = 0.25;
+      breathAmp = 0.11 + closeBoost * 0.14;
+      breathFreqStart = 1150;
+      breathFreqEnd = 780;
+      useDualOsc = true;
+    } else if (kind === 'groan') {
+      dur = 0.68 + Math.random() * 0.30;
+      f0Start = (94 + Math.random() * 24) * pitch;
+      f0Mid = f0Start * 1.12;
+      f0End = f0Start * 0.72;
+      rattleHz = 24 + Math.random() * 9;
+      rattleDepth = 0.38;
+      f1Start = 450 + Math.random() * 70;
+      f1End = 310;
+      f2Start = 1160 + Math.random() * 140;
+      f2End = 820;
+      vocalAmp = 0.30;
+      breathAmp = 0.18 + closeBoost * 0.24;
+      breathFreqStart = 1650;
+      breathFreqEnd = 1180;
+      useDualOsc = true;
+      useSubRumble = closeBoost > 0.12;
+    } else if (kind === 'snarl') {
+      dur = 0.48 + Math.random() * 0.26;
+      f0Start = (118 + Math.random() * 34) * pitch;
+      f0Mid = f0Start * 1.28;
+      f0End = f0Start * 0.78;
+      rattleHz = 31 + Math.random() * 12;
+      rattleDepth = 0.48;
+      f1Start = 640 + Math.random() * 110;
+      f1End = 460;
+      f2Start = 1720 + Math.random() * 260;
+      f2End = 2320;
+      vocalAmp = 0.42;
+      breathAmp = 0.30 + closeBoost * 0.38 + veryClose * 0.24;
+      breathFreqStart = 2450;
+      breathFreqEnd = 1720;
+      breathQ = 1.65;
+      useDualOsc = true;
+      useSubRumble = true;
+    } else if (kind === 'lunge') {
+      dur = 0.42 + Math.random() * 0.16;
+      f0Start = (158 + Math.random() * 32) * pitch;
+      f0Mid = f0Start * 1.56;
+      f0End = f0Start * 0.86;
+      rattleHz = 36 + Math.random() * 10;
+      rattleDepth = 0.45;
+      f1Start = 840;
+      f1End = 1260;
+      f2Start = 2120;
+      f2End = 2820;
+      vocalAmp = 0.48;
+      breathAmp = 0.34 + closeBoost * 0.34 + veryClose * 0.22;
+      breathFreqStart = 2780;
+      breathFreqEnd = 1980;
+      breathQ = 1.55;
+      useDualOsc = true;
+      useSubRumble = true;
+    } else if (kind === 'hurt') {
+      dur = 0.22 + Math.random() * 0.11;
+      f0Start = (128 + Math.random() * 26) * pitch;
+      f0Mid = f0Start * 0.92;
+      f0End = f0Start * 0.58;
+      rattleHz = 28;
+      rattleDepth = 0.32;
+      f1Start = 540;
+      f1End = 320;
+      f2Start = 1320;
+      f2End = 780;
+      vocalAmp = 0.30;
+      breathAmp = 0.16;
+      breathFreqStart = 1850;
+      breathFreqEnd = 980;
+    } else {
+      // 'death': wet collapsing exhale rattle
+      dur = 0.78 + Math.random() * 0.28;
+      f0Start = (114 + Math.random() * 22) * pitch;
+      f0Mid = f0Start * 0.72;
+      f0End = Math.max(36, f0Start * 0.40);
+      rattleHz = 24;
+      rattleDepth = 0.44;
+      f1Start = 460;
+      f1End = 210;
+      f2Start = 1120;
+      f2End = 480;
+      vocalAmp = 0.32;
+      breathAmp = 0.26;
+      breathFreqStart = 1220;
+      breathFreqEnd = 440;
+      breathQ = 1.45;
+      useDualOsc = true;
+    }
+
+    // 1. Primary vocal cord oscillator + throat-rattle LFO (AM + subtle FM vocal fry)
+    const osc1 = ctx.createOscillator();
+    osc1.type = 'sawtooth';
+    osc1.frequency.setValueAtTime(f0Start, t);
+    osc1.frequency.linearRampToValueAtTime(f0Mid, t + dur * 0.34);
+    osc1.frequency.exponentialRampToValueAtTime(Math.max(32, f0End), t + dur);
+
+    const lfo = ctx.createOscillator();
+    lfo.type = 'sine';
+    lfo.frequency.setValueAtTime(rattleHz, t);
+    if (kind === 'death') {
+      lfo.frequency.exponentialRampToValueAtTime(9, t + dur);
+    }
+
+    const fmDepth = ctx.createGain();
+    fmDepth.gain.value = isAggressive ? 16 : 9;
+    lfo.connect(fmDepth);
+    fmDepth.connect(osc1.frequency);
+
+    const vocalMix = ctx.createGain();
+    vocalMix.gain.value = 1.0;
+    osc1.connect(vocalMix);
+
+    let osc2: OscillatorNode | null = null;
+    if (useDualOsc) {
+      osc2 = ctx.createOscillator();
+      osc2.type = kind === 'moan' ? 'triangle' : 'sawtooth';
+      const detuneRatio = kind === 'moan' ? 0.504 : isAggressive ? 1.072 : 0.992;
+      osc2.frequency.setValueAtTime(f0Start * detuneRatio, t);
+      osc2.frequency.linearRampToValueAtTime(f0Mid * detuneRatio, t + dur * 0.34);
+      osc2.frequency.exponentialRampToValueAtTime(Math.max(28, f0End * detuneRatio), t + dur);
+      const o2Gain = ctx.createGain();
+      o2Gain.gain.value = kind === 'moan' ? 0.65 : 0.52;
+      osc2.connect(o2Gain);
+      o2Gain.connect(vocalMix);
+    }
+
+    // Dual vocal-tract formants (F1 throat cavity + F2 snarl/mouth resonance)
+    const f1 = ctx.createBiquadFilter();
+    f1.type = 'bandpass';
+    f1.frequency.setValueAtTime(f1Start, t);
+    f1.frequency.exponentialRampToValueAtTime(Math.max(140, f1End), t + dur);
+    f1.Q.value = isAggressive ? 2.5 : 3.5;
+
+    const f2 = ctx.createBiquadFilter();
+    f2.type = 'bandpass';
+    f2.frequency.setValueAtTime(f2Start, t);
+    f2.frequency.exponentialRampToValueAtTime(Math.max(260, f2End), t + dur);
+    f2.Q.value = isAggressive ? 2.2 : 2.9;
+
+    const f2Gain = ctx.createGain();
+    f2Gain.gain.value = isAggressive ? 0.85 : 0.55;
+
+    const amNode = ctx.createGain();
+    amNode.gain.value = 1.0;
+    const amDepth = ctx.createGain();
+    amDepth.gain.value = rattleDepth;
+    lfo.connect(amDepth);
+    amDepth.connect(amNode.gain);
+
+    const vocalEnv = ctx.createGain();
+    const peakVocal = Math.min(1.15, vocalAmp * horrorGain);
+    const attackSec = kind === 'lunge' || kind === 'hurt' ? 0.025 : kind === 'snarl' ? 0.045 : 0.11;
+    vocalEnv.gain.setValueAtTime(0.001, t);
+    vocalEnv.gain.linearRampToValueAtTime(peakVocal, t + attackSec);
+    vocalEnv.gain.setValueAtTime(peakVocal * 0.88, t + dur * 0.52);
+    vocalEnv.gain.exponentialRampToValueAtTime(0.001, t + dur);
+
+    vocalMix.connect(f1);
+    vocalMix.connect(f2);
+    f1.connect(amNode);
+    f2.connect(f2Gain);
+    f2Gain.connect(amNode);
+    amNode.connect(vocalEnv);
+    vocalEnv.connect(airLp);
+
+    // 2. Wet raspy breath / close-range sibilant hiss layer
+    const breath = ctx.createBufferSource();
+    breath.buffer = this.noiseBuffer;
+    const breathBp = ctx.createBiquadFilter();
+    breathBp.type = 'bandpass';
+    breathBp.frequency.setValueAtTime(breathFreqStart, t);
+    breathBp.frequency.exponentialRampToValueAtTime(Math.max(320, breathFreqEnd), t + dur);
+    breathBp.Q.value = breathQ;
+
+    const breathEnv = ctx.createGain();
+    const peakBreath = Math.min(0.95, breathAmp * horrorGain);
+    breathEnv.gain.setValueAtTime(0.001, t);
+    breathEnv.gain.linearRampToValueAtTime(peakBreath, t + Math.min(0.09, dur * 0.2));
+    breathEnv.gain.exponentialRampToValueAtTime(0.001, t + dur * 1.04);
+
+    breath.connect(breathBp);
+    breathBp.connect(breathEnv);
+    breathEnv.connect(airLp);
+
+    // 3. Close-range chest-rumble undertone (drives chest-mic saturation when an infected is right behind you)
+    if (useSubRumble && closeBoost > 0.05) {
+      const sub = ctx.createOscillator();
+      sub.type = 'triangle';
+      sub.frequency.setValueAtTime(66 * pitch, t);
+      sub.frequency.exponentialRampToValueAtTime(38 * pitch, t + dur * 0.88);
+      const subGain = ctx.createGain();
+      const peakSub = Math.min(0.55, (0.16 + closeBoost * 0.28 + veryClose * 0.16) * intensity);
+      subGain.gain.setValueAtTime(0.001, t);
+      subGain.gain.linearRampToValueAtTime(peakSub, t + 0.04);
+      subGain.gain.exponentialRampToValueAtTime(0.001, t + dur * 0.9);
+      sub.connect(subGain);
+      subGain.connect(panner);
+      sub.start(t);
+      sub.stop(t + dur * 0.94);
+    }
+
+    const stopAt = t + dur + 0.06;
+    osc1.start(t);
+    osc1.stop(stopAt);
+    osc2?.start(t);
+    osc2?.stop(stopAt);
+    lfo.start(t);
+    lfo.stop(stopAt);
+    breath.start(t, Math.random() * 0.75, dur + 0.08);
+
+    let cleaned = false;
+    const cleanup = () => {
+      if (cleaned) return;
+      cleaned = true;
+      this.activeZombieVocals = Math.max(0, this.activeZombieVocals - 1);
+      try {
+        airLp.disconnect();
+        panner.disconnect();
+        drySend.disconnect();
+        wetSend.disconnect();
+      } catch {
+        // already disconnected
+      }
+    };
+    breath.onended = cleanup;
+    osc1.onended = cleanup;
+  }
+
+  /**
+   * Horror-mix 3D HRTF spatialized zombie footsteps:
+   *  - Slow shamblers produce an eerie dragging grit scuff followed by a dull heel thud
+   *  - Sprinting infected produce heavier, sharper stomping thuds that escalate sharply inside 12m
+   */
+  public playZombieFootstep(
+    pos: Readonly<THREE.Vector3>,
+    opts?: ZombieFootstepAudioOptions,
+  ): void {
+    this.ensureInitialized();
+    if (!this.ctx || !this.noiseBuffer || !this.dryBus || !this.wetBus) return;
+    const dist = opts?.distanceM ?? pos.distanceTo(this.listenerPos);
+    if (dist > 24) return;
+    if (this.activeZombieSteps >= 6) return;
+
+    const ctx = this.ctx;
+    const t = ctx.currentTime;
+    const speedMps = opts?.speedMps ?? 2.2;
+    const surface = opts?.surface ?? 'concrete';
+    const isDrag = opts?.isDrag ?? speedMps < 2.15;
+
+    const closeFactor = THREE.MathUtils.clamp(1 - dist / 15, 0, 1);
+    const veryClose = THREE.MathUtils.clamp(1 - dist / 6.0, 0, 1);
+    const speedWeight = THREE.MathUtils.clamp(speedMps / 3.3, 0.56, 1.38);
+    const amp = (0.36 + closeFactor * 0.64 + veryClose * 0.36) * speedWeight;
+
+    const panner = this.createHRTFPanner(pos, 2.0, 26);
+    if (!panner) return;
+    panner.rolloffFactor = 1.08;
+    panner.connect(this.dryBus);
+    panner.connect(this.wetBus);
+    if (this.interiorWetBus) {
+      panner.connect(this.interiorWetBus);
+    }
+
+    this.activeZombieSteps += 1;
+
+    // 1. Heavy floor-coupled heel thump (low rumble felt strongly when sprinting close behind player)
+    const thump = ctx.createOscillator();
+    thump.type = surface === 'metal' ? 'triangle' : 'sine';
+    const thumpStart = surface === 'metal' ? 128 : surface === 'wood' ? 102 : 90;
+    const thumpEnd = surface === 'metal' ? 46 : 33;
+    const jitter = 0.92 + Math.random() * 0.16;
+    thump.frequency.setValueAtTime(thumpStart * jitter, t);
+    thump.frequency.exponentialRampToValueAtTime(thumpEnd, t + 0.082);
+
+    const tg = ctx.createGain();
+    tg.gain.setValueAtTime(Math.min(0.82, 0.42 * amp), t);
+    tg.gain.exponentialRampToValueAtTime(0.001, t + 0.095);
+    thump.connect(tg);
+    tg.connect(panner);
+    thump.start(t);
+    thump.stop(t + 0.11);
+
+    // 2. Surface-matched sole slap / grit crunch
+    const slap = ctx.createBufferSource();
+    slap.buffer = this.noiseBuffer;
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.value =
+      surface === 'metal'
+        ? 1850
+        : surface === 'wood'
+          ? 560
+          : surface === 'puddle'
+            ? 1480
+            : surface === 'gravel' || surface === 'grass'
+              ? 680
+              : 1020;
+    bp.Q.value = surface === 'metal' ? 2.4 : 1.3;
+
+    const sg = ctx.createGain();
+    const slapDur = isDrag ? 0.155 : 0.078;
+    sg.gain.setValueAtTime(0.001, t);
+    sg.gain.linearRampToValueAtTime(Math.min(0.68, (isDrag ? 0.28 : 0.34) * amp), t + (isDrag ? 0.035 : 0.008));
+    sg.gain.exponentialRampToValueAtTime(0.001, t + slapDur);
+
+    slap.connect(bp);
+    bp.connect(sg);
+    sg.connect(panner);
+    slap.start(t, Math.random() * 0.9, slapDur + 0.03);
+
+    slap.onended = () => {
+      this.activeZombieSteps = Math.max(0, this.activeZombieSteps - 1);
+      try {
+        panner.disconnect();
+      } catch {
+        // already disconnected
+      }
+    };
+  }
+
   public dispose(): void {
     try {
       this.windSource?.stop();
@@ -2093,6 +2529,8 @@ export class BodycamAudio implements IBodycamAudioSource {
       void this.ctx.close();
       this.ctx = null;
     }
+    this.activeZombieVocals = 0;
+    this.activeZombieSteps = 0;
     this.initialized = false;
   }
 }

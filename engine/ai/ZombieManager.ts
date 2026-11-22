@@ -39,6 +39,9 @@ export interface ZombieActor {
   knockbackVelZ: number;
   deathProgress: number;
   gaitPhase: number;
+  prevGaitStep: number;
+  voicePitchScale: number;
+  snarlCooldownSec: number;
   nextVocalMs: number;
   lastSeenPlayerTimer: number;
 }
@@ -383,9 +386,13 @@ export class ZombieManager {
       knockbackVelZ: 0,
       deathProgress: state === 'DEAD' ? 1 : 0,
       gaitPhase: Math.random() * Math.PI * 2,
+      prevGaitStep: 0,
+      voicePitchScale: 0.8 + Math.random() * 0.4,
+      snarlCooldownSec: 0.4 + Math.random() * 1.2,
       nextVocalMs: performance.now() + 2000 + Math.random() * 6000,
       lastSeenPlayerTimer: 0,
     };
+    actor.prevGaitStep = Math.floor(actor.gaitPhase / Math.PI);
 
     if (state === 'DEAD') {
       for (const m of actorHitMeshes) m.userData.zombieDead = true;
@@ -444,7 +451,7 @@ export class ZombieManager {
       m.userData.zombieDead = true;
     }
     z.debugCone.visible = false;
-    this.audio.playZombieVocal(z.group.position, 'hurt');
+    this.audio.playZombieVocal(z.group.position, 'death', { pitchScale: z.voicePitchScale });
     if (this.lastWorldRef) {
       if (z.chunkKey) {
         const delta = this.lastWorldRef.chunkManager.getOrCreateDelta(z.chunkKey);
@@ -786,16 +793,30 @@ export class ZombieManager {
         }
       }
 
-      // 2. Spatialized HRTF idle rasps
-      if (nowMs >= z.nextVocalMs) {
-        z.nextVocalMs = nowMs + (z.state === 'CHASE' ? 2200 : 5200) + Math.random() * 4500;
-        if (z.group.position.distanceTo(playerPos) < 42) {
-          this.audio.playZombieVocal(z.group.position, z.state === 'CHASE' ? 'alert' : 'rasp');
+      // 2. Spatialized HRTF horror-mix proximity vocals (snarls close, groans mid, moans far)
+      const distToPlayer = z.group.position.distanceTo(playerPos);
+      if (z.snarlCooldownSec > 0) z.snarlCooldownSec = Math.max(0, z.snarlCooldownSec - dt);
+      if (distToPlayer < 7.0 && z.snarlCooldownSec <= 0) {
+        this.audio.playZombieVocal(z.group.position, 'snarl', {
+          distanceM: distToPlayer,
+          pitchScale: z.voicePitchScale,
+          intensity: distToPlayer < 3.8 ? 1.25 : 1.08,
+        });
+        z.snarlCooldownSec = 1.7 + Math.random() * 1.9;
+        z.nextVocalMs = Math.max(z.nextVocalMs, nowMs + 1500);
+      } else if (nowMs >= z.nextVocalMs) {
+        const isChase = z.state === 'CHASE' || z.state === 'ATTACK';
+        z.nextVocalMs = nowMs + (isChase ? 2100 : 4800) + Math.random() * 3800;
+        if (distToPlayer < 38) {
+          this.audio.playZombieVocal(
+            z.group.position,
+            distToPlayer < 7.2 ? 'snarl' : distToPlayer < 16 || isChase ? 'groan' : 'moan',
+            { distanceM: distToPlayer, pitchScale: z.voicePitchScale },
+          );
         }
       }
 
       // 3. State Movement & Behavior (with 6-limb trauma parity)
-      const distToPlayer = z.group.position.distanceTo(playerPos);
       let moveSpeed = 0;
       let moveTarget: THREE.Vector3 | null = null;
       const limbs = z.trauma.getLimbStatesReadOnly();
@@ -814,7 +835,11 @@ export class ZombieManager {
           if (z.attackCooldown <= 0) {
             // Damaged/blacked arms slow wind-up cooldown (up to 1.6x slower via reloadSpeedMult) and reduce strike force
             z.attackCooldown = z.archetype.attackCooldownSec / Math.max(0.55, mod.reloadSpeedMult);
-            this.audio.playZombieVocal(z.group.position, 'alert');
+            this.audio.playZombieVocal(z.group.position, 'lunge', {
+              distanceM: distToPlayer,
+              pitchScale: z.voicePitchScale,
+              intensity: 1.25,
+            });
             onAttackPlayer(z.archetype.attackDamage * armDamageMult, z.archetype.bleedChance);
           }
         } else {
@@ -882,6 +907,18 @@ export class ZombieManager {
         this.moveZombieWithCollision(z, stepX, stepZ, world);
 
         z.gaitPhase += dt * moveSpeed * 3.4 * mod.limpCadenceScale;
+        const stepIdx = Math.floor(z.gaitPhase / Math.PI);
+        if (stepIdx !== z.prevGaitStep) {
+          z.prevGaitStep = stepIdx;
+          if (distToPlayer < 22) {
+            this.audio.playZombieFootstep(z.group.position, {
+              distanceM: distToPlayer,
+              speedMps: moveSpeed,
+              surface: 'concrete',
+              isDrag: moveSpeed < 2.2 || mod.limpCadenceScale < 0.85,
+            });
+          }
+        }
         const leftAmp = 0.52 * (1 - mod.leftLegImpairment * 0.58);
         const rightAmp = 0.52 * (1 - mod.rightLegImpairment * 0.58);
         const swingPhase = Math.sin(z.gaitPhase);

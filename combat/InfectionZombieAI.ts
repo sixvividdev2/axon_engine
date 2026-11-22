@@ -101,6 +101,15 @@ interface ZombieActor {
   deathTimer: number;
   dying: boolean;
 
+  // Horror-mix spatial audio state
+  voicePitchScale: number;
+  vocalCooldownSec: number;
+  snarlCooldownSec: number;
+  hurtAudioCooldownSec: number;
+  prevWalkStepIndex: number;
+  wasInWindup: boolean;
+  lastSpeedMps: number;
+
   // Visuals
   root: THREE.Group;
   bodyPivot: THREE.Group;
@@ -187,6 +196,8 @@ export class InfectionZombieAI {
   private readonly _zeroScale = new THREE.Vector3(0, 0, 0);
   private readonly _hidePos = new THREE.Vector3(0, -50, 0);
   private readonly _tmpAudioPos = new THREE.Vector3();
+  private readonly _audioIndices: number[] = [];
+  private readonly _audioDists: number[] = [];
 
   // Shared zombie geometries/materials
   private readonly geoLeg: THREE.BoxGeometry;
@@ -490,9 +501,14 @@ export class InfectionZombieAI {
     this.zombies.push(z);
     this.rebuildActiveHitMeshes();
 
-    // Subtle spatial wood-window breach cue at the entry point
+    // Subtle spatial wood-window breach cue + eerie spawn moan at the entry hallway
     this._tmpAudioPos.set(pkt.entryPos[0], pkt.entryPos[1] + 1.0, pkt.entryPos[2]);
     this.audio.playImpact(this._tmpAudioPos, 'wood');
+    this._tmpAudioPos.set(pkt.x, pkt.y + 1.5, pkt.z);
+    this.audio.playZombieVocal(this._tmpAudioPos, 'moan', {
+      pitchScale: z.voicePitchScale,
+      intensity: 0.85,
+    });
   }
 
   public applySyncSnapshot(pkt: GameZombiesSyncPacket): void {
@@ -599,6 +615,11 @@ export class InfectionZombieAI {
     const z = this.zombies.find((item) => item.id === zombieId && item.alive);
     if (z) {
       z.staggerTimer = Math.max(z.staggerTimer, headshot ? 0.25 : 0.14);
+      if (z.hurtAudioCooldownSec <= 0) {
+        z.hurtAudioCooldownSec = 0.28;
+        this._tmpAudioPos.set(z.pos.x, z.pos.y + 1.5, z.pos.z);
+        this.audio.playZombieVocal(this._tmpAudioPos, 'hurt', { pitchScale: z.voicePitchScale });
+      }
     }
     this.spawnBloodBurst(impactPoint, headshot ? 9 : 5);
   }
@@ -609,6 +630,8 @@ export class InfectionZombieAI {
       z.alive = false;
       z.dying = true;
       z.deathTimer = 0;
+      this._tmpAudioPos.set(z.pos.x, z.pos.y + 1.45, z.pos.z);
+      this.audio.playZombieVocal(this._tmpAudioPos, 'death', { pitchScale: z.voicePitchScale });
       this.rebuildActiveHitMeshes();
     }
     if (point) {
@@ -780,6 +803,13 @@ export class InfectionZombieAI {
       attackCooldown: 0.4,
       deathTimer: 0,
       dying: false,
+      voicePitchScale: 0.80 + Math.random() * 0.42,
+      vocalCooldownSec: 0.8 + Math.random() * 3.8,
+      snarlCooldownSec: 0.25 + Math.random() * 0.9,
+      hurtAudioCooldownSec: 0,
+      prevWalkStepIndex: 0,
+      wasInWindup: false,
+      lastSpeedMps: 0,
       root,
       bodyPivot,
       leftArm,
@@ -788,6 +818,7 @@ export class InfectionZombieAI {
       rightLeg,
       hitMeshes: [leftLeg, rightLeg, torso, head, leftArm, rightArm],
     };
+    z.prevWalkStepIndex = Math.floor(z.walkCycle / Math.PI);
 
     root.position.copy(z.pos);
     root.rotation.set(0, z.yaw, 0);
@@ -824,6 +855,12 @@ export class InfectionZombieAI {
     this.zombies.push(z);
     this.toSpawnThisRound = Math.max(0, this.toSpawnThisRound - 1);
     this.rebuildActiveHitMeshes();
+
+    this._tmpAudioPos.set(spawner.spawnPos[0], spawner.spawnPos[1] + 1.5, spawner.spawnPos[2]);
+    this.audio.playZombieVocal(this._tmpAudioPos, 'moan', {
+      pitchScale: z.voicePitchScale,
+      intensity: 0.82,
+    });
 
     onZombieSpawn?.({
       type: 'game:zombie_spawn',
@@ -893,6 +930,12 @@ export class InfectionZombieAI {
       };
     }
 
+    if (z.hurtAudioCooldownSec <= 0) {
+      z.hurtAudioCooldownSec = 0.28;
+      this._tmpAudioPos.set(z.pos.x, z.pos.y + 1.5, z.pos.z);
+      this.audio.playZombieVocal(this._tmpAudioPos, 'hurt', { pitchScale: z.voicePitchScale });
+    }
+
     return {
       hit: true,
       killed: false,
@@ -923,6 +966,15 @@ export class InfectionZombieAI {
     if (z.hp <= 0) {
       this.killZombie(z);
       return { hit: true, killed: true, headshot: false, pointsAwarded: 130 };
+    }
+
+    if (z.hurtAudioCooldownSec <= 0) {
+      z.hurtAudioCooldownSec = 0.24;
+      this._tmpAudioPos.set(z.pos.x, z.pos.y + 1.5, z.pos.z);
+      this.audio.playZombieVocal(this._tmpAudioPos, 'hurt', {
+        pitchScale: z.voicePitchScale,
+        intensity: 1.15,
+      });
     }
 
     return { hit: true, killed: false, headshot: false, pointsAwarded: 20 };
@@ -1010,6 +1062,8 @@ export class InfectionZombieAI {
     z.dying = true;
     z.deathTimer = 0;
     this.killedThisRound += 1;
+    this._tmpAudioPos.set(z.pos.x, z.pos.y + 1.45, z.pos.z);
+    this.audio.playZombieVocal(this._tmpAudioPos, 'death', { pitchScale: z.voicePitchScale });
     this.rebuildActiveHitMeshes();
   }
 
@@ -1200,6 +1254,7 @@ export class InfectionZombieAI {
         while (dyaw < -Math.PI) dyaw += Math.PI * 2;
         z.yaw += dyaw * rotAlpha;
 
+        z.lastSpeedMps = spd;
         z.walkCycle += dt * Math.max(1.2, spd * 2.9);
         const stride = Math.min(0.65, spd * 0.18);
         if (z.netEntryStage === 'vault') {
@@ -1234,6 +1289,7 @@ export class InfectionZombieAI {
         z.root.position.copy(z.pos);
         z.root.rotation.set(0, z.yaw, 0);
       }
+      this.updateSpatialZombieAudio(dt, playerPos);
       return;
     }
 
@@ -1344,6 +1400,7 @@ export class InfectionZombieAI {
             z.pos.y = THREE.MathUtils.damp(z.pos.y, z.windowOuterPos.y, 12, dt);
             z.yaw = Math.atan2(-dx, -dz);
 
+            z.lastSpeedMps = walkSpd;
             z.walkCycle += dt * Math.max(1.2, walkSpd * 2.9);
             const stride = Math.min(0.6, walkSpd * 0.18);
             z.leftLeg.rotation.x = Math.sin(z.walkCycle) * stride;
@@ -1533,6 +1590,12 @@ export class InfectionZombieAI {
           }
         } else if (distToPlayer <= ZOMBIE_ATTACK_RANGE && dyP < 1.5 && z.attackCooldown <= 0 && z.staggerTimer <= 0) {
           z.windupTimer = scaledWindup;
+          this._tmpAudioPos.set(z.pos.x, z.pos.y + 1.5, z.pos.z);
+          this.audio.playZombieVocal(this._tmpAudioPos, 'lunge', {
+            pitchScale: z.voicePitchScale,
+            intensity: 1.25,
+          });
+          z.snarlCooldownSec = Math.max(z.snarlCooldownSec, 1.4);
         } else if (z.staggerTimer <= 0) {
           let steerX = dxP;
           let steerZ = dzP;
@@ -1710,6 +1773,7 @@ export class InfectionZombieAI {
 
       // Shamble / sprint animation
       const spd = Math.hypot(moveX, moveZ);
+      z.lastSpeedMps = spd;
       z.walkCycle += dt * Math.max(1.2, spd * 2.9);
       const stride = Math.min(0.65, spd * 0.18);
       z.leftLeg.rotation.x = Math.sin(z.walkCycle) * stride;
@@ -1726,6 +1790,153 @@ export class InfectionZombieAI {
 
       z.root.position.copy(z.pos);
       z.root.rotation.set(0, z.yaw, 0);
+    }
+
+    // 4. Distance-prioritized horror-mix spatial audio scheduler (6 closest zombies)
+    this.updateSpatialZombieAudio(dt, playerPos);
+  }
+
+  /**
+   * Zero-GC distance-prioritized HRTF horror audio scheduler:
+   * Ranks active zombies by distance to the local listener so the 6 closest threats
+   * claim crisp proximity-scaled snarls, groans, moans, and stride-synced footsteps
+   * without overwhelming Web Audio convolution during high rounds.
+   */
+  private updateSpatialZombieAudio(dt: number, listenerPos: Readonly<THREE.Vector3>): void {
+    const count = this.zombies.length;
+    if (count === 0) return;
+
+    this._audioIndices.length = 0;
+    this._audioDists.length = 0;
+
+    for (let i = 0; i < count; i++) {
+      const z = this.zombies[i];
+      if (!z.alive) continue;
+
+      if (z.vocalCooldownSec > 0) z.vocalCooldownSec = Math.max(0, z.vocalCooldownSec - dt);
+      if (z.snarlCooldownSec > 0) z.snarlCooldownSec = Math.max(0, z.snarlCooldownSec - dt);
+      if (z.hurtAudioCooldownSec > 0) z.hurtAudioCooldownSec = Math.max(0, z.hurtAudioCooldownSec - dt);
+
+      const dx = z.pos.x - listenerPos.x;
+      const dy = z.pos.y - listenerPos.y;
+      const dz = z.pos.z - listenerPos.z;
+      const dist = Math.hypot(dx, dy, dz);
+
+      if (dist <= 35) {
+        this._audioIndices.push(i);
+        this._audioDists.push(dist);
+      } else {
+        // Keep step phase synchronized so distant zombies don't burst-step upon entering range
+        z.prevWalkStepIndex = Math.floor(z.walkCycle / Math.PI);
+        z.wasInWindup = this.isClientReplica ? z.netWindup : z.windupTimer > 0;
+      }
+    }
+
+    const candCount = this._audioIndices.length;
+    if (candCount === 0) return;
+
+    // Partial selection sort for up to 6 closest infected (zero allocations)
+    const maxBudget = Math.min(6, candCount);
+    for (let k = 0; k < maxBudget; k++) {
+      let minPos = k;
+      let minDist = this._audioDists[k];
+      for (let j = k + 1; j < candCount; j++) {
+        if (this._audioDists[j] < minDist) {
+          minDist = this._audioDists[j];
+          minPos = j;
+        }
+      }
+      if (minPos !== k) {
+        const tmpIdx = this._audioIndices[k];
+        this._audioIndices[k] = this._audioIndices[minPos];
+        this._audioIndices[minPos] = tmpIdx;
+        const tmpD = this._audioDists[k];
+        this._audioDists[k] = this._audioDists[minPos];
+        this._audioDists[minPos] = tmpD;
+      }
+    }
+
+    // Keep non-budgeted candidates' stride index synced
+    for (let k = maxBudget; k < candCount; k++) {
+      const z = this.zombies[this._audioIndices[k]];
+      z.prevWalkStepIndex = Math.floor(z.walkCycle / Math.PI);
+      z.wasInWindup = this.isClientReplica ? z.netWindup : z.windupTimer > 0;
+    }
+
+    for (let k = 0; k < maxBudget; k++) {
+      const z = this.zombies[this._audioIndices[k]];
+      const dist = this._audioDists[k];
+
+      // 1. Client-replica lunge shriek detection on attack windup edge
+      const inWindup = this.isClientReplica ? z.netWindup : z.windupTimer > 0;
+      if (this.isClientReplica && inWindup && !z.wasInWindup && dist < 18) {
+        this._tmpAudioPos.set(z.pos.x, z.pos.y + 1.5, z.pos.z);
+        this.audio.playZombieVocal(this._tmpAudioPos, 'lunge', {
+          distanceM: dist,
+          pitchScale: z.voicePitchScale,
+          intensity: 1.25,
+        });
+        z.snarlCooldownSec = Math.max(z.snarlCooldownSec, 1.4);
+      }
+      z.wasInWindup = inWindup;
+
+      // 2. Stride-synced spatial footsteps (heavier stomps when sprinting, dragging scuff when shambling)
+      const stepIdx = Math.floor(z.walkCycle / Math.PI);
+      if (stepIdx !== z.prevWalkStepIndex) {
+        z.prevWalkStepIndex = stepIdx;
+        const isWalking =
+          (z.entryStage === 'pursue' || z.entryStage === 'approach') && z.lastSpeedMps > 0.35;
+        if (isWalking && dist < 22) {
+          this._tmpAudioPos.set(z.pos.x, z.pos.y + 0.08, z.pos.z);
+          this.audio.playZombieFootstep(this._tmpAudioPos, {
+            distanceM: dist,
+            speedMps: z.lastSpeedMps,
+            surface: z.entryStage === 'approach' ? 'wood' : 'concrete',
+            isDrag: z.lastSpeedMps < 2.25 && (stepIdx & 1) === 1,
+          });
+        }
+      }
+
+      // 3. Close-range aggressive horror snarl override (< 6.8m)
+      if (dist < 6.8 && z.snarlCooldownSec <= 0) {
+        this._tmpAudioPos.set(z.pos.x, z.pos.y + 1.5, z.pos.z);
+        this.audio.playZombieVocal(this._tmpAudioPos, 'snarl', {
+          distanceM: dist,
+          pitchScale: z.voicePitchScale,
+          intensity: dist < 3.6 ? 1.28 : 1.08,
+        });
+        z.snarlCooldownSec = 1.65 + Math.random() * 1.85;
+        z.vocalCooldownSec = Math.max(z.vocalCooldownSec, 1.35);
+        continue;
+      }
+
+      // 4. Proximity-escalating moans & raspy groans (close -> mid -> distant corridor dread)
+      if (z.vocalCooldownSec <= 0) {
+        this._tmpAudioPos.set(z.pos.x, z.pos.y + 1.5, z.pos.z);
+        if (dist < 7.2) {
+          this.audio.playZombieVocal(this._tmpAudioPos, 'snarl', {
+            distanceM: dist,
+            pitchScale: z.voicePitchScale,
+            intensity: 1.12,
+          });
+          z.vocalCooldownSec = 1.9 + Math.random() * 1.7;
+          z.snarlCooldownSec = Math.max(z.snarlCooldownSec, 1.5);
+        } else if (dist < 16.5 || z.entryStage === 'tear' || z.entryStage === 'vault') {
+          this.audio.playZombieVocal(this._tmpAudioPos, 'groan', {
+            distanceM: dist,
+            pitchScale: z.voicePitchScale,
+            intensity: 1.0,
+          });
+          z.vocalCooldownSec = 2.8 + Math.random() * 2.5;
+        } else {
+          this.audio.playZombieVocal(this._tmpAudioPos, 'moan', {
+            distanceM: dist,
+            pitchScale: z.voicePitchScale,
+            intensity: 0.92,
+          });
+          z.vocalCooldownSec = 4.4 + Math.random() * 3.8;
+        }
+      }
     }
   }
 
