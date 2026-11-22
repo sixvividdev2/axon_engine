@@ -8,7 +8,7 @@ import {
   LobbyVisibility,
   sanitizeSpecialEventConfig,
   SpecialEventRecord,
-} from '../src/data/multiplayer';
+} from '../data/multiplayer';
 import { generateId } from './crypto';
 import {
   CachedMatchState,

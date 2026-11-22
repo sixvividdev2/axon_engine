@@ -80,6 +80,68 @@ export const GymHud: React.FC<GymHudProps> = ({
 
   return (
     <div className="pointer-events-none fixed inset-0 z-10 select-none">
+      {/* Flashbang Concussive Whiteout Overlay */}
+      {snapshot.flashBlindAlpha > 0.01 && (
+        <div
+          className="pointer-events-none fixed inset-0 z-40 bg-sky-50"
+          style={{ opacity: Math.min(0.96, snapshot.flashBlindAlpha) }}
+        />
+      )}
+
+      {/* Authentic 4-Stage Grenade Manual of Arms Prompt (No exact millisecond fuse readout) */}
+      {snapshot.grenadeHoldStage !== 'HOLSTERED' && !gunsmithOpen && (
+        <div
+          className={`pointer-events-none fixed top-[58%] left-1/2 z-30 w-72 -translate-x-1/2 border px-3 py-1.5 font-mono-tabular ${
+            snapshot.grenadeHoldStage === 'LEVER_RELEASED'
+              ? 'border-red-500/85 bg-neutral-950/92'
+              : snapshot.grenadeHoldStage === 'PIN_PULLED'
+                ? 'border-amber-400/85 bg-neutral-950/92'
+                : 'border-neutral-600/90 bg-neutral-950/90'
+          }`}
+        >
+          <div className="flex items-center justify-between text-[10px] uppercase tracking-wider">
+            <span
+              className={
+                snapshot.grenadeHoldStage === 'LEVER_RELEASED'
+                  ? 'font-semibold text-red-400'
+                  : snapshot.grenadeHoldStage === 'PIN_PULLED'
+                    ? 'font-semibold text-amber-300'
+                    : 'font-semibold text-neutral-100'
+              }
+            >
+              {snapshot.tacticalEquipmentShortName}
+              {snapshot.grenadeHoldStage === 'DRAWN'
+                ? ' · READY'
+                : snapshot.grenadeHoldStage === 'PIN_PULLED'
+                  ? ' · PIN PULLED'
+                  : ' · LIVE FUSE'}
+            </span>
+            <span className="text-neutral-300">
+              {snapshot.grenadeHoldStage === 'DRAWN'
+                ? 'HOLD LMB PIN · [H] STOW'
+                : snapshot.grenadeHoldStage === 'PIN_PULLED'
+                  ? 'RMB LEVER · REL LMB THROW'
+                  : 'RELEASE LMB TO THROW'}
+            </span>
+          </div>
+          {snapshot.grenadeHoldStage === 'PIN_PULLED' && (
+            <div className="mt-1 text-[9px] uppercase tracking-wider text-neutral-400">
+              Safety lever gripped — chemical delay NOT burning
+            </div>
+          )}
+          {snapshot.grenadeHoldStage === 'LEVER_RELEASED' && (
+            <div className="mt-1.5 h-1.5 w-full overflow-hidden bg-neutral-800">
+              <div
+                className={
+                  snapshot.grenadeCookRatio > 0.68 ? 'h-full bg-red-500' : 'h-full bg-amber-400'
+                }
+                style={{ width: `${Math.min(100, Math.round(snapshot.grenadeCookRatio * 100))}%` }}
+              />
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Diegetic Bodycam Recording Overlay (Toggleable in F1 Optics Tuner) */}
       {config.showRecOverlay && !gunsmithOpen && (
         <div
@@ -157,6 +219,12 @@ export const GymHud: React.FC<GymHudProps> = ({
         >
           <span className="text-neutral-100">{snapshot.equippedWeaponName}</span>
           <span className="text-sky-300">{snapshot.ammoVariantLabel}</span>
+          <span className="text-emerald-300/90">
+            ZERO {snapshot.zeroDistanceM}m
+            {snapshot.zeroElevationMrad !== 0
+              ? ` ${snapshot.zeroElevationMrad > 0 ? '+' : ''}${snapshot.zeroElevationMrad.toFixed(1)}`
+              : ''}
+          </span>
           {snapshot.isSubsonic && <span className="text-emerald-300">SUB</span>}
           {snapshot.isBoltCycling && <span className="text-amber-300">BOLT</span>}
           {snapshot.isMagnifiedOptic && (
@@ -176,6 +244,10 @@ export const GymHud: React.FC<GymHudProps> = ({
           )}
           <span className="text-neutral-400">
             {snapshot.ammoInMag}/{snapshot.magCapacity}
+          </span>
+          <span className="text-neutral-600">|</span>
+          <span className={snapshot.grenadeCount > 0 ? 'text-amber-300' : 'text-red-400'}>
+            {snapshot.tacticalEquipmentShortName} {snapshot.grenadeCount}/{snapshot.grenadeMax} [H]
           </span>
           <span className="text-neutral-600">|</span>
           <span>1-4 Weapons</span>
@@ -289,6 +361,9 @@ export const GymHud: React.FC<GymHudProps> = ({
               </div>
               <div>
                 <span className="text-neutral-200">L / Alt+L</span> Red / IR Laser
+              </div>
+              <div>
+                <span className="text-neutral-200">H / 5</span> Draw · LMB Pin · RMB Lever
               </div>
               <div>
                 <span className="text-neutral-200">F / T / G</span> Flashlight &amp; Supp.

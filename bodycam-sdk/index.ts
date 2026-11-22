@@ -25,3 +25,6 @@ export * from './operator/OperatorAssetLoader';
 export * from './physics/SecondaryPhysicsSolver';
 export * from './physics/SecondaryPhysicsRigApplier';
 export * from './physics/ArticulatedRagdoll';
+export * from './equipment/TacticalEquipmentStore';
+export * from './equipment/TacticalEquipmentMesh';
+export * from './equipment/TacticalGrenadeSystem';

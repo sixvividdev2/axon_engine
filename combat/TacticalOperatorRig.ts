@@ -15,6 +15,17 @@ import {
   TacticalUniformMaterialBundle,
   TacticalUniformMaterialLibrary,
 } from '../bodycam-sdk/TacticalUniforms';
+import {
+  DEFAULT_TACTICAL_BELT_SLOT,
+  DEFAULT_TACTICAL_EQUIPMENT_ID,
+  TacticalBeltSlot,
+  TacticalEquipmentId,
+} from '../data/tacticalEquipment';
+import {
+  buildTacticalEquipmentMesh,
+  BuiltTacticalEquipmentMesh,
+  getBeltSlotTransforms,
+} from '../bodycam-sdk/equipment/TacticalEquipmentMesh';
 
 export type TacticalActorKind = 'remote_player' | 'bot';
 
@@ -67,6 +78,12 @@ export interface BuiltTacticalOperatorRig {
   applyUniform: (uniformId: OperatorUniformId) => void;
   applyCombatPose: (pose: TacticalCombatPose) => void;
   resetRagdollPose: () => void;
+  setBeltEquipment: (
+    equipmentId: TacticalEquipmentId,
+    beltSlot?: TacticalBeltSlot,
+    count?: number,
+    visible?: boolean,
+  ) => void;
 }
 
 type MaterialSlot =
@@ -496,6 +513,52 @@ export class TacticalOperatorRigFactory {
     holster.position.set(0.168 * pelvisW, -0.03, -0.005);
 
     pelvisGroup.add(pelvisMesh, beltMesh, buckle, dumpPouch, holster);
+
+    // Belt Tactical Equipment Mount (grenades / utility canisters on waist belt)
+    const beltEquipmentMount = new THREE.Group();
+    beltEquipmentMount.name = 'belt_tactical_equipment_slot';
+    pelvisGroup.add(beltEquipmentMount);
+    const beltBuiltItems: BuiltTacticalEquipmentMesh[] = [];
+
+    const setBeltEquipment = (
+      equipmentId: TacticalEquipmentId,
+      beltSlot: TacticalBeltSlot = DEFAULT_TACTICAL_BELT_SLOT,
+      count = 2,
+      visible = true,
+    ): void => {
+      for (let i = 0; i < beltBuiltItems.length; i++) {
+        beltEquipmentMount.remove(beltBuiltItems[i].group);
+        beltBuiltItems[i].dispose();
+      }
+      beltBuiltItems.length = 0;
+      if (!visible || count <= 0) {
+        beltEquipmentMount.visible = false;
+        return;
+      }
+      beltEquipmentMount.visible = true;
+      const transforms = getBeltSlotTransforms(beltSlot, pelvisW, pelvisD);
+      const n = Math.min(transforms.length, Math.max(0, Math.round(count)));
+      for (let i = 0; i < n; i++) {
+        const built = buildTacticalEquipmentMesh(equipmentId, { withBeltClip: true, scale: 1.0 });
+        const tf = transforms[i];
+        built.group.position.set(tf.position[0], tf.position[1], tf.position[2]);
+        built.group.rotation.set(tf.rotation[0], tf.rotation[1], tf.rotation[2]);
+        beltEquipmentMount.add(built.group);
+        beltBuiltItems.push(built);
+      }
+    };
+
+    // Equip default tactical frag grenade on third-person operator belts
+    setBeltEquipment(DEFAULT_TACTICAL_EQUIPMENT_ID, DEFAULT_TACTICAL_BELT_SLOT, 1, true);
+    this.disposables.push({
+      dispose: () => {
+        for (let i = 0; i < beltBuiltItems.length; i++) {
+          beltEquipmentMount.remove(beltBuiltItems[i].group);
+          beltBuiltItems[i].dispose();
+        }
+        beltBuiltItems.length = 0;
+      },
+    });
 
     // === ARTICULATED LEGS (Hip -> Thigh -> Knee(backward bend) -> Shin -> Ankle -> Sculpted Multi-Part Boot) ===
     const buildArticulatedLeg = (side: -1 | 1) => {
@@ -1058,6 +1121,7 @@ export class TacticalOperatorRigFactory {
       applyUniform,
       applyCombatPose,
       resetRagdollPose,
+      setBeltEquipment,
     };
   }
 

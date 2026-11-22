@@ -26,6 +26,8 @@ import {
 import { formatRankLabel } from '../data/progression';
 import { BATTLE_MAPS, ZOMBIE_MAPS } from '../maps/MapRegistry';
 import { BotDifficultyId } from '../maps/types';
+import { useTacticalEquipmentSelection } from '../bodycam-sdk/equipment/TacticalEquipmentStore';
+import { TACTICAL_EQUIPMENT_LIST } from '../data/tacticalEquipment';
 
 export const LobbyRoomView: React.FC = () => {
   const { user } = useAuth();
@@ -43,6 +45,8 @@ export const LobbyRoomView: React.FC = () => {
     startMatch,
   } = useLobby();
   const { openDrawer: openSocialDrawer } = useSocial();
+  const { selection: tacticalSelection, setEquipment: setTacticalEquipmentId } =
+    useTacticalEquipmentSelection();
 
   const [chatText, setChatText] = useState<string>('');
   const [copiedKey, setCopiedKey] = useState<'lobby' | 'event' | null>(null);
@@ -485,6 +489,33 @@ export const LobbyRoomView: React.FC = () => {
               </div>
             </div>
           )}
+
+          {/* Personal Tactical Grenade Loadout (Synced to Player Belt & Match) */}
+          <div className="border border-neutral-800 bg-neutral-900/50 p-3">
+            <div className="flex items-center justify-between font-mono-tabular text-[10px] uppercase tracking-wider text-neutral-400">
+              <span>Your Belt Grenade</span>
+              <span className="text-amber-300">4 / H in Match</span>
+            </div>
+            <div className="mt-1.5 grid grid-cols-2 gap-1">
+              {TACTICAL_EQUIPMENT_LIST.map((eq) => {
+                const active = tacticalSelection.equipmentId === eq.id;
+                return (
+                  <button
+                    key={eq.id}
+                    type="button"
+                    onClick={() => setTacticalEquipmentId(eq.id)}
+                    className={`cursor-pointer border px-2 py-1 text-left font-mono-tabular text-[10px] font-semibold uppercase transition-colors ${
+                      active
+                        ? 'border-amber-400 bg-amber-500/20 text-amber-200'
+                        : 'border-neutral-800 bg-neutral-950 text-neutral-400 hover:border-neutral-600 hover:text-neutral-200'
+                    }`}
+                  >
+                    {eq.shortName}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
 
           {/* Action CTA: Host Launch Match vs Joined Ready/Team */}
           <div className="space-y-2 border-t border-neutral-800 pt-4">

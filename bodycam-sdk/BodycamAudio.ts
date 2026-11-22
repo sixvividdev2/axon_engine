@@ -1570,6 +1570,432 @@ export class BodycamAudio implements IBodycamAudioSource {
     }
   }
 
+  /**
+   * Crisp tactical grenade safety-pin ring yank (pulling pin alone does NOT ignite fuse).
+   */
+  public playGrenadePinPull(): void {
+    this.ensureInitialized();
+    if (!this.ctx || !this.dryBus || !this.noiseBuffer) return;
+    const ctx = this.ctx;
+    const t = ctx.currentTime;
+
+    // 1. Cotter-pin unbending & metallic ring yank scrape
+    const osc = ctx.createOscillator();
+    osc.type = 'triangle';
+    osc.frequency.setValueAtTime(2750, t);
+    osc.frequency.exponentialRampToValueAtTime(4350, t + 0.058);
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.001, t);
+    g.gain.linearRampToValueAtTime(0.16, t + 0.012);
+    g.gain.exponentialRampToValueAtTime(0.001, t + 0.072);
+    osc.connect(g);
+    this.connectToOutputBuses(g);
+    osc.start(t);
+    osc.stop(t + 0.08);
+
+    // Subtle steel-on-steel scrape transient
+    const scrape = ctx.createBufferSource();
+    scrape.buffer = this.noiseBuffer;
+    const hp = ctx.createBiquadFilter();
+    hp.type = 'bandpass';
+    hp.frequency.value = 3900;
+    hp.Q.value = 3.2;
+    const sg = ctx.createGain();
+    sg.gain.setValueAtTime(0.09, t);
+    sg.gain.exponentialRampToValueAtTime(0.001, t + 0.048);
+    scrape.connect(hp);
+    hp.connect(sg);
+    this.connectToOutputBuses(sg);
+    scrape.start(t, Math.random() * 1.1, 0.055);
+  }
+
+  /**
+   * Spring-loaded safety lever (spoon) fly-off ping + percussion primer ignition pop.
+   */
+  public playGrenadeLeverSnap(): void {
+    this.ensureInitialized();
+    if (!this.ctx || !this.dryBus || !this.noiseBuffer) return;
+    const ctx = this.ctx;
+    const t = ctx.currentTime;
+
+    // 1. Spring-loaded spoon metallic ping
+    const ping = ctx.createOscillator();
+    ping.type = 'square';
+    ping.frequency.setValueAtTime(2280, t);
+    ping.frequency.exponentialRampToValueAtTime(840, t + 0.036);
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.value = 2350;
+    bp.Q.value = 2.8;
+    const pg = ctx.createGain();
+    pg.gain.setValueAtTime(0.22, t);
+    pg.gain.exponentialRampToValueAtTime(0.001, t + 0.046);
+    ping.connect(bp);
+    bp.connect(pg);
+    this.connectToOutputBuses(pg);
+    ping.start(t);
+    ping.stop(t + 0.052);
+
+    // 2. Percussion primer strike pop + pyrotechnic delay fuse sizzle start (~22ms later)
+    const popT = t + 0.022;
+    const pop = ctx.createBufferSource();
+    pop.buffer = this.noiseBuffer;
+    const popBp = ctx.createBiquadFilter();
+    popBp.type = 'bandpass';
+    popBp.frequency.setValueAtTime(1650, popT);
+    popBp.frequency.exponentialRampToValueAtTime(580, popT + 0.045);
+    popBp.Q.value = 1.4;
+    const popG = ctx.createGain();
+    popG.gain.setValueAtTime(0.26, popT);
+    popG.gain.exponentialRampToValueAtTime(0.001, popT + 0.052);
+    pop.connect(popBp);
+    popBp.connect(popG);
+    this.connectToOutputBuses(popG);
+    pop.start(popT, Math.random() * 0.9, 0.06);
+
+    const hiss = ctx.createBufferSource();
+    hiss.buffer = this.noiseBuffer;
+    const hissHp = ctx.createBiquadFilter();
+    hissHp.type = 'highpass';
+    hissHp.frequency.value = 4600;
+    const hissG = ctx.createGain();
+    hissG.gain.setValueAtTime(0.001, popT + 0.015);
+    hissG.gain.linearRampToValueAtTime(0.065, popT + 0.045);
+    hissG.gain.exponentialRampToValueAtTime(0.001, popT + 0.42);
+    hiss.connect(hissHp);
+    hissHp.connect(hissG);
+    this.connectToOutputBuses(hissG);
+    hiss.start(popT + 0.015, Math.random() * 0.6, 0.44);
+  }
+
+  /**
+   * Concussive flashbang ear-muffle lowpass dip + realistic dual-sine high-frequency tinnitus fade.
+   */
+  public playFlashbangTinnitus(intensity: number): void {
+    this.ensureInitialized();
+    if (!this.ctx || !this.masterGain || !this.masterLowpass) return;
+    const amp = THREE.MathUtils.clamp(intensity, 0.08, 1.0);
+    const ctx = this.ctx;
+    const t = ctx.currentTime;
+    const holdDur = 0.65 + amp * 1.45;
+    const recoverDur = 2.8 + amp * 3.4;
+
+    // 1. Slam masterLowpass down to simulate concussive acoustic threshold shift (muffled ears)
+    const lpFreq = this.masterLowpass.frequency;
+    lpFreq.cancelScheduledValues(t);
+    lpFreq.setValueAtTime(Math.max(280, lpFreq.value), t);
+    const minCutoff = THREE.MathUtils.lerp(2400, 340, amp);
+    lpFreq.exponentialRampToValueAtTime(minCutoff, t + 0.04);
+    lpFreq.setValueAtTime(minCutoff, t + holdDur * 0.55);
+    lpFreq.exponentialRampToValueAtTime(22000, t + holdDur + recoverDur);
+
+    // 2. Dual-sine inner-ear tinnitus ringing routed straight to masterGain (post-lowpass)
+    const ringVol = 0.16 * Math.pow(amp, 1.15);
+    const freqs = [4320 + Math.random() * 180, 6180 + Math.random() * 240];
+    for (let i = 0; i < freqs.length; i++) {
+      const osc = ctx.createOscillator();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(freqs[i], t);
+      osc.frequency.linearRampToValueAtTime(freqs[i] * 0.985, t + holdDur + recoverDur);
+
+      const rg = ctx.createGain();
+      const peak = i === 0 ? ringVol : ringVol * 0.42;
+      rg.gain.setValueAtTime(0.0001, t);
+      rg.gain.linearRampToValueAtTime(peak, t + 0.035);
+      rg.gain.setValueAtTime(peak * 0.92, t + holdDur * 0.6);
+      rg.gain.exponentialRampToValueAtTime(0.0001, t + holdDur + recoverDur);
+
+      osc.connect(rg);
+      rg.connect(this.masterGain);
+      osc.start(t);
+      osc.stop(t + holdDur + recoverDur + 0.06);
+    }
+  }
+
+  /**
+   * Mechanical LPVO magnification ring throw-lever ratchet click.
+   */
+  public playZoomRatchetClick(zoomLevel = 1): void {
+    this.ensureInitialized();
+    if (!this.ctx || !this.dryBus || !this.noiseBuffer) return;
+    const ctx = this.ctx;
+    const t = ctx.currentTime;
+    const pitchScale = 0.9 + THREE.MathUtils.clamp((zoomLevel - 1) / 5, 0, 1) * 0.25;
+
+    // 1. Machined aluminum throw-lever detent snap
+    const osc = ctx.createOscillator();
+    osc.type = 'triangle';
+    osc.frequency.setValueAtTime(1920 * pitchScale, t);
+    osc.frequency.exponentialRampToValueAtTime(740 * pitchScale, t + 0.022);
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.15, t);
+    g.gain.exponentialRampToValueAtTime(0.001, t + 0.026);
+    osc.connect(g);
+    this.connectToOutputBuses(g);
+    osc.start(t);
+    osc.stop(t + 0.032);
+
+    // 2. Knurled O-ring rubberized ring glide brush
+    const brush = ctx.createBufferSource();
+    brush.buffer = this.noiseBuffer;
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.value = 1480 * pitchScale;
+    bp.Q.value = 2.4;
+    const bg = ctx.createGain();
+    bg.gain.setValueAtTime(0.065, t);
+    bg.gain.exponentialRampToValueAtTime(0.001, t + 0.045);
+    brush.connect(bp);
+    bp.connect(bg);
+    this.connectToOutputBuses(bg);
+    brush.start(t, Math.random() * 0.8, 0.052);
+  }
+
+  /**
+   * Crisp 0.1 MRAD scope elevation / windage turret mechanical ball-detent click.
+   */
+  public playTurretClick(up = true): void {
+    this.ensureInitialized();
+    if (!this.ctx || !this.dryBus) return;
+    const ctx = this.ctx;
+    const t = ctx.currentTime;
+
+    const osc = ctx.createOscillator();
+    osc.type = 'square';
+    const fStart = up ? 3150 : 2650;
+    osc.frequency.setValueAtTime(fStart, t);
+    osc.frequency.exponentialRampToValueAtTime(fStart * 0.42, t + 0.014);
+
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.value = up ? 2900 : 2400;
+    bp.Q.value = 3.2;
+
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.17, t);
+    g.gain.exponentialRampToValueAtTime(0.001, t + 0.019);
+
+    osc.connect(bp);
+    bp.connect(g);
+    this.connectToOutputBuses(g);
+    osc.start(t);
+    osc.stop(t + 0.024);
+  }
+
+  /**
+   * Spatialized metallic grenade/canister floor & wall bounce clink.
+   */
+  public playGrenadeBounce(position: Readonly<THREE.Vector3>, speed = 4.5): void {
+    this.ensureInitialized();
+    if (!this.ctx || !this.dryBus || !this.noiseBuffer) return;
+    const ctx = this.ctx;
+    const t = ctx.currentTime;
+    const amp = THREE.MathUtils.clamp(speed / 9.0, 0.14, 1.0);
+    const jitter = 0.9 + Math.random() * 0.22;
+
+    const panner = this.createHRTFPanner(position, 2.2, 48);
+    const dest: AudioNode = panner ?? this.dryBus;
+    if (panner) {
+      this.connectToOutputBuses(panner, true);
+    }
+
+    // Hollow cast-iron/aluminum canister ring
+    const ring = ctx.createOscillator();
+    ring.type = 'triangle';
+    ring.frequency.setValueAtTime(1420 * jitter, t);
+    ring.frequency.exponentialRampToValueAtTime(890 * jitter, t + 0.075);
+    const rg = ctx.createGain();
+    rg.gain.setValueAtTime(0.19 * amp, t);
+    rg.gain.exponentialRampToValueAtTime(0.001, t + 0.085);
+    ring.connect(rg);
+    rg.connect(dest);
+    ring.start(t);
+    ring.stop(t + 0.095);
+
+    // Impact grit transient
+    const grit = ctx.createBufferSource();
+    grit.buffer = this.noiseBuffer;
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.value = 1850 * jitter;
+    bp.Q.value = 1.9;
+    const gg = ctx.createGain();
+    gg.gain.setValueAtTime(0.18 * amp, t);
+    gg.gain.exponentialRampToValueAtTime(0.001, t + 0.055);
+    grit.connect(bp);
+    bp.connect(gg);
+    gg.connect(dest);
+    grit.start(t, Math.random() * 1.1, 0.065);
+  }
+
+  /**
+   * Spatialized tactical ordnance detonation synthesizer for frag, flashbang, smoke, and thermite.
+   */
+  public playExplosion(
+    position: Readonly<THREE.Vector3>,
+    kind: 'frag' | 'flash' | 'smoke' | 'thermite',
+  ): void {
+    this.ensureInitialized();
+    if (!this.ctx || !this.dryBus || !this.noiseBuffer) return;
+    const ctx = this.ctx;
+    const t = ctx.currentTime;
+
+    const panner = this.createHRTFPanner(position, kind === 'smoke' ? 4.5 : 8.5, 145);
+    const dest: AudioNode = panner ?? this.dryBus;
+    if (panner) {
+      this.connectToOutputBuses(panner, true);
+    }
+
+    if (kind === 'frag') {
+      this.duckAmbientWind(1.35, 0.006);
+
+      // 1. Sub-bass overpressure shockwave punch
+      const sub = ctx.createOscillator();
+      sub.type = 'sine';
+      sub.frequency.setValueAtTime(118, t);
+      sub.frequency.exponentialRampToValueAtTime(24, t + 0.55);
+      const subGain = ctx.createGain();
+      subGain.gain.setValueAtTime(0.95, t);
+      subGain.gain.exponentialRampToValueAtTime(0.001, t + 0.68);
+      sub.connect(subGain);
+      subGain.connect(dest);
+      sub.start(t);
+      sub.stop(t + 0.72);
+
+      // 2. Concussive detonation crack + rolling debris rumble
+      const blast = ctx.createBufferSource();
+      blast.buffer = this.noiseBuffer;
+      const lp = ctx.createBiquadFilter();
+      lp.type = 'lowpass';
+      lp.frequency.setValueAtTime(4600, t);
+      lp.frequency.exponentialRampToValueAtTime(240, t + 0.95);
+      const bg = ctx.createGain();
+      bg.gain.setValueAtTime(0.001, t);
+      bg.gain.linearRampToValueAtTime(0.92, t + 0.01);
+      bg.gain.exponentialRampToValueAtTime(0.001, t + 1.15);
+      blast.connect(lp);
+      lp.connect(bg);
+      bg.connect(dest);
+      blast.start(t, 0, 1.25);
+
+      // 3. High-velocity shrapnel snap
+      const crack = ctx.createBufferSource();
+      crack.buffer = this.noiseBuffer;
+      const hp = ctx.createBiquadFilter();
+      hp.type = 'bandpass';
+      hp.frequency.value = 2600;
+      hp.Q.value = 0.9;
+      const cg = ctx.createGain();
+      cg.gain.setValueAtTime(0.55, t);
+      cg.gain.exponentialRampToValueAtTime(0.001, t + 0.16);
+      crack.connect(hp);
+      hp.connect(cg);
+      cg.connect(dest);
+      crack.start(t, Math.random() * 0.6, 0.18);
+      return;
+    }
+
+    if (kind === 'flash') {
+      this.duckAmbientWind(1.1, 0.008);
+
+      // Sharp magnesium-perchlorate concussive bang
+      const bang = ctx.createBufferSource();
+      bang.buffer = this.noiseBuffer;
+      const bp = ctx.createBiquadFilter();
+      bp.type = 'bandpass';
+      bp.frequency.setValueAtTime(2900, t);
+      bp.frequency.exponentialRampToValueAtTime(750, t + 0.28);
+      bp.Q.value = 0.8;
+      const bg = ctx.createGain();
+      bg.gain.setValueAtTime(0.9, t);
+      bg.gain.exponentialRampToValueAtTime(0.001, t + 0.34);
+      bang.connect(bp);
+      bp.connect(bg);
+      bg.connect(dest);
+      bang.start(t, 0, 0.38);
+
+      const punch = ctx.createOscillator();
+      punch.type = 'triangle';
+      punch.frequency.setValueAtTime(240, t);
+      punch.frequency.exponentialRampToValueAtTime(52, t + 0.18);
+      const pg = ctx.createGain();
+      pg.gain.setValueAtTime(0.62, t);
+      pg.gain.exponentialRampToValueAtTime(0.001, t + 0.22);
+      punch.connect(pg);
+      pg.connect(dest);
+      punch.start(t);
+      punch.stop(t + 0.24);
+      return;
+    }
+
+    if (kind === 'smoke') {
+      // Primer pop + pressurized gas hiss plume
+      const pop = ctx.createOscillator();
+      pop.type = 'sine';
+      pop.frequency.setValueAtTime(280, t);
+      pop.frequency.exponentialRampToValueAtTime(85, t + 0.08);
+      const pg = ctx.createGain();
+      pg.gain.setValueAtTime(0.32, t);
+      pg.gain.exponentialRampToValueAtTime(0.001, t + 0.1);
+      pop.connect(pg);
+      pg.connect(dest);
+      pop.start(t);
+      pop.stop(t + 0.12);
+
+      const hiss = ctx.createBufferSource();
+      hiss.buffer = this.noiseBuffer;
+      hiss.loop = true;
+      const bp = ctx.createBiquadFilter();
+      bp.type = 'bandpass';
+      bp.frequency.setValueAtTime(2400, t);
+      bp.frequency.exponentialRampToValueAtTime(1350, t + 2.4);
+      bp.Q.value = 1.4;
+      const hg = ctx.createGain();
+      hg.gain.setValueAtTime(0.001, t + 0.04);
+      hg.gain.linearRampToValueAtTime(0.34, t + 0.22);
+      hg.gain.exponentialRampToValueAtTime(0.001, t + 2.6);
+      hiss.connect(bp);
+      bp.connect(hg);
+      hg.connect(dest);
+      hiss.start(t + 0.04);
+      hiss.stop(t + 2.65);
+      return;
+    }
+
+    // 'thermite': intense igniter crack + white-hot magnesium crackle hiss
+    const ign = ctx.createBufferSource();
+    ign.buffer = this.noiseBuffer;
+    const ihp = ctx.createBiquadFilter();
+    ihp.type = 'bandpass';
+    ihp.frequency.setValueAtTime(1950, t);
+    ihp.frequency.exponentialRampToValueAtTime(620, t + 0.45);
+    ihp.Q.value = 1.1;
+    const ig = ctx.createGain();
+    ig.gain.setValueAtTime(0.68, t);
+    ig.gain.exponentialRampToValueAtTime(0.001, t + 0.5);
+    ign.connect(ihp);
+    ihp.connect(ig);
+    ig.connect(dest);
+    ign.start(t, 0, 0.55);
+
+    const burn = ctx.createBufferSource();
+    burn.buffer = this.noiseBuffer;
+    burn.loop = true;
+    const bbp = ctx.createBiquadFilter();
+    bbp.type = 'bandpass';
+    bbp.frequency.value = 3400;
+    bbp.Q.value = 0.85;
+    const bg = ctx.createGain();
+    bg.gain.setValueAtTime(0.001, t + 0.08);
+    bg.gain.linearRampToValueAtTime(0.26, t + 0.28);
+    bg.gain.exponentialRampToValueAtTime(0.001, t + 2.9);
+    burn.connect(bbp);
+    bbp.connect(bg);
+    bg.connect(dest);
+    burn.start(t + 0.08);
+    burn.stop(t + 2.95);
+  }
+
   public dispose(): void {
     try {
       this.windSource?.stop();
@@ -1583,3 +2009,4 @@ export class BodycamAudio implements IBodycamAudioSource {
     this.initialized = false;
   }
 }
+

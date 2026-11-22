@@ -9,6 +9,13 @@ import {
   WeaponCategory,
 } from '../bodycam-sdk';
 import { AmmoVariantId, getAmmoVariantsForCaliber } from '../data/calibers';
+import {
+  getTacticalEquipmentDef,
+  TACTICAL_BELT_SLOTS,
+  TACTICAL_EQUIPMENT_LIST,
+  TacticalBeltSlot,
+  TacticalEquipmentId,
+} from '../data/tacticalEquipment';
 import { GymSnapshot } from './GymEngine';
 import { GYM_ZONE_PRESETS, GymZoneId } from './GymWorld';
 
@@ -24,12 +31,17 @@ interface GymTunerPanelProps {
   onToggleSuppressor: () => void;
   onToggleReticleIllumination: () => void;
   onToggleArmTrauma: () => void;
+  onSelectTacticalEquipment: (equipmentId: TacticalEquipmentId) => void;
+  onSelectTacticalBeltSlot: (slot: TacticalBeltSlot) => void;
+  onToggleTacticalMountOnBelt: (visible: boolean) => void;
+  onRestockTacticalEquipment: () => void;
+  onQuickThrowTactical: () => void;
   onClose: () => void;
   onResumeLock: () => void;
   onReturnToMenu: () => void;
 }
 
-type TunerTab = 'optics' | 'controller' | 'weapon_audio';
+type TunerTab = 'optics' | 'controller' | 'weapon_audio' | 'tactical';
 
 interface SliderRowProps {
   label: string;
@@ -84,6 +96,11 @@ export const GymTunerPanel: React.FC<GymTunerPanelProps> = ({
   onToggleSuppressor,
   onToggleReticleIllumination,
   onToggleArmTrauma,
+  onSelectTacticalEquipment,
+  onSelectTacticalBeltSlot,
+  onToggleTacticalMountOnBelt,
+  onRestockTacticalEquipment,
+  onQuickThrowTactical,
   onClose,
   onResumeLock,
   onReturnToMenu,
@@ -239,19 +256,20 @@ export const GymTunerPanel: React.FC<GymTunerPanelProps> = ({
       </div>
 
       {/* Tab Selector */}
-      <div className="grid grid-cols-3 border-b border-neutral-800 font-mono-tabular text-[11px] uppercase">
+      <div className="grid grid-cols-4 border-b border-neutral-800 font-mono-tabular text-[10px] uppercase">
         {(
           [
             ['optics', 'Optics'],
-            ['controller', 'Physics & Rig'],
-            ['weapon_audio', 'Weapon & Mic'],
+            ['controller', 'Rig'],
+            ['weapon_audio', 'Weapon'],
+            ['tactical', 'Tactical Belt'],
           ] as [TunerTab, string][]
         ).map(([id, label]) => (
           <button
             key={id}
             type="button"
             onClick={() => setTab(id)}
-            className={`cursor-pointer whitespace-nowrap border-b-2 py-2 text-center transition-colors ${
+            className={`cursor-pointer whitespace-nowrap border-b-2 px-1 py-2 text-center transition-colors ${
               tab === id
                 ? 'border-amber-400 bg-neutral-900/90 font-semibold text-amber-300'
                 : 'border-transparent text-neutral-400 hover:text-neutral-200'
@@ -713,6 +731,150 @@ export const GymTunerPanel: React.FC<GymTunerPanelProps> = ({
             />
           </>
         )}
+
+        {tab === 'tactical' && (() => {
+          const activeDef = getTacticalEquipmentDef(snapshot.tacticalEquipmentId);
+          return (
+            <div className="space-y-4 font-mono-tabular">
+              {/* Specialized Tactical Equipment Slot */}
+              <div className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <span className="text-[10px] font-semibold uppercase tracking-wider text-amber-400">
+                    Tactical Equipment Slot
+                  </span>
+                  <span className="text-[10px] text-neutral-400">
+                    [H]/[5] Draw · LMB Pin · RMB Lever
+                  </span>
+                </div>
+
+                <div className="space-y-1.5">
+                  {TACTICAL_EQUIPMENT_LIST.map((item) => {
+                    const active = snapshot.tacticalEquipmentId === item.id;
+                    const fuseLabel =
+                      item.fuseVarianceSec && item.fuseVarianceSec > 0
+                        ? `${(item.fuseSec - item.fuseVarianceSec).toFixed(1)}–${(item.fuseSec + item.fuseVarianceSec).toFixed(1)}s`
+                        : `${item.fuseSec.toFixed(1)}s`;
+                    return (
+                      <button
+                        key={item.id}
+                        type="button"
+                        onClick={() => onSelectTacticalEquipment(item.id)}
+                        className={`w-full cursor-pointer border px-3 py-2 text-left transition-colors ${
+                          active
+                            ? 'border-amber-400 bg-amber-500/15 text-amber-200'
+                            : 'border-neutral-800 bg-neutral-900/75 text-neutral-300 hover:border-neutral-600'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-[11px] font-semibold uppercase tracking-wider">
+                            {item.name}
+                          </span>
+                          <span
+                            className={`text-[10px] font-semibold uppercase ${
+                              item.category === 'lethal' ? 'text-amber-400' : 'text-sky-400'
+                            }`}
+                          >
+                            {item.category} · {fuseLabel}
+                          </span>
+                        </div>
+                        <p className="mt-0.5 font-sans text-[11px] leading-snug text-neutral-400">
+                          {item.description}
+                        </p>
+                        <div className="mt-1.5 flex items-center gap-3 text-[10px] text-neutral-500">
+                          <span>
+                            {item.lethalRadiusM
+                              ? `LETHAL ${item.lethalRadiusM.toFixed(0)}m · CAS ${item.blastRadiusM.toFixed(0)}m`
+                              : `RAD ${item.blastRadiusM.toFixed(1)}m`}
+                          </span>
+                          <span>
+                            {item.maxDamage > 0
+                              ? `DMG ${item.maxDamage}${item.id === 'an_m14_thermite' ? '/s' : ''}`
+                              : `SCREEN ${item.effectDurationSec.toFixed(0)}s`}
+                          </span>
+                          <span>WT {item.weightKg.toFixed(2)}kg</span>
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Player Belt Mesh Assignment */}
+              <div className="space-y-2 border-t border-neutral-800 pt-3">
+                <div className="flex items-center justify-between">
+                  <span className="text-[10px] font-semibold uppercase tracking-wider text-neutral-300">
+                    Belt Mesh Assignment
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => onToggleTacticalMountOnBelt(!snapshot.tacticalMountOnBelt)}
+                    className={`cursor-pointer border px-2 py-0.5 text-[10px] font-semibold uppercase ${
+                      snapshot.tacticalMountOnBelt
+                        ? 'border-emerald-500/70 bg-emerald-950/50 text-emerald-300'
+                        : 'border-neutral-700 bg-neutral-900 text-neutral-400'
+                    }`}
+                  >
+                    {snapshot.tacticalMountOnBelt ? 'MOUNTED ON BELT' : 'STOWED'}
+                  </button>
+                </div>
+                <p className="font-sans text-[11px] leading-snug text-neutral-400">
+                  Mounts the active ordnance 3D mesh onto the operator&apos;s waist belt across
+                  Playground, Battle, Infection, and Operator Preview.
+                </p>
+                <div className="grid grid-cols-2 gap-1.5">
+                  {TACTICAL_BELT_SLOTS.map((slot) => {
+                    const active = snapshot.tacticalBeltSlot === slot.id;
+                    return (
+                      <button
+                        key={slot.id}
+                        type="button"
+                        onClick={() => onSelectTacticalBeltSlot(slot.id)}
+                        className={`cursor-pointer border px-2.5 py-2 text-left transition-colors ${
+                          active
+                            ? 'border-amber-400 bg-amber-500/15 text-amber-200'
+                            : 'border-neutral-800 bg-neutral-900/75 text-neutral-300 hover:border-neutral-600'
+                        }`}
+                      >
+                        <div className="text-[10px] font-semibold uppercase tracking-wider">
+                          {slot.label}
+                        </div>
+                        <div className="mt-0.5 font-sans text-[10px] leading-tight text-neutral-500">
+                          {slot.description}
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Pouch Readout & Live Test Controls */}
+              <div className="space-y-2 border-t border-neutral-800 pt-3">
+                <div className="flex items-center justify-between text-[11px]">
+                  <span className="uppercase tracking-wider text-neutral-400">Carried Supply</span>
+                  <span className="font-semibold text-amber-300">
+                    {activeDef.shortName} · {snapshot.grenadeCount}/{snapshot.grenadeMax}
+                  </span>
+                </div>
+                <div className="grid grid-cols-2 gap-2">
+                  <button
+                    type="button"
+                    onClick={onRestockTacticalEquipment}
+                    className="cursor-pointer whitespace-nowrap border border-emerald-600/70 bg-emerald-950/40 px-2.5 py-2 text-[10px] font-semibold uppercase tracking-wider text-emerald-300 hover:bg-emerald-900/50"
+                  >
+                    Restock Pouch
+                  </button>
+                  <button
+                    type="button"
+                    onClick={onQuickThrowTactical}
+                    className="cursor-pointer whitespace-nowrap border border-amber-400/70 bg-amber-500/15 px-2.5 py-2 text-[10px] font-semibold uppercase tracking-wider text-amber-200 hover:bg-amber-500/25"
+                  >
+                    Quick Throw
+                  </button>
+                </div>
+              </div>
+            </div>
+          );
+        })()}
       </div>
 
       {/* Footer Export & Mode Actions */}

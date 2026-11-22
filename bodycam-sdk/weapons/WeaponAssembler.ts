@@ -78,6 +78,33 @@ function makeCartridge(
 }
 
 /**
+ * Builds a true hollow cylindrical sleeve / scope ring aligned along the Z axis.
+ * Prevents solid cylinder end-caps from ever sitting inside or coplanar with a PiP ocular lens.
+ */
+function createHollowRingGeo(
+  track: <T extends THREE.BufferGeometry>(g: T) => T,
+  outerR: number,
+  innerR: number,
+  lengthZ: number,
+  curveSegments = 22,
+): THREE.ExtrudeGeometry {
+  const shape = new THREE.Shape();
+  shape.absarc(0, 0, outerR, 0, Math.PI * 2, false);
+  const hole = new THREE.Path();
+  hole.absarc(0, 0, Math.min(innerR, outerR - 0.0008), 0, Math.PI * 2, true);
+  shape.holes.push(hole);
+  const geo = track(
+    new THREE.ExtrudeGeometry(shape, {
+      depth: lengthZ,
+      bevelEnabled: false,
+      curveSegments,
+    }),
+  );
+  geo.translate(0, 0, -lengthZ * 0.5);
+  return geo;
+}
+
+/**
  * Procedural PBR 3D builder & dynamic re-assembler for modular firearm attachments.
  * Re-computes sightAnchor, leftHandSocket & grip pose, muzzleSocket, flashlight/laser sockets,
  * detachable magazine references, and derived physics ONLY on attach/detach (zero per-frame allocs).
@@ -119,7 +146,11 @@ export class WeaponAssembler {
     assembly.hasCantedOptic = false;
     assembly.cantReticleMaterial = null;
     assembly.ocularRadiusM = 0.015;
+    assembly.railAdapterGroup = null;
     assembly.opticGroup = null;
+    assembly.zoomRingPivot = null;
+    assembly.zoomRingSocket = null;
+    assembly.elevationTurretMesh = null;
     assembly.suppressor = null;
     assembly.flashlightModule = null;
     assembly.laserModule = null;
@@ -208,6 +239,76 @@ export class WeaponAssembler {
     const convExtraLenM = magDef?.id.startsWith('conv_') ? (magDef.extraLengthM ?? 0) : 0;
 
     // -------------------------------------------------------------------------
+    // 0. DEDICATED RAIL ADAPTER SLOT (Zenitco B-13 Dovetail Bridge / HK MP5 Claw Rail)
+    // -------------------------------------------------------------------------
+    const railAdapterId = attachments?.railAdapter;
+    const railAdapterDef = railAdapterId ? ATTACHMENTS[railAdapterId] : undefined;
+    const hasB13Adapter = railAdapterDef?.id === 'rail_b13_dovetail';
+    const hasMp5ClawAdapter = railAdapterDef?.id === 'rail_mp5_claw';
+    if (railAdapterDef && railAdapterDef.slot === 'railAdapter') {
+      const adapterGroup = new THREE.Group();
+      adapterGroup.name = 'mounted_rail_adapter';
+      assembly.opticMountSocket.add(adapterGroup);
+      mountedGroups.push(adapterGroup);
+
+      if (hasB13Adapter) {
+        // Zenitco B-13 CNC-milled AK dovetail side clamp + swept cantilever top Picatinny rail
+        const sideClamp = new THREE.Mesh(
+          track(new THREE.BoxGeometry(0.0075, 0.022, 0.072)),
+          mats.gunmetal,
+        );
+        sideClamp.position.set(-0.022, -0.022, 0.004);
+        const qdLever = new THREE.Mesh(
+          track(new THREE.BoxGeometry(0.005, 0.007, 0.036)),
+          mats.anodized,
+        );
+        qdLever.position.set(-0.026, -0.025, 0.016);
+        const sideArmF = new THREE.Mesh(
+          track(new THREE.BoxGeometry(0.006, 0.044, 0.018)),
+          mats.anodized,
+        );
+        sideArmF.position.set(-0.021, -0.002, -0.024);
+        const sideArmR = sideArmF.clone();
+        sideArmR.position.z = 0.024;
+        const sideToTopBridge = new THREE.Mesh(
+          track(new THREE.BoxGeometry(0.028, 0.007, 0.088)),
+          mats.anodized,
+        );
+        sideToTopBridge.position.set(-0.010, 0.016, 0.0);
+        const picRailTop = new THREE.Mesh(
+          track(new THREE.BoxGeometry(0.021, 0.0065, 0.132)),
+          mats.anodized,
+        );
+        picRailTop.position.set(0, 0.0195, -0.004);
+        adapterGroup.add(sideClamp, qdLever, sideArmF, sideArmR, sideToTopBridge, picRailTop);
+      } else if (hasMp5ClawAdapter) {
+        // HK MFI 4-point low-profile claw mount clamping onto MP5 receiver ribs
+        const clawBody = new THREE.Mesh(
+          track(new THREE.BoxGeometry(0.033, 0.013, 0.104)),
+          mats.gunmetal,
+        );
+        clawBody.position.set(0, 0.002, 0);
+        for (const cz of [-0.036, 0.036]) {
+          for (const side of [-1, 1]) {
+            const lug = new THREE.Mesh(
+              track(new THREE.BoxGeometry(0.005, 0.014, 0.012)),
+              mats.anodized,
+            );
+            lug.position.set(side * 0.0165, -0.004, cz);
+            adapterGroup.add(lug);
+          }
+        }
+        const clawRail = new THREE.Mesh(
+          track(new THREE.BoxGeometry(0.021, 0.0065, 0.106)),
+          mats.anodized,
+        );
+        clawRail.position.set(0, 0.0115, 0);
+        adapterGroup.add(clawBody, clawRail);
+      }
+      assembly.railAdapterGroup = adapterGroup;
+    }
+
+    // -------------------------------------------------------------------------
     // 1. OPTIC SLOT (parented directly to opticMountSocket so slide-milled RMRs reciprocate with slideGroup!)
     // -------------------------------------------------------------------------
     const opticId = attachments?.optic;
@@ -231,21 +332,26 @@ export class WeaponAssembler {
         assembly.ironSightRearFolded.visible = true;
       }
 
-      // Rail interface mounts (AK Dovetail, MP5 Claw, Shotgun Saddle, Pistol Milled Plate)
-      if (isAkStyle) {
+      // Rail interface mounts — only fabricate built-in side clamp if a standalone railAdapter isn't already mounted!
+      const isDirectDovetailOptic =
+        opticDef.id === 'optic_pso1m2' ||
+        opticDef.id === 'optic_pso1_4x' ||
+        opticDef.id === 'optic_kobra_rd' ||
+        opticDef.id === 'optic_pso4';
+      if (isAkStyle && !hasB13Adapter) {
         const sideArm = new THREE.Mesh(
-          track(new THREE.BoxGeometry(0.0065, 0.052, 0.062)),
-          mats.anodized,
+          track(new THREE.BoxGeometry(0.0068, 0.052, isDirectDovetailOptic ? 0.058 : 0.062)),
+          mats.gunmetal,
         );
         sideArm.position.set(-0.021, -0.008, 0);
         const sideClamp = new THREE.Mesh(
-          track(new THREE.BoxGeometry(0.008, 0.012, 0.026)),
-          mats.gunmetal,
+          track(new THREE.BoxGeometry(0.0085, 0.014, 0.032)),
+          mats.anodized,
         );
         sideClamp.position.set(-0.023, -0.028, 0.006);
         const sideToTopBridge = new THREE.Mesh(
           track(new THREE.BoxGeometry(0.026, 0.007, 0.062)),
-          mats.anodized,
+          mats.gunmetal,
         );
         sideToTopBridge.position.set(-0.011, 0.015, 0);
         const topBridge = new THREE.Mesh(
@@ -254,7 +360,7 @@ export class WeaponAssembler {
         );
         topBridge.position.set(0, 0.015, 0);
         opticMount.add(sideArm, sideClamp, sideToTopBridge, topBridge);
-      } else if (isMp5Claw) {
+      } else if (isMp5Claw && !hasMp5ClawAdapter) {
         const clawBody = new THREE.Mesh(
           track(new THREE.BoxGeometry(0.032, 0.014, 0.092)),
           mats.gunmetal,
@@ -282,34 +388,66 @@ export class WeaponAssembler {
         opticMount.add(rmrPlate);
       }
 
-      const mountBaseY = isAkStyle
-        ? 0.0198
-        : isMp5Claw
-          ? 0.0162
-          : isShotgunSaddle
-            ? 0.0068
-            : isPistolMilled
-              ? 0.0038
-              : 0.0012;
+      const mountBaseY = hasB13Adapter
+        ? 0.0228
+        : isAkStyle
+          ? 0.0198
+          : hasMp5ClawAdapter || isMp5Claw
+            ? 0.0162
+            : isShotgunSaddle
+              ? 0.0068
+              : isPistolMilled
+                ? 0.0038
+                : 0.0012;
 
-      if (opticDef.id === 'optic_rmr_micro') {
+      if (opticDef.id === 'optic_rmr_type2' || opticDef.id === 'optic_rmr_micro') {
+        // Trijicon RMR Type 2 1x Reflex:
+        // Direct milled slide plate on pistols, or skeletonized Picatinny RM33 riser on rifles/shotguns/PDWs
+        const usePicRiser = !isPistolMilled && !isPistolStyle;
+        const riserH = usePicRiser ? 0.015 : 0;
+        if (usePicRiser) {
+          const riserBase = new THREE.Mesh(
+            track(new THREE.BoxGeometry(0.024, 0.005, 0.046)),
+            mats.gunmetal,
+          );
+          riserBase.position.set(0, mountBaseY + 0.0025, 0);
+          const riserPostF = new THREE.Mesh(
+            track(new THREE.BoxGeometry(0.018, riserH, 0.010)),
+            mats.anodized,
+          );
+          riserPostF.position.set(0, mountBaseY + 0.004 + riserH * 0.5, -0.013);
+          const riserPostR = riserPostF.clone();
+          riserPostR.position.z = 0.013;
+          opticMount.add(riserBase, riserPostF, riserPostR);
+        }
+        const rmrBaseY = mountBaseY + riserH;
         const base = new THREE.Mesh(
-          track(new THREE.BoxGeometry(0.025, 0.007, 0.042)),
+          track(new THREE.BoxGeometry(0.026, 0.0072, 0.044)),
           mats.anodized,
         );
-        base.position.set(0, mountBaseY + 0.002, 0);
+        base.position.set(0, rmrBaseY + 0.0032, 0);
+        // Patented Trijicon owl-ear forged aluminum hood
         const earL = new THREE.Mesh(
-          track(new THREE.BoxGeometry(0.0036, 0.018, 0.024)),
+          track(new THREE.BoxGeometry(0.0038, 0.019, 0.025)),
           mats.anodized,
         );
-        earL.position.set(-0.0112, mountBaseY + 0.012, -0.003);
+        earL.position.set(-0.0114, rmrBaseY + 0.013, -0.003);
         const earR = earL.clone();
-        earR.position.x = 0.0112;
+        earR.position.x = 0.0114;
         const archTop = new THREE.Mesh(
-          track(new THREE.BoxGeometry(0.026, 0.0032, 0.022)),
+          track(new THREE.BoxGeometry(0.0266, 0.0034, 0.023)),
           mats.anodized,
         );
-        archTop.position.set(0, mountBaseY + 0.0205, -0.003);
+        archTop.position.set(0, rmrBaseY + 0.0218, -0.003);
+        // Side brightness +/- membrane buttons
+        const btnPlus = new THREE.Mesh(
+          track(new THREE.BoxGeometry(0.002, 0.004, 0.005)),
+          mats.wornPolymer,
+        );
+        btnPlus.position.set(-0.0135, rmrBaseY + 0.0045, 0.008);
+        const btnMinus = btnPlus.clone();
+        btnMinus.position.x = 0.0135;
+
         const reticleMat = createParallaxCollimatedReticleMaterial({
           mode: 'rmr_dot',
           reticleColorHex: primaryReticleHex,
@@ -317,12 +455,12 @@ export class WeaponAssembler {
           brightness: 2.95,
         });
         customMats.push(reticleMat);
-        const reticleCenterY = mountBaseY + 0.0135;
-        const glass = new THREE.Mesh(track(new THREE.PlaneGeometry(0.019, 0.014)), reticleMat);
+        const reticleCenterY = rmrBaseY + 0.0142;
+        const glass = new THREE.Mesh(track(new THREE.PlaneGeometry(0.0192, 0.0144)), reticleMat);
         glass.position.set(0, reticleCenterY, -0.004);
         glass.renderOrder = 4;
 
-        opticMount.add(base, earL, earR, archTop, glass);
+        opticMount.add(base, earL, earR, archTop, btnPlus, btnMinus, glass);
         assembly.opticGroup = opticMount;
         assembly.reticleMaterial = reticleMat;
         assembly.sightAnchor.position.set(
@@ -573,23 +711,16 @@ export class WeaponAssembler {
           mats.anodized,
         );
         riser.position.set(0, mountBaseY + 0.005, 0.004);
-        const ringF = new THREE.Mesh(
-          track(new THREE.CylinderGeometry(0.0172, 0.0172, 0.014, 14)),
-          mats.gunmetal,
-        );
-        ringF.rotation.x = Math.PI * 0.5;
-        ringF.position.set(0, mountBaseY + 0.025, -0.026);
-        const ringR = new THREE.Mesh(
-          track(new THREE.CylinderGeometry(0.0172, 0.0172, 0.014, 14)),
-          mats.gunmetal,
-        );
-        ringR.rotation.x = Math.PI * 0.5;
-        ringR.position.set(0, mountBaseY + 0.025, 0.024);
-
         const scopeCenterY = mountBaseY + 0.025;
         const scopeTubeLen = 0.148;
         const outerR = 0.0174;
-        const innerR = 0.0146;
+        const innerR = 0.0148;
+        const ringGeo = createHollowRingGeo(track, 0.0188, outerR + 0.0002, 0.014, 18);
+        const ringF = new THREE.Mesh(ringGeo, mats.gunmetal);
+        ringF.position.set(0, scopeCenterY, -0.026);
+        const ringR = new THREE.Mesh(ringGeo, mats.gunmetal);
+        ringR.position.set(0, scopeCenterY, 0.024);
+
         const tubeShape = new THREE.Shape();
         tubeShape.absarc(0, 0, outerR, 0, Math.PI * 2, false);
         const boreHole = new THREE.Path();
@@ -599,8 +730,8 @@ export class WeaponAssembler {
           new THREE.ExtrudeGeometry(tubeShape, {
             depth: scopeTubeLen,
             bevelEnabled: true,
-            bevelThickness: 0.0015,
-            bevelSize: 0.0014,
+            bevelThickness: 0.0014,
+            bevelSize: 0.0012,
             bevelSegments: 2,
             curveSegments: 20,
           }),
@@ -609,37 +740,23 @@ export class WeaponAssembler {
         const scopeBody = new THREE.Mesh(tubeGeo, mats.anodized);
         scopeBody.position.set(0, scopeCenterY, 0.004);
 
-        // Flared objective bell (front) & rubber eyecup flange (rear)
-        const objShape = new THREE.Shape();
-        objShape.absarc(0, 0, 0.021, 0, Math.PI * 2, false);
-        const objHole = new THREE.Path();
-        objHole.absarc(0, 0, 0.0168, 0, Math.PI * 2, true);
-        objShape.holes.push(objHole);
-        const objGeo = track(
-          new THREE.ExtrudeGeometry(objShape, {
-            depth: 0.036,
-            bevelEnabled: false,
-            curveSegments: 20,
-          }),
-        );
-        objGeo.translate(0, 0, -0.018);
+        const objGeo = createHollowRingGeo(track, 0.021, 0.0168, 0.036, 20);
         const objBell = new THREE.Mesh(objGeo, mats.gunmetal);
         objBell.position.set(0, scopeCenterY, -0.072);
 
         const eyecup = new THREE.Mesh(
-          track(new THREE.TorusGeometry(0.0165, 0.0036, 8, 20)),
+          track(new THREE.TorusGeometry(0.0168, 0.0032, 8, 20)),
           mats.wornPolymer,
         );
-        eyecup.position.set(0, scopeCenterY, 0.079);
+        eyecup.position.set(0, scopeCenterY, 0.081);
 
-        // Elevation & Windage Turret Drums
         const elevDrum = new THREE.Mesh(
-          track(new THREE.CylinderGeometry(0.0068, 0.0072, 0.010, 10)),
+          track(new THREE.CylinderGeometry(0.0068, 0.0072, 0.010, 12)),
           mats.brass,
         );
         elevDrum.position.set(0, scopeCenterY + 0.020, -0.004);
         const windDrum = new THREE.Mesh(
-          track(new THREE.CylinderGeometry(0.0065, 0.0070, 0.010, 10)),
+          track(new THREE.CylinderGeometry(0.0065, 0.0070, 0.010, 12)),
           mats.brass,
         );
         windDrum.rotation.z = Math.PI * 0.5;
@@ -653,16 +770,16 @@ export class WeaponAssembler {
         scopeMat.userData.hasIllumination = Boolean(opticDef.hasIlluminatedReticle);
         scopeMat.uniforms.uIlluminated.value = opticDef.hasIlluminatedReticle ? 1.0 : 0.0;
         customMats.push(scopeMat);
-        const ocularRadius = 0.0148;
+        const ocularRadius = 0.0144;
         const reticleGlass = new THREE.Mesh(
           track(new THREE.CircleGeometry(ocularRadius, 28)),
           scopeMat,
         );
-        reticleGlass.position.set(0, scopeCenterY, 0.068);
+        reticleGlass.position.set(0, scopeCenterY, 0.073);
         reticleGlass.renderOrder = 6;
 
         const objGlass = new THREE.Mesh(
-          track(new THREE.CircleGeometry(0.0166, 20)),
+          track(new THREE.CircleGeometry(0.0164, 20)),
           mats.lensGlass,
         );
         objGlass.position.set(0, scopeCenterY, -0.084);
@@ -681,46 +798,46 @@ export class WeaponAssembler {
           objGlass,
         );
         assembly.opticGroup = opticMount;
+        assembly.elevationTurretMesh = elevDrum;
         assembly.reticleMaterial = scopeMat;
         assembly.scopeLensMaterial = scopeMat;
         assembly.ocularRadiusM = ocularRadius;
         assembly.sightAnchor.position.set(
           opticRestPos.x,
           opticRestPos.y + scopeCenterY,
-          opticRestPos.z + 0.068,
+          opticRestPos.z + 0.073,
         );
         assembly.objectiveSocket.position.set(
           opticRestPos.x,
           opticRestPos.y + scopeCenterY,
           opticRestPos.z - 0.092,
         );
-      } else if (opticDef.id === 'optic_lpvo_1_6') {
-        // Razor HD 1-6x24 LPVO: Cantilever mount, 30mm tube, throw lever zoom ring, flared bell
+      } else if (opticDef.id === 'optic_razor_1_6' || opticDef.id === 'optic_lpvo_1_6') {
+        // Vortex Razor HD Gen II-E 1–6×24 LPVO:
+        // 30mm cantilever mount, true HOLLOW tube + HOLLOW rings + HOLLOW rotating magnification ring & throw lever
+        // (zero solid cylinder end-caps inside or coplanar with ocular glass -> zero black polygon flicker!)
         const cantileverBase = new THREE.Mesh(
-          track(new THREE.BoxGeometry(0.025, 0.012, 0.098)),
+          track(new THREE.BoxGeometry(0.025, 0.011, 0.104)),
           mats.anodized,
         );
-        cantileverBase.position.set(0, mountBaseY + 0.004, -0.002);
+        cantileverBase.position.set(0, mountBaseY + 0.0045, -0.004);
 
-        const scopeCenterY = mountBaseY + 0.026;
-        for (const rz of [-0.036, 0.030]) {
+        const scopeCenterY = mountBaseY + 0.027;
+        const outerR = 0.0176;
+        const innerR = 0.0156;
+        const mountRingGeo = createHollowRingGeo(track, 0.0194, outerR + 0.0002, 0.016, 20);
+        for (const rz of [-0.038, 0.026]) {
           const post = new THREE.Mesh(
-            track(new THREE.BoxGeometry(0.018, 0.018, 0.016)),
+            track(new THREE.BoxGeometry(0.017, 0.013, 0.016)),
             mats.anodized,
           );
-          post.position.set(0, mountBaseY + 0.014, rz);
-          const ringCollar = new THREE.Mesh(
-            track(new THREE.CylinderGeometry(0.0182, 0.0182, 0.016, 16)),
-            mats.anodized,
-          );
-          ringCollar.rotation.x = Math.PI * 0.5;
+          post.position.set(0, mountBaseY + 0.011, rz);
+          const ringCollar = new THREE.Mesh(mountRingGeo, mats.anodized);
           ringCollar.position.set(0, scopeCenterY, rz);
           opticMount.add(post, ringCollar);
         }
 
-        const tubeLen = 0.172;
-        const outerR = 0.0176;
-        const innerR = 0.0148;
+        const tubeLen = 0.176;
         const tubeShape = new THREE.Shape();
         tubeShape.absarc(0, 0, outerR, 0, Math.PI * 2, false);
         const boreHole = new THREE.Path();
@@ -730,59 +847,89 @@ export class WeaponAssembler {
           new THREE.ExtrudeGeometry(tubeShape, {
             depth: tubeLen,
             bevelEnabled: true,
-            bevelThickness: 0.0014,
-            bevelSize: 0.0012,
+            bevelThickness: 0.0012,
+            bevelSize: 0.0010,
             bevelSegments: 2,
-            curveSegments: 20,
+            curveSegments: 24,
           }),
         );
         tubeGeo.translate(0, 0, -tubeLen * 0.5);
-        const mainTube = new THREE.Mesh(tubeGeo, mats.gunmetal);
+        // Signature Vortex Stealth Shadow dark bronze-gunmetal tube finish
+        const mainTube = new THREE.Mesh(tubeGeo, mats.peqFde);
         mainTube.position.set(0, scopeCenterY, -0.004);
 
-        // Front 24mm objective bell
-        const objShape = new THREE.Shape();
-        objShape.absarc(0, 0, 0.0215, 0, Math.PI * 2, false);
-        const objHole = new THREE.Path();
-        objHole.absarc(0, 0, 0.0176, 0, Math.PI * 2, true);
-        objShape.holes.push(objHole);
-        const objGeo = track(
-          new THREE.ExtrudeGeometry(objShape, {
-            depth: 0.046,
-            bevelEnabled: false,
-            curveSegments: 20,
-          }),
-        );
-        objGeo.translate(0, 0, -0.023);
-        const frontBell = new THREE.Mesh(objGeo, mats.anodized);
-        frontBell.position.set(0, scopeCenterY, -0.104);
+        // Front 24mm hollow objective bell
+        const objGeo = createHollowRingGeo(track, 0.0212, 0.0174, 0.046, 22);
+        const frontBell = new THREE.Mesh(objGeo, mats.peqFde);
+        frontBell.position.set(0, scopeCenterY, -0.106);
 
-        // Rear magnification ring + tactile throw lever
-        const zoomRing = new THREE.Mesh(
-          track(new THREE.CylinderGeometry(0.0195, 0.0195, 0.024, 18)),
+        // Rotatable HOLLOW magnification ring + tactile throw lever strictly forward of ocular lens (z = 0.056)
+        const zoomRingPivot = new THREE.Group();
+        zoomRingPivot.name = 'scope_zoom_ring_pivot';
+        zoomRingPivot.position.set(0, scopeCenterY, 0.056);
+
+        const zoomSleeveGeo = createHollowRingGeo(track, 0.0202, outerR + 0.0003, 0.020, 22);
+        const zoomRing = new THREE.Mesh(zoomSleeveGeo, mats.anodized);
+        zoomRingPivot.add(zoomRing);
+
+        // Knurled tactile ribs around the hollow zoom ring
+        for (let i = 0; i < 6; i++) {
+          const ang = (i / 6) * Math.PI * 2;
+          const rib = new THREE.Mesh(
+            track(new THREE.BoxGeometry(0.0022, 0.0024, 0.017)),
+            mats.gunmetal,
+          );
+          rib.position.set(Math.cos(ang) * 0.0204, Math.sin(ang) * 0.0204, 0);
+          rib.rotation.z = ang;
+          zoomRingPivot.add(rib);
+        }
+
+        // Physical throw lever extending radially from upper-left of ring
+        const throwLever = new THREE.Mesh(
+          track(new THREE.BoxGeometry(0.0046, 0.018, 0.0062)),
           mats.anodized,
         );
-        zoomRing.rotation.x = Math.PI * 0.5;
-        zoomRing.position.set(0, scopeCenterY, 0.068);
-        const throwLever = new THREE.Mesh(
-          track(new THREE.BoxGeometry(0.0045, 0.015, 0.006)),
+        throwLever.position.set(-0.017, 0.019, 0);
+        throwLever.rotation.z = 0.72;
+        const leverTip = new THREE.Mesh(
+          track(new THREE.CylinderGeometry(0.0032, 0.0032, 0.007, 10)),
           mats.gunmetal,
         );
-        throwLever.position.set(-0.016, scopeCenterY + 0.018, 0.068);
-        throwLever.rotation.z = 0.65;
+        leverTip.rotation.x = Math.PI * 0.5;
+        leverTip.position.set(-0.0235, 0.026, 0);
+        zoomRingPivot.add(throwLever, leverTip);
+
+        // IK target socket for left-hand variable zoom ring twist animation
+        const zoomRingSocket = new THREE.Object3D();
+        zoomRingSocket.name = 'zoomRingSocket';
+        zoomRingSocket.position.set(-0.026, 0.024, 0.004);
+        zoomRingPivot.add(zoomRingSocket);
+
+        // Rear hollow ocular housing bell & rubber ring cleanly surrounding the PiP glass
+        const ocularBellGeo = createHollowRingGeo(track, 0.0205, 0.0156, 0.020, 24);
+        const ocularBell = new THREE.Mesh(ocularBellGeo, mats.peqFde);
+        ocularBell.position.set(0, scopeCenterY, 0.080);
 
         const ocularRing = new THREE.Mesh(
-          track(new THREE.TorusGeometry(0.0168, 0.0028, 8, 20)),
+          track(new THREE.TorusGeometry(0.0178, 0.0024, 8, 24)),
           mats.wornPolymer,
         );
-        ocularRing.position.set(0, scopeCenterY, 0.088);
+        ocularRing.position.set(0, scopeCenterY, 0.091);
 
-        // Capped elevation, windage & side illumination dial
+        // Capped elevation (rotatable for zeroing clicks), windage & side illumination dial
+        const elevTurretGroup = new THREE.Group();
+        elevTurretGroup.position.set(0, scopeCenterY + 0.021, -0.004);
         const elevCap = new THREE.Mesh(
-          track(new THREE.CylinderGeometry(0.0075, 0.0078, 0.012, 12)),
+          track(new THREE.CylinderGeometry(0.0076, 0.0080, 0.012, 14)),
           mats.anodized,
         );
-        elevCap.position.set(0, scopeCenterY + 0.021, -0.004);
+        const elevIndexTick = new THREE.Mesh(
+          track(new THREE.BoxGeometry(0.0014, 0.0016, 0.0072)),
+          mats.brass,
+        );
+        elevIndexTick.position.set(0, 0.0062, -0.0028);
+        elevTurretGroup.add(elevCap, elevIndexTick);
+
         const windCap = new THREE.Mesh(
           track(new THREE.CylinderGeometry(0.0072, 0.0075, 0.011, 12)),
           mats.anodized,
@@ -791,7 +938,7 @@ export class WeaponAssembler {
         windCap.position.set(0.021, scopeCenterY, -0.004);
         const illumDial = new THREE.Mesh(
           track(new THREE.CylinderGeometry(0.0072, 0.0072, 0.010, 12)),
-          mats.peqFde,
+          mats.anodized,
         );
         illumDial.rotation.z = Math.PI * 0.5;
         illumDial.position.set(-0.020, scopeCenterY, -0.004);
@@ -804,59 +951,64 @@ export class WeaponAssembler {
         scopeMat.userData.hasIllumination = Boolean(opticDef.hasIlluminatedReticle);
         scopeMat.uniforms.uIlluminated.value = opticDef.hasIlluminatedReticle ? 1.0 : 0.0;
         customMats.push(scopeMat);
-        const ocularRadius = 0.0155;
+        // Strictly inside ocularBell inner bore (0.0156) and cleanly separated from zoomRing (rear edge at 0.066)
+        const ocularRadius = 0.0151;
         const reticleGlass = new THREE.Mesh(
-          track(new THREE.CircleGeometry(ocularRadius, 28)),
+          track(new THREE.CircleGeometry(ocularRadius, 32)),
           scopeMat,
         );
-        reticleGlass.position.set(0, scopeCenterY, 0.080);
+        reticleGlass.position.set(0, scopeCenterY, 0.085);
         reticleGlass.renderOrder = 6;
 
         const objGlass = new THREE.Mesh(
-          track(new THREE.CircleGeometry(0.0174, 20)),
+          track(new THREE.CircleGeometry(0.0170, 20)),
           mats.lensGlass,
         );
-        objGlass.position.set(0, scopeCenterY, -0.122);
+        objGlass.position.set(0, scopeCenterY, -0.125);
         objGlass.renderOrder = 3;
 
         opticMount.add(
           cantileverBase,
           mainTube,
           frontBell,
-          zoomRing,
-          throwLever,
+          zoomRingPivot,
+          ocularBell,
           ocularRing,
-          elevCap,
+          elevTurretGroup,
           windCap,
           illumDial,
           reticleGlass,
           objGlass,
         );
         assembly.opticGroup = opticMount;
+        assembly.zoomRingPivot = zoomRingPivot;
+        assembly.zoomRingSocket = zoomRingSocket;
+        assembly.elevationTurretMesh = elevTurretGroup;
         assembly.reticleMaterial = scopeMat;
         assembly.scopeLensMaterial = scopeMat;
         assembly.ocularRadiusM = ocularRadius;
         assembly.sightAnchor.position.set(
           opticRestPos.x,
           opticRestPos.y + scopeCenterY,
-          opticRestPos.z + 0.080,
+          opticRestPos.z + 0.085,
         );
         assembly.objectiveSocket.position.set(
           opticRestPos.x,
           opticRestPos.y + scopeCenterY,
-          opticRestPos.z - 0.128,
+          opticRestPos.z - 0.132,
         );
-      } else if (opticDef.id === 'optic_pso1_4x') {
-        // Classic Soviet PSO-1 4x24 Sniper Optic w/ Grey Enamel Tube, Extendable Sunshade & Eyecup
+      } else if (opticDef.id === 'optic_pso1m2' || opticDef.id === 'optic_pso1_4x') {
+        // Authentic Soviet PSO-1M2 4×24 Prism Scope:
+        // Side-rail dovetail clamp, grey-enamel hollow tube, extendable sunshade, rubber eyecup, amber/red LED battery cap
         const riser = new THREE.Mesh(
-          track(new THREE.BoxGeometry(0.024, 0.014, 0.092)),
+          track(new THREE.BoxGeometry(0.022, 0.014, 0.094)),
           mats.gunmetal,
         );
         riser.position.set(0, mountBaseY + 0.005, 0.004);
         const scopeCenterY = mountBaseY + 0.025;
         const scopeTubeLen = 0.188;
-        const outerR = 0.0168;
-        const innerR = 0.0142;
+        const outerR = 0.0170;
+        const innerR = 0.0148;
         const tubeShape = new THREE.Shape();
         tubeShape.absarc(0, 0, outerR, 0, Math.PI * 2, false);
         const boreHole = new THREE.Path();
@@ -866,10 +1018,10 @@ export class WeaponAssembler {
           new THREE.ExtrudeGeometry(tubeShape, {
             depth: scopeTubeLen,
             bevelEnabled: true,
-            bevelThickness: 0.0014,
-            bevelSize: 0.0012,
+            bevelThickness: 0.0013,
+            bevelSize: 0.0011,
             bevelSegments: 2,
-            curveSegments: 20,
+            curveSegments: 22,
           }),
         );
         tubeGeo.translate(0, 0, -scopeTubeLen * 0.5);
@@ -877,34 +1029,49 @@ export class WeaponAssembler {
         scopeBody.position.set(0, scopeCenterY, -0.008);
 
         const sunshade = new THREE.Mesh(
-          track(new THREE.CylinderGeometry(0.0185, 0.0175, 0.048, 18, 1, true)),
+          createHollowRingGeo(track, 0.0186, 0.0168, 0.048, 20),
           mats.gunmetal,
         );
-        sunshade.rotation.x = Math.PI * 0.5;
         sunshade.position.set(0, scopeCenterY, -0.118);
 
+        // Accordion-style rubber PSO eyecup strictly behind ocular lens (inner bore > ocularRadius)
         const eyecup = new THREE.Mesh(
-          track(new THREE.CylinderGeometry(0.0165, 0.0185, 0.036, 16, 1, true)),
+          track(new THREE.CylinderGeometry(0.0176, 0.0195, 0.036, 18, 1, true)),
           mats.wornPolymer,
         );
         eyecup.rotation.x = Math.PI * 0.5;
-        eyecup.position.set(0, scopeCenterY, 0.098);
+        eyecup.position.set(0, scopeCenterY, 0.104);
 
+        const elevDrumGroup = new THREE.Group();
+        elevDrumGroup.position.set(0, scopeCenterY + 0.0195, -0.008);
         const elevDrum = new THREE.Mesh(
-          track(new THREE.CylinderGeometry(0.007, 0.0074, 0.011, 10)),
+          track(new THREE.CylinderGeometry(0.0072, 0.0076, 0.011, 12)),
           mats.anodized,
         );
-        elevDrum.position.set(0, scopeCenterY + 0.019, -0.008);
+        const elevTick = new THREE.Mesh(
+          track(new THREE.BoxGeometry(0.0014, 0.0015, 0.007)),
+          mats.brass,
+        );
+        elevTick.position.set(0, 0.0058, -0.0026);
+        elevDrumGroup.add(elevDrum, elevTick);
+
         const windDrum = new THREE.Mesh(
-          track(new THREE.CylinderGeometry(0.0068, 0.0072, 0.011, 10)),
+          track(new THREE.CylinderGeometry(0.0068, 0.0072, 0.011, 12)),
           mats.anodized,
         );
         windDrum.rotation.z = Math.PI * 0.5;
-        windDrum.position.set(0.019, scopeCenterY, -0.008);
+        windDrum.position.set(0.0195, scopeCenterY, -0.008);
+
+        // Under-tube AA/3V illumination battery housing + toggle switch
+        const battCap = new THREE.Mesh(
+          track(new THREE.CylinderGeometry(0.0058, 0.0058, 0.022, 10)),
+          mats.anodized,
+        );
+        battCap.position.set(-0.012, scopeCenterY - 0.016, 0.028);
 
         const scopeMat = createScopeLensMaterial({
           reticleMode: 'pso_prism',
-          reticleColorHex: resolveReticleColorHex(attachments?.reticleColor, 0xff3b24),
+          reticleColorHex: resolveReticleColorHex(attachments?.reticleColor, 0xff8c1a),
           coatingTintHex: 0x1a7254,
         });
         scopeMat.userData.hasIllumination = Boolean(opticDef.hasIlluminatedReticle);
@@ -915,14 +1082,14 @@ export class WeaponAssembler {
           track(new THREE.CircleGeometry(ocularRadius, 28)),
           scopeMat,
         );
-        reticleGlass.position.set(0, scopeCenterY, 0.078);
+        reticleGlass.position.set(0, scopeCenterY, 0.082);
         reticleGlass.renderOrder = 6;
 
         const objGlass = new THREE.Mesh(
-          track(new THREE.CircleGeometry(0.015, 18)),
+          track(new THREE.CircleGeometry(0.0148, 18)),
           mats.lensGlass,
         );
-        objGlass.position.set(0, scopeCenterY, -0.102);
+        objGlass.position.set(0, scopeCenterY, -0.104);
         objGlass.renderOrder = 3;
 
         opticMount.add(
@@ -930,19 +1097,21 @@ export class WeaponAssembler {
           scopeBody,
           sunshade,
           eyecup,
-          elevDrum,
+          elevDrumGroup,
           windDrum,
+          battCap,
           reticleGlass,
           objGlass,
         );
         assembly.opticGroup = opticMount;
+        assembly.elevationTurretMesh = elevDrumGroup;
         assembly.reticleMaterial = scopeMat;
         assembly.scopeLensMaterial = scopeMat;
         assembly.ocularRadiusM = ocularRadius;
         assembly.sightAnchor.position.set(
           opticRestPos.x,
           opticRestPos.y + scopeCenterY,
-          opticRestPos.z + 0.078,
+          opticRestPos.z + 0.082,
         );
         assembly.objectiveSocket.position.set(
           opticRestPos.x,
@@ -950,7 +1119,7 @@ export class WeaponAssembler {
           opticRestPos.z - 0.145,
         );
       } else if (opticDef.id === 'optic_nightforce_atacr') {
-        // Nightforce ATACR 5-25x56 F1: Heavy dual-ring unimount, 34mm tube, ZeroStop turrets, 56mm bell
+        // Nightforce ATACR 5-25x56 F1: Hollow dual-ring unimount, 34mm tube, ZeroStop turrets, hollow zoom ring, 56mm bell
         const mountBase = new THREE.Mesh(
           track(new THREE.BoxGeometry(0.028, 0.014, 0.128)),
           mats.anodized,
@@ -958,24 +1127,21 @@ export class WeaponAssembler {
         mountBase.position.set(0, mountBaseY + 0.005, -0.006);
 
         const scopeCenterY = mountBaseY + 0.030;
+        const outerR = 0.0196;
+        const innerR = 0.0176;
+        const atacrRingGeo = createHollowRingGeo(track, 0.0216, outerR + 0.0002, 0.020, 20);
         for (const rz of [-0.052, 0.038]) {
           const post = new THREE.Mesh(
-            track(new THREE.BoxGeometry(0.022, 0.022, 0.020)),
+            track(new THREE.BoxGeometry(0.020, 0.016, 0.020)),
             mats.anodized,
           );
-          post.position.set(0, mountBaseY + 0.016, rz);
-          const ringCollar = new THREE.Mesh(
-            track(new THREE.CylinderGeometry(0.0205, 0.0205, 0.020, 18)),
-            mats.anodized,
-          );
-          ringCollar.rotation.x = Math.PI * 0.5;
+          post.position.set(0, mountBaseY + 0.013, rz);
+          const ringCollar = new THREE.Mesh(atacrRingGeo, mats.anodized);
           ringCollar.position.set(0, scopeCenterY, rz);
           opticMount.add(post, ringCollar);
         }
 
         const tubeLen = 0.228;
-        const outerR = 0.0195;
-        const innerR = 0.0172;
         const tubeShape = new THREE.Shape();
         tubeShape.absarc(0, 0, outerR, 0, Math.PI * 2, false);
         const boreHole = new THREE.Path();
@@ -995,29 +1161,24 @@ export class WeaponAssembler {
         const mainTube = new THREE.Mesh(tubeGeo, mats.anodized);
         mainTube.position.set(0, scopeCenterY, -0.016);
 
-        // Large 56mm objective bell + sunshade
-        const objShape = new THREE.Shape();
-        objShape.absarc(0, 0, 0.029, 0, Math.PI * 2, false);
-        const objHole = new THREE.Path();
-        objHole.absarc(0, 0, 0.025, 0, Math.PI * 2, true);
-        objShape.holes.push(objHole);
-        const objGeo = track(
-          new THREE.ExtrudeGeometry(objShape, {
-            depth: 0.088,
-            bevelEnabled: false,
-            curveSegments: 22,
-          }),
-        );
-        objGeo.translate(0, 0, -0.044);
+        const objGeo = createHollowRingGeo(track, 0.029, 0.025, 0.088, 22);
         const frontBell = new THREE.Mesh(objGeo, mats.anodized);
         frontBell.position.set(0, scopeCenterY, -0.168);
 
         // ZeroStop oversized elevation, windage & parallax turrets
+        const elevTurretGroup = new THREE.Group();
+        elevTurretGroup.position.set(0, scopeCenterY + 0.026, -0.016);
         const elevTurret = new THREE.Mesh(
           track(new THREE.CylinderGeometry(0.0115, 0.012, 0.018, 16)),
           mats.gunmetal,
         );
-        elevTurret.position.set(0, scopeCenterY + 0.026, -0.016);
+        const elevTick = new THREE.Mesh(
+          track(new THREE.BoxGeometry(0.0018, 0.0018, 0.010)),
+          mats.brass,
+        );
+        elevTick.position.set(0, 0.0094, -0.004);
+        elevTurretGroup.add(elevTurret, elevTick);
+
         const windTurret = new THREE.Mesh(
           track(new THREE.CylinderGeometry(0.010, 0.0105, 0.014, 16)),
           mats.gunmetal,
@@ -1031,12 +1192,23 @@ export class WeaponAssembler {
         parallaxTurret.rotation.z = Math.PI * 0.5;
         parallaxTurret.position.set(-0.025, scopeCenterY, -0.016);
 
+        // Hollow zoom ring strictly forward of ocular glass (no solid end-cap flicker)
+        const zoomRingPivot = new THREE.Group();
+        zoomRingPivot.position.set(0, scopeCenterY, 0.064);
         const zoomRing = new THREE.Mesh(
-          track(new THREE.CylinderGeometry(0.0225, 0.0225, 0.026, 18)),
+          createHollowRingGeo(track, 0.0226, outerR + 0.0003, 0.022, 22),
           mats.gunmetal,
         );
-        zoomRing.rotation.x = Math.PI * 0.5;
-        zoomRing.position.set(0, scopeCenterY, 0.072);
+        const atacrLever = new THREE.Mesh(
+          track(new THREE.BoxGeometry(0.0042, 0.014, 0.0055)),
+          mats.anodized,
+        );
+        atacrLever.position.set(-0.019, 0.018, 0);
+        atacrLever.rotation.z = 0.7;
+        const zoomRingSocket = new THREE.Object3D();
+        zoomRingSocket.name = 'zoomRingSocket';
+        zoomRingSocket.position.set(-0.025, 0.022, 0.004);
+        zoomRingPivot.add(zoomRing, atacrLever, zoomRingSocket);
 
         const scopeMat = createScopeLensMaterial({
           reticleMode: 'sniper_mildot',
@@ -1046,12 +1218,12 @@ export class WeaponAssembler {
         scopeMat.userData.hasIllumination = Boolean(opticDef.hasIlluminatedReticle);
         scopeMat.uniforms.uIlluminated.value = opticDef.hasIlluminatedReticle ? 1.0 : 0.0;
         customMats.push(scopeMat);
-        const ocularRadius = 0.0175;
+        const ocularRadius = 0.0171;
         const reticleGlass = new THREE.Mesh(
-          track(new THREE.CircleGeometry(ocularRadius, 28)),
+          track(new THREE.CircleGeometry(ocularRadius, 32)),
           scopeMat,
         );
-        reticleGlass.position.set(0, scopeCenterY, 0.090);
+        reticleGlass.position.set(0, scopeCenterY, 0.094);
         reticleGlass.renderOrder = 6;
 
         const objGlass = new THREE.Mesh(
@@ -1065,21 +1237,24 @@ export class WeaponAssembler {
           mountBase,
           mainTube,
           frontBell,
-          elevTurret,
+          elevTurretGroup,
           windTurret,
           parallaxTurret,
-          zoomRing,
+          zoomRingPivot,
           reticleGlass,
           objGlass,
         );
         assembly.opticGroup = opticMount;
+        assembly.zoomRingPivot = zoomRingPivot;
+        assembly.zoomRingSocket = zoomRingSocket;
+        assembly.elevationTurretMesh = elevTurretGroup;
         assembly.reticleMaterial = scopeMat;
         assembly.scopeLensMaterial = scopeMat;
         assembly.ocularRadiusM = ocularRadius;
         assembly.sightAnchor.position.set(
           opticRestPos.x,
           opticRestPos.y + scopeCenterY,
-          opticRestPos.z + 0.090,
+          opticRestPos.z + 0.094,
         );
         assembly.objectiveSocket.position.set(
           opticRestPos.x,

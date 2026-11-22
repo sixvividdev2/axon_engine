@@ -2,7 +2,7 @@ import {
   LobbyRoomState,
   OperatorUniformId,
   SyncedAimStance,
-} from '../src/data/multiplayer';
+} from '../data/multiplayer';
 
 export interface CachedMatchState {
   powerOn: boolean;

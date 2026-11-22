@@ -18,6 +18,8 @@ import {
   createBodycamTelemetry,
   DEFAULT_BODYCAM_SDK_CONFIG,
   DEFAULT_TRAUMA_MODIFIERS,
+  GrenadeDetonationEvent,
+  GrenadeHoldStage,
   IBodycamWorldAdapter,
   LENS_PRESETS,
   operatorAssetLoader,
@@ -26,14 +28,23 @@ import {
   ScopeRenderer,
   SDK_WEAPON_LIST,
   SDK_WEAPON_PROFILES,
+  solveZeroPitchRad,
+  TacticalGrenadeSystem,
+  tacticalEquipmentStore,
   WeaponRig,
 } from '../bodycam-sdk';
+import {
+  getTacticalEquipmentDef,
+  TacticalBeltSlot,
+  TacticalEquipmentId,
+} from '../data/tacticalEquipment';
 import {
   AttachmentSlot,
   computeDerivedWeaponStats,
   createBareAttachments,
   DerivedWeaponStats,
   getCompatibleAttachments,
+  getDefaultZeroDistanceM,
   normalizeWeaponAttachments,
   ReticleColorId,
   WeaponAttachments,
@@ -92,6 +103,20 @@ export interface GymSnapshot {
   reticleIlluminated: boolean;
   armedAdsMode: AdsMode;
   hasCantedOptic: boolean;
+  tacticalEquipmentId: TacticalEquipmentId;
+  tacticalEquipmentName: string;
+  tacticalEquipmentShortName: string;
+  tacticalBeltSlot: TacticalBeltSlot;
+  tacticalMountOnBelt: boolean;
+  grenadeCount: number;
+  grenadeMax: number;
+  grenadeHoldStage: GrenadeHoldStage;
+  grenadeCooking: boolean;
+  grenadeCookRatio: number;
+  flashBlindAlpha: number;
+  zeroDistanceM: number;
+  zeroElevationMrad: number;
+  heightOverBoreM: number;
 }
 
 type Listener = (snap: GymSnapshot) => void;
@@ -125,6 +150,8 @@ export class GymEngine {
   private readonly postProcess: BodycamPostProcess;
   private readonly scopeRenderer: ScopeRenderer;
   private readonly ballistics: GymBallistics;
+  private readonly grenadeSystem: TacticalGrenadeSystem;
+  private readonly unsubTacticalEquipment: () => void;
 
   private config: BodycamSDKConfig = { ...DEFAULT_BODYCAM_SDK_CONFIG };
   private readonly telemetry: BodycamTelemetry = createBodycamTelemetry();
@@ -155,6 +182,15 @@ export class GymEngine {
   private flashlightOn = false;
   private simulatedArmTrauma = false;
   private lookingAtBench = false;
+  private tacticalEquipmentId: TacticalEquipmentId = tacticalEquipmentStore.getSelection().equipmentId;
+  private tacticalBeltSlot: TacticalBeltSlot = tacticalEquipmentStore.getSelection().beltSlot;
+  private tacticalMountOnBelt: boolean = tacticalEquipmentStore.getSelection().mountOnBelt;
+  private grenadeCount = 4;
+  private readonly grenadeMax = 4;
+  private flashBlindAlpha = 0;
+  private readonly _throwDir = new THREE.Vector3();
+  private readonly _throwOrigin = new THREE.Vector3();
+  private readonly _playerVelScratch = new THREE.Vector3();
 
   private isFiring = false;
   private shiftHeld = false;
@@ -354,6 +390,38 @@ export class GymEngine {
       this.world.paperTargets,
     );
 
+    this.grenadeSystem = new TacticalGrenadeSystem({
+      scene: this.scene,
+      physics: this.adapter,
+      worldRaycastMeshes: this.world.raycastMeshes,
+      worldBounds: {
+        minX: this.world.physics.boundsMinX,
+        maxX: this.world.physics.boundsMaxX,
+        minZ: this.world.physics.boundsMinZ,
+        maxZ: this.world.physics.boundsMaxZ,
+      },
+      audio: this.audio,
+      onShatterGlass: (obj, pt, dir) => {
+        if (this.world.shatterBreakable(obj, pt, dir)) {
+          this.audio.playGlassShatter(pt, 0.9);
+        }
+      },
+      onDetonate: (ev) => {
+        this.handleGrenadeDetonation(ev);
+      },
+    });
+
+    this.grenadeSystem.attachViewmodelCamera(this.camera);
+
+    this.syncBeltEquipmentMesh();
+    this.unsubTacticalEquipment = tacticalEquipmentStore.subscribe((sel) => {
+      this.tacticalEquipmentId = sel.equipmentId;
+      this.tacticalBeltSlot = sel.beltSlot;
+      this.tacticalMountOnBelt = sel.mountOnBelt;
+      this.syncBeltEquipmentMesh();
+      this.emitSnapshot();
+    });
+
     // Initialize bare weapon attachments (or restore saved Gunsmith loadout) & magazine counts
     const savedLoadout = this.saveManager.loadGymLoadout();
     for (const w of SDK_WEAPON_LIST) {
@@ -361,6 +429,9 @@ export class GymEngine {
         ? normalizeWeaponAttachments(w.id, savedLoadout[w.id])
         : createBareAttachments();
       this.attachmentsByWeapon[w.id] = att;
+      if (att.selectedAmmoId && AMMO_VARIANTS[att.selectedAmmoId as AmmoVariantId]) {
+        this.selectedAmmoVariantByWeapon[w.id] = att.selectedAmmoId as AmmoVariantId;
+      }
       const derived = computeDerivedWeaponStats(w.massKg, w.barrelLengthM, w.magCapacity, att);
       this.magAmmoByWeapon[w.id] = derived.magCapacity;
     }
@@ -428,12 +499,71 @@ export class GymEngine {
     const variant = AMMO_VARIANTS[variantId];
     if (!variant || variant.caliberId !== calId) return;
     this.selectedAmmoVariantByWeapon[prof.id] = variantId;
+    const curAtt = this.getAttachmentsFor(prof.id);
+    this.attachmentsByWeapon[prof.id] = normalizeWeaponAttachments(prof.id, {
+      ...curAtt,
+      selectedAmmoId: variantId,
+    });
+    this.saveManager.saveGymLoadout(this.attachmentsByWeapon);
     this.syncRuntimeProfile();
     this.audio.playWeaponCue('gunsmith_snap', { position: this.camera.position, intensity: 0.75 });
     this.showToast(
       `Ammo Loaded: ${variant.label} (${Math.round(this._runtimeProfile.muzzleVelocityMps)} m/s)`,
     );
     this.emitSnapshot();
+  }
+
+  public selectZeroDistance(distanceM: number): void {
+    const prof = SDK_WEAPON_PROFILES[this.equippedWeaponId];
+    if (!prof || prof.holdClass === 'unarmed') return;
+    const clampedDist = Math.max(25, Math.min(800, Math.round(distanceM)));
+    const curAtt = this.getAttachmentsFor(prof.id);
+    this.attachmentsByWeapon[prof.id] = normalizeWeaponAttachments(prof.id, {
+      ...curAtt,
+      zeroDistanceM: clampedDist,
+    });
+    this.saveManager.saveGymLoadout(this.attachmentsByWeapon);
+    this.syncRuntimeProfile();
+    this.emitSnapshot();
+  }
+
+  public adjustZeroElevationMrad(elevationMrad: number): void {
+    const prof = SDK_WEAPON_PROFILES[this.equippedWeaponId];
+    if (!prof || prof.holdClass === 'unarmed') return;
+    const clampedMrad = Math.round(THREE.MathUtils.clamp(elevationMrad, -10, 20) * 10) / 10;
+    const curAtt = this.getAttachmentsFor(prof.id);
+    this.attachmentsByWeapon[prof.id] = normalizeWeaponAttachments(prof.id, {
+      ...curAtt,
+      zeroElevationMrad: clampedMrad,
+    });
+    this.saveManager.saveGymLoadout(this.attachmentsByWeapon);
+    this.syncRuntimeProfile();
+    this.emitSnapshot();
+  }
+
+  public playGunsmithTurretClick(up: boolean): void {
+    this.audio.ensureInitialized();
+    this.audio.playTurretClick(up);
+  }
+
+  public playGunsmithTestFireSound(): void {
+    this.audio.ensureInitialized();
+    const prof = this.getWeaponProfile();
+    if (prof.holdClass === 'unarmed') return;
+    const derived = this.weaponRig.getDerivedStats();
+    const activeAmmo = this.getActiveAmmoVariant(prof.id);
+    const audioWeight: 'pistol' | 'carbine' | 'heavy_rifle' =
+      prof.weightClass === 'pistol' || prof.weightClass === 'heavy_rifle'
+        ? prof.weightClass
+        : 'carbine';
+    this.audio.playWeaponCue('fire', {
+      position: this.camera.position,
+      weightClass: audioWeight,
+      caliberId: activeAmmo.caliberId,
+      suppressed: derived.isSuppressed,
+      isSubsonic: activeAmmo.isSubsonic,
+      muzzleComp: derived.hasCompensator,
+    });
   }
 
   public toggleFireMode(): void {
@@ -472,6 +602,24 @@ export class GymEngine {
       this._runtimeProfile.ballisticCoefficient = ammo.ballisticCoefficient;
       this._runtimeProfile.bulletMassGrams = ammo.bulletMassGrams;
       this._runtimeProfile.spreadMOA = Math.hypot(base.spreadMOA, ammo.spreadMOA);
+
+      const att = this.getAttachmentsFor(base.id);
+      const zeroDistanceM = att.zeroDistanceM ?? getDefaultZeroDistanceM(base.category);
+      const zeroElevationMrad = att.zeroElevationMrad ?? 0;
+      const hob = this.weaponRig.getHeightOverBoreM();
+      const zeroPitchRad = solveZeroPitchRad({
+        muzzleVelocityMs: this._runtimeProfile.muzzleVelocityMps,
+        bc: this._runtimeProfile.ballisticCoefficient,
+        heightOverBoreM: hob,
+        zeroDistanceM,
+        extraElevationMrad: zeroElevationMrad,
+      });
+      this.weaponRig.setZeroConfig(zeroDistanceM, zeroElevationMrad, zeroPitchRad);
+      if (this.world.gunsmithBench.isOpen()) {
+        this.world.gunsmithBench.setShowcaseTurretElevation(zeroElevationMrad);
+      }
+    } else {
+      this.weaponRig.setZeroConfig(100, 0, 0);
     }
   }
 
@@ -590,6 +738,144 @@ export class GymEngine {
     this.emitSnapshot();
   }
 
+  private syncBeltEquipmentMesh(): void {
+    this.skeleton.setBeltEquipment(
+      this.tacticalEquipmentId,
+      this.tacticalBeltSlot,
+      this.grenadeCount,
+      this.tacticalMountOnBelt,
+    );
+  }
+
+  public setTacticalEquipment(id: TacticalEquipmentId): void {
+    tacticalEquipmentStore.setEquipment(id);
+    const def = getTacticalEquipmentDef(id);
+    this.grenadeCount = this.grenadeMax;
+    this.syncBeltEquipmentMesh();
+    this.audio.playGearRattle('weapon_swap', 0.65);
+    this.showToast(`Belt Ordnance Assigned: ${def.name}`);
+    this.emitSnapshot();
+  }
+
+  public setTacticalBeltSlot(slot: TacticalBeltSlot): void {
+    tacticalEquipmentStore.setBeltSlot(slot);
+    this.audio.playGearRattle('weapon_swap', 0.55);
+    this.showToast(`Belt Mount Updated: ${slot.replace('_', ' ').toUpperCase()}`);
+    this.emitSnapshot();
+  }
+
+  public setTacticalMountOnBelt(visible: boolean): void {
+    tacticalEquipmentStore.setMountOnBelt(visible);
+    this.showToast(visible ? 'Belt Mesh Mounted' : 'Belt Mesh Stowed');
+    this.emitSnapshot();
+  }
+
+  public restockTacticalEquipment(): void {
+    this.grenadeCount = this.grenadeMax;
+    this.syncBeltEquipmentMesh();
+    this.audio.playGearRattle('weapon_swap', 0.7);
+    this.showToast(`Ordnance Pouch Restocked (${this.grenadeCount}/${this.grenadeMax})`);
+    this.emitSnapshot();
+  }
+
+  public triggerQuickThrow(): void {
+    if (this.world.gunsmithBench.isActiveOrTransitioning()) return;
+    if (this.grenadeCount <= 0) {
+      this.restockTacticalEquipment();
+    }
+    this.camera.getWorldDirection(this._throwDir);
+    this._throwOrigin.copy(this.camera.position);
+    this.controller.getVelocity(this._playerVelScratch);
+    this.audio.playGrenadePinPull();
+    this.grenadeSystem.releaseThrow(
+      this._throwOrigin,
+      this._throwDir,
+      this._playerVelScratch,
+      this.tacticalEquipmentId,
+    );
+    this.grenadeCount = Math.max(0, this.grenadeCount - 1);
+    this.syncBeltEquipmentMesh();
+    const def = getTacticalEquipmentDef(this.tacticalEquipmentId);
+    this.showToast(`Thrown: ${def.shortName} (${this.grenadeCount}/${this.grenadeMax})`);
+    this.emitSnapshot();
+  }
+
+  private handleGrenadeDetonation(ev: GrenadeDetonationEvent): void {
+    const camPos = this.camera.position;
+    const dist = camPos.distanceTo(ev.position);
+
+    // Kick reactive AR500 steel targets & shatter nearby glass in Gym!
+    if (!ev.isTick && (ev.kind === 'frag' || ev.kind === 'flash')) {
+      for (let i = 0; i < this.world.steelTargets.length; i++) {
+        const st = this.world.steelTargets[i];
+        const stPos = new THREE.Vector3();
+        st.plateMesh.getWorldPosition(stPos);
+        if (ev.kind === 'frag') {
+          const fragRes = this.grenadeSystem.evaluateFragDamageAt(ev.position, stPos, ev.def);
+          if (fragRes.damage > 2) {
+            const kickScale = THREE.MathUtils.clamp(fragRes.damage / 110, 0.25, 1.4);
+            st.hitAngVel -= 14.5 * kickScale;
+            st.hitFlashTimer = 0.14;
+          }
+        } else {
+          const d = stPos.distanceTo(ev.position);
+          if (d <= ev.radiusM * 1.15) {
+            const falloff = Math.max(0.2, 1 - d / (ev.radiusM * 1.15));
+            st.hitAngVel -= 5.0 * falloff;
+            st.hitFlashTimer = 0.14;
+          }
+        }
+      }
+      if (ev.kind === 'frag') {
+        const glassList = this.world.raycastMeshes.filter(
+          (m) => m.userData?.breakableGlass && !m.userData.shattered,
+        );
+        for (let i = 0; i < glassList.length; i++) {
+          const gm = glassList[i];
+          const gPos = new THREE.Vector3();
+          gm.getWorldPosition(gPos);
+          if (gPos.distanceTo(ev.position) <= ev.radiusM * 0.9) {
+            const dir = gPos.clone().sub(ev.position).normalize();
+            if (this.world.shatterBreakable(gm, gPos, dir)) {
+              this.audio.playGlassShatter(gPos, 0.95);
+            }
+          }
+        }
+      }
+    }
+
+    // Concussion adrenaline & full bodycam CMOS flashbang overload + tinnitus
+    if (!ev.isTick && dist <= ev.radiusM * 1.35) {
+      const closeness = Math.max(0, 1 - dist / (ev.radiusM * 1.35));
+      if (ev.kind === 'frag') {
+        const fragRes = this.grenadeSystem.evaluateFragDamageAt(ev.position, camPos, ev.def);
+        if (fragRes.damage > 0 || closeness > 0.2) {
+          this.adrenalineStress = THREE.MathUtils.clamp(
+            this.adrenalineStress + 0.55 * closeness,
+            0,
+            1,
+          );
+        }
+      } else if (ev.kind === 'flash') {
+        this.camera.getWorldDirection(this._throwDir);
+        const exposure = this.grenadeSystem.computeFlashbangExposure(
+          ev.position,
+          camPos,
+          this._throwDir,
+          ev.radiusM * 1.25,
+        );
+        if (exposure.intensity > 0.05) {
+          this.postProcess.triggerFlashbangOverload(exposure.intensity);
+          this.audio.playFlashbangTinnitus(exposure.intensity);
+          this.flashBlindAlpha = Math.max(
+            this.flashBlindAlpha,
+            THREE.MathUtils.clamp(exposure.intensity * 0.34, 0, 0.36),
+          );
+        }
+      }
+    }
+  }
+
   public toggleSuppressor(): void {
     if (
       this.world.gunsmithBench.isActiveOrTransitioning() ||
@@ -633,6 +919,9 @@ export class GymEngine {
 
   public openGunsmith(): void {
     if (this.world.gunsmithBench.isOpen()) return;
+    if (this.grenadeSystem.isDrawn()) {
+      this.handleGrenadeHolsterOrToss();
+    }
     this.audio.ensureInitialized();
     this.weaponRig.cancelAction();
     this.tunerOpen = false;
@@ -658,6 +947,7 @@ export class GymEngine {
     const baseProf = SDK_WEAPON_PROFILES[this.equippedWeaponId] ?? SDK_WEAPON_PROFILES.m4_556;
     const att = this.getAttachmentsFor(baseProf.id);
     this.world.gunsmithBench.enter(this.camera, baseProf, att);
+    this.world.gunsmithBench.setShowcaseTurretElevation(att.zeroElevationMrad ?? 0);
     this.world.gunsmithBench.projectPins(
       this.camera,
       this.container.clientWidth || 1,
@@ -807,9 +1097,31 @@ export class GymEngine {
     }
   }
 
+  private handleGrenadeHolsterOrToss(): 'holstered' | 'tossed' | 'none' {
+    this.camera.getWorldDirection(this._throwDir);
+    this._throwOrigin.copy(this.camera.position);
+    this.controller.getVelocity(this._playerVelScratch);
+    const res = this.grenadeSystem.holsterOrTossOnSwitch(
+      this._throwOrigin,
+      this._throwDir,
+      this._playerVelScratch,
+    );
+    if (res === 'tossed') {
+      this.grenadeCount = Math.max(0, this.grenadeCount - 1);
+      this.syncBeltEquipmentMesh();
+      this.showToast('Live Grenade Tossed Clear!');
+    } else if (res === 'holstered') {
+      this.showToast('Grenade Re-Pinned & Holstered');
+    }
+    return res;
+  }
+
   public switchWeapon(weaponId: string, silent = false): void {
     const prof = SDK_WEAPON_PROFILES[weaponId];
     if (!prof) return;
+    if (this.grenadeSystem.isDrawn()) {
+      this.handleGrenadeHolsterOrToss();
+    }
     this.equippedWeaponId = prof.id;
     if (prof.holdClass !== 'unarmed') {
       this.lastFirearmId = prof.id;
@@ -904,10 +1216,9 @@ export class GymEngine {
 
   private cycleOpticZoom(dir: 1 | -1): void {
     if (!this.weaponRig.hasVariableZoom()) return;
-    const prev = this.weaponRig.getActiveOpticZoomMult();
-    const next = this.weaponRig.cycleOpticZoom(dir);
+    const prev = this.weaponRig.getTargetOpticZoomMult();
+    const next = this.weaponRig.cycleOpticZoom(dir, true);
     if (Math.abs(next - prev) < 0.01) return;
-    this.audio.playTacticalSwitchClick(dir > 0);
     this.showToast(`Optic Magnification: ${next.toFixed(1)}x`);
     this.emitSnapshot();
   }
@@ -944,7 +1255,13 @@ export class GymEngine {
     }
     this.animator.triggerMagCheck(prof.magCheckDurationSec);
     const rounds = this.magAmmoByWeapon[prof.id] ?? 0;
-    this.showToast(`Mag Check: ${rounds} / ${prof.magCapacity} (${prof.caliberLabel})`);
+    const att = this.getAttachmentsFor(prof.id);
+    const zeroDist = att.zeroDistanceM ?? getDefaultZeroDistanceM(prof.category);
+    const zeroMrad = att.zeroElevationMrad ?? 0;
+    const mradTag = zeroMrad !== 0 ? ` ${zeroMrad > 0 ? '+' : ''}${zeroMrad.toFixed(1)} MRAD` : '';
+    this.showToast(
+      `Mag Check: ${rounds}/${prof.magCapacity} · ${prof.caliberLabel} · ZERO ${zeroDist}m${mradTag}`,
+    );
     this.emitSnapshot();
   }
 
@@ -959,7 +1276,11 @@ export class GymEngine {
       return;
     }
     if (this.animator.triggerInspect()) {
-      this.showToast(`Inspecting ${prof.name}`);
+      const att = this.getAttachmentsFor(prof.id);
+      const zeroDist = att.zeroDistanceM ?? getDefaultZeroDistanceM(prof.category);
+      const zeroMrad = att.zeroElevationMrad ?? 0;
+      const mradTag = zeroMrad !== 0 ? ` (${zeroMrad > 0 ? '+' : ''}${zeroMrad.toFixed(1)} MRAD)` : '';
+      this.showToast(`Inspecting ${prof.name} · ZERO ${zeroDist}m${mradTag}`);
       this.emitSnapshot();
     }
   }
@@ -1095,13 +1416,15 @@ export class GymEngine {
       this.semiTriggerConsumed = true;
     }
 
+    if (this.grenadeSystem.isDrawn()) return;
     const derived = this.weaponRig.getDerivedStats();
     const activeAmmo = this.getActiveAmmoVariant(prof.id);
     const suppressed = derived.isSuppressed;
     this.animator.interruptInspect();
+    this.weaponRig.cancelZoomTwist();
 
-    // Sample world muzzle transform BEFORE recoil kick so shot leaves true aimed sightline
-    this.weaponRig.getMuzzleWorldTransform(this._muzzlePos, this._muzzleDir);
+    // Sample world muzzle transform BEFORE recoil kick, applying true HOB ballistic zeroing pitch
+    this.weaponRig.getMuzzleWorldTransform(this._muzzlePos, this._muzzleDir, true);
     this.ballistics.fireRound(
       this._muzzlePos,
       this._muzzleDir,
@@ -1169,6 +1492,9 @@ export class GymEngine {
       this.input.leanRight = false;
       this.input.holdBreath = false;
       this.input.vault = false;
+      if (this.grenadeSystem.isDrawn() && !this.grenadeSystem.isLeverReleased()) {
+        this.grenadeSystem.cancelCook();
+      }
     }
     this.emitSnapshot();
   };
@@ -1187,6 +1513,19 @@ export class GymEngine {
     }
     if (!this.pointerLocked) return;
     this.audio.ensureInitialized();
+
+    // Authentic 4-stage tactical grenade Manual of Arms when grenade is drawn
+    if (this.grenadeSystem.isDrawn()) {
+      if (e.button === 0 && this.grenadeSystem.getHoldStage() === 'DRAWN') {
+        this.grenadeSystem.pullPin();
+        this.emitSnapshot();
+      } else if (e.button === 2 && this.grenadeSystem.getHoldStage() === 'PIN_PULLED') {
+        this.grenadeSystem.releaseLever();
+        this.emitSnapshot();
+      }
+      return;
+    }
+
     if (e.button === 0) {
       this.animator.interruptInspect();
       this.isFiring = true;
@@ -1218,6 +1557,25 @@ export class GymEngine {
 
   private readonly onMouseUp = (e: MouseEvent): void => {
     if (e.button === 0) {
+      if (this.grenadeSystem.isPinPulled()) {
+        this.camera.getWorldDirection(this._throwDir);
+        this._throwOrigin.copy(this.camera.position);
+        this.controller.getVelocity(this._playerVelScratch);
+        if (
+          this.grenadeSystem.throwHeldGrenade(
+            this._throwOrigin,
+            this._throwDir,
+            this._playerVelScratch,
+          )
+        ) {
+          this.grenadeCount = Math.max(0, this.grenadeCount - 1);
+          this.syncBeltEquipmentMesh();
+          const def = getTacticalEquipmentDef(this.tacticalEquipmentId);
+          this.showToast(`Thrown: ${def.shortName} (${this.grenadeCount}/${this.grenadeMax})`);
+          this.emitSnapshot();
+        }
+        return;
+      }
       this.isFiring = false;
       this.semiTriggerConsumed = false;
     } else if (e.button === 2) {
@@ -1359,6 +1717,26 @@ export class GymEngine {
       case 'BracketLeft':
         if (!e.repeat && this.controller.isAds && this.weaponRig.hasVariableZoom()) {
           this.cycleOpticZoom(-1);
+        }
+        break;
+      case 'KeyH':
+      case 'Digit5':
+        if (!e.repeat) {
+          if (this.grenadeSystem.isDrawn()) {
+            this.handleGrenadeHolsterOrToss();
+            this.emitSnapshot();
+          } else if (this.grenadeCount <= 0) {
+            this.showToast('Ordnance Pouch Empty — Restock in [F1] Tactical Gear');
+          } else {
+            this.isFiring = false;
+            this.input.ads = false;
+            this.reloadTimer = 0;
+            this.weaponRig.cancelZoomTwist();
+            this.grenadeSystem.drawGrenade(this.tacticalEquipmentId);
+            const def = getTacticalEquipmentDef(this.tacticalEquipmentId);
+            this.showToast(`${def.shortName} Drawn — LMB Pin · RMB Lever · Release LMB Throw`);
+            this.emitSnapshot();
+          }
         }
         break;
       case 'Space':
@@ -1577,7 +1955,7 @@ export class GymEngine {
 
       this._fpsCamPos.copy(this.camera.position);
       this._fpsCamQuat.copy(this.camera.quaternion);
-      this.weaponRig.root.visible = true;
+      this.weaponRig.root.visible = !this.grenadeSystem.isDrawn();
       this.skeleton.root.visible = true;
 
       // Bench interaction look-at raycast
@@ -1611,11 +1989,21 @@ export class GymEngine {
       );
     }
 
-    // 3. Step Real-World Ballistics & Reactive AR500 Steel Targets
+    // 3. Step Real-World Ballistics, Tactical Grenades & Reactive AR500 Steel Targets
     this.ballistics.update(dt, this.adapter, (hitInfo) => {
       this.lastHit = hitInfo;
       this.emitSnapshot();
     });
+    const wasLiveBefore = this.grenadeSystem.isLeverReleased();
+    this.grenadeSystem.update(dt, this.camera.position);
+    if (wasLiveBefore && !this.grenadeSystem.isLeverReleased()) {
+      // Over-cooked live fuse in hand!
+      this.grenadeCount = Math.max(0, this.grenadeCount - 1);
+      this.syncBeltEquipmentMesh();
+    }
+    if (this.flashBlindAlpha > 0) {
+      this.flashBlindAlpha = Math.max(0, this.flashBlindAlpha - dt * 0.42);
+    }
     this.world.updateDynamicTargets(dt);
 
     // 4. Step AAA Bodycam Post-Process
@@ -1756,6 +2144,20 @@ export class GymEngine {
       reticleIlluminated: this.weaponRig.reticleIlluminated,
       armedAdsMode: this.getArmedAdsMode(prof.id),
       hasCantedOptic: this.weaponRig.hasCantedOptic(),
+      tacticalEquipmentId: this.tacticalEquipmentId,
+      tacticalEquipmentName: getTacticalEquipmentDef(this.tacticalEquipmentId).name,
+      tacticalEquipmentShortName: getTacticalEquipmentDef(this.tacticalEquipmentId).shortName,
+      tacticalBeltSlot: this.tacticalBeltSlot,
+      tacticalMountOnBelt: this.tacticalMountOnBelt,
+      grenadeCount: this.grenadeCount,
+      grenadeMax: this.grenadeMax,
+      grenadeHoldStage: this.grenadeSystem.getHoldStage(),
+      grenadeCooking: this.grenadeSystem.isCooking(),
+      grenadeCookRatio: this.grenadeSystem.getCookRatio(),
+      flashBlindAlpha: this.flashBlindAlpha,
+      zeroDistanceM: att.zeroDistanceM ?? getDefaultZeroDistanceM(prof.category),
+      zeroElevationMrad: att.zeroElevationMrad ?? 0,
+      heightOverBoreM: this.weaponRig.getHeightOverBoreM(),
     };
   }
 
@@ -1772,6 +2174,8 @@ export class GymEngine {
     if (document.pointerLockElement === this.renderer.domElement) {
       document.exitPointerLock();
     }
+    this.unsubTacticalEquipment();
+    this.grenadeSystem.dispose();
     this.ballistics.dispose();
     this.scopeRenderer.dispose();
     this.weaponRig.dispose();

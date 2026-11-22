@@ -24,6 +24,11 @@ import { MultiplayerHubPanel } from './MultiplayerHubPanel';
 import { OperatorSelectPanel } from './OperatorSelectPanel';
 import { useOperatorSelection } from '../bodycam-sdk/operator/OperatorSelectionStore';
 import { OPERATOR_PROFILES } from '../bodycam-sdk/operator/OperatorTypes';
+import { useTacticalEquipmentSelection } from '../bodycam-sdk/equipment/TacticalEquipmentStore';
+import {
+  TACTICAL_EQUIPMENT_LIST,
+  TacticalEquipmentId,
+} from '../data/tacticalEquipment';
 
 export type HubTabId = TopLevelModeId | 'operator' | 'multiplayer';
 
@@ -63,6 +68,8 @@ export const MainMenuHub: React.FC<MainMenuHubProps> = ({
   const { friends, incomingRequests, openDrawer: openSocialDrawer } = useSocial();
   const { lobby } = useLobby();
   const [selectedOperatorId] = useOperatorSelection();
+  const { selection: tacticalSelection, setEquipment: setTacticalEquipmentId } =
+    useTacticalEquipmentSelection();
   const [activeTab, setActiveTab] = useState<HubTabId>(lobby ? 'multiplayer' : initialTab);
   const [battleConfig, setBattleConfig] = useState<BattleMatchConfig>(initialBattleConfig);
   const [infectionConfig, setInfectionConfig] =
@@ -299,7 +306,41 @@ export const MainMenuHub: React.FC<MainMenuHubProps> = ({
                 <span className="text-neutral-600">·</span>
                 <span>Dual-Render PiP Scopes &amp; Canted Sights</span>
                 <span className="text-neutral-600">·</span>
-                <span>Gunsmith Loadout Persistence</span>
+                <span>Belt Tactical Ordnance &amp; Gunsmith Persistence</span>
+              </div>
+
+              {/* Belt Tactical Grenade Selector for Playground */}
+              <div className="mt-4 border border-neutral-800 bg-neutral-950/88 p-3.5">
+                <div className="flex items-center justify-between">
+                  <span className="font-mono-tabular text-[10px] uppercase tracking-[0.18em] text-neutral-400">
+                    Belt Tactical Equipment (All Modes)
+                  </span>
+                  <span className="font-mono-tabular text-[10px] text-amber-300">
+                    Hold H / 5 in Range · 4 / H in Combat
+                  </span>
+                </div>
+                <div className="mt-2 grid grid-cols-2 gap-1.5 sm:grid-cols-4">
+                  {TACTICAL_EQUIPMENT_LIST.map((eq) => {
+                    const active = tacticalSelection.equipmentId === eq.id;
+                    return (
+                      <button
+                        key={eq.id}
+                        type="button"
+                        onClick={() => setTacticalEquipmentId(eq.id)}
+                        className={`cursor-pointer border px-2.5 py-2 text-left font-mono-tabular transition-colors ${
+                          active
+                            ? 'border-amber-400 bg-amber-500/20 text-amber-200'
+                            : 'border-neutral-800 bg-neutral-900/80 text-neutral-400 hover:border-neutral-600 hover:text-neutral-200'
+                        }`}
+                      >
+                        <div className="text-[11px] font-semibold uppercase">{eq.shortName}</div>
+                        <div className="text-[9px] uppercase opacity-75">
+                          {eq.category} · {eq.fuseSec.toFixed(1)}s fuse
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
               </div>
 
               <div className="mt-6 flex flex-wrap items-center gap-3">
@@ -361,7 +402,7 @@ export const MainMenuHub: React.FC<MainMenuHubProps> = ({
               </div>
 
               {/* Match Parameters & Loadout Strip */}
-              <div className="grid grid-cols-1 gap-3 border border-neutral-800 bg-neutral-950/88 p-4 md:grid-cols-5">
+              <div className="grid grid-cols-1 gap-3 border border-neutral-800 bg-neutral-950/88 p-4 md:grid-cols-6">
                 {/* Bot Count */}
                 <div>
                   <div className="font-mono-tabular text-[10px] uppercase tracking-wider text-neutral-400">
@@ -490,6 +531,32 @@ export const MainMenuHub: React.FC<MainMenuHubProps> = ({
                     })}
                   </select>
                 </div>
+
+                {/* Tactical Grenade */}
+                <div>
+                  <label
+                    htmlFor="battle-grenade-select"
+                    className="block font-mono-tabular text-[10px] uppercase tracking-wider text-amber-400/90"
+                  >
+                    Tactical Grenade
+                  </label>
+                  <select
+                    id="battle-grenade-select"
+                    value={tacticalSelection.equipmentId}
+                    onChange={(e) => {
+                      const nextId = e.target.value as TacticalEquipmentId;
+                      setTacticalEquipmentId(nextId);
+                      updateBattle({ tacticalEquipmentId: nextId });
+                    }}
+                    className="mt-1.5 w-full cursor-pointer border border-neutral-700 bg-neutral-900 px-2.5 py-1.5 font-mono-tabular text-xs text-neutral-100 focus:border-amber-400 focus:outline-none"
+                  >
+                    {TACTICAL_EQUIPMENT_LIST.map((eq) => (
+                      <option key={eq.id} value={eq.id}>
+                        {eq.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
               </div>
 
               {/* Shared MapSelector (theme="tactical") */}
@@ -514,7 +581,12 @@ export const MainMenuHub: React.FC<MainMenuHubProps> = ({
                 </div>
                 <button
                   type="button"
-                  onClick={() => onLaunchBattle(battleConfig)}
+                  onClick={() =>
+                    onLaunchBattle({
+                      ...battleConfig,
+                      tacticalEquipmentId: tacticalSelection.equipmentId,
+                    })
+                  }
                   className="cursor-pointer whitespace-nowrap shrink-0 bg-amber-500 px-8 py-3 font-display text-base font-bold uppercase tracking-wider text-neutral-950 transition-colors hover:bg-amber-400"
                 >
                   Deploy Match
@@ -554,6 +626,43 @@ export const MainMenuHub: React.FC<MainMenuHubProps> = ({
                 />
               </div>
 
+              {/* Starting Belt Grenade Selector for Infection */}
+              <div className="flex flex-wrap items-center justify-between gap-3 border border-red-950/80 bg-neutral-950/86 px-4 py-3">
+                <div>
+                  <div className="font-mono-tabular text-[10px] uppercase tracking-[0.18em] text-red-400">
+                    Starting Belt Ordnance (+1 Per Cleared Wave)
+                  </div>
+                  <div className="mt-0.5 font-mono-tabular text-[11px] text-neutral-400">
+                    Mounted on operator waist belt · Hold 4 or H to cook &amp; throw
+                  </div>
+                </div>
+                <div className="flex flex-wrap gap-1.5">
+                  {TACTICAL_EQUIPMENT_LIST.map((eq) => {
+                    const active = tacticalSelection.equipmentId === eq.id;
+                    return (
+                      <button
+                        key={eq.id}
+                        type="button"
+                        onClick={() => {
+                          setTacticalEquipmentId(eq.id);
+                          setInfectionConfig((prev) => ({
+                            ...prev,
+                            tacticalEquipmentId: eq.id,
+                          }));
+                        }}
+                        className={`cursor-pointer whitespace-nowrap border px-3 py-1.5 font-mono-tabular text-[11px] font-semibold uppercase transition-colors ${
+                          active
+                            ? 'border-red-500 bg-red-600/25 text-red-100'
+                            : 'border-neutral-800 bg-neutral-900 text-neutral-400 hover:border-neutral-600 hover:text-neutral-200'
+                        }`}
+                      >
+                        {eq.shortName}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
               <div className="flex flex-wrap items-center justify-between gap-3 border-t border-red-950/80 pt-3">
                 <div className="font-mono-tabular text-[11px] text-neutral-300">
                   Buyable Doors · Backstage Power Switch · Wall-Buys &amp; Ammo Refills · 950 PTS
@@ -561,7 +670,12 @@ export const MainMenuHub: React.FC<MainMenuHubProps> = ({
                 </div>
                 <button
                   type="button"
-                  onClick={() => onLaunchInfection(infectionConfig)}
+                  onClick={() =>
+                    onLaunchInfection({
+                      ...infectionConfig,
+                      tacticalEquipmentId: tacticalSelection.equipmentId,
+                    })
+                  }
                   className="cursor-pointer whitespace-nowrap shrink-0 bg-red-600 px-8 py-3 font-display text-base font-bold uppercase tracking-wider text-neutral-50 transition-colors hover:bg-red-500"
                 >
                   Enter Infection
@@ -584,7 +698,7 @@ export const MainMenuHub: React.FC<MainMenuHubProps> = ({
         <footer className="flex flex-wrap items-center justify-between gap-3 border-t border-neutral-800/70 pt-3 font-mono-tabular text-[11px] text-neutral-400">
           <div>
             WASD Move · Shift Sprint / Hold Breath · RMB ADS · MMB Point Aim · R Reload · G
-            Suppressor · V Bash · X Kick · F Interact / Light
+            Suppressor · 4 / H Grenade · V Bash · X Kick · F Interact / Light
           </div>
           <div className="text-neutral-500">
             Operator: {selectedOperatorProfile.label} ({selectedOperatorProfile.callsign}) · F1

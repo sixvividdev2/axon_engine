@@ -112,13 +112,27 @@ function buildKinoTheater(
   const screenTex = trackTex(createCinemaScreenTexture(maxAniso));
 
   const matTile = trackMat(
-    new THREE.MeshStandardMaterial({ map: tileTex, roughness: 0.42, metalness: 0.08 }),
+    new THREE.MeshStandardMaterial({
+      map: tileTex,
+      roughness: 0.42,
+      metalness: 0.08,
+      polygonOffset: true,
+      polygonOffsetFactor: -2,
+      polygonOffsetUnits: -4,
+    }),
   );
   const matTheaterWall = trackMat(
     new THREE.MeshStandardMaterial({ map: wallTex, roughness: 0.84, metalness: 0.05 }),
   );
   const matCarpet = trackMat(
-    new THREE.MeshStandardMaterial({ color: 0x45151a, roughness: 0.96, metalness: 0.02 }),
+    new THREE.MeshStandardMaterial({
+      color: 0x45151a,
+      roughness: 0.96,
+      metalness: 0.02,
+      polygonOffset: true,
+      polygonOffsetFactor: -2,
+      polygonOffsetUnits: -4,
+    }),
   );
   const matVelvet = trackMat(
     new THREE.MeshStandardMaterial({ color: 0x7a171e, roughness: 0.9, metalness: 0.04 }),
@@ -142,7 +156,14 @@ function buildKinoTheater(
     new THREE.MeshStandardMaterial({ color: 0x1b1618, roughness: 0.95, metalness: 0.03 }),
   );
   const matScreen = trackMat(
-    new THREE.MeshStandardMaterial({ map: screenTex, roughness: 0.92, metalness: 0.02 }),
+    new THREE.MeshStandardMaterial({
+      map: screenTex,
+      roughness: 0.92,
+      metalness: 0.02,
+      polygonOffset: true,
+      polygonOffsetFactor: -2,
+      polygonOffsetUnits: -4,
+    }),
   );
   const matExitGlow = trackMat(
     new THREE.MeshStandardMaterial({
@@ -195,21 +216,21 @@ function buildKinoTheater(
   sceneGroup.add(baseFloor);
   raycastMeshes.push(baseFloor);
 
-  // Grand Lobby Checkered Tile (Z in [8, 22], X in [-13, 13])
-  const lobbyFloor = new THREE.Mesh(trackGeo(new THREE.PlaneGeometry(26, 14)), matTile);
+  // Grand Lobby Checkered Tile (Z in [8.25, 21.95], X in [-12.75, 12.75])
+  const lobbyFloor = new THREE.Mesh(trackGeo(new THREE.PlaneGeometry(25.5, 13.7)), matTile);
   lobbyFloor.rotation.x = -Math.PI * 0.5;
-  lobbyFloor.position.set(0, 0.02, 15);
+  lobbyFloor.position.set(0, 0.02, 15.1);
   lobbyFloor.receiveShadow = !isSoftwareGl;
   lobbyFloor.userData.surfaceMaterial = 'concrete';
   sceneGroup.add(lobbyFloor);
   raycastMeshes.push(lobbyFloor);
   physics.addSurfaceZone({ minX: -13, maxX: 13, minZ: 8, maxZ: 22, surface: 'concrete' });
 
-  // Main Auditorium Sloped Carpet Floor (Z in [-8, 8], gently rises from Y=0 at Z=-8 to Y=1.2 at Z=8)
-  const audFloorSlopeLen = Math.hypot(16, 1.2);
-  const audFloor = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(26, 0.22, audFloorSlopeLen)), matCarpet);
-  audFloor.position.set(0, 0.49, 0);
-  audFloor.rotation.x = Math.atan2(1.2, 16);
+  // Main Auditorium Sloped Carpet Floor (Z in [-8, 7.75], seated cleanly above baseFloor without clipping pitFloor)
+  const audFloorSlopeLen = Math.hypot(15.75, 1.2);
+  const audFloor = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(25.5, 0.14, audFloorSlopeLen)), matCarpet);
+  audFloor.position.set(0, 0.56, -0.125);
+  audFloor.rotation.x = Math.atan2(1.2, 15.75);
   audFloor.receiveShadow = !isSoftwareGl;
   audFloor.userData.surfaceMaterial = 'wood';
   sceneGroup.add(audFloor);
@@ -225,10 +246,10 @@ function buildKinoTheater(
     surface: 'wood',
   });
 
-  // Flat orchestra pit floor between sloped seats & stage (Z in [-15, -8], Y = 0)
-  const pitFloor = new THREE.Mesh(trackGeo(new THREE.PlaneGeometry(26, 7.2)), matCarpet);
+  // Flat orchestra pit floor between sloped seats & stage (Z in [-15.0, -8.05], zero overlap with audFloor)
+  const pitFloor = new THREE.Mesh(trackGeo(new THREE.PlaneGeometry(25.5, 6.95)), matCarpet);
   pitFloor.rotation.x = -Math.PI * 0.5;
-  pitFloor.position.set(0, 0.02, -11.5);
+  pitFloor.position.set(0, 0.02, -11.525);
   pitFloor.receiveShadow = !isSoftwareGl;
   pitFloor.userData.surfaceMaterial = 'wood';
   sceneGroup.add(pitFloor);
@@ -263,42 +284,40 @@ function buildKinoTheater(
   // Interior Acoustic Zones (Lobby, Auditorium, West Wing are indoor; East Alley is outdoor!)
   physics.addInteriorZone({ minX: -22, maxX: 13, minY: 0, maxY: 9, minZ: -24, maxZ: 22, material: 'wood' });
 
-  // === 2. MAIN ARCHITECTURAL WALLS & CEILINGS ===
+  // === 2. MAIN ARCHITECTURAL WALLS & CEILINGS (non-overlapping corner joints) ===
   const H = 7.6;
-  // South Grand Entrance Wall (behind player spawn, Z = 22)
-  addSolidBox(0, H * 0.5, 22.2, 26.6, H, 0.5, matTheaterWall);
-  // North Stage Back Wall (Z = -24.2)
-  addSolidBox(0, H * 0.5, -24.2, 45.0, H, 0.5, matTheaterWall);
-  // West Outer Wall (West Dressing Corridor, X = -22.2)
-  addSolidBox(-22.2, H * 0.5, -5.0, 0.5, H, 38.8, matTheaterWall);
-  addSolidBox(-17.6, H * 0.5, 14.2, 9.6, H, 0.5, matTheaterWall); // closes South end of West Wing
-  // East Outer Alley Fence/Brick Wall (X = 22.2)
-  addSolidBox(22.2, 3.8, -5.0, 0.5, 7.6, 38.8, matAlley);
-  addSolidBox(17.6, 3.8, 14.2, 9.6, 7.6, 0.5, matAlley); // closes South end of Alley
+  // South Grand Entrance Wall (behind player spawn, Z = 22.2, X in [-13.225, 13.225])
+  addSolidBox(0, H * 0.5, 22.2, 26.45, H, 0.5, matTheaterWall);
+  // North Stage Back Wall (Z = -24.2, X in [-22.45, 22.45])
+  addSolidBox(0, H * 0.5, -24.2, 44.9, H, 0.5, matTheaterWall);
+  // West Outer Wall (X = -22.2, Z in [-23.95, 14.45], butts cleanly against North wall)
+  addSolidBox(-22.2, H * 0.5, -4.75, 0.5, H, 38.4, matTheaterWall);
+  addSolidBox(-17.5875, H * 0.5, 14.2, 8.725, H, 0.5, matTheaterWall); // X in [-21.95, -13.225]
+  // East Outer Alley Fence/Brick Wall (X = 22.2, Z in [-23.95, 14.45])
+  addSolidBox(22.2, 3.8, -4.75, 0.5, 7.6, 38.4, matAlley);
+  addSolidBox(17.5875, 3.8, 14.2, 8.725, 7.6, 0.5, matAlley); // X in [13.225, 21.95]
 
-  // Wall dividing Lobby (Z > 8) from Auditorium (Z < 8) — solid central wall so progression routes through wings or upper balcony!
-  addSolidBox(0, H * 0.5, 8.0, 26.0, H, 0.5, matTheaterWall);
+  // Wall dividing Lobby (Z > 8) from Auditorium (Z < 8), fitting strictly inside X in [-12.775, 12.775]
+  addSolidBox(0, H * 0.5, 8.0, 25.55, H, 0.5, matTheaterWall);
 
-  // West Interior Wall separating Lobby/Auditorium (X = -13) with 2 doorway breaches for buyable doors
-  // Breach 1: Lobby -> West Wing at Z in [8.8, 12.2]
-  // Breach 2: West Wing -> Auditorium at Z in [-13.2, -9.8]
-  addSolidBox(-13.0, H * 0.5, 17.2, 0.45, H, 10.0, matTheaterWall); // Z 12.2..22.2
+  // West Interior Wall separating Lobby/Auditorium (X = -13, Z strictly in [-23.95, 21.95])
+  addSolidBox(-13.0, H * 0.5, 17.075, 0.45, H, 9.75, matTheaterWall); // Z 12.2..21.95
   addSolidBox(-13.0, H * 0.5, -0.5, 0.45, H, 18.6, matTheaterWall); // Z -9.8..8.8
-  addSolidBox(-13.0, H * 0.5, -18.7, 0.45, H, 11.0, matTheaterWall); // Z -24.2..-13.2
+  addSolidBox(-13.0, H * 0.5, -18.575, 0.45, H, 10.75, matTheaterWall); // Z -23.95..-13.2
   // Door headers
   addSolidBox(-13.0, 5.4, 10.5, 0.45, 4.4, 3.4, matTheaterWall);
   addSolidBox(-13.0, 5.4, -11.5, 0.45, 4.4, 3.4, matTheaterWall);
 
-  // East Interior Wall separating Lobby/Auditorium from Moonlit Alley (X = 13) with 2 doorway breaches
-  addSolidBox(13.0, H * 0.5, 17.2, 0.45, H, 10.0, matTheaterWall);
+  // East Interior Wall separating Lobby/Auditorium from Moonlit Alley (X = 13, Z strictly in [-23.95, 21.95])
+  addSolidBox(13.0, H * 0.5, 17.075, 0.45, H, 9.75, matTheaterWall);
   addSolidBox(13.0, H * 0.5, -0.5, 0.45, H, 18.6, matTheaterWall);
-  addSolidBox(13.0, H * 0.5, -18.7, 0.45, H, 11.0, matTheaterWall);
+  addSolidBox(13.0, H * 0.5, -18.575, 0.45, H, 10.75, matTheaterWall);
   addSolidBox(13.0, 5.4, 10.5, 0.45, 4.4, 3.4, matTheaterWall);
   addSolidBox(13.0, 5.4, -11.5, 0.45, 4.4, 3.4, matTheaterWall);
 
-  // Ceilings (Lobby, Auditorium, West Wing; East Back Alley stays open to the moonlit sky!)
-  addSolidBox(0, H + 0.15, -1.0, 26.5, 0.3, 46.8, matCeiling);
-  addSolidBox(-17.6, 4.4, -5.0, 9.6, 0.3, 38.8, matCeiling);
+  // Ceilings (seated strictly atop/inside walls with zero coplanar penetration)
+  addSolidBox(0, H + 0.15, -1.0, 26.45, 0.3, 46.9, matCeiling);
+  addSolidBox(-17.5875, 4.4, -5.0, 8.725, 0.3, 37.9, matCeiling);
 
   // === 3. GRAND SPAWN LOBBY: Ticket Booth, Twin Staircases & Mezzanine Overlook ===
   // Ornate Central Ticket Booth (kiteable centerpiece!)
@@ -314,7 +333,15 @@ function buildKinoTheater(
   );
   const marquee = new THREE.Mesh(
     trackGeo(new THREE.PlaneGeometry(5.6, 1.4)),
-    trackMat(new THREE.MeshStandardMaterial({ map: marqueeTex, roughness: 0.55 })),
+    trackMat(
+      new THREE.MeshStandardMaterial({
+        map: marqueeTex,
+        roughness: 0.55,
+        polygonOffset: true,
+        polygonOffsetFactor: -2,
+        polygonOffsetUnits: -4,
+      }),
+    ),
   );
   marquee.position.set(0, 5.2, 8.28);
   sceneGroup.add(marquee);
@@ -396,21 +423,21 @@ function buildKinoTheater(
     physics.addBox({ minX: 2.0, maxX: 8.6, minY: y, maxY: y + 0.95, minZ: z - 0.35, maxZ: z + 0.4, surface: 'wood', blocksMovement: true });
   }
 
-  // Massive Torn Vintage Cinema Screen & Heavy Velvet Proscenium Curtains on Stage
+  // Massive Torn Vintage Cinema Screen & Heavy Velvet Proscenium Curtains (non-overlapping valance)
   const screenMesh = new THREE.Mesh(trackGeo(new THREE.PlaneGeometry(15.5, 5.4)), matScreen);
   screenMesh.position.set(0, 4.1, -23.85);
   sceneGroup.add(screenMesh);
-  addSolidBox(-9.5, 4.1, -23.5, 3.8, 6.4, 0.8, matVelvet, 'wood');
-  addSolidBox(9.5, 4.1, -23.5, 3.8, 6.4, 0.8, matVelvet, 'wood');
+  addSolidBox(-9.5, 3.65, -23.5, 3.8, 5.6, 0.8, matVelvet, 'wood');
+  addSolidBox(9.5, 3.65, -23.5, 3.8, 5.6, 0.8, matVelvet, 'wood');
   addSolidBox(0, 6.9, -23.4, 22.8, 0.9, 0.9, matVelvet, 'wood');
 
   // === 5. UPPER PROJECTOR BOOTH (Zone 5: 'projector', Y = 4.2m overlooking auditorium!) ===
   const PROJ_Y = 4.2;
-  // Booth floor & side walls
-  addSolidBox(0, PROJ_Y - 0.14, 5.6, 10.6, 0.28, 4.6, matStageWood, 'wood');
-  addSolidBox(0, PROJ_Y + 0.52, 3.4, 10.6, 1.04, 0.24, matTheaterWall); // viewing slit parapet
-  addSolidBox(-5.2, PROJ_Y + 1.5, 5.6, 0.28, 3.0, 4.6, matTheaterWall);
-  addSolidBox(5.2, PROJ_Y + 1.5, 5.6, 0.28, 3.0, 4.6, matTheaterWall);
+  // Booth floor & non-overlapping parapet + side walls (clear of Z = 7.75 divider face)
+  addSolidBox(0, PROJ_Y - 0.14, 5.515, 10.68, 0.28, 4.47, matStageWood, 'wood');
+  addSolidBox(0, PROJ_Y + 0.52, 3.4, 10.12, 1.04, 0.24, matTheaterWall); // viewing slit parapet between side walls
+  addSolidBox(-5.2, PROJ_Y + 1.5, 5.515, 0.28, 3.0, 4.47, matTheaterWall);
+  addSolidBox(5.2, PROJ_Y + 1.5, 5.515, 0.28, 3.0, 4.47, matTheaterWall);
 
   // Stair ramp from Auditorium Rear-West up into Projector Booth (X in [-11.5, -5.2], Z in [4.5, 7.2])
   physics.addRamp({
@@ -468,19 +495,36 @@ function buildKinoTheater(
     const mainBarrier = addSolidBox(x, y + h * 0.5, z, w, h, d, matBarricadeWood, 'wood', `col_${id}`, visualGroup);
     mainBarrier.userData.interactableId = id;
 
-    const beamA = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(Math.max(w, d) * 1.05, 0.22, 0.28)), matBrass);
-    beamA.position.set(x, y + h * 0.45, z);
+    const alongZ = d > w;
+    const beamA = new THREE.Mesh(
+      trackGeo(new THREE.BoxGeometry(Math.max(w, d) * 0.98, 0.22, 0.08)),
+      matBrass,
+    );
+    beamA.position.set(
+      x + (alongZ ? w * 0.5 + 0.05 : 0),
+      y + h * 0.45,
+      z + (alongZ ? 0 : d * 0.5 + 0.05),
+    );
     beamA.rotation.z = 0.24;
-    if (d > w) beamA.rotation.y = Math.PI * 0.5;
+    if (alongZ) beamA.rotation.y = Math.PI * 0.5;
     visualGroup.add(beamA);
 
     const doorSignTex = trackTex(createStencilSignTexture(label, `${cost} PTS · [F] CLEAR`, '#ef4444', '#1d0d10', maxAniso));
     const plaque = new THREE.Mesh(
       trackGeo(new THREE.PlaneGeometry(1.7, 0.65)),
-      trackMat(new THREE.MeshStandardMaterial({ map: doorSignTex, roughness: 0.6, side: THREE.DoubleSide })),
+      trackMat(
+        new THREE.MeshStandardMaterial({
+          map: doorSignTex,
+          roughness: 0.6,
+          side: THREE.DoubleSide,
+          polygonOffset: true,
+          polygonOffsetFactor: -2,
+          polygonOffsetUnits: -4,
+        }),
+      ),
     );
-    plaque.position.set(x + (d > w ? 0.36 : 0), y + 1.5, z + (w >= d ? 0.36 : 0));
-    if (d > w) plaque.rotation.y = Math.PI * 0.5;
+    plaque.position.set(x + (alongZ ? 0.36 : 0), y + 1.5, z + (alongZ ? 0 : 0.36));
+    if (alongZ) plaque.rotation.y = Math.PI * 0.5;
     visualGroup.add(plaque);
 
     interactables.push({
@@ -573,7 +617,17 @@ function buildKinoTheater(
     const tex = trackTex(createWallBuyTexture(weaponLabel, cost, maxAniso));
     const plaque = new THREE.Mesh(
       trackGeo(new THREE.PlaneGeometry(1.65, 0.82)),
-      trackMat(new THREE.MeshStandardMaterial({ map: tex, transparent: true, roughness: 0.7 })),
+      trackMat(
+        new THREE.MeshStandardMaterial({
+          map: tex,
+          transparent: true,
+          depthWrite: false,
+          roughness: 0.7,
+          polygonOffset: true,
+          polygonOffsetFactor: -2,
+          polygonOffsetUnits: -4,
+        }),
+      ),
     );
     plaque.position.set(x, y, z);
     plaque.rotation.y = rotY;

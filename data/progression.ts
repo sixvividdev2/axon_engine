@@ -118,9 +118,9 @@ export const STARTER_WEAPON_IDS: ReadonlySet<string> = new Set([
  * when the rifle itself is unlocked. Explicitly excludes DMRs.
  */
 export const BOLT_ACTION_AUTO_SCOPE: Readonly<Record<string, string>> = {
-  mosin_m91_30: 'optic_pso1_4x',
-  colt_c19: 'optic_lpvo_1_6',
-  remington_m24: 'optic_lpvo_1_6',
+  mosin_m91_30: 'optic_pso1m2',
+  colt_c19: 'optic_razor_1_6',
+  remington_m24: 'optic_razor_1_6',
   sv_98: 'optic_nightforce_atacr',
   ai_awm: 'optic_nightforce_atacr',
   barrett_mrad: 'optic_nightforce_atacr',
@@ -208,6 +208,11 @@ export const ATTACHMENT_UNLOCK_GUN_LEVEL: Readonly<Record<string, number>> = {
   optic_t2_red_dot: 5,
   mag_pm_12: 5,
 
+  // Rail Adapters & Starter Reflex (Lv. 1)
+  rail_b13_dovetail: 1,
+  rail_mp5_claw: 1,
+  optic_rmr_type2: 1,
+
   // Mid-tier handling, lasers, holos & standard mags (Lv. 6–10)
   tac_laser_red: 6,
   optic_eotech_holo: 7,
@@ -216,6 +221,7 @@ export const ATTACHMENT_UNLOCK_GUN_LEVEL: Readonly<Record<string, number>> = {
   canted_kobra_rd: 8,
   mag_ak_30: 8,
   optic_pso1_4x: 9,
+  optic_pso1m2: 1,
   mag_saiga_10: 9,
   canted_eotech_holo: 10,
   mag_ar10_20: 10,
@@ -226,6 +232,7 @@ export const ATTACHMENT_UNLOCK_GUN_LEVEL: Readonly<Record<string, number>> = {
   muzzle_nagant_bramit: 12,
   muzzle_9mm_suppressor: 12,
   optic_lpvo_1_6: 12,
+  optic_razor_1_6: 1,
   mag_ak_45_bakelite: 13,
   muzzle_pbs4_545: 14,
   muzzle_salvo_12ga: 15,

@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { ArticulatedRagdoll, BodycamAudio } from '../bodycam-sdk';
+import { ActiveSmokeCloudInfo, ArticulatedRagdoll, BodycamAudio } from '../bodycam-sdk';
 import {
   normalizeOperatorId,
   OperatorId,
@@ -169,6 +169,7 @@ interface BotActor {
   targetYaw: number;
   walkCycle: number;
   flinchTimer: number;
+  stunTimer: number;
   hasNetState: boolean;
   firingVisualTimer: number;
   recoilKick: number;
@@ -190,6 +191,9 @@ interface BotActor {
   fireTimer: number;
   burstCooldown: number;
   muzzleFlashTimer: number;
+  smokeAlertTimer: number;
+  smokeFlankDir: number;
+  smokeCloudPos: THREE.Vector3;
 
   // 3D Hierarchy (Unified TacticalOperatorRig) & Articulated Ragdoll
   rig: BuiltTacticalOperatorRig;
@@ -365,6 +369,7 @@ export class BattleBotAI {
         targetYaw: 0,
         walkCycle: Math.random() * Math.PI * 2,
         flinchTimer: 0,
+        stunTimer: 0,
         hasNetState: false,
         firingVisualTimer: 0,
         recoilKick: 0,
@@ -382,6 +387,9 @@ export class BattleBotAI {
         fireTimer: 0,
         burstCooldown: 0.4 + Math.random() * 0.5,
         muzzleFlashTimer: 0,
+        smokeAlertTimer: 0,
+        smokeFlankDir: Math.random() < 0.5 ? -1 : 1,
+        smokeCloudPos: new THREE.Vector3(),
         rig,
         ragdoll: new ArticulatedRagdoll(),
         root: rig.root,
@@ -801,6 +809,99 @@ export class BattleBotAI {
     this.rebuildActiveHitMeshes();
   }
 
+  /**
+   * Applies tactical grenade AoE damage or flashbang stun to hostile bots with line-of-sight occlusion.
+   */
+  public applyAreaBlast(
+    origin: Readonly<THREE.Vector3>,
+    radiusM: number,
+    maxDamage: number,
+    kind: 'frag' | 'flash' | 'smoke' | 'thermite',
+    attackerName: string,
+    attackerTeam: BattleTeamId,
+    weaponLabel: string,
+    customFragEvaluator?: (targetPos: Readonly<THREE.Vector3>) => number,
+  ): { hits: number; kills: number; killedBotIds: string[] } {
+    if (this.isClientReplica || kind === 'smoke') {
+      return { hits: 0, kills: 0, killedBotIds: [] };
+    }
+    let hits = 0;
+    let kills = 0;
+    const killedBotIds: string[] = [];
+
+    for (let i = 0; i < this.bots.length; i++) {
+      const bot = this.bots[i];
+      if (!bot.alive) continue;
+      if (!this.isHostilePair(attackerTeam, bot.team)) continue;
+
+      const targetCenter = this._tmpTarget.set(bot.pos.x, bot.pos.y + 1.12, bot.pos.z);
+      const dist = targetCenter.distanceTo(origin);
+      const evalRadius = kind === 'frag' ? Math.max(radiusM, 26.0) : radiusM;
+      if (dist > evalRadius) continue;
+
+      if (kind === 'frag' && customFragEvaluator) {
+        const fragDmg = customFragEvaluator(targetCenter);
+        if (fragDmg <= 0.5) continue;
+        hits += 1;
+        bot.hp -= fragDmg;
+        bot.flinchTimer = Math.max(bot.flinchTimer, 0.34);
+        if (bot.hp <= 0) {
+          this.killBot(bot, attackerName, attackerTeam, false, weaponLabel);
+          this._tmpDir.subVectors(targetCenter, origin);
+          this._tmpDir.y = Math.max(0.35, this._tmpDir.y + 0.55);
+          if (this._tmpDir.lengthSq() > 1e-4) {
+            this._tmpDir.normalize();
+            const falloff = Math.max(0.18, 1 - dist / Math.max(1, radiusM));
+            bot.ragdoll.applyHitZoneImpulse('thorax', this._tmpDir, 6.8 * falloff + 2.2);
+          }
+          kills += 1;
+          killedBotIds.push(bot.id);
+        }
+        continue;
+      }
+
+      const hasLos = this.hasLineOfSight(origin, targetCenter);
+      if (!hasLos && kind !== 'thermite') continue;
+
+      const falloff = Math.max(0.14, 1 - dist / Math.max(0.5, radiusM));
+      hits += 1;
+
+      if (kind === 'flash') {
+        bot.stunTimer = Math.max(bot.stunTimer, 1.8 + 2.8 * falloff);
+        bot.flinchTimer = Math.max(bot.flinchTimer, 0.55);
+        bot.burstShotsLeft = 0;
+        if (maxDamage > 0) {
+          bot.hp -= Math.round(maxDamage * falloff);
+          if (bot.hp <= 0) {
+            this.killBot(bot, attackerName, attackerTeam, false, weaponLabel);
+            kills += 1;
+            killedBotIds.push(bot.id);
+          }
+        }
+        continue;
+      }
+
+      const dmg = Math.max(6, maxDamage * Math.pow(falloff, kind === 'frag' ? 1.15 : 0.85));
+      bot.hp -= dmg;
+      bot.flinchTimer = Math.max(bot.flinchTimer, kind === 'frag' ? 0.32 : 0.16);
+
+      if (bot.hp <= 0) {
+        this.killBot(bot, attackerName, attackerTeam, false, weaponLabel);
+        // Apply radial blast impulse to ragdoll away from detonation point
+        this._tmpDir.subVectors(targetCenter, origin);
+        this._tmpDir.y = Math.max(0.35, this._tmpDir.y + 0.55);
+        if (this._tmpDir.lengthSq() > 1e-4) {
+          this._tmpDir.normalize();
+          bot.ragdoll.applyHitZoneImpulse('thorax', this._tmpDir, kind === 'frag' ? 6.8 * falloff + 2.2 : 2.6);
+        }
+        kills += 1;
+        killedBotIds.push(bot.id);
+      }
+    }
+
+    return { hits, kills, killedBotIds };
+  }
+
   public recordPlayerDeath(attackerName: string, attackerTeam: BattleTeamId, attackerId?: string): void {
     const killerBot = attackerId ? this.bots.find((b) => b.id === attackerId) : undefined;
     if (killerBot) {
@@ -871,7 +972,14 @@ export class BattleBotAI {
     return { name: bestName, kills: bestKills };
   }
 
-  private hasLineOfSight(from: Readonly<THREE.Vector3>, to: Readonly<THREE.Vector3>): boolean {
+  private hasLineOfSight(
+    from: Readonly<THREE.Vector3>,
+    to: Readonly<THREE.Vector3>,
+    isLineBlockedBySmoke?: (a: Readonly<THREE.Vector3>, b: Readonly<THREE.Vector3>) => boolean,
+  ): boolean {
+    if (isLineBlockedBySmoke && isLineBlockedBySmoke(from, to)) {
+      return false;
+    }
     this._tmpDir.subVectors(to, from);
     const dist = this._tmpDir.length();
     if (dist < 0.2) return true;
@@ -914,6 +1022,8 @@ export class BattleBotAI {
     onDamagePlayer: (ev: BotPlayerDamageEvent) => void,
     humanTargets?: BattleHumanTarget[],
     onBotFire?: (botId: string, origin: Readonly<THREE.Vector3>, end: Readonly<THREE.Vector3>) => void,
+    isLineBlockedBySmoke?: (a: Readonly<THREE.Vector3>, b: Readonly<THREE.Vector3>) => boolean,
+    getActiveSmokeClouds?: () => readonly ActiveSmokeCloudInfo[],
   ): void {
     // Update pooled tracers
     for (let i = 0; i < this.tracers.length; i++) {
@@ -1072,16 +1182,25 @@ export class BattleBotAI {
         let bestDist = this.diff.visionRangeM;
         let bestLos = false;
 
+        const activeSmokeClouds = getActiveSmokeClouds ? getActiveSmokeClouds() : [];
+        let blockedBySmoke = false;
+
         // Consider ALL living human players (Host + joined teammates/opponents)
         for (let h = 0; h < humans.length; h++) {
           const hm = humans[h];
           if (!hm.alive || !this.isHostilePair(bot.team, hm.team)) continue;
           this._tmpTarget.set(hm.pos.x, hm.pos.y + 1.42, hm.pos.z);
           const d = this._tmpOrigin.distanceTo(this._tmpTarget);
-          if (d < bestDist && this.hasLineOfSight(this._tmpOrigin, this._tmpTarget)) {
-            bestDist = d;
-            bestId = `human:${hm.id}`;
-            bestLos = true;
+          if (d < bestDist) {
+            if (isLineBlockedBySmoke && isLineBlockedBySmoke(this._tmpOrigin, this._tmpTarget)) {
+              blockedBySmoke = true;
+              continue;
+            }
+            if (this.hasLineOfSight(this._tmpOrigin, this._tmpTarget)) {
+              bestDist = d;
+              bestId = `human:${hm.id}`;
+              bestLos = true;
+            }
           }
         }
 
@@ -1092,10 +1211,34 @@ export class BattleBotAI {
           if (!other.alive || !this.isHostilePair(bot.team, other.team)) continue;
           this._tmpTarget.set(other.pos.x, other.pos.y + 1.32, other.pos.z);
           const d = this._tmpOrigin.distanceTo(this._tmpTarget);
-          if (d < bestDist && this.hasLineOfSight(this._tmpOrigin, this._tmpTarget)) {
-            bestDist = d;
-            bestId = other.id;
-            bestLos = true;
+          if (d < bestDist) {
+            if (isLineBlockedBySmoke && isLineBlockedBySmoke(this._tmpOrigin, this._tmpTarget)) {
+              blockedBySmoke = true;
+              continue;
+            }
+            if (this.hasLineOfSight(this._tmpOrigin, this._tmpTarget)) {
+              bestDist = d;
+              bestId = other.id;
+              bestLos = true;
+            }
+          }
+        }
+
+        // Detect nearby screening smoke clouds so bots react tactically (flank / watch perimeter)
+        if (activeSmokeClouds.length > 0) {
+          let nearestCloud: ActiveSmokeCloudInfo | null = null;
+          let nearestSq = 24 * 24;
+          for (let c = 0; c < activeSmokeClouds.length; c++) {
+            const cl = activeSmokeClouds[c];
+            const dSq = cl.position.distanceToSquared(bot.pos);
+            if (dSq < nearestSq) {
+              nearestSq = dSq;
+              nearestCloud = cl;
+            }
+          }
+          if (nearestCloud && (blockedBySmoke || nearestSq < 16 * 16)) {
+            bot.smokeAlertTimer = Math.max(bot.smokeAlertTimer, 3.2);
+            bot.smokeCloudPos.copy(nearestCloud.position);
           }
         }
 
@@ -1107,8 +1250,9 @@ export class BattleBotAI {
           bot.hasLos = true;
         } else {
           bot.hasLos = false;
-          if (Math.random() < 0.25) {
+          if (blockedBySmoke || Math.random() < 0.25) {
             bot.targetId = null;
+            bot.burstShotsLeft = 0;
           }
         }
       }
@@ -1174,8 +1318,13 @@ export class BattleBotAI {
         moveX = (strafeX * 0.72 + nx * radial) * moveSpeed * 0.65;
         moveZ = (strafeZ * 0.72 + nz * radial) * moveSpeed * 0.65;
 
-        // 3. Burst-Fire Engagement
-        if (bot.reactionTimer > 0) {
+        // 3. Burst-Fire Engagement (suppressed while flashbang-stunned)
+        if (bot.stunTimer > 0) {
+          bot.stunTimer = Math.max(0, bot.stunTimer - dt);
+          bot.burstShotsLeft = 0;
+          moveX *= 0.25;
+          moveZ *= 0.25;
+        } else if (bot.reactionTimer > 0) {
           bot.reactionTimer -= dt;
         } else {
           if (bot.burstShotsLeft <= 0) {
@@ -1202,58 +1351,78 @@ export class BattleBotAI {
           }
         }
       } else {
-        // Patrol / Advance across NavGraph toward cover or hostile sector
-        bot.repathTimer -= dt;
-        if (bot.repathTimer <= 0 || bot.pathIndex >= bot.path.length) {
-          bot.repathTimer = 1.6 + Math.random() * 1.2;
-          const startNode = findNearestNavNode(this.map.navGraph, bot.pos);
-          if (startNode) {
-            const nodes = this.map.navGraph.nodes;
-            let goalNode: NavNode | null = null;
+        if (bot.stunTimer > 0) {
+          bot.stunTimer = Math.max(0, bot.stunTimer - dt);
+        }
+        if (bot.smokeAlertTimer > 0) {
+          bot.smokeAlertTimer = Math.max(0, bot.smokeAlertTimer - dt);
+          // Tactical smoke reaction: circle/flank laterally around smoke plume while watching edge
+          const dx = bot.smokeCloudPos.x - bot.pos.x;
+          const dz = bot.smokeCloudPos.z - bot.pos.z;
+          const dist = Math.max(0.5, Math.hypot(dx, dz));
+          const nx = dx / dist;
+          const nz = dz / dist;
+          const flankX = -nz * bot.smokeFlankDir;
+          const flankZ = nx * bot.smokeFlankDir;
+          // Back out if standing inside dense smoke; otherwise orbit perimeter at ~9-12m
+          const radial = dist < 5.2 ? -0.85 : dist > 13.5 ? 0.35 : 0.0;
+          moveX = (flankX * 0.82 + nx * radial) * moveSpeed * 0.78;
+          moveZ = (flankZ * 0.82 + nz * radial) * moveSpeed * 0.78;
+          bot.targetYaw = Math.atan2(-dx, -dz);
+        } else {
+          // Patrol / Advance across NavGraph toward cover or hostile sector
+          bot.repathTimer -= dt;
+          if (bot.repathTimer <= 0 || bot.pathIndex >= bot.path.length) {
+            bot.repathTimer = 1.6 + Math.random() * 1.2;
+            const startNode = findNearestNavNode(this.map.navGraph, bot.pos);
+            if (startNode) {
+              const nodes = this.map.navGraph.nodes;
+              let goalNode: NavNode | null = null;
 
-            // 55% chance pursue nearest hostile area, 45% pick tactical cover node
-            if (Math.random() < 0.55) {
-              const hostileHumans = humans.filter(
-                (hm) => hm.alive && this.isHostilePair(bot.team, hm.team),
-              );
-              if (hostileHumans.length > 0 && Math.random() < 0.65) {
-                const chosenH = hostileHumans[Math.floor(Math.random() * hostileHumans.length)];
-                goalNode = findNearestNavNode(this.map.navGraph, chosenH.pos);
-              } else {
-                const hostiles = this.bots.filter(
-                  (o) => o.alive && o.id !== bot.id && this.isHostilePair(bot.team, o.team),
+              // 55% chance pursue nearest hostile area, 45% pick tactical cover node
+              if (Math.random() < 0.55) {
+                const hostileHumans = humans.filter(
+                  (hm) => hm.alive && this.isHostilePair(bot.team, hm.team),
                 );
-                if (hostiles.length > 0) {
-                  const chosen = hostiles[Math.floor(Math.random() * hostiles.length)];
-                  goalNode = findNearestNavNode(this.map.navGraph, chosen.pos);
+                if (hostileHumans.length > 0 && Math.random() < 0.65) {
+                  const chosenH = hostileHumans[Math.floor(Math.random() * hostileHumans.length)];
+                  goalNode = findNearestNavNode(this.map.navGraph, chosenH.pos);
+                } else {
+                  const hostiles = this.bots.filter(
+                    (o) => o.alive && o.id !== bot.id && this.isHostilePair(bot.team, o.team),
+                  );
+                  if (hostiles.length > 0) {
+                    const chosen = hostiles[Math.floor(Math.random() * hostiles.length)];
+                    goalNode = findNearestNavNode(this.map.navGraph, chosen.pos);
+                  }
                 }
               }
-            }
-            if (!goalNode || goalNode.id === startNode.id) {
-              const coverNodes = nodes.filter((n) => n.isCover && n.id !== startNode.id);
-              const pool = coverNodes.length > 0 && Math.random() < 0.7 ? coverNodes : nodes;
-              goalNode = pool[Math.floor(Math.random() * pool.length)];
-            }
+              if (!goalNode || goalNode.id === startNode.id) {
+                const coverNodes = nodes.filter((n) => n.isCover && n.id !== startNode.id);
+                const pool = coverNodes.length > 0 && Math.random() < 0.7 ? coverNodes : nodes;
+                goalNode = pool[Math.floor(Math.random() * pool.length)];
+              }
 
-            if (goalNode && goalNode.id !== startNode.id) {
-              bot.path = findNavPath(this.map.navGraph, startNode.id, goalNode.id);
-              bot.pathIndex = bot.path.length > 1 ? 1 : 0;
-              bot.goalNodeId = goalNode.id;
+              if (goalNode && goalNode.id !== startNode.id) {
+                bot.path = findNavPath(this.map.navGraph, startNode.id, goalNode.id);
+                bot.pathIndex = bot.path.length > 1 ? 1 : 0;
+                bot.goalNodeId = goalNode.id;
+              }
             }
           }
-        }
 
-        if (bot.pathIndex < bot.path.length) {
-          const wp = bot.path[bot.pathIndex];
-          const dx = wp.position[0] - bot.pos.x;
-          const dz = wp.position[2] - bot.pos.z;
-          const dist = Math.hypot(dx, dz);
-          if (dist < 0.95) {
-            bot.pathIndex++;
-          } else {
-            moveX = (dx / dist) * moveSpeed;
-            moveZ = (dz / dist) * moveSpeed;
-            bot.targetYaw = Math.atan2(-dx, -dz);
+          if (bot.pathIndex < bot.path.length) {
+            const wp = bot.path[bot.pathIndex];
+            const dx = wp.position[0] - bot.pos.x;
+            const dz = wp.position[2] - bot.pos.z;
+            const dist = Math.hypot(dx, dz);
+            if (dist < 0.95) {
+              bot.pathIndex++;
+            } else {
+              moveX = (dx / dist) * moveSpeed;
+              moveZ = (dz / dist) * moveSpeed;
+              bot.targetYaw = Math.atan2(-dx, -dz);
+            }
           }
         }
       }
@@ -1304,8 +1473,13 @@ export class BattleBotAI {
         bot.walkCycle += dt * speedHoriz * 2.55;
       }
 
-      const isAimingFire = bot.hasLos || bot.firingVisualTimer > 0;
-      const flinchPitch = bot.flinchTimer > 0 ? Math.sin(bot.flinchTimer * 35) * 0.16 : 0;
+      const isAimingFire = (bot.hasLos || bot.firingVisualTimer > 0) && bot.stunTimer <= 0;
+      const flinchPitch =
+        bot.stunTimer > 0
+          ? -0.22 + Math.sin(performance.now() * 0.018) * 0.1
+          : bot.flinchTimer > 0
+            ? Math.sin(bot.flinchTimer * 35) * 0.16
+            : 0;
       let aimPitch = 0;
       if (bot.hasLos && targetPos) {
         const horizDist = Math.max(0.5, Math.hypot(targetPos.x - bot.pos.x, targetPos.z - bot.pos.z));

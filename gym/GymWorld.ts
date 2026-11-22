@@ -278,6 +278,9 @@ export function buildGymWorld(
       roughnessMap: textures.puddleRoughness,
       roughness: 0.08,
       metalness: 0.15,
+      polygonOffset: true,
+      polygonOffsetFactor: -2,
+      polygonOffsetUnits: -4,
     }),
   );
 
@@ -361,13 +364,14 @@ export function buildGymWorld(
         map: tex,
         roughness: 0.65,
         metalness: 0.1,
+        depthWrite: false,
         polygonOffset: true,
-        polygonOffsetFactor: -1,
-        polygonOffsetUnits: -2,
+        polygonOffsetFactor: -2,
+        polygonOffsetUnits: -4,
       }),
     );
     const mesh = new THREE.Mesh(trackGeo(new THREE.PlaneGeometry(width, 0.88)), mat);
-    mesh.position.set(x, 0.004, z);
+    mesh.position.set(x, 0.005, z);
     mesh.rotation.x = -Math.PI / 2;
     scene.add(mesh);
   };
@@ -540,7 +544,7 @@ export function buildGymWorld(
   for (let i = 0; i < numSteps; i++) {
     const h = (i + 1) * stepRise;
     const zCenter = stairStartZ - i * stepTread - stepTread * 0.5;
-    addSolidBox(stairX, h * 0.5, zCenter, stairWidth, h, stepTread, concreteWallMat, 'concrete');
+    addSolidBox(stairX, h * 0.5, zCenter, stairWidth, h, stepTread - 0.002, concreteWallMat, 'concrete');
     // High-contrast yellow nosing strip offset +3mm outward on X and front Z, seated cleanly on tread
     const nose = new THREE.Mesh(
       trackGeo(new THREE.BoxGeometry(stairWidth + 0.006, 0.018, 0.043)),
@@ -555,10 +559,10 @@ export function buildGymWorld(
   addSolidBox(-14.9, 0.80, 2.61, 10.2, 1.60, 4.22, concreteWallMat, 'concrete');
   addSign('DROP-OFF EDGE 1.60M', 'LANDING KNEE-SHOCK TEST', -9.75, 1.15, 2.6, Math.PI * 0.5, 2.5, 0.72, '#e06c38');
 
-  // North safety guardrail along the mezzanine back edge
+  // North safety guardrail along the mezzanine back edge (posts stop cleanly at top rail underside 2.51m)
   addSolidBox(-14.9, 2.55, 0.58, 10.2, 0.08, 0.08, yellowRailMat, 'metal');
   for (let px = -19.8; px <= -10.0; px += 2.45) {
-    addSolidBox(px, 2.1, 0.58, 0.07, 1.0, 0.07, steelBeamMat, 'metal');
+    addSolidBox(px, 2.055, 0.58, 0.07, 0.91, 0.07, steelBeamMat, 'metal');
   }
 
   // Smooth 18° Concrete Sloped Ramp rising from z=9.6 to z=4.7 (baseY 0 -> topY 1.60, run 4.9m -> ~18.1°)
@@ -669,12 +673,12 @@ export function buildGymWorld(
   // CQB hallway ceiling over Lane A (seated cleanly atop 3.60m walls)
   addSolidBox(12.25, 3.72, 6.5, 3.85, 0.24, 10.0, concreteWallMat, 'concrete');
 
-  // Lane B: Low 1.22m-Clearance Crouch Tunnel (x: 14.175..18.325, z: 2.5..10.0)
+  // Lane B: Low 1.22m-Clearance Crouch Tunnel (inset 5mm from flanking wall inner faces)
   // Stand capsule is 1.62m -> forces crouch & triggers overhead ceiling lock if player tries to stand inside!
-  addSolidBox(16.25, 1.22 + 0.35, 6.25, 4.15, 0.70, 7.5, darkConcreteMat, 'concrete');
-  // Yellow/black hazard low-clearance trim bands offset 3mm (0.003m) proud of each tunnel portal face
-  addSolidBox(16.25, 1.22 + 0.123, 9.997, 4.144, 0.24, 0.012, hazardMat, 'metal', false);
-  addSolidBox(16.25, 1.22 + 0.123, 2.503, 4.144, 0.24, 0.012, hazardMat, 'metal', false);
+  addSolidBox(16.25, 1.22 + 0.35, 6.25, 4.14, 0.70, 7.5, darkConcreteMat, 'concrete');
+  // Yellow/black hazard low-clearance trim bands offset 6mm proud of each tunnel portal face
+  addSolidBox(16.25, 1.22 + 0.123, 10.006, 4.136, 0.24, 0.012, hazardMat, 'metal', false);
+  addSolidBox(16.25, 1.22 + 0.123, 2.494, 4.136, 0.24, 0.012, hazardMat, 'metal', false);
   addSign('CROUCH TUNNEL · 1.22M', 'OVERHEAD CLEARANCE LOCK TEST', 16.25, 2.38, 10.12, 0, 3.2, 0.82, '#e0a938');
   addSign('CQB DOORFRAMES', 'Q/E LEAN · CANT (B) · LASER (L)', 12.25, 2.85, 10.22, 0, 2.8, 0.76, '#7ec4cf');
 
@@ -988,12 +992,12 @@ export function buildGymWorld(
   concreteBarrier.userData.gymTargetLabel = '12CM CONCRETE';
   addFloorPlaque('12CM CONCRETE', 'HEAVY AP / .338 TEST', 23.2, -10.8, '#b8c0c4', 1.6);
 
-  // 3) Shallow Water Trough + Breakable Range Glass Pane at z = -9.0
+  // 3) Shallow Water Trough + Breakable Range Glass Pane at z = -9.0 (water seated cleanly above frame top)
   const waterTroughFrame = addSolidBox(20.4, 0.09, -9.0, 2.2, 0.18, 1.4, steelBeamMat, 'metal', true);
   waterTroughFrame.userData.ballisticMaterial = 'steel';
   waterTroughFrame.userData.thicknessM = 0.05;
-  const waterSurface = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(2.08, 0.06, 1.28)), puddleMat);
-  waterSurface.position.set(20.4, 0.17, -9.0);
+  const waterSurface = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(2.08, 0.016, 1.28)), puddleMat);
+  waterSurface.position.set(20.4, 0.189, -9.0);
   waterSurface.userData.surfaceMaterial = 'puddle';
   waterSurface.userData.ballisticMaterial = 'water';
   waterSurface.userData.thicknessM = 0.08;

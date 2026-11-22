@@ -34,6 +34,7 @@ export interface GunsmithBenchBuildOptions {
 }
 
 const PIN_SLOTS: readonly { slot: AttachmentSlot; pinLabel: string }[] = [
+  { slot: 'railAdapter', pinLabel: 'MOUNT' },
   { slot: 'optic', pinLabel: 'OPTIC' },
   { slot: 'canted', pinLabel: 'CANT' },
   { slot: 'muzzle', pinLabel: 'MUZZLE' },
@@ -223,12 +224,12 @@ export class GunsmithBench {
     registerBenchHitMesh(benchTop, 'wood');
     this.root.add(benchTop);
 
-    // Front steel edge trim
+    // Front steel edge trim seated cleanly proud of benchTop front face (no overlap)
     const frontEdgeTrim = new THREE.Mesh(
       trackGeo(new THREE.BoxGeometry(benchW + 0.01, topThick + 0.004, 0.024)),
       steelFrameMat,
     );
-    frontEdgeTrim.position.set(0, topY - topThick * 0.5, benchD * 0.5);
+    frontEdgeTrim.position.set(0, topY - topThick * 0.5, benchD * 0.5 + 0.012);
     registerBenchHitMesh(frontEdgeTrim, 'metal');
     this.root.add(frontEdgeTrim);
 
@@ -308,12 +309,12 @@ export class GunsmithBench {
     registerBenchHitMesh(partsTray, 'metal');
     this.root.add(partsTray);
 
-    // Divided tray rim
+    // Rubber tray liner seated cleanly atop steel partsTray (topY + 0.028)
     const trayRim = new THREE.Mesh(
-      trackGeo(new THREE.BoxGeometry(0.44, 0.016, 0.32)),
+      trackGeo(new THREE.BoxGeometry(0.44, 0.008, 0.32)),
       rubberMatMaterial,
     );
-    trayRim.position.set(0.66, topY + 0.022, 0.06);
+    trayRim.position.set(0.66, topY + 0.032, 0.06);
     this.root.add(trayRim);
 
     // Spare 3D parts resting in the bench tray (suppressor tube, bakelite mag, optic, PEQ box, ammo box)
@@ -553,6 +554,20 @@ export class GunsmithBench {
     return this.showcaseStats;
   }
 
+  public setShowcaseTurretElevation(elevationMrad: number): void {
+    if (this.showcaseAssembly?.elevationTurretMesh) {
+      this.showcaseAssembly.elevationTurretMesh.rotation.y = -(elevationMrad / 10) * Math.PI * 2;
+    }
+  }
+
+  public getShowcaseHeightOverBoreM(): number {
+    if (!this.showcaseAssembly) return 0.055;
+    const hob =
+      this.showcaseAssembly.sightAnchor.position.y -
+      this.showcaseAssembly.muzzleSocket.position.y;
+    return THREE.MathUtils.clamp(Math.abs(hob) > 0.008 ? hob : 0.055, 0.018, 0.14);
+  }
+
   private clearShowcaseWeapon(): void {
     if (this.showcaseAssembly) {
       this.cradleAnchor.remove(this.showcaseAssembly.group);
@@ -665,6 +680,9 @@ export class GunsmithBench {
       const pin = outPins[i];
       let socket: THREE.Object3D;
       switch (pin.slot) {
+        case 'railAdapter':
+          socket = asm.railAdapterGroup;
+          break;
         case 'optic':
           socket = asm.opticMountSocket;
           break;
@@ -686,6 +704,9 @@ export class GunsmithBench {
       }
 
       socket.getWorldPosition(this._pinWorld);
+      if (pin.slot === 'railAdapter') {
+        this._pinWorld.y -= 0.032;
+      }
       this._pinNdc.copy(this._pinWorld).project(camera);
 
       const inFront = this._pinNdc.z >= -1 && this._pinNdc.z <= 1;

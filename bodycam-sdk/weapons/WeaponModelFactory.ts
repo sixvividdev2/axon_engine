@@ -91,7 +91,11 @@ export interface WeaponModelAssembly {
   suppressor: THREE.Object3D | null;
   flashlightModule: THREE.Object3D | null;
   laserModule: THREE.Object3D | null;
+  railAdapterGroup: THREE.Object3D | null;
   opticGroup: THREE.Object3D | null;
+  zoomRingPivot: THREE.Group | null;
+  zoomRingSocket: THREE.Object3D | null;
+  elevationTurretMesh: THREE.Object3D | null;
   reticleMaterial: THREE.ShaderMaterial | null;
   scopeLensMaterial: THREE.ShaderMaterial | null;
   hasCantedOptic: boolean;
@@ -2186,7 +2190,11 @@ export class WeaponModelFactory {
       suppressor,
       flashlightModule,
       laserModule,
+      railAdapterGroup: null,
       opticGroup,
+      zoomRingPivot: null,
+      zoomRingSocket: null,
+      elevationTurretMesh: null,
       reticleMaterial,
       scopeLensMaterial: null,
       hasCantedOptic: false,

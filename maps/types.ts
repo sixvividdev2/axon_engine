@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { BodycamPhysicsWorld } from '../bodycam-sdk';
+import { TacticalEquipmentId } from '../data/tacticalEquipment';
 
 export type TopLevelModeId = 'playground' | 'battle' | 'infection';
 export type BattleRuleId = 'tdm' | 'ffa';
@@ -13,10 +14,12 @@ export interface BattleMatchConfig {
   difficulty: BotDifficultyId;
   primaryWeaponId: string;
   secondaryWeaponId: string;
+  tacticalEquipmentId?: TacticalEquipmentId;
 }
 
 export interface InfectionMatchConfig {
   mapId: string;
+  tacticalEquipmentId?: TacticalEquipmentId;
 }
 
 export interface NavNode {

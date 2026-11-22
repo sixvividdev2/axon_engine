@@ -86,8 +86,21 @@ export class WeaponRig {
   private derivedStats: DerivedWeaponStats = computeDerivedWeaponStats(0, 0.25, 0, {});
   private assembly: WeaponModelAssembly | null = null;
   private opticZoomIndex = 1;
+  private scopeZoomCurrent = 1.0;
+  private scopeZoomTarget = 1.0;
+  private zoomTwistTimer = 0;
+  private zoomTwistActive = false;
+  private zoomTwistDuration = 0.28;
   private lastOpticId: string | null = null;
   public reticleIlluminated = true;
+  private audio?: IBodycamAudioSource;
+
+  // True height-over-bore zeroing pitch compensation
+  private zeroDistanceM = 100;
+  private zeroElevationMrad = 0;
+  private zeroPitchRad = 0;
+  private readonly _zeroAxisX = new THREE.Vector3(1, 0, 0);
+  private readonly _zeroPitchQuat = new THREE.Quaternion();
 
   // Muzzle flash (45ms HDR spike)
   private muzzleFlashLight: THREE.PointLight;
@@ -191,6 +204,7 @@ export class WeaponRig {
 
   constructor(scene: THREE.Scene, isSoftwareGl: boolean, audio?: IBodycamAudioSource) {
     this.scene = scene;
+    this.audio = audio;
     this.weaponAnimator = new WeaponAnimator(scene, audio);
 
     this.shoulderAnchor.position.copy(RIGHT_SHOULDER_LOCAL);
@@ -320,6 +334,7 @@ export class WeaponRig {
   }
 
   public setAudio(audio: IBodycamAudioSource): void {
+    this.audio = audio;
     this.weaponAnimator.setAudio(audio);
   }
 
@@ -438,17 +453,98 @@ export class WeaponRig {
   public getActiveOpticZoomMult(): number {
     const levels = this.derivedStats.opticZoomLevels;
     if (levels.length > 0) {
+      return this.scopeZoomCurrent;
+    }
+    return this.derivedStats.adsZoomFactor;
+  }
+
+  public getTargetOpticZoomMult(): number {
+    const levels = this.derivedStats.opticZoomLevels;
+    if (levels.length > 0) {
       const idx = Math.max(0, Math.min(levels.length - 1, this.opticZoomIndex));
       return levels[idx];
     }
     return this.derivedStats.adsZoomFactor;
   }
 
-  public cycleOpticZoom(dir: 1 | -1): number {
+  public cycleOpticZoom(dir: 1 | -1, withIkTwist = true): number {
     const levels = this.derivedStats.opticZoomLevels;
-    if (levels.length <= 1) return this.getActiveOpticZoomMult();
+    if (levels.length <= 1) return this.getTargetOpticZoomMult();
+    const prevIdx = this.opticZoomIndex;
     this.opticZoomIndex = Math.max(0, Math.min(levels.length - 1, this.opticZoomIndex + dir));
-    return levels[this.opticZoomIndex];
+    const target = levels[this.opticZoomIndex];
+    this.scopeZoomTarget = target;
+
+    if (this.opticZoomIndex !== prevIdx) {
+      this.audio?.playZoomRatchetClick?.(target);
+      if (withIkTwist && this.assembly?.zoomRingSocket && this.lastIsAds && !this.lastIsSprinting) {
+        this.zoomTwistActive = true;
+        this.zoomTwistTimer = 0;
+      }
+    }
+    return target;
+  }
+
+  public cancelZoomTwist(): void {
+    this.zoomTwistActive = false;
+    this.zoomTwistTimer = 0;
+  }
+
+  public isZoomTwistActive(): boolean {
+    return this.zoomTwistActive;
+  }
+
+  /**
+   * Returns 0..1 left-hand IK blend weight during the 0.28s LPVO zoom-ring reach -> twist -> return arc,
+   * writing the live world-space transform of `assembly.zoomRingSocket` into `outPos` / `outQuat`.
+   */
+  public getZoomRingIkOverride(outPos: THREE.Vector3, outQuat: THREE.Quaternion): number {
+    if (!this.zoomTwistActive || !this.assembly?.zoomRingSocket) return 0;
+    const p = THREE.MathUtils.clamp(this.zoomTwistTimer / Math.max(0.05, this.zoomTwistDuration), 0, 1);
+    let w = 0;
+    if (p < 0.28) {
+      const t = p / 0.28;
+      w = t * t * (3 - 2 * t);
+    } else if (p < 0.72) {
+      w = 1.0;
+    } else {
+      const t = (p - 0.72) / 0.28;
+      w = 1.0 - t * t * (3 - 2 * t);
+    }
+    if (w <= 0.001) return 0;
+    this.root.updateMatrixWorld(true);
+    this.assembly.zoomRingSocket.getWorldPosition(outPos);
+    this.assembly.zoomRingSocket.getWorldQuaternion(outQuat);
+    return w;
+  }
+
+  public setZeroConfig(zeroDistanceM: number, zeroElevationMrad: number, zeroPitchRad: number): void {
+    this.zeroDistanceM = zeroDistanceM;
+    this.zeroElevationMrad = zeroElevationMrad;
+    this.zeroPitchRad = zeroPitchRad;
+    if (this.assembly?.elevationTurretMesh) {
+      // 1 full turret revolution = 10 MRAD
+      this.assembly.elevationTurretMesh.rotation.y = -(zeroElevationMrad / 10) * Math.PI * 2;
+    }
+  }
+
+  public getZeroDistanceM(): number {
+    return this.zeroDistanceM;
+  }
+
+  public getZeroElevationMrad(): number {
+    return this.zeroElevationMrad;
+  }
+
+  public getZeroPitchRad(): number {
+    return this.zeroPitchRad;
+  }
+
+  /** True physical Height-Over-Bore (meters) from bore/muzzle centerline to active sight optical axis. */
+  public getHeightOverBoreM(): number {
+    if (!this.assembly) return 0.055;
+    const hob = this.assembly.sightAnchor.position.y - this.assembly.muzzleSocket.position.y;
+    return THREE.MathUtils.clamp(Math.abs(hob) > 0.008 ? hob : 0.055, 0.018, 0.14);
   }
 
   public toggleReticleIllumination(): boolean {
@@ -461,15 +557,45 @@ export class WeaponRig {
     const levels = this.derivedStats.opticZoomLevels;
     if (opticId !== this.lastOpticId) {
       this.lastOpticId = opticId;
+      this.cancelZoomTwist();
       if (levels.length > 0) {
-        // Default to 4.0x on PSO-4 (index 1 of [2.8, 4.0]) and 4.0x on LPVO (index 2 of [1, 2.5, 4, 6])
-        this.opticZoomIndex = levels.length >= 4 ? 2 : levels.length - 1;
+        // Default to 1x on 1-6x LPVO (6 steps) or 4x on legacy/PSO scopes
+        this.opticZoomIndex = levels.length === 6 ? 0 : levels.length >= 4 ? 2 : levels.length - 1;
+        this.scopeZoomTarget = levels[this.opticZoomIndex];
+        this.scopeZoomCurrent = this.scopeZoomTarget;
       } else {
         this.opticZoomIndex = 0;
+        this.scopeZoomTarget = this.derivedStats.adsZoomFactor;
+        this.scopeZoomCurrent = this.scopeZoomTarget;
       }
     } else if (levels.length > 0) {
       this.opticZoomIndex = Math.max(0, Math.min(levels.length - 1, this.opticZoomIndex));
+      this.scopeZoomTarget = levels[this.opticZoomIndex];
+      this.scopeZoomCurrent = THREE.MathUtils.clamp(
+        this.scopeZoomCurrent,
+        levels[0],
+        levels[levels.length - 1],
+      );
+    } else {
+      this.scopeZoomTarget = this.derivedStats.adsZoomFactor;
+      this.scopeZoomCurrent = this.scopeZoomTarget;
     }
+    this.applyZoomRingPivotAngle();
+  }
+
+  private applyZoomRingPivotAngle(): void {
+    const pivot = this.assembly?.zoomRingPivot;
+    if (!pivot) return;
+    const levels = this.derivedStats.opticZoomLevels;
+    if (levels.length <= 1) {
+      pivot.rotation.z = 0;
+      return;
+    }
+    const minZ = levels[0];
+    const maxZ = levels[levels.length - 1];
+    const norm = THREE.MathUtils.clamp((this.scopeZoomCurrent - minZ) / Math.max(0.01, maxZ - minZ), 0, 1);
+    // Counter-clockwise throw-lever rotation (~88 deg sweep from 1x to 6x)
+    pivot.rotation.z = -norm * 1.54;
   }
 
   /** Mass-normalized handling factor (pistol ~0.68, carbine ~1.0, heavy_rifle ~1.38) */
@@ -806,10 +932,14 @@ export class WeaponRig {
     this.modelGroup.updateMatrixWorld(true);
   }
 
-  public getMuzzleWorldTransform(outPos: THREE.Vector3, outDir: THREE.Vector3): void {
+  public getMuzzleWorldTransform(outPos: THREE.Vector3, outDir: THREE.Vector3, applyZeroPitch = false): void {
     this.root.updateMatrixWorld(true);
     this.muzzleAnchor.getWorldPosition(outPos);
     this.muzzleAnchor.getWorldQuaternion(this._tmpQuat);
+    if (applyZeroPitch && Math.abs(this.zeroPitchRad) > 1e-6) {
+      this._zeroPitchQuat.setFromAxisAngle(this._zeroAxisX, this.zeroPitchRad);
+      this._tmpQuat.multiply(this._zeroPitchQuat);
+    }
     outDir.set(0, 0, -1).applyQuaternion(this._tmpQuat).normalize();
   }
 
@@ -1238,6 +1368,24 @@ export class WeaponRig {
     this.cantBlend = this.weaponAnimator.cantBlend;
     this.pointAimBlend = this.weaponAnimator.pointAimBlend;
     this.sprintBlend = this.weaponAnimator.sprintBlend;
+
+    // 6. Smooth variable-zoom magnification interpolation & 0.28s interruptible zoom-ring IK timer
+    if (
+      this.zoomTwistActive &&
+      (isSprinting || !isAds || this.weaponAnimator.getActiveAction() !== 'NONE' || vaultRetentionBlend > 0.1)
+    ) {
+      this.cancelZoomTwist();
+    }
+    if (this.zoomTwistActive) {
+      this.zoomTwistTimer += dt;
+      if (this.zoomTwistTimer >= this.zoomTwistDuration) {
+        this.cancelZoomTwist();
+      }
+    }
+    if (this.derivedStats.opticZoomLevels.length > 0) {
+      this.scopeZoomCurrent = THREE.MathUtils.damp(this.scopeZoomCurrent, this.scopeZoomTarget, 18, dt);
+      this.applyZoomRingPivotAngle();
+    }
 
     this.root.updateMatrixWorld(true);
   }

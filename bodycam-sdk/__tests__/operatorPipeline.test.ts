@@ -16,17 +16,25 @@ import {
   RigContractViolationError,
   SDK_WEAPON_PROFILES,
   SecondaryPhysicsSolver,
+  TACTICAL_EQUIPMENT_STORAGE_KEY,
+  TacticalEquipmentStore,
   WeaponRig,
+  simulateMaterialPenetration,
+  simulateTrajectoryProfile,
+  solveZeroPitchRad,
   validateCrossOperatorParity,
   validateOperatorRig,
 } from '../index';
 import {
+  ATTACHMENTS,
   computeDerivedWeaponStats,
   createBareAttachments,
   getCompatibleAttachments,
   getOwnedSuppressorDef,
+  getRequiredRailAdapterId,
   normalizeWeaponAttachments,
 } from '../../data/attachments';
+import { AMMO_VARIANTS } from '../../data/calibers';
 
 /**
  * Minimal headless 2D canvas stub so Three.js CanvasTexture procedural PBR materials
@@ -577,3 +585,180 @@ describe('Phase 5 — ArticulatedRagdoll Handoff, Impulse & World Collision', ()
     expect(ragdoll.isSleeping()).toBe(true);
   });
 });
+
+describe('Phase 6 — Tactical Equipment Belt Mounting & Persistent Store', () => {
+  it('mounts grenades onto the pelvis belt slot for MALE and FEMALE while preserving STRICT rig parity', () => {
+    const male = new CharacterSkeleton(1, 'team_a', 'MALE');
+    const female = new CharacterSkeleton(1, 'team_a', 'FEMALE');
+
+    male.setBeltEquipment('m67_frag', 'front_left', 2, true);
+    female.setBeltEquipment('m84_flash', 'right_hip', 3, true);
+
+    expect(male.getBeltEquipmentState()).toEqual({
+      equipmentId: 'm67_frag',
+      beltSlot: 'front_left',
+      count: 2,
+      visible: true,
+    });
+    expect(female.getBeltEquipmentState()).toEqual({
+      equipmentId: 'm84_flash',
+      beltSlot: 'right_hip',
+      count: 3,
+      visible: true,
+    });
+
+    const maleReport = validateOperatorRig(male.root, 'MALE', 'STRICT');
+    const femaleReport = validateOperatorRig(female.root, 'FEMALE', 'STRICT');
+    expect(maleReport.valid).toBe(true);
+    expect(femaleReport.valid).toBe(true);
+
+    const parityReport = validateCrossOperatorParity(male.root, female.root, 'STRICT');
+    expect(parityReport.valid).toBe(true);
+    expect(parityReport.issues).toHaveLength(0);
+
+    // Unmounting or depleting hides mounted meshes without breaking parity
+    male.setBeltEquipment('an_m14_thermite', 'rear_belt', 0, false);
+    expect(validateOperatorRig(male.root, 'MALE', 'STRICT').valid).toBe(true);
+  });
+
+  it('persists TacticalEquipmentStore changes and notifies subscribers cleanly', () => {
+    const storage = new MemoryStorage();
+    const storeA = new TacticalEquipmentStore(storage);
+    expect(storeA.getSelection()).toEqual({
+      equipmentId: 'm67_frag',
+      beltSlot: 'front_left',
+      mountOnBelt: true,
+    });
+
+    const notifications: Array<{ equipmentId: string; beltSlot: string; mountOnBelt: boolean }> = [];
+    const unsubscribe = storeA.subscribe((next) => notifications.push(next));
+
+    storeA.setEquipment('m18_smoke');
+    storeA.setBeltSlot('left_hip');
+    storeA.setMountOnBelt(false);
+
+    expect(notifications).toHaveLength(3);
+    expect(notifications[2]).toEqual({
+      equipmentId: 'm18_smoke',
+      beltSlot: 'left_hip',
+      mountOnBelt: false,
+    });
+    expect(storage.getItem(TACTICAL_EQUIPMENT_STORAGE_KEY)).toBeTruthy();
+
+    unsubscribe();
+    storeA.setMountOnBelt(true);
+    expect(notifications).toHaveLength(3);
+
+    const storeB = new TacticalEquipmentStore(storage);
+    expect(storeB.getSelection()).toEqual({
+      equipmentId: 'm18_smoke',
+      beltSlot: 'left_hip',
+      mountOnBelt: true,
+    });
+  });
+});
+
+describe('Phase 7 — Rail-Adapter Optics, Razor PiP Hollow Geometry & Ballistics Zeroing', () => {
+  it('enforces B-13 AK dovetail and MP5 claw rail adapters before mounting Picatinny optics', () => {
+    // AKM requires B-13 dovetail adapter to mount Razor 1-6x, while PSO-1M2 mounts natively
+    expect(getRequiredRailAdapterId(ATTACHMENTS.optic_razor_1_6, 'akm_762')).toBe('rail_b13_dovetail');
+    const bareAkmOptics = getCompatibleAttachments('akm_762', 'optic', createBareAttachments());
+    expect(bareAkmOptics.some((o) => o.id === 'optic_pso1m2')).toBe(true);
+    expect(bareAkmOptics.some((o) => o.id === 'optic_razor_1_6')).toBe(false);
+
+    const b13AkmOptics = getCompatibleAttachments('akm_762', 'optic', {
+      railAdapter: 'rail_b13_dovetail',
+    });
+    expect(b13AkmOptics.some((o) => o.id === 'optic_razor_1_6')).toBe(true);
+
+    // Stripping the B-13 adapter automatically clears Picatinny optics during normalization
+    const strippedAkm = normalizeWeaponAttachments('akm_762', {
+      railAdapter: null,
+      optic: 'optic_razor_1_6',
+    });
+    expect(strippedAkm.optic).toBeUndefined();
+
+    // MP5 requires claw mount adapter for Razor 1-6x
+    expect(getRequiredRailAdapterId(ATTACHMENTS.optic_razor_1_6, 'hk_mp5')).toBe('rail_mp5_claw');
+    const bareMp5Optics = getCompatibleAttachments('hk_mp5', 'optic', createBareAttachments());
+    expect(bareMp5Optics.some((o) => o.id === 'optic_razor_1_6')).toBe(false);
+    const clawMp5Optics = getCompatibleAttachments('hk_mp5', 'optic', {
+      railAdapter: 'rail_mp5_claw',
+    });
+    expect(clawMp5Optics.some((o) => o.id === 'optic_razor_1_6')).toBe(true);
+
+    // RMR Type 2 mounts cleanly on Glock 17 slide & M4A1 receiver
+    expect(
+      getCompatibleAttachments('glock_17', 'optic', createBareAttachments()).some(
+        (o) => o.id === 'optic_rmr_type2',
+      ),
+    ).toBe(true);
+  });
+
+  it('assembles Vortex Razor 1-6x with hollow ocular ring, zoomRingPivot, zoomRingSocket & elevation turret', () => {
+    const scene = new THREE.Scene();
+    const rig = new WeaponRig(scene, true);
+    const att = normalizeWeaponAttachments('m4_556', { optic: 'optic_razor_1_6' });
+    rig.setWeaponProfile(SDK_WEAPON_PROFILES.m4_556, att);
+    const assembly = rig.getModelAssembly();
+
+    expect(assembly).toBeTruthy();
+    expect(assembly!.opticGroup).toBeTruthy();
+    expect(assembly!.scopeLensMaterial).toBeTruthy();
+    expect(assembly!.zoomRingPivot).toBeTruthy();
+    expect(assembly!.zoomRingSocket).toBeTruthy();
+    expect(assembly!.elevationTurretMesh).toBeTruthy();
+    expect(assembly!.scopeLensMaterial?.polygonOffset).toBe(true);
+  });
+
+  it('solves HOB zeroing pitch accurately and simulates deterministic trajectory & material penetration', () => {
+    const m855a1 = AMMO_VARIANTS['556x45_m855a1'];
+    const pitch100 = solveZeroPitchRad({
+      muzzleVelocityMs: m855a1.baseVelocityMs,
+      bc: m855a1.ballisticCoefficient,
+      heightOverBoreM: 0.068,
+      zeroDistanceM: 100,
+    });
+    const pitch300 = solveZeroPitchRad({
+      muzzleVelocityMs: m855a1.baseVelocityMs,
+      bc: m855a1.ballisticCoefficient,
+      heightOverBoreM: 0.068,
+      zeroDistanceM: 300,
+    });
+    expect(pitch100).toBeGreaterThan(0);
+    expect(pitch300).toBeGreaterThan(pitch100);
+
+    const profile = simulateTrajectoryProfile({
+      ammo: m855a1,
+      heightOverBoreM: 0.068,
+      zeroDistanceM: 100,
+      maxRangeM: 400,
+    });
+    expect(profile.points.length).toBeGreaterThan(40);
+    const at100 = profile.rangeGates.find((g) => g.distanceM === 100);
+    expect(at100).toBeTruthy();
+    expect(Math.abs(at100!.dropCm)).toBeLessThan(1.5);
+
+    // M855A1 AP penetrates pine timber cleanly and stops on thick AR500 steel
+    const woodPen = simulateMaterialPenetration({
+      ammo: m855a1,
+      impactSpeedMs: 850,
+      material: 'wood',
+      thicknessM: 0.038,
+      obliquityDeg: 0,
+    });
+    expect(woodPen.outcome).toBe('penetrate');
+    expect(woodPen.exitSpeedMs).toBeGreaterThan(600);
+
+    const ar500Stop = simulateMaterialPenetration({
+      ammo: m855a1,
+      impactSpeedMs: 700,
+      material: 'steel',
+      thicknessM: 0.014,
+      obliquityDeg: 5,
+    });
+    expect(ar500Stop.outcome).not.toBe('penetrate');
+  });
+});
+
+

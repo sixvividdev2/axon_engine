@@ -815,6 +815,70 @@ export class InfectionZombieAI {
     return { hit: true, killed: false, headshot: false, pointsAwarded: 20 };
   }
 
+  /**
+   * Applies tactical grenade AoE damage, radial knockback, and flashbang stagger to nearby zombies.
+   */
+  public applyAreaBlast(
+    origin: Readonly<THREE.Vector3>,
+    radiusM: number,
+    maxDamage: number,
+    kind: 'frag' | 'flash' | 'smoke' | 'thermite',
+  ): { hits: number; kills: number; pointsAwarded: number } {
+    if (this.isClientReplica || kind === 'smoke') {
+      return { hits: 0, kills: 0, pointsAwarded: 0 };
+    }
+    let hits = 0;
+    let kills = 0;
+    let pointsAwarded = 0;
+
+    for (let i = 0; i < this.zombies.length; i++) {
+      const z = this.zombies[i];
+      if (!z.alive) continue;
+      const dx = z.pos.x - origin.x;
+      const dy = z.pos.y + 1.0 - origin.y;
+      const dz = z.pos.z - origin.z;
+      const dist = Math.hypot(dx, dy, dz);
+      if (dist > radiusM) continue;
+
+      const falloff = Math.max(0.18, 1 - dist / Math.max(0.5, radiusM));
+      hits += 1;
+
+      if (kind === 'flash') {
+        z.staggerTimer = Math.max(z.staggerTimer, 1.8 + 2.2 * falloff);
+        z.windupTimer = 0;
+        if (maxDamage > 0) {
+          z.hp -= Math.round(maxDamage * falloff);
+        }
+        if (z.hp <= 0) {
+          this.killZombie(z);
+          kills += 1;
+          pointsAwarded += 70;
+        }
+        continue;
+      }
+
+      const dmg = Math.max(10, maxDamage * Math.pow(falloff, kind === 'frag' ? 1.05 : 0.8));
+      z.hp -= dmg;
+      z.staggerTimer = Math.max(z.staggerTimer, kind === 'frag' ? 0.65 : 0.28);
+      z.windupTimer = 0;
+      const horiz = Math.max(0.15, Math.hypot(dx, dz));
+      const kb = kind === 'frag' ? 5.6 * falloff + 1.4 : 1.1;
+      z.knockbackVelX += (dx / horiz) * kb;
+      z.knockbackVelZ += (dz / horiz) * kb;
+      this.spawnBloodBurst(new THREE.Vector3(z.pos.x, z.pos.y + 1.05, z.pos.z), kind === 'frag' ? 8 : 4);
+
+      if (z.hp <= 0) {
+        this.killZombie(z);
+        kills += 1;
+        pointsAwarded += 75;
+      } else {
+        pointsAwarded += 10;
+      }
+    }
+
+    return { hits, kills, pointsAwarded };
+  }
+
   private killZombie(z: ZombieActor): void {
     z.alive = false;
     z.dying = true;

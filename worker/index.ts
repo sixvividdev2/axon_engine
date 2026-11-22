@@ -9,14 +9,14 @@ import {
   LobbyVisibility,
   sanitizeSpecialEventConfig,
   SpecialEventRecord,
-} from '../src/data/multiplayer';
+} from '../data/multiplayer';
 import {
   applyMatchProgression,
   CareerProgressionState,
   getStarterUnlockedAttachments,
   MatchResultInput,
   WeaponProgressRecord,
-} from '../src/data/progression';
+} from '../data/progression';
 import {
   buildClearSessionCookie,
   buildSessionCookie,

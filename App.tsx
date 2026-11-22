@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { tacticalEquipmentStore } from './bodycam-sdk';
 import {
   CombatSessionEngine,
   CombatSessionParams,
@@ -100,6 +101,14 @@ function PlaygroundView({ onReturnToMenu }: { onReturnToMenu: () => void }) {
           onToggleSuppressor={() => engine?.toggleSuppressor()}
           onToggleReticleIllumination={() => engine?.toggleReticleIllumination()}
           onToggleArmTrauma={() => engine?.toggleSimulatedArmTrauma()}
+          onSelectTacticalEquipment={(id) => engine?.setTacticalEquipment(id)}
+          onSelectTacticalBeltSlot={(slot) => engine?.setTacticalBeltSlot(slot)}
+          onToggleTacticalMountOnBelt={(mount) => engine?.setTacticalMountOnBelt(mount)}
+          onRestockTacticalEquipment={() => engine?.restockTacticalEquipment()}
+          onQuickThrowTactical={() => {
+            engine?.setTunerOpen(false);
+            engine?.triggerQuickThrow();
+          }}
           onClose={() => engine?.setTunerOpen(false)}
           onResumeLock={() => engine?.requestLock()}
           onReturnToMenu={onReturnToMenu}
@@ -118,12 +127,19 @@ function PlaygroundView({ onReturnToMenu }: { onReturnToMenu: () => void }) {
           attachments={snapshot.attachments}
           stats={snapshot.derivedStats}
           pins={snapshot.gunsmithPins}
+          zeroDistanceM={snapshot.zeroDistanceM}
+          zeroElevationMrad={snapshot.zeroElevationMrad}
+          heightOverBoreM={snapshot.heightOverBoreM}
           careerRank={effectiveRank}
           weaponProgress={getWeaponProgress(snapshot.equippedWeaponId)}
           isWeaponUnlocked={isWeaponUnlocked}
           isAttachmentUnlocked={isAttachmentUnlocked}
           onSelectWeapon={(id) => engine?.selectGunsmithWeapon(id)}
           onSelectAmmoVariant={(variantId) => engine?.selectAmmoVariant(variantId)}
+          onSelectZeroDistance={(distanceM) => engine?.selectZeroDistance(distanceM)}
+          onAdjustElevationMrad={(mrad) => engine?.adjustZeroElevationMrad(mrad)}
+          onTestFireSound={() => engine?.playGunsmithTestFireSound()}
+          onTurretClickSound={(up) => engine?.playGunsmithTurretClick(up)}
           onToggleFireMode={() => engine?.toggleFireMode()}
           onSelectAttachment={(slot, attachmentId) => {
             if (attachmentId && !isAttachmentUnlocked(attachmentId)) return;
@@ -235,6 +251,9 @@ function CombatSessionView({
           onToggleTuner={(open) => engine?.setTunerOpen(open)}
           onUpdateConfig={(patch) => engine?.updateConfig(patch)}
           onApplyLensPreset={(preset) => engine?.applyLensPreset(preset)}
+          onSelectTacticalEquipment={(id) => engine?.setTacticalEquipment(id)}
+          onSelectTacticalBeltSlot={(slot) => engine?.setTacticalBeltSlot(slot)}
+          onToggleTacticalMountOnBelt={(mount) => engine?.setTacticalMountOnBelt(mount)}
           onRematch={() => {
             committedMatchRef.current = false;
             setRankSummary(null);
@@ -306,11 +325,12 @@ function AppShell() {
         }
       : undefined;
 
+    const selectedTacticalId = tacticalEquipmentStore.getSelection().equipmentId;
     const params: CombatSessionParams =
       st.mode === 'infection'
         ? {
             mode: 'infection',
-            infectionConfig: { mapId: st.mapId },
+            infectionConfig: { mapId: st.mapId, tacticalEquipmentId: selectedTacticalId },
             multiplayer: mpBridge,
           }
         : {
@@ -323,6 +343,7 @@ function AppShell() {
               difficulty: st.botDifficulty,
               primaryWeaponId: battleConfig.primaryWeaponId,
               secondaryWeaponId: battleConfig.secondaryWeaponId,
+              tacticalEquipmentId: selectedTacticalId,
             },
             multiplayer: mpBridge,
           };

@@ -257,21 +257,21 @@ function buildPripyatBlock(
   outerBlocks.computeBoundingSphere();
   sceneGroup.add(outerBlocks);
 
-  // Perimeter Exterior Walls (with blown-out daylight window bays on West & East)
-  // North & South solid exterior walls (both floors)
-  addSolidBox(0, ROOF_Y * 0.5, -17, 40, ROOF_Y, 0.5, matConcrete);
-  addSolidBox(0, ROOF_Y * 0.5, 17, 40, ROOF_Y, 0.5, matConcrete);
+  // Perimeter Exterior Walls (non-overlapping corner & window pier joints)
+  // North & South solid exterior walls (both floors: x in [-20.25, 20.25], z = ±17)
+  addSolidBox(0, ROOF_Y * 0.5, -17, 40.5, ROOF_Y, 0.5, matConcrete);
+  addSolidBox(0, ROOF_Y * 0.5, 17, 40.5, ROOF_Y, 0.5, matConcrete);
 
-  // West & East perimeter walls with recessed daylight window gaps (sill 1.05m, header 2.8m)
+  // West & East perimeter walls strictly between North & South inner faces (z in [-16.75, 16.75])
   for (const sideX of [-20, 20]) {
     for (const floorY of [0, FLOOR_2_Y]) {
-      // Lower sill wall across full Z
-      addSolidBox(sideX, floorY + 0.52, 0, 0.5, 1.04, 34, matConcrete);
-      // Upper header beam across full Z
-      addSolidBox(sideX, floorY + 3.15, 0, 0.5, 0.9, 34, matConcrete);
-      // Piers separating 3 window openings along Z
-      for (const pz of [-15.5, -6.0, 6.0, 15.5]) {
-        addSolidBox(sideX, floorY + 1.88, pz, 0.52, 1.72, 3.0, matConcrete);
+      // Lower sill wall (y: floorY .. floorY + 1.04)
+      addSolidBox(sideX, floorY + 0.52, 0, 0.5, 1.04, 33.5, matConcrete);
+      // Upper header beam (y: floorY + 2.70 .. floorY + 3.60)
+      addSolidBox(sideX, floorY + 3.15, 0, 0.5, 0.9, 33.5, matConcrete);
+      // Window piers strictly between sill top (1.04) & header bottom (2.70), flush inside N/S walls
+      for (const pz of [-15.25, -6.0, 6.0, 15.25]) {
+        addSolidBox(sideX, floorY + 1.87, pz, 0.5, 1.66, 3.0, matConcrete);
       }
     }
   }
@@ -288,25 +288,25 @@ function buildPripyatBlock(
   });
 
   // === 2. Ground Floor Interior Rooms & Corridor Partitioning ===
-  // Central Spine Corridor runs Z = -16.5 to +16.5 along X in [-3.8, 3.8]
-  // West Apartments (X in [-19.5, -3.8]): divided at Z = -5.5 and Z = 5.5 into NW, W-Stair/Mid, SW
-  addWallWithDoor('z', -3.8, -16.8, -5.5, 0, WALL_H, -11.2, 2.2, 2.5, 0.34, matPlaster);
-  addWallWithDoor('z', -3.8, 5.5, 16.8, 0, WALL_H, 11.2, 2.2, 2.5, 0.34, matPlaster);
-  // Breached divider walls between NW/Mid and SW/Mid
-  addWallWithDoor('x', -5.5, -19.5, -3.8, 0, WALL_H, -12.5, 2.4, 2.5, 0.34, matPlaster);
-  addWallWithDoor('x', 5.5, -19.5, -3.8, 0, WALL_H, -12.5, 2.4, 2.5, 0.34, matPlaster);
+  // Ground floor interior walls stop flush beneath the 2nd-floor slab underside (FLOOR_2_Y - 0.28 = 3.32)
+  const GROUND_WALL_H = FLOOR_2_Y - 0.28;
+  // West Apartments (X in [-19.75, -3.63]): non-overlapping T-joints at Z = ±5.5
+  addWallWithDoor('z', -3.8, -16.75, -5.67, 0, GROUND_WALL_H, -11.2, 2.2, 2.5, 0.34, matPlaster);
+  addWallWithDoor('z', -3.8, 5.67, 16.75, 0, GROUND_WALL_H, 11.2, 2.2, 2.5, 0.34, matPlaster);
+  addWallWithDoor('x', -5.5, -19.75, -3.63, 0, GROUND_WALL_H, -12.5, 2.4, 2.5, 0.34, matPlaster);
+  addWallWithDoor('x', 5.5, -19.75, -3.63, 0, GROUND_WALL_H, -12.5, 2.4, 2.5, 0.34, matPlaster);
 
-  // East Offices (X in [3.8, 19.5]): divided at Z = -5.5 and Z = 5.5 into NE, E-Stair/Mid, SE
-  addWallWithDoor('z', 3.8, -16.8, -5.5, 0, WALL_H, -11.2, 2.2, 2.5, 0.34, matPlaster);
-  addWallWithDoor('z', 3.8, 5.5, 16.8, 0, WALL_H, 11.2, 2.2, 2.5, 0.34, matPlaster);
-  addWallWithDoor('x', -5.5, 3.8, 19.5, 0, WALL_H, 12.5, 2.4, 2.5, 0.34, matPlaster);
-  addWallWithDoor('x', 5.5, 3.8, 19.5, 0, WALL_H, 12.5, 2.4, 2.5, 0.34, matPlaster);
+  // East Offices (X in [3.63, 19.75]): non-overlapping T-joints at Z = ±5.5
+  addWallWithDoor('z', 3.8, -16.75, -5.67, 0, GROUND_WALL_H, -11.2, 2.2, 2.5, 0.34, matPlaster);
+  addWallWithDoor('z', 3.8, 5.67, 16.75, 0, GROUND_WALL_H, 11.2, 2.2, 2.5, 0.34, matPlaster);
+  addWallWithDoor('x', -5.5, 3.63, 19.75, 0, GROUND_WALL_H, 12.5, 2.4, 2.5, 0.34, matPlaster);
+  addWallWithDoor('x', 5.5, 3.63, 19.75, 0, GROUND_WALL_H, 12.5, 2.4, 2.5, 0.34, matPlaster);
 
-  // Apartment interior tactical partition baffles (breached CQB rooms)
-  addSolidBox(-11.5, 1.8, -11.5, 0.3, 3.6, 5.2, matPlaster);
-  addSolidBox(11.5, 1.8, -11.5, 0.3, 3.6, 5.2, matPlaster);
-  addSolidBox(-11.5, 1.8, 11.5, 0.3, 3.6, 5.2, matPlaster);
-  addSolidBox(11.5, 1.8, 11.5, 0.3, 3.6, 5.2, matPlaster);
+  // Apartment interior tactical partition baffles (stop cleanly beneath 2nd-floor slab)
+  addSolidBox(-11.5, GROUND_WALL_H * 0.5, -11.5, 0.3, GROUND_WALL_H, 5.2, matPlaster);
+  addSolidBox(11.5, GROUND_WALL_H * 0.5, -11.5, 0.3, GROUND_WALL_H, 5.2, matPlaster);
+  addSolidBox(-11.5, GROUND_WALL_H * 0.5, 11.5, 0.3, GROUND_WALL_H, 5.2, matPlaster);
+  addSolidBox(11.5, GROUND_WALL_H * 0.5, 11.5, 0.3, GROUND_WALL_H, 5.2, matPlaster);
 
   // Interior timber desks / cover crates inside offices
   const deskPositions: Array<[number, number, number, number, number]> = [
@@ -321,33 +321,33 @@ function buildPripyatBlock(
     addSolidBox(dx, dy, dz, dw, dy * 2, dd, matWood, 'wood');
   }
 
-  // === 3. Second Floor Slabs (with Open Central Atrium & Stairwell Cutouts) ===
-  // North second-floor bridge & offices (Z in [-16.8, -5.5])
-  addSolidBox(0, FLOOR_2_Y - 0.14, -11.15, 39.6, 0.28, 11.3, matConcrete);
-  // South second-floor bridge & offices (Z in [5.5, 16.8])
-  addSolidBox(0, FLOOR_2_Y - 0.14, 11.15, 39.6, 0.28, 11.3, matConcrete);
-  // West outer balcony strip (X in [-19.8, -10.2], Z in [-5.5, 5.5])
-  addSolidBox(-15.0, FLOOR_2_Y - 0.14, 0, 9.6, 0.28, 11.0, matConcrete);
-  // East outer balcony strip (X in [10.2, 19.8], Z in [-5.5, 5.5])
-  addSolidBox(15.0, FLOOR_2_Y - 0.14, 0, 9.6, 0.28, 11.0, matConcrete);
+  // === 3. Second Floor Slabs (non-overlapping joints inside exterior walls) ===
+  // North second-floor bridge & offices (Z in [-16.75, -5.5], X in [-19.75, 19.75])
+  addSolidBox(0, FLOOR_2_Y - 0.14, -11.125, 39.5, 0.28, 11.25, matConcrete);
+  // South second-floor bridge & offices (Z in [5.5, 16.75], X in [-19.75, 19.75])
+  addSolidBox(0, FLOOR_2_Y - 0.14, 11.125, 39.5, 0.28, 11.25, matConcrete);
+  // West outer balcony strip (X in [-19.75, -10.2], Z in [-5.5, 5.5])
+  addSolidBox(-14.975, FLOOR_2_Y - 0.14, 0, 9.55, 0.28, 11.0, matConcrete);
+  // East outer balcony strip (X in [10.2, 19.75], Z in [-5.5, 5.5])
+  addSolidBox(14.975, FLOOR_2_Y - 0.14, 0, 9.55, 0.28, 11.0, matConcrete);
 
-  // Waist-high concrete parapets overlooking the central double-height atrium (Y = 3.6 -> 4.65)
-  addSolidBox(0, FLOOR_2_Y + 0.52, -5.65, 20.4, 1.04, 0.28, matConcrete);
-  addSolidBox(0, FLOOR_2_Y + 0.52, 5.65, 20.4, 1.04, 0.28, matConcrete);
-  addSolidBox(-10.35, FLOOR_2_Y + 0.52, 0, 0.28, 1.04, 11.0, matConcrete);
-  addSolidBox(10.35, FLOOR_2_Y + 0.52, 0, 0.28, 1.04, 11.0, matConcrete);
+  // Waist-high concrete parapets overlooking central atrium (non-overlapping corners)
+  addSolidBox(0, FLOOR_2_Y + 0.52, -5.64, 20.96, 1.04, 0.28, matConcrete);
+  addSolidBox(0, FLOOR_2_Y + 0.52, 5.64, 20.96, 1.04, 0.28, matConcrete);
+  addSolidBox(-10.34, FLOOR_2_Y + 0.52, 0, 0.28, 1.04, 11.0, matConcrete);
+  addSolidBox(10.34, FLOOR_2_Y + 0.52, 0, 0.28, 1.04, 11.0, matConcrete);
 
-  // Second Floor Interior Partitions (with wide doorways)
-  addWallWithDoor('z', -5.5, -16.8, -5.5, FLOOR_2_Y, WALL_H, -11.5, 2.4, 2.5, 0.32, matPlaster);
-  addWallWithDoor('z', 5.5, -16.8, -5.5, FLOOR_2_Y, WALL_H, -11.5, 2.4, 2.5, 0.32, matPlaster);
-  addWallWithDoor('z', -5.5, 5.5, 16.8, FLOOR_2_Y, WALL_H, 11.5, 2.4, 2.5, 0.32, matPlaster);
-  addWallWithDoor('z', 5.5, 5.5, 16.8, FLOOR_2_Y, WALL_H, 11.5, 2.4, 2.5, 0.32, matPlaster);
+  // Second Floor Interior Partitions (butted cleanly between parapets & exterior walls)
+  addWallWithDoor('z', -5.5, -16.75, -5.78, FLOOR_2_Y, WALL_H, -11.5, 2.4, 2.5, 0.32, matPlaster);
+  addWallWithDoor('z', 5.5, -16.75, -5.78, FLOOR_2_Y, WALL_H, -11.5, 2.4, 2.5, 0.32, matPlaster);
+  addWallWithDoor('z', -5.5, 5.78, 16.75, FLOOR_2_Y, WALL_H, 11.5, 2.4, 2.5, 0.32, matPlaster);
+  addWallWithDoor('z', 5.5, 5.78, 16.75, FLOOR_2_Y, WALL_H, 11.5, 2.4, 2.5, 0.32, matPlaster);
 
-  // Roof Slab (with central skylight breach for dramatic overcast shafts into the atrium!)
-  addSolidBox(0, ROOF_Y + 0.15, -11.5, 40.4, 0.3, 11.4, matDarkConcrete);
-  addSolidBox(0, ROOF_Y + 0.15, 11.5, 40.4, 0.3, 11.4, matDarkConcrete);
-  addSolidBox(-13.5, ROOF_Y + 0.15, 0, 13.4, 0.3, 11.8, matDarkConcrete);
-  addSolidBox(13.5, ROOF_Y + 0.15, 0, 13.4, 0.3, 11.8, matDarkConcrete);
+  // Roof Slab (exact non-overlapping seams around central atrium skylight)
+  addSolidBox(0, ROOF_Y + 0.15, -11.525, 40.5, 0.3, 11.45, matDarkConcrete);
+  addSolidBox(0, ROOF_Y + 0.15, 11.525, 40.5, 0.3, 11.45, matDarkConcrete);
+  addSolidBox(-13.525, ROOF_Y + 0.15, 0, 13.45, 0.3, 11.6, matDarkConcrete);
+  addSolidBox(13.525, ROOF_Y + 0.15, 0, 13.45, 0.3, 11.6, matDarkConcrete);
 
   // === 4. Dual Symmetrical Brutalist Staircases (West & East Mid-Atrium) ===
   // West Stair: X in [-9.6, -6.2], rises along +Z from Z = -4.6 (Y=0) to Z = 5.4 (Y=3.6)
@@ -375,7 +375,8 @@ function buildPripyatBlock(
     const stepCount = 16;
     const stepD = (maxZ - minZ) / stepCount;
     const stepH = FLOOR_2_Y / stepCount;
-    const stepGeo = trackGeo(new THREE.BoxGeometry(width, stepH, stepD + 0.04));
+    // Slight 2mm tread gap eliminates coplanar side-face overlap between adjacent steps
+    const stepGeo = trackGeo(new THREE.BoxGeometry(width, stepH, Math.max(0.05, stepD - 0.002)));
     const stepInst = new THREE.InstancedMesh(stepGeo, matDarkConcrete, stepCount);
     stepInst.receiveShadow = !isSoftwareGl;
     stepInst.castShadow = !isSoftwareGl;
@@ -410,56 +411,63 @@ function buildPripyatBlock(
   buildStairFlight(7.8, 2.8, 4.4, -5.5, '-z');
 
   // === 5. InstancedMesh Structural Columns, Sandbag Cover & Fluorescent Fixtures ===
-  const columnCoords: Array<[number, number, number]> = [
-    [-3.6, 1.8, -14.2],
-    [3.6, 1.8, -14.2],
-    [-3.6, 1.8, -6.2],
-    [3.6, 1.8, -6.2],
-    [-3.6, 1.8, 0.0],
-    [3.6, 1.8, 0.0],
-    [-3.6, 1.8, 6.2],
-    [3.6, 1.8, 6.2],
-    [-3.6, 1.8, 14.2],
-    [3.6, 1.8, 14.2],
-    [-14.5, 1.8, -8.0],
-    [14.5, 1.8, -8.0],
-    [-14.5, 1.8, 8.0],
-    [14.5, 1.8, 8.0],
-    [-14.5, FLOOR_2_Y + 1.8, -8.0],
-    [14.5, FLOOR_2_Y + 1.8, -8.0],
-    [-14.5, FLOOR_2_Y + 1.8, 8.0],
-    [14.5, FLOOR_2_Y + 1.8, 8.0],
-    [-5.5, FLOOR_2_Y + 1.8, -12.0],
-    [5.5, FLOOR_2_Y + 1.8, -12.0],
-    [-5.5, FLOOR_2_Y + 1.8, 12.0],
-    [5.5, FLOOR_2_Y + 1.8, 12.0],
+  // Ground-floor columns stop cleanly under 2nd-floor slab (h=3.32) and clear partition walls
+  const groundColumnCoords: Array<[number, number, number]> = [
+    [-3.28, GROUND_WALL_H * 0.5, -14.2],
+    [3.28, GROUND_WALL_H * 0.5, -14.2],
+    [-3.28, GROUND_WALL_H * 0.5, -6.2],
+    [3.28, GROUND_WALL_H * 0.5, -6.2],
+    [-3.6, GROUND_WALL_H * 0.5, 0.0],
+    [3.6, GROUND_WALL_H * 0.5, 0.0],
+    [-3.28, GROUND_WALL_H * 0.5, 6.2],
+    [3.28, GROUND_WALL_H * 0.5, 6.2],
+    [-3.28, GROUND_WALL_H * 0.5, 14.2],
+    [3.28, GROUND_WALL_H * 0.5, 14.2],
+    [-14.5, GROUND_WALL_H * 0.5, -8.0],
+    [14.5, GROUND_WALL_H * 0.5, -8.0],
+    [-14.5, GROUND_WALL_H * 0.5, 8.0],
+    [14.5, GROUND_WALL_H * 0.5, 8.0],
   ];
-  const colGeo = trackGeo(new THREE.BoxGeometry(0.68, 3.6, 0.68));
-  const colInst = new THREE.InstancedMesh(colGeo, matConcrete, columnCoords.length);
-  colInst.castShadow = !isSoftwareGl;
-  colInst.receiveShadow = !isSoftwareGl;
-  columnCoords.forEach(([cx, cy, cz], i) => {
-    dummy.position.set(cx, cy, cz);
-    dummy.rotation.set(0, 0, 0);
-    dummy.scale.set(1, 1, 1);
-    dummy.updateMatrix();
-    colInst.setMatrixAt(i, dummy.matrix);
-    physics.addBox({
-      minX: cx - 0.34,
-      maxX: cx + 0.34,
-      minY: cy - 1.8,
-      maxY: cy + 1.8,
-      minZ: cz - 0.34,
-      maxZ: cz + 0.34,
-      surface: 'concrete',
-      blocksMovement: true,
+  const upperColumnCoords: Array<[number, number, number]> = [
+    [-14.5, FLOOR_2_Y + WALL_H * 0.5, -8.0],
+    [14.5, FLOOR_2_Y + WALL_H * 0.5, -8.0],
+    [-14.5, FLOOR_2_Y + WALL_H * 0.5, 8.0],
+    [14.5, FLOOR_2_Y + WALL_H * 0.5, 8.0],
+    [-6.0, FLOOR_2_Y + WALL_H * 0.5, -12.0],
+    [6.0, FLOOR_2_Y + WALL_H * 0.5, -12.0],
+    [-6.0, FLOOR_2_Y + WALL_H * 0.5, 12.0],
+    [6.0, FLOOR_2_Y + WALL_H * 0.5, 12.0],
+  ];
+  const addColumnBatch = (coords: Array<[number, number, number]>, height: number): void => {
+    const colGeo = trackGeo(new THREE.BoxGeometry(0.68, height, 0.68));
+    const colInst = new THREE.InstancedMesh(colGeo, matConcrete, coords.length);
+    colInst.castShadow = !isSoftwareGl;
+    colInst.receiveShadow = !isSoftwareGl;
+    coords.forEach(([cx, cy, cz], i) => {
+      dummy.position.set(cx, cy, cz);
+      dummy.rotation.set(0, 0, 0);
+      dummy.scale.set(1, 1, 1);
+      dummy.updateMatrix();
+      colInst.setMatrixAt(i, dummy.matrix);
+      physics.addBox({
+        minX: cx - 0.34,
+        maxX: cx + 0.34,
+        minY: cy - height * 0.5,
+        maxY: cy + height * 0.5,
+        minZ: cz - 0.34,
+        maxZ: cz + 0.34,
+        surface: 'concrete',
+        blocksMovement: true,
+      });
     });
-  });
-  colInst.instanceMatrix.needsUpdate = true;
-  colInst.computeBoundingSphere();
-  colInst.userData.surfaceMaterial = 'concrete';
-  sceneGroup.add(colInst);
-  raycastMeshes.push(colInst);
+    colInst.instanceMatrix.needsUpdate = true;
+    colInst.computeBoundingSphere();
+    colInst.userData.surfaceMaterial = 'concrete';
+    sceneGroup.add(colInst);
+    raycastMeshes.push(colInst);
+  };
+  addColumnBatch(groundColumnCoords, GROUND_WALL_H);
+  addColumnBatch(upperColumnCoords, WALL_H);
 
   // InstancedMesh Sandbag Cover Positions (crouch-height tactical cover across central corridor & rooms)
   const sandbagBarriers: Array<[number, number, number, number]> = [
@@ -486,7 +494,7 @@ function buildPripyatBlock(
         const localX = (col - 0.5) * 0.72 + (row % 2 === 1 ? 0.12 : 0);
         const wx = bx + localX * cos;
         const wz = bz - localX * sin;
-        dummy.position.set(wx, by + 0.18 + row * 0.34, wz);
+        dummy.position.set(wx, by + 0.181 + row * 0.362, wz);
         dummy.rotation.set(0, rotY, 0);
         dummy.scale.set(1, 1, 1);
         dummy.updateMatrix();
@@ -512,23 +520,23 @@ function buildPripyatBlock(
   sceneGroup.add(bagInst);
   raycastMeshes.push(bagInst);
 
-  // InstancedMesh Ceiling Fluorescent Housings + Flickering Corridor PointLights
+  // InstancedMesh Ceiling Fluorescent Housings (flush below 3.32m slab & 7.20m roof, zero overlap)
   const fixtureCoords: Array<[number, number, number]> = [
-    [0, 3.42, -12.5],
-    [0, 3.42, -7.5],
-    [0, 3.42, 7.5],
-    [0, 3.42, 12.5],
-    [-12.5, 3.42, -11.0],
-    [12.5, 3.42, -11.0],
-    [-12.5, 3.42, 11.0],
-    [12.5, 3.42, 11.0],
-    [0, ROOF_Y - 0.14, -11.0],
-    [0, ROOF_Y - 0.14, 11.0],
-    [-14.0, ROOF_Y - 0.14, 0],
-    [14.0, ROOF_Y - 0.14, 0],
+    [0, 3.268, -12.5],
+    [0, 3.268, -7.5],
+    [0, 3.268, 7.5],
+    [0, 3.268, 12.5],
+    [-12.5, 3.268, -11.0],
+    [12.5, 3.268, -11.0],
+    [-12.5, 3.268, 11.0],
+    [12.5, 3.268, 11.0],
+    [0, ROOF_Y - 0.052, -11.0],
+    [0, ROOF_Y - 0.052, 11.0],
+    [-14.0, ROOF_Y - 0.052, 0],
+    [14.0, ROOF_Y - 0.052, 0],
   ];
   const housingGeo = trackGeo(new THREE.BoxGeometry(1.4, 0.1, 0.24));
-  const tubeGeo = trackGeo(new THREE.BoxGeometry(1.26, 0.05, 0.12));
+  const tubeGeo = trackGeo(new THREE.BoxGeometry(1.26, 0.048, 0.12));
   const housingInst = new THREE.InstancedMesh(housingGeo, matFluorescentHousing, fixtureCoords.length);
   const tubeInst = new THREE.InstancedMesh(tubeGeo, matTubeOn, fixtureCoords.length);
   fixtureCoords.forEach(([fx, fy, fz], i) => {
@@ -537,7 +545,7 @@ function buildPripyatBlock(
     dummy.scale.set(1, 1, 1);
     dummy.updateMatrix();
     housingInst.setMatrixAt(i, dummy.matrix);
-    dummy.position.set(fx, fy - 0.06, fz);
+    dummy.position.set(fx, fy - 0.076, fz);
     dummy.updateMatrix();
     tubeInst.setMatrixAt(i, dummy.matrix);
   });
@@ -565,13 +573,35 @@ function buildPripyatBlock(
     flickerLights.push({ light: pl, baseIntensity: inten, phase: i * 1.9, broken });
   }
 
-  // Cyrillic/Sector Stencil Plaques on Corridor Walls
+  // Cyrillic/Sector Stencil Plaques on Corridor Walls (polygonOffset prevents grazing Z-fighting)
   const signNorthTex = trackTex(createStencilSignTexture('БЛОК 04 · СЕВЕР', 'PRIPYAT SECTOR NORTH', '#e0a448', '#252927', maxAniso));
   const signSouthTex = trackTex(createStencilSignTexture('БЛОК 04 · ЮГ', 'PRIPYAT SECTOR SOUTH', '#5ca6d8', '#252927', maxAniso));
   const signGeo = trackGeo(new THREE.PlaneGeometry(2.4, 0.9));
-  const signN = new THREE.Mesh(signGeo, trackMat(new THREE.MeshStandardMaterial({ map: signNorthTex, roughness: 0.7 })));
+  const signN = new THREE.Mesh(
+    signGeo,
+    trackMat(
+      new THREE.MeshStandardMaterial({
+        map: signNorthTex,
+        roughness: 0.7,
+        polygonOffset: true,
+        polygonOffsetFactor: -2,
+        polygonOffsetUnits: -4,
+      }),
+    ),
+  );
   signN.position.set(0, 2.35, -16.72);
-  const signS = new THREE.Mesh(signGeo, trackMat(new THREE.MeshStandardMaterial({ map: signSouthTex, roughness: 0.7 })));
+  const signS = new THREE.Mesh(
+    signGeo,
+    trackMat(
+      new THREE.MeshStandardMaterial({
+        map: signSouthTex,
+        roughness: 0.7,
+        polygonOffset: true,
+        polygonOffsetFactor: -2,
+        polygonOffsetUnits: -4,
+      }),
+    ),
+  );
   signS.position.set(0, 2.35, 16.72);
   signS.rotation.y = Math.PI;
   sceneGroup.add(signN, signS);

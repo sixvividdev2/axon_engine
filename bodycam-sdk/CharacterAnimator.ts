@@ -242,6 +242,10 @@ export class CharacterAnimator {
   private readonly _suppressorMountRoot = new THREE.Vector3();
   private readonly _suppressorTwistQuat = new THREE.Quaternion();
   private readonly _suppressorTwistEuler = new THREE.Euler(0, 0, 0, 'YXZ');
+  private readonly _zoomRingPosWorld = new THREE.Vector3();
+  private readonly _zoomRingQuatWorld = new THREE.Quaternion();
+  private readonly _zoomRingPosRoot = new THREE.Vector3();
+  private readonly _zoomRingQuatRoot = new THREE.Quaternion();
 
   // Post-animation soft-tissue & gear secondary physics
   private readonly secondaryApplier: SecondaryPhysicsRigApplier;
@@ -2046,6 +2050,21 @@ export class CharacterAnimator {
       this._tmpEuler.set(0.18, -0.28, 0.36, 'YXZ');
       this._lDesiredQuatRoot.setFromEuler(this._tmpEuler);
       leftGripCurl = 0.88;
+    } else if (isFirearm && this.weaponRig.isZoomTwistActive()) {
+      // 0.28s interruptible LPVO magnification ring throw-lever twist with left hand IK
+      const zoomW = this.weaponRig.getZoomRingIkOverride(
+        this._zoomRingPosWorld,
+        this._zoomRingQuatWorld,
+      );
+      if (zoomW > 0.001) {
+        leftOverridden = true;
+        this._zoomRingPosRoot.copy(this._zoomRingPosWorld);
+        this.skeleton.root.worldToLocal(this._zoomRingPosRoot);
+        this._zoomRingQuatRoot.copy(this._zoomRingQuatWorld).premultiply(this._rootWorldQuatInv);
+        this._lDesiredRoot.lerp(this._zoomRingPosRoot, zoomW);
+        this._lDesiredQuatRoot.slerp(this._zoomRingQuatRoot, zoomW * 0.72);
+        leftGripCurl = THREE.MathUtils.lerp(leftGripCurl, 0.76, zoomW);
+      }
     }
 
     if (this.wasLeftOverridden && !leftOverridden) {

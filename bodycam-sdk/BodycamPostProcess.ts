@@ -139,6 +139,9 @@ const BodycamOpticalShader = {
     uBlur: { value: 0.0 },
     uChromaticSpike: { value: 0.0 },
     uBreathVignette: { value: 0.0 },
+    tFlashBurnIn: { value: null as THREE.Texture | null },
+    uFlashOverload: { value: 0.0 },
+    uFlashBurnIn: { value: 0.0 },
   },
   vertexShader: /* glsl */ `
     varying vec2 vUv;
@@ -167,6 +170,9 @@ const BodycamOpticalShader = {
     uniform float uBlur;
     uniform float uChromaticSpike;
     uniform float uBreathVignette;
+    uniform sampler2D tFlashBurnIn;
+    uniform float uFlashOverload;
+    uniform float uFlashBurnIn;
     varying vec2 vUv;
 
     float rand(vec2 co) {
@@ -287,6 +293,25 @@ const BodycamOpticalShader = {
       float noise = rand(uv * vec2(1280.0, 720.0) + fract(uTime * 43.0)) - 0.5;
       col += noise * uGrain * (0.28 + shadowWeight * 1.45);
 
+      // Real-life bodycam CMOS flashbang overload:
+      //  1) High-intensity clipped whiteout with magenta/green CMOS rolling highlight smear
+      //  2) Frozen sensor afterimage burn-in from detonation instant fading as AGC recovers
+      if (uFlashBurnIn > 0.002) {
+        vec3 burnHdr = texture2D(tFlashBurnIn, uv).rgb * 1.25;
+        vec3 burnSrgb = linearToSrgb(acesFilmic(burnHdr));
+        float burnLuma = dot(burnSrgb, vec3(0.299, 0.587, 0.114));
+        // Subtle green/violet retinal & CMOS sensor ghost tint
+        vec3 ghostCol = mix(burnSrgb, vec3(burnLuma * 0.96, burnLuma * 1.04, burnLuma * 0.92), 0.35);
+        col = mix(col, max(col, ghostCol * 1.18), clamp(uFlashBurnIn * 0.78, 0.0, 0.85));
+      }
+      if (uFlashOverload > 0.002) {
+        float overload = clamp(uFlashOverload, 0.0, 1.0);
+        // Vertical CMOS bloom smear & blown-out white ceiling
+        float smear = exp(-abs(uv.x - 0.5) * 2.2) * overload * 0.45;
+        vec3 cmosTint = vec3(1.0, 0.97, 1.02) + vec3(0.18, -0.05, 0.22) * smear * (1.0 - overload * 0.5);
+        col = mix(col, cmosTint, smoothstep(0.0, 0.85, overload));
+      }
+
       gl_FragColor = vec4(clamp(col, 0.0, 1.0), 1.0);
     }
   `,
@@ -389,6 +414,7 @@ export class BodycamPostProcess {
   private isSoftwareGl: boolean;
 
   private hdrTarget: THREE.WebGLRenderTarget;
+  private flashBurnInTarget: THREE.WebGLRenderTarget;
   private lumTarget: THREE.WebGLRenderTarget;
   private glareTargetA: THREE.WebGLRenderTarget;
   private glareTargetB: THREE.WebGLRenderTarget;
@@ -402,11 +428,19 @@ export class BodycamPostProcess {
   private glareExtractMaterial: THREE.ShaderMaterial;
   private glareBlurMaterial: THREE.ShaderMaterial;
   private opticalMaterial: THREE.ShaderMaterial;
+  private copyMaterial: THREE.ShaderMaterial;
 
   private currentExposure = 0.95;
   private avgLuminance = 0.22;
   private frameCount = 0;
   private beforeMainRenderCallback: (() => void) | null = null;
+
+  // Bodycam CMOS Flashbang Overload state
+  private flashOverloadIntensity = 0;
+  private flashBurnInStrength = 0;
+  private flashCapturePending = false;
+  private flashOverloadPeak = 0;
+  private flashHoldTimer = 0;
 
   private readonly _sizeVec = new THREE.Vector2();
 
@@ -457,6 +491,13 @@ export class BodycamPostProcess {
     this.glareTargetA = new THREE.WebGLRenderTarget(gw, gh, glareOpts);
     this.glareTargetB = new THREE.WebGLRenderTarget(gw, gh, glareOpts);
 
+    // Half-res HDR snapshot target for realistic CMOS flashbang burn-in afterimage
+    this.flashBurnInTarget = new THREE.WebGLRenderTarget(
+      Math.max(128, Math.floor(w / 2)),
+      Math.max(72, Math.floor(h / 2)),
+      glareOpts,
+    );
+
     this.lensDirtTex = createProceduralLensDirtTexture();
 
     this.lumMaterial = new THREE.ShaderMaterial({
@@ -492,6 +533,29 @@ export class BodycamPostProcess {
       depthWrite: false,
     });
     this.opticalMaterial.uniforms.tLensDirt.value = this.lensDirtTex;
+    this.opticalMaterial.uniforms.tFlashBurnIn.value = this.flashBurnInTarget.texture;
+
+    this.copyMaterial = new THREE.ShaderMaterial({
+      uniforms: {
+        tSrc: { value: null as THREE.Texture | null },
+      },
+      vertexShader: /* glsl */ `
+        varying vec2 vUv;
+        void main() {
+          vUv = uv;
+          gl_Position = vec4(position.xy, 0.0, 1.0);
+        }
+      `,
+      fragmentShader: /* glsl */ `
+        uniform sampler2D tSrc;
+        varying vec2 vUv;
+        void main() {
+          gl_FragColor = texture2D(tSrc, vUv);
+        }
+      `,
+      depthTest: false,
+      depthWrite: false,
+    });
 
     this.quadCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
     this.quadScene = new THREE.Scene();
@@ -511,6 +575,10 @@ export class BodycamPostProcess {
     const gh = Math.max(36, Math.floor(ph / 4));
     this.glareTargetA.setSize(gw, gh);
     this.glareTargetB.setSize(gw, gh);
+    this.flashBurnInTarget.setSize(
+      Math.max(128, Math.floor(pw / 2)),
+      Math.max(72, Math.floor(ph / 2)),
+    );
     this.glareExtractMaterial.uniforms.uTexel.value.set(1 / gw, 1 / gh);
   }
 
@@ -524,6 +592,29 @@ export class BodycamPostProcess {
 
   public setBeforeMainRenderCallback(fn: (() => void) | null): void {
     this.beforeMainRenderCallback = fn;
+  }
+
+  /**
+   * Triggers a physically authentic bodycam CMOS flashbang overload:
+   *  - Snapshots the live HDR frame into `flashBurnInTarget` for sensor burn-in afterimage
+   *  - Blows out highlight clipping & vertical smear
+   *  - Slams auto-exposure down so AGC visibly recovers over 3.5-5.5 seconds
+   */
+  public triggerFlashbangOverload(intensity: number): void {
+    const clamped = THREE.MathUtils.clamp(intensity, 0.08, 1.0);
+    if (clamped >= this.flashOverloadIntensity * 0.7) {
+      this.flashCapturePending = true;
+    }
+    this.flashOverloadPeak = Math.max(this.flashOverloadPeak, clamped);
+    this.flashOverloadIntensity = Math.max(this.flashOverloadIntensity, clamped);
+    this.flashBurnInStrength = Math.max(this.flashBurnInStrength, clamped * 0.95);
+    this.flashHoldTimer = Math.max(this.flashHoldTimer, 0.35 + clamped * 1.15);
+    // Slam CMOS auto-exposure shutter down immediately in response to peak lux spike
+    this.currentExposure = Math.min(this.currentExposure, THREE.MathUtils.lerp(0.65, 0.16, clamped));
+  }
+
+  public getFlashOverloadIntensity(): number {
+    return Math.max(this.flashOverloadIntensity, this.flashBurnInStrength);
   }
 
   public update(
@@ -566,18 +657,40 @@ export class BodycamPostProcess {
     const my = THREE.MathUtils.clamp(whipVelY * mbScale, -0.018, 0.018);
     u.uMotionVel.value.set(mx, my);
 
+    // Step bodycam CMOS flashbang overload decay & AGC recovery
+    const clampedDelta = Math.min(Math.max(delta, 0.0001), 0.05);
+    if (this.flashHoldTimer > 0) {
+      this.flashHoldTimer = Math.max(0, this.flashHoldTimer - clampedDelta);
+    } else if (this.flashOverloadIntensity > 0) {
+      this.flashOverloadIntensity = Math.max(0, this.flashOverloadIntensity - clampedDelta * 0.48);
+    }
+    if (this.flashBurnInStrength > 0) {
+      const burnDecay = this.flashHoldTimer > 0 ? 0.04 : 0.21;
+      this.flashBurnInStrength = Math.max(0, this.flashBurnInStrength - clampedDelta * burnDecay);
+    }
+    u.uFlashOverload.value = this.flashOverloadIntensity;
+    u.uFlashBurnIn.value = this.flashBurnInStrength;
+
     if (trauma) {
       u.uInjury.value = THREE.MathUtils.clamp(trauma.arterialVignette, 0, 0.72);
       u.uBleeding.value = trauma.anyHeavyBleed ? 1.0 : trauma.anyLightBleed ? 0.55 : 0.0;
       u.uDesaturation.value = THREE.MathUtils.clamp(trauma.desaturation, 0, 0.68);
-      u.uBlur.value = THREE.MathUtils.clamp(trauma.concussionBlur, 0, 0.65);
-      u.uChromaticSpike.value = THREE.MathUtils.clamp(trauma.chromaticSpike, 0, 0.012);
+      u.uBlur.value = THREE.MathUtils.clamp(
+        Math.max(trauma.concussionBlur, this.flashBurnInStrength * 0.45),
+        0,
+        0.65,
+      );
+      u.uChromaticSpike.value = THREE.MathUtils.clamp(
+        Math.max(trauma.chromaticSpike, this.flashOverloadIntensity * 0.009),
+        0,
+        0.012,
+      );
     } else {
       u.uInjury.value = THREE.MathUtils.clamp((85 - health) / 85, 0, 1);
       u.uBleeding.value = bleeding ? 1.0 : 0.0;
       u.uDesaturation.value = THREE.MathUtils.clamp(((85 - health) / 85) * 0.54, 0, 0.68);
-      u.uBlur.value = 0;
-      u.uChromaticSpike.value = 0;
+      u.uBlur.value = THREE.MathUtils.clamp(this.flashBurnInStrength * 0.42, 0, 0.65);
+      u.uChromaticSpike.value = THREE.MathUtils.clamp(this.flashOverloadIntensity * 0.0085, 0, 0.012);
     }
   }
 
@@ -673,6 +786,16 @@ export class BodycamPostProcess {
       this.opticalMaterial.uniforms.tGlare.value = this.glareTargetA.texture;
     }
 
+    // 3b. Snapshot HDR frame into flashBurnInTarget on the exact frame of flashbang detonation
+    if (this.flashCapturePending) {
+      this.flashCapturePending = false;
+      this.copyMaterial.uniforms.tSrc.value = this.hdrTarget.texture;
+      this.quadMesh.material = this.copyMaterial;
+      this.renderer.setRenderTarget(this.flashBurnInTarget);
+      this.renderer.render(this.quadScene, this.quadCamera);
+      this.opticalMaterial.uniforms.tFlashBurnIn.value = this.flashBurnInTarget.texture;
+    }
+
     // 4. Final optical & CMOS sensor composite to screen
     this.opticalMaterial.uniforms.tHdr.value = this.hdrTarget.texture;
     this.quadMesh.material = this.opticalMaterial;
@@ -682,6 +805,7 @@ export class BodycamPostProcess {
 
   public dispose(): void {
     this.hdrTarget.dispose();
+    this.flashBurnInTarget.dispose();
     this.lumTarget.dispose();
     this.glareTargetA.dispose();
     this.glareTargetB.dispose();
@@ -691,5 +815,6 @@ export class BodycamPostProcess {
     this.glareExtractMaterial.dispose();
     this.glareBlurMaterial.dispose();
     this.opticalMaterial.dispose();
+    this.copyMaterial.dispose();
   }
 }

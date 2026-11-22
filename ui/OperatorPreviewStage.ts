@@ -5,6 +5,7 @@ import { operatorAssetLoader } from '../bodycam-sdk/operator/OperatorAssetLoader
 import { OperatorId } from '../bodycam-sdk/operator/OperatorTypes';
 import { SecondaryPhysicsRigApplier } from '../bodycam-sdk/physics/SecondaryPhysicsRigApplier';
 import { OperatorUniformId } from '../bodycam-sdk/TacticalUniforms';
+import { tacticalEquipmentStore } from '../bodycam-sdk/equipment/TacticalEquipmentStore';
 
 const HERO_YAW = 0.34;
 const HERO_PITCH = 0.07;
@@ -61,6 +62,7 @@ export class OperatorPreviewStage {
   private elapsedSec = 0;
   private readonly resizeObserver: ResizeObserver;
   private readonly stageDisposables: Array<{ dispose: () => void }> = [];
+  private readonly unsubTacticalEquipment: () => void;
 
   // Scratch vectors
   private readonly _lookTarget = new THREE.Vector3(0, TARGET_Y, 0);
@@ -115,6 +117,12 @@ export class OperatorPreviewStage {
     this.buildStudioEnvironment();
     scene.add(this.turntableGroup);
     this.loadOperatorRig(this.currentOperatorId);
+
+    this.unsubTacticalEquipment = tacticalEquipmentStore.subscribe((sel) => {
+      if (!this.disposed && this.skeleton) {
+        this.skeleton.setBeltEquipment(sel.equipmentId, sel.beltSlot, 2, sel.mountOnBelt);
+      }
+    });
 
     // Event listeners
     const dom = renderer.domElement;
@@ -283,6 +291,8 @@ export class OperatorPreviewStage {
     });
 
     const skel = loaded.skeleton;
+    const sel = tacticalEquipmentStore.getSelection();
+    skel.setBeltEquipment(sel.equipmentId, sel.beltSlot, 2, sel.mountOnBelt);
     skel.setFirstPersonHeadShadowOnly(false);
     skel.setAllMeshesWorldLayer();
     // Face +Z toward the front studio camera so operator looks naturally toward the viewer
@@ -481,6 +491,7 @@ export class OperatorPreviewStage {
       this.timerId = null;
     }
 
+    this.unsubTacticalEquipment();
     this.resizeObserver.disconnect();
     const dom = this.renderer.domElement;
     dom.removeEventListener('pointerdown', this.onPointerDown);

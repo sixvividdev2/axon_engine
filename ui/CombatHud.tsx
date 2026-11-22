@@ -5,6 +5,12 @@ import {
   LENS_PRESETS,
 } from '../bodycam-sdk';
 import { CombatSessionSnapshot } from '../combat/CombatSessionEngine';
+import {
+  TACTICAL_BELT_SLOTS,
+  TACTICAL_EQUIPMENT_LIST,
+  TacticalBeltSlot,
+  TacticalEquipmentId,
+} from '../data/tacticalEquipment';
 import { HeartRateIndicator } from './HeartRateIndicator';
 
 export interface MultiplayerHudControls {
@@ -23,6 +29,9 @@ interface CombatHudProps {
   onToggleTuner: (open: boolean) => void;
   onUpdateConfig: (patch: Partial<BodycamSDKConfig>) => void;
   onApplyLensPreset: (preset: BodycamLensPresetId) => void;
+  onSelectTacticalEquipment: (id: TacticalEquipmentId) => void;
+  onSelectTacticalBeltSlot: (slot: TacticalBeltSlot) => void;
+  onToggleTacticalMountOnBelt: (mount: boolean) => void;
   onRematch: () => void;
   onReturnToMenu: (tab?: 'battle' | 'infection') => void;
 }
@@ -46,6 +55,9 @@ export const CombatHud: React.FC<CombatHudProps> = ({
   onToggleTuner,
   onUpdateConfig,
   onApplyLensPreset,
+  onSelectTacticalEquipment,
+  onSelectTacticalBeltSlot,
+  onToggleTacticalMountOnBelt,
   onRematch,
   onReturnToMenu,
 }) => {
@@ -75,6 +87,16 @@ export const CombatHud: React.FC<CombatHudProps> = ({
             background: `radial-gradient(circle at center, transparent 48%, rgba(185, 28, 28, ${(
               snapshot.damageFlash * 0.55
             ).toFixed(3)}) 100%)`,
+          }}
+        />
+      )}
+
+      {/* Flashbang Whiteout Overlay */}
+      {snapshot.flashBlindAlpha > 0.01 && (
+        <div
+          className="fixed inset-0 z-20"
+          style={{
+            backgroundColor: `rgba(242, 248, 255, ${Math.min(0.96, snapshot.flashBlindAlpha).toFixed(3)})`,
           }}
         />
       )}
@@ -411,6 +433,60 @@ export const CombatHud: React.FC<CombatHudProps> = ({
         </div>
       )}
 
+      {/* Authentic 4-Stage Grenade Manual of Arms Indicator */}
+      {snapshot.pointerLocked && snapshot.grenadeHoldStage !== 'HOLSTERED' && (
+        <div
+          className={`fixed top-[56%] left-1/2 flex w-72 -translate-x-1/2 flex-col gap-1 border px-3.5 py-1.5 font-mono-tabular ${
+            snapshot.grenadeHoldStage === 'LEVER_RELEASED'
+              ? 'border-red-500/85 bg-neutral-950/92'
+              : snapshot.grenadeHoldStage === 'PIN_PULLED'
+                ? 'border-amber-400/85 bg-neutral-950/92'
+                : 'border-neutral-600/85 bg-neutral-950/90'
+          }`}
+        >
+          <div className="flex items-center justify-between text-[10px] font-semibold uppercase tracking-wider">
+            <span
+              className={
+                snapshot.grenadeHoldStage === 'LEVER_RELEASED'
+                  ? 'text-red-400'
+                  : snapshot.grenadeHoldStage === 'PIN_PULLED'
+                    ? 'text-amber-300'
+                    : 'text-neutral-100'
+              }
+            >
+              {snapshot.tacticalEquipmentShortName}
+              {snapshot.grenadeHoldStage === 'DRAWN'
+                ? ' · READY'
+                : snapshot.grenadeHoldStage === 'PIN_PULLED'
+                  ? ' · PIN PULLED'
+                  : ' · LIVE FUSE'}
+            </span>
+            <span className="text-neutral-300">
+              {snapshot.grenadeHoldStage === 'DRAWN'
+                ? 'LMB PIN · [H] STOW'
+                : snapshot.grenadeHoldStage === 'PIN_PULLED'
+                  ? 'RMB LEVER · REL LMB'
+                  : 'RELEASE LMB THROW'}
+            </span>
+          </div>
+          {snapshot.grenadeHoldStage === 'PIN_PULLED' && (
+            <div className="text-[9px] uppercase tracking-wider text-neutral-400">
+              Lever held — fuse NOT running
+            </div>
+          )}
+          {snapshot.grenadeHoldStage === 'LEVER_RELEASED' && (
+            <div className="h-1.5 w-full overflow-hidden bg-neutral-800">
+              <div
+                className={`h-full transition-all duration-75 ${
+                  snapshot.grenadeCookRatio > 0.68 ? 'bg-red-500' : 'bg-amber-400'
+                }`}
+                style={{ width: `${Math.min(100, Math.round(snapshot.grenadeCookRatio * 100))}%` }}
+              />
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Transient Toast */}
       {snapshot.toastMessage && (
         <div className="fixed bottom-12 left-1/2 -translate-x-1/2 border border-neutral-700/80 bg-neutral-950/90 px-3.5 py-1.5 font-mono-tabular text-xs text-neutral-100">
@@ -418,7 +494,7 @@ export const CombatHud: React.FC<CombatHudProps> = ({
         </div>
       )}
 
-      {/* Bottom-Right Health & Weapon Status Block */}
+      {/* Bottom-Right Health, Belt Ordnance & Weapon Status Block */}
       <div className="fixed right-5 bottom-4 flex flex-col items-end gap-1.5">
         {/* Tactical Health Bar */}
         <div className="flex items-center gap-2.5 bg-neutral-950/86 px-3 py-1.5 font-mono-tabular text-[11px]">
@@ -436,29 +512,57 @@ export const CombatHud: React.FC<CombatHudProps> = ({
           <span className="w-8 text-right font-semibold text-neutral-100">{snapshot.hp}</span>
         </div>
 
-        {/* Active Weapon & Ammo */}
-        <div className="flex items-center gap-3 border border-neutral-800/90 bg-neutral-950/88 px-3.5 py-2 font-mono-tabular">
-          <div className="text-right">
-            <div className="text-xs font-semibold text-neutral-100">
-              {snapshot.equippedWeaponName}
+        <div className="flex items-stretch gap-1.5">
+          {/* Belt Tactical Grenade Slot */}
+          <div
+            className={`flex flex-col justify-center border px-3 py-1.5 font-mono-tabular text-right ${
+              snapshot.grenadeHoldStage === 'LEVER_RELEASED'
+                ? 'border-red-500 bg-red-950/75 text-red-200'
+                : snapshot.grenadeHoldStage !== 'HOLSTERED'
+                  ? 'border-amber-400 bg-amber-950/75 text-amber-200'
+                  : snapshot.grenadeCount > 0
+                    ? 'border-neutral-800/90 bg-neutral-950/88 text-neutral-200'
+                    : 'border-neutral-800/60 bg-neutral-950/72 text-neutral-500'
+            }`}
+          >
+            <div className="text-[10px] font-semibold uppercase tracking-wider">
+              {snapshot.tacticalEquipmentShortName}
             </div>
-            <div className="text-[10px] uppercase tracking-wider text-neutral-400">
-              {snapshot.isReloading
-                ? 'RELOADING...'
-                : snapshot.armedAdsMode === 'POINT_AIM'
-                  ? 'POINT AIM'
-                  : snapshot.armedAdsMode === 'CANTED'
-                    ? 'CANTED'
-                    : snapshot.equippedCaliber}
+            <div className="mt-0.5 flex items-baseline justify-end gap-1.5">
+              <span className="font-display text-lg leading-none font-bold text-amber-300">
+                {snapshot.grenadeCount}
+              </span>
+              <span className="text-[10px] text-neutral-400">/ {snapshot.grenadeMax}</span>
+              <span className="border border-neutral-700 bg-neutral-900 px-1 text-[9px] text-neutral-300">
+                4/H
+              </span>
             </div>
           </div>
-          <div className="border-l border-neutral-800 pl-3 text-right">
-            <span className="font-display text-2xl font-bold text-neutral-50">
-              {snapshot.ammoInMag}
-            </span>
-            <span className="ml-1 text-xs text-neutral-400">
-              / {snapshot.reserveAmmo < 0 ? 'INF' : snapshot.reserveAmmo}
-            </span>
+
+          {/* Active Weapon & Ammo */}
+          <div className="flex items-center gap-3 border border-neutral-800/90 bg-neutral-950/88 px-3.5 py-2 font-mono-tabular">
+            <div className="text-right">
+              <div className="text-xs font-semibold text-neutral-100">
+                {snapshot.equippedWeaponName}
+              </div>
+              <div className="text-[10px] uppercase tracking-wider text-neutral-400">
+                {snapshot.isReloading
+                  ? 'RELOADING...'
+                  : snapshot.armedAdsMode === 'POINT_AIM'
+                    ? 'POINT AIM'
+                    : snapshot.armedAdsMode === 'CANTED'
+                      ? 'CANTED'
+                      : `${snapshot.equippedCaliber} · Z ${snapshot.zeroDistanceM}m`}
+              </div>
+            </div>
+            <div className="border-l border-neutral-800 pl-3 text-right">
+              <span className="font-display text-2xl font-bold text-neutral-50">
+                {snapshot.ammoInMag}
+              </span>
+              <span className="ml-1 text-xs text-neutral-400">
+                / {snapshot.reserveAmmo < 0 ? 'INF' : snapshot.reserveAmmo}
+              </span>
+            </div>
           </div>
         </div>
       </div>
@@ -470,6 +574,7 @@ export const CombatHud: React.FC<CombatHudProps> = ({
           style={{ textShadow: '0 1px 2px rgba(0,0,0,0.95)' }}
         >
           <span>1-2 Weapons</span>
+          <span className="text-amber-300">4 / H Grenade</span>
           <span>R Reload</span>
           <span>MMB Pt-Aim</span>
           <span>V Bash</span>
@@ -668,6 +773,56 @@ export const CombatHud: React.FC<CombatHudProps> = ({
                 className="accent-amber-400"
               />
             </label>
+
+            {/* Belt Tactical Equipment Assignment */}
+            <div className="border-t border-neutral-800 pt-3">
+              <div className="mb-1.5 flex items-center justify-between font-mono-tabular text-[10px] uppercase tracking-wider text-neutral-400">
+                <span>Tactical Belt Slot</span>
+                <button
+                  type="button"
+                  onClick={() => onToggleTacticalMountOnBelt(!snapshot.tacticalMountOnBelt)}
+                  className={`cursor-pointer border px-1.5 py-0.5 text-[9px] font-semibold ${
+                    snapshot.tacticalMountOnBelt
+                      ? 'border-emerald-500/70 bg-emerald-950/50 text-emerald-300'
+                      : 'border-neutral-700 bg-neutral-900 text-neutral-400'
+                  }`}
+                >
+                  Belt Mesh: {snapshot.tacticalMountOnBelt ? 'ON' : 'OFF'}
+                </button>
+              </div>
+              <div className="grid grid-cols-2 gap-1">
+                {TACTICAL_EQUIPMENT_LIST.map((item) => (
+                  <button
+                    key={item.id}
+                    type="button"
+                    onClick={() => onSelectTacticalEquipment(item.id)}
+                    className={`cursor-pointer border px-2 py-1 text-left font-mono-tabular text-[10px] ${
+                      snapshot.tacticalEquipmentId === item.id
+                        ? 'border-amber-400 bg-amber-500/20 text-amber-200'
+                        : 'border-neutral-800 bg-neutral-900 text-neutral-400 hover:text-neutral-200'
+                    }`}
+                  >
+                    {item.shortName}
+                  </button>
+                ))}
+              </div>
+              <div className="mt-1.5 grid grid-cols-4 gap-1">
+                {TACTICAL_BELT_SLOTS.map((slot) => (
+                  <button
+                    key={slot.id}
+                    type="button"
+                    onClick={() => onSelectTacticalBeltSlot(slot.id)}
+                    className={`cursor-pointer border py-1 font-mono-tabular text-[9px] uppercase ${
+                      snapshot.tacticalBeltSlot === slot.id
+                        ? 'border-amber-400/80 bg-amber-500/15 text-amber-300'
+                        : 'border-neutral-800 bg-neutral-900 text-neutral-500 hover:text-neutral-300'
+                    }`}
+                  >
+                    {slot.shortLabel}
+                  </button>
+                ))}
+              </div>
+            </div>
 
             <button
               type="button"

@@ -21,6 +21,18 @@ import {
   TACTICAL_UNIFORM_PRESETS,
 } from './TacticalUniforms';
 import { BodycamWeaponHoldClass } from './types';
+import {
+  DEFAULT_TACTICAL_BELT_SLOT,
+  DEFAULT_TACTICAL_EQUIPMENT_ID,
+  TacticalBeltSlot,
+  TacticalEquipmentId,
+} from '../data/tacticalEquipment';
+import {
+  buildTacticalEquipmentMesh,
+  BuiltTacticalEquipmentMesh,
+  getBeltSlotTransforms,
+} from './equipment/TacticalEquipmentMesh';
+import { tacticalEquipmentStore } from './equipment/TacticalEquipmentStore';
 
 export interface ArticulatedFinger {
   proximal: THREE.Group;
@@ -103,6 +115,21 @@ export class CharacterSkeleton {
   public readonly headGroup = new THREE.Group();
 
   public readonly magPouchAnchor = new THREE.Object3D();
+  public readonly beltEquipmentMount = new THREE.Group();
+
+  private beltEquipmentMeshes: BuiltTacticalEquipmentMesh[] = [];
+  private beltEquipmentState: {
+    equipmentId: TacticalEquipmentId;
+    beltSlot: TacticalBeltSlot;
+    count: number;
+    visible: boolean;
+  } = {
+    equipmentId: DEFAULT_TACTICAL_EQUIPMENT_ID,
+    beltSlot: DEFAULT_TACTICAL_BELT_SLOT,
+    count: 2,
+    visible: true,
+  };
+  private beltUseWorldLayer = true;
 
   public readonly leftArm: ArticulatedArm;
   public readonly rightArm: ArticulatedArm;
@@ -415,6 +442,17 @@ export class CharacterSkeleton {
     holster.position.set(0.165 * p.pelvisWidthScale, -0.04, -0.005);
 
     this.pelvis.add(pelvisMesh, beltMesh, buckleMesh, dumpPouch, holster);
+
+    // Tactical Equipment Belt Mount Group (unit scale, non-canonical child of pelvis)
+    this.beltEquipmentMount.name = 'belt_tactical_equipment_slot';
+    this.pelvis.add(this.beltEquipmentMount);
+    const initialEquip = tacticalEquipmentStore.getSelection();
+    this.setBeltEquipment(
+      initialEquip.equipmentId,
+      initialEquip.beltSlot,
+      2,
+      initialEquip.mountOnBelt,
+    );
 
     // Secondary Glute Soft-Tissue Nodes (child of pelvis, scale = 1)
     const sec_glute_l = new THREE.Group();
@@ -1706,7 +1744,76 @@ export class CharacterSkeleton {
     hand.thumbDist.rotation.set(-0.48, 0, 0);
   }
 
+  /**
+   * Assigns & rebuilds the 3D tactical equipment meshes mounted on the player's belt.
+   * Updates live in Playground/Gym, Battle, Infection, and the 3D Operator Preview.
+   */
+  public setBeltEquipment(
+    equipmentId: TacticalEquipmentId,
+    beltSlot: TacticalBeltSlot,
+    count = 2,
+    visible = true,
+  ): void {
+    this.beltEquipmentState = { equipmentId, beltSlot, count, visible };
+
+    // Cleanly dispose previous belt equipment meshes
+    for (let i = 0; i < this.beltEquipmentMeshes.length; i++) {
+      const prev = this.beltEquipmentMeshes[i];
+      this.beltEquipmentMount.remove(prev.group);
+      prev.dispose();
+    }
+    this.beltEquipmentMeshes.length = 0;
+
+    if (!visible || count <= 0) {
+      this.beltEquipmentMount.visible = false;
+      return;
+    }
+
+    this.beltEquipmentMount.visible = true;
+    const transforms = getBeltSlotTransforms(
+      beltSlot,
+      this.profile.pelvisWidthScale,
+      this.profile.pelvisDepthScale,
+    );
+    const mountCount = Math.min(transforms.length, Math.max(0, Math.round(count)));
+
+    for (let i = 0; i < mountCount; i++) {
+      const built = buildTacticalEquipmentMesh(equipmentId, {
+        withBeltClip: true,
+        scale: 1.0,
+      });
+      const tf = transforms[i];
+      built.group.position.set(tf.position[0], tf.position[1], tf.position[2]);
+      built.group.rotation.set(tf.rotation[0], tf.rotation[1], tf.rotation[2]);
+      built.group.traverse((obj) => {
+        if ((obj as THREE.Mesh).isMesh) {
+          const m = obj as THREE.Mesh;
+          m.castShadow = true;
+          m.receiveShadow = true;
+          m.layers.set(this.beltUseWorldLayer ? 0 : VIEWMODEL_LAYER);
+        }
+      });
+      this.beltEquipmentMount.add(built.group);
+      this.beltEquipmentMeshes.push(built);
+    }
+  }
+
+  public getBeltEquipmentState(): Readonly<{
+    equipmentId: TacticalEquipmentId;
+    beltSlot: TacticalBeltSlot;
+    count: number;
+    visible: boolean;
+  }> {
+    return this.beltEquipmentState;
+  }
+
   public dispose(): void {
+    for (let i = 0; i < this.beltEquipmentMeshes.length; i++) {
+      const prev = this.beltEquipmentMeshes[i];
+      this.beltEquipmentMount.remove(prev.group);
+      prev.dispose();
+    }
+    this.beltEquipmentMeshes.length = 0;
     this.geos.forEach((g) => g.dispose());
     this.mats.forEach((m) => m.dispose());
     this.texSets.forEach((t) => {

@@ -778,6 +778,31 @@ export class RemotePlayerManager {
     return out;
   }
 
+  public getAliveHostilesInRadius(
+    origin: Readonly<THREE.Vector3>,
+    radiusM: number,
+  ): Array<{ userId: string; username: string; pos: THREE.Vector3; dist: number }> {
+    const out: Array<{ userId: string; username: string; pos: THREE.Vector3; dist: number }> = [];
+    for (const op of this.players.values()) {
+      if (!op.hasInitialState || !op.alive) continue;
+      if (this.isFriendly(op.userId)) continue;
+      const dist = Math.hypot(
+        op.curPos.x - origin.x,
+        op.curPos.y + 1.1 - origin.y,
+        op.curPos.z - origin.z,
+      );
+      if (dist <= radiusM) {
+        out.push({
+          userId: op.userId,
+          username: op.username,
+          pos: op.curPos.clone(),
+          dist,
+        });
+      }
+    }
+    return out;
+  }
+
   public dispose(): void {
     for (const op of this.players.values()) {
       op.nameTexture.dispose();

@@ -85,4 +85,29 @@ export interface IBodycamAudioSource {
 
   /** Diegetic hold-breath audio cues: inhale, soft exhale, depleted gasp, and low-O2 cardiac thump */
   playBreathCue?(kind: BodycamBreathCueKind, intensity?: number): void;
+
+  /** Metallic grenade safety-pin yank (does NOT ignite fuse) */
+  playGrenadePinPull?(): void;
+
+  /** Spring-loaded safety lever (spoon) fly-off + percussion primer ignition snap */
+  playGrenadeLeverSnap?(): void;
+
+  /** Spatialized grenade/canister floor & wall bounce clink */
+  playGrenadeBounce?(pos: Readonly<THREE.Vector3>, speed?: number): void;
+
+  /** Spatialized tactical ordnance detonation audio */
+  playExplosion?(
+    pos: Readonly<THREE.Vector3>,
+    kind: 'frag' | 'flash' | 'smoke' | 'thermite',
+  ): void;
+
+  /** Concussive ear-muffle low-pass dip + realistic high-frequency tinnitus fade */
+  playFlashbangTinnitus?(intensity: number): void;
+
+  /** Mechanical LPVO magnification ring throw-lever detent click */
+  playZoomRatchetClick?(zoomLevel?: number): void;
+
+  /** Tactile 0.1 MRAD scope elevation/windage turret click */
+  playTurretClick?(up?: boolean): void;
 }
+

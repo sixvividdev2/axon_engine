@@ -95,6 +95,511 @@ const GRAVITY_MPS2 = 9.81;
 const AIR_DENSITY_SEA = 1.225;
 const SPEED_OF_SOUND_MPS = 340.3;
 
+export interface BallisticTrajectoryPoint {
+  distanceM: number;
+  yRelSightM: number;
+  dropCm: number;
+  dropMrad: number;
+  velocityMs: number;
+  energyJ: number;
+  damageAtRange: number;
+  damageRatio: number;
+  tofMs: number;
+  supersonic: boolean;
+}
+
+export interface BallisticRangeGate extends BallisticTrajectoryPoint {
+  label: string;
+}
+
+export interface BallisticTrajectoryProfile {
+  muzzleVelocityMs: number;
+  muzzleEnergyJ: number;
+  heightOverBoreM: number;
+  zeroDistanceM: number;
+  zeroElevationMrad: number;
+  zeroPitchRad: number;
+  nearZeroM: number | null;
+  farZeroM: number | null;
+  maxRangeM: number;
+  points: BallisticTrajectoryPoint[];
+  rangeGates: BallisticRangeGate[];
+}
+
+export interface ZeroSolveParams {
+  muzzleVelocityMs: number;
+  bc: number;
+  heightOverBoreM: number;
+  zeroDistanceM: number;
+  extraElevationMrad?: number;
+}
+
+export interface TrajectorySimParams {
+  ammo: AmmoVariantDef;
+  barrelVelocityMult?: number;
+  attachmentVelocityMult?: number;
+  heightOverBoreM: number;
+  zeroDistanceM: number;
+  extraElevationMrad?: number;
+  maxRangeM: number;
+  sampleStepM?: number;
+  baseDamage?: number;
+}
+
+export interface MaterialPenetrationParams {
+  ammo: AmmoVariantDef;
+  impactSpeedMs: number;
+  material: BallisticMaterialId;
+  thicknessM: number;
+  obliquityDeg: number; // 0 = perpendicular head-on, 90 = parallel grazing
+  barrelVelocityMult?: number;
+  attachmentVelocityMult?: number;
+}
+
+export interface MaterialPenetrationResult {
+  outcome: TerminalOutcome;
+  material: BallisticMaterialId;
+  impactSpeedMs: number;
+  impactEnergyJ: number;
+  exitSpeedMs: number;
+  exitEnergyJ: number;
+  exitDamageRatio: number;
+  grazingAngleDeg: number;
+  criticalRicochetDeg: number;
+  penetrationDepthCm: number;
+  effectiveThicknessCm: number;
+  spallShards: number;
+}
+
+function computeG1DragFactor(speedMs: number, bc: number): number {
+  const mach = speedMs / SPEED_OF_SOUND_MPS;
+  let cd = 0.24;
+  if (mach >= 0.85 && mach < 1.2) {
+    const t = (mach - 0.85) / 0.35;
+    cd = 0.24 + t * 0.34;
+  } else if (mach >= 1.2) {
+    cd = 0.58 / Math.pow(mach, 0.32);
+  }
+  return (0.5 * AIR_DENSITY_SEA * speedMs * cd * 0.00046) / Math.max(0.05, bc);
+}
+
+function computeCorePenMult(coreType: AmmoVariantDef['coreType'], matId: BallisticMaterialId): number {
+  if (matId !== 'steel' && matId !== 'concrete') return 1.0;
+  switch (coreType) {
+    case 'tungsten_ap':
+      return 1.22;
+    case 'solid_steel':
+      return 1.18;
+    case 'steel_core_ap':
+      return 1.05;
+    case 'lead_fmj':
+      return 0.86;
+    case 'lead_jhp':
+      return 0.52;
+    case 'soft_lead':
+      return 0.48;
+    case 'frangible_pellet':
+      return 0.30;
+    default:
+      return 1.0;
+  }
+}
+
+/**
+ * Pure 2D RK2 vertical ballistic integrator (identical drag/gravity kernel to live 3D projectiles).
+ * Returns bullet vertical elevation relative to sightline (m) at `targetDistM`.
+ */
+function integrateYAtDistance(
+  muzzleVelocityMs: number,
+  bc: number,
+  heightOverBoreM: number,
+  launchPitchRad: number,
+  targetDistM: number,
+): number {
+  let x = 0;
+  let y = -Math.max(0.01, heightOverBoreM);
+  let vx = Math.cos(launchPitchRad) * muzzleVelocityMs;
+  let vy = Math.sin(launchPitchRad) * muzzleVelocityMs;
+  const dt = 0.002;
+  let t = 0;
+
+  while (x < targetDistM && t < 5.0) {
+    const spd1 = Math.hypot(vx, vy);
+    if (spd1 < 25) break;
+    const df1 = computeG1DragFactor(spd1, bc);
+    const ax1 = -vx * df1;
+    const ay1 = -GRAVITY_MPS2 - vy * df1;
+
+    const vxMid = vx + ax1 * dt * 0.5;
+    const vyMid = vy + ay1 * dt * 0.5;
+    const spd2 = Math.hypot(vxMid, vyMid);
+    const df2 = computeG1DragFactor(spd2, bc);
+    const ax2 = -vxMid * df2;
+    const ay2 = -GRAVITY_MPS2 - vyMid * df2;
+
+    const prevX = x;
+    const prevY = y;
+    x += vxMid * dt;
+    y += vyMid * dt;
+    vx += ax2 * dt;
+    vy += ay2 * dt;
+    t += dt;
+
+    if (x >= targetDistM) {
+      const frac = (targetDistM - prevX) / Math.max(1e-6, x - prevX);
+      return prevY + (y - prevY) * frac;
+    }
+  }
+  return y;
+}
+
+/**
+ * Solves exact bore upward pitch (radians) required for the bullet to cross the sightline
+ * at `zeroDistanceM` given physical Height-Over-Bore, plus optional extra MRAD turret dial.
+ */
+export function solveZeroPitchRad(params: ZeroSolveParams): number {
+  const v0 = Math.max(80, params.muzzleVelocityMs);
+  const bc = Math.max(0.05, params.bc);
+  const hob = Math.max(0.01, params.heightOverBoreM);
+  const zeroDist = THREE.MathUtils.clamp(params.zeroDistanceM, 10, 1200);
+
+  let lo = -0.02;
+  let hi = 0.14;
+  for (let iter = 0; iter < 18; iter++) {
+    const mid = (lo + hi) * 0.5;
+    const yAtZero = integrateYAtDistance(v0, bc, hob, mid, zeroDist);
+    if (yAtZero < 0) {
+      lo = mid;
+    } else {
+      hi = mid;
+    }
+  }
+  const basePitch = (lo + hi) * 0.5;
+  const turretRad = (params.extraElevationMrad ?? 0) * 0.001;
+  return basePitch + turretRad;
+}
+
+/**
+ * Maps terminal damage ratio (1.0 = peak muzzle lethality -> 0.0 = spent round)
+ * to a military-grade Green -> Yellow -> Orange -> Red RGB tuple (0..1).
+ */
+export function sampleDamageColorRGB(damageRatio: number, out: THREE.Color): THREE.Color {
+  const t = THREE.MathUtils.clamp(damageRatio, 0, 1);
+  if (t >= 0.66) {
+    // Vivid tactical green (#22c55e) -> lime-yellow (#eab308)
+    const u = (1.0 - t) / 0.34;
+    out.setRGB(
+      THREE.MathUtils.lerp(0.13, 0.92, u),
+      THREE.MathUtils.lerp(0.88, 0.78, u),
+      THREE.MathUtils.lerp(0.36, 0.10, u),
+    );
+  } else if (t >= 0.33) {
+    // Yellow (#eab308) -> amber-orange (#f97316)
+    const u = (0.66 - t) / 0.33;
+    out.setRGB(
+      THREE.MathUtils.lerp(0.92, 0.98, u),
+      THREE.MathUtils.lerp(0.78, 0.44, u),
+      THREE.MathUtils.lerp(0.10, 0.08, u),
+    );
+  } else {
+    // Orange (#f97316) -> crimson red (#ef4444)
+    const u = (0.33 - t) / 0.33;
+    out.setRGB(
+      THREE.MathUtils.lerp(0.98, 0.94, u),
+      THREE.MathUtils.lerp(0.44, 0.16, u),
+      THREE.MathUtils.lerp(0.08, 0.18, u),
+    );
+  }
+  return out;
+}
+
+/**
+ * Single Source of Truth trajectory profile shared by Gunsmith 3D Wireframe Ballistics Sim
+ * and live BallisticsSolver firing.
+ */
+export function simulateTrajectoryProfile(params: TrajectorySimParams): BallisticTrajectoryProfile {
+  const { ammo } = params;
+  const v0 = BallisticsSolver.computeMuzzleVelocityMs(
+    ammo,
+    params.barrelVelocityMult ?? 1.0,
+    params.attachmentVelocityMult ?? 1.0,
+  );
+  const massKg = Math.max(0.0005, ammo.bulletMassGrams * 0.001);
+  const muzzleEnergyJ = 0.5 * massKg * v0 * v0;
+  const hob = Math.max(0.015, params.heightOverBoreM);
+  const zeroDist = Math.max(15, params.zeroDistanceM);
+  const extraMrad = params.extraElevationMrad ?? 0;
+  const maxRangeM = Math.max(50, params.maxRangeM);
+  const stepM = Math.max(1, params.sampleStepM ?? Math.max(2, Math.round(maxRangeM / 120)));
+
+  const zeroPitchRad = solveZeroPitchRad({
+    muzzleVelocityMs: v0,
+    bc: ammo.ballisticCoefficient,
+    heightOverBoreM: hob,
+    zeroDistanceM: zeroDist,
+    extraElevationMrad: extraMrad,
+  });
+
+  const baseDamage =
+    params.baseDamage ??
+    THREE.MathUtils.clamp((muzzleEnergyJ / 38) * ammo.fleshExpansionMult, 24, 165);
+
+  const makePoint = (distM: number, yRelSightM: number, spdMs: number, tofSec: number): BallisticTrajectoryPoint => {
+    const energyJ = 0.5 * massKg * spdMs * spdMs;
+    // Damage scales primarily with retained kinetic energy & velocity expansion threshold
+    const velRatio = THREE.MathUtils.clamp(spdMs / Math.max(1, v0), 0, 1.1);
+    const energyRatio = THREE.MathUtils.clamp(energyJ / Math.max(1, muzzleEnergyJ), 0, 1.1);
+    const damageRatio = THREE.MathUtils.clamp(energyRatio * 0.72 + velRatio * 0.28, 0.08, 1.0);
+    const dropCm = yRelSightM * 100;
+    const dropMrad = distM > 1 ? (yRelSightM / distM) * 1000 : 0;
+    return {
+      distanceM: distM,
+      yRelSightM,
+      dropCm,
+      dropMrad,
+      velocityMs: spdMs,
+      energyJ,
+      damageAtRange: baseDamage * damageRatio,
+      damageRatio,
+      tofMs: tofSec * 1000,
+      supersonic: spdMs >= SPEED_OF_SOUND_MPS,
+    };
+  };
+
+  const points: BallisticTrajectoryPoint[] = [];
+  points.push(makePoint(0, -hob, v0, 0));
+
+  const gateDistances = [25, 50, 100, 150, 200, 300, 400, 500, 600, 800].filter((d) => d <= maxRangeM);
+  if (gateDistances.length === 0 || gateDistances[gateDistances.length - 1] < maxRangeM) {
+    gateDistances.push(maxRangeM);
+  }
+  const rangeGates: BallisticRangeGate[] = [];
+  let nextGateIdx = 0;
+
+  let x = 0;
+  let y = -hob;
+  let vx = Math.cos(zeroPitchRad) * v0;
+  let vy = Math.sin(zeroPitchRad) * v0;
+  let t = 0;
+  const dt = 0.002;
+  let nextSampleX = stepM;
+  let nearZeroM: number | null = null;
+  let farZeroM: number | null = null;
+
+  while (x < maxRangeM && t < 5.5) {
+    const spd1 = Math.hypot(vx, vy);
+    if (spd1 < 35) break;
+    const df1 = computeG1DragFactor(spd1, ammo.ballisticCoefficient);
+    const ax1 = -vx * df1;
+    const ay1 = -GRAVITY_MPS2 - vy * df1;
+
+    const vxMid = vx + ax1 * dt * 0.5;
+    const vyMid = vy + ay1 * dt * 0.5;
+    const spd2 = Math.hypot(vxMid, vyMid);
+    const df2 = computeG1DragFactor(spd2, ammo.ballisticCoefficient);
+    const ax2 = -vxMid * df2;
+    const ay2 = -GRAVITY_MPS2 - vyMid * df2;
+
+    const prevX = x;
+    const prevY = y;
+    const prevSpd = spd1;
+    const prevT = t;
+
+    x += vxMid * dt;
+    y += vyMid * dt;
+    vx += ax2 * dt;
+    vy += ay2 * dt;
+    t += dt;
+    const currSpd = Math.hypot(vx, vy);
+
+    // Detect sightline zero crossings (y == 0)
+    if (prevY < 0 && y >= 0 && nearZeroM === null) {
+      const f = (0 - prevY) / Math.max(1e-6, y - prevY);
+      nearZeroM = prevX + (x - prevX) * f;
+    } else if (prevY > 0 && y <= 0 && farZeroM === null) {
+      const f = (0 - prevY) / Math.max(1e-6, prevY - y);
+      farZeroM = prevX + (x - prevX) * f;
+    }
+
+    while (nextGateIdx < gateDistances.length && x >= gateDistances[nextGateIdx]) {
+      const gd = gateDistances[nextGateIdx];
+      const f = THREE.MathUtils.clamp((gd - prevX) / Math.max(1e-6, x - prevX), 0, 1);
+      const gy = prevY + (y - prevY) * f;
+      const gSpd = prevSpd + (currSpd - prevSpd) * f;
+      const gT = prevT + (t - prevT) * f;
+      rangeGates.push({
+        ...makePoint(gd, gy, gSpd, gT),
+        label: `${gd}m`,
+      });
+      nextGateIdx++;
+    }
+
+    while (nextSampleX <= maxRangeM && x >= nextSampleX) {
+      const f = THREE.MathUtils.clamp((nextSampleX - prevX) / Math.max(1e-6, x - prevX), 0, 1);
+      const sy = prevY + (y - prevY) * f;
+      const sSpd = prevSpd + (currSpd - prevSpd) * f;
+      const sT = prevT + (t - prevT) * f;
+      points.push(makePoint(nextSampleX, sy, sSpd, sT));
+      nextSampleX += stepM;
+    }
+  }
+
+  return {
+    muzzleVelocityMs: v0,
+    muzzleEnergyJ,
+    heightOverBoreM: hob,
+    zeroDistanceM: zeroDist,
+    zeroElevationMrad: extraMrad,
+    zeroPitchRad,
+    nearZeroM,
+    farZeroM,
+    maxRangeM,
+    points,
+    rangeGates,
+  };
+}
+
+/**
+ * Deterministic Single-Source material penetration / ricochet / spall evaluation
+ * using the exact same equations as `BallisticsSolver.resolveImpact`.
+ */
+export function simulateMaterialPenetration(params: MaterialPenetrationParams): MaterialPenetrationResult {
+  const { ammo, impactSpeedMs, material } = params;
+  const mat = BALLISTIC_MATERIALS[material];
+  const v0 = BallisticsSolver.computeMuzzleVelocityMs(
+    ammo,
+    params.barrelVelocityMult ?? 1.0,
+    params.attachmentVelocityMult ?? 1.0,
+  );
+  const massKg = Math.max(0.0005, ammo.bulletMassGrams * 0.001);
+  const impactEnergyJ = 0.5 * massKg * impactSpeedMs * impactSpeedMs;
+  const nominalKE = 0.5 * massKg * v0 * v0;
+  const initialPenPower = ammo.penetrationRating * 68 + Math.pow(nominalKE / 1000, 0.65) * 26;
+
+  const obliquityDeg = THREE.MathUtils.clamp(params.obliquityDeg, 0, 86);
+  const grazingAngleDeg = 90 - obliquityDeg;
+  const cosOb = Math.max(0.08, Math.cos(THREE.MathUtils.degToRad(obliquityDeg)));
+  const effectiveThicknessM = Math.max(0.004, params.thicknessM / cosOb);
+  const criticalRicochetDeg = computeCriticalRicochetDeg(mat, ammo.coreType, impactSpeedMs);
+
+  // 0. Glass shatter pass-through
+  if (material === 'glass') {
+    const exitSpeedMs = impactSpeedMs * 0.88;
+    const exitEnergyJ = 0.5 * massKg * exitSpeedMs * exitSpeedMs;
+    return {
+      outcome: 'penetrate',
+      material,
+      impactSpeedMs,
+      impactEnergyJ,
+      exitSpeedMs,
+      exitEnergyJ,
+      exitDamageRatio: exitEnergyJ / Math.max(1, impactEnergyJ),
+      grazingAngleDeg,
+      criticalRicochetDeg,
+      penetrationDepthCm: effectiveThicknessM * 100,
+      effectiveThicknessCm: effectiveThicknessM * 100,
+      spallShards: 6,
+    };
+  }
+
+  // 1. Grazing ricochet
+  if (grazingAngleDeg <= criticalRicochetDeg && impactSpeedMs > 120) {
+    const grazingBonus = (1 - grazingAngleDeg / Math.max(1, criticalRicochetDeg)) * 0.30;
+    const retention = THREE.MathUtils.clamp(
+      0.30 + mat.elasticityRetention * 0.25 + grazingBonus,
+      0.30,
+      0.65,
+    );
+    const exitSpeedMs = impactSpeedMs * retention;
+    const exitEnergyJ = 0.5 * massKg * exitSpeedMs * exitSpeedMs;
+    return {
+      outcome: 'ricochet',
+      material,
+      impactSpeedMs,
+      impactEnergyJ,
+      exitSpeedMs,
+      exitEnergyJ,
+      exitDamageRatio: exitEnergyJ / Math.max(1, impactEnergyJ),
+      grazingAngleDeg,
+      criticalRicochetDeg,
+      penetrationDepthCm: Math.min(effectiveThicknessM * 100, 0.6),
+      effectiveThicknessCm: effectiveThicknessM * 100,
+      spallShards: material === 'steel' ? 4 : 2,
+    };
+  }
+
+  // 2. Penetration check (identical formula to live resolveImpact)
+  const corePenMult = computeCorePenMult(ammo.coreType, material);
+  const dynPen =
+    initialPenPower *
+    corePenMult *
+    THREE.MathUtils.clamp(impactSpeedMs / Math.max(180, ammo.baseVelocityMs), 0.25, 1.35);
+  const requiredPen = mat.penetrationResistance * (0.22 + effectiveThicknessM * 9.0);
+
+  if (dynPen > requiredPen && effectiveThicknessM < 0.52) {
+    const exitRatio = THREE.MathUtils.clamp(Math.sqrt(1 - requiredPen / dynPen), 0.28, 0.85);
+    const exitSpeedMs = impactSpeedMs * exitRatio;
+    const exitEnergyJ = 0.5 * massKg * exitSpeedMs * exitSpeedMs;
+    return {
+      outcome: 'penetrate',
+      material,
+      impactSpeedMs,
+      impactEnergyJ,
+      exitSpeedMs,
+      exitEnergyJ,
+      exitDamageRatio: exitEnergyJ / Math.max(1, impactEnergyJ),
+      grazingAngleDeg,
+      criticalRicochetDeg,
+      penetrationDepthCm: effectiveThicknessM * 100,
+      effectiveThicknessCm: effectiveThicknessM * 100,
+      spallShards: material === 'steel' || material === 'concrete' ? 5 : 2,
+    };
+  }
+
+  // 3. Fragment / spall check
+  const fragileBullet =
+    ammo.coreType === 'lead_jhp' ||
+    ammo.coreType === 'soft_lead' ||
+    (ammo.coreType === 'steel_core_ap' && ammo.bulletMassGrams <= 4.5 && impactSpeedMs > 780) ||
+    (ammo.coreType === 'lead_fmj' && ammo.bulletMassGrams <= 4.5 && impactSpeedMs > 780);
+
+  const penFrac = THREE.MathUtils.clamp(dynPen / Math.max(1, requiredPen), 0.05, 0.96);
+  const partialDepthCm = effectiveThicknessM * 100 * penFrac;
+
+  if (mat.spallTendency > 0.45 && fragileBullet && impactSpeedMs >= ammo.fragmentThresholdMs) {
+    return {
+      outcome: 'fragment',
+      material,
+      impactSpeedMs,
+      impactEnergyJ,
+      exitSpeedMs: 0,
+      exitEnergyJ: 0,
+      exitDamageRatio: 0,
+      grazingAngleDeg,
+      criticalRicochetDeg,
+      penetrationDepthCm: partialDepthCm,
+      effectiveThicknessCm: effectiveThicknessM * 100,
+      spallShards: 4,
+    };
+  }
+
+  // 4. Stop / embed
+  return {
+    outcome: 'stop',
+    material,
+    impactSpeedMs,
+    impactEnergyJ,
+    exitSpeedMs: 0,
+    exitEnergyJ: 0,
+    exitDamageRatio: 0,
+    grazingAngleDeg,
+    criticalRicochetDeg,
+    penetrationDepthCm: partialDepthCm,
+    effectiveThicknessCm: effectiveThicknessM * 100,
+    spallShards: 0,
+  };
+}
+
 export class BallisticsSolver {
   public readonly group = new THREE.Group();
   private readonly projectiles: PooledProjectile[] = [];

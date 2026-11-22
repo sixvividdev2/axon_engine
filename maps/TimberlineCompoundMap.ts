@@ -136,7 +136,14 @@ function buildTimberlineCompound(
     new THREE.MeshStandardMaterial({ map: forestTex, roughness: 0.96, metalness: 0.02 }),
   );
   const matGravel = trackMat(
-    new THREE.MeshStandardMaterial({ color: 0x5d5c55, roughness: 0.95, metalness: 0.02 }),
+    new THREE.MeshStandardMaterial({
+      color: 0x5d5c55,
+      roughness: 0.95,
+      metalness: 0.02,
+      polygonOffset: true,
+      polygonOffsetFactor: -2,
+      polygonOffsetUnits: -4,
+    }),
   );
   const matWood = trackMat(
     new THREE.MeshStandardMaterial({ map: cabinWoodTex, roughness: 0.88, metalness: 0.03 }),
@@ -284,16 +291,16 @@ function buildTimberlineCompound(
     }
   };
 
-  // North & South perimeter with 6m wide central vehicle gates
-  addFenceSegment(-26, -24, -3.5, -24);
-  addFenceSegment(3.5, -24, 26, -24);
-  addFenceSegment(-26, 24, -3.5, 24);
-  addFenceSegment(3.5, 24, 26, 24);
-  // West & East perimeter with 5m flank breaches
-  addFenceSegment(-26, -24, -26, -3.0);
-  addFenceSegment(-26, 3.0, -26, 24);
-  addFenceSegment(26, -24, 26, -3.0);
-  addFenceSegment(26, 3.0, 26, 24);
+  // North & South perimeter with 6m wide central vehicle gates (span full x including corners)
+  addFenceSegment(-26.225, -24, -3.5, -24);
+  addFenceSegment(3.5, -24, 26.225, -24);
+  addFenceSegment(-26.225, 24, -3.5, 24);
+  addFenceSegment(3.5, 24, 26.225, 24);
+  // West & East perimeter inset cleanly between North & South inner faces (z: ±23.775)
+  addFenceSegment(-26, -23.775, -26, -3.0);
+  addFenceSegment(-26, 3.0, -26, 23.775);
+  addFenceSegment(26, -23.775, 26, -3.0);
+  addFenceSegment(26, 3.0, 26, 23.775);
 
   const dummy = new THREE.Object3D();
   const postGeo = trackGeo(new THREE.CylinderGeometry(0.06, 0.06, 3.05, 6));
@@ -337,15 +344,16 @@ function buildTimberlineCompound(
 
     const buildWallSide = (side: 'north' | 'south' | 'east' | 'west', hasDoor: boolean): void => {
       const isNS = side === 'north' || side === 'south';
-      const span = isNS ? w : d;
+      // Non-overlapping corners: N/S walls span full width w; E/W walls span strictly between N/S inner faces (d - 2*t)
+      const span = isNS ? w : d - t * 2;
       const fixed =
         side === 'north'
-          ? cz - d * 0.5
+          ? cz - (d - t) * 0.5
           : side === 'south'
-            ? cz + d * 0.5
+            ? cz + (d - t) * 0.5
             : side === 'west'
-              ? cx - w * 0.5
-              : cx + w * 0.5;
+              ? cx - (w - t) * 0.5
+              : cx + (w - t) * 0.5;
 
       if (hasDoor) {
         const seg = (span - doorW) * 0.5;
@@ -360,19 +368,22 @@ function buildTimberlineCompound(
           addSolidBox(fixed, 0.14 + doorH + headerH * 0.5, cz, t, headerH, doorW, matWood, 'wood');
         }
       } else {
-        // Windowed timber wall (sill 1.05m + header 0.85m + side frames)
+        // Windowed timber wall with exact non-overlapping sill (0..1.04), jambs (1.04..2.26), and header (2.26..3.10)
         const winW = 2.0;
+        const sillH = 1.04;
+        const headerH = 0.84;
+        const jambH = h - sillH - headerH; // 1.22m exact gap between sill & header
         const sideSeg = Math.max(0.5, (span - winW) * 0.5);
         if (isNS) {
-          addSolidBox(cx, 0.14 + 0.52, fixed, span, 1.04, t, matWood, 'wood');
-          addSolidBox(cx, 0.14 + h - 0.42, fixed, span, 0.84, t, matWood, 'wood');
-          addSolidBox(cx - (winW + sideSeg) * 0.5, 0.14 + 1.65, fixed, sideSeg, 1.24, t, matWood, 'wood');
-          addSolidBox(cx + (winW + sideSeg) * 0.5, 0.14 + 1.65, fixed, sideSeg, 1.24, t, matWood, 'wood');
+          addSolidBox(cx, 0.14 + sillH * 0.5, fixed, span, sillH, t, matWood, 'wood');
+          addSolidBox(cx, 0.14 + h - headerH * 0.5, fixed, span, headerH, t, matWood, 'wood');
+          addSolidBox(cx - (winW + sideSeg) * 0.5, 0.14 + sillH + jambH * 0.5, fixed, sideSeg, jambH, t, matWood, 'wood');
+          addSolidBox(cx + (winW + sideSeg) * 0.5, 0.14 + sillH + jambH * 0.5, fixed, sideSeg, jambH, t, matWood, 'wood');
         } else {
-          addSolidBox(fixed, 0.14 + 0.52, cz, t, 1.04, span, matWood, 'wood');
-          addSolidBox(fixed, 0.14 + h - 0.42, cz, t, 0.84, span, matWood, 'wood');
-          addSolidBox(fixed, 0.14 + 1.65, cz - (winW + sideSeg) * 0.5, t, 1.24, sideSeg, matWood, 'wood');
-          addSolidBox(fixed, 0.14 + 1.65, cz + (winW + sideSeg) * 0.5, t, 1.24, sideSeg, matWood, 'wood');
+          addSolidBox(fixed, 0.14 + sillH * 0.5, cz, t, sillH, span, matWood, 'wood');
+          addSolidBox(fixed, 0.14 + h - headerH * 0.5, cz, t, headerH, span, matWood, 'wood');
+          addSolidBox(fixed, 0.14 + sillH + jambH * 0.5, cz - (winW + sideSeg) * 0.5, t, jambH, sideSeg, matWood, 'wood');
+          addSolidBox(fixed, 0.14 + sillH + jambH * 0.5, cz + (winW + sideSeg) * 0.5, t, jambH, sideSeg, matWood, 'wood');
         }
       }
     };
@@ -409,22 +420,26 @@ function buildTimberlineCompound(
   const twX = 14.5;
   const twZ = 13.5;
   const twH = 3.1;
-  // 4 corner timber legs
+  // 4 corner timber legs stopping cleanly beneath deck slab underside (y: 0..2.98)
+  const deckBottomY = twH - 0.12;
+  const deckTopY = twH + 0.12;
   for (const sx of [-2.1, 2.1]) {
     for (const sz of [-2.1, 2.1]) {
-      addSolidBox(twX + sx, twH * 0.5, twZ + sz, 0.28, twH, 0.28, matWood, 'wood');
+      addSolidBox(twX + sx, deckBottomY * 0.5, twZ + sz, 0.28, deckBottomY, 0.28, matWood, 'wood');
     }
   }
-  // Overlook deck slab
+  // Overlook deck slab (y: 2.98..3.22)
   addSolidBox(twX, twH, twZ, 4.8, 0.24, 4.8, matWoodFloor, 'wood');
-  // Waist-high parapet railings (open on North entry side for ramp)
-  addSolidBox(twX, twH + 0.62, twZ + 2.25, 4.8, 1.0, 0.18, matWood, 'wood');
-  addSolidBox(twX - 2.25, twH + 0.62, twZ, 0.18, 1.0, 4.5, matWood, 'wood');
-  addSolidBox(twX + 2.25, twH + 0.62, twZ, 0.18, 1.0, 4.5, matWood, 'wood');
-  // Roof posts & canopy
-  for (const sx of [-2.1, 2.1]) {
-    for (const sz of [-2.1, 2.1]) {
-      addSolidBox(twX + sx, twH + 1.5, twZ + sz, 0.18, 2.8, 0.18, matWood, 'wood');
+  // Waist-high parapet railings seated atop deck with non-overlapping corners & posts
+  addSolidBox(twX, deckTopY + 0.5, twZ + 2.28, 4.74, 1.0, 0.16, matWood, 'wood');
+  addSolidBox(twX - 2.29, deckTopY + 0.5, twZ - 0.08, 0.16, 1.0, 4.56, matWood, 'wood');
+  addSolidBox(twX + 2.29, deckTopY + 0.5, twZ - 0.08, 0.16, 1.0, 4.56, matWood, 'wood');
+  // Roof posts (inset cleanly at ±2.06 so they don't overlap railings, spanning deckTopY..roofBottom)
+  const roofBottomY = twH + 2.85;
+  const roofPostH = roofBottomY - deckTopY;
+  for (const sx of [-2.06, 2.06]) {
+    for (const sz of [-2.06, 2.06]) {
+      addSolidBox(twX + sx, deckTopY + roofPostH * 0.5, twZ + sz, 0.18, roofPostH, 0.18, matWood, 'wood');
     }
   }
   addSolidBox(twX, twH + 2.95, twZ, 5.4, 0.2, 5.4, matRoof, 'metal');

@@ -1,7 +1,14 @@
 import { WeaponCategory, WeaponRailType } from '../bodycam-sdk/types';
 import { BaseCaliberId } from './calibers';
 
-export type AttachmentSlot = 'optic' | 'canted' | 'muzzle' | 'tactical' | 'foregrip' | 'magazine';
+export type AttachmentSlot =
+  | 'railAdapter'
+  | 'optic'
+  | 'canted'
+  | 'muzzle'
+  | 'tactical'
+  | 'foregrip'
+  | 'magazine';
 
 export type ForegripPoseStyle = 'none' | 'vertical' | 'angled';
 
@@ -39,6 +46,8 @@ export function resolveReticleColorHex(
  * Stored directly on WeaponInstance.attachments and persisted in SaveManager.
  */
 export interface WeaponAttachments {
+  /** Dedicated rail mount adapter (e.g. Zenitco B-13 AK dovetail-to-Picatinny or HK MP5 claw mount) */
+  railAdapter?: string | null;
   optic?: string | null;
   canted?: string | null;
   muzzle?: string | null;
@@ -49,6 +58,10 @@ export interface WeaponAttachments {
   magazine?: string | null;
   reticleColor?: ReticleColorId | null;
   cantedReticleColor?: ReticleColorId | null;
+  /** Persisted ammo variant ID & ballistic zero configuration per firearm */
+  selectedAmmoId?: string | null;
+  zeroDistanceM?: number;
+  zeroElevationMrad?: number;
 }
 
 export function getOwnedSuppressorDef(attachments?: WeaponAttachments | null): AttachmentDef | null {
@@ -62,6 +75,9 @@ export interface WeaponInstance {
   id: string;
   weaponId: string;
   attachments: WeaponAttachments;
+  selectedAmmoId?: string;
+  zeroDistanceM?: number;
+  zeroElevationMrad?: number;
   chambered?: boolean;
   ammoInMag?: number;
 }
@@ -120,6 +136,10 @@ export interface AttachmentDef {
   leftHandSocketOffset?: readonly [number, number, number];
   leftHandRotOffset?: readonly [number, number, number];
   leftGripCurl?: number;
+
+  // Rail Adapter
+  grantsPicatinnyRail?: boolean;
+  requiresPicatinnyRail?: boolean;
 
   // Magazine / Caliber Conversion
   capacityOverride?: number;
@@ -209,6 +229,7 @@ export const WEAPON_COMPAT_META: Record<string, WeaponCompatMeta> = {
 };
 
 export const ATTACHMENT_SLOTS: readonly { slot: AttachmentSlot; pinLabel: string; title: string }[] = [
+  { slot: 'railAdapter', pinLabel: 'ADAPTER', title: 'Rail Adapter Mount' },
   { slot: 'optic', pinLabel: 'OPTIC', title: 'Optics & Sights' },
   { slot: 'canted', pinLabel: 'CANT', title: '45° Canted Backup Optic' },
   { slot: 'muzzle', pinLabel: 'MUZZLE', title: 'Muzzle Devices' },
@@ -218,7 +239,121 @@ export const ATTACHMENT_SLOTS: readonly { slot: AttachmentSlot; pinLabel: string
 ];
 
 export const ATTACHMENTS: Record<string, AttachmentDef> = {
-  // === OPTICS ===
+  // === RAIL ADAPTERS ===
+  rail_b13_dovetail: {
+    id: 'rail_b13_dovetail',
+    name: 'Zenitco B-13 Dovetail-to-Picatinny Rail',
+    shortName: 'B-13 Rail',
+    slot: 'railAdapter',
+    description: 'CNC-milled Russian side-rail bridge converting AK/SVD/Saiga dovetails to a full MIL-STD-1913 Picatinny top rail.',
+    compatibleWeapons: ['aks74u', 'ak105', 'dragunov_svd', 'saiga_12', 'aks74u_545', 'ak74u_545', 'akm_762'],
+    compatibleRails: ['dovetail_ak'],
+    excludedWeapons: ['mosin_m91_30'],
+    massKg: 0.16,
+    ergonomicsDelta: -1,
+    extraLengthM: 0,
+    recoilPitchMult: 1.0,
+    recoilYawMult: 1.0,
+    sightMisalignMult: 1.0,
+    grantsPicatinnyRail: true,
+  },
+  rail_mp5_claw: {
+    id: 'rail_mp5_claw',
+    name: 'HK MFI Low-Profile MP5 Claw Rail',
+    shortName: 'MP5 Claw',
+    slot: 'railAdapter',
+    description: 'Four-point steel claw mount clamping onto the MP5 receiver slots to provide a MIL-STD-1913 Picatinny optic rail.',
+    compatibleWeapons: ['hk_mp5'],
+    compatibleRails: ['mp5_claw'],
+    massKg: 0.13,
+    ergonomicsDelta: -1,
+    extraLengthM: 0,
+    recoilPitchMult: 1.0,
+    recoilYawMult: 1.0,
+    sightMisalignMult: 1.0,
+    grantsPicatinnyRail: true,
+  },
+
+  // === CANONICAL REAL-LIFE OPTICS ===
+  optic_pso1m2: {
+    id: 'optic_pso1m2',
+    name: 'PSO-1M2 4×24 Prism',
+    shortName: 'PSO-1M2 4×',
+    slot: 'optic',
+    description: 'Fixed 4.0× Soviet side-rail dovetail prism scope with rubber eyecup, 1.7m stadiametric rangefinder, and illuminated amber/red chevrons.',
+    compatibleWeapons: ['aks74u', 'ak105', 'dragunov_svd', 'saiga_12', 'aks74u_545', 'ak74u_545', 'akm_762'],
+    compatibleRails: ['dovetail_ak'],
+    compatibleCategories: ['dmrs', 'bolt_action', 'carbines', 'pdws', 'shotguns'],
+    massKg: 0.62,
+    ergonomicsDelta: -8,
+    extraLengthM: 0,
+    recoilPitchMult: 1.0,
+    recoilYawMult: 1.0,
+    sightMisalignMult: 1.05,
+    reticleType: 'pso_prism',
+    hasIlluminatedReticle: true,
+    opticHeightOffsetM: 0.044,
+    opticEyeReliefM: 0.112,
+    adsZoomFactor: 4.0,
+    hasVariableZoom: false,
+    zoomLevels: [4.0],
+    ocularRadiusM: 0.0144,
+  },
+  optic_razor_1_6: {
+    id: 'optic_razor_1_6',
+    name: 'Vortex Razor HD Gen II-E 1–6×24 LPVO',
+    shortName: 'Razor 1–6×',
+    slot: 'optic',
+    description: 'Variable 1.0×–6.0× HD LPVO in 30mm cantilever mount with rotating magnification throw lever & daylight-bright JM-1/Mil-Dot reticle.',
+    compatibleWeapons: [
+      'm4a1', 'hk416', 'fn_scar_l', 'sig_mcx', 'colt_c8', 'sig_sg552', 'fn_p90',
+      'remington_m24', 'ai_awm', 'sv_98', 'barrett_mrad', 'colt_c19',
+      'mk14_ebr', 'kac_m110', 'hk_g28', 'fn_scar_h_pr', 'colt_c20',
+      'm4_556',
+    ],
+    compatibleRails: ['picatinny_top', 'p90_rail'],
+    compatibleCategories: ['carbines', 'pdws', 'dmrs', 'bolt_action'],
+    excludedWeapons: ['desert_eagle_xix', 'chiappa_rhino', 'mosin_m91_30'],
+    requiresPicatinnyRail: true,
+    massKg: 0.61,
+    ergonomicsDelta: -10,
+    extraLengthM: 0,
+    recoilPitchMult: 1.0,
+    recoilYawMult: 1.0,
+    sightMisalignMult: 1.04,
+    reticleType: 'lpvo_mildot',
+    hasIlluminatedReticle: true,
+    opticHeightOffsetM: 0.044,
+    opticEyeReliefM: 0.118,
+    adsZoomFactor: 1.0,
+    hasVariableZoom: true,
+    zoomLevels: [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+    ocularRadiusM: 0.0152,
+  },
+  optic_rmr_type2: {
+    id: 'optic_rmr_type2',
+    name: 'Trijicon RMR Type 2 1× Reflex',
+    shortName: 'RMR Type 2',
+    slot: 'optic',
+    description: 'Parallax-collimated 3.25 MOA reflex sight with light-reactive glass. Mounts direct to milled pistol slides or via Picatinny riser on long guns.',
+    compatibleWeapons: [],
+    compatibleRails: ['pistol_milled', 'picatinny_top', 'p90_rail'],
+    compatibleCategories: ['pistols', 'shotguns', 'pdws', 'carbines', 'dmrs', 'revolvers'],
+    excludedWeapons: ['mosin_m91_30'],
+    requiresPicatinnyRail: true,
+    massKg: 0.042,
+    ergonomicsDelta: 6,
+    extraLengthM: 0,
+    recoilPitchMult: 1.0,
+    recoilYawMult: 1.0,
+    sightMisalignMult: 0.91,
+    reticleType: 'rmr_dot',
+    hasIlluminatedReticle: true,
+    opticHeightOffsetM: 0.022,
+    opticEyeReliefM: 0.24,
+    adsZoomFactor: 1.03,
+  },
+  // Legacy alias retained for existing saved loadouts
   optic_rmr_micro: {
     id: 'optic_rmr_micro',
     name: 'Trijicon RMR Type 2 Micro RDS',
@@ -226,8 +361,9 @@ export const ATTACHMENTS: Record<string, AttachmentDef> = {
     slot: 'optic',
     description: 'Ruggedized milled-slide / low-profile 3.25 MOA reflex red dot for pistols, shotguns, and P90 rails.',
     compatibleWeapons: [],
-    compatibleRails: ['pistol_milled', 'picatinny_top', 'p90_rail', 'mp5_claw'],
+    compatibleRails: ['pistol_milled', 'picatinny_top', 'p90_rail'],
     compatibleCategories: ['pistols', 'shotguns', 'pdws', 'carbines', 'revolvers'],
+    requiresPicatinnyRail: true,
     massKg: 0.04,
     ergonomicsDelta: 6,
     extraLengthM: 0,
@@ -354,14 +490,15 @@ export const ATTACHMENTS: Record<string, AttachmentDef> = {
   },
   optic_lpvo_1_6: {
     id: 'optic_lpvo_1_6',
-    name: 'Razor HD 1-6x24 LPVO',
+    name: 'Razor HD 1-6x24 LPVO (Legacy)',
     shortName: '1-6x LPVO',
     slot: 'optic',
     description: 'Variable 1x–6x low-power tactical optic with PiP HDR glass & illuminated Mil-Dot.',
-    compatibleWeapons: ['m4_556', 'aks74u_545', 'ak74u_545', 'akm_762'],
-    compatibleRails: ['picatinny_top', 'dovetail_ak'],
-    compatibleCategories: ['carbines', 'dmrs', 'bolt_action'],
+    compatibleWeapons: ['m4_556'],
+    compatibleRails: ['picatinny_top', 'p90_rail'],
+    compatibleCategories: ['carbines', 'pdws', 'dmrs', 'bolt_action'],
     excludedWeapons: ['desert_eagle_xix', 'chiappa_rhino', 'mosin_m91_30'],
+    requiresPicatinnyRail: true,
     massKg: 0.68,
     ergonomicsDelta: -12,
     extraLengthM: 0,
@@ -372,10 +509,10 @@ export const ATTACHMENTS: Record<string, AttachmentDef> = {
     hasIlluminatedReticle: true,
     opticHeightOffsetM: 0.044,
     opticEyeReliefM: 0.120,
-    adsZoomFactor: 3.0,
+    adsZoomFactor: 1.0,
     hasVariableZoom: true,
-    zoomLevels: [1.0, 2.5, 4.0, 6.0],
-    ocularRadiusM: 0.0155,
+    zoomLevels: [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+    ocularRadiusM: 0.0152,
   },
   optic_nightforce_atacr: {
     id: 'optic_nightforce_atacr',
@@ -880,7 +1017,41 @@ export interface DerivedWeaponStats {
   foregripPose: ForegripPoseStyle;
 }
 
-export function isAttachmentCompatible(def: AttachmentDef, weaponId: string): boolean {
+export function hasMountedPicatinnyAdapter(attachments?: WeaponAttachments | null): boolean {
+  if (!attachments?.railAdapter) return false;
+  return Boolean(ATTACHMENTS[attachments.railAdapter]?.grantsPicatinnyRail);
+}
+
+/**
+ * Returns the rail adapter ID required to mount `def` onto `weaponId` if the weapon lacks
+ * a native Picatinny rail, or `null` if no adapter is required (or already mounted).
+ */
+export function getRequiredRailAdapterId(
+  def: AttachmentDef,
+  weaponId: string,
+  attachments?: WeaponAttachments | null,
+): string | null {
+  if (def.slot !== 'optic' || !def.requiresPicatinnyRail) return null;
+  const meta = WEAPON_COMPAT_META[weaponId];
+  if (!meta) return null;
+  if (meta.railType === 'picatinny_top' || meta.railType === 'p90_rail') return null;
+  if (meta.railType === 'pistol_milled' && def.compatibleRails?.includes('pistol_milled')) {
+    return null;
+  }
+  if (meta.railType === 'dovetail_ak' && weaponId !== 'mosin_m91_30') {
+    return hasMountedPicatinnyAdapter(attachments) ? null : 'rail_b13_dovetail';
+  }
+  if (meta.railType === 'mp5_claw') {
+    return hasMountedPicatinnyAdapter(attachments) ? null : 'rail_mp5_claw';
+  }
+  return null;
+}
+
+export function isAttachmentCompatible(
+  def: AttachmentDef,
+  weaponId: string,
+  attachments?: WeaponAttachments | null,
+): boolean {
   if (def.excludedWeapons && def.excludedWeapons.includes(weaponId)) {
     return false;
   }
@@ -903,10 +1074,38 @@ export function isAttachmentCompatible(def: AttachmentDef, weaponId: string): bo
     return false;
   }
 
+  // Rail-adapter gating for Picatinny optics on Soviet dovetail / MP5 claw receivers:
+  // If an adapter is mounted, treat the receiver as having a picatinny_top rail (and block direct dovetail-only scopes like PSO-1M2 while the B-13 bridge occupies the dovetail!).
+  const adapterMounted = hasMountedPicatinnyAdapter(attachments);
+  if (def.slot === 'optic' && meta) {
+    if (
+      adapterMounted &&
+      (meta.railType === 'dovetail_ak' || meta.railType === 'mp5_claw') &&
+      def.compatibleRails &&
+      def.compatibleRails.includes('dovetail_ak') &&
+      !def.compatibleRails.includes('picatinny_top')
+    ) {
+      // Dovetail side-rail is occupied by B-13 bridge; PSO-1M2 cannot co-mount with B-13
+      return false;
+    }
+    if (
+      def.requiresPicatinnyRail &&
+      (meta.railType === 'dovetail_ak' || meta.railType === 'mp5_claw')
+    ) {
+      if (!adapterMounted) return false;
+      const catOk = !def.compatibleCategories || def.compatibleCategories.includes(meta.category);
+      return catOk;
+    }
+  }
+
   if (explicitMatch) return true;
   if (!meta) return false;
 
-  const railOk = !def.compatibleRails || def.compatibleRails.includes(meta.railType);
+  const effectiveRail: WeaponRailType =
+    adapterMounted && (meta.railType === 'dovetail_ak' || meta.railType === 'mp5_claw')
+      ? 'picatinny_top'
+      : meta.railType;
+  const railOk = !def.compatibleRails || def.compatibleRails.includes(effectiveRail);
   const catOk = !def.compatibleCategories || def.compatibleCategories.includes(meta.category);
   const hasRule = Boolean(def.compatibleRails || def.compatibleCategories);
   return hasRule && railOk && catOk;
@@ -915,19 +1114,59 @@ export function isAttachmentCompatible(def: AttachmentDef, weaponId: string): bo
 export function getCompatibleAttachments(
   weaponId: string,
   slot: AttachmentSlot,
+  attachments?: WeaponAttachments | null,
+  includeAdapterLocked = false,
 ): AttachmentDef[] {
   const out: AttachmentDef[] = [];
   for (const key of Object.keys(ATTACHMENTS)) {
     const def = ATTACHMENTS[key];
-    if (def.slot === slot && isAttachmentCompatible(def, weaponId)) {
+    if (def.slot !== slot) continue;
+    // Hide legacy duplicate aliases from Gunsmith picklists while keeping them loadable from saves
+    if (def.id === 'optic_rmr_micro' || def.id === 'optic_lpvo_1_6' || def.id === 'optic_pso1_4x') {
+      continue;
+    }
+    if (isAttachmentCompatible(def, weaponId, attachments)) {
+      out.push(def);
+    } else if (
+      includeAdapterLocked &&
+      slot === 'optic' &&
+      getRequiredRailAdapterId(def, weaponId, attachments) !== null &&
+      isAttachmentCompatible(def, weaponId, {
+        ...attachments,
+        railAdapter: getRequiredRailAdapterId(def, weaponId, attachments),
+      })
+    ) {
       out.push(def);
     }
   }
   return out;
 }
 
+export function getZeroDistancePresets(category: WeaponCategory): readonly number[] {
+  if (category === 'dmrs' || category === 'bolt_action') {
+    return [25, 50, 100, 150, 200, 300, 500, 600, 800];
+  }
+  if (category === 'pistols' || category === 'revolvers' || category === 'shotguns') {
+    return [25, 50, 100, 150, 200];
+  }
+  return [25, 50, 100, 150, 200, 300];
+}
+
+export function getDefaultZeroDistanceM(category: WeaponCategory): number {
+  if (category === 'pistols' || category === 'revolvers' || category === 'shotguns') return 25;
+  if (category === 'dmrs' || category === 'bolt_action') return 100;
+  return 50;
+}
+
+export function getBallisticSimMaxRangeM(category: WeaponCategory): number {
+  if (category === 'dmrs' || category === 'bolt_action') return 800;
+  if (category === 'pistols' || category === 'revolvers' || category === 'shotguns') return 200;
+  return 400;
+}
+
 export function createBareAttachments(): WeaponAttachments {
   return {
+    railAdapter: null,
     optic: null,
     canted: null,
     muzzle: null,
@@ -945,12 +1184,30 @@ export function normalizeWeaponAttachments(
 ): WeaponAttachments {
   const clean: WeaponAttachments = {};
   if (!attachments) return clean;
+
+  // Normalize railAdapter first because optic compatibility depends on it!
+  if (attachments.railAdapter) {
+    const adapterDef = ATTACHMENTS[attachments.railAdapter];
+    if (
+      adapterDef &&
+      adapterDef.slot === 'railAdapter' &&
+      isAttachmentCompatible(adapterDef, weaponId)
+    ) {
+      clean.railAdapter = adapterDef.id;
+    }
+  }
+
   const slots: AttachmentSlot[] = ['optic', 'canted', 'muzzle', 'tactical', 'foregrip', 'magazine'];
   for (const s of slots) {
-    const id = attachments[s];
+    let id = attachments[s];
     if (!id) continue;
+    // Upgrade legacy saved aliases cleanly to canonical IDs when compatible
+    if (id === 'optic_rmr_micro') id = 'optic_rmr_type2';
+    if (id === 'optic_lpvo_1_6') id = 'optic_razor_1_6';
+    if (id === 'optic_pso1_4x') id = 'optic_pso1m2';
+
     const def = ATTACHMENTS[id];
-    if (def && def.slot === s && isAttachmentCompatible(def, weaponId)) {
+    if (def && def.slot === s && isAttachmentCompatible(def, weaponId, clean)) {
       clean[s] = id;
     }
   }
@@ -962,6 +1219,18 @@ export function normalizeWeaponAttachments(
   }
   if (isValidReticleColorId(attachments.cantedReticleColor)) {
     clean.cantedReticleColor = attachments.cantedReticleColor;
+  }
+  if (typeof attachments.selectedAmmoId === 'string' && attachments.selectedAmmoId.length > 0) {
+    clean.selectedAmmoId = attachments.selectedAmmoId;
+  }
+  if (typeof attachments.zeroDistanceM === 'number' && Number.isFinite(attachments.zeroDistanceM)) {
+    clean.zeroDistanceM = Math.max(15, Math.min(1000, Math.round(attachments.zeroDistanceM)));
+  }
+  if (
+    typeof attachments.zeroElevationMrad === 'number' &&
+    Number.isFinite(attachments.zeroElevationMrad)
+  ) {
+    clean.zeroElevationMrad = Math.max(-15, Math.min(25, Math.round(attachments.zeroElevationMrad * 10) / 10));
   }
   return clean;
 }
@@ -996,6 +1265,7 @@ export function computeDerivedWeaponStats(
 
   if (attachments) {
     const ids = [
+      attachments.railAdapter,
       attachments.optic,
       attachments.canted,
       attachments.muzzle,

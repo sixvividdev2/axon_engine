@@ -305,6 +305,9 @@ export function createScopeLensMaterial(opts: ScopeLensMaterialOptions): THREE.S
     `,
     transparent: false,
     depthWrite: true,
+    polygonOffset: true,
+    polygonOffsetFactor: -1,
+    polygonOffsetUnits: -1,
     side: THREE.FrontSide,
   });
 }
