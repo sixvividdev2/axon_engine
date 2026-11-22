@@ -26,10 +26,21 @@ import {
 import { formatRankLabel } from '../data/progression';
 import { BATTLE_MAPS, ZOMBIE_MAPS } from '../maps/MapRegistry';
 import { BotDifficultyId } from '../maps/types';
+import {
+  formatKillfeedPolicyLabel,
+  LobbyKillfeedPolicy,
+  resolveEffectiveKillfeed,
+  useKillfeedPreference,
+} from '../data/killfeedSettings';
+import { useLoadoutStore } from '../data/loadoutStore';
 import { useTacticalEquipmentSelection } from '../bodycam-sdk/equipment/TacticalEquipmentStore';
 import { TACTICAL_EQUIPMENT_LIST } from '../data/tacticalEquipment';
 
-export const LobbyRoomView: React.FC = () => {
+interface LobbyRoomViewProps {
+  onOpenLoadoutWorkbench?: () => void;
+}
+
+export const LobbyRoomView: React.FC<LobbyRoomViewProps> = ({ onOpenLoadoutWorkbench }) => {
   const { user } = useAuth();
   const {
     lobby,
@@ -47,6 +58,9 @@ export const LobbyRoomView: React.FC = () => {
   const { openDrawer: openSocialDrawer } = useSocial();
   const { selection: tacticalSelection, setEquipment: setTacticalEquipmentId } =
     useTacticalEquipmentSelection();
+  const [personalKillfeed, setPersonalKillfeed] = useKillfeedPreference();
+  const loadoutState = useLoadoutStore();
+  const activeLoadout = loadoutState.slots[loadoutState.activeIndex] ?? loadoutState.slots[0];
 
   const [chatText, setChatText] = useState<string>('');
   const [copiedKey, setCopiedKey] = useState<'lobby' | 'event' | null>(null);
@@ -490,11 +504,93 @@ export const LobbyRoomView: React.FC = () => {
             </div>
           )}
 
-          {/* Personal Tactical Grenade Loadout (Synced to Player Belt & Match) */}
+          {/* Host Killfeed Policy Override & Personal Toggle */}
           <div className="border border-neutral-800 bg-neutral-900/50 p-3">
             <div className="flex items-center justify-between font-mono-tabular text-[10px] uppercase tracking-wider text-neutral-400">
-              <span>Your Belt Grenade</span>
-              <span className="text-amber-300">4 / H in Match</span>
+              <span>Killfeed HUD Policy</span>
+              <span className="text-amber-300">
+                {formatKillfeedPolicyLabel(lobby.killfeedPolicy ?? 'player_choice')}
+              </span>
+            </div>
+            {isHost ? (
+              <>
+                <div className="mt-1.5 grid grid-cols-3 gap-1">
+                  {(
+                    [
+                      { id: 'player_choice', label: 'Player' },
+                      { id: 'force_on', label: 'Force On' },
+                      { id: 'force_off', label: 'Force Off' },
+                    ] as Array<{ id: LobbyKillfeedPolicy; label: string }>
+                  ).map((opt) => {
+                    const active = (lobby.killfeedPolicy ?? 'player_choice') === opt.id;
+                    return (
+                      <button
+                        key={opt.id}
+                        type="button"
+                        onClick={() => updateSettings({ killfeedPolicy: opt.id })}
+                        className={`cursor-pointer border py-1 font-mono-tabular text-[10px] font-semibold uppercase transition-colors ${
+                          active
+                            ? 'border-amber-400 bg-amber-500/20 text-amber-200'
+                            : 'border-neutral-800 bg-neutral-950 text-neutral-400 hover:border-neutral-600 hover:text-neutral-200'
+                        }`}
+                      >
+                        {opt.label}
+                      </button>
+                    );
+                  })}
+                </div>
+                <div className="mt-1 text-[10px] text-neutral-500">
+                  Force On / Off overrides every joined player while in this lobby.
+                </div>
+              </>
+            ) : (
+              <div className="mt-1.5 flex items-center justify-between text-[11px]">
+                {(() => {
+                  const eff = resolveEffectiveKillfeed(
+                    personalKillfeed,
+                    lobby.killfeedPolicy ?? 'player_choice',
+                  );
+                  if (eff.overriddenByHost) {
+                    return (
+                      <span className="font-mono-tabular text-amber-300">
+                        {eff.overrideLabel} (Locked by Host)
+                      </span>
+                    );
+                  }
+                  return (
+                    <>
+                      <span className="text-neutral-400">Personal Killfeed</span>
+                      <button
+                        type="button"
+                        onClick={() => setPersonalKillfeed(!personalKillfeed)}
+                        className={`cursor-pointer border px-2 py-0.5 font-mono-tabular text-[10px] font-semibold uppercase ${
+                          personalKillfeed
+                            ? 'border-emerald-500/70 bg-emerald-950/50 text-emerald-300'
+                            : 'border-neutral-700 bg-neutral-950 text-neutral-400'
+                        }`}
+                      >
+                        {personalKillfeed ? 'ON' : 'OFF'}
+                      </button>
+                    </>
+                  );
+                })()}
+              </div>
+            )}
+          </div>
+
+          {/* Active Loadout & Gunsmith Bench Quick Access */}
+          <div className="border border-neutral-800 bg-neutral-900/50 p-3">
+            <div className="flex items-center justify-between font-mono-tabular text-[10px] uppercase tracking-wider text-neutral-400">
+              <span>Active Loadout · {activeLoadout.name}</span>
+              {onOpenLoadoutWorkbench && (
+                <button
+                  type="button"
+                  onClick={onOpenLoadoutWorkbench}
+                  className="cursor-pointer border border-sky-500/60 bg-sky-500/15 px-2 py-0.5 font-mono-tabular text-[10px] font-semibold text-sky-300 hover:bg-sky-500/25"
+                >
+                  Open Gunsmith
+                </button>
+              )}
             </div>
             <div className="mt-1.5 grid grid-cols-2 gap-1">
               {TACTICAL_EQUIPMENT_LIST.map((eq) => {

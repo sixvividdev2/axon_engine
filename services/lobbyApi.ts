@@ -1,5 +1,6 @@
 import {
   LobbyBrowserEntry,
+  LobbyKillfeedPolicy,
   LobbyModeId,
   LobbyRoomState,
   LobbyVisibility,
@@ -83,6 +84,7 @@ export interface CreateLobbyPayload {
   botCount?: number;
   killLimit?: number;
   botDifficulty?: BotDifficultyId;
+  killfeedPolicy?: LobbyKillfeedPolicy;
   specialEventId?: string | null;
 }
 

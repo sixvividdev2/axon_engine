@@ -1371,6 +1371,7 @@ export default {
           botCount?: number;
           killLimit?: number;
           botDifficulty?: 'recruit' | 'tactical' | 'veteran';
+          killfeedPolicy?: 'player_choice' | 'force_on' | 'force_off';
           specialEventId?: string | null;
         }>(request);
 
@@ -1405,7 +1406,12 @@ export default {
           : body?.battleRule === 'ffa'
             ? 'ffa'
             : 'tdm';
-        const validMaps = new Set(['pripyat_block', 'timberline_compound', 'kino_theater']);
+        const validMaps = new Set([
+          'pripyat_block',
+          'timberline_compound',
+          'korsakov_substation',
+          'kino_theater',
+        ]);
         const defaultMap = mode === 'infection' ? 'kino_theater' : 'pripyat_block';
         const mapId = specialEvent
           ? specialEvent.config.mapId
@@ -1436,6 +1442,11 @@ export default {
           : body?.botDifficulty === 'recruit' || body?.botDifficulty === 'veteran'
             ? body.botDifficulty
             : 'tactical';
+        const killfeedPolicy = specialEvent
+          ? (specialEvent.config.killfeedPolicy ?? 'player_choice')
+          : body?.killfeedPolicy === 'force_on' || body?.killfeedPolicy === 'force_off'
+            ? body.killfeedPolicy
+            : 'player_choice';
 
         let code = generateLobbyCode();
         for (let attempt = 0; attempt < 5; attempt++) {
@@ -1467,6 +1478,7 @@ export default {
             botCount,
             killLimit,
             botDifficulty,
+            killfeedPolicy,
             specialEvent,
           }),
         });

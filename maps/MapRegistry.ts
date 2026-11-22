@@ -1,4 +1,5 @@
 import { KINO_THEATER_MAP } from './KinoTheaterMap';
+import { KORSAKOV_SUBSTATION_MAP } from './KorsakovSubstationMap';
 import { PRIPYAT_BLOCK_MAP } from './PripyatBlockMap';
 import { TIMBERLINE_COMPOUND_MAP } from './TimberlineCompoundMap';
 import { IMapDefinition } from './types';
@@ -6,6 +7,7 @@ import { IMapDefinition } from './types';
 export const BATTLE_MAPS: readonly IMapDefinition[] = [
   PRIPYAT_BLOCK_MAP,
   TIMBERLINE_COMPOUND_MAP,
+  KORSAKOV_SUBSTATION_MAP,
 ];
 
 /**

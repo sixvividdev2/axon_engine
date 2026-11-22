@@ -583,6 +583,7 @@ export class LobbyRoomDO {
         botCount: number;
         killLimit: number;
         botDifficulty: 'recruit' | 'tactical' | 'veteran';
+        killfeedPolicy?: 'player_choice' | 'force_on' | 'force_off';
         specialEvent: SpecialEventRecord | null;
       };
 
@@ -596,6 +597,11 @@ export class LobbyRoomDO {
       const botCount = botsEnabled
         ? Math.max(0, Math.min(10, Math.round(ev ? ev.config.botCount : body.botCount)))
         : 0;
+      const killfeedPolicy = ev
+        ? (ev.config.killfeedPolicy ?? 'player_choice')
+        : body.killfeedPolicy === 'force_on' || body.killfeedPolicy === 'force_off'
+          ? body.killfeedPolicy
+          : 'player_choice';
 
       this.room = {
         state: {
@@ -611,6 +617,7 @@ export class LobbyRoomDO {
           botCount,
           killLimit: ev ? ev.config.killLimit : Math.max(10, Math.min(100, body.killLimit || 30)),
           botDifficulty: ev ? ev.config.botDifficulty : body.botDifficulty,
+          killfeedPolicy,
           status: 'lobby',
           matchSequence: 0,
           specialEvent: ev,
@@ -896,6 +903,7 @@ export class LobbyRoomDO {
       if (
         patch.mapId === 'pripyat_block' ||
         patch.mapId === 'timberline_compound' ||
+        patch.mapId === 'korsakov_substation' ||
         patch.mapId === 'kino_theater'
       ) {
         st.mapId = patch.mapId;
@@ -925,6 +933,13 @@ export class LobbyRoomDO {
       ) {
         st.botDifficulty = patch.botDifficulty;
       }
+      if (
+        patch.killfeedPolicy === 'player_choice' ||
+        patch.killfeedPolicy === 'force_on' ||
+        patch.killfeedPolicy === 'force_off'
+      ) {
+        st.killfeedPolicy = patch.killfeedPolicy;
+      }
       if (st.specialEvent) {
         st.specialEvent = {
           ...st.specialEvent,
@@ -938,6 +953,7 @@ export class LobbyRoomDO {
             botCount: st.botCount,
             killLimit: st.killLimit,
             botDifficulty: st.botDifficulty,
+            killfeedPolicy: st.killfeedPolicy,
           }),
         };
       }

@@ -9,6 +9,7 @@ import {
 import { AuthProvider, useAuth } from './context/AuthContext';
 import { LobbyProvider, useLobby } from './context/LobbyContext';
 import { SocialProvider, useSocial } from './context/SocialContext';
+import { loadoutStore } from './data/loadoutStore';
 import { MatchProgressionSummary } from './data/progression';
 import { GymEngine, GymSnapshot } from './gym/GymEngine';
 import { GymHud } from './gym/GymHud';
@@ -20,11 +21,11 @@ import {
 import { AccountSettingsModal } from './ui/AccountSettingsModal';
 import { AuthModal } from './ui/AuthModal';
 import { CombatHud, MultiplayerHudControls } from './ui/CombatHud';
-import { GunsmithModal } from './ui/GunsmithModal';
 import { HubTabId, MainMenuHub } from './ui/MainMenuHub';
 import { RankUpCinematic } from './ui/RankUpCinematic';
 import { SocialHubDrawer } from './ui/SocialHubDrawer';
 import { SocialInviteToast } from './ui/SocialInviteToast';
+import { UnifiedLoadoutWorkbench } from './ui/UnifiedLoadoutWorkbench';
 
 type ActiveView =
   | { kind: 'menu'; tab: HubTabId }
@@ -116,43 +117,45 @@ function PlaygroundView({ onReturnToMenu }: { onReturnToMenu: () => void }) {
       )}
 
       {snapshot && snapshot.gunsmithOpen && (
-        <GunsmithModal
-          weaponId={snapshot.equippedWeaponId}
-          weaponName={snapshot.equippedWeaponName}
-          caliberLabel={snapshot.equippedCaliber}
-          activeCaliberId={snapshot.activeCaliberId}
-          activeAmmoVariantId={snapshot.activeAmmoVariantId}
-          toggleablePumpSemi={snapshot.toggleablePumpSemi}
-          spas12Mode={snapshot.spas12Mode}
-          attachments={snapshot.attachments}
-          stats={snapshot.derivedStats}
-          pins={snapshot.gunsmithPins}
-          zeroDistanceM={snapshot.zeroDistanceM}
-          zeroElevationMrad={snapshot.zeroElevationMrad}
-          heightOverBoreM={snapshot.heightOverBoreM}
+        <UnifiedLoadoutWorkbench
+          gymBridge={{
+            weaponId: snapshot.equippedWeaponId,
+            weaponName: snapshot.equippedWeaponName,
+            caliberLabel: snapshot.equippedCaliber,
+            activeCaliberId: snapshot.activeCaliberId,
+            activeAmmoVariantId: snapshot.activeAmmoVariantId,
+            toggleablePumpSemi: snapshot.toggleablePumpSemi,
+            spas12Mode: snapshot.spas12Mode,
+            attachments: snapshot.attachments,
+            stats: snapshot.derivedStats,
+            pins: snapshot.gunsmithPins,
+            zeroDistanceM: snapshot.zeroDistanceM,
+            zeroElevationMrad: snapshot.zeroElevationMrad,
+            heightOverBoreM: snapshot.heightOverBoreM,
+            onSelectWeapon: (id) => engine?.selectGunsmithWeapon(id),
+            onSelectAmmoVariant: (variantId) => engine?.selectAmmoVariant(variantId),
+            onSelectZeroDistance: (distanceM) => engine?.selectZeroDistance(distanceM),
+            onAdjustElevationMrad: (mrad) => engine?.adjustZeroElevationMrad(mrad),
+            onTestFireSound: () => engine?.playGunsmithTestFireSound(),
+            onTurretClickSound: (up) => engine?.playGunsmithTurretClick(up),
+            onToggleFireMode: () => engine?.toggleFireMode(),
+            onSelectAttachment: (slot, attachmentId) => {
+              if (attachmentId && !isAttachmentUnlocked(attachmentId)) return;
+              if (!isWeaponUnlocked(snapshot.equippedWeaponId)) return;
+              engine?.selectGunsmithAttachment(slot, attachmentId);
+            },
+            onSelectReticleColor: (slot, colorId) =>
+              engine?.selectGunsmithReticleColor(slot, colorId),
+            onStripAll: () => engine?.stripGunsmithWeapon(),
+            onOrbit: (dx, dy) => engine?.orbitGunsmith(dx, dy),
+            onZoom: (deltaY) => engine?.zoomGunsmith(deltaY),
+          }}
           careerRank={effectiveRank}
-          weaponProgress={getWeaponProgress(snapshot.equippedWeaponId)}
+          getWeaponProgress={getWeaponProgress}
           isWeaponUnlocked={isWeaponUnlocked}
           isAttachmentUnlocked={isAttachmentUnlocked}
-          onSelectWeapon={(id) => engine?.selectGunsmithWeapon(id)}
-          onSelectAmmoVariant={(variantId) => engine?.selectAmmoVariant(variantId)}
-          onSelectZeroDistance={(distanceM) => engine?.selectZeroDistance(distanceM)}
-          onAdjustElevationMrad={(mrad) => engine?.adjustZeroElevationMrad(mrad)}
-          onTestFireSound={() => engine?.playGunsmithTestFireSound()}
-          onTurretClickSound={(up) => engine?.playGunsmithTurretClick(up)}
-          onToggleFireMode={() => engine?.toggleFireMode()}
-          onSelectAttachment={(slot, attachmentId) => {
-            if (attachmentId && !isAttachmentUnlocked(attachmentId)) return;
-            if (!isWeaponUnlocked(snapshot.equippedWeaponId)) return;
-            engine?.selectGunsmithAttachment(slot, attachmentId);
-          }}
-          onSelectReticleColor={(slot, colorId) =>
-            engine?.selectGunsmithReticleColor(slot, colorId)
-          }
-          onStripAll={() => engine?.stripGunsmithWeapon()}
-          onOrbit={(dx, dy) => engine?.orbitGunsmith(dx, dy)}
-          onZoom={(deltaY) => engine?.zoomGunsmith(deltaY)}
           onClose={() => engine?.closeGunsmith()}
+          closeLabel="Return to Range"
         />
       )}
     </main>
@@ -284,6 +287,7 @@ function AppShell() {
     lobby,
     isHost,
     matchSignal,
+    updateSettings,
     hostRestartMatch,
     hostEndMatchToLobby,
     leaveLobby,
@@ -325,7 +329,9 @@ function AppShell() {
         }
       : undefined;
 
-    const selectedTacticalId = tacticalEquipmentStore.getSelection().equipmentId;
+    const activeLoadout = loadoutStore.getActiveSlot();
+    const selectedTacticalId =
+      tacticalEquipmentStore.getSelection().equipmentId || activeLoadout.tacticalEquipmentId;
     const params: CombatSessionParams =
       st.mode === 'infection'
         ? {
@@ -341,8 +347,8 @@ function AppShell() {
               botCount: st.botsEnabled ? st.botCount : 0,
               killLimit: st.killLimit,
               difficulty: st.botDifficulty,
-              primaryWeaponId: battleConfig.primaryWeaponId,
-              secondaryWeaponId: battleConfig.secondaryWeaponId,
+              primaryWeaponId: activeLoadout.primaryWeaponId || battleConfig.primaryWeaponId,
+              secondaryWeaponId: activeLoadout.secondaryWeaponId || battleConfig.secondaryWeaponId,
               tacticalEquipmentId: selectedTacticalId,
             },
             multiplayer: mpBridge,
@@ -377,6 +383,9 @@ function AppShell() {
           isHost,
           lobbyCode: lobby.code,
           eventName: lobby.specialEvent?.name ?? null,
+          killfeedPolicy: lobby.killfeedPolicy ?? 'player_choice',
+          localPlayerName: user?.username ?? 'YOU',
+          onHostUpdateKillfeedPolicy: (policy) => updateSettings({ killfeedPolicy: policy }),
           onHostRestart: hostRestartMatch,
           onHostEndToLobby: hostEndMatchToLobby,
           onLeaveMatch: () => {

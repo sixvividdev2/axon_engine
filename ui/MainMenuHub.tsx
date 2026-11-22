@@ -18,10 +18,18 @@ import {
   InfectionMatchConfig,
   TopLevelModeId,
 } from '../maps/types';
+import {
+  GRAPHICS_QUALITY_ORDER,
+  GRAPHICS_QUALITY_PROFILES,
+  useGraphicsQuality,
+} from '../data/graphicsQuality';
+import { useKillfeedPreference } from '../data/killfeedSettings';
+import { useLoadoutStore } from '../data/loadoutStore';
 import { MapSelector } from './MapSelector';
 import { MenuBackdrop3D, MenuBackdropMood } from './MenuBackdrop3D';
 import { MultiplayerHubPanel } from './MultiplayerHubPanel';
 import { OperatorSelectPanel } from './OperatorSelectPanel';
+import { UnifiedLoadoutWorkbench } from './UnifiedLoadoutWorkbench';
 import { useOperatorSelection } from '../bodycam-sdk/operator/OperatorSelectionStore';
 import { OPERATOR_PROFILES } from '../bodycam-sdk/operator/OperatorTypes';
 import { useTacticalEquipmentSelection } from '../bodycam-sdk/equipment/TacticalEquipmentStore';
@@ -30,7 +38,7 @@ import {
   TacticalEquipmentId,
 } from '../data/tacticalEquipment';
 
-export type HubTabId = TopLevelModeId | 'operator' | 'multiplayer';
+export type HubTabId = TopLevelModeId | 'loadout' | 'operator' | 'multiplayer';
 
 interface MainMenuHubProps {
   initialTab?: HubTabId;
@@ -64,12 +72,19 @@ export const MainMenuHub: React.FC<MainMenuHubProps> = ({
     openAccountSettings,
     requireAuth,
     isWeaponUnlocked,
+    isAttachmentUnlocked,
+    getWeaponProgress,
   } = useAuth();
   const { friends, incomingRequests, openDrawer: openSocialDrawer } = useSocial();
   const { lobby } = useLobby();
   const [selectedOperatorId] = useOperatorSelection();
   const { selection: tacticalSelection, setEquipment: setTacticalEquipmentId } =
     useTacticalEquipmentSelection();
+  const loadoutState = useLoadoutStore();
+  const activeLoadout = loadoutState.slots[loadoutState.activeIndex] ?? loadoutState.slots[0];
+  const [graphicsQuality, setGraphicsQuality] = useGraphicsQuality();
+  const [personalKillfeed, setPersonalKillfeed] = useKillfeedPreference();
+  const [lobbyWorkbenchOpen, setLobbyWorkbenchOpen] = useState<boolean>(false);
   const [activeTab, setActiveTab] = useState<HubTabId>(lobby ? 'multiplayer' : initialTab);
   const [battleConfig, setBattleConfig] = useState<BattleMatchConfig>(initialBattleConfig);
   const [infectionConfig, setInfectionConfig] =
@@ -123,10 +138,29 @@ export const MainMenuHub: React.FC<MainMenuHubProps> = ({
     }
   }, [user, lobby, activeTab]);
 
+  // Keep Battle weapons synced with the active Loadout slot whenever user edits Loadout tab
+  useEffect(() => {
+    setBattleConfig((prev) => {
+      const nextPrimary = isWeaponUnlocked(activeLoadout.primaryWeaponId)
+        ? activeLoadout.primaryWeaponId
+        : prev.primaryWeaponId;
+      const nextSecondary = isWeaponUnlocked(activeLoadout.secondaryWeaponId)
+        ? activeLoadout.secondaryWeaponId
+        : prev.secondaryWeaponId;
+      if (nextPrimary === prev.primaryWeaponId && nextSecondary === prev.secondaryWeaponId) {
+        return prev;
+      }
+      return { ...prev, primaryWeaponId: nextPrimary, secondaryWeaponId: nextSecondary };
+    });
+  }, [activeLoadout.primaryWeaponId, activeLoadout.secondaryWeaponId, isWeaponUnlocked]);
+
   const isInfection = activeTab === 'infection';
   const isOperatorTab = activeTab === 'operator';
+  const isLoadoutTab = activeTab === 'loadout' || lobbyWorkbenchOpen;
   const mood: MenuBackdropMood =
-    activeTab === 'multiplayer' || activeTab === 'operator' ? 'battle' : activeTab;
+    activeTab === 'multiplayer' || activeTab === 'operator' || activeTab === 'loadout'
+      ? 'battle'
+      : activeTab;
   const rankInfo = getRankTitleInfo(effectiveRank);
   const selectedOperatorProfile = OPERATOR_PROFILES[selectedOperatorId];
 
@@ -136,11 +170,11 @@ export const MainMenuHub: React.FC<MainMenuHubProps> = ({
 
   return (
     <div className="relative h-screen w-screen overflow-hidden bg-neutral-950 text-neutral-100 select-none">
-      {/* Live 3D Architectural Backdrop (unmounted during Operator Turntable to avoid competing WebGL contexts) */}
-      {!isOperatorTab && <MenuBackdrop3D mood={mood} />}
+      {/* Live 3D Architectural Backdrop (unmounted during Operator or CAD Loadout Stage to avoid competing WebGL contexts) */}
+      {!isOperatorTab && !isLoadoutTab && <MenuBackdrop3D mood={mood} />}
 
       {/* Directional contrast scrim + Infection crimson arterial vignette */}
-      {!isOperatorTab && (
+      {!isOperatorTab && !isLoadoutTab && (
         <div
           className={`pointer-events-none fixed inset-0 z-[1] transition-opacity duration-500 ${
             isInfection ? 'infection-vignette' : ''
@@ -173,9 +207,10 @@ export const MainMenuHub: React.FC<MainMenuHubProps> = ({
           <nav className="flex flex-wrap items-center gap-1.5" aria-label="Game Modes">
             {(
               [
-                { id: 'playground', label: 'PLAYGROUND', sub: 'Range & Gunsmith', gated: false },
+                { id: 'playground', label: 'PLAYGROUND', sub: 'Range & Ballistics', gated: false },
                 { id: 'battle', label: 'BATTLE', sub: 'Solo TDM & FFA', gated: false },
                 { id: 'infection', label: 'INFECTION', sub: 'Solo Zombies', gated: false },
+                { id: 'loadout', label: 'LOADOUT', sub: activeLoadout.name, gated: false },
                 {
                   id: 'operator',
                   label: 'OPERATOR',
@@ -691,21 +726,70 @@ export const MainMenuHub: React.FC<MainMenuHubProps> = ({
             />
           )}
 
-          {activeTab === 'multiplayer' && user && <MultiplayerHubPanel />}
+          {activeTab === 'multiplayer' && user && (
+            <MultiplayerHubPanel
+              onOpenLoadoutWorkbench={() => setLobbyWorkbenchOpen(true)}
+            />
+          )}
         </main>
 
-        {/* Bottom Controls Reference Footer */}
+        {/* Bottom Controls, 4-Mode Graphics Quality & Killfeed Toggle Footer */}
         <footer className="flex flex-wrap items-center justify-between gap-3 border-t border-neutral-800/70 pt-3 font-mono-tabular text-[11px] text-neutral-400">
           <div>
-            WASD Move · Shift Sprint / Hold Breath · RMB ADS · MMB Point Aim · R Reload · G
-            Suppressor · 4 / H Grenade · V Bash · X Kick · F Interact / Light
+            WASD Move · Shift Sprint · RMB ADS · MMB Point Aim · R Reload · 4 / H Grenade · F
+            Interact · F1 Settings
           </div>
-          <div className="text-neutral-500">
-            Operator: {selectedOperatorProfile.label} ({selectedOperatorProfile.callsign}) · F1
-            Optics Tuner
+          <div className="flex flex-wrap items-center gap-3">
+            <div className="flex items-center gap-1">
+              <span className="text-[10px] uppercase text-neutral-500">Graphics</span>
+              {GRAPHICS_QUALITY_ORDER.map((gid) => (
+                <button
+                  key={gid}
+                  type="button"
+                  onClick={() => setGraphicsQuality(gid)}
+                  className={`cursor-pointer border px-1.5 py-0.5 text-[10px] uppercase transition-colors ${
+                    graphicsQuality === gid
+                      ? 'border-amber-400 bg-amber-500/20 text-amber-300'
+                      : 'border-neutral-800 bg-neutral-900 text-neutral-500 hover:text-neutral-200'
+                  }`}
+                  title={GRAPHICS_QUALITY_PROFILES[gid].description}
+                >
+                  {GRAPHICS_QUALITY_PROFILES[gid].shortLabel}
+                </button>
+              ))}
+            </div>
+            <button
+              type="button"
+              onClick={() => setPersonalKillfeed(!personalKillfeed)}
+              className={`cursor-pointer border px-2 py-0.5 text-[10px] uppercase transition-colors ${
+                personalKillfeed
+                  ? 'border-emerald-500/60 bg-emerald-950/40 text-emerald-300'
+                  : 'border-neutral-800 bg-neutral-900 text-neutral-500'
+              }`}
+            >
+              Killfeed: {personalKillfeed ? 'ON' : 'OFF'}
+            </button>
           </div>
         </footer>
       </div>
+
+      {/* Unified CAD Loadout & Gunsmith Workbench Overlay (Main Menu Loadout Tab or Lobby Quick Edit) */}
+      {(activeTab === 'loadout' || lobbyWorkbenchOpen) && (
+        <UnifiedLoadoutWorkbench
+          careerRank={effectiveRank}
+          getWeaponProgress={getWeaponProgress}
+          isWeaponUnlocked={isWeaponUnlocked}
+          isAttachmentUnlocked={isAttachmentUnlocked}
+          onClose={() => {
+            if (lobbyWorkbenchOpen) {
+              setLobbyWorkbenchOpen(false);
+            } else {
+              setActiveTab('battle');
+            }
+          }}
+          closeLabel={lobbyWorkbenchOpen ? 'Back to Lobby' : 'Back to Menu'}
+        />
+      )}
     </div>
   );
 };

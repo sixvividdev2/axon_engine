@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { BodycamPhysicsWorld } from '../bodycam-sdk';
+import { GraphicsQualityId } from '../data/graphicsQuality';
 import { TacticalEquipmentId } from '../data/tacticalEquipment';
 
 export type TopLevelModeId = 'playground' | 'battle' | 'infection';
@@ -130,11 +131,18 @@ export interface IMapDefinition {
   status: 'playable' | 'coming_soon';
   environmentTags: string[];
   accentHex: string;
-  previewStyle: 'cqb_pripyat' | 'forest_compound' | 'kino_theater' | 'locked_depot' | 'locked_bunker';
+  previewStyle:
+    | 'cqb_pripyat'
+    | 'forest_compound'
+    | 'korsakov_substation'
+    | 'kino_theater'
+    | 'locked_depot'
+    | 'locked_bunker';
   build: (
     scene: THREE.Scene,
     renderer: THREE.WebGLRenderer,
     isSoftwareGl: boolean,
+    graphicsQuality?: GraphicsQualityId,
   ) => BuiltMapInstance;
 }
 

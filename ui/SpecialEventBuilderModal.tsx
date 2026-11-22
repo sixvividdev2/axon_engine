@@ -444,6 +444,41 @@ export const SpecialEventBuilderModal: React.FC<SpecialEventBuilderModalProps> =
                   />
                 </label>
               </div>
+
+              <div className="border border-neutral-800 bg-neutral-900/50 p-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <div className="font-mono-tabular text-[10px] uppercase tracking-wider text-neutral-400">
+                      Lobby Killfeed Policy (Host Override)
+                    </div>
+                    <div className="text-[11px] text-neutral-500">
+                      Overrides every joined player&apos;s killfeed setting while in this event lobby
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-3 gap-1.5">
+                    {(
+                      [
+                        { id: 'player_choice' as const, label: 'Player Choice' },
+                        { id: 'force_on' as const, label: 'Force On' },
+                        { id: 'force_off' as const, label: 'Force Off' },
+                      ]
+                    ).map((opt) => (
+                      <button
+                        key={opt.id}
+                        type="button"
+                        onClick={() => patchCfg({ killfeedPolicy: opt.id })}
+                        className={`cursor-pointer whitespace-nowrap border px-2.5 py-1.5 font-mono-tabular text-[11px] ${
+                          (cfg.killfeedPolicy ?? 'player_choice') === opt.id
+                            ? 'border-amber-400 bg-amber-500/20 text-amber-300'
+                            : 'border-neutral-800 bg-neutral-950 text-neutral-400 hover:text-neutral-200'
+                        }`}
+                      >
+                        {opt.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
             </section>
 
             {/* Section 4: AI Bots Tuning */}

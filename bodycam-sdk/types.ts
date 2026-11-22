@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import type { GraphicsQualityId } from '../data/graphicsQuality';
 
 export type BodycamSurfaceMaterial =
   | 'concrete'
@@ -571,6 +572,8 @@ export interface BodycamSDKConfig {
   motionBlurStrength: number;
   opticParallaxStrength: number;
   showRecOverlay: boolean;
+  showKillfeed: boolean;
+  graphicsQuality: GraphicsQualityId;
   flashlightAngleDeg: number;
 
   // Mic Chain & Tactile Gear Audio
@@ -615,6 +618,8 @@ export const DEFAULT_BODYCAM_SDK_CONFIG: BodycamSDKConfig = {
   motionBlurStrength: 0.38,
   opticParallaxStrength: 1.0,
   showRecOverlay: true,
+  showKillfeed: true,
+  graphicsQuality: 'balanced',
   flashlightAngleDeg: 26,
 
   micClippingDrive: 4.5,

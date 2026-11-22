@@ -28,7 +28,13 @@ import { BattleRuleId, BotDifficultyId } from '../maps/types';
 import { LobbyRoomView } from './LobbyRoomView';
 import { SpecialEventBuilderModal } from './SpecialEventBuilderModal';
 
-export const MultiplayerHubPanel: React.FC = () => {
+interface MultiplayerHubPanelProps {
+  onOpenLoadoutWorkbench?: () => void;
+}
+
+export const MultiplayerHubPanel: React.FC<MultiplayerHubPanelProps> = ({
+  onOpenLoadoutWorkbench,
+}) => {
   const {
     lobby,
     connecting,
@@ -79,7 +85,7 @@ export const MultiplayerHubPanel: React.FC = () => {
 
   // If currently inside an active lobby, render the live LobbyRoomView
   if (lobby) {
-    return <LobbyRoomView />;
+    return <LobbyRoomView onOpenLoadoutWorkbench={onOpenLoadoutWorkbench} />;
   }
 
   const availableMaps = mode === 'infection' ? ZOMBIE_MAPS : BATTLE_MAPS;

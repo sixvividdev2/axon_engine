@@ -6,17 +6,32 @@ import {
 } from '../bodycam-sdk';
 import { CombatSessionSnapshot } from '../combat/CombatSessionEngine';
 import {
+  GRAPHICS_QUALITY_ORDER,
+  GRAPHICS_QUALITY_PROFILES,
+  GraphicsQualityId,
+  useGraphicsQuality,
+} from '../data/graphicsQuality';
+import {
+  LobbyKillfeedPolicy,
+  resolveEffectiveKillfeed,
+  useKillfeedPreference,
+} from '../data/killfeedSettings';
+import {
   TACTICAL_BELT_SLOTS,
   TACTICAL_EQUIPMENT_LIST,
   TacticalBeltSlot,
   TacticalEquipmentId,
 } from '../data/tacticalEquipment';
 import { HeartRateIndicator } from './HeartRateIndicator';
+import { KillfeedOverlay } from './KillfeedOverlay';
 
 export interface MultiplayerHudControls {
   isHost: boolean;
   lobbyCode: string;
   eventName?: string | null;
+  killfeedPolicy?: LobbyKillfeedPolicy;
+  localPlayerName?: string;
+  onHostUpdateKillfeedPolicy?: (policy: LobbyKillfeedPolicy) => void;
   onHostRestart: () => void;
   onHostEndToLobby: () => void;
   onLeaveMatch: () => void;
@@ -63,6 +78,12 @@ export const CombatHud: React.FC<CombatHudProps> = ({
 }) => {
   const isBattle = snapshot.mode === 'battle';
   const isInfection = snapshot.mode === 'infection';
+  const [personalKillfeed, setPersonalKillfeed] = useKillfeedPreference();
+  const [graphicsQuality, setGraphicsQuality] = useGraphicsQuality();
+  const effectiveKillfeed = resolveEffectiveKillfeed(
+    personalKillfeed && snapshot.config.showKillfeed,
+    multiplayerSession?.killfeedPolicy ?? null,
+  );
   const hpRatio = Math.max(0, Math.min(1, snapshot.hp / Math.max(1, snapshot.maxHp)));
   const presetLabel =
     snapshot.config.lensPreset === 'gopro_chest'
@@ -79,6 +100,12 @@ export const CombatHud: React.FC<CombatHudProps> = ({
 
   return (
     <div className="pointer-events-none fixed inset-0 z-10 select-none">
+      {/* Top-Left CSS-Animated Killfeed (Active in Battle & Infection; Host Override > Player Toggle) */}
+      <KillfeedOverlay
+        entries={snapshot.killfeed}
+        enabled={effectiveKillfeed.enabled}
+        localPlayerName={multiplayerSession?.localPlayerName ?? 'YOU'}
+      />
       {/* Peripheral Damage Flash Overlay */}
       {snapshot.damageFlash > 0.02 && (
         <div
@@ -173,44 +200,6 @@ export const CombatHud: React.FC<CombatHudProps> = ({
               </>
             )}
           </div>
-
-          {/* Top-Left Killfeed */}
-          {snapshot.killfeed.length > 0 && (
-            <div className="fixed top-4 left-5 flex flex-col gap-1 font-mono-tabular text-[11px]">
-              {snapshot.killfeed.map((k) => (
-                <div
-                  key={k.id}
-                  className="flex items-center gap-1.5 bg-neutral-950/82 px-2.5 py-1 text-neutral-200"
-                >
-                  <span
-                    className={
-                      k.killerTeam === 'A'
-                        ? 'font-semibold text-sky-300'
-                        : k.killerTeam === 'B'
-                          ? 'font-semibold text-orange-400'
-                          : 'font-semibold text-amber-300'
-                    }
-                  >
-                    {k.killerName}
-                  </span>
-                  <span className="text-[10px] text-neutral-500">
-                    [{k.headshot ? 'HS' : k.weaponLabel}]
-                  </span>
-                  <span
-                    className={
-                      k.victimTeam === 'A'
-                        ? 'text-sky-200/80'
-                        : k.victimTeam === 'B'
-                          ? 'text-orange-300/80'
-                          : 'text-neutral-300'
-                    }
-                  >
-                    {k.victimName}
-                  </span>
-                </div>
-              ))}
-            </div>
-          )}
 
           {/* Respawn / Eliminated Spectating Banner */}
           {!snapshot.playerAlive && snapshot.matchOutcome === 'active' && (
@@ -821,6 +810,94 @@ export const CombatHud: React.FC<CombatHudProps> = ({
                     {slot.shortLabel}
                   </button>
                 ))}
+              </div>
+            </div>
+
+            {/* HUD Killfeed & Graphics Quality */}
+            <div className="border-t border-neutral-800 pt-3">
+              <div className="mb-1.5 flex items-center justify-between font-mono-tabular text-[10px] uppercase tracking-wider text-neutral-400">
+                <span>Killfeed HUD</span>
+                {effectiveKillfeed.overriddenByHost ? (
+                  <span className="text-amber-300">{effectiveKillfeed.overrideLabel}</span>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const next = !personalKillfeed;
+                      setPersonalKillfeed(next);
+                      onUpdateConfig({ showKillfeed: next });
+                    }}
+                    className={`cursor-pointer border px-2 py-0.5 text-[10px] font-semibold ${
+                      personalKillfeed
+                        ? 'border-emerald-500/70 bg-emerald-950/50 text-emerald-300'
+                        : 'border-neutral-700 bg-neutral-900 text-neutral-400'
+                    }`}
+                  >
+                    {personalKillfeed ? 'ON' : 'OFF'}
+                  </button>
+                )}
+              </div>
+
+              {multiplayerSession?.isHost && multiplayerSession.onHostUpdateKillfeedPolicy && (
+                <div className="mt-2">
+                  <div className="mb-1 font-mono-tabular text-[9px] uppercase tracking-wider text-amber-300/90">
+                    Host Lobby Override (All Players)
+                  </div>
+                  <div className="grid grid-cols-3 gap-1">
+                    {(
+                      [
+                        { id: 'player_choice', label: 'Player' },
+                        { id: 'force_on', label: 'Force On' },
+                        { id: 'force_off', label: 'Force Off' },
+                      ] as Array<{ id: LobbyKillfeedPolicy; label: string }>
+                    ).map((opt) => {
+                      const active =
+                        (multiplayerSession.killfeedPolicy ?? 'player_choice') === opt.id;
+                      return (
+                        <button
+                          key={opt.id}
+                          type="button"
+                          onClick={() => multiplayerSession.onHostUpdateKillfeedPolicy?.(opt.id)}
+                          className={`cursor-pointer border py-1 font-mono-tabular text-[9px] uppercase ${
+                            active
+                              ? 'border-amber-400 bg-amber-500/20 text-amber-200'
+                              : 'border-neutral-800 bg-neutral-900 text-neutral-400 hover:text-neutral-200'
+                          }`}
+                        >
+                          {opt.label}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+
+              <div className="mt-3">
+                <div className="mb-1.5 flex items-center justify-between font-mono-tabular text-[10px] uppercase tracking-wider text-neutral-400">
+                  <span>Graphics Mode</span>
+                  <span className="text-amber-300">
+                    {GRAPHICS_QUALITY_PROFILES[graphicsQuality].label}
+                  </span>
+                </div>
+                <div className="grid grid-cols-4 gap-1">
+                  {GRAPHICS_QUALITY_ORDER.map((gid: GraphicsQualityId) => (
+                    <button
+                      key={gid}
+                      type="button"
+                      onClick={() => {
+                        setGraphicsQuality(gid);
+                        onUpdateConfig({ graphicsQuality: gid });
+                      }}
+                      className={`cursor-pointer border py-1 font-mono-tabular text-[9px] uppercase ${
+                        graphicsQuality === gid
+                          ? 'border-amber-400 bg-amber-500/20 text-amber-300'
+                          : 'border-neutral-800 bg-neutral-900 text-neutral-400 hover:text-neutral-200'
+                      }`}
+                    >
+                      {GRAPHICS_QUALITY_PROFILES[gid].shortLabel}
+                    </button>
+                  ))}
+                </div>
               </div>
             </div>
 

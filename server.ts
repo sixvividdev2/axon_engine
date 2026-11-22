@@ -1360,7 +1360,12 @@ async function startServer() {
       : req.body?.battleRule === 'ffa'
         ? 'ffa'
         : 'tdm';
-    const validMaps = new Set(['pripyat_block', 'timberline_compound', 'kino_theater']);
+    const validMaps = new Set([
+      'pripyat_block',
+      'timberline_compound',
+      'korsakov_substation',
+      'kino_theater',
+    ]);
     const defaultMap = mode === 'infection' ? 'kino_theater' : 'pripyat_block';
     const mapId = specialEvent
       ? specialEvent.config.mapId
@@ -1400,6 +1405,11 @@ async function startServer() {
       : req.body?.botDifficulty === 'recruit' || req.body?.botDifficulty === 'veteran'
         ? req.body.botDifficulty
         : 'tactical';
+    const killfeedPolicy = specialEvent
+      ? (specialEvent.config.killfeedPolicy ?? 'player_choice')
+      : req.body?.killfeedPolicy === 'force_on' || req.body?.killfeedPolicy === 'force_off'
+        ? req.body.killfeedPolicy
+        : 'player_choice';
 
     let code = generateLobbyCode();
     while (activeLobbyRooms.has(code)) {
@@ -1421,6 +1431,7 @@ async function startServer() {
         botCount,
         killLimit,
         botDifficulty,
+        killfeedPolicy,
         status: 'lobby',
         matchSequence: 0,
         specialEvent,
@@ -1798,6 +1809,7 @@ async function startServer() {
               if (
                 patch.mapId === 'pripyat_block' ||
                 patch.mapId === 'timberline_compound' ||
+                patch.mapId === 'korsakov_substation' ||
                 patch.mapId === 'kino_theater'
               ) {
                 st.mapId = patch.mapId;
@@ -1827,6 +1839,13 @@ async function startServer() {
               ) {
                 st.botDifficulty = patch.botDifficulty;
               }
+              if (
+                patch.killfeedPolicy === 'player_choice' ||
+                patch.killfeedPolicy === 'force_on' ||
+                patch.killfeedPolicy === 'force_off'
+              ) {
+                st.killfeedPolicy = patch.killfeedPolicy;
+              }
               if (st.specialEvent) {
                 st.specialEvent = {
                   ...st.specialEvent,
@@ -1840,6 +1859,7 @@ async function startServer() {
                     botCount: st.botCount,
                     killLimit: st.killLimit,
                     botDifficulty: st.botDifficulty,
+                    killfeedPolicy: st.killfeedPolicy,
                   }),
                 };
               }

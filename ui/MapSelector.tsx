@@ -20,37 +20,37 @@ const MapPreviewArtwork: React.FC<{
       <svg viewBox="0 0 320 130" className="h-full w-full" preserveAspectRatio="xMidYMid slice">
         <defs>
           <linearGradient id="pripyatBg" x1="0" y1="0" x2="1" y2="1">
-            <stop offset="0%" stopColor="#172028" />
-            <stop offset="100%" stopColor="#0c1014" />
+            <stop offset="0%" stopColor="#1b2b2c" />
+            <stop offset="100%" stopColor="#0d1314" />
           </linearGradient>
         </defs>
         <rect width="320" height="130" fill="url(#pripyatBg)" />
-        {/* Brutalist schematic floorplan & atrium */}
-        <g stroke="#4b647a" strokeWidth="1.5" fill="none" opacity="0.72">
-          <rect x="26" y="16" width="268" height="98" />
-          <rect x="112" y="16" width="96" height="98" stroke="#8cb6d6" />
-          <line x1="26" y1="65" x2="112" y2="65" />
-          <line x1="208" y1="65" x2="294" y2="65" />
-          {/* Stairwell treads */}
-          <path d="M126 30 H148 M126 36 H148 M126 42 H148 M126 48 H148" stroke="#d9a05b" />
-          <path d="M172 82 H194 M172 88 H194 M172 94 H194 M172 100 H194" stroke="#d9a05b" />
+        {/* U-shaped Soviet courtyard microdistrict + rusted vehicles & overgrown birch */}
+        <g stroke="#5c8a85" strokeWidth="1.5" fill="none" opacity="0.82">
+          <rect x="24" y="14" width="272" height="96" />
+          <rect x="24" y="14" width="68" height="96" fill="#233738" opacity="0.65" />
+          <rect x="228" y="14" width="68" height="96" fill="#233738" opacity="0.65" />
+          <rect x="92" y="14" width="136" height="32" fill="#283d3d" opacity="0.65" />
         </g>
-        {/* Pillars */}
-        <g fill="#7ba2bf" opacity="0.8">
-          <rect x="128" y="61" width="7" height="7" />
-          <rect x="185" y="61" width="7" height="7" />
-          <rect x="64" y="37" width="6" height="6" />
-          <rect x="248" y="85" width="6" height="6" />
+        {/* Overgrown courtyard trees & rusted cars */}
+        <g fill="#4f6d4a" opacity="0.85">
+          <circle cx="132" cy="74" r="9" />
+          <circle cx="188" cy="70" r="8" />
+          <circle cx="158" cy="86" r="7" />
+        </g>
+        <g fill="#8c5332" stroke="#d9a05b" strokeWidth="0.8">
+          <rect x="114" y="56" width="14" height="7" transform="rotate(-14 121 59)" />
+          <rect x="192" y="88" width="16" height="7" transform="rotate(11 200 91)" />
         </g>
         <text
-          x="34"
-          y="106"
-          fill="#9db8cc"
-          fontSize="9"
+          x="32"
+          y="122"
+          fill="#8cc4bd"
+          fontSize="8.5"
           fontFamily="IBM Plex Mono, monospace"
-          letterSpacing="1.6"
+          letterSpacing="1.4"
         >
-          SECTOR 04 // 2-FLOOR ATRIUM
+          PRIPYAT MICRODISTRICT · TEAL-AMBER DECAY
         </text>
       </svg>
     );
@@ -66,47 +66,92 @@ const MapPreviewArtwork: React.FC<{
           </linearGradient>
         </defs>
         <rect width="320" height="130" fill="url(#timberBg)" />
-        {/* Rolling contour rings */}
-        <g stroke="#3e5948" strokeWidth="1" fill="none" opacity="0.55">
-          <ellipse cx="160" cy="65" rx="145" ry="54" />
-          <ellipse cx="160" cy="65" rx="112" ry="42" />
-        </g>
-        {/* Compound perimeter wall */}
-        <rect
-          x="76"
-          y="26"
-          width="168"
-          height="78"
+        {/* River winding across valley */}
+        <path
+          d="M0 94 Q80 78 156 96 T320 82"
           fill="none"
-          stroke="#7aa384"
-          strokeWidth="1.6"
-          strokeDasharray="18 6"
+          stroke="#3b6e82"
+          strokeWidth="10"
+          opacity="0.65"
         />
-        {/* 3 Wooden Cabins + Watchtower */}
-        <g fill="#4f6d58" stroke="#b9d6be" strokeWidth="1">
-          <rect x="92" y="38" width="38" height="22" />
-          <rect x="186" y="36" width="42" height="24" />
-          <rect x="128" y="72" width="46" height="22" />
-          <rect x="206" y="78" width="14" height="14" fill="#d97736" stroke="#f5c878" />
+        {/* Airstrip with parallel edge lights */}
+        <rect x="150" y="20" width="138" height="22" fill="#252c2b" stroke="#6c7b77" strokeWidth="1" />
+        <g fill="#f5b942">
+          <circle cx="160" cy="22" r="1.4" />
+          <circle cx="185" cy="22" r="1.4" />
+          <circle cx="210" cy="22" r="1.4" />
+          <circle cx="235" cy="22" r="1.4" />
+          <circle cx="260" cy="22" r="1.4" />
+          <circle cx="160" cy="40" r="1.4" />
+          <circle cx="185" cy="40" r="1.4" />
+          <circle cx="210" cy="40" r="1.4" />
+          <circle cx="235" cy="40" r="1.4" />
+          <circle cx="260" cy="40" r="1.4" />
         </g>
-        {/* Pine tree clusters */}
-        <g fill="#2d4c36" opacity="0.9">
-          <circle cx="38" cy="34" r="9" />
-          <circle cx="54" cy="48" r="7" />
-          <circle cx="42" cy="88" r="10" />
-          <circle cx="276" cy="36" r="10" />
-          <circle cx="288" cy="84" r="9" />
-          <circle cx="264" cy="96" r="7" />
+        {/* Military base, helipad, radar, villages */}
+        <g fill="#4f6d58" stroke="#b9d6be" strokeWidth="1">
+          <rect x="42" y="26" width="24" height="16" />
+          <rect x="74" y="32" width="22" height="15" />
+          <rect x="164" y="54" width="32" height="16" />
+          <rect x="204" y="54" width="32" height="16" />
+          <circle cx="256" cy="64" r="10" fill="#2e3836" stroke="#f5c878" />
         </g>
         <text
-          x="34"
-          y="108"
+          x="26"
+          y="122"
           fill="#9abca2"
-          fontSize="9"
+          fontSize="8.5"
           fontFamily="IBM Plex Mono, monospace"
-          letterSpacing="1.6"
+          letterSpacing="1.3"
         >
-          PERIMETER // 3 CABINS · WATCHTOWER
+          VALLEY · AIRSTRIP · HELIPAD · RADAR · BUNKER
+        </text>
+      </svg>
+    );
+  }
+
+  if (style === 'korsakov_substation') {
+    return (
+      <svg viewBox="0 0 320 130" className="h-full w-full" preserveAspectRatio="xMidYMid slice">
+        <defs>
+          <linearGradient id="korsakovBg" x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0%" stopColor="#1c2229" />
+            <stop offset="100%" stopColor="#0b0f14" />
+          </linearGradient>
+        </defs>
+        <rect width="320" height="130" fill="url(#korsakovBg)" />
+        {/* Industrial slate turbine hall + transformer bays */}
+        <g stroke="#64748b" strokeWidth="1.4" fill="none">
+          <rect x="24" y="18" width="170" height="84" fill="#161c24" />
+          <rect x="204" y="18" width="92" height="84" strokeDasharray="6 4" />
+        </g>
+        {/* Three colossal turbine drums + sodium-vapor glow */}
+        <g fill="#26303d" stroke="#f59e0b" strokeWidth="1.2">
+          <circle cx="62" cy="60" r="16" />
+          <circle cx="108" cy="60" r="16" />
+          <circle cx="154" cy="60" r="16" />
+        </g>
+        {/* Blue emergency exit beacons */}
+        <g fill="#38bdf8">
+          <rect x="24" y="54" width="4" height="12" />
+          <rect x="190" y="24" width="4" height="12" />
+          <rect x="190" y="84" width="4" height="12" />
+        </g>
+        {/* Outdoor transformer gantries */}
+        <g stroke="#94a3b8" strokeWidth="1.2">
+          <rect x="220" y="30" width="24" height="18" fill="#1e293b" />
+          <rect x="256" y="30" width="24" height="18" fill="#1e293b" />
+          <rect x="220" y="70" width="60" height="20" fill="#1e293b" />
+        </g>
+        <text
+          x="26"
+          y="122"
+          fill="#93c5fd"
+          fontSize="8.5"
+          fontFamily="IBM Plex Mono, monospace"
+          letterSpacing="1.3"
+        >
+          INDUSTRIAL SLATE · SODIUM-VAPOR · BLUE EXITS
         </text>
       </svg>
     );
@@ -117,43 +162,38 @@ const MapPreviewArtwork: React.FC<{
       <svg viewBox="0 0 320 130" className="h-full w-full" preserveAspectRatio="xMidYMid slice">
         <defs>
           <radialGradient id="kinoGlow" cx="50%" cy="22%" r="72%">
-            <stop offset="0%" stopColor="#5c161b" />
-            <stop offset="65%" stopColor="#1b090c" />
-            <stop offset="100%" stopColor="#090405" />
+            <stop offset="0%" stopColor="#1e4a3d" />
+            <stop offset="65%" stopColor="#0f1f1c" />
+            <stop offset="100%" stopColor="#070d0d" />
           </radialGradient>
         </defs>
         <rect width="320" height="130" fill="url(#kinoGlow)" />
-        {/* Theater auditorium schematic: Stage -> Sloped Rows -> Lobby -> Projector */}
-        <g stroke="#b8383f" strokeWidth="1.4" fill="none" opacity="0.85">
-          {/* Outer wings */}
-          <rect x="34" y="16" width="252" height="98" stroke="#6e2228" />
-          {/* Main auditorium */}
-          <rect x="86" y="16" width="148" height="66" />
-          {/* Lobby */}
-          <rect x="86" y="82" width="148" height="32" stroke="#d9a05b" />
-          {/* Stage proscenium */}
-          <rect x="102" y="20" width="116" height="16" fill="#3a1116" stroke="#e05252" />
+        {/* Art-Deco Noir Emerald & Brass Theater Schematic */}
+        <g stroke="#b89448" strokeWidth="1.4" fill="none" opacity="0.88">
+          <rect x="34" y="16" width="252" height="94" stroke="#356859" />
+          <rect x="86" y="16" width="148" height="62" />
+          <rect x="86" y="78" width="148" height="32" stroke="#d4af5f" />
+          <rect x="102" y="20" width="116" height="15" fill="#18382f" stroke="#d4af5f" />
         </g>
-        {/* Auditorium seat rows */}
-        <g stroke="#99282f" strokeWidth="2.5" opacity="0.8">
-          <line x1="108" y1="46" x2="148" y2="46" />
-          <line x1="172" y1="46" x2="212" y2="46" />
-          <line x1="108" y1="56" x2="148" y2="56" />
-          <line x1="172" y1="56" x2="212" y2="56" />
-          <line x1="108" y1="66" x2="148" y2="66" />
-          <line x1="172" y1="66" x2="212" y2="66" />
+        <g stroke="#34725f" strokeWidth="2.5" opacity="0.85">
+          <line x1="108" y1="45" x2="148" y2="45" />
+          <line x1="172" y1="45" x2="212" y2="45" />
+          <line x1="108" y1="55" x2="148" y2="55" />
+          <line x1="172" y1="55" x2="212" y2="55" />
+          <line x1="108" y1="65" x2="148" y2="65" />
+          <line x1="172" y1="65" x2="212" y2="65" />
         </g>
-        {/* Projector cone beam */}
-        <polygon points="154,82 166,82 194,24 126,24" fill="#f5b942" opacity="0.11" />
+        {/* Warm amber projector cone beam */}
+        <polygon points="154,78 166,78 194,24 126,24" fill="#f5b942" opacity="0.16" />
         <text
-          x="42"
-          y="108"
-          fill="#d9898d"
-          fontSize="9"
+          x="38"
+          y="122"
+          fill="#a7d9c6"
+          fontSize="8.5"
           fontFamily="IBM Plex Mono, monospace"
-          letterSpacing="1.6"
+          letterSpacing="1.3"
         >
-          5 ZONES // LOBBY · STAGE · BOOTH
+          ART-DECO NOIR · STAGE · PROJECTION BOOTH
         </text>
       </svg>
     );

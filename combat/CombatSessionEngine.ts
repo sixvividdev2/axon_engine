@@ -55,6 +55,9 @@ import {
   TacticalBeltSlot,
   TacticalEquipmentId,
 } from '../data/tacticalEquipment';
+import { getGraphicsQualityProfile, graphicsQualityStore } from '../data/graphicsQuality';
+import { killfeedPreferenceStore } from '../data/killfeedSettings';
+import { loadoutStore } from '../data/loadoutStore';
 import { SaveManager } from '../engine/persistence/SaveManager';
 import { getMapDefinitionById } from '../maps/MapRegistry';
 import {
@@ -417,8 +420,13 @@ export class CombatSessionEngine {
     const width = Math.max(1, container.clientWidth);
     const height = Math.max(1, container.clientHeight);
 
+    const activeQuality = graphicsQualityStore.getQuality();
+    const qProfile = getGraphicsQualityProfile(activeQuality);
+    this.config.graphicsQuality = activeQuality;
+    this.config.showKillfeed = killfeedPreferenceStore.getEnabled();
+
     this.renderer = new THREE.WebGLRenderer({
-      antialias: false,
+      antialias: qProfile.antialias,
       powerPreference: 'high-performance',
       stencil: false,
     });
@@ -429,10 +437,10 @@ export class CombatSessionEngine {
     this.isSoftwareGl = /swiftshader|llvmpipe|software/i.test(glRenderer);
 
     this.renderer.setPixelRatio(
-      this.isSoftwareGl ? 1 : Math.min(window.devicePixelRatio || 1, 2),
+      this.isSoftwareGl ? 1 : Math.min(window.devicePixelRatio || 1, qProfile.maxDpr),
     );
     this.renderer.setSize(width, height);
-    this.renderer.shadowMap.enabled = !this.isSoftwareGl;
+    this.renderer.shadowMap.enabled = !this.isSoftwareGl && qProfile.castShadows;
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     this.renderer.toneMapping = THREE.NoToneMapping;
     this.renderer.domElement.style.display = 'block';
@@ -441,14 +449,15 @@ export class CombatSessionEngine {
     container.appendChild(this.renderer.domElement);
 
     this.scene = new THREE.Scene();
-    this.camera = new THREE.PerspectiveCamera(72, width / height, 0.05, 190);
+    // Near plane >= 0.08m improves depth-buffer precision & prevents z-fighting across large open valleys
+    this.camera = new THREE.PerspectiveCamera(72, width / height, 0.08, 360);
     this.scene.add(this.camera);
 
-    // Resolve and build selected map
+    // Resolve and build selected map with selected Graphics Quality tier
     const mapId =
       params.mode === 'battle' ? params.battleConfig.mapId : params.infectionConfig.mapId;
     const mapDef = getMapDefinitionById(mapId) ?? getMapDefinitionById('pripyat_block')!;
-    this.map = mapDef.build(this.scene, this.renderer, this.isSoftwareGl);
+    this.map = mapDef.build(this.scene, this.renderer, this.isSoftwareGl, activeQuality);
 
     // Audio
     this.audio = new BodycamAudio();
@@ -667,12 +676,21 @@ export class CombatSessionEngine {
       laserOffset: [...defaultProf.laserOffset],
     };
 
-    // Restore saved Gunsmith attachments from PLAYGROUND
+    // Restore saved Gunsmith attachments from PLAYGROUND and active Unified Loadout slot
     const savedLoadout = this.saveManager.loadGymLoadout();
     if (savedLoadout) {
       for (const [wId, att] of Object.entries(savedLoadout)) {
         this.attachmentsByWeapon[wId] = normalizeWeaponAttachments(wId, att);
       }
+    }
+    const activeUnifiedSlot = loadoutStore.getActiveSlot();
+    for (const [wId, build] of Object.entries(activeUnifiedSlot.weaponBuilds)) {
+      this.attachmentsByWeapon[wId] = normalizeWeaponAttachments(wId, {
+        ...build.attachments,
+        selectedAmmoId: build.ammoVariantId,
+        zeroDistanceM: build.zeroDistanceM,
+        zeroElevationMrad: build.zeroElevationMrad,
+      });
     }
 
     // Configure starting loadout per mode
@@ -1303,6 +1321,24 @@ export class CombatSessionEngine {
       const pkt = raw as unknown as GameZombieKilledPacket;
       this._tmpImpactPoint.set(pkt.px, pkt.py, pkt.pz);
       this.zombieAI.playVisualDeath(pkt.zombieId, this._tmpImpactPoint);
+      const killerMember = this.mp.members.find((m) => m.userId === pkt.killerUserId);
+      const killerName =
+        pkt.killerUserId === this.mp.localUserId
+          ? this.mp.localUsername
+          : (killerMember?.username ?? 'SURVIVOR');
+      const weaponLabel = pkt.melee
+        ? 'MELEE'
+        : pkt.weaponId
+          ? resolveWeaponProfile(pkt.weaponId).name
+          : 'WEAPON';
+      this.pushMpKillfeed({
+        killerName,
+        killerTeam: 'A',
+        victimName: 'INFECTED',
+        victimTeam: 'B',
+        headshot: Boolean(pkt.headshot),
+        weaponLabel,
+      });
       if (pkt.killerUserId === this.mp.localUserId) {
         this.hitmarkerTimer = 0.28;
         this.hitmarkerHeadshot = pkt.headshot;
@@ -1564,6 +1600,18 @@ export class CombatSessionEngine {
 
   public updateConfig(patch: Partial<BodycamSDKConfig>): void {
     this.config = { ...this.config, ...patch };
+    if (typeof patch.showKillfeed === 'boolean') {
+      killfeedPreferenceStore.setEnabled(patch.showKillfeed);
+    }
+    if (patch.graphicsQuality) {
+      graphicsQualityStore.setQuality(patch.graphicsQuality);
+      const qProfile = getGraphicsQualityProfile(patch.graphicsQuality);
+      this.renderer.setPixelRatio(
+        this.isSoftwareGl ? 1 : Math.min(window.devicePixelRatio || 1, qProfile.maxDpr),
+      );
+      this.renderer.shadowMap.enabled = !this.isSoftwareGl && qProfile.castShadows;
+      this.renderer.shadowMap.needsUpdate = true;
+    }
     this.audio.setSettings(
       this.config.micClippingDrive,
       this.config.masterVolume,
@@ -1824,6 +1872,14 @@ export class CombatSessionEngine {
         this.hitmarkerKill = res.kills > 0;
         if (res.kills > 0) {
           this.playerKills += res.kills;
+          this.pushMpKillfeed({
+            killerName: this.mp?.localUsername ?? 'YOU',
+            killerTeam: 'A',
+            victimName: res.kills > 1 ? `INFECTED ×${res.kills}` : 'INFECTED',
+            victimTeam: 'B',
+            headshot: false,
+            weaponLabel: ev.def.killfeedLabel,
+          });
         }
         if (res.pointsAwarded > 0) {
           this.addPoints(
@@ -2086,6 +2142,14 @@ export class CombatSessionEngine {
           this.playerKills += 1;
           this.recordWeaponKill(this._runtimeProfile.id);
           if (res.headshot) this.playerHeadshots += 1;
+          this.pushMpKillfeed({
+            killerName: this.mp?.localUsername ?? 'YOU',
+            killerTeam: 'A',
+            victimName: 'INFECTED',
+            victimTeam: 'B',
+            headshot: res.headshot,
+            weaponLabel: this._runtimeProfile.name,
+          });
           if (this.mp) {
             const killedPkt: GameZombieKilledPacket = {
               type: 'game:zombie_killed',
@@ -2197,6 +2261,14 @@ export class CombatSessionEngine {
         }
         if (res.killed) {
           this.playerKills += 1;
+          this.pushMpKillfeed({
+            killerName: this.mp?.localUsername ?? 'YOU',
+            killerTeam: 'A',
+            victimName: 'INFECTED',
+            victimTeam: 'B',
+            headshot: false,
+            weaponLabel: isKick ? 'PUSH-KICK' : 'MELEE',
+          });
           if (this.mp) {
             const killedPkt: GameZombieKilledPacket = {
               type: 'game:zombie_killed',
@@ -2351,6 +2423,14 @@ export class CombatSessionEngine {
         }
         this.checkBattleVictory();
       } else if (this.params.mode === 'infection') {
+        this.pushMpKillfeed({
+          killerName: attackerLabel,
+          killerTeam: 'B',
+          victimName: this.mp?.localUsername ?? 'YOU',
+          victimTeam: 'A',
+          headshot: false,
+          weaponLabel: attackerLabel === 'INFECTED' ? 'CLAW' : attackerLabel,
+        });
         const aliveTeammates = this.remotePlayers?.getAliveHumanTargets() ?? [];
         if (this.mp && aliveTeammates.length > 0) {
           this.spectating = true;

@@ -1,10 +1,27 @@
 import * as THREE from 'three';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import { BodycamPhysicsWorld, BodycamSurfaceMaterial } from '../bodycam-sdk';
+import { getGraphicsQualityProfile, GraphicsQualityId } from '../data/graphicsQuality';
+import { createStencilSignTexture } from '../gym/GymTextures';
 import {
+  buildArmoryWeaponRack,
+  buildInstancedGrassTufts,
+  buildOfficeDesk,
+  buildRadarTower,
+  buildRealisticHelicopterProp,
+  buildRustedVehicle,
+  PropFactoryContext,
+  VehicleMaterials,
+} from './MapPropFactory';
+import {
+  createAsphaltRoadTexture,
   createCabinWoodTexture,
   createCorrugatedMetalTexture,
   createForestFloorTexture,
+  createIndustrialSlateConcreteTexture,
+  createRiverWaterTexture,
+  createRunwayAsphaltTexture,
+  createRustedMetalTexture,
   createSovietConcreteTexture,
 } from './MapTextures';
 import {
@@ -17,16 +34,16 @@ import {
 } from './types';
 
 const LIGHTING_PRESET: MapLightingPreset = {
-  backgroundHex: 0x7e8d91,
-  fogHex: 0x79878b,
-  fogDensity: 0.0145,
-  envIntensity: 0.56,
-  hemiSkyHex: 0xb6c8ce,
-  hemiGroundHex: 0x353c2e,
-  hemiIntensity: 0.92,
-  keyLightHex: 0xe8efe6,
-  keyLightIntensity: 1.95,
-  keyLightPos: [-32, 42, 26],
+  backgroundHex: 0x829197,
+  fogHex: 0x7b8a90,
+  fogDensity: 0.0052, // wider visibility for massive open forest valley & airstrip
+  envIntensity: 0.58,
+  hemiSkyHex: 0xbed0d6,
+  hemiGroundHex: 0x353d2e,
+  hemiIntensity: 0.95,
+  keyLightHex: 0xf0f4ea,
+  keyLightIntensity: 2.0,
+  keyLightPos: [-60, 82, 48],
 };
 
 function seededRand(seed: number): () => number {
@@ -37,35 +54,87 @@ function seededRand(seed: number): () => number {
   };
 }
 
+/** Winding alpine river centerline X as a function of Z */
+function getRiverCenterX(z: number): number {
+  return -24.0 + Math.sin(z * 0.026) * 9.5 + Math.cos(z * 0.013) * 3.5;
+}
+
 /**
- * Smooth outdoor elevation function:
- * Flat (Y = 0) across the fenced compound footprint (|x| < 26, |z| < 24) so cabins, walls,
- * and containers ground flush with zero floating, rising softly into wooded ridges outside.
+ * Visual heightfield for the massive 340m x 340m Timberline Forest Valley:
+ * - Perfectly flat (Y = 0) across the Military Base compound (X in [4, 102], Z in [-68, 64])
+ *   and across both village clearings and lone cabin pads so every structure sits 100% flush.
+ * - Carves a smooth riverbed channel along getRiverCenterX(z) down to Y = -1.65m.
+ * - Gently rolls into natural wooded mountain ridges past |x|,|z| > 108m (no artificial box walls!).
  */
-function sampleForestTerrainY(x: number, z: number): number {
-  const edgeX = Math.max(0, Math.abs(x) - 27.5);
-  const edgeZ = Math.max(0, Math.abs(z) - 25.5);
-  const blend = THREE.MathUtils.clamp(Math.hypot(edgeX, edgeZ) / 14.0, 0, 1);
-  if (blend <= 0.001) return 0;
-  const smooth = blend * blend * (3 - 2 * blend);
-  const ridge =
-    Math.sin(x * 0.085) * Math.cos(z * 0.09) * 1.15 +
-    Math.sin((x + z) * 0.05) * 0.75 +
-    Math.min(3.5, Math.hypot(edgeX, edgeZ) * 0.085);
-  return Math.max(0, ridge * smooth);
+function sampleVisualTerrainY(x: number, z: number): number {
+  // 1. River channel carve
+  const riverX = getRiverCenterX(z);
+  const distRiver = Math.abs(x - riverX);
+  let riverCarve = 0;
+  if (distRiver < 10.5) {
+    const t = THREE.MathUtils.clamp((distRiver - 4.2) / 6.3, 0, 1);
+    const smooth = t * t * (3 - 2 * t);
+    riverCarve = -1.65 * (1 - smooth);
+  }
+
+  // 2. Keep Military Base, Highway, Villages & Lone Cabins level (Y = 0)
+  const inMilBase = x >= 2 && x <= 104 && z >= -68 && z <= 64;
+  const inHighway = Math.abs(x - -2) <= 7.5 && Math.abs(z) <= 115;
+  const inVillageNW = x >= -86 && x <= -36 && z >= -82 && z <= -36;
+  const inVillageSW = x >= -88 && x <= -38 && z >= 34 && z <= 84;
+  const nearLoneCabin =
+    (Math.hypot(x - 78, z - -84) < 12) ||
+    (Math.hypot(x - -96, z - 4) < 12) ||
+    (Math.hypot(x - 84, z - 82) < 12);
+
+  if (inMilBase || inHighway || inVillageNW || inVillageSW || nearLoneCabin) {
+    return riverCarve;
+  }
+
+  // 3. Gentle forest undulations inside playable valley + dramatic mountain ridges around perimeter
+  const edgeX = Math.max(0, Math.abs(x) - 104);
+  const edgeZ = Math.max(0, Math.abs(z) - 104);
+  const outerDist = Math.hypot(edgeX, edgeZ);
+  const outerBlend = THREE.MathUtils.clamp(outerDist / 28.0, 0, 1);
+  const outerSmooth = outerBlend * outerBlend * (3 - 2 * outerBlend);
+
+  const valleyRoll =
+    (Math.sin(x * 0.045) * Math.cos(z * 0.048) * 1.1 + Math.sin((x - z) * 0.03) * 0.7) *
+    THREE.MathUtils.clamp((distRiver - 8.5) / 8.0, 0, 1);
+
+  const ridgeH =
+    outerSmooth *
+    (6.5 + Math.sin(x * 0.04) * 3.0 + Math.cos(z * 0.042) * 3.0 + Math.min(18, outerDist * 0.32));
+
+  return riverCarve + Math.max(0, valleyRoll * 0.45) + ridgeH;
+}
+
+/**
+ * Physics ground height query: returns -10.0 over the Underground Bunker footprint
+ * so the player & bots can walk DOWN into the bunker at Y = -3.6m without terrain clamping
+ * them back to Y = 0, while the solid concrete bunker roof collider supports walking on top at Y = 0!
+ */
+function samplePhysicsTerrainY(x: number, z: number): number {
+  if (x >= 42.6 && x <= 62.4 && z >= -16.4 && z <= 4.4) {
+    return -10.0;
+  }
+  return sampleVisualTerrainY(x, z);
 }
 
 function buildTimberlineCompound(
   scene: THREE.Scene,
   renderer: THREE.WebGLRenderer,
   isSoftwareGl: boolean,
+  graphicsQuality?: GraphicsQualityId,
 ): BuiltMapInstance {
+  const qProfile = getGraphicsQualityProfile(graphicsQuality);
+
   const physics = new BodycamPhysicsWorld();
-  physics.baseFloorY = 0;
-  physics.boundsMinX = -42;
-  physics.boundsMaxX = 42;
-  physics.boundsMinZ = -42;
-  physics.boundsMaxZ = 42;
+  physics.baseFloorY = -4.5; // Allow subterranean bunker floor at Y = -3.6m!
+  physics.boundsMinX = -114;
+  physics.boundsMaxX = 114;
+  physics.boundsMinZ = -114;
+  physics.boundsMaxZ = 114;
 
   const sceneGroup = new THREE.Group();
   scene.add(sceneGroup);
@@ -89,12 +158,15 @@ function buildTimberlineCompound(
   };
 
   scene.background = new THREE.Color(LIGHTING_PRESET.backgroundHex);
-  scene.fog = new THREE.FogExp2(LIGHTING_PRESET.fogHex, LIGHTING_PRESET.fogDensity);
+  scene.fog = new THREE.FogExp2(
+    LIGHTING_PRESET.fogHex,
+    LIGHTING_PRESET.fogDensity * qProfile.fogDensityScale,
+  );
 
   const pmrem = new THREE.PMREMGenerator(renderer);
   const envTex = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
   scene.environment = envTex;
-  scene.environmentIntensity = LIGHTING_PRESET.envIntensity;
+  scene.environmentIntensity = LIGHTING_PRESET.envIntensity * qProfile.envIntensityScale;
   pmrem.dispose();
 
   const hemi = new THREE.HemisphereLight(
@@ -109,41 +181,61 @@ function buildTimberlineCompound(
     LIGHTING_PRESET.keyLightIntensity,
   );
   sun.position.set(...LIGHTING_PRESET.keyLightPos);
-  if (!isSoftwareGl) {
+  if (!isSoftwareGl && qProfile.castShadows) {
     sun.castShadow = true;
-    sun.shadow.mapSize.set(2048, 2048);
-    sun.shadow.camera.near = 2;
-    sun.shadow.camera.far = 115;
-    sun.shadow.camera.left = -46;
-    sun.shadow.camera.right = 46;
-    sun.shadow.camera.top = 46;
-    sun.shadow.camera.bottom = -46;
+    const sm = Math.min(2048, qProfile.shadowMapSize);
+    sun.shadow.mapSize.set(sm, sm);
+    sun.shadow.camera.near = 4;
+    sun.shadow.camera.far = 260;
+    sun.shadow.camera.left = -120;
+    sun.shadow.camera.right = 120;
+    sun.shadow.camera.top = 120;
+    sun.shadow.camera.bottom = -120;
     sun.shadow.bias = -0.0005;
-    sun.shadow.normalBias = 0.02;
+    sun.shadow.normalBias = 0.03;
   }
   sceneGroup.add(sun);
 
-  const maxAniso = renderer.capabilities.getMaxAnisotropy();
-  const forestTex = trackTex(createForestFloorTexture(maxAniso, 22, 22));
+  const maxAniso = Math.min(qProfile.anisotropyCap, renderer.capabilities.getMaxAnisotropy() || 4);
+
+  // Textures
+  const forestTex = trackTex(createForestFloorTexture(maxAniso, 36, 36));
   const cabinWoodTex = trackTex(createCabinWoodTexture(maxAniso, 2, 1, '#614833', 707));
   const cabinFloorTex = trackTex(createCabinWoodTexture(maxAniso, 3, 2, '#4a3727', 719));
-  const concTex = trackTex(createSovietConcreteTexture(maxAniso, 2, 1, '#7a7e7b', 733));
-  const containerBlueTex = trackTex(createCorrugatedMetalTexture(maxAniso, '#3e5361', 745));
-  const containerOliveTex = trackTex(createCorrugatedMetalTexture(maxAniso, '#4b5742', 751));
-  const containerRustTex = trackTex(createCorrugatedMetalTexture(maxAniso, '#6b4132', 763));
+  const concTex = trackTex(createSovietConcreteTexture(maxAniso, 3, 2, '#7b7f7c', 733));
+  const bunkerConcTex = trackTex(createIndustrialSlateConcreteTexture(maxAniso, 3, 2, '#4c5256', 739));
+  const roadAsphaltTex = trackTex(createAsphaltRoadTexture(maxAniso, 2, 24, false, 741));
+  const runwayTex = trackTex(createRunwayAsphaltTexture(maxAniso, 2, 14));
+  const riverTex = trackTex(createRiverWaterTexture(maxAniso, 2, 24));
+  const garageMetalTex = trackTex(createCorrugatedMetalTexture(maxAniso, '#455148', 751));
+  const rustOliveTex = trackTex(createRustedMetalTexture(maxAniso, '#485442', 761));
+  const rustBlueTex = trackTex(createRustedMetalTexture(maxAniso, '#3c5261', 762));
+  const pureRustTex = trackTex(createRustedMetalTexture(maxAniso, '#6b3e26', 763));
 
+  // Materials
   const matTerrain = trackMat(
     new THREE.MeshStandardMaterial({ map: forestTex, roughness: 0.96, metalness: 0.02 }),
   );
-  const matGravel = trackMat(
-    new THREE.MeshStandardMaterial({
-      color: 0x5d5c55,
-      roughness: 0.95,
-      metalness: 0.02,
-      polygonOffset: true,
-      polygonOffsetFactor: -2,
-      polygonOffsetUnits: -4,
-    }),
+  const matRoad = trackMat(
+    new THREE.MeshStandardMaterial({ map: roadAsphaltTex, roughness: 0.9, metalness: 0.03 }),
+  );
+  const matDirtPath = trackMat(
+    new THREE.MeshStandardMaterial({ color: 0x5c4f3d, roughness: 0.97, metalness: 0.01 }),
+  );
+  const matRunway = trackMat(
+    new THREE.MeshStandardMaterial({ map: runwayTex, roughness: 0.86, metalness: 0.04 }),
+  );
+  const matRunwayPaint = trackMat(
+    new THREE.MeshStandardMaterial({ color: 0xd9dad5, roughness: 0.82, metalness: 0.02 }),
+  );
+  const matYellowPaint = trackMat(
+    new THREE.MeshStandardMaterial({ color: 0xdca437, roughness: 0.75, metalness: 0.05 }),
+  );
+  const matBaseConcrete = trackMat(
+    new THREE.MeshStandardMaterial({ map: concTex, roughness: 0.91, metalness: 0.04 }),
+  );
+  const matBunkerConcrete = trackMat(
+    new THREE.MeshStandardMaterial({ map: bunkerConcTex, roughness: 0.88, metalness: 0.08 }),
   );
   const matWood = trackMat(
     new THREE.MeshStandardMaterial({ map: cabinWoodTex, roughness: 0.88, metalness: 0.03 }),
@@ -152,17 +244,20 @@ function buildTimberlineCompound(
     new THREE.MeshStandardMaterial({ map: cabinFloorTex, roughness: 0.85, metalness: 0.03 }),
   );
   const matRoof = trackMat(
-    new THREE.MeshStandardMaterial({ color: 0x35393c, roughness: 0.72, metalness: 0.35 }),
+    new THREE.MeshStandardMaterial({ color: 0x353b3e, roughness: 0.72, metalness: 0.36 }),
   );
-  const matConcrete = trackMat(
-    new THREE.MeshStandardMaterial({ map: concTex, roughness: 0.92, metalness: 0.04 }),
+  const matGarageMetal = trackMat(
+    new THREE.MeshStandardMaterial({ map: garageMetalTex, roughness: 0.68, metalness: 0.44 }),
   );
-  const matFencePost = trackMat(
-    new THREE.MeshStandardMaterial({ color: 0x454a4d, roughness: 0.55, metalness: 0.68 }),
+  const matSteel = trackMat(
+    new THREE.MeshStandardMaterial({ color: 0x3f464a, roughness: 0.52, metalness: 0.72 }),
+  );
+  const matGunMetal = trackMat(
+    new THREE.MeshStandardMaterial({ color: 0x24272a, roughness: 0.44, metalness: 0.82 }),
   );
   const matFenceMesh = trackMat(
     new THREE.MeshStandardMaterial({
-      color: 0x596266,
+      color: 0x5d676b,
       roughness: 0.6,
       metalness: 0.65,
       transparent: true,
@@ -170,50 +265,66 @@ function buildTimberlineCompound(
       side: THREE.DoubleSide,
     }),
   );
-  const matBark = trackMat(
-    new THREE.MeshStandardMaterial({ color: 0x473526, roughness: 0.95, metalness: 0.02 }),
+  const matRiver = trackMat(
+    new THREE.MeshStandardMaterial({
+      map: riverTex,
+      roughness: 0.24,
+      metalness: 0.32,
+      transparent: true,
+      opacity: 0.84,
+    }),
   );
-  const matPineNeedles = trackMat(
-    new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.88, metalness: 0.02 }),
+  const matBark = trackMat(new THREE.MeshStandardMaterial({ color: 0x463426, roughness: 0.95 }));
+  const matPineNeedles = trackMat(new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.88 }));
+  const matRock = trackMat(new THREE.MeshStandardMaterial({ color: 0x5c6160, roughness: 0.94 }));
+  const matRunwayBulb = trackMat(
+    new THREE.MeshStandardMaterial({ color: 0xffefc2, emissive: 0xf7c96b, emissiveIntensity: 2.8, roughness: 0.15 }),
   );
-  const matRock = trackMat(
-    new THREE.MeshStandardMaterial({ color: 0x595e5c, roughness: 0.94, metalness: 0.04 }),
+  const matThresholdGreen = trackMat(
+    new THREE.MeshStandardMaterial({ color: 0x4ade80, emissive: 0x22c55e, emissiveIntensity: 2.6, roughness: 0.15 }),
   );
-  const matContBlue = trackMat(
-    new THREE.MeshStandardMaterial({ map: containerBlueTex, roughness: 0.65, metalness: 0.45 }),
+  const matBunkerStrip = trackMat(
+    new THREE.MeshStandardMaterial({ color: 0xdff5ff, emissive: 0x93d8f8, emissiveIntensity: 2.0, roughness: 0.2 }),
   );
-  const matContOlive = trackMat(
-    new THREE.MeshStandardMaterial({ map: containerOliveTex, roughness: 0.68, metalness: 0.42 }),
-  );
-  const matContRust = trackMat(
-    new THREE.MeshStandardMaterial({ map: containerRustTex, roughness: 0.72, metalness: 0.38 }),
+  const matWindsock = trackMat(
+    new THREE.MeshStandardMaterial({ color: 0xe66524, roughness: 0.75, side: THREE.DoubleSide }),
   );
 
-  // === 1. Rolling Outdoor Forest Terrain (180m x 180m fading cleanly into fog) ===
-  const terrainGeo = trackGeo(new THREE.PlaneGeometry(180, 180, 64, 64));
-  terrainGeo.rotateX(-Math.PI * 0.5);
-  const posAttr = terrainGeo.attributes.position;
-  for (let i = 0; i < posAttr.count; i++) {
-    const vx = posAttr.getX(i);
-    const vz = posAttr.getZ(i);
-    posAttr.setY(i, sampleForestTerrainY(vx, vz));
-  }
-  terrainGeo.computeVertexNormals();
-  const terrainMesh = new THREE.Mesh(terrainGeo, matTerrain);
-  terrainMesh.receiveShadow = !isSoftwareGl;
-  terrainMesh.userData.surfaceMaterial = 'grass';
-  sceneGroup.add(terrainMesh);
-  raycastMeshes.push(terrainMesh);
+  const baseVehMats = {
+    rust: trackMat(new THREE.MeshStandardMaterial({ map: pureRustTex, roughness: 0.82, metalness: 0.38 })),
+    tire: trackMat(new THREE.MeshStandardMaterial({ color: 0x1a1c1d, roughness: 0.95 })),
+    rim: trackMat(new THREE.MeshStandardMaterial({ color: 0x614b39, roughness: 0.72, metalness: 0.45 })),
+    darkInterior: trackMat(new THREE.MeshStandardMaterial({ color: 0x151718, roughness: 0.95 })),
+    glass: trackMat(
+      new THREE.MeshStandardMaterial({
+        color: 0x283b42,
+        roughness: 0.2,
+        metalness: 0.6,
+        transparent: true,
+        opacity: 0.45,
+      }),
+    ),
+    chrome: trackMat(new THREE.MeshStandardMaterial({ color: 0x7f786d, roughness: 0.45, metalness: 0.65 })),
+  };
+  const vehOlive: VehicleMaterials = {
+    ...baseVehMats,
+    body: trackMat(new THREE.MeshStandardMaterial({ map: rustOliveTex, roughness: 0.74, metalness: 0.34 })),
+  };
+  const vehBlue: VehicleMaterials = {
+    ...baseVehMats,
+    body: trackMat(new THREE.MeshStandardMaterial({ map: rustBlueTex, roughness: 0.74, metalness: 0.34 })),
+  };
 
-  // Compound compacted gravel yard pad (offset +0.025m to prevent Z-fighting)
-  const yardPad = new THREE.Mesh(trackGeo(new THREE.PlaneGeometry(50, 46)), matGravel);
-  yardPad.rotation.x = -Math.PI * 0.5;
-  yardPad.position.y = 0.025;
-  yardPad.receiveShadow = !isSoftwareGl;
-  yardPad.userData.surfaceMaterial = 'gravel';
-  sceneGroup.add(yardPad);
-  raycastMeshes.push(yardPad);
-  physics.addSurfaceZone({ minX: -25, maxX: 25, minZ: -23, maxZ: 23, surface: 'gravel' });
+  const propCtx: PropFactoryContext = {
+    sceneGroup,
+    physics,
+    raycastMeshes,
+    isSoftwareGl,
+    trackGeo,
+    trackMat,
+  };
+
+  const dummy = new THREE.Object3D();
 
   const addSolidBox = (
     x: number,
@@ -224,11 +335,12 @@ function buildTimberlineCompound(
     d: number,
     mat: THREE.Material,
     surface: BodycamSurfaceMaterial = 'concrete',
+    castShadow = true,
   ): THREE.Mesh => {
     const mesh = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(w, h, d)), mat);
     mesh.position.set(x, y, z);
-    mesh.castShadow = !isSoftwareGl && h > 0.35;
-    mesh.receiveShadow = !isSoftwareGl;
+    mesh.castShadow = !isSoftwareGl && qProfile.castShadows && castShadow && h > 0.35;
+    mesh.receiveShadow = !isSoftwareGl && qProfile.castShadows;
     mesh.userData.surfaceMaterial = surface;
     sceneGroup.add(mesh);
     raycastMeshes.push(mesh);
@@ -245,98 +357,166 @@ function buildTimberlineCompound(
     return mesh;
   };
 
-  // === 2. Compound Perimeter Concrete Curb & Chain-Link Fence (InstancedMesh posts + 4 breached gates) ===
-  const fencePostCoords: Array<[number, number]> = [];
-  const addFenceSegment = (x1: number, z1: number, x2: number, z2: number): void => {
-    const dx = x2 - x1;
-    const dz = z2 - z1;
-    const len = Math.hypot(dx, dz);
-    const cx = (x1 + x2) * 0.5;
-    const cz = (z1 + z2) * 0.5;
-    const alongX = Math.abs(dx) >= Math.abs(dz);
+  // === 1. MASSIVE 340m x 340m TERRAIN WITH CLEAN BUNKER ENTRANCE CUTOUT (ZERO Z-FIGHTING!) ===
+  const terrainSize = 340;
+  const segs = 104;
+  const terrainGeo = trackGeo(new THREE.PlaneGeometry(terrainSize, terrainSize, segs, segs));
+  terrainGeo.rotateX(-Math.PI * 0.5);
+  const posAttr = terrainGeo.attributes.position;
+  for (let i = 0; i < posAttr.count; i++) {
+    const vx = posAttr.getX(i);
+    const vz = posAttr.getZ(i);
+    posAttr.setY(i, sampleVisualTerrainY(vx, vz));
+  }
+  // Remove triangles overlapping the underground bunker stairwell opening so terrain never slices the entry!
+  const oldIndex = terrainGeo.getIndex()!;
+  const keptIndices: number[] = [];
+  for (let i = 0; i < oldIndex.count; i += 3) {
+    const a = oldIndex.getX(i);
+    const b = oldIndex.getX(i + 1);
+    const c = oldIndex.getX(i + 2);
+    const cx = (posAttr.getX(a) + posAttr.getX(b) + posAttr.getX(c)) / 3;
+    const cz = (posAttr.getZ(a) + posAttr.getZ(b) + posAttr.getZ(c)) / 3;
+    // Cutout strictly over the bunker stairwell & subterranean chamber roof (bunker roof slab covers it cleanly!)
+    if (cx >= 42.5 && cx <= 62.5 && cz >= -16.5 && cz <= 4.5) {
+      continue;
+    }
+    keptIndices.push(a, b, c);
+  }
+  terrainGeo.setIndex(keptIndices);
+  terrainGeo.computeVertexNormals();
 
-    // Concrete jersey barrier base (0.95m high, solid cover)
-    addSolidBox(
-      cx,
-      0.48,
-      cz,
-      alongX ? len : 0.45,
-      0.96,
-      alongX ? 0.45 : len,
-      matConcrete,
-      'concrete',
-    );
-    // Upper chain-link visual panel (blocks movement to 2.9m, bullets & vision pass through!)
-    const panel = new THREE.Mesh(
-      trackGeo(new THREE.BoxGeometry(alongX ? len : 0.06, 1.95, alongX ? 0.06 : len)),
-      matFenceMesh,
-    );
-    panel.position.set(cx, 1.92, cz);
-    sceneGroup.add(panel);
-    physics.addBox({
-      minX: cx - (alongX ? len * 0.5 : 0.14),
-      maxX: cx + (alongX ? len * 0.5 : 0.14),
-      minY: 0.96,
-      maxY: 2.95,
-      minZ: cz - (alongX ? 0.14 : len * 0.5),
-      maxZ: cz + (alongX ? 0.14 : len * 0.5),
-      surface: 'metal',
-      blocksMovement: true,
+  const terrainMesh = new THREE.Mesh(terrainGeo, matTerrain);
+  terrainMesh.receiveShadow = !isSoftwareGl && qProfile.castShadows;
+  terrainMesh.userData.surfaceMaterial = 'grass';
+  sceneGroup.add(terrainMesh);
+  raycastMeshes.push(terrainMesh);
+
+  // === 2. WINDING ALPINE RIVER & TWO BRIDGES ===
+  // Ribbon water mesh following getRiverCenterX(z) at y = -0.35m (well above -1.65m riverbed)
+  const riverSegsZ = 64;
+  const riverHalfW = 7.4;
+  const rPositions: number[] = [];
+  const rUvs: number[] = [];
+  const rIndices: number[] = [];
+  for (let i = 0; i <= riverSegsZ; i++) {
+    const tz = i / riverSegsZ;
+    const z = -155 + tz * 310;
+    const rx = getRiverCenterX(z);
+    rPositions.push(rx - riverHalfW, -0.35, z);
+    rPositions.push(rx + riverHalfW, -0.35, z);
+    rUvs.push(0, tz * 14);
+    rUvs.push(1, tz * 14);
+    if (i < riverSegsZ) {
+      const base = i * 2;
+      rIndices.push(base, base + 2, base + 1);
+      rIndices.push(base + 1, base + 2, base + 3);
+    }
+  }
+  const riverGeo = trackGeo(new THREE.BufferGeometry());
+  riverGeo.setAttribute('position', new THREE.Float32BufferAttribute(rPositions, 3));
+  riverGeo.setAttribute('uv', new THREE.Float32BufferAttribute(rUvs, 2));
+  riverGeo.setIndex(rIndices);
+  riverGeo.computeVertexNormals();
+  const riverMesh = new THREE.Mesh(riverGeo, matRiver);
+  riverMesh.receiveShadow = !isSoftwareGl && qProfile.castShadows;
+  sceneGroup.add(riverMesh);
+
+  // Two sturdy timber-and-steel Road Bridges spanning the river at Z = -48 and Z = 34
+  const buildBridge = (bz: number): void => {
+    const rx = getRiverCenterX(bz);
+    const bridgeLen = 19.5;
+    const bridgeW = 5.4;
+    // Main bridge deck (top at y = 0.24m)
+    addSolidBox(rx, 0.12, bz, bridgeLen, 0.24, bridgeW, matWoodFloor, 'wood');
+    // Approach ramps on West & East ends
+    physics.addRamp({
+      minX: rx - bridgeLen * 0.5 - 3.2,
+      maxX: rx - bridgeLen * 0.5,
+      minZ: bz - bridgeW * 0.5,
+      maxZ: bz + bridgeW * 0.5,
+      baseY: 0,
+      topY: 0.24,
+      riseAxis: '+x',
+      surface: 'wood',
     });
-
-    const posts = Math.max(2, Math.round(len / 3.4));
-    for (let i = 0; i <= posts; i++) {
-      const t = i / posts;
-      fencePostCoords.push([x1 + dx * t, z1 + dz * t]);
+    physics.addRamp({
+      minX: rx + bridgeLen * 0.5,
+      maxX: rx + bridgeLen * 0.5 + 3.2,
+      minZ: bz - bridgeW * 0.5,
+      maxZ: bz + bridgeW * 0.5,
+      baseY: 0,
+      topY: 0.24,
+      riseAxis: '-x',
+      surface: 'wood',
+    });
+    // Side concrete curbs & steel guardrails
+    for (const side of [-1, 1]) {
+      addSolidBox(rx, 0.72, bz + side * (bridgeW * 0.5 - 0.14), bridgeLen, 0.96, 0.2, matSteel, 'metal');
+      // Support piers descending into riverbed
+      for (const px of [-6.0, 0, 6.0]) {
+        addSolidBox(rx + px, -0.8, bz + side * (bridgeW * 0.42), 0.55, 1.7, 0.55, matBaseConcrete, 'concrete', false);
+      }
     }
   };
+  buildBridge(-48);
+  buildBridge(34);
 
-  // North & South perimeter with 6m wide central vehicle gates (span full x including corners)
-  addFenceSegment(-26.225, -24, -3.5, -24);
-  addFenceSegment(3.5, -24, 26.225, -24);
-  addFenceSegment(-26.225, 24, -3.5, 24);
-  addFenceSegment(3.5, 24, 26.225, 24);
-  // West & East perimeter inset cleanly between North & South inner faces (z: ±23.775)
-  addFenceSegment(-26, -23.775, -26, -3.0);
-  addFenceSegment(-26, 3.0, -26, 23.775);
-  addFenceSegment(26, -23.775, 26, -3.0);
-  addFenceSegment(26, 3.0, 26, 23.775);
+  // === 3. PAVED HIGHWAY ROAD & BRANCHING DIRT PATHS (Solid Raised Thin Pads -> Zero Z-Fighting) ===
+  const addFlatRoadStrip = (
+    x: number,
+    z: number,
+    w: number,
+    d: number,
+    mat: THREE.Material,
+    surface: BodycamSurfaceMaterial,
+    topY = 0.05,
+  ): void => {
+    const m = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(w, topY, d)), mat);
+    m.position.set(x, topY * 0.5, z);
+    m.receiveShadow = !isSoftwareGl && qProfile.castShadows;
+    m.userData.surfaceMaterial = surface;
+    sceneGroup.add(m);
+    raycastMeshes.push(m);
+    physics.addSurfaceZone({ minX: x - w * 0.5, maxX: x + w * 0.5, minZ: z - d * 0.5, maxZ: z + d * 0.5, surface });
+  };
 
-  const dummy = new THREE.Object3D();
-  const postGeo = trackGeo(new THREE.CylinderGeometry(0.06, 0.06, 3.05, 6));
-  const postInst = new THREE.InstancedMesh(postGeo, matFencePost, fencePostCoords.length);
-  fencePostCoords.forEach(([px, pz], i) => {
-    dummy.position.set(px, 1.52, pz);
-    dummy.rotation.set(0, 0, 0);
-    dummy.scale.set(1, 1, 1);
-    dummy.updateMatrix();
-    postInst.setMatrixAt(i, dummy.matrix);
-  });
-  postInst.instanceMatrix.needsUpdate = true;
-  postInst.computeBoundingSphere();
-  sceneGroup.add(postInst);
+  // Main North-South Paved Highway along X = -2 (Z in [-112, 112])
+  addFlatRoadStrip(-2, 0, 7.6, 224, matRoad, 'asphalt', 0.05);
+  // Paved Military Base Entry Spur (Z = -48, X in [1.8, 16]) and South Spur (Z = 34, X in [1.8, 16])
+  addFlatRoadStrip(8.9, -48, 14.2, 6.4, matRoad, 'asphalt', 0.055);
+  addFlatRoadStrip(8.9, 34, 14.2, 6.4, matRoad, 'asphalt', 0.055);
+  // Dirt tracks linking bridges to NW Village, SW Village & Lone Cabins
+  addFlatRoadStrip(-52, -48, 38, 4.6, matDirtPath, 'gravel', 0.04);
+  addFlatRoadStrip(-58, -60, 4.6, 24, matDirtPath, 'gravel', 0.04);
+  addFlatRoadStrip(-54, 34, 38, 4.6, matDirtPath, 'gravel', 0.04);
+  addFlatRoadStrip(-62, 54, 4.6, 38, matDirtPath, 'gravel', 0.04);
+  addFlatRoadStrip(-11.5, -48, 13.0, 4.8, matDirtPath, 'gravel', 0.04);
+  addFlatRoadStrip(-10.5, 34, 11.0, 4.8, matDirtPath, 'gravel', 0.04);
 
-  // === 3. Three Enterable Wooden Cabins / Command Shed ===
-  const buildEnterableCabin = (
+  // === 4. ENTERABLE FURNISHED TIMBER CABIN HELPER (Villages & Lone Cabins) ===
+  const buildCabin = (
     cx: number,
     cz: number,
     w: number,
     d: number,
-    doorSideA: 'south' | 'north' | 'east' | 'west',
-    doorSideB: 'south' | 'north' | 'east' | 'west',
+    doorSideA: 'north' | 'south' | 'east' | 'west',
+    doorSideB?: 'north' | 'south' | 'east' | 'west',
   ): void => {
+    const baseY = Math.max(0, sampleVisualTerrainY(cx, cz));
     const h = 3.1;
     const t = 0.28;
-    const doorW = 2.0;
+    const doorW = 1.95;
     const doorH = 2.35;
 
-    // Raised timber floorboard deck (0.14m step-up)
-    addSolidBox(cx, 0.07, cz, w, 0.14, d, matWoodFloor, 'wood');
+    // Raised timber deck + foundation skirt so zero floating on sloped ground
+    addSolidBox(cx, baseY + 0.08, cz, w, 0.42, d, matWoodFloor, 'wood', false);
+    const floorTop = baseY + 0.29;
     physics.addInteriorZone({
       minX: cx - w * 0.5,
       maxX: cx + w * 0.5,
-      minY: 0,
-      maxY: h + 0.4,
+      minY: floorTop,
+      maxY: floorTop + h + 0.4,
       minZ: cz - d * 0.5,
       maxZ: cz + d * 0.5,
       material: 'wood',
@@ -344,7 +524,6 @@ function buildTimberlineCompound(
 
     const buildWallSide = (side: 'north' | 'south' | 'east' | 'west', hasDoor: boolean): void => {
       const isNS = side === 'north' || side === 'south';
-      // Non-overlapping corners: N/S walls span full width w; E/W walls span strictly between N/S inner faces (d - 2*t)
       const span = isNS ? w : d - t * 2;
       const fixed =
         side === 'north'
@@ -359,31 +538,30 @@ function buildTimberlineCompound(
         const seg = (span - doorW) * 0.5;
         const headerH = h - doorH;
         if (isNS) {
-          addSolidBox(cx - (doorW + seg) * 0.5, 0.14 + h * 0.5, fixed, seg, h, t, matWood, 'wood');
-          addSolidBox(cx + (doorW + seg) * 0.5, 0.14 + h * 0.5, fixed, seg, h, t, matWood, 'wood');
-          addSolidBox(cx, 0.14 + doorH + headerH * 0.5, fixed, doorW, headerH, t, matWood, 'wood');
+          addSolidBox(cx - (doorW + seg) * 0.5, floorTop + h * 0.5, fixed, seg, h, t, matWood, 'wood');
+          addSolidBox(cx + (doorW + seg) * 0.5, floorTop + h * 0.5, fixed, seg, h, t, matWood, 'wood');
+          addSolidBox(cx, floorTop + doorH + headerH * 0.5, fixed, doorW, headerH, t, matWood, 'wood');
         } else {
-          addSolidBox(fixed, 0.14 + h * 0.5, cz - (doorW + seg) * 0.5, t, h, seg, matWood, 'wood');
-          addSolidBox(fixed, 0.14 + h * 0.5, cz + (doorW + seg) * 0.5, t, h, seg, matWood, 'wood');
-          addSolidBox(fixed, 0.14 + doorH + headerH * 0.5, cz, t, headerH, doorW, matWood, 'wood');
+          addSolidBox(fixed, floorTop + h * 0.5, cz - (doorW + seg) * 0.5, t, h, seg, matWood, 'wood');
+          addSolidBox(fixed, floorTop + h * 0.5, cz + (doorW + seg) * 0.5, t, h, seg, matWood, 'wood');
+          addSolidBox(fixed, floorTop + doorH + headerH * 0.5, cz, t, headerH, doorW, matWood, 'wood');
         }
       } else {
-        // Windowed timber wall with exact non-overlapping sill (0..1.04), jambs (1.04..2.26), and header (2.26..3.10)
-        const winW = 2.0;
+        const winW = 1.9;
         const sillH = 1.04;
         const headerH = 0.84;
-        const jambH = h - sillH - headerH; // 1.22m exact gap between sill & header
-        const sideSeg = Math.max(0.5, (span - winW) * 0.5);
+        const jambH = h - sillH - headerH;
+        const sideSeg = Math.max(0.45, (span - winW) * 0.5);
         if (isNS) {
-          addSolidBox(cx, 0.14 + sillH * 0.5, fixed, span, sillH, t, matWood, 'wood');
-          addSolidBox(cx, 0.14 + h - headerH * 0.5, fixed, span, headerH, t, matWood, 'wood');
-          addSolidBox(cx - (winW + sideSeg) * 0.5, 0.14 + sillH + jambH * 0.5, fixed, sideSeg, jambH, t, matWood, 'wood');
-          addSolidBox(cx + (winW + sideSeg) * 0.5, 0.14 + sillH + jambH * 0.5, fixed, sideSeg, jambH, t, matWood, 'wood');
+          addSolidBox(cx, floorTop + sillH * 0.5, fixed, span, sillH, t, matWood, 'wood');
+          addSolidBox(cx, floorTop + h - headerH * 0.5, fixed, span, headerH, t, matWood, 'wood');
+          addSolidBox(cx - (winW + sideSeg) * 0.5, floorTop + sillH + jambH * 0.5, fixed, sideSeg, jambH, t, matWood, 'wood');
+          addSolidBox(cx + (winW + sideSeg) * 0.5, floorTop + sillH + jambH * 0.5, fixed, sideSeg, jambH, t, matWood, 'wood');
         } else {
-          addSolidBox(fixed, 0.14 + sillH * 0.5, cz, t, sillH, span, matWood, 'wood');
-          addSolidBox(fixed, 0.14 + h - headerH * 0.5, cz, t, headerH, span, matWood, 'wood');
-          addSolidBox(fixed, 0.14 + sillH + jambH * 0.5, cz - (winW + sideSeg) * 0.5, t, jambH, sideSeg, matWood, 'wood');
-          addSolidBox(fixed, 0.14 + sillH + jambH * 0.5, cz + (winW + sideSeg) * 0.5, t, jambH, sideSeg, matWood, 'wood');
+          addSolidBox(fixed, floorTop + sillH * 0.5, cz, t, sillH, span, matWood, 'wood');
+          addSolidBox(fixed, floorTop + h - headerH * 0.5, cz, t, headerH, span, matWood, 'wood');
+          addSolidBox(fixed, floorTop + sillH + jambH * 0.5, cz - (winW + sideSeg) * 0.5, t, jambH, sideSeg, matWood, 'wood');
+          addSolidBox(fixed, floorTop + sillH + jambH * 0.5, cz + (winW + sideSeg) * 0.5, t, jambH, sideSeg, matWood, 'wood');
         }
       }
     };
@@ -393,136 +571,476 @@ function buildTimberlineCompound(
     buildWallSide('east', doorSideA === 'east' || doorSideB === 'east');
     buildWallSide('west', doorSideA === 'west' || doorSideB === 'west');
 
-    // Roof slab + pitched corrugated metal overhang
-    addSolidBox(cx, 0.14 + h + 0.12, cz, w + 0.8, 0.24, d + 0.8, matRoof, 'metal');
+    // Roof overhang + pitched gable crown
+    addSolidBox(cx, floorTop + h + 0.12, cz, w + 0.9, 0.24, d + 0.9, matRoof, 'metal');
     const ridge = new THREE.Mesh(
-      trackGeo(new THREE.CylinderGeometry(0.1, Math.min(w, d) * 0.62, 1.2, 4)),
+      trackGeo(new THREE.CylinderGeometry(0.12, Math.min(w, d) * 0.62, 1.3, 4)),
       matRoof,
     );
-    ridge.position.set(cx, 0.14 + h + 0.82, cz);
+    ridge.position.set(cx, floorTop + h + 0.85, cz);
     ridge.rotation.y = Math.PI * 0.25;
     ridge.scale.set(w / Math.min(w, d), 1, d / Math.min(w, d));
-    ridge.castShadow = !isSoftwareGl;
+    ridge.castShadow = !isSoftwareGl && qProfile.castShadows;
     sceneGroup.add(ridge);
 
-    // Interior tactical worktable / crate cover (off-center so walkways stay clear)
-    addSolidBox(cx + w * 0.24, 0.56, cz - d * 0.22, 1.4, 0.84, 0.8, matWood, 'wood');
+    // Interior furniture desk
+    buildOfficeDesk(propCtx, cx + w * 0.22, floorTop, cz - d * 0.2, 0.1, matWood, matSteel);
   };
 
-  // Cabin 1: North-West Timber Cabin
-  buildEnterableCabin(-15.5, -14.0, 9.2, 7.2, 'south', 'east');
-  // Cabin 2: North-East Command Shed
-  buildEnterableCabin(15.5, -13.5, 9.0, 7.0, 'south', 'west');
-  // Cabin 3: South-West Bunkhouse
-  buildEnterableCabin(-15.0, 13.5, 9.2, 7.2, 'north', 'east');
+  // --- Village Cluster 1: North-West Logging Village ---
+  buildCabin(-58, -64, 9.0, 7.2, 'south', 'east');
+  buildCabin(-72, -52, 8.6, 6.8, 'east', 'south');
+  buildCabin(-48, -56, 8.2, 6.6, 'south', 'west');
+  buildRustedVehicle(propCtx, 'pickup', -56, 0, -52, 0.52, vehBlue);
+  addSolidBox(-64, 0.55, -56, 2.2, 1.1, 1.4, matWood, 'wood'); // village woodpile
 
-  // === 4. South-East Timber Watchtower (Elevated Overlook Platform + Walkable Ramp) ===
-  const twX = 14.5;
-  const twZ = 13.5;
-  const twH = 3.1;
-  // 4 corner timber legs stopping cleanly beneath deck slab underside (y: 0..2.98)
-  const deckBottomY = twH - 0.12;
-  const deckTopY = twH + 0.12;
-  for (const sx of [-2.1, 2.1]) {
-    for (const sz of [-2.1, 2.1]) {
-      addSolidBox(twX + sx, deckBottomY * 0.5, twZ + sz, 0.28, deckBottomY, 0.28, matWood, 'wood');
+  // --- Village Cluster 2: South-West Riverside Hamlet ---
+  buildCabin(-58, 52, 9.2, 7.2, 'north', 'east');
+  buildCabin(-74, 62, 8.6, 6.8, 'east', 'north');
+  buildCabin(-56, 70, 8.4, 6.6, 'north', 'west');
+  buildRustedVehicle(propCtx, 'lada', -64, 0, 46, -0.35, vehOlive);
+  addSolidBox(-65, 0.65, 58, 1.6, 1.3, 1.6, matBaseConcrete, 'concrete'); // stone village well
+
+  // --- Three Lone Forest Cabins ---
+  buildCabin(78, -84, 8.4, 6.8, 'south', 'west');
+  buildCabin(-96, 4, 8.2, 6.6, 'east');
+  buildCabin(84, 82, 8.4, 6.8, 'north', 'west');
+
+  // === 5. MILITARY BASE COMPOUND (X in [12, 96], Z in [-62, 58], FLAT Y = 0) ===
+  // Concrete base apron pad (cleanly stops outside the bunker stairwell opening!)
+  // West apron strip: X in [12, 42.5], Z in [-62, 58]
+  addFlatRoadStrip(27.25, -2.0, 30.5, 120.0, matBaseConcrete, 'concrete', 0.04);
+  // North-East apron above bunker: X in [42.5, 65], Z in [-62, -16.5]
+  addFlatRoadStrip(53.75, -39.25, 22.5, 45.5, matBaseConcrete, 'concrete', 0.04);
+  // South-East apron below bunker: X in [42.5, 65], Z in [4.5, 58]
+  addFlatRoadStrip(53.75, 31.25, 22.5, 53.5, matBaseConcrete, 'concrete', 0.04);
+
+  // Military Base Perimeter Concrete Curb + Chain-Link Fence with Wide Gates
+  const fencePosts: Array<[number, number]> = [];
+  const addFence = (x1: number, z1: number, x2: number, z2: number): void => {
+    const dx = x2 - x1;
+    const dz = z2 - z1;
+    const len = Math.hypot(dx, dz);
+    const cx = (x1 + x2) * 0.5;
+    const cz = (z1 + z2) * 0.5;
+    const alongX = Math.abs(dx) >= Math.abs(dz);
+    addSolidBox(cx, 0.45, cz, alongX ? len : 0.36, 0.9, alongX ? 0.36 : len, matBaseConcrete, 'concrete');
+    const panel = new THREE.Mesh(
+      trackGeo(new THREE.BoxGeometry(alongX ? len : 0.06, 2.0, alongX ? 0.06 : len)),
+      matFenceMesh,
+    );
+    panel.position.set(cx, 1.9, cz);
+    sceneGroup.add(panel);
+    physics.addBox({
+      minX: cx - (alongX ? len * 0.5 : 0.14),
+      maxX: cx + (alongX ? len * 0.5 : 0.14),
+      minY: 0.9,
+      maxY: 2.95,
+      minZ: cz - (alongX ? 0.14 : len * 0.5),
+      maxZ: cz + (alongX ? 0.14 : len * 0.5),
+      surface: 'metal',
+      blocksMovement: true,
+    });
+    const n = Math.max(2, Math.round(len / 4.2));
+    for (let i = 0; i <= n; i++) {
+      fencePosts.push([x1 + (dx * i) / n, z1 + (dz * i) / n]);
+    }
+  };
+
+  // Outer Military Base Fence (gates at West Z=-48, West Z=34, North X=52, South X=52)
+  addFence(12, -62, 46, -62);
+  addFence(58, -62, 96, -62);
+  addFence(12, 58, 46, 58);
+  addFence(58, 58, 96, 58);
+  addFence(96, -61.8, 96, 57.8);
+  addFence(12, -61.8, 12, -52.5);
+  addFence(12, -43.5, 12, 29.5);
+  addFence(12, 38.5, 12, 57.8);
+
+  // --- 5A. FENCED COMMS STATION COMPOUND + TALL RADAR TOWER (X in [15, 36], Z in [-58, -32]) ---
+  addFence(15, -58, 36, -58);
+  addFence(15, -32, 23, -32);
+  addFence(28.5, -32, 36, -32);
+  addFence(15, -57.8, 15, -32.2);
+  addFence(36, -57.8, 36, -32.2);
+
+  const radar = buildRadarTower(propCtx, 25.5, 0.04, -48.5, 19.5);
+  // Enterable Comms Control Shack beside the Radar Tower
+  addSolidBox(22.0, 0.12, -37.5, 7.6, 0.16, 5.2, matBunkerConcrete, 'concrete', false);
+  addSolidBox(22.0, 1.7, -40.0, 7.6, 3.0, 0.28, matBunkerConcrete);
+  addSolidBox(18.34, 1.7, -37.5, 0.28, 3.0, 4.72, matBunkerConcrete);
+  addSolidBox(25.66, 1.7, -37.5, 0.28, 3.0, 4.72, matBunkerConcrete);
+  // Front South wall with open doorway
+  addSolidBox(19.6, 1.7, -35.0, 2.8, 3.0, 0.28, matBunkerConcrete);
+  addSolidBox(24.4, 1.7, -35.0, 2.8, 3.0, 0.28, matBunkerConcrete);
+  addSolidBox(22.0, 2.85, -35.0, 2.0, 0.7, 0.28, matBunkerConcrete);
+  addSolidBox(22.0, 3.32, -37.5, 8.0, 0.24, 5.6, matRoof, 'metal');
+  buildOfficeDesk(propCtx, 22.0, 0.2, -38.8, 0, matSteel, matGunMetal);
+
+  // --- 5B. TWO LARGE GARAGE-STYLE VEHICLE BUILDINGS (X = 25, Z = -14 & Z = 10) ---
+  const buildMilitaryGarage = (gx: number, gz: number, vehicleStyle: 'zil_truck' | 'pickup'): void => {
+    const gw = 16.0;
+    const gd = 12.0;
+    const gh = 5.0;
+    const t = 0.36;
+    // Concrete bay floor slab (y top = 0.12m)
+    addSolidBox(gx, 0.06, gz, gw, 0.12, gd, matBunkerConcrete, 'concrete', false);
+    physics.addInteriorZone({
+      minX: gx - gw * 0.5,
+      maxX: gx + gw * 0.5,
+      minY: 0,
+      maxY: gh + 0.5,
+      minZ: gz - gd * 0.5,
+      maxZ: gz + gd * 0.5,
+      material: 'concrete',
+    });
+    // North & South solid corrugated/concrete side walls
+    addSolidBox(gx, 0.12 + gh * 0.5, gz - gd * 0.5 + t * 0.5, gw, gh, t, matGarageMetal, 'metal');
+    addSolidBox(gx, 0.12 + gh * 0.5, gz + gd * 0.5 - t * 0.5, gw, gh, t, matGarageMetal, 'metal');
+    // West back wall with personnel door
+    addSolidBox(gx - gw * 0.5 + t * 0.5, 0.12 + gh * 0.5, gz - 3.6, t, gh, 4.1, matGarageMetal, 'metal');
+    addSolidBox(gx - gw * 0.5 + t * 0.5, 0.12 + gh * 0.5, gz + 3.6, t, gh, 4.1, matGarageMetal, 'metal');
+    addSolidBox(gx - gw * 0.5 + t * 0.5, 0.12 + 3.85, gz, t, 2.3, 3.1, matGarageMetal, 'metal');
+    // East front facade with TWO wide open garage vehicle bays (center pillar + header beam)
+    addSolidBox(gx + gw * 0.5 - t * 0.5, 0.12 + gh * 0.5, gz, t, gh, 1.2, matBaseConcrete, 'concrete');
+    addSolidBox(gx + gw * 0.5 - t * 0.5, 0.12 + 4.35, gz, t, 1.3, gd - t * 2, matGarageMetal, 'metal');
+    // Roof slab + exposed interior steel trusses
+    addSolidBox(gx, 0.12 + gh + 0.16, gz, gw + 0.6, 0.32, gd + 0.6, matRoof, 'metal');
+    for (const tx of [-4.5, 0, 4.5]) {
+      const truss = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(0.24, 0.34, gd - 0.8)), matSteel);
+      truss.position.set(gx + tx, gh - 0.1, gz);
+      sceneGroup.add(truss);
+    }
+    // Parked vehicle inside bay + mechanic workbench
+    buildRustedVehicle(propCtx, vehicleStyle, gx + 0.5, 0.12, gz - 2.8, Math.PI * 0.5, vehOlive);
+    buildOfficeDesk(propCtx, gx - 5.2, 0.12, gz + 4.2, 0, matSteel, matGunMetal);
+  };
+  buildMilitaryGarage(25.0, -14.0, 'zil_truck');
+  buildMilitaryGarage(25.0, 10.0, 'pickup');
+
+  // --- 5C. LONG PAVED AIRSTRIP WITH PARALLEL ILLUMINATED EDGE LIGHTS (X = 78, Z in [-58, 54]) ---
+  const runwayX = 78.0;
+  const runwayW = 18.0;
+  const runwayLen = 112.0;
+  const runwayCenterZ = -2.0;
+  // Runway tarmac slab (y top = 0.08m)
+  addFlatRoadStrip(runwayX, runwayCenterZ, runwayW, runwayLen, matRunway, 'asphalt', 0.08);
+  // Painted white centerline dashes & threshold piano keys (solid 0.025m elevated above tarmac -> ZERO z-fighting)
+  for (let dz = -48; dz <= 44; dz += 10) {
+    const dash = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(0.42, 0.024, 5.2)), matRunwayPaint);
+    dash.position.set(runwayX, 0.092, dz);
+    sceneGroup.add(dash);
+  }
+  for (const endZ of [-54.5, 50.5]) {
+    for (let kx = -6.5; kx <= 6.5; kx += 2.6) {
+      const key = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(1.1, 0.024, 4.6)), matRunwayPaint);
+      key.position.set(runwayX + kx, 0.092, endZ);
+      sceneGroup.add(key);
     }
   }
-  // Overlook deck slab (y: 2.98..3.22)
-  addSolidBox(twX, twH, twZ, 4.8, 0.24, 4.8, matWoodFloor, 'wood');
-  // Waist-high parapet railings seated atop deck with non-overlapping corners & posts
-  addSolidBox(twX, deckTopY + 0.5, twZ + 2.28, 4.74, 1.0, 0.16, matWood, 'wood');
-  addSolidBox(twX - 2.29, deckTopY + 0.5, twZ - 0.08, 0.16, 1.0, 4.56, matWood, 'wood');
-  addSolidBox(twX + 2.29, deckTopY + 0.5, twZ - 0.08, 0.16, 1.0, 4.56, matWood, 'wood');
-  // Roof posts (inset cleanly at ±2.06 so they don't overlap railings, spanning deckTopY..roofBottom)
-  const roofBottomY = twH + 2.85;
-  const roofPostH = roofBottomY - deckTopY;
-  for (const sx of [-2.06, 2.06]) {
-    for (const sz of [-2.06, 2.06]) {
-      addSolidBox(twX + sx, deckTopY + roofPostH * 0.5, twZ + sz, 0.18, roofPostH, 0.18, matWood, 'wood');
+  // Parallel Runway Edge Lights along BOTH edges (X = 68.4 and X = 87.6) + Green Threshold Lights
+  const edgeLightPosts: Array<[number, number, boolean]> = [];
+  for (let lz = -56; lz <= 52; lz += 12) {
+    edgeLightPosts.push([runwayX - runwayW * 0.5 - 0.6, lz, false]);
+    edgeLightPosts.push([runwayX + runwayW * 0.5 + 0.6, lz, false]);
+  }
+  for (const endZ of [-58.4, 54.4]) {
+    for (const tx of [-7.0, -3.5, 0, 3.5, 7.0]) {
+      edgeLightPosts.push([runwayX + tx, endZ, true]);
     }
   }
-  addSolidBox(twX, twH + 2.95, twZ, 5.4, 0.2, 5.4, matRoof, 'metal');
+  const pedGeo = trackGeo(new THREE.CylinderGeometry(0.08, 0.12, 0.42, 8));
+  const bulbGeo = trackGeo(new THREE.SphereGeometry(0.14, 8, 8));
+  const pedInst = new THREE.InstancedMesh(pedGeo, matSteel, edgeLightPosts.length);
+  edgeLightPosts.forEach(([lx, lz, isThresh], idx) => {
+    dummy.position.set(lx, 0.21, lz);
+    dummy.rotation.set(0, 0, 0);
+    dummy.scale.set(1, 1, 1);
+    dummy.updateMatrix();
+    pedInst.setMatrixAt(idx, dummy.matrix);
 
-  // Walkable wooden ramp up the North side of the Watchtower
-  physics.addRamp({
-    minX: twX - 1.1,
-    maxX: twX + 1.1,
-    minZ: twZ - 8.2,
-    maxZ: twZ - 2.2,
-    baseY: 0,
-    topY: twH + 0.12,
-    riseAxis: '+z',
-    surface: 'wood',
+    const bulb = new THREE.Mesh(bulbGeo, isThresh ? matThresholdGreen : matRunwayBulb);
+    bulb.position.set(lx, 0.48, lz);
+    sceneGroup.add(bulb);
   });
-  const rampLen = Math.hypot(6.0, twH + 0.12);
-  const rampMesh = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(2.2, 0.18, rampLen)), matWoodFloor);
-  rampMesh.position.set(twX, (twH + 0.12) * 0.5 - 0.06, twZ - 5.2);
-  rampMesh.rotation.x = -Math.atan2(twH + 0.12, 6.0);
-  rampMesh.receiveShadow = !isSoftwareGl;
-  rampMesh.userData.surfaceMaterial = 'wood';
-  sceneGroup.add(rampMesh);
-  raycastMeshes.push(rampMesh);
+  pedInst.instanceMatrix.needsUpdate = true;
+  pedInst.computeBoundingSphere();
+  sceneGroup.add(pedInst);
 
-  // === 5. Corrugated Shipping Containers & Tactical Yard Cover ===
-  addSolidBox(-5.2, 1.32, -4.5, 6.0, 2.64, 2.5, matContBlue, 'metal');
-  addSolidBox(5.8, 1.32, -1.8, 2.5, 2.64, 6.0, matContOlive, 'metal');
-  addSolidBox(-2.8, 1.32, 6.2, 6.0, 2.64, 2.5, matContRust, 'metal');
-  addSolidBox(1.5, 0.56, -13.2, 3.2, 1.12, 0.85, matConcrete, 'concrete');
-  addSolidBox(-1.5, 0.56, 13.8, 3.2, 1.12, 0.85, matConcrete, 'concrete');
+  // Subtle glowing PointLights spaced along runway (capped by GraphicsQuality)
+  const runwayGlowCount = Math.min(4, Math.max(1, Math.floor(qProfile.maxAccentLights * 0.3)));
+  for (let i = 0; i < runwayGlowCount; i++) {
+    const rz = -42 + (i / Math.max(1, runwayGlowCount - 1)) * 84;
+    const rl = new THREE.PointLight(0xffd27d, 5.5, 22, 1.7);
+    rl.position.set(runwayX, 1.4, rz);
+    sceneGroup.add(rl);
+  }
 
-  // === 6. InstancedMesh Multi-Part Pine Forest (185 trees = 4 draw calls total!) ===
-  const rand = seededRand(2026);
+  // Windsock Mast next to Airstrip
+  const sockPole = new THREE.Mesh(trackGeo(new THREE.CylinderGeometry(0.06, 0.09, 6.2, 8)), matSteel);
+  sockPole.position.set(65.5, 3.1, -32.0);
+  const windsockCone = new THREE.Mesh(trackGeo(new THREE.CylinderGeometry(0.18, 0.42, 2.2, 10, 1, true)), matWindsock);
+  windsockCone.rotation.z = Math.PI * 0.45;
+  windsockCone.position.set(66.6, 5.75, -32.0);
+  sceneGroup.add(sockPole, windsockCone);
+
+  // --- 5D. ELEVATED HELIPAD WITH ACCESS STAIRS & REALISTIC HELICOPTER PROP (X = 48, Z = 36) ---
+  const heliX = 48.0;
+  const heliZ = 36.0;
+  const heliH = 1.6;
+  // Elevated concrete pad platform (16m x 16m, top = 1.6m)
+  addSolidBox(heliX, heliH * 0.5, heliZ, 16.0, heliH, 16.0, matBaseConcrete, 'concrete');
+  // Painted yellow helipad circle & "H" bars elevated +0.025m above pad -> ZERO z-fighting
+  const hRing = new THREE.Mesh(trackGeo(new THREE.RingGeometry(4.6, 5.2, 32)), matYellowPaint);
+  hRing.rotation.x = -Math.PI * 0.5;
+  hRing.position.set(heliX, heliH + 0.028, heliZ);
+  sceneGroup.add(hRing);
+  const hLeft = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(0.7, 0.026, 4.8)), matYellowPaint);
+  hLeft.position.set(heliX - 1.5, heliH + 0.026, heliZ);
+  const hRight = hLeft.clone();
+  hRight.position.set(heliX + 1.5, heliH + 0.026, heliZ);
+  const hMid = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(3.2, 0.026, 0.7)), matYellowPaint);
+  hMid.position.set(heliX, heliH + 0.026, heliZ);
+  sceneGroup.add(hLeft, hRight, hMid);
+
+  // Helipad safety railings (leaving open West stair landing at Z in [34.2, 37.8])
+  addSolidBox(heliX, heliH + 0.52, heliZ - 7.85, 16.0, 1.0, 0.14, matSteel, 'metal');
+  addSolidBox(heliX, heliH + 0.52, heliZ + 7.85, 16.0, 1.0, 0.14, matSteel, 'metal');
+  addSolidBox(heliX + 7.85, heliH + 0.52, heliZ, 0.14, 1.0, 15.5, matSteel, 'metal');
+  addSolidBox(heliX - 7.85, heliH + 0.52, heliZ - 4.8, 0.14, 1.0, 6.0, matSteel, 'metal');
+  addSolidBox(heliX - 7.85, heliH + 0.52, heliZ + 4.8, 0.14, 1.0, 6.0, matSteel, 'metal');
+
+  // Wide Steel Access Staircase rising along +X from X = 36.2 (y = 0.04) up to X = 40.0 (y = 1.6)
+  physics.addRamp({
+    minX: 36.2,
+    maxX: 40.0,
+    minZ: heliZ - 1.8,
+    maxZ: heliZ + 1.8,
+    baseY: 0.04,
+    topY: heliH,
+    riseAxis: '+x',
+    surface: 'metal',
+  });
+  const hSteps = 9;
+  const hStepW = 3.8 / hSteps;
+  const hStepH = (heliH - 0.04) / hSteps;
+  const hStepGeo = trackGeo(new THREE.BoxGeometry(hStepW - 0.004, hStepH, 3.6));
+  const hStepInst = new THREE.InstancedMesh(hStepGeo, matSteel, hSteps);
+  for (let i = 0; i < hSteps; i++) {
+    dummy.position.set(36.2 + (i + 0.5) * hStepW, 0.04 + (i + 0.5) * hStepH, heliZ);
+    dummy.rotation.set(0, 0, 0);
+    dummy.scale.set(1, 1, 1);
+    dummy.updateMatrix();
+    hStepInst.setMatrixAt(i, dummy.matrix);
+  }
+  hStepInst.instanceMatrix.needsUpdate = true;
+  hStepInst.computeBoundingSphere();
+  sceneGroup.add(hStepInst);
+  raycastMeshes.push(hStepInst);
+
+  // Realistic 15-Part Tactical Helicopter Prop resting on the Helipad
+  buildRealisticHelicopterProp(propCtx, heliX + 0.4, heliH, heliZ, -Math.PI * 0.35);
+
+  // --- 5E. REINFORCED ARMORY BUILDING (X = 50, Z = -40) ---
+  const armX = 50.0;
+  const armZ = -40.0;
+  const armW = 14.0;
+  const armD = 10.0;
+  const armH = 3.8;
+  addSolidBox(armX, 0.08, armZ, armW, 0.16, armD, matBunkerConcrete, 'concrete', false);
+  physics.addInteriorZone({
+    minX: armX - 7,
+    maxX: armX + 7,
+    minY: 0,
+    maxY: armH + 0.4,
+    minZ: armZ - 5,
+    maxZ: armZ + 5,
+    material: 'concrete',
+  });
+  // Armory perimeter concrete walls with South & West tactical doorways
+  addSolidBox(armX, 0.16 + armH * 0.5, armZ - 4.8, armW, armH, 0.4, matBunkerConcrete);
+  addSolidBox(armX + 6.8, 0.16 + armH * 0.5, armZ, 0.4, armH, armD - 0.8, matBunkerConcrete);
+  // South doorway
+  addSolidBox(armX - 4.2, 0.16 + armH * 0.5, armZ + 4.8, 5.6, armH, 0.4, matBunkerConcrete);
+  addSolidBox(armX + 4.2, 0.16 + armH * 0.5, armZ + 4.8, 5.6, armH, 0.4, matBunkerConcrete);
+  addSolidBox(armX, 0.16 + 3.2, armZ + 4.8, 2.8, 1.2, 0.4, matBunkerConcrete);
+  // West doorway
+  addSolidBox(armX - 6.8, 0.16 + armH * 0.5, armZ - 3.0, 0.4, armH, 3.2, matBunkerConcrete);
+  addSolidBox(armX - 6.8, 0.16 + armH * 0.5, armZ + 3.0, 0.4, armH, 3.2, matBunkerConcrete);
+  addSolidBox(armX - 6.8, 0.16 + 3.2, armZ, 0.4, 1.2, 2.8, matBunkerConcrete);
+  addSolidBox(armX, 0.16 + armH + 0.16, armZ, armW + 0.6, 0.32, armD + 0.6, matRoof, 'metal');
+
+  // Armory signage + 4 interior Weapon Racks & Tactical Table
+  const armSignTex = trackTex(createStencilSignTexture('SECTOR 04 · ARMORY', 'RESTRICTED MUNITIONS', '#f59e0b', '#1b2226', maxAniso));
+  const armSign = new THREE.Mesh(
+    trackGeo(new THREE.PlaneGeometry(3.2, 0.85)),
+    trackMat(new THREE.MeshStandardMaterial({ map: armSignTex, roughness: 0.65, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -4 })),
+  );
+  armSign.position.set(armX, 3.25, armZ + 5.04);
+  sceneGroup.add(armSign);
+  buildArmoryWeaponRack(propCtx, armX - 3.2, 0.16, armZ - 4.1, 0, matSteel, matGunMetal, matWood);
+  buildArmoryWeaponRack(propCtx, armX + 0.0, 0.16, armZ - 4.1, 0, matSteel, matGunMetal, matWood);
+  buildArmoryWeaponRack(propCtx, armX + 3.2, 0.16, armZ - 4.1, 0, matSteel, matGunMetal, matWood);
+  buildArmoryWeaponRack(propCtx, armX + 6.1, 0.16, armZ, -Math.PI * 0.5, matSteel, matGunMetal, matWood);
+  buildOfficeDesk(propCtx, armX, 0.16, armZ + 0.2, 0, matSteel, matGunMetal);
+
+  // --- 5F. UNDERGROUND BUNKER WITH ONE SINGLE ENTRY/EXIT DOORWAY (X in [43, 62], Z in [-16, 4]) ---
+  const bFloorY = -3.6;
+  const bCeilY = -0.18; // Top of roof slab = 0.0m, flush with surrounding military base ground!
+  // Subterranean Bunker Floor Slab (y top = -3.6m)
+  addSolidBox(53.0, bFloorY - 0.16, -6.0, 18.8, 0.32, 20.4, matBunkerConcrete, 'concrete', false);
+  // Subterranean Bunker Outer Walls (y: -3.6..0.0)
+  addSolidBox(62.2, -1.8, -6.0, 0.45, 3.6, 20.4, matBunkerConcrete); // East wall
+  addSolidBox(53.0, -1.8, -16.0, 18.8, 3.6, 0.45, matBunkerConcrete); // North wall
+  addSolidBox(53.0, -1.8, 4.0, 18.8, 3.6, 0.45, matBunkerConcrete); // South wall
+  addSolidBox(43.8, -1.8, -12.4, 0.45, 3.6, 7.2, matBunkerConcrete); // West wall North of stairs
+  addSolidBox(43.8, -1.8, 0.4, 0.45, 3.6, 7.2, matBunkerConcrete); // West wall South of stairs
+
+  // Bunker Roof Slabs at Grade Level (y top = 0.02m, leaving exact stairwell opening X in [43.8, 52.8], Z in [-8.4, -3.6]!)
+  addSolidBox(53.0, bCeilY, -12.3, 18.8, 0.4, 7.8, matBaseConcrete, 'concrete', false); // North roof
+  addSolidBox(53.0, bCeilY, 0.3, 18.8, 0.4, 7.8, matBaseConcrete, 'concrete', false); // South roof
+  addSolidBox(57.6, bCeilY, -6.0, 9.6, 0.4, 4.8, matBaseConcrete, 'concrete', false); // East roof over main bunker chamber
+
+  // Surface Concrete Entry Hood over the Stairwell with ONE SINGLE BLAST DOORWAY facing West (X = 43.2)
+  addSolidBox(48.2, 1.5, -8.6, 9.8, 3.0, 0.4, matBunkerConcrete); // Hood North wall
+  addSolidBox(48.2, 1.5, -3.4, 9.8, 3.0, 0.4, matBunkerConcrete); // Hood South wall
+  addSolidBox(52.9, 1.5, -6.0, 0.4, 3.0, 5.2, matBunkerConcrete); // Hood East end wall
+  addSolidBox(48.2, 3.16, -6.0, 10.2, 0.32, 5.6, matBunkerConcrete); // Hood Roof
+  // Single West Entry/Exit Blast Door Frame (2.4m wide opening centered at Z = -6.0)
+  addSolidBox(43.4, 1.5, -7.8, 0.45, 3.0, 1.4, matBunkerConcrete);
+  addSolidBox(43.4, 1.5, -4.2, 0.45, 3.0, 1.4, matBunkerConcrete);
+  addSolidBox(43.4, 2.75, -6.0, 0.45, 0.5, 2.4, matSteel, 'metal');
+  const bunkerSignTex = trackTex(createStencilSignTexture('BUNKER 01 · SUB-LEVEL', 'SINGLE ACCESS ONLY', '#38bdf8', '#151c22', maxAniso));
+  const bunkerSign = new THREE.Mesh(
+    trackGeo(new THREE.PlaneGeometry(2.6, 0.68)),
+    trackMat(new THREE.MeshStandardMaterial({ map: bunkerSignTex, roughness: 0.6, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -4 })),
+  );
+  bunkerSign.position.set(43.14, 2.72, -6.0);
+  bunkerSign.rotation.y = -Math.PI * 0.5;
+  sceneGroup.add(bunkerSign);
+
+  // Concrete Stairwell Descending along +X from X = 43.8 (Y = 0) down to X = 52.6 (Y = -3.6)
+  physics.addRamp({
+    minX: 43.8,
+    maxX: 52.6,
+    minZ: -8.35,
+    maxZ: -3.65,
+    baseY: bFloorY,
+    topY: 0.04,
+    riseAxis: '-x',
+    surface: 'concrete',
+  });
+  const bSteps = 18;
+  const bStepW = 8.8 / bSteps;
+  const bStepH = (0.04 - bFloorY) / bSteps;
+  const bStepGeo = trackGeo(new THREE.BoxGeometry(bStepW - 0.004, bStepH, 4.7));
+  const bStepInst = new THREE.InstancedMesh(bStepGeo, matBunkerConcrete, bSteps);
+  for (let i = 0; i < bSteps; i++) {
+    // High at X=43.8 (i=0), descending to Y=-3.6 at X=52.6 (i=17)
+    const sx = 43.8 + (i + 0.5) * bStepW;
+    const sy = 0.04 - (i + 0.5) * bStepH;
+    dummy.position.set(sx, sy, -6.0);
+    dummy.rotation.set(0, 0, 0);
+    dummy.scale.set(1, 1, 1);
+    dummy.updateMatrix();
+    bStepInst.setMatrixAt(i, dummy.matrix);
+  }
+  bStepInst.instanceMatrix.needsUpdate = true;
+  bStepInst.computeBoundingSphere();
+  bStepInst.userData.surfaceMaterial = 'concrete';
+  sceneGroup.add(bStepInst);
+  raycastMeshes.push(bStepInst);
+
+  // Subterranean Bunker Interior Furnishings, Acoustic Zone & Cool Fluorescent Lighting
+  physics.addInteriorZone({ minX: 43.5, maxX: 62.0, minY: -4.0, maxY: 0.2, minZ: -16.0, maxZ: 4.0, material: 'concrete' });
+  buildOfficeDesk(propCtx, 58.0, bFloorY, -12.0, -Math.PI * 0.5, matSteel, matGunMetal);
+  buildOfficeDesk(propCtx, 58.0, bFloorY, 0.0, -Math.PI * 0.5, matSteel, matGunMetal);
+  buildArmoryWeaponRack(propCtx, 48.0, bFloorY, -15.1, 0, matSteel, matGunMetal, matWood);
+  buildArmoryWeaponRack(propCtx, 53.0, bFloorY, 3.1, Math.PI, matSteel, matGunMetal, matWood);
+  addSolidBox(55.0, bFloorY + 0.6, -6.0, 2.2, 1.2, 1.4, matSteel, 'metal'); // center command console
+
+  for (const [blx, blz] of [
+    [55.5, -11.0],
+    [55.5, -1.0],
+    [48.5, -6.0],
+  ]) {
+    const strip = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(1.4, 0.08, 0.2)), matBunkerStrip);
+    strip.position.set(blx, -0.45, blz);
+    sceneGroup.add(strip);
+    const pl = new THREE.PointLight(0xbbe6ff, 7.5, 16, 1.7);
+    pl.position.set(blx, -0.75, blz);
+    sceneGroup.add(pl);
+  }
+
+  // Instanced Fence Posts across Base & Comms Compound
+  const postGeo = trackGeo(new THREE.CylinderGeometry(0.06, 0.06, 3.05, 6));
+  const postInst = new THREE.InstancedMesh(postGeo, matSteel, fencePosts.length);
+  fencePosts.forEach(([px, pz], i) => {
+    dummy.position.set(px, 1.52, pz);
+    dummy.rotation.set(0, 0, 0);
+    dummy.scale.set(1, 1, 1);
+    dummy.updateMatrix();
+    postInst.setMatrixAt(i, dummy.matrix);
+  });
+  postInst.instanceMatrix.needsUpdate = true;
+  postInst.computeBoundingSphere();
+  sceneGroup.add(postInst);
+
+  // === 6. MASSIVE INSTANCED PINE FOREST & BOULDERS (Scaled by GraphicsQuality) ===
+  const rand = seededRand(202705);
+  const targetTrees = Math.max(120, Math.round(340 * qProfile.foliageDensity));
   const treeSpots: Array<{ x: number; y: number; z: number; scale: number; yaw: number; tint: THREE.Color }> = [];
+
   const isClearForTree = (tx: number, tz: number): boolean => {
-    // Keep inside compound clear except a few outer corners
-    if (Math.abs(tx) < 28.0 && Math.abs(tz) < 26.0) return false;
-    // Keep gate approaches clear for flanking lanes
-    if (Math.abs(tx) < 5.5 && Math.abs(tz) < 36.0) return false;
-    if (Math.abs(tz) < 5.0 && Math.abs(tx) < 36.0) return false;
+    // Keep Military Base compound + airstrip clear
+    if (tx >= 8 && tx <= 102 && tz >= -67 && tz <= 63) return false;
+    // Keep paved highway clear
+    if (Math.abs(tx - -2) < 8.5 && Math.abs(tz) < 120) return false;
+    // Keep river channel & banks clear
+    if (Math.abs(tx - getRiverCenterX(tz)) < 11.5) return false;
+    // Keep bridge dirt approaches clear
+    if (Math.abs(tz - -48) < 6.0 && tx > -78 && tx < 16) return false;
+    if (Math.abs(tz - 34) < 6.0 && tx > -78 && tx < 16) return false;
+    // Keep Village clusters & lone cabins clear
+    if (tx >= -82 && tx <= -40 && tz >= -74 && tz <= -42) return false;
+    if (tx >= -84 && tx <= -44 && tz >= 42 && tz <= 78) return false;
+    if (Math.hypot(tx - 78, tz - -84) < 11) return false;
+    if (Math.hypot(tx - -96, tz - 4) < 11) return false;
+    if (Math.hypot(tx - 84, tz - 82) < 11) return false;
     return true;
   };
 
-  for (let attempt = 0; attempt < 900 && treeSpots.length < 185; attempt++) {
-    const angle = rand() * Math.PI * 2;
-    const dist = 28.5 + Math.pow(rand(), 0.72) * 48.0;
-    const tx = Math.cos(angle) * dist;
-    const tz = Math.sin(angle) * dist;
+  for (let attempt = 0; attempt < 2600 && treeSpots.length < targetTrees; attempt++) {
+    const tx = (rand() - 0.5) * 285;
+    const tz = (rand() - 0.5) * 285;
     if (!isClearForTree(tx, tz)) continue;
-    if (treeSpots.some((s) => (s.x - tx) ** 2 + (s.z - tz) ** 2 < 14.5)) continue;
-
-    const ty = sampleForestTerrainY(tx, tz);
-    const scale = 0.85 + rand() * 0.38;
-    const tint = new THREE.Color().setHSL(
-      0.30 + (rand() - 0.5) * 0.05,
-      0.30 + rand() * 0.14,
-      0.19 + rand() * 0.09,
-    );
+    if (treeSpots.some((s) => (s.x - tx) ** 2 + (s.z - tz) ** 2 < 24.0)) continue;
+    const ty = sampleVisualTerrainY(tx, tz);
+    const scale = 0.9 + rand() * 0.55;
+    const tint = new THREE.Color().setHSL(0.30 + (rand() - 0.5) * 0.05, 0.30 + rand() * 0.14, 0.18 + rand() * 0.09);
     treeSpots.push({ x: tx, y: ty, z: tz, scale, yaw: rand() * Math.PI * 2, tint });
   }
 
-  // Composite 4-part pine tree: trunk + 3 layered conical needle tiers (bottom-center grounded)
-  const trunkGeo = trackGeo(new THREE.CylinderGeometry(0.18, 0.30, 3.2, 7));
-  trunkGeo.translate(0, 1.6, 0);
-  const tier1Geo = trackGeo(new THREE.ConeGeometry(2.35, 4.2, 8));
-  tier1Geo.translate(0, 4.1, 0);
-  const tier2Geo = trackGeo(new THREE.ConeGeometry(1.85, 3.6, 8));
-  tier2Geo.translate(0, 6.4, 0);
-  const tier3Geo = trackGeo(new THREE.ConeGeometry(1.2, 2.8, 8));
-  tier3Geo.translate(0, 8.4, 0);
+  const trunkGeo = trackGeo(new THREE.CylinderGeometry(0.18, 0.32, 3.6, 7));
+  trunkGeo.translate(0, 1.8, 0);
+  const tier1Geo = trackGeo(new THREE.ConeGeometry(2.5, 4.6, 8));
+  tier1Geo.translate(0, 4.5, 0);
+  const tier2Geo = trackGeo(new THREE.ConeGeometry(1.9, 3.8, 8));
+  tier2Geo.translate(0, 7.0, 0);
+  const tier3Geo = trackGeo(new THREE.ConeGeometry(1.25, 3.0, 8));
+  tier3Geo.translate(0, 9.2, 0);
 
-  const count = treeSpots.length;
-  const trunkInst = new THREE.InstancedMesh(trunkGeo, matBark, count);
-  const tier1Inst = new THREE.InstancedMesh(tier1Geo, matPineNeedles, count);
-  const tier2Inst = new THREE.InstancedMesh(tier2Geo, matPineNeedles, count);
-  const tier3Inst = new THREE.InstancedMesh(tier3Geo, matPineNeedles, count);
+  const tCount = treeSpots.length;
+  const trunkInst = new THREE.InstancedMesh(trunkGeo, matBark, tCount);
+  const tier1Inst = new THREE.InstancedMesh(tier1Geo, matPineNeedles, tCount);
+  const tier2Inst = new THREE.InstancedMesh(tier2Geo, matPineNeedles, tCount);
+  const tier3Inst = new THREE.InstancedMesh(tier3Geo, matPineNeedles, tCount);
 
-  trunkInst.castShadow = !isSoftwareGl;
-  tier1Inst.castShadow = !isSoftwareGl;
-  tier2Inst.castShadow = !isSoftwareGl;
+  trunkInst.castShadow = !isSoftwareGl && qProfile.castShadows;
+  tier1Inst.castShadow = !isSoftwareGl && qProfile.castShadows;
 
   treeSpots.forEach((t, i) => {
-    dummy.position.set(t.x, t.y - 0.08, t.z);
+    dummy.position.set(t.x, t.y - 0.1, t.z);
     dummy.rotation.set(0, t.yaw, 0);
     dummy.scale.setScalar(t.scale);
     dummy.updateMatrix();
@@ -535,8 +1053,7 @@ function buildTimberlineCompound(
     tier2Inst.setColorAt(i, t.tint.clone().offsetHSL(0, 0, 0.02));
     tier3Inst.setColorAt(i, t.tint.clone().offsetHSL(0, 0, 0.04));
 
-    // Add trunk collision box for trees inside the playable bounds
-    if (Math.abs(t.x) <= 42 && Math.abs(t.z) <= 42) {
+    if (Math.abs(t.x) <= 112 && Math.abs(t.z) <= 112) {
       const r = 0.34 * t.scale;
       physics.addBox({
         minX: t.x - r,
@@ -560,33 +1077,54 @@ function buildTimberlineCompound(
   }
   raycastMeshes.push(trunkInst);
 
-  // InstancedMesh mossy boulders scattered around outer forest lanes for natural cover
-  const rockGeo = trackGeo(new THREE.DodecahedronGeometry(1.1, 0));
-  const rockSpots: Array<[number, number, number]> = [
-    [-32, 0, -14],
-    [-33, 0, 12],
-    [32, 0, -12],
-    [33, 0, 14],
-    [-12, 0, -32],
-    [14, 0, -31],
-    [-14, 0, 32],
-    [12, 0, 31],
+  // Undergrowth grass tufts along forest clearings & riverbanks
+  const grassCount = Math.max(60, Math.round(220 * qProfile.foliageDensity));
+  const grassSpots: Array<{ x: number; y: number; z: number; scale: number; yaw: number; tint: THREE.Color }> = [];
+  for (let i = 0; i < grassCount; i++) {
+    const gx = (rand() - 0.5) * 210;
+    const gz = (rand() - 0.5) * 210;
+    if (gx >= 11 && gx <= 97 && gz >= -63 && gz <= 59) continue;
+    if (Math.abs(gx - getRiverCenterX(gz)) < 7.8) continue;
+    if (Math.abs(gx - -2) < 5.0) continue;
+    const gy = sampleVisualTerrainY(gx, gz);
+    grassSpots.push({
+      x: gx,
+      y: gy,
+      z: gz,
+      scale: 0.75 + rand() * 0.9,
+      yaw: rand() * Math.PI * 2,
+      tint: new THREE.Color().setHSL(0.24 + (rand() - 0.5) * 0.07, 0.32, 0.23 + rand() * 0.09),
+    });
+  }
+  buildInstancedGrassTufts(propCtx, grassSpots);
+
+  // Natural mossy valley boulders along riverbanks & forest flanks
+  const rockGeo = trackGeo(new THREE.DodecahedronGeometry(1.3, 0));
+  const rockSpots: Array<[number, number]> = [
+    [-12, -26],
+    [-38, -22],
+    [-14, 12],
+    [-38, 14],
+    [-10, 68],
+    [-40, -78],
+    [40, -82],
+    [44, 78],
   ];
   const rockInst = new THREE.InstancedMesh(rockGeo, matRock, rockSpots.length);
-  rockSpots.forEach(([rx, , rz], i) => {
-    const ry = sampleForestTerrainY(rx, rz);
-    dummy.position.set(rx, ry + 0.55, rz);
-    dummy.rotation.set(i * 0.4, i * 1.1, 0);
-    dummy.scale.set(1.3, 0.85, 1.1);
+  rockSpots.forEach(([rx, rz], i) => {
+    const ry = sampleVisualTerrainY(rx, rz);
+    dummy.position.set(rx, ry + 0.6, rz);
+    dummy.rotation.set(i * 0.5, i * 1.1, 0);
+    dummy.scale.set(1.4, 0.88, 1.2);
     dummy.updateMatrix();
     rockInst.setMatrixAt(i, dummy.matrix);
     physics.addBox({
-      minX: rx - 1.2,
-      maxX: rx + 1.2,
+      minX: rx - 1.4,
+      maxX: rx + 1.4,
       minY: ry,
-      maxY: ry + 1.45,
-      minZ: rz - 1.1,
-      maxZ: rz + 1.1,
+      maxY: ry + 1.5,
+      minZ: rz - 1.2,
+      maxZ: rz + 1.2,
       surface: 'concrete',
       blocksMovement: true,
     });
@@ -597,77 +1135,80 @@ function buildTimberlineCompound(
   sceneGroup.add(rockInst);
   raycastMeshes.push(rockInst);
 
-  // === 7. Outdoor + Indoor NavGraph (26 nodes linking cabins, yard, watchtower, & outer forest) ===
+  // === 7. VALLEY-WIDE NAVGRAPH (Villages, Bridges, Highway, Military Base, Airstrip, Helipad, Bunker) ===
   const rawNodes: NavNode[] = [
-    // Central compound yard & container lanes
-    { id: 'y_center', position: [0, 0, 0.5], zoneId: 'default', neighbors: ['y_n', 'y_s', 'y_w', 'y_e'], isCover: true, coverNormal: [0, 1] },
-    { id: 'y_n', position: [0, 0, -10.0], zoneId: 'default', neighbors: ['y_center', 'gate_n', 'cab_nw_e', 'cab_ne_w'], isCover: true, coverNormal: [0, 1] },
-    { id: 'y_s', position: [0, 0, 11.2], zoneId: 'default', neighbors: ['y_center', 'gate_s', 'cab_sw_e', 'tw_base'], isCover: true, coverNormal: [0, -1] },
-    { id: 'y_w', position: [-10.5, 0, 0], zoneId: 'default', neighbors: ['y_center', 'gate_w', 'cab_nw_s', 'cab_sw_n'], isCover: true, coverNormal: [1, 0] },
-    { id: 'y_e', position: [11.0, 0, 0], zoneId: 'default', neighbors: ['y_center', 'gate_e', 'cab_ne_s', 'tw_base'], isCover: true, coverNormal: [-1, 0] },
+    // Paved Highway spine
+    { id: 'hwy_n', position: [-2, 0.05, -72], zoneId: 'default', neighbors: ['hwy_br_n', 'base_gate_n'] },
+    { id: 'hwy_br_n', position: [-2, 0.05, -48], zoneId: 'default', neighbors: ['hwy_n', 'hwy_mid', 'br_n_e', 'base_gate_nw'] },
+    { id: 'hwy_mid', position: [-2, 0.05, -6], zoneId: 'default', neighbors: ['hwy_br_n', 'hwy_br_s'], isCover: true, coverNormal: [1, 0] },
+    { id: 'hwy_br_s', position: [-2, 0.05, 34], zoneId: 'default', neighbors: ['hwy_mid', 'hwy_s', 'br_s_e', 'base_gate_sw'] },
+    { id: 'hwy_s', position: [-2, 0.05, 72], zoneId: 'default', neighbors: ['hwy_br_s', 'base_gate_s'] },
 
-    // Enterable Cabins (exterior thresholds + interior nodes)
-    { id: 'cab_nw_s', position: [-15.5, 0, -8.8], zoneId: 'default', neighbors: ['y_w', 'cab_nw_in'] },
-    { id: 'cab_nw_e', position: [-9.2, 0, -14.0], zoneId: 'default', neighbors: ['y_n', 'cab_nw_in'] },
-    { id: 'cab_nw_in', position: [-15.5, 0.14, -14.0], zoneId: 'default', neighbors: ['cab_nw_s', 'cab_nw_e'], isCover: true, coverNormal: [1, 1] },
+    // Bridges & West Villages
+    { id: 'br_n_e', position: [getRiverCenterX(-48) + 10, 0.1, -48], zoneId: 'default', neighbors: ['hwy_br_n', 'br_n_w'] },
+    { id: 'br_n_w', position: [getRiverCenterX(-48) - 10, 0.1, -48], zoneId: 'default', neighbors: ['br_n_e', 'vil_nw_c'] },
+    { id: 'vil_nw_c', position: [-58, 0, -52], zoneId: 'default', neighbors: ['br_n_w', 'vil_nw_n', 'lone_w'], isCover: true, coverNormal: [1, 1] },
+    { id: 'vil_nw_n', position: [-58, 0.3, -64], zoneId: 'default', neighbors: ['vil_nw_c'] },
 
-    { id: 'cab_ne_s', position: [15.5, 0, -8.4], zoneId: 'default', neighbors: ['y_e', 'cab_ne_in'] },
-    { id: 'cab_ne_w', position: [9.2, 0, -13.5], zoneId: 'default', neighbors: ['y_n', 'cab_ne_in'] },
-    { id: 'cab_ne_in', position: [15.5, 0.14, -13.5], zoneId: 'default', neighbors: ['cab_ne_s', 'cab_ne_w'], isCover: true, coverNormal: [-1, 1] },
+    { id: 'br_s_e', position: [getRiverCenterX(34) + 10, 0.1, 34], zoneId: 'default', neighbors: ['hwy_br_s', 'br_s_w'] },
+    { id: 'br_s_w', position: [getRiverCenterX(34) - 10, 0.1, 34], zoneId: 'default', neighbors: ['br_s_e', 'vil_sw_c'] },
+    { id: 'vil_sw_c', position: [-62, 0, 52], zoneId: 'default', neighbors: ['br_s_w', 'vil_sw_s', 'lone_w'], isCover: true, coverNormal: [1, -1] },
+    { id: 'vil_sw_s', position: [-56, 0.3, 70], zoneId: 'default', neighbors: ['vil_sw_c'] },
+    { id: 'lone_w', position: [-88, 0, 4], zoneId: 'default', neighbors: ['vil_nw_c', 'vil_sw_c'] },
 
-    { id: 'cab_sw_n', position: [-15.0, 0, 8.2], zoneId: 'default', neighbors: ['y_w', 'cab_sw_in'] },
-    { id: 'cab_sw_e', position: [-8.8, 0, 13.5], zoneId: 'default', neighbors: ['y_s', 'cab_sw_in'] },
-    { id: 'cab_sw_in', position: [-15.0, 0.14, 13.5], zoneId: 'default', neighbors: ['cab_sw_n', 'cab_sw_e'], isCover: true, coverNormal: [1, -1] },
+    // Military Base Gates & Interior Spine
+    { id: 'base_gate_nw', position: [14, 0.04, -48], zoneId: 'default', neighbors: ['hwy_br_n', 'comms_gate', 'gar_1_e'] },
+    { id: 'base_gate_sw', position: [14, 0.04, 34], zoneId: 'default', neighbors: ['hwy_br_s', 'gar_2_e', 'heli_foot'] },
+    { id: 'base_gate_n', position: [52, 0.04, -62], zoneId: 'default', neighbors: ['hwy_n', 'armory_out', 'airstrip_n', 'lone_ne'] },
+    { id: 'base_gate_s', position: [52, 0.04, 58], zoneId: 'default', neighbors: ['hwy_s', 'heli_foot', 'airstrip_s', 'lone_se'] },
+    { id: 'lone_ne', position: [74, 0, -76], zoneId: 'default', neighbors: ['base_gate_n'] },
+    { id: 'lone_se', position: [78, 0, 74], zoneId: 'default', neighbors: ['base_gate_s'] },
 
-    // Watchtower approach & overlook deck
-    { id: 'tw_base', position: [14.5, 0, 4.2], zoneId: 'default', neighbors: ['y_e', 'y_s', 'tw_top'] },
-    { id: 'tw_top', position: [14.5, twH + 0.12, 13.5], zoneId: 'default', neighbors: ['tw_base'], isCover: true, coverNormal: [-1, -1] },
+    // Comms Station, Garages, Armory, Helipad, Airstrip & Single-Entry Underground Bunker
+    { id: 'comms_gate', position: [25.5, 0.04, -30], zoneId: 'default', neighbors: ['base_gate_nw', 'armory_out', 'gar_1_e'], isCover: true, coverNormal: [0, 1] },
+    { id: 'gar_1_e', position: [37, 0.04, -14], zoneId: 'default', neighbors: ['base_gate_nw', 'comms_gate', 'gar_2_e', 'bunker_door'], isCover: true, coverNormal: [-1, 0] },
+    { id: 'gar_2_e', position: [37, 0.04, 10], zoneId: 'default', neighbors: ['gar_1_e', 'base_gate_sw', 'heli_foot', 'bunker_door'], isCover: true, coverNormal: [-1, 0] },
+    { id: 'armory_out', position: [50, 0.04, -32], zoneId: 'default', neighbors: ['base_gate_n', 'comms_gate', 'armory_in', 'airstrip_n'] },
+    { id: 'armory_in', position: [50, 0.16, -40], zoneId: 'default', neighbors: ['armory_out'], isCover: true, coverNormal: [0, 1] },
+    { id: 'heli_foot', position: [34, 0.04, 36], zoneId: 'default', neighbors: ['base_gate_sw', 'gar_2_e', 'base_gate_s', 'heli_top'] },
+    { id: 'heli_top', position: [44, heliH, 36], zoneId: 'default', neighbors: ['heli_foot'], isCover: true, coverNormal: [1, 0] },
+    { id: 'airstrip_n', position: [76, 0.08, -42], zoneId: 'default', neighbors: ['base_gate_n', 'armory_out', 'airstrip_mid'] },
+    { id: 'airstrip_mid', position: [76, 0.08, -2], zoneId: 'default', neighbors: ['airstrip_n', 'airstrip_s', 'bunker_door'] },
+    { id: 'airstrip_s', position: [76, 0.08, 40], zoneId: 'default', neighbors: ['airstrip_mid', 'base_gate_s'] },
 
-    // 4 Breached Compound Gates
-    { id: 'gate_n', position: [0, 0, -24.0], zoneId: 'default', neighbors: ['y_n', 'for_n'] },
-    { id: 'gate_s', position: [0, 0, 24.0], zoneId: 'default', neighbors: ['y_s', 'for_s'] },
-    { id: 'gate_w', position: [-26.0, 0, 0], zoneId: 'default', neighbors: ['y_w', 'for_w'] },
-    { id: 'gate_e', position: [26.0, 0, 0], zoneId: 'default', neighbors: ['y_e', 'for_e'] },
-
-    // Outer Forest Perimeter Flanking Ring
-    { id: 'for_n', position: [0, sampleForestTerrainY(0, -32), -32], zoneId: 'default', neighbors: ['gate_n', 'for_nw', 'for_ne'], isCover: true, coverNormal: [0, 1] },
-    { id: 'for_s', position: [0, sampleForestTerrainY(0, 32), 32], zoneId: 'default', neighbors: ['gate_s', 'for_sw', 'for_se'], isCover: true, coverNormal: [0, -1] },
-    { id: 'for_w', position: [-33, sampleForestTerrainY(-33, 0), 0], zoneId: 'default', neighbors: ['gate_w', 'for_nw', 'for_sw'], isCover: true, coverNormal: [1, 0] },
-    { id: 'for_e', position: [33, sampleForestTerrainY(33, 0), 0], zoneId: 'default', neighbors: ['gate_e', 'for_ne', 'for_se'], isCover: true, coverNormal: [-1, 0] },
-    { id: 'for_nw', position: [-31, sampleForestTerrainY(-31, -29), -29], zoneId: 'default', neighbors: ['for_n', 'for_w'] },
-    { id: 'for_ne', position: [31, sampleForestTerrainY(31, -29), -29], zoneId: 'default', neighbors: ['for_n', 'for_e'] },
-    { id: 'for_sw', position: [-31, sampleForestTerrainY(-31, 29), 29], zoneId: 'default', neighbors: ['for_s', 'for_w'] },
-    { id: 'for_se', position: [31, sampleForestTerrainY(31, 29), 29], zoneId: 'default', neighbors: ['for_s', 'for_e'] },
+    // Underground Bunker (single entry/exit doorway!)
+    { id: 'bunker_door', position: [41.5, 0.04, -6.0], zoneId: 'default', neighbors: ['gar_1_e', 'gar_2_e', 'airstrip_mid', 'bunker_in'] },
+    { id: 'bunker_in', position: [55.0, bFloorY, -6.0], zoneId: 'default', neighbors: ['bunker_door'], isCover: true, coverNormal: [-1, 0] },
   ];
 
   const teamA: SpawnPoint[] = [
-    { position: [0, 0, -21.2], yaw: Math.PI },
-    { position: [-15.5, 0.14, -14.0], yaw: Math.PI * 0.85 },
-    { position: [15.5, 0.14, -13.5], yaw: -Math.PI * 0.85 },
-    { position: [-7.5, 0, -20.5], yaw: Math.PI },
-    { position: [7.5, 0, -20.5], yaw: Math.PI },
-    { position: [0, sampleForestTerrainY(0, -31), -31], yaw: Math.PI },
+    { position: [-54, 0, -48], yaw: Math.PI * 0.5 },
+    { position: [-58, 0.3, -64], yaw: Math.PI * 0.65 },
+    { position: [-2, 0.05, -62], yaw: Math.PI },
+    { position: [-62, 0, 48], yaw: Math.PI * 0.35 },
+    { position: [-88, 0, 4], yaw: Math.PI * 0.5 },
+    { position: [-2, 0.05, 58], yaw: 0 },
   ];
   const teamB: SpawnPoint[] = [
-    { position: [0, 0, 21.2], yaw: 0 },
-    { position: [-15.0, 0.14, 13.5], yaw: Math.PI * 0.15 },
-    { position: [14.5, twH + 0.12, 13.5], yaw: -Math.PI * 0.25 },
-    { position: [-7.5, 0, 20.5], yaw: 0 },
-    { position: [7.5, 0, 20.5], yaw: 0 },
-    { position: [0, sampleForestTerrainY(0, 31), 31], yaw: 0 },
+    { position: [50, 0.04, -54], yaw: Math.PI },
+    { position: [76, 0.08, -42], yaw: -Math.PI * 0.65 },
+    { position: [76, 0.08, 36], yaw: -Math.PI * 0.35 },
+    { position: [37, 0.04, 24], yaw: -Math.PI * 0.5 },
+    { position: [37, 0.04, -22], yaw: -Math.PI * 0.5 },
+    { position: [54, bFloorY, -6], yaw: -Math.PI * 0.5 },
   ];
   const ffa: SpawnPoint[] = [
     ...teamA,
     ...teamB,
-    { position: [-21.5, 0, 0], yaw: -Math.PI * 0.5 },
-    { position: [21.5, 0, 0], yaw: Math.PI * 0.5 },
+    { position: [44, heliH, 36], yaw: -Math.PI * 0.5 },
+    { position: [74, 0, -76], yaw: Math.PI },
   ];
 
   physics.setRaycastMeshes(raycastMeshes);
 
   return {
     id: 'timberline_compound',
-    name: 'Timberline Compound',
+    name: 'Timberline Valley & Base',
     sceneGroup,
     physics,
     raycastMeshes,
@@ -676,12 +1217,20 @@ function buildTimberlineCompound(
       teamA,
       teamB,
       ffa,
-      playerStart: teamA[0],
+      playerStart: teamB[3], // drops player facing the base, garages, radar & valley!
       zombieSpawners: [],
     },
-    terrainHeightAt: sampleForestTerrainY,
+    terrainHeightAt: samplePhysicsTerrainY,
     interactables: [],
     lightingPreset: LIGHTING_PRESET,
+    update: (dt, elapsedSec) => {
+      // Smooth rotating radar dish + blinking aviation obstruction beacon
+      radar.dishPivot.rotation.y += dt * 0.55;
+      const blink = Math.sin(elapsedSec * 4.2) > 0.25;
+      radar.beaconMat.emissiveIntensity = blink ? 3.2 : 0.35;
+      // Subtle flowing alpine river scroll
+      riverTex.offset.y = -(elapsedSec * 0.14) % 1;
+    },
     dispose: () => {
       scene.remove(sceneGroup);
       envTex.dispose();
@@ -695,13 +1244,13 @@ function buildTimberlineCompound(
 
 export const TIMBERLINE_COMPOUND_MAP: IMapDefinition = {
   id: 'timberline_compound',
-  name: 'Timberline Compound',
-  subtitle: 'Overcast Forest & Enterable Cabins',
+  name: 'Timberline Valley',
+  subtitle: 'Open Forest, Villages & Airbase',
   description:
-    'Fenced logging compound ringed by dense instanced pine woods, featuring three enterable timber cabins, a climbable watchtower overlook, and corrugated yard cover.',
+    'Expansive alpine valley with two timber villages, lone cabins, winding river & bridges, paved roads, and a full military base featuring a radar comms compound, two garages, lit airstrip, elevated helipad with helicopter prop, armory, and single-entry underground bunker.',
   mode: 'battle',
   status: 'playable',
-  environmentTags: ['Outdoor & Indoor', 'Mid-Long Range', 'Pine Forest'],
+  environmentTags: ['Open Valley', 'Airbase & Bunker', 'Villages & River'],
   accentHex: '#38bdf8',
   previewStyle: 'forest_compound',
   build: buildTimberlineCompound,

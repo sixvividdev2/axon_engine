@@ -1,13 +1,23 @@
 import * as THREE from 'three';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import { BodycamPhysicsWorld, BodycamSurfaceMaterial } from '../bodycam-sdk';
+import { getGraphicsQualityProfile, GraphicsQualityId } from '../data/graphicsQuality';
 import { createStencilSignTexture } from '../gym/GymTextures';
 import {
+  buildOfficeDesk,
+  buildRustedVehicle,
+  PropFactoryContext,
+  VehicleMaterials,
+} from './MapPropFactory';
+import {
+  createAsphaltRoadTexture,
   createCabinWoodTexture,
+  createChalkBlueprintTexture,
   createCinemaScreenTexture,
-  createSovietConcreteTexture,
-  createTheaterTileTexture,
-  createTheaterWallTexture,
+  createKinoArtDecoTileTexture,
+  createKinoEmeraldWallTexture,
+  createKinoPosterTexture,
+  createRustedMetalTexture,
   createWallBuyTexture,
 } from './MapTextures';
 import {
@@ -20,24 +30,28 @@ import {
   ZombieSpawnerDef,
 } from './types';
 
+// Art-Deco Noir Atmosphere: Deep slate-midnight sky, cold moonlight, emerald-brass interior (less red!)
 const LIGHTING_PRESET: MapLightingPreset = {
-  backgroundHex: 0x0b0d14,
-  fogHex: 0x100d11,
-  fogDensity: 0.026,
-  envIntensity: 0.22,
-  hemiSkyHex: 0x45526d,
-  hemiGroundHex: 0x1a1214,
-  hemiIntensity: 0.34,
-  keyLightHex: 0x8ea8d6,
-  keyLightIntensity: 0.62,
-  keyLightPos: [18, 30, 14],
+  backgroundHex: 0x090f14,
+  fogHex: 0x0b1216,
+  fogDensity: 0.022,
+  envIntensity: 0.28,
+  hemiSkyHex: 0x526b84,
+  hemiGroundHex: 0x161f1e,
+  hemiIntensity: 0.42,
+  keyLightHex: 0x9ec0e6,
+  keyLightIntensity: 0.72,
+  keyLightPos: [20, 32, 14],
 };
 
 function buildKinoTheater(
   scene: THREE.Scene,
   renderer: THREE.WebGLRenderer,
   isSoftwareGl: boolean,
+  graphicsQuality?: GraphicsQualityId,
 ): BuiltMapInstance {
+  const qProfile = getGraphicsQualityProfile(graphicsQuality);
+
   const physics = new BodycamPhysicsWorld();
   physics.baseFloorY = 0;
   physics.boundsMinX = -22.2;
@@ -68,12 +82,15 @@ function buildKinoTheater(
   };
 
   scene.background = new THREE.Color(LIGHTING_PRESET.backgroundHex);
-  scene.fog = new THREE.FogExp2(LIGHTING_PRESET.fogHex, LIGHTING_PRESET.fogDensity);
+  scene.fog = new THREE.FogExp2(
+    LIGHTING_PRESET.fogHex,
+    LIGHTING_PRESET.fogDensity * qProfile.fogDensityScale,
+  );
 
   const pmrem = new THREE.PMREMGenerator(renderer);
   const envTex = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
   scene.environment = envTex;
-  scene.environmentIntensity = LIGHTING_PRESET.envIntensity;
+  scene.environmentIntensity = LIGHTING_PRESET.envIntensity * qProfile.envIntensityScale;
   pmrem.dispose();
 
   const hemi = new THREE.HemisphereLight(
@@ -83,77 +100,70 @@ function buildKinoTheater(
   );
   sceneGroup.add(hemi);
 
-  // Cool eerie moonlight directional light (shines down into moonlit East Back Alley & Lobby skylights)
   const moonLight = new THREE.DirectionalLight(
     LIGHTING_PRESET.keyLightHex,
     LIGHTING_PRESET.keyLightIntensity,
   );
   moonLight.position.set(...LIGHTING_PRESET.keyLightPos);
-  if (!isSoftwareGl) {
+  if (!isSoftwareGl && qProfile.castShadows) {
     moonLight.castShadow = true;
-    moonLight.shadow.mapSize.set(1024, 1024);
+    const sm = Math.min(2048, qProfile.shadowMapSize);
+    moonLight.shadow.mapSize.set(sm, sm);
     moonLight.shadow.camera.near = 2;
-    moonLight.shadow.camera.far = 80;
+    moonLight.shadow.camera.far = 85;
     moonLight.shadow.camera.left = -28;
     moonLight.shadow.camera.right = 28;
     moonLight.shadow.camera.top = 28;
     moonLight.shadow.camera.bottom = -28;
     moonLight.shadow.bias = -0.0005;
-    moonLight.shadow.normalBias = 0.02;
+    moonLight.shadow.normalBias = 0.025;
   }
   sceneGroup.add(moonLight);
 
-  const maxAniso = renderer.capabilities.getMaxAnisotropy();
-  const tileTex = trackTex(createTheaterTileTexture(maxAniso, 6, 4));
-  const wallTex = trackTex(createTheaterWallTexture(maxAniso, 3, 1));
-  const stageWoodTex = trackTex(createCabinWoodTexture(maxAniso, 4, 2, '#513726', 1948));
-  const crateWoodTex = trackTex(createCabinWoodTexture(maxAniso, 1, 1, '#5d432c', 1952));
-  const alleyConcTex = trackTex(createSovietConcreteTexture(maxAniso, 4, 4, '#363b40', 1962));
+  const maxAniso = Math.min(qProfile.anisotropyCap, renderer.capabilities.getMaxAnisotropy() || 4);
+
+  // Original Art-Deco Noir Textures (Emerald-Jade, Tarnished Brass, Cream Terrazzo, Dark Walnut)
+  const tileTex = trackTex(createKinoArtDecoTileTexture(maxAniso, 6, 4));
+  const wallTex = trackTex(createKinoEmeraldWallTexture(maxAniso, 3, 1));
+  const stageWoodTex = trackTex(createCabinWoodTexture(maxAniso, 4, 2, '#423225', 1948));
+  const crateWoodTex = trackTex(createCabinWoodTexture(maxAniso, 1, 1, '#584430', 1952));
+  const alleyTex = trackTex(createAsphaltRoadTexture(maxAniso, 5, 5, false, 1962));
   const screenTex = trackTex(createCinemaScreenTexture(maxAniso));
+  const rustTex = trackTex(createRustedMetalTexture(maxAniso, '#364648', 1943));
 
   const matTile = trackMat(
-    new THREE.MeshStandardMaterial({
-      map: tileTex,
-      roughness: 0.42,
-      metalness: 0.08,
-      polygonOffset: true,
-      polygonOffsetFactor: -2,
-      polygonOffsetUnits: -4,
-    }),
+    new THREE.MeshStandardMaterial({ map: tileTex, roughness: 0.38, metalness: 0.1 }),
   );
   const matTheaterWall = trackMat(
-    new THREE.MeshStandardMaterial({ map: wallTex, roughness: 0.84, metalness: 0.05 }),
+    new THREE.MeshStandardMaterial({ map: wallTex, roughness: 0.82, metalness: 0.06 }),
   );
+  // Deep slate-emerald carpet & emerald velvet drapes/seats (replacing red!)
   const matCarpet = trackMat(
-    new THREE.MeshStandardMaterial({
-      color: 0x45151a,
-      roughness: 0.96,
-      metalness: 0.02,
-      polygonOffset: true,
-      polygonOffsetFactor: -2,
-      polygonOffsetUnits: -4,
-    }),
+    new THREE.MeshStandardMaterial({ color: 0x162928, roughness: 0.96, metalness: 0.02 }),
   );
   const matVelvet = trackMat(
-    new THREE.MeshStandardMaterial({ color: 0x7a171e, roughness: 0.9, metalness: 0.04 }),
+    new THREE.MeshStandardMaterial({ color: 0x17453e, roughness: 0.88, metalness: 0.05 }),
   );
   const matCastIron = trackMat(
-    new THREE.MeshStandardMaterial({ color: 0x202124, roughness: 0.55, metalness: 0.72 }),
+    new THREE.MeshStandardMaterial({ color: 0x202427, roughness: 0.52, metalness: 0.74 }),
   );
   const matBrass = trackMat(
-    new THREE.MeshStandardMaterial({ color: 0xb89448, roughness: 0.35, metalness: 0.82 }),
+    new THREE.MeshStandardMaterial({ color: 0xbfa054, roughness: 0.32, metalness: 0.84 }),
+  );
+  const matCopper = trackMat(
+    new THREE.MeshStandardMaterial({ color: 0x9e623d, roughness: 0.36, metalness: 0.82 }),
   );
   const matStageWood = trackMat(
-    new THREE.MeshStandardMaterial({ map: stageWoodTex, roughness: 0.78, metalness: 0.04 }),
+    new THREE.MeshStandardMaterial({ map: stageWoodTex, roughness: 0.76, metalness: 0.04 }),
   );
   const matBarricadeWood = trackMat(
     new THREE.MeshStandardMaterial({ map: crateWoodTex, roughness: 0.9, metalness: 0.02 }),
   );
   const matAlley = trackMat(
-    new THREE.MeshStandardMaterial({ map: alleyConcTex, roughness: 0.76, metalness: 0.08 }),
+    new THREE.MeshStandardMaterial({ map: alleyTex, roughness: 0.74, metalness: 0.08 }),
   );
   const matCeiling = trackMat(
-    new THREE.MeshStandardMaterial({ color: 0x1b1618, roughness: 0.95, metalness: 0.03 }),
+    new THREE.MeshStandardMaterial({ color: 0x13191b, roughness: 0.95, metalness: 0.03 }),
   );
   const matScreen = trackMat(
     new THREE.MeshStandardMaterial({
@@ -165,14 +175,48 @@ function buildKinoTheater(
       polygonOffsetUnits: -4,
     }),
   );
+  // Subtle warm-amber/emerald Art-Deco exit lamps instead of harsh red
   const matExitGlow = trackMat(
     new THREE.MeshStandardMaterial({
-      color: 0xdc2626,
-      emissive: 0xdc2626,
+      color: 0x5eead4,
+      emissive: 0x14b8a6,
       emissiveIntensity: 1.5,
       roughness: 0.3,
     }),
   );
+  const matSconceAmber = trackMat(
+    new THREE.MeshStandardMaterial({
+      color: 0xffe4b5,
+      emissive: 0xe6a84a,
+      emissiveIntensity: 1.8,
+      roughness: 0.25,
+    }),
+  );
+  const matMeteorShard = trackMat(
+    new THREE.MeshStandardMaterial({
+      color: 0x34d399,
+      emissive: 0x10b981,
+      emissiveIntensity: 2.2,
+      roughness: 0.18,
+      metalness: 0.25,
+    }),
+  );
+  const matFilmCanister = trackMat(
+    new THREE.MeshStandardMaterial({
+      color: 0xbec5c8,
+      roughness: 0.32,
+      metalness: 0.86,
+    }),
+  );
+
+  const propCtx: PropFactoryContext = {
+    sceneGroup,
+    physics,
+    raycastMeshes,
+    isSoftwareGl,
+    trackGeo,
+    trackMat,
+  };
 
   const addSolidBox = (
     x: number,
@@ -188,8 +232,8 @@ function buildKinoTheater(
   ): THREE.Mesh => {
     const mesh = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(w, h, d)), mat);
     mesh.position.set(x, y, z);
-    mesh.castShadow = !isSoftwareGl && h > 0.4;
-    mesh.receiveShadow = !isSoftwareGl;
+    mesh.castShadow = !isSoftwareGl && qProfile.castShadows && h > 0.35;
+    mesh.receiveShadow = !isSoftwareGl && qProfile.castShadows;
     mesh.userData.surfaceMaterial = surface;
     parent.add(mesh);
     raycastMeshes.push(mesh);
@@ -207,31 +251,38 @@ function buildKinoTheater(
     return mesh;
   };
 
-  // === 1. FLOORING & ZONES ===
-  // Base dark ground plane
-  const baseFloor = new THREE.Mesh(trackGeo(new THREE.PlaneGeometry(54, 54)), matAlley);
+  // === 1. FLOORING & ZONES (Strict Y separation >= 0.035m -> ZERO Z-FIGHTING) ===
+  const baseFloor = new THREE.Mesh(trackGeo(new THREE.PlaneGeometry(58, 58)), matAlley);
   baseFloor.rotation.x = -Math.PI * 0.5;
-  baseFloor.receiveShadow = !isSoftwareGl;
+  baseFloor.position.y = 0;
+  baseFloor.receiveShadow = !isSoftwareGl && qProfile.castShadows;
   baseFloor.userData.surfaceMaterial = 'asphalt';
   sceneGroup.add(baseFloor);
   raycastMeshes.push(baseFloor);
 
-  // Grand Lobby Checkered Tile (Z in [8.25, 21.95], X in [-12.75, 12.75])
-  const lobbyFloor = new THREE.Mesh(trackGeo(new THREE.PlaneGeometry(25.5, 13.7)), matTile);
-  lobbyFloor.rotation.x = -Math.PI * 0.5;
+  // Grand Foyer Art-Deco Terrazzo Slab (solid thin slab y top = 0.04m)
+  const lobbyFloor = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(25.5, 0.04, 13.7)), matTile);
   lobbyFloor.position.set(0, 0.02, 15.1);
-  lobbyFloor.receiveShadow = !isSoftwareGl;
+  lobbyFloor.receiveShadow = !isSoftwareGl && qProfile.castShadows;
   lobbyFloor.userData.surfaceMaterial = 'concrete';
   sceneGroup.add(lobbyFloor);
   raycastMeshes.push(lobbyFloor);
   physics.addSurfaceZone({ minX: -13, maxX: 13, minZ: 8, maxZ: 22, surface: 'concrete' });
 
-  // Main Auditorium Sloped Carpet Floor (Z in [-8, 7.75], seated cleanly above baseFloor without clipping pitFloor)
+  // West Dressing Room Walnut Plank Floor (y top = 0.04m)
+  const westFloor = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(8.6, 0.04, 37.6)), matStageWood);
+  westFloor.position.set(-17.6, 0.02, -4.8);
+  westFloor.receiveShadow = !isSoftwareGl && qProfile.castShadows;
+  westFloor.userData.surfaceMaterial = 'wood';
+  sceneGroup.add(westFloor);
+  raycastMeshes.push(westFloor);
+
+  // Main Auditorium Sloped Emerald Carpet Floor
   const audFloorSlopeLen = Math.hypot(15.75, 1.2);
   const audFloor = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(25.5, 0.14, audFloorSlopeLen)), matCarpet);
-  audFloor.position.set(0, 0.56, -0.125);
+  audFloor.position.set(0, 0.57, -0.125);
   audFloor.rotation.x = Math.atan2(1.2, 15.75);
-  audFloor.receiveShadow = !isSoftwareGl;
+  audFloor.receiveShadow = !isSoftwareGl && qProfile.castShadows;
   audFloor.userData.surfaceMaterial = 'wood';
   sceneGroup.add(audFloor);
   raycastMeshes.push(audFloor);
@@ -246,18 +297,21 @@ function buildKinoTheater(
     surface: 'wood',
   });
 
-  // Flat orchestra pit floor between sloped seats & stage (Z in [-15.0, -8.05], zero overlap with audFloor)
-  const pitFloor = new THREE.Mesh(trackGeo(new THREE.PlaneGeometry(25.5, 6.95)), matCarpet);
-  pitFloor.rotation.x = -Math.PI * 0.5;
-  pitFloor.position.set(0, 0.02, -11.525);
-  pitFloor.receiveShadow = !isSoftwareGl;
+  // Flat orchestra pit floor (y top = 0.04m, cleanly clears sloped floor)
+  const pitFloor = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(25.5, 0.04, 6.9)), matCarpet);
+  pitFloor.position.set(0, 0.02, -11.55);
+  pitFloor.receiveShadow = !isSoftwareGl && qProfile.castShadows;
   pitFloor.userData.surfaceMaterial = 'wood';
   sceneGroup.add(pitFloor);
   raycastMeshes.push(pitFloor);
 
-  // Elevated Wooden Stage (Z in [-24, -15], X in [-12.5, 12.5], Y = 0.85m)
+  // Elevated Walnut Stage (Z in [-24, -15], Y = 0.85m) + Brass Stage Footlight Apron
   addSolidBox(0, 0.425, -19.5, 25.0, 0.85, 9.0, matStageWood, 'wood');
-  // Twin side stage access ramps (smooth kiting up/down the stage!)
+  for (let fx = -6.0; fx <= 6.0; fx += 2.0) {
+    const hood = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(0.45, 0.12, 0.22)), matBrass);
+    hood.position.set(fx, 0.91, -15.16);
+    sceneGroup.add(hood);
+  }
   for (const sx of [-9.2, 9.2]) {
     physics.addRamp({
       minX: sx - 1.8,
@@ -275,68 +329,82 @@ function buildKinoTheater(
     );
     stRamp.position.set(sx, 0.36, -13.8);
     stRamp.rotation.x = Math.atan2(0.85, 2.4);
-    stRamp.receiveShadow = !isSoftwareGl;
+    stRamp.receiveShadow = !isSoftwareGl && qProfile.castShadows;
     stRamp.userData.surfaceMaterial = 'wood';
     sceneGroup.add(stRamp);
     raycastMeshes.push(stRamp);
   }
 
-  // Interior Acoustic Zones (Lobby, Auditorium, West Wing are indoor; East Alley is outdoor!)
   physics.addInteriorZone({ minX: -22, maxX: 13, minY: 0, maxY: 9, minZ: -24, maxZ: 22, material: 'wood' });
 
-  // === 2. MAIN ARCHITECTURAL WALLS & CEILINGS (non-overlapping corner joints) ===
+  // === 2. MAIN ARCHITECTURAL WALLS & CEILINGS (Non-overlapping corner joints) ===
   const H = 7.6;
-  // South Grand Entrance Wall (behind player spawn, Z = 22.2, X in [-13.225, 13.225])
   addSolidBox(0, H * 0.5, 22.2, 26.45, H, 0.5, matTheaterWall);
-  // North Stage Back Wall (Z = -24.2, X in [-22.45, 22.45])
   addSolidBox(0, H * 0.5, -24.2, 44.9, H, 0.5, matTheaterWall);
-  // West Outer Wall (X = -22.2, Z in [-23.95, 14.45], butts cleanly against North wall)
   addSolidBox(-22.2, H * 0.5, -4.75, 0.5, H, 38.4, matTheaterWall);
-  addSolidBox(-17.5875, H * 0.5, 14.2, 8.725, H, 0.5, matTheaterWall); // X in [-21.95, -13.225]
-  // East Outer Alley Fence/Brick Wall (X = 22.2, Z in [-23.95, 14.45])
+  addSolidBox(-17.5875, H * 0.5, 14.2, 8.725, H, 0.5, matTheaterWall);
   addSolidBox(22.2, 3.8, -4.75, 0.5, 7.6, 38.4, matAlley);
-  addSolidBox(17.5875, 3.8, 14.2, 8.725, 7.6, 0.5, matAlley); // X in [13.225, 21.95]
+  addSolidBox(17.5875, 3.8, 14.2, 8.725, 7.6, 0.5, matAlley);
 
-  // Wall dividing Lobby (Z > 8) from Auditorium (Z < 8), fitting strictly inside X in [-12.775, 12.775]
   addSolidBox(0, H * 0.5, 8.0, 25.55, H, 0.5, matTheaterWall);
 
-  // West Interior Wall separating Lobby/Auditorium (X = -13, Z strictly in [-23.95, 21.95])
-  addSolidBox(-13.0, H * 0.5, 17.075, 0.45, H, 9.75, matTheaterWall); // Z 12.2..21.95
-  addSolidBox(-13.0, H * 0.5, -0.5, 0.45, H, 18.6, matTheaterWall); // Z -9.8..8.8
-  addSolidBox(-13.0, H * 0.5, -18.575, 0.45, H, 10.75, matTheaterWall); // Z -23.95..-13.2
-  // Door headers
+  addSolidBox(-13.0, H * 0.5, 17.075, 0.45, H, 9.75, matTheaterWall);
+  addSolidBox(-13.0, H * 0.5, -0.5, 0.45, H, 18.6, matTheaterWall);
+  addSolidBox(-13.0, H * 0.5, -18.575, 0.45, H, 10.75, matTheaterWall);
   addSolidBox(-13.0, 5.4, 10.5, 0.45, 4.4, 3.4, matTheaterWall);
   addSolidBox(-13.0, 5.4, -11.5, 0.45, 4.4, 3.4, matTheaterWall);
 
-  // East Interior Wall separating Lobby/Auditorium from Moonlit Alley (X = 13, Z strictly in [-23.95, 21.95])
   addSolidBox(13.0, H * 0.5, 17.075, 0.45, H, 9.75, matTheaterWall);
   addSolidBox(13.0, H * 0.5, -0.5, 0.45, H, 18.6, matTheaterWall);
   addSolidBox(13.0, H * 0.5, -18.575, 0.45, H, 10.75, matTheaterWall);
   addSolidBox(13.0, 5.4, 10.5, 0.45, 4.4, 3.4, matTheaterWall);
   addSolidBox(13.0, 5.4, -11.5, 0.45, 4.4, 3.4, matTheaterWall);
 
-  // Ceilings (seated strictly atop/inside walls with zero coplanar penetration)
+  // Ceilings + Architectural Coffered Beams
   addSolidBox(0, H + 0.15, -1.0, 26.45, 0.3, 46.9, matCeiling);
   addSolidBox(-17.5875, 4.4, -5.0, 8.725, 0.3, 37.9, matCeiling);
+  for (const bz of [18, 12, 2, -6, -14, -20]) {
+    const beam = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(25.0, 0.36, 0.42)), matCastIron);
+    beam.position.set(0, H - 0.18, bz);
+    sceneGroup.add(beam);
+  }
 
-  // === 3. GRAND SPAWN LOBBY: Ticket Booth, Twin Staircases & Mezzanine Overlook ===
-  // Ornate Central Ticket Booth (kiteable centerpiece!)
-  addSolidBox(0, 0.55, 15.2, 3.8, 1.1, 2.8, matStageWood, 'wood');
+  // === 3. GRAND ART-DECO FOYER: Ticket Kiosk, Brass Chandelier, Twin Stairs & Mezzanine ===
+  addSolidBox(0, 0.56, 15.2, 3.8, 1.08, 2.8, matStageWood, 'wood');
   addSolidBox(0, 2.85, 15.2, 4.1, 0.3, 3.1, matBrass, 'metal');
   for (const bx of [-1.7, 1.7]) {
     for (const bz of [14.0, 16.4]) {
-      addSolidBox(bx, 1.9, bz, 0.16, 1.6, 0.16, matBrass, 'metal');
+      addSolidBox(bx, 1.92, bz, 0.16, 1.56, 0.16, matBrass, 'metal');
     }
   }
+  // Grand Brass Art-Deco Chandelier hanging above Lobby Center
+  const chandGroup = new THREE.Group();
+  chandGroup.position.set(0, 5.75, 15.2);
+  const cStem = new THREE.Mesh(trackGeo(new THREE.CylinderGeometry(0.06, 0.06, 1.8, 8)), matBrass);
+  cStem.position.y = 0.9;
+  const cRing1 = new THREE.Mesh(trackGeo(new THREE.TorusGeometry(1.45, 0.07, 8, 24)), matBrass);
+  cRing1.rotation.x = Math.PI * 0.5;
+  const cRing2 = new THREE.Mesh(trackGeo(new THREE.TorusGeometry(0.85, 0.06, 8, 20)), matBrass);
+  cRing2.rotation.x = Math.PI * 0.5;
+  cRing2.position.y = -0.45;
+  chandGroup.add(cStem, cRing1, cRing2);
+  for (let i = 0; i < 8; i++) {
+    const ang = (i / 8) * Math.PI * 2;
+    const globe = new THREE.Mesh(trackGeo(new THREE.SphereGeometry(0.11, 8, 8)), matSconceAmber);
+    globe.position.set(Math.cos(ang) * 1.45, 0.14, Math.sin(ang) * 1.45);
+    chandGroup.add(globe);
+  }
+  sceneGroup.add(chandGroup);
+
   const marqueeTex = trackTex(
-    createStencilSignTexture('DER LICHTSPIELHAUS', 'KINO · EST. 1941', '#e5c07b', '#2b1316', maxAniso),
+    createStencilSignTexture('THÉÂTRE LUMIÈRE', 'ART-DECO CINEMA · 1945', '#e5c07b', '#132826', maxAniso),
   );
   const marquee = new THREE.Mesh(
     trackGeo(new THREE.PlaneGeometry(5.6, 1.4)),
     trackMat(
       new THREE.MeshStandardMaterial({
         map: marqueeTex,
-        roughness: 0.55,
+        roughness: 0.52,
         polygonOffset: true,
         polygonOffsetFactor: -2,
         polygonOffsetUnits: -4,
@@ -346,9 +414,10 @@ function buildKinoTheater(
   marquee.position.set(0, 5.2, 8.28);
   sceneGroup.add(marquee);
 
-  // Twin Angled Lobby Staircases rising up to a South Mezzanine Overlook (Y = 3.1m)
+  // Twin Angled Lobby Staircases + South Mezzanine Overlook
   addSolidBox(0, 3.0, 20.1, 25.4, 0.24, 3.8, matStageWood, 'wood');
-  addSolidBox(0, 3.55, 18.28, 17.0, 0.96, 0.18, matBrass, 'metal'); // Overlook railing
+  addSolidBox(0, 3.55, 18.28, 17.0, 0.96, 0.18, matBrass, 'metal');
+  const dummy = new THREE.Object3D();
   for (const side of [-1, 1]) {
     const sx = side * 10.6;
     physics.addRamp({
@@ -361,19 +430,29 @@ function buildKinoTheater(
       riseAxis: '+z',
       surface: 'wood',
     });
-    const stMesh = new THREE.Mesh(
-      trackGeo(new THREE.BoxGeometry(3.2, 0.22, Math.hypot(5.6, 3.12))),
-      matStageWood,
-    );
-    stMesh.position.set(sx, 1.48, 15.4);
-    stMesh.rotation.x = -Math.atan2(3.12, 5.6);
-    stMesh.userData.surfaceMaterial = 'wood';
-    sceneGroup.add(stMesh);
-    raycastMeshes.push(stMesh);
+    // Discrete carved walnut stairs for crisp visual silhouette
+    const stepCount = 14;
+    const stepD = 5.6 / stepCount;
+    const stepH = 3.12 / stepCount;
+    const sGeo = trackGeo(new THREE.BoxGeometry(3.2, stepH, stepD - 0.004));
+    const sInst = new THREE.InstancedMesh(sGeo, matStageWood, stepCount);
+    sInst.receiveShadow = !isSoftwareGl && qProfile.castShadows;
+    for (let i = 0; i < stepCount; i++) {
+      const t = (i + 0.5) / stepCount;
+      dummy.position.set(sx, (i + 0.5) * stepH, 12.6 + t * 5.6);
+      dummy.rotation.set(0, 0, 0);
+      dummy.scale.set(1, 1, 1);
+      dummy.updateMatrix();
+      sInst.setMatrixAt(i, dummy.matrix);
+    }
+    sInst.instanceMatrix.needsUpdate = true;
+    sInst.computeBoundingSphere();
+    sInst.userData.surfaceMaterial = 'wood';
+    sceneGroup.add(sInst);
+    raycastMeshes.push(sInst);
   }
 
-  // === 4. MAIN AUDITORIUM: InstancedMesh Red Velvet Seats + Stage + Torn Cinema Screen ===
-  // 6 rows x 10 seats split cleanly by a 3.2m center aisle and 3.4m outer kiting aisles!
+  // === 4. MAIN AUDITORIUM: Deep Emerald Velvet Seats + Torn Screen + Proscenium Arch ===
   const seatPositions: Array<[number, number, number]> = [];
   for (let row = 0; row < 6; row++) {
     const z = -6.2 + row * 2.25;
@@ -391,17 +470,16 @@ function buildKinoTheater(
   const frameGeo = trackGeo(new THREE.BoxGeometry(0.92, 0.44, 0.46));
   const cushionInst = new THREE.InstancedMesh(cushionGeo, matVelvet, seatPositions.length);
   const frameInst = new THREE.InstancedMesh(frameGeo, matCastIron, seatPositions.length);
-  cushionInst.castShadow = !isSoftwareGl;
-  cushionInst.receiveShadow = !isSoftwareGl;
-  const dummy = new THREE.Object3D();
+  cushionInst.castShadow = !isSoftwareGl && qProfile.castShadows;
+  cushionInst.receiveShadow = !isSoftwareGl && qProfile.castShadows;
   seatPositions.forEach(([sx, sy, sz], i) => {
-    dummy.position.set(sx, sy + 0.58, sz + 0.14);
+    dummy.position.set(sx, sy + 0.6, sz + 0.14);
     dummy.rotation.set(-0.08, 0, 0);
     dummy.scale.set(1, 1, 1);
     dummy.updateMatrix();
     cushionInst.setMatrixAt(i, dummy.matrix);
 
-    dummy.position.set(sx, sy + 0.24, sz);
+    dummy.position.set(sx, sy + 0.25, sz);
     dummy.rotation.set(0, 0, 0);
     dummy.updateMatrix();
     frameInst.setMatrixAt(i, dummy.matrix);
@@ -414,7 +492,6 @@ function buildKinoTheater(
   sceneGroup.add(cushionInst, frameInst);
   raycastMeshes.push(cushionInst);
 
-  // Low row collision strips so players/zombies navigate the wide center & outer aisles cleanly
   for (let row = 0; row < 6; row++) {
     const z = -6.2 + row * 2.25;
     const slopeT = THREE.MathUtils.clamp((z - -8) / 16, 0, 1);
@@ -423,23 +500,22 @@ function buildKinoTheater(
     physics.addBox({ minX: 2.0, maxX: 8.6, minY: y, maxY: y + 0.95, minZ: z - 0.35, maxZ: z + 0.4, surface: 'wood', blocksMovement: true });
   }
 
-  // Massive Torn Vintage Cinema Screen & Heavy Velvet Proscenium Curtains (non-overlapping valance)
+  // Torn Cinema Screen + Deep Emerald Velvet Proscenium Drapes + Brass Molding
   const screenMesh = new THREE.Mesh(trackGeo(new THREE.PlaneGeometry(15.5, 5.4)), matScreen);
-  screenMesh.position.set(0, 4.1, -23.85);
+  screenMesh.position.set(0, 4.1, -23.84);
   sceneGroup.add(screenMesh);
-  addSolidBox(-9.5, 3.65, -23.5, 3.8, 5.6, 0.8, matVelvet, 'wood');
-  addSolidBox(9.5, 3.65, -23.5, 3.8, 5.6, 0.8, matVelvet, 'wood');
-  addSolidBox(0, 6.9, -23.4, 22.8, 0.9, 0.9, matVelvet, 'wood');
+  addSolidBox(-9.5, 3.65, -23.45, 3.8, 5.6, 0.8, matVelvet, 'wood');
+  addSolidBox(9.5, 3.65, -23.45, 3.8, 5.6, 0.8, matVelvet, 'wood');
+  addSolidBox(0, 6.9, -23.35, 22.8, 0.9, 0.9, matVelvet, 'wood');
+  addSolidBox(0, 6.42, -22.88, 22.8, 0.14, 0.12, matBrass, 'metal');
 
-  // === 5. UPPER PROJECTOR BOOTH (Zone 5: 'projector', Y = 4.2m overlooking auditorium!) ===
+  // === 5. UPPER PROJECTOR BOOTH (Zone 5: 'projector') ===
   const PROJ_Y = 4.2;
-  // Booth floor & non-overlapping parapet + side walls (clear of Z = 7.75 divider face)
   addSolidBox(0, PROJ_Y - 0.14, 5.515, 10.68, 0.28, 4.47, matStageWood, 'wood');
-  addSolidBox(0, PROJ_Y + 0.52, 3.4, 10.12, 1.04, 0.24, matTheaterWall); // viewing slit parapet between side walls
+  addSolidBox(0, PROJ_Y + 0.52, 3.4, 10.12, 1.04, 0.24, matTheaterWall);
   addSolidBox(-5.2, PROJ_Y + 1.5, 5.515, 0.28, 3.0, 4.47, matTheaterWall);
   addSolidBox(5.2, PROJ_Y + 1.5, 5.515, 0.28, 3.0, 4.47, matTheaterWall);
 
-  // Stair ramp from Auditorium Rear-West up into Projector Booth (X in [-11.5, -5.2], Z in [4.5, 7.2])
   physics.addRamp({
     minX: -11.4,
     maxX: -5.2,
@@ -459,7 +535,8 @@ function buildKinoTheater(
   raycastMeshes.push(projRamp);
 
   // Twin Vintage 35mm Film Projectors inside Booth
-  for (const px of [-2.0, 2.0]) {
+  const reelMeshes: THREE.Mesh[] = [];
+  for (const px of [-2.2, 2.2]) {
     const pGroup = new THREE.Group();
     pGroup.position.set(px, PROJ_Y, 4.6);
     const ped = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(0.5, 1.1, 0.65)), matCastIron);
@@ -468,14 +545,151 @@ function buildKinoTheater(
     body.position.set(0, 1.32, -0.1);
     const reel1 = new THREE.Mesh(trackGeo(new THREE.CylinderGeometry(0.32, 0.32, 0.08, 16)), matBrass);
     reel1.rotation.z = Math.PI * 0.5;
-    reel1.position.set(0.24, 1.78, 0.1);
+    reel1.position.set(0.26, 1.78, 0.1);
     const reel2 = reel1.clone();
-    reel2.position.set(0.24, 1.05, 0.35);
+    reel2.position.set(0.26, 1.05, 0.35);
+    reelMeshes.push(reel1, reel2);
     pGroup.add(ped, body, reel1, reel2);
     sceneGroup.add(pGroup);
   }
 
-  // === 6. BUYABLE DOORS / DEBRIS BARRICADES ===
+  // === 6. COPYRIGHT-SAFE BO1 KINO VISUAL EASTER EGGS & MICRO-DETAILS ===
+  // Easter Egg #1: Stage Center & Projection Booth Brass/Copper Resonance Teleporter Pads
+  const teleRingMat = trackMat(
+    new THREE.MeshStandardMaterial({
+      color: 0x38bdf8,
+      emissive: 0x0ea5e9,
+      emissiveIntensity: 0.25,
+      roughness: 0.22,
+    }),
+  );
+  const buildTeleporterPad = (tx: number, ty: number, tz: number, radius: number): void => {
+    const padGroup = new THREE.Group();
+    padGroup.position.set(tx, ty + 0.035, tz);
+    const basePlate = new THREE.Mesh(trackGeo(new THREE.CylinderGeometry(radius, radius * 1.06, 0.06, 24)), matCastIron);
+    const outerCoil = new THREE.Mesh(trackGeo(new THREE.TorusGeometry(radius * 0.88, 0.055, 8, 28)), matCopper);
+    outerCoil.rotation.x = Math.PI * 0.5;
+    outerCoil.position.y = 0.05;
+    const innerRing = new THREE.Mesh(trackGeo(new THREE.TorusGeometry(radius * 0.56, 0.035, 8, 24)), teleRingMat);
+    innerRing.rotation.x = Math.PI * 0.5;
+    innerRing.position.y = 0.055;
+    padGroup.add(basePlate, outerCoil, innerRing);
+    sceneGroup.add(padGroup);
+  };
+  buildTeleporterPad(0, 0.85, -18.8, 1.85); // Iconic center stage pad!
+  buildTeleporterPad(0, PROJ_Y, 5.8, 1.15); // Linked booth pad!
+
+  // Easter Egg #2: Chalk Teleporter Equations in Projector Booth + Backstage Parabolic Emitter Schematic
+  const eqTex = trackTex(createChalkBlueprintTexture('HARMONIC LINK LOG · 1945', 'equations', maxAniso));
+  const eqBoard = new THREE.Mesh(
+    trackGeo(new THREE.PlaneGeometry(2.8, 1.4)),
+    trackMat(
+      new THREE.MeshStandardMaterial({
+        map: eqTex,
+        roughness: 0.85,
+        polygonOffset: true,
+        polygonOffsetFactor: -2,
+        polygonOffsetUnits: -4,
+      }),
+    ),
+  );
+  eqBoard.position.set(-4.98, PROJ_Y + 1.65, 5.4);
+  eqBoard.rotation.y = Math.PI * 0.5;
+  sceneGroup.add(eqBoard);
+
+  const emitTex = trackTex(createChalkBlueprintTexture('BACKSTAGE LAB NOTE', 'emitter', maxAniso));
+  const emitBoard = new THREE.Mesh(
+    trackGeo(new THREE.PlaneGeometry(2.4, 1.2)),
+    trackMat(
+      new THREE.MeshStandardMaterial({
+        map: emitTex,
+        roughness: 0.85,
+        polygonOffset: true,
+        polygonOffsetFactor: -2,
+        polygonOffsetUnits: -4,
+      }),
+    ),
+  );
+  emitBoard.position.set(-12.68, 2.3, -21.2);
+  emitBoard.rotation.y = Math.PI * 0.5;
+  sceneGroup.add(emitBoard);
+
+  // Easter Egg #3: Glowing Emerald Meteorite Shard in Velvet Display Plinth (West Dressing Room)
+  const plinth = new THREE.Group();
+  plinth.position.set(-20.8, 0.04, -3.2);
+  const plinthBase = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(0.95, 1.05, 0.95)), matStageWood);
+  plinthBase.position.y = 0.525;
+  const plinthTrim = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(1.02, 0.08, 1.02)), matBrass);
+  plinthTrim.position.y = 1.06;
+  const meteorShard = new THREE.Mesh(trackGeo(new THREE.OctahedronGeometry(0.26, 0)), matMeteorShard);
+  meteorShard.position.y = 1.38;
+  plinth.add(plinthBase, plinthTrim, meteorShard);
+  sceneGroup.add(plinth);
+  const meteorLight = new THREE.PointLight(0x10b981, 2.8, 5.5, 2);
+  meteorLight.position.set(-20.4, 1.5, -3.2);
+  sceneGroup.add(meteorLight);
+
+  // Easter Egg #4: Three Hidden 35mm Film Canisters (Mezzanine, Dressing Room, Backstage)
+  const filmLocations: Array<[number, number, number]> = [
+    [6.8, 3.16, 20.6],
+    [-19.8, 0.86, 5.8],
+    [10.2, 0.92, -22.2],
+  ];
+  for (const [fx, fy, fz] of filmLocations) {
+    const tin = new THREE.Mesh(trackGeo(new THREE.CylinderGeometry(0.22, 0.22, 0.07, 16)), matFilmCanister);
+    tin.position.set(fx, fy, fz);
+    const labelRing = new THREE.Mesh(trackGeo(new THREE.CylinderGeometry(0.14, 0.14, 0.078, 12)), matBrass);
+    labelRing.position.set(fx, fy, fz);
+    sceneGroup.add(tin, labelRing);
+  }
+
+  // Easter Egg #5: Vintage Art-Deco Cinema Posters + Mezzanine Reel-to-Reel Tape Deck
+  const poster1Tex = trackTex(createKinoPosterTexture('THÉÂTRE LUMIÈRE', 'GALA · OCT 1945', 'rgba(20,184,166,0.45)', maxAniso));
+  const poster2Tex = trackTex(createKinoPosterTexture('DER NACHTZUG', 'ACT III · BERLIN', 'rgba(217,155,38,0.45)', maxAniso));
+  const addPoster = (tex: THREE.Texture, x: number, y: number, z: number, ry: number): void => {
+    const p = new THREE.Mesh(
+      trackGeo(new THREE.PlaneGeometry(1.15, 1.72)),
+      trackMat(
+        new THREE.MeshStandardMaterial({
+          map: tex,
+          roughness: 0.6,
+          polygonOffset: true,
+          polygonOffsetFactor: -2,
+          polygonOffsetUnits: -4,
+        }),
+      ),
+    );
+    p.position.set(x, y, z);
+    p.rotation.y = ry;
+    sceneGroup.add(p);
+  };
+  addPoster(poster1Tex, -12.72, 2.25, 15.2, Math.PI * 0.5);
+  addPoster(poster2Tex, 12.72, 2.25, 15.2, -Math.PI * 0.5);
+  addPoster(poster2Tex, -21.88, 2.15, -8.5, Math.PI * 0.5);
+  addPoster(poster1Tex, -4.5, 4.6, 21.88, Math.PI);
+
+  // Dressing Room vanity table + Mezzanine operator desk with vintage reel-to-reel tape deck
+  buildOfficeDesk(propCtx, -20.0, 0.04, 5.8, Math.PI * 0.5, matStageWood, matCastIron);
+  buildOfficeDesk(propCtx, -4.5, 3.12, 20.6, 0, matStageWood, matCastIron);
+  const tapeDeck = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(0.56, 0.24, 0.34)), matCastIron);
+  tapeDeck.position.set(-4.5, 4.08, 20.6);
+  sceneGroup.add(tapeDeck);
+
+  // East Moonlit Back Alley detailed props: Rusted vintage 1940s sedan + wooden supply crates
+  const alleyCarMats: VehicleMaterials = {
+    body: trackMat(new THREE.MeshStandardMaterial({ map: rustTex, roughness: 0.72, metalness: 0.35 })),
+    rust: trackMat(new THREE.MeshStandardMaterial({ color: 0x5d3924, roughness: 0.85, metalness: 0.38 })),
+    tire: trackMat(new THREE.MeshStandardMaterial({ color: 0x181a1b, roughness: 0.95 })),
+    rim: matCastIron,
+    darkInterior: trackMat(new THREE.MeshStandardMaterial({ color: 0x101314, roughness: 0.95 })),
+    glass: trackMat(new THREE.MeshStandardMaterial({ color: 0x263b42, roughness: 0.2, metalness: 0.6, transparent: true, opacity: 0.45 })),
+    chrome: matBrass,
+  };
+  buildRustedVehicle(propCtx, 'moskvitch', 19.8, 0, 7.2, -0.18, alleyCarMats);
+  addSolidBox(20.6, 0.55, -8.5, 1.4, 1.1, 1.4, matBarricadeWood, 'wood');
+  addSolidBox(20.4, 0.45, -10.2, 1.1, 0.9, 1.1, matBarricadeWood, 'wood');
+
+  // === 7. BUYABLE DOORS / DEBRIS BARRICADES ===
   const addBuyableDoor = (
     id: string,
     label: string,
@@ -491,7 +705,6 @@ function buildKinoTheater(
     const visualGroup = new THREE.Group();
     sceneGroup.add(visualGroup);
 
-    // Crossed wooden barricade timbers + painted cost plaque
     const mainBarrier = addSolidBox(x, y + h * 0.5, z, w, h, d, matBarricadeWood, 'wood', `col_${id}`, visualGroup);
     mainBarrier.userData.interactableId = id;
 
@@ -509,7 +722,7 @@ function buildKinoTheater(
     if (alongZ) beamA.rotation.y = Math.PI * 0.5;
     visualGroup.add(beamA);
 
-    const doorSignTex = trackTex(createStencilSignTexture(label, `${cost} PTS · [F] CLEAR`, '#ef4444', '#1d0d10', maxAniso));
+    const doorSignTex = trackTex(createStencilSignTexture(label, `${cost} PTS · [F] CLEAR`, '#f5c06b', '#132422', maxAniso));
     const plaque = new THREE.Mesh(
       trackGeo(new THREE.PlaneGeometry(1.7, 0.65)),
       trackMat(
@@ -547,10 +760,9 @@ function buildKinoTheater(
   addBuyableDoor('door_east_auditorium', 'Auditorium East', 1000, 'auditorium', 13.0, 0, -11.5, 0.52, 3.1, 3.3);
   addBuyableDoor('door_projector', 'Projector Booth', 1250, 'projector', -10.8, 1.15, 6.0, 0.52, 2.8, 2.7);
 
-  // === 7. INTERACTABLES: Power Switch, Wall-Buys, Mystery Crate & 2 Power-Gated Perk Machines ===
-  // A) Backstage Power Switch (Stage Left: X = -11.2, Y = 0.85, Z = -18.5)
+  // === 8. INTERACTABLES: Power Switch, Wall-Buys, Mystery Crate & 2 Power-Gated Perk Machines ===
   const powerLampMat = trackMat(
-    new THREE.MeshStandardMaterial({ color: 0xef4444, emissive: 0xef4444, emissiveIntensity: 2.2, roughness: 0.25 }),
+    new THREE.MeshStandardMaterial({ color: 0xf59e0b, emissive: 0xf59e0b, emissiveIntensity: 2.2, roughness: 0.25 }),
   );
   const powerLever = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(0.12, 0.55, 0.12)), matBrass);
   const powerGroup = new THREE.Group();
@@ -562,7 +774,7 @@ function buildKinoTheater(
   powerLever.rotation.z = -0.55;
   powerGroup.add(panelBox, lampMesh, powerLever);
   sceneGroup.add(powerGroup);
-  const powerGlow = new THREE.PointLight(0xef4444, 3.2, 6.5, 2);
+  const powerGlow = new THREE.PointLight(0xf59e0b, 3.2, 6.5, 2);
   powerGlow.position.set(-11.9, 2.4, -18.5);
   sceneGroup.add(powerGlow);
 
@@ -577,7 +789,7 @@ function buildKinoTheater(
     activated: false,
   });
 
-  // B) Mystery Weapon Crate (Stage Right: X = 8.4, Y = 0.85, Z = -18.5)
+  // Mystery Weapon Crate
   const crateGroup = new THREE.Group();
   crateGroup.position.set(8.4, 0.85, -18.5);
   addSolidBox(8.4, 1.25, -18.5, 2.2, 0.8, 0.92, matBarricadeWood, 'wood');
@@ -603,7 +815,7 @@ function buildKinoTheater(
     activated: false,
   });
 
-  // C) Chalk Wall-Buys across Lobby, Wings, Auditorium & Projector Booth
+  // Chalk Wall-Buys
   const addWallBuy = (
     id: string,
     weaponId: string,
@@ -652,7 +864,7 @@ function buildKinoTheater(
   addWallBuy('wb_m4a1', 'm4a1', 'M4A1 5.56 Carbine', 1750, 12.7, 1.6, -5.0, -Math.PI * 0.5);
   addWallBuy('wb_spas', 'spas_12', 'SPAS-12 Tactical', 1400, 0, PROJ_Y + 1.5, 7.72, Math.PI);
 
-  // D) Two Power-Gated Perk Machines (Vitality Reserve + Rapid Handling)
+  // Two Power-Gated Perk Machines
   const perkEmissiveMats: Array<{ mat: THREE.MeshStandardMaterial; light: THREE.PointLight; color: number }> = [];
   const addPerkMachine = (
     id: string,
@@ -670,7 +882,7 @@ function buildKinoTheater(
       new THREE.MeshStandardMaterial({
         color: colorHex,
         emissive: colorHex,
-        emissiveIntensity: 0.08, // dim until Power is restored!
+        emissiveIntensity: 0.08,
         roughness: 0.25,
       }),
     );
@@ -720,21 +932,19 @@ function buildKinoTheater(
   addPerkMachine('perk_vitality', 'vitality', 'Vitality Reserve (+60 Max HP)', 2500, 0xb91c1c, -11.9, 0.1, -1.8, Math.PI * 0.5);
   addPerkMachine('perk_rapid', 'rapid_handling', 'Rapid Handling (Fast Reload)', 3000, 0x15803d, 21.1, 0.0, -3.5, -Math.PI * 0.5);
 
-  // === 8. POWER-LINKED THEATER LIGHTING RIG (Emergency Dim -> Illuminated Stage & Auditorium) ===
-  // Subtle always-on emergency exit lights & Lobby dim lamp
-  const lobbyBaseLight = new THREE.PointLight(0xd99b52, 7.5, 22, 1.7);
+  // === 9. POWER-LINKED ART-DECO NOIR LIGHTING RIG (Warm Brass + Cool Moonlight + Emerald Accents) ===
+  const lobbyBaseLight = new THREE.PointLight(0xe5b772, 9.0, 24, 1.65);
   lobbyBaseLight.position.set(0, 5.2, 15.2);
   sceneGroup.add(lobbyBaseLight);
 
-  const westEmergency = new THREE.PointLight(0xc24136, 4.2, 15, 1.8);
-  westEmergency.position.set(-17.5, 3.6, 2.0);
-  sceneGroup.add(westEmergency);
+  const westLamp = new THREE.PointLight(0x47b8a8, 5.2, 16, 1.75);
+  westLamp.position.set(-17.5, 3.6, 2.0);
+  sceneGroup.add(westLamp);
 
-  const alleyStreetLight = new THREE.PointLight(0x7ca6d8, 8.5, 24, 1.6);
+  const alleyStreetLight = new THREE.PointLight(0x88b4e6, 9.5, 25, 1.55);
   alleyStreetLight.position.set(17.5, 5.8, -2.0);
   sceneGroup.add(alleyStreetLight);
 
-  // Glowing red EXIT boxes above doorways
   for (const [ex, ey, ez] of [
     [-12.6, 3.4, 10.5],
     [12.6, 3.4, 10.5],
@@ -746,29 +956,28 @@ function buildKinoTheater(
     sceneGroup.add(sign);
   }
 
-  // Power-gated auditorium chandeliers, warm golden stage spotlights & volumetric projector beam
   const powerLights: Array<{ light: THREE.Light; targetIntensity: number }> = [];
   for (const [cx, cy, cz, inten] of [
     [0, 6.4, 2.5, 16.0],
     [0, 6.4, -5.5, 18.0],
     [0, 6.2, -17.5, 22.0],
-    [-7.5, 5.8, -17.0, 11.0],
-    [7.5, 5.8, -17.0, 11.0],
+    [-7.5, 5.8, -17.0, 11.5],
+    [7.5, 5.8, -17.0, 11.5],
     [-17.5, 3.8, -6.0, 8.5],
   ]) {
-    const pl = new THREE.PointLight(0xffcb82, 0, 26, 1.55);
+    const pl = new THREE.PointLight(0xffd28c, 0, 28, 1.5);
     pl.position.set(cx, cy, cz);
     sceneGroup.add(pl);
     powerLights.push({ light: pl, targetIntensity: inten });
   }
 
-  // Volumetric-style vintage projector cone from Booth to Torn Screen (visible when powered)
+  // Volumetric-style vintage projector cone from Booth to Torn Screen
   const beamGeo = trackGeo(new THREE.ConeGeometry(5.6, 28.0, 20, 1, true));
   beamGeo.translate(0, -14.0, 0);
   beamGeo.rotateX(Math.PI * 0.5);
   const beamMat = trackMat(
     new THREE.MeshBasicMaterial({
-      color: 0xffdf9e,
+      color: 0xffe4a8,
       transparent: true,
       opacity: 0.0,
       depthWrite: false,
@@ -788,9 +997,10 @@ function buildKinoTheater(
   const setPowerState = (powered: boolean): void => {
     powerOn = powered;
     powerLever.rotation.z = powered ? 0.55 : -0.55;
-    powerLampMat.color.setHex(powered ? 0x22c55e : 0xef4444);
-    powerLampMat.emissive.setHex(powered ? 0x22c55e : 0xef4444);
-    powerGlow.color.setHex(powered ? 0x22c55e : 0xef4444);
+    powerLampMat.color.setHex(powered ? 0x10b981 : 0xf59e0b);
+    powerLampMat.emissive.setHex(powered ? 0x10b981 : 0xf59e0b);
+    powerGlow.color.setHex(powered ? 0x10b981 : 0xf59e0b);
+    teleRingMat.emissiveIntensity = powered ? 2.4 : 0.25;
     projectorBeam.visible = powered;
     for (const pm of perkEmissiveMats) {
       pm.mat.emissiveIntensity = powered ? 2.2 : 0.08;
@@ -798,27 +1008,22 @@ function buildKinoTheater(
     }
   };
 
-  // === 9. BARRICADED ZOMBIE ENTRY WINDOWS & SPAWNERS ===
+  // === 10. BARRICADED ZOMBIE ENTRY WINDOWS & SPAWNERS ===
   const zombieSpawners: ZombieSpawnerDef[] = [
-    // Lobby initial windows (4)
     { id: 'sp_lob_w1', zoneId: 'lobby', spawnPos: [-12.2, 0, 18.2], entryPos: [-9.8, 0, 18.2], entryNodeId: 'lob_w', yaw: Math.PI * 0.5 },
     { id: 'sp_lob_e1', zoneId: 'lobby', spawnPos: [12.2, 0, 18.2], entryPos: [9.8, 0, 18.2], entryNodeId: 'lob_e', yaw: -Math.PI * 0.5 },
     { id: 'sp_lob_sw', zoneId: 'lobby', spawnPos: [-5.5, 0, 21.4], entryPos: [-5.5, 0, 18.5], entryNodeId: 'lob_sw', yaw: Math.PI },
     { id: 'sp_lob_se', zoneId: 'lobby', spawnPos: [5.5, 0, 21.4], entryPos: [5.5, 0, 18.5], entryNodeId: 'lob_se', yaw: Math.PI },
-    // West Wing spawners (2)
     { id: 'sp_ww_1', zoneId: 'west_wing', spawnPos: [-21.4, 0, 4.5], entryPos: [-18.2, 0, 4.5], entryNodeId: 'ww_mid', yaw: Math.PI * 0.5 },
     { id: 'sp_ww_2', zoneId: 'west_wing', spawnPos: [-21.4, 0, -6.5], entryPos: [-18.2, 0, -6.5], entryNodeId: 'ww_n', yaw: Math.PI * 0.5 },
-    // East Alley spawners (2)
     { id: 'sp_ew_1', zoneId: 'east_wing', spawnPos: [21.4, 0, 4.5], entryPos: [18.2, 0, 4.5], entryNodeId: 'ew_mid', yaw: -Math.PI * 0.5 },
     { id: 'sp_ew_2', zoneId: 'east_wing', spawnPos: [21.4, 0, -6.5], entryPos: [18.2, 0, -6.5], entryNodeId: 'ew_n', yaw: -Math.PI * 0.5 },
-    // Auditorium & Stage spawners (4)
     { id: 'sp_aud_w', zoneId: 'auditorium', spawnPos: [-11.8, 0.55, 0.5], entryPos: [-10.2, 0.55, 0.5], entryNodeId: 'aud_aisle_w', yaw: Math.PI * 0.5 },
     { id: 'sp_aud_e', zoneId: 'auditorium', spawnPos: [11.8, 0.55, 0.5], entryPos: [10.2, 0.55, 0.5], entryNodeId: 'aud_aisle_e', yaw: -Math.PI * 0.5 },
     { id: 'sp_stage_w', zoneId: 'auditorium', spawnPos: [-11.5, 0.85, -22.2], entryPos: [-8.8, 0.85, -20.5], entryNodeId: 'stage_l', yaw: Math.PI * 0.25 },
     { id: 'sp_stage_e', zoneId: 'auditorium', spawnPos: [11.5, 0.85, -22.2], entryPos: [8.8, 0.85, -20.5], entryNodeId: 'stage_r', yaw: -Math.PI * 0.25 },
   ];
 
-  // Visual barricaded window frames at spawner locations
   const slatGeo = trackGeo(new THREE.BoxGeometry(0.14, 0.2, 1.9));
   const slatInst = new THREE.InstancedMesh(slatGeo, matBarricadeWood, zombieSpawners.length * 3);
   let slatIdx = 0;
@@ -835,30 +1040,26 @@ function buildKinoTheater(
   slatInst.computeBoundingSphere();
   sceneGroup.add(slatInst);
 
-  // === 10. ZONE-GATED NAVGRAPH (Continuous Figure-8 Kiting Loop across All 5 Zones!) ===
+  // === 11. ZONE-GATED NAVGRAPH ===
   const rawNodes: NavNode[] = [
-    // Zone 1: Grand Lobby
-    { id: 'lob_c', position: [0, 0, 11.2], zoneId: 'lobby', neighbors: ['lob_w', 'lob_e', 'lob_sw', 'lob_se'] },
-    { id: 'lob_w', position: [-9.2, 0, 11.0], zoneId: 'lobby', neighbors: ['lob_c', 'lob_sw', 'ww_s'] },
-    { id: 'lob_e', position: [9.2, 0, 11.0], zoneId: 'lobby', neighbors: ['lob_c', 'lob_se', 'ew_s'] },
-    { id: 'lob_sw', position: [-6.5, 0, 17.6], zoneId: 'lobby', neighbors: ['lob_c', 'lob_w', 'lob_se', 'lob_mez'] },
-    { id: 'lob_se', position: [6.5, 0, 17.6], zoneId: 'lobby', neighbors: ['lob_c', 'lob_e', 'lob_sw', 'lob_mez'] },
+    { id: 'lob_c', position: [0, 0.04, 11.2], zoneId: 'lobby', neighbors: ['lob_w', 'lob_e', 'lob_sw', 'lob_se'] },
+    { id: 'lob_w', position: [-9.2, 0.04, 11.0], zoneId: 'lobby', neighbors: ['lob_c', 'lob_sw', 'ww_s'] },
+    { id: 'lob_e', position: [9.2, 0.04, 11.0], zoneId: 'lobby', neighbors: ['lob_c', 'lob_se', 'ew_s'] },
+    { id: 'lob_sw', position: [-6.5, 0.04, 17.6], zoneId: 'lobby', neighbors: ['lob_c', 'lob_w', 'lob_se', 'lob_mez'] },
+    { id: 'lob_se', position: [6.5, 0.04, 17.6], zoneId: 'lobby', neighbors: ['lob_c', 'lob_e', 'lob_sw', 'lob_mez'] },
     { id: 'lob_mez', position: [0, 3.12, 19.6], zoneId: 'lobby', neighbors: ['lob_sw', 'lob_se'] },
 
-    // Zone 2: West Dressing Corridor
-    { id: 'ww_s', position: [-16.8, 0, 10.5], zoneId: 'west_wing', requiredDoorId: 'door_west_wing', neighbors: ['lob_w', 'ww_mid'] },
-    { id: 'ww_mid', position: [-17.5, 0, 1.0], zoneId: 'west_wing', neighbors: ['ww_s', 'ww_n'] },
-    { id: 'ww_n', position: [-17.2, 0, -11.5], zoneId: 'west_wing', neighbors: ['ww_mid', 'aud_pit_w'] },
+    { id: 'ww_s', position: [-16.8, 0.04, 10.5], zoneId: 'west_wing', requiredDoorId: 'door_west_wing', neighbors: ['lob_w', 'ww_mid'] },
+    { id: 'ww_mid', position: [-17.5, 0.04, 1.0], zoneId: 'west_wing', neighbors: ['ww_s', 'ww_n'] },
+    { id: 'ww_n', position: [-17.2, 0.04, -11.5], zoneId: 'west_wing', neighbors: ['ww_mid', 'aud_pit_w'] },
 
-    // Zone 3: Moonlit East Back Alley
     { id: 'ew_s', position: [16.8, 0, 10.5], zoneId: 'east_wing', requiredDoorId: 'door_east_wing', neighbors: ['lob_e', 'ew_mid'] },
     { id: 'ew_mid', position: [17.5, 0, 1.0], zoneId: 'east_wing', neighbors: ['ew_s', 'ew_n'] },
     { id: 'ew_n', position: [17.2, 0, -11.5], zoneId: 'east_wing', neighbors: ['ew_mid', 'aud_pit_e'] },
 
-    // Zone 4: Sloped Main Auditorium & Elevated Stage
-    { id: 'aud_pit_w', position: [-10.6, 0, -11.5], zoneId: 'auditorium', neighbors: ['ww_n', 'aud_aisle_w', 'aud_pit_c', 'stage_l'] },
-    { id: 'aud_pit_c', position: [0, 0, -11.5], zoneId: 'auditorium', neighbors: ['aud_pit_w', 'aud_pit_e', 'aud_center_mid'] },
-    { id: 'aud_pit_e', position: [10.6, 0, -11.5], zoneId: 'auditorium', neighbors: ['ew_n', 'aud_aisle_e', 'aud_pit_c', 'stage_r'] },
+    { id: 'aud_pit_w', position: [-10.6, 0.04, -11.5], zoneId: 'auditorium', neighbors: ['ww_n', 'aud_aisle_w', 'aud_pit_c', 'stage_l'] },
+    { id: 'aud_pit_c', position: [0, 0.04, -11.5], zoneId: 'auditorium', neighbors: ['aud_pit_w', 'aud_pit_e', 'aud_center_mid'] },
+    { id: 'aud_pit_e', position: [10.6, 0.04, -11.5], zoneId: 'auditorium', neighbors: ['ew_n', 'aud_aisle_e', 'aud_pit_c', 'stage_r'] },
     { id: 'aud_aisle_w', position: [-10.6, 0.6, 0], zoneId: 'auditorium', neighbors: ['aud_pit_w', 'aud_back_w'] },
     { id: 'aud_center_mid', position: [0, 0.6, 0], zoneId: 'auditorium', neighbors: ['aud_pit_c', 'aud_back_c'] },
     { id: 'aud_aisle_e', position: [10.6, 0.6, 0], zoneId: 'auditorium', neighbors: ['aud_pit_e', 'aud_back_e'] },
@@ -869,7 +1070,6 @@ function buildKinoTheater(
     { id: 'stage_c', position: [0, 0.85, -18.5], zoneId: 'auditorium', neighbors: ['stage_l', 'stage_r'] },
     { id: 'stage_r', position: [7.5, 0.85, -18.5], zoneId: 'auditorium', neighbors: ['aud_pit_e', 'stage_c'] },
 
-    // Zone 5: Upper Projector Booth
     { id: 'proj_booth', position: [0, PROJ_Y, 5.6], zoneId: 'projector', requiredDoorId: 'door_projector', neighbors: ['aud_back_w'] },
   ];
 
@@ -883,10 +1083,10 @@ function buildKinoTheater(
     raycastMeshes,
     navGraph: buildNavGraph(rawNodes),
     spawnPoints: {
-      teamA: [{ position: [0, 0, 11.4], yaw: 0 }],
+      teamA: [{ position: [0, 0.04, 11.4], yaw: 0 }],
       teamB: [{ position: [0, 0.85, -18.0], yaw: Math.PI }],
-      ffa: [{ position: [0, 0, 11.4], yaw: 0 }],
-      playerStart: { position: [0, 0, 11.4], yaw: 0, zoneId: 'lobby' },
+      ffa: [{ position: [0, 0.04, 11.4], yaw: 0 }],
+      playerStart: { position: [0, 0.04, 11.4], yaw: 0, zoneId: 'lobby' },
       zombieSpawners,
     },
     interactables,
@@ -900,13 +1100,16 @@ function buildKinoTheater(
       }
       if (powerOn) {
         beamMat.opacity = 0.085 + Math.sin(elapsedSec * 14.0) * 0.012;
+        for (const r of reelMeshes) {
+          r.rotation.x += dt * 1.4;
+        }
       } else {
         beamMat.opacity = 0;
       }
-      // Subtle mystery crate shimmer
       crateLight.intensity = 3.8 + Math.sin(elapsedSec * 3.4) * 0.85;
-      // Subtle eerie red flicker in West Wing emergency bulb
-      westEmergency.intensity = 3.6 + Math.sin(elapsedSec * 11.5) * 0.55;
+      westLamp.intensity = 4.6 + Math.sin(elapsedSec * 9.2) * 0.45;
+      meteorShard.rotation.y = elapsedSec * 0.65;
+      meteorLight.intensity = 2.4 + Math.sin(elapsedSec * 2.6) * 0.6;
     },
     dispose: () => {
       scene.remove(sceneGroup);
@@ -922,13 +1125,13 @@ function buildKinoTheater(
 export const KINO_THEATER_MAP: IMapDefinition = {
   id: 'der_lichtspielhaus',
   name: 'Der Lichtspielhaus',
-  subtitle: 'Abandoned 1940s Cinema',
+  subtitle: 'Art-Deco Noir 1940s Cinema',
   description:
-    'Hold the Grand Lobby, unlock the Dressing Corridor and Moonlit Back Alley, breach the sloped Auditorium and Stage, restore Main Power, and claim the upper Projector Booth.',
+    'Emerald-velvet and tarnished-brass 1940s grand cinema preserving the iconic foyer-to-stage loop, moonlit alley, power restoration, and hidden lore artifacts.',
   mode: 'infection',
   status: 'playable',
-  environmentTags: ['Round-Based Horde', '5 Unlockable Zones', 'Power & Perks'],
-  accentHex: '#dc2626',
+  environmentTags: ['Art-Deco Noir', '5 Unlockable Zones', 'Lore Easter Eggs'],
+  accentHex: '#10b981',
   previewStyle: 'kino_theater',
   build: buildKinoTheater,
 };

@@ -1,6 +1,11 @@
 import { OperatorId } from '../bodycam-sdk/operator/OperatorTypes';
+import {
+  isValidLobbyKillfeedPolicy,
+  LobbyKillfeedPolicy,
+} from './killfeedSettings';
 import { BattleRuleId, BotDifficultyId } from '../maps/types';
 
+export type { LobbyKillfeedPolicy };
 export type LobbyVisibility = 'public' | 'friends_only' | 'private';
 export type LobbyModeId = 'battle' | 'infection';
 export type EventCycleModeId = 'battle_tdm' | 'battle_ffa' | 'infection';
@@ -38,6 +43,7 @@ export interface SpecialEventConfig {
   zombieAttackSpeedMult: number; // 0.5..2.5
   zombieSpawnAmountMult: number; // 0.25..3.0
   waveBreakIntervalSec: number; // 2..30
+  killfeedPolicy?: LobbyKillfeedPolicy;
 }
 
 export interface SpecialEventRecord {
@@ -83,6 +89,7 @@ export interface LobbySettingsPatch {
   botCount?: number;
   killLimit?: number;
   botDifficulty?: BotDifficultyId;
+  killfeedPolicy?: LobbyKillfeedPolicy;
 }
 
 export interface LobbyRoomState {
@@ -98,6 +105,7 @@ export interface LobbyRoomState {
   botCount: number;
   killLimit: number;
   botDifficulty: BotDifficultyId;
+  killfeedPolicy?: LobbyKillfeedPolicy;
   status: 'lobby' | 'in_match';
   matchSequence: number;
   specialEvent: SpecialEventRecord | null;
@@ -154,6 +162,7 @@ export const DEFAULT_SPECIAL_EVENT_CONFIG: SpecialEventConfig = {
   zombieAttackSpeedMult: 1.0,
   zombieSpawnAmountMult: 1.0,
   waveBreakIntervalSec: 6,
+  killfeedPolicy: 'player_choice',
 };
 
 function clampNum(val: unknown, min: number, max: number, fallback: number): number {
@@ -170,7 +179,12 @@ export function sanitizeSpecialEventConfig(raw: unknown): SpecialEventConfig {
   const obj = (raw && typeof raw === 'object' ? raw : {}) as Partial<SpecialEventConfig>;
   const mode: LobbyModeId = obj.mode === 'infection' ? 'infection' : 'battle';
   const battleRule: BattleRuleId = obj.battleRule === 'ffa' ? 'ffa' : 'tdm';
-  const validMaps = new Set(['pripyat_block', 'timberline_compound', 'kino_theater']);
+  const validMaps = new Set([
+    'pripyat_block',
+    'timberline_compound',
+    'korsakov_substation',
+    'kino_theater',
+  ]);
   const defaultMap = mode === 'infection' ? 'kino_theater' : 'pripyat_block';
   const mapId = typeof obj.mapId === 'string' && validMaps.has(obj.mapId) ? obj.mapId : defaultMap;
 
@@ -219,6 +233,9 @@ export function sanitizeSpecialEventConfig(raw: unknown): SpecialEventConfig {
     zombieAttackSpeedMult: Number(clampNum(obj.zombieAttackSpeedMult, 0.5, 2.5, 1.0).toFixed(2)),
     zombieSpawnAmountMult: Number(clampNum(obj.zombieSpawnAmountMult, 0.25, 3.0, 1.0).toFixed(2)),
     waveBreakIntervalSec: clampInt(obj.waveBreakIntervalSec, 2, 30, 6),
+    killfeedPolicy: isValidLobbyKillfeedPolicy(obj.killfeedPolicy)
+      ? obj.killfeedPolicy
+      : 'player_choice',
   };
 }
 
@@ -251,7 +268,9 @@ export function formatMapDisplayName(mapId: string): string {
     case 'pripyat_block':
       return 'Pripyat Block';
     case 'timberline_compound':
-      return 'Timberline Compound';
+      return 'Timberline Valley';
+    case 'korsakov_substation':
+      return 'Korsakov Substation';
     case 'kino_theater':
       return 'Kino Theater';
     default:
