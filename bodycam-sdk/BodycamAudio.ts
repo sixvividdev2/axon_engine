@@ -1,0 +1,1585 @@
+import * as THREE from 'three';
+import {
+  BodycamBreathCueKind,
+  BodycamGearRattleKind,
+  BodycamWeaponAudioCue,
+  BodycamWeaponCueOptions,
+  IBodycamAudioSource,
+} from './IBodycamAudioSource';
+import { BodycamMeleeAttackType, BodycamSurfaceMaterial } from './types';
+
+/**
+ * Self-contained Bodycam Chest-Mic Web Audio Engine:
+ *  - Surface-aware procedural footsteps (concrete, wood, metal, gravel, puddle, grass, asphalt)
+ *  - Tactical Gear / Plate-Carrier Vest Rattle layer scaled by movement, crouch/stand, & landing shock
+ *  - Vault & Mantle surface-matched hand-slap, boot scuff, and tempered glass shatter foley
+ *  - HRTF 3D spatialization, dynamic interior/exterior convolution reverb
+ *  - Soft-clipping WaveShaperNode + DynamicsCompressorNode chest-mic saturation chain
+ */
+export class BodycamAudio implements IBodycamAudioSource {
+  private ctx: AudioContext | null = null;
+  private masterGain: GainNode | null = null;
+  private masterLowpass: BiquadFilterNode | null = null;
+  private micShaper: WaveShaperNode | null = null;
+  private micCompressor: DynamicsCompressorNode | null = null;
+  private dryBus: GainNode | null = null;
+  private wetBus: GainNode | null = null;
+  private convolver: ConvolverNode | null = null;
+  private interiorWetBus: GainNode | null = null;
+  private interiorConvolver: ConvolverNode | null = null;
+
+  private windGain: GainNode | null = null;
+  private windSource: AudioBufferSourceNode | null = null;
+  private currentIndoor = false;
+  private currentInteriorMaterial: 'concrete' | 'wood' | 'metal' | 'outdoor' = 'outdoor';
+
+  private noiseBuffer: AudioBuffer | null = null;
+  private clipDrive = 4.5;
+  private masterVolume = 0.85;
+  private gearRattleGain = 0.75;
+  private initialized = false;
+
+  public ensureInitialized(): void {
+    if (this.initialized) {
+      if (this.ctx && this.ctx.state === 'suspended') {
+        void this.ctx.resume();
+      }
+      return;
+    }
+
+    const AudioCtx =
+      window.AudioContext ||
+      (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+    if (!AudioCtx) return;
+
+    const ctx = new AudioCtx();
+    this.ctx = ctx;
+
+    // Master output
+    const master = ctx.createGain();
+    master.gain.value = this.masterVolume;
+    master.connect(ctx.destination);
+    this.masterGain = master;
+
+    // Trauma concussion lowpass
+    const lp = ctx.createBiquadFilter();
+    lp.type = 'lowpass';
+    lp.frequency.value = 22000;
+    lp.Q.value = 0.7;
+    lp.connect(master);
+    this.masterLowpass = lp;
+
+    // Chest-mic DynamicsCompressorNode -> limits loud shots and ducks wind
+    const comp = ctx.createDynamicsCompressor();
+    comp.threshold.value = -16;
+    comp.knee.value = 6;
+    comp.ratio.value = 14;
+    comp.attack.value = 0.0015;
+    comp.release.value = 0.24;
+    comp.connect(lp);
+    this.micCompressor = comp;
+
+    // Chest-mic WaveShaperNode -> authentic soft-clipping capsule saturation
+    const shaper = ctx.createWaveShaper();
+    shaper.curve = this.makeClipCurve(this.clipDrive);
+    shaper.oversample = '2x';
+    shaper.connect(comp);
+    this.micShaper = shaper;
+
+    // Dry bus -> shaper -> compressor
+    const dry = ctx.createGain();
+    dry.gain.value = 1.0;
+    dry.connect(shaper);
+    this.dryBus = dry;
+
+    // Exterior open-air convolution reverb
+    const convolver = ctx.createConvolver();
+    convolver.buffer = this.createImpulseResponse(ctx, 1.85, 2.75, false);
+    this.convolver = convolver;
+
+    const wet = ctx.createGain();
+    wet.gain.value = 0.34;
+    wet.connect(convolver);
+    convolver.connect(shaper);
+    this.wetBus = wet;
+
+    // Tight interior slapback convolution reverb (concrete bunker / CQB corridor)
+    const intConvolver = ctx.createConvolver();
+    intConvolver.buffer = this.createImpulseResponse(ctx, 0.56, 3.3, true);
+    this.interiorConvolver = intConvolver;
+
+    const intWet = ctx.createGain();
+    intWet.gain.value = 0.0;
+    intWet.connect(intConvolver);
+    intConvolver.connect(shaper);
+    this.interiorWetBus = intWet;
+
+    this.noiseBuffer = this.createNoiseBuffer(ctx, 2.5);
+    this.startWindAmbience();
+    this.initialized = true;
+  }
+
+  private makeClipCurve(drive: number): Float32Array<ArrayBuffer> {
+    const samples = 1024;
+    const buf = new ArrayBuffer(samples * 4);
+    const curve = new Float32Array(buf);
+    const k = Math.max(0.5, drive * 8);
+    for (let i = 0; i < samples; i++) {
+      const x = (i * 2) / samples - 1;
+      curve[i] = ((1 + k) * x) / (1 + k * Math.abs(x));
+    }
+    return curve;
+  }
+
+  private createNoiseBuffer(ctx: AudioContext, seconds: number): AudioBuffer {
+    const length = Math.floor(ctx.sampleRate * seconds);
+    const buffer = ctx.createBuffer(1, length, ctx.sampleRate);
+    const data = buffer.getChannelData(0);
+    for (let i = 0; i < length; i++) {
+      data[i] = Math.random() * 2 - 1;
+    }
+    return buffer;
+  }
+
+  private createImpulseResponse(
+    ctx: AudioContext,
+    durationSec: number,
+    decay: number,
+    tightInterior: boolean,
+  ): AudioBuffer {
+    const length = Math.floor(ctx.sampleRate * durationSec);
+    const impulse = ctx.createBuffer(2, length, ctx.sampleRate);
+    for (let c = 0; c < 2; c++) {
+      const ch = impulse.getChannelData(c);
+      let lp = 0;
+      for (let i = 0; i < length; i++) {
+        const t = i / length;
+        const env = Math.pow(1 - t, decay);
+        const white = (Math.random() * 2 - 1) * env;
+        lp = lp * (tightInterior ? 0.36 : 0.65) + white * (tightInterior ? 0.64 : 0.35);
+        let slap = lp;
+        if (tightInterior) {
+          if (
+            i === Math.floor(ctx.sampleRate * 0.011) ||
+            i === Math.floor(ctx.sampleRate * 0.025) ||
+            i === Math.floor(ctx.sampleRate * 0.047)
+          ) {
+            slap += (Math.random() * 2 - 1) * 0.82;
+          }
+        } else if (i === Math.floor(ctx.sampleRate * 0.045) || i === Math.floor(ctx.sampleRate * 0.115)) {
+          slap += (Math.random() * 2 - 1) * 0.55;
+        }
+        ch[i] = slap;
+      }
+    }
+    return impulse;
+  }
+
+  private startWindAmbience(): void {
+    if (!this.ctx || !this.noiseBuffer || !this.dryBus) return;
+    const ctx = this.ctx;
+    const src = ctx.createBufferSource();
+    src.buffer = this.noiseBuffer;
+    src.loop = true;
+
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.value = 320;
+    bp.Q.value = 1.65;
+
+    const lp = ctx.createBiquadFilter();
+    lp.type = 'lowpass';
+    lp.frequency.value = 680;
+
+    const lfo = ctx.createOscillator();
+    lfo.frequency.value = 0.13;
+    const lfoGain = ctx.createGain();
+    lfoGain.gain.value = 135;
+    lfo.connect(lfoGain);
+    lfoGain.connect(bp.frequency);
+    lfo.start();
+
+    const windGain = ctx.createGain();
+    windGain.gain.value = 0.0836; // Reduced 12% from 0.095
+
+    src.connect(bp);
+    bp.connect(lp);
+    lp.connect(windGain);
+    windGain.connect(this.dryBus);
+    src.start();
+
+    this.windGain = windGain;
+    this.windSource = src;
+  }
+
+  public setSettings(clipDrive: number, masterVolume: number, gearRattleGain = 0.75): void {
+    this.clipDrive = clipDrive;
+    this.masterVolume = masterVolume;
+    this.gearRattleGain = gearRattleGain;
+    if (this.micShaper) {
+      this.micShaper.curve = this.makeClipCurve(clipDrive);
+    }
+    if (this.masterGain && this.ctx) {
+      this.masterGain.gain.setTargetAtTime(masterVolume, this.ctx.currentTime, 0.04);
+    }
+  }
+
+  public updateListener(
+    position: Readonly<THREE.Vector3>,
+    forward: Readonly<THREE.Vector3>,
+    up: Readonly<THREE.Vector3>,
+  ): void {
+    if (!this.ctx) return;
+    const listener = this.ctx.listener;
+    if (listener.positionX) {
+      const t = this.ctx.currentTime;
+      listener.positionX.setValueAtTime(position.x, t);
+      listener.positionY.setValueAtTime(position.y, t);
+      listener.positionZ.setValueAtTime(position.z, t);
+      listener.forwardX.setValueAtTime(forward.x, t);
+      listener.forwardY.setValueAtTime(forward.y, t);
+      listener.forwardZ.setValueAtTime(forward.z, t);
+      listener.upX.setValueAtTime(up.x, t);
+      listener.upY.setValueAtTime(up.y, t);
+      listener.upZ.setValueAtTime(up.z, t);
+    }
+  }
+
+  private createHRTFPanner(
+    pos: Readonly<THREE.Vector3>,
+    refDist = 2.0,
+    maxDist = 110,
+  ): PannerNode | null {
+    if (!this.ctx) return null;
+    const panner = this.ctx.createPanner();
+    panner.panningModel = 'HRTF';
+    panner.distanceModel = 'inverse';
+    panner.refDistance = refDist;
+    panner.maxDistance = maxDist;
+    panner.rolloffFactor = 1.15;
+    panner.positionX.setValueAtTime(pos.x, this.ctx.currentTime);
+    panner.positionY.setValueAtTime(pos.y, this.ctx.currentTime);
+    panner.positionZ.setValueAtTime(pos.z, this.ctx.currentTime);
+    return panner;
+  }
+
+  public setInteriorAcoustics(
+    isIndoor: boolean,
+    material: 'concrete' | 'wood' | 'metal' | 'outdoor',
+  ): void {
+    if (this.currentIndoor === isIndoor && this.currentInteriorMaterial === material) return;
+    this.currentIndoor = isIndoor;
+    this.currentInteriorMaterial = material;
+    if (!this.ctx) return;
+    const t = this.ctx.currentTime;
+    const targetWind = isIndoor ? 0.01584 : 0.0836;
+    const targetOutWet = isIndoor ? 0.05 : 0.34;
+    const targetIntWet = isIndoor
+      ? material === 'concrete'
+        ? 0.56
+        : material === 'metal'
+          ? 0.62
+          : 0.34
+      : 0.0;
+
+    this.windGain?.gain.setTargetAtTime(targetWind, t, 0.14);
+    this.wetBus?.gain.setTargetAtTime(targetOutWet, t, 0.12);
+    this.interiorWetBus?.gain.setTargetAtTime(targetIntWet, t, 0.12);
+  }
+
+  private duckAmbientWind(durationSec = 0.85, targetGain = 0.0105): void {
+    if (!this.ctx || !this.windGain) return;
+    const t = this.ctx.currentTime;
+    const restoreGain = this.currentIndoor ? 0.01584 : 0.0836;
+    this.windGain.gain.cancelScheduledValues(t);
+    this.windGain.gain.setValueAtTime(this.windGain.gain.value, t);
+    this.windGain.gain.linearRampToValueAtTime(Math.min(targetGain, restoreGain), t + 0.015);
+    this.windGain.gain.exponentialRampToValueAtTime(restoreGain, t + durationSec);
+  }
+
+  private connectToOutputBuses(node: AudioNode, sendOutdoorWet = false): void {
+    if (!this.dryBus) return;
+    node.connect(this.dryBus);
+    if (sendOutdoorWet && this.wetBus) {
+      node.connect(this.wetBus);
+    }
+    if (this.currentIndoor && this.interiorWetBus) {
+      node.connect(this.interiorWetBus);
+    }
+  }
+
+  /**
+   * Procedural surface-specific boot heel-strike synthesizer.
+   * Distinct physical timbre for concrete, wood, metal, gravel, puddle, grass, and asphalt.
+   */
+  public playFootstep(surface: BodycamSurfaceMaterial, intensity = 1.0): void {
+    this.ensureInitialized();
+    if (!this.ctx || !this.noiseBuffer || !this.dryBus) return;
+    const ctx = this.ctx;
+    const t = ctx.currentTime;
+    const amp = THREE.MathUtils.clamp(intensity, 0.15, 2.0);
+    const pitchJitter = 0.92 + Math.random() * 0.16;
+
+    // 1. Subtle low-end boot heel thud (present on every hard surface)
+    const heelOsc = ctx.createOscillator();
+    heelOsc.type = 'sine';
+    const heelStart =
+      surface === 'wood' ? 145 : surface === 'metal' ? 195 : surface === 'puddle' ? 95 : 115;
+    heelOsc.frequency.setValueAtTime(heelStart * pitchJitter, t);
+    heelOsc.frequency.exponentialRampToValueAtTime(38, t + 0.065);
+    const heelGain = ctx.createGain();
+    const heelVol =
+      surface === 'gravel' || surface === 'grass' ? 0.055 * amp : surface === 'puddle' ? 0.08 * amp : 0.14 * amp;
+    heelGain.gain.setValueAtTime(heelVol, t);
+    heelGain.gain.exponentialRampToValueAtTime(0.001, t + 0.075);
+    heelOsc.connect(heelGain);
+    this.connectToOutputBuses(heelGain);
+    heelOsc.start(t);
+    heelOsc.stop(t + 0.085);
+
+    if (surface === 'concrete' || surface === 'asphalt') {
+      // Crisp hard rubber sole slap + fine surface grit scuff
+      const src = ctx.createBufferSource();
+      src.buffer = this.noiseBuffer;
+      const bp = ctx.createBiquadFilter();
+      bp.type = 'bandpass';
+      bp.frequency.value = (surface === 'asphalt' ? 760 : 620) * pitchJitter;
+      bp.Q.value = 1.5;
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0.16 * amp, t);
+      g.gain.exponentialRampToValueAtTime(0.001, t + 0.075);
+      src.connect(bp);
+      bp.connect(g);
+      this.connectToOutputBuses(g);
+      src.start(t, Math.random() * 1.2, 0.085);
+
+      // High grit scuff
+      const grit = ctx.createBufferSource();
+      grit.buffer = this.noiseBuffer;
+      const hp = ctx.createBiquadFilter();
+      hp.type = 'highpass';
+      hp.frequency.value = 2400;
+      const gg = ctx.createGain();
+      gg.gain.setValueAtTime(0.045 * amp, t + 0.01);
+      gg.gain.exponentialRampToValueAtTime(0.001, t + 0.055);
+      grit.connect(hp);
+      hp.connect(gg);
+      this.connectToOutputBuses(gg);
+      grit.start(t + 0.01, Math.random() * 1.2, 0.06);
+      return;
+    }
+
+    if (surface === 'wood') {
+      // Hollow resonant wooden plank knock + brief board creak
+      const plank = ctx.createOscillator();
+      plank.type = 'triangle';
+      plank.frequency.setValueAtTime(245 * pitchJitter, t);
+      plank.frequency.exponentialRampToValueAtTime(118 * pitchJitter, t + 0.09);
+      const pbp = ctx.createBiquadFilter();
+      pbp.type = 'bandpass';
+      pbp.frequency.value = 340 * pitchJitter;
+      pbp.Q.value = 3.2;
+      const pg = ctx.createGain();
+      pg.gain.setValueAtTime(0.24 * amp, t);
+      pg.gain.exponentialRampToValueAtTime(0.001, t + 0.11);
+      plank.connect(pbp);
+      pbp.connect(pg);
+      this.connectToOutputBuses(pg);
+      plank.start(t);
+      plank.stop(t + 0.12);
+
+      const src = ctx.createBufferSource();
+      src.buffer = this.noiseBuffer;
+      const bp = ctx.createBiquadFilter();
+      bp.type = 'bandpass';
+      bp.frequency.value = 410 * pitchJitter;
+      bp.Q.value = 2.6;
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0.15 * amp, t);
+      g.gain.exponentialRampToValueAtTime(0.001, t + 0.095);
+      src.connect(bp);
+      bp.connect(g);
+      this.connectToOutputBuses(g);
+      src.start(t, Math.random() * 1.2, 0.11);
+      return;
+    }
+
+    if (surface === 'metal') {
+      // Industrial steel grate dual-mode metallic clang + sharp sole strike
+      const modes = [980, 2140, 3420];
+      for (let i = 0; i < modes.length; i++) {
+        const osc = ctx.createOscillator();
+        osc.type = i === 0 ? 'triangle' : 'sine';
+        osc.frequency.setValueAtTime(modes[i] * pitchJitter, t);
+        osc.frequency.exponentialRampToValueAtTime(modes[i] * 0.94 * pitchJitter, t + 0.14);
+        const mg = ctx.createGain();
+        mg.gain.setValueAtTime((i === 0 ? 0.13 : i === 1 ? 0.085 : 0.045) * amp, t);
+        mg.gain.exponentialRampToValueAtTime(0.001, t + (0.14 - i * 0.025));
+        osc.connect(mg);
+        this.connectToOutputBuses(mg, true);
+        osc.start(t);
+        osc.stop(t + 0.16);
+      }
+
+      const src = ctx.createBufferSource();
+      src.buffer = this.noiseBuffer;
+      const bp = ctx.createBiquadFilter();
+      bp.type = 'bandpass';
+      bp.frequency.value = 1850 * pitchJitter;
+      bp.Q.value = 3.5;
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0.14 * amp, t);
+      g.gain.exponentialRampToValueAtTime(0.001, t + 0.085);
+      src.connect(bp);
+      bp.connect(g);
+      this.connectToOutputBuses(g);
+      src.start(t, Math.random() * 1.2, 0.095);
+      return;
+    }
+
+    if (surface === 'gravel') {
+      // Multi-grain shifting crushed stone crunch (4 staggered granular micro-bursts)
+      for (let i = 0; i < 4; i++) {
+        const delay = i * (0.018 + Math.random() * 0.014);
+        const src = ctx.createBufferSource();
+        src.buffer = this.noiseBuffer;
+        const bp = ctx.createBiquadFilter();
+        bp.type = 'bandpass';
+        bp.frequency.value = (1550 + i * 620 + Math.random() * 480) * pitchJitter;
+        bp.Q.value = 1.9;
+        const g = ctx.createGain();
+        const peak = (i === 0 ? 0.19 : 0.12 - i * 0.018) * amp;
+        g.gain.setValueAtTime(0.001, t + delay);
+        g.gain.linearRampToValueAtTime(peak, t + delay + 0.008);
+        g.gain.exponentialRampToValueAtTime(0.001, t + delay + 0.055);
+        src.connect(bp);
+        bp.connect(g);
+        this.connectToOutputBuses(g);
+        src.start(t + delay, Math.random() * 1.4, 0.065);
+      }
+      return;
+    }
+
+    if (surface === 'puddle') {
+      // Wet boot splash sweep + sparkling droplet spray
+      const splash = ctx.createBufferSource();
+      splash.buffer = this.noiseBuffer;
+      const bp = ctx.createBiquadFilter();
+      bp.type = 'bandpass';
+      bp.frequency.setValueAtTime(720 * pitchJitter, t);
+      bp.frequency.exponentialRampToValueAtTime(2950 * pitchJitter, t + 0.07);
+      bp.frequency.exponentialRampToValueAtTime(1100, t + 0.20);
+      bp.Q.value = 1.3;
+      const sg = ctx.createGain();
+      sg.gain.setValueAtTime(0.001, t);
+      sg.gain.linearRampToValueAtTime(0.24 * amp, t + 0.018);
+      sg.gain.exponentialRampToValueAtTime(0.001, t + 0.21);
+      splash.connect(bp);
+      bp.connect(sg);
+      this.connectToOutputBuses(sg, true);
+      splash.start(t, Math.random() * 1.0, 0.23);
+
+      // Droplet spatter
+      const spray = ctx.createBufferSource();
+      spray.buffer = this.noiseBuffer;
+      const hp = ctx.createBiquadFilter();
+      hp.type = 'highpass';
+      hp.frequency.value = 3400;
+      const dg = ctx.createGain();
+      dg.gain.setValueAtTime(0.09 * amp, t + 0.03);
+      dg.gain.exponentialRampToValueAtTime(0.001, t + 0.18);
+      spray.connect(hp);
+      hp.connect(dg);
+      this.connectToOutputBuses(dg);
+      spray.start(t + 0.03, Math.random() * 1.0, 0.17);
+      return;
+    }
+
+    // Grass / soil fallback
+    const src = ctx.createBufferSource();
+    src.buffer = this.noiseBuffer;
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.value = 820 * pitchJitter;
+    bp.Q.value = 0.85;
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.13 * amp, t);
+    g.gain.exponentialRampToValueAtTime(0.001, t + 0.095);
+    src.connect(bp);
+    bp.connect(g);
+    this.connectToOutputBuses(g);
+    src.start(t, Math.random() * 1.2, 0.11);
+  }
+
+  /**
+   * Tactical Gear / Plate-Carrier Vest Rattle synthesizer.
+   * Layers nylon Cordura rub, sling creak, and subtle polymer mag/buckle micro-clacks.
+   * Scaled by movement intensity, crouch/stand posture transitions, and landing impact shock.
+   */
+  public playGearRattle(
+    kind: BodycamGearRattleKind,
+    intensity = 1.0,
+  ): void {
+    this.ensureInitialized();
+    if (!this.ctx || !this.noiseBuffer || !this.dryBus || this.gearRattleGain <= 0.01) return;
+    const ctx = this.ctx;
+    const t = ctx.currentTime;
+    const scale = THREE.MathUtils.clamp(intensity, 0.15, 2.2) * this.gearRattleGain;
+
+    // 1. Plate-carrier Cordura / canvas fabric rub
+    const rub = ctx.createBufferSource();
+    rub.buffer = this.noiseBuffer;
+    const rubBp = ctx.createBiquadFilter();
+    rubBp.type = 'bandpass';
+    rubBp.frequency.setValueAtTime(
+      kind === 'crouch'
+        ? 540
+        : kind === 'landing'
+          ? 460
+          : kind === 'vault' || kind === 'melee'
+            ? 620
+            : 680 + Math.random() * 160,
+      t,
+    );
+    rubBp.Q.value = 1.65;
+    const rubDur =
+      kind === 'crouch'
+        ? 0.19
+        : kind === 'landing'
+          ? 0.24
+          : kind === 'vault'
+            ? 0.22
+            : kind === 'melee'
+              ? 0.16
+              : 0.11;
+    const rubGain = ctx.createGain();
+    const rubPeak =
+      (kind === 'landing'
+        ? 0.13
+        : kind === 'vault'
+          ? 0.11
+          : kind === 'melee'
+            ? 0.095
+            : kind === 'crouch'
+              ? 0.085
+              : 0.052) * scale;
+    rubGain.gain.setValueAtTime(0.001, t);
+    rubGain.gain.linearRampToValueAtTime(rubPeak, t + 0.022);
+    rubGain.gain.exponentialRampToValueAtTime(0.001, t + rubDur);
+    rub.connect(rubBp);
+    rubBp.connect(rubGain);
+    this.connectToOutputBuses(rubGain);
+    rub.start(t, Math.random() * 1.5, rubDur + 0.02);
+
+    // 2. Subtle polymer mag pouch / metal sling swivel clink on heavier motion
+    if (
+      kind === 'landing' ||
+      kind === 'vault' ||
+      kind === 'melee' ||
+      kind === 'weapon_swap' ||
+      (kind === 'step' && intensity > 0.65)
+    ) {
+      const clinkCount = kind === 'landing' || kind === 'vault' ? 2 : 1;
+      for (let i = 0; i < clinkCount; i++) {
+        const delay = 0.012 + i * 0.048 + Math.random() * 0.018;
+        const osc = ctx.createOscillator();
+        osc.type = 'triangle';
+        const f = (2350 + Math.random() * 950) * (kind === 'landing' ? 0.92 : 1.0);
+        osc.frequency.setValueAtTime(f, t + delay);
+        osc.frequency.exponentialRampToValueAtTime(f * 0.52, t + delay + 0.028);
+
+        const hp = ctx.createBiquadFilter();
+        hp.type = 'highpass';
+        hp.frequency.value = 1600;
+
+        const cg = ctx.createGain();
+        const peak =
+          (kind === 'landing'
+            ? 0.065
+            : kind === 'vault'
+              ? 0.052
+              : kind === 'melee'
+                ? 0.046
+                : kind === 'weapon_swap'
+                  ? 0.05
+                  : 0.026) * scale;
+        cg.gain.setValueAtTime(peak, t + delay);
+        cg.gain.exponentialRampToValueAtTime(0.001, t + delay + 0.032);
+        osc.connect(hp);
+        hp.connect(cg);
+        this.connectToOutputBuses(cg);
+        osc.start(t + delay);
+        osc.stop(t + delay + 0.038);
+      }
+    }
+  }
+
+  /**
+   * Surface-matched tactical glove palm-slap / brace impact for vaulting & mantling.
+   */
+  public playHandSlap(surface: BodycamSurfaceMaterial, intensity = 1.0): void {
+    this.ensureInitialized();
+    if (!this.ctx || !this.noiseBuffer || !this.dryBus) return;
+    const ctx = this.ctx;
+    const t = ctx.currentTime;
+    const amp = THREE.MathUtils.clamp(intensity, 0.2, 1.8);
+    const jitter = 0.92 + Math.random() * 0.16;
+
+    // 1. Muffled gloved palm meat thump
+    const thump = ctx.createOscillator();
+    thump.type = 'sine';
+    const startFreq = surface === 'metal' ? 190 : surface === 'wood' ? 165 : 132;
+    thump.frequency.setValueAtTime(startFreq * jitter, t);
+    thump.frequency.exponentialRampToValueAtTime(48, t + 0.058);
+    const tg = ctx.createGain();
+    tg.gain.setValueAtTime(0.18 * amp, t);
+    tg.gain.exponentialRampToValueAtTime(0.001, t + 0.068);
+    thump.connect(tg);
+    this.connectToOutputBuses(tg);
+    thump.start(t);
+    thump.stop(t + 0.075);
+
+    // 2. Leather glove slap + surface texture grit
+    const slap = ctx.createBufferSource();
+    slap.buffer = this.noiseBuffer;
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.value =
+      (surface === 'metal' ? 1450 : surface === 'wood' ? 680 : 940) * jitter;
+    bp.Q.value = surface === 'metal' ? 2.4 : 1.4;
+    const sg = ctx.createGain();
+    sg.gain.setValueAtTime(0.001, t);
+    sg.gain.linearRampToValueAtTime(0.19 * amp, t + 0.008);
+    sg.gain.exponentialRampToValueAtTime(0.001, t + 0.078);
+    slap.connect(bp);
+    bp.connect(sg);
+    this.connectToOutputBuses(sg);
+    slap.start(t, Math.random() * 1.3, 0.09);
+
+    // 3. Metallic shipping-container hollow ring when slapping metal ledges
+    if (surface === 'metal') {
+      const ring = ctx.createOscillator();
+      ring.type = 'triangle';
+      ring.frequency.setValueAtTime(310 * jitter, t);
+      ring.frequency.exponentialRampToValueAtTime(245 * jitter, t + 0.14);
+      const rg = ctx.createGain();
+      rg.gain.setValueAtTime(0.14 * amp, t);
+      rg.gain.exponentialRampToValueAtTime(0.001, t + 0.16);
+      ring.connect(rg);
+      this.connectToOutputBuses(rg, true);
+      ring.start(t);
+      ring.stop(t + 0.17);
+    }
+  }
+
+  /**
+   * Surface-matched rubber boot sole scrape / kick-off scuff during climb & high mantle.
+   */
+  public playBootScuff(surface: BodycamSurfaceMaterial, intensity = 1.0): void {
+    this.ensureInitialized();
+    if (!this.ctx || !this.noiseBuffer || !this.dryBus) return;
+    const ctx = this.ctx;
+    const t = ctx.currentTime;
+    const amp = THREE.MathUtils.clamp(intensity, 0.2, 1.8);
+    const jitter = 0.9 + Math.random() * 0.2;
+
+    const scuff = ctx.createBufferSource();
+    scuff.buffer = this.noiseBuffer;
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    const fStart = surface === 'metal' ? 1850 : surface === 'wood' ? 820 : 1280;
+    bp.frequency.setValueAtTime(fStart * jitter, t);
+    bp.frequency.exponentialRampToValueAtTime(fStart * 0.55 * jitter, t + 0.14);
+    bp.Q.value = 1.9;
+
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.001, t);
+    g.gain.linearRampToValueAtTime(0.16 * amp, t + 0.02);
+    g.gain.exponentialRampToValueAtTime(0.001, t + 0.155);
+    scuff.connect(bp);
+    bp.connect(g);
+    this.connectToOutputBuses(g);
+    scuff.start(t, Math.random() * 1.1, 0.17);
+
+    if (surface === 'metal') {
+      const thud = ctx.createOscillator();
+      thud.type = 'triangle';
+      thud.frequency.setValueAtTime(220 * jitter, t);
+      thud.frequency.exponentialRampToValueAtTime(115, t + 0.11);
+      const tg = ctx.createGain();
+      tg.gain.setValueAtTime(0.15 * amp, t);
+      tg.gain.exponentialRampToValueAtTime(0.001, t + 0.12);
+      thud.connect(tg);
+      this.connectToOutputBuses(tg, true);
+      thud.start(t);
+      thud.stop(t + 0.13);
+    }
+  }
+
+  /**
+   * Tempered window glass shatter + cascading shard tinkles.
+   */
+  public playGlassShatter(pos: Readonly<THREE.Vector3>, intensity = 1.0): void {
+    this.ensureInitialized();
+    if (!this.ctx || !this.noiseBuffer || !this.dryBus || !this.wetBus) return;
+    const ctx = this.ctx;
+    const t = ctx.currentTime;
+    const amp = THREE.MathUtils.clamp(intensity, 0.3, 1.8);
+
+    const panner = this.createHRTFPanner(pos, 1.8, 95);
+    if (!panner) return;
+    panner.connect(this.dryBus);
+    panner.connect(this.wetBus);
+    if (this.interiorWetBus) {
+      panner.connect(this.interiorWetBus);
+    }
+
+    // 1. Sharp initial pane burst
+    const burst = ctx.createBufferSource();
+    burst.buffer = this.noiseBuffer;
+    const hp = ctx.createBiquadFilter();
+    hp.type = 'highpass';
+    hp.frequency.value = 2600;
+    const bg = ctx.createGain();
+    bg.gain.setValueAtTime(0.58 * amp, t);
+    bg.gain.exponentialRampToValueAtTime(0.001, t + 0.24);
+    burst.connect(hp);
+    hp.connect(bg);
+    bg.connect(panner);
+    burst.start(t, Math.random() * 0.8, 0.26);
+
+    // 2. Cascading high-frequency crystalline shard tinkles
+    for (let i = 0; i < 9; i++) {
+      const delay = 0.015 + i * 0.032 + Math.random() * 0.055;
+      const osc = ctx.createOscillator();
+      osc.type = 'sine';
+      const freq = 3400 + Math.random() * 4400;
+      osc.frequency.setValueAtTime(freq, t + delay);
+      osc.frequency.exponentialRampToValueAtTime(freq * (0.9 + Math.random() * 0.08), t + delay + 0.08);
+      const sg = ctx.createGain();
+      const peak = (0.14 - i * 0.01) * amp;
+      sg.gain.setValueAtTime(Math.max(0.02, peak), t + delay);
+      sg.gain.exponentialRampToValueAtTime(0.001, t + delay + 0.085);
+      osc.connect(sg);
+      sg.connect(panner);
+      osc.start(t + delay);
+      osc.stop(t + delay + 0.095);
+    }
+  }
+
+  /**
+   * Crisp sleeve/boot air-cut whoosh for alternating jabs, crosses, rifle bashes, and push-kicks.
+   */
+  public playMeleeWhoosh(attackType: BodycamMeleeAttackType): void {
+    this.ensureInitialized();
+    if (!this.ctx || !this.noiseBuffer || !this.dryBus) return;
+    const ctx = this.ctx;
+    const t = ctx.currentTime;
+    const heavy = attackType === 'kick' || attackType === 'cross';
+    const dur = attackType === 'kick' ? 0.22 : attackType === 'cross' ? 0.17 : 0.13;
+
+    const src = ctx.createBufferSource();
+    src.buffer = this.noiseBuffer;
+
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    const fStart = attackType === 'kick' ? 240 : attackType === 'cross' ? 360 : 480;
+    const fPeak = attackType === 'kick' ? 620 : attackType === 'cross' ? 920 : 1220;
+    bp.frequency.setValueAtTime(fStart, t);
+    bp.frequency.exponentialRampToValueAtTime(fPeak, t + dur * 0.42);
+    bp.frequency.exponentialRampToValueAtTime(fStart * 0.72, t + dur);
+    bp.Q.value = heavy ? 1.55 : 1.9;
+
+    const g = ctx.createGain();
+    const peakGain = attackType === 'kick' ? 0.24 : attackType === 'cross' ? 0.19 : 0.14;
+    g.gain.setValueAtTime(0.001, t);
+    g.gain.linearRampToValueAtTime(peakGain, t + dur * 0.35);
+    g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+
+    src.connect(bp);
+    bp.connect(g);
+    this.connectToOutputBuses(g);
+    src.start(t, Math.random() * 1.1, dur + 0.03);
+  }
+
+  /**
+   * Visceral meaty blunt thud / heavy tactical boot-slam impact that drives the chest-mic chain.
+   */
+  public playMeleeImpact(
+    pos: Readonly<THREE.Vector3>,
+    attackType: BodycamMeleeAttackType,
+    surface: BodycamSurfaceMaterial | 'flesh',
+    intensity = 1.0,
+  ): void {
+    this.ensureInitialized();
+    if (!this.ctx || !this.noiseBuffer || !this.dryBus || !this.wetBus) return;
+    const ctx = this.ctx;
+    const t = ctx.currentTime;
+    const amp = THREE.MathUtils.clamp(intensity, 0.35, 1.8);
+    const isKick = attackType === 'kick';
+    const isHeavy = isKick || attackType === 'cross' || attackType === 'bash';
+
+    const panner = this.createHRTFPanner(pos, 1.5, 85);
+    if (!panner) return;
+    panner.connect(this.dryBus);
+    panner.connect(this.wetBus);
+    if (this.interiorWetBus) {
+      panner.connect(this.interiorWetBus);
+    }
+
+    // 1. Sub-bass chest/boot pressure thump
+    const thump = ctx.createOscillator();
+    thump.type = isKick ? 'triangle' : 'sine';
+    const startHz = isKick ? 118 : isHeavy ? 148 : 172;
+    const endHz = isKick ? 32 : 44;
+    thump.frequency.setValueAtTime(startHz * (0.94 + Math.random() * 0.12), t);
+    thump.frequency.exponentialRampToValueAtTime(endHz, t + (isKick ? 0.145 : 0.095));
+
+    const tg = ctx.createGain();
+    tg.gain.setValueAtTime((isKick ? 0.92 : isHeavy ? 0.62 : 0.44) * amp, t);
+    tg.gain.exponentialRampToValueAtTime(0.001, t + (isKick ? 0.16 : 0.11));
+    thump.connect(tg);
+    tg.connect(panner);
+    thump.start(t);
+    thump.stop(t + 0.18);
+
+    // 2. Surface-matched transient slap / crunch
+    const slap = ctx.createBufferSource();
+    slap.buffer = this.noiseBuffer;
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.value =
+      surface === 'flesh'
+        ? isKick
+          ? 290
+          : 420
+        : surface === 'wood'
+          ? 520
+          : surface === 'metal'
+            ? 1650
+            : 1120;
+    bp.Q.value = surface === 'metal' ? 2.6 : 1.35;
+
+    const sg = ctx.createGain();
+    sg.gain.setValueAtTime((isKick ? 0.56 : 0.38) * amp, t);
+    sg.gain.exponentialRampToValueAtTime(0.001, t + (isKick ? 0.13 : 0.085));
+    slap.connect(bp);
+    bp.connect(sg);
+    sg.connect(panner);
+    slap.start(t, Math.random() * 0.9, 0.15);
+
+    // 3. Resonant overtone for metal plates / wooden door slams
+    if (surface === 'metal' || surface === 'wood') {
+      const ring = ctx.createOscillator();
+      ring.type = 'triangle';
+      const baseF = surface === 'metal' ? 1480 + Math.random() * 280 : 195 + Math.random() * 35;
+      ring.frequency.setValueAtTime(baseF, t);
+      ring.frequency.exponentialRampToValueAtTime(baseF * (surface === 'metal' ? 0.96 : 0.65), t + 0.18);
+      const rg = ctx.createGain();
+      rg.gain.setValueAtTime((isKick ? 0.34 : 0.22) * amp, t);
+      rg.gain.exponentialRampToValueAtTime(0.001, t + (surface === 'metal' ? 0.26 : 0.16));
+      ring.connect(rg);
+      rg.connect(panner);
+      ring.start(t);
+      ring.stop(t + 0.28);
+    }
+  }
+
+  public playGunshot(
+    pos: Readonly<THREE.Vector3>,
+    weightClass: 'pistol' | 'carbine' | 'heavy_rifle',
+    suppressed: boolean,
+    isSubsonic = false,
+  ): void {
+    this.ensureInitialized();
+    if (!this.ctx || !this.noiseBuffer || !this.dryBus || !this.wetBus) return;
+    const ctx = this.ctx;
+    const t = ctx.currentTime;
+
+    const panner = this.createHRTFPanner(pos, 1.5, isSubsonic && suppressed ? 45 : 160);
+    if (!panner) return;
+    panner.connect(this.dryBus);
+    panner.connect(this.wetBus);
+    if (this.interiorWetBus) {
+      panner.connect(this.interiorWetBus);
+    }
+
+    const heavy = weightClass === 'heavy_rifle';
+    const rifle = weightClass === 'carbine' || heavy;
+    const subSupp = suppressed && isSubsonic;
+
+    // 1. Sub-bass pressure punch (saturates the WaveShaper chest mic when loud!)
+    const thumpOsc = ctx.createOscillator();
+    thumpOsc.type = 'triangle';
+    thumpOsc.frequency.setValueAtTime(
+      subSupp ? 115 : suppressed ? 130 : heavy ? 112 : rifle ? 140 : 162,
+      t,
+    );
+    thumpOsc.frequency.exponentialRampToValueAtTime(32, t + (subSupp ? 0.045 : suppressed ? 0.07 : 0.15));
+
+    const thumpGain = ctx.createGain();
+    thumpGain.gain.setValueAtTime(
+      subSupp ? 0.24 : suppressed ? 0.62 : heavy ? 2.8 : rifle ? 2.3 : 1.75,
+      t,
+    );
+    thumpGain.gain.exponentialRampToValueAtTime(0.001, t + (subSupp ? 0.055 : suppressed ? 0.08 : 0.19));
+    thumpOsc.connect(thumpGain);
+    thumpGain.connect(panner);
+    thumpOsc.start(t);
+    thumpOsc.stop(t + 0.21);
+
+    // 2. Muzzle blast crack (suppressed subsonic has no supersonic flight crack)
+    const blast = ctx.createBufferSource();
+    blast.buffer = this.noiseBuffer;
+    const bp = ctx.createBiquadFilter();
+    bp.type = suppressed ? 'lowpass' : 'bandpass';
+    bp.frequency.setValueAtTime(
+      subSupp ? 520 : suppressed ? 950 : heavy ? 1480 : rifle ? 1720 : 1980,
+      t,
+    );
+    bp.frequency.exponentialRampToValueAtTime(
+      subSupp ? 140 : suppressed ? 240 : 360,
+      t + (subSupp ? 0.055 : suppressed ? 0.09 : 0.26),
+    );
+    bp.Q.value = 0.7;
+
+    const blastGain = ctx.createGain();
+    blastGain.gain.setValueAtTime(
+      subSupp ? 0.22 : suppressed ? 0.50 : heavy ? 3.1 : rifle ? 2.65 : 2.05,
+      t,
+    );
+    blastGain.gain.exponentialRampToValueAtTime(
+      0.001,
+      t + (subSupp ? 0.07 : suppressed ? 0.11 : heavy ? 0.34 : 0.25),
+    );
+    blast.connect(bp);
+    bp.connect(blastGain);
+    blastGain.connect(panner);
+    blast.start(t);
+    blast.stop(t + 0.38);
+
+    // 3. Mechanical bolt carrier / firing-pin snap
+    const boltOsc = ctx.createOscillator();
+    boltOsc.type = 'square';
+    boltOsc.frequency.setValueAtTime(heavy ? 2100 : 2500, t + 0.012);
+    boltOsc.frequency.exponentialRampToValueAtTime(720, t + 0.044);
+    const boltGain = ctx.createGain();
+    boltGain.gain.setValueAtTime(subSupp ? 0.22 : 0.18, t + 0.012);
+    boltGain.gain.exponentialRampToValueAtTime(0.001, t + 0.05);
+    boltOsc.connect(boltGain);
+    boltGain.connect(panner);
+    boltOsc.start(t + 0.012);
+    boltOsc.stop(t + 0.056);
+
+    if (!suppressed) {
+      this.duckAmbientWind(1.0, 0.01);
+    }
+  }
+
+  public playImpact(
+    pos: Readonly<THREE.Vector3>,
+    materialType: 'concrete' | 'wood' | 'metal' | 'steel_plate' | 'paper' | 'puddle',
+  ): void {
+    this.ensureInitialized();
+    if (!this.ctx || !this.noiseBuffer || !this.dryBus || !this.wetBus) return;
+    const ctx = this.ctx;
+    const t = ctx.currentTime;
+    const panner = this.createHRTFPanner(pos, 2.0, 95);
+    if (!panner) return;
+    panner.connect(this.dryBus);
+    panner.connect(this.wetBus);
+    if (this.interiorWetBus) {
+      panner.connect(this.interiorWetBus);
+    }
+
+    if (materialType === 'steel_plate' || materialType === 'metal') {
+      // Crisp AR500 reactive steel plate ring (fundamental + metallic harmonic overtone)
+      const base = materialType === 'steel_plate' ? 1850 + Math.random() * 260 : 2500 + Math.random() * 600;
+      const freqs = materialType === 'steel_plate' ? [base, base * 1.49, base * 2.13] : [base, base * 1.62];
+      const dur = materialType === 'steel_plate' ? 0.58 : 0.20;
+      for (let i = 0; i < freqs.length; i++) {
+        const osc = ctx.createOscillator();
+        osc.type = i === 0 ? 'triangle' : 'sine';
+        osc.frequency.setValueAtTime(freqs[i], t);
+        osc.frequency.exponentialRampToValueAtTime(freqs[i] * 0.985, t + dur);
+        const g = ctx.createGain();
+        g.gain.setValueAtTime(i === 0 ? 0.42 : i === 1 ? 0.24 : 0.12, t);
+        g.gain.exponentialRampToValueAtTime(0.001, t + dur * (1 - i * 0.18));
+        osc.connect(g);
+        g.connect(panner);
+        osc.start(t);
+        osc.stop(t + dur + 0.03);
+      }
+      return;
+    }
+
+    const src = ctx.createBufferSource();
+    src.buffer = this.noiseBuffer;
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.value =
+      materialType === 'paper' ? 2400 : materialType === 'wood' ? 720 : materialType === 'puddle' ? 1200 : 1450;
+    bp.Q.value = materialType === 'paper' ? 1.8 : 1.3;
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(materialType === 'paper' ? 0.18 : 0.28, t);
+    g.gain.exponentialRampToValueAtTime(0.001, t + (materialType === 'puddle' ? 0.16 : 0.085));
+    src.connect(bp);
+    bp.connect(g);
+    g.connect(panner);
+    src.start(t, Math.random() * 0.8, 0.18);
+  }
+
+  /**
+   * Spatialized supersonic grazing ricochet whine / Doppler zing.
+   */
+  public playRicochet(
+    pos: Readonly<THREE.Vector3>,
+    speedMps: number,
+    surface: BodycamSurfaceMaterial,
+  ): void {
+    this.ensureInitialized();
+    if (!this.ctx || !this.dryBus || !this.wetBus) return;
+    const ctx = this.ctx;
+    const t = ctx.currentTime;
+    const panner = this.createHRTFPanner(pos, 2.0, 120);
+    if (!panner) return;
+    panner.connect(this.dryBus);
+    panner.connect(this.wetBus);
+    if (this.interiorWetBus) {
+      panner.connect(this.interiorWetBus);
+    }
+
+    const energyNorm = THREE.MathUtils.clamp(speedMps / 750, 0.35, 1.35);
+    const startHz =
+      (surface === 'metal' ? 3250 : surface === 'puddle' ? 1950 : 2550) *
+      (0.88 + Math.random() * 0.28) *
+      Math.min(1.2, 0.8 + energyNorm * 0.35);
+    const midHz = startHz * (0.58 + Math.random() * 0.18);
+    const endHz = midHz * 0.42;
+    const dur = 0.24 + Math.random() * 0.14;
+
+    const osc = ctx.createOscillator();
+    osc.type = 'sawtooth';
+    osc.frequency.setValueAtTime(startHz, t);
+    osc.frequency.exponentialRampToValueAtTime(midHz, t + dur * 0.35);
+    osc.frequency.exponentialRampToValueAtTime(endHz, t + dur);
+
+    // Subtle spin warble (tumble modulation)
+    const lfo = ctx.createOscillator();
+    lfo.type = 'sine';
+    lfo.frequency.value = 34 + Math.random() * 26;
+    const lfoGain = ctx.createGain();
+    lfoGain.gain.value = startHz * 0.06;
+    lfo.connect(lfoGain);
+    lfoGain.connect(osc.frequency);
+
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.setValueAtTime(startHz * 0.85, t);
+    bp.frequency.exponentialRampToValueAtTime(endHz * 1.15, t + dur);
+    bp.Q.value = 3.2;
+
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.001, t);
+    g.gain.linearRampToValueAtTime(0.28 * Math.min(1.2, energyNorm), t + 0.012);
+    g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+
+    osc.connect(bp);
+    bp.connect(g);
+    g.connect(panner);
+    osc.start(t);
+    lfo.start(t);
+    osc.stop(t + dur + 0.02);
+    lfo.stop(t + dur + 0.02);
+  }
+
+  public playTacticalSwitchClick(highPitch = false): void {
+    this.ensureInitialized();
+    if (!this.ctx || !this.dryBus) return;
+    const t = this.ctx.currentTime;
+    const osc = this.ctx.createOscillator();
+    osc.type = 'square';
+    osc.frequency.setValueAtTime(highPitch ? 2850 : 2150, t);
+    osc.frequency.exponentialRampToValueAtTime(highPitch ? 1250 : 880, t + 0.016);
+    const g = this.ctx.createGain();
+    g.gain.setValueAtTime(0.14, t);
+    g.gain.exponentialRampToValueAtTime(0.001, t + 0.022);
+    osc.connect(g);
+    g.connect(this.dryBus);
+    osc.start(t);
+    osc.stop(t + 0.028);
+  }
+
+  public playReloadFoley(stage: 'out' | 'in' | 'rack' | 'check'): void {
+    this.ensureInitialized();
+    if (!this.ctx || !this.dryBus) return;
+    const t = this.ctx.currentTime;
+    const osc = this.ctx.createOscillator();
+    osc.type = stage === 'rack' ? 'sawtooth' : 'square';
+    const baseFreq = stage === 'out' ? 900 : stage === 'in' ? 680 : stage === 'rack' ? 1450 : 1100;
+    osc.frequency.setValueAtTime(baseFreq, t);
+    osc.frequency.exponentialRampToValueAtTime(baseFreq * 0.42, t + 0.055);
+    const bp = this.ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.value = 1800;
+    const g = this.ctx.createGain();
+    g.gain.setValueAtTime(0.22, t);
+    g.gain.exponentialRampToValueAtTime(0.001, t + 0.065);
+    osc.connect(bp);
+    bp.connect(g);
+    g.connect(this.dryBus);
+    osc.start(t);
+    osc.stop(t + 0.072);
+  }
+
+  public playDryFire(): void {
+    this.ensureInitialized();
+    if (!this.ctx || !this.dryBus) return;
+    const t = this.ctx.currentTime;
+    const osc = this.ctx.createOscillator();
+    osc.type = 'triangle';
+    osc.frequency.setValueAtTime(3400, t);
+    osc.frequency.exponentialRampToValueAtTime(620, t + 0.025);
+    const g = this.ctx.createGain();
+    g.gain.setValueAtTime(0.36, t);
+    g.gain.exponentialRampToValueAtTime(0.001, t + 0.03);
+    osc.connect(g);
+    g.connect(this.dryBus);
+    osc.start(t);
+    osc.stop(t + 0.035);
+  }
+
+  /**
+   * Procedural mechanical weapon cue synthesizer synced to WeaponAnimator beats.
+   * Covers mag_out, mag_in, rack (2-stage steel bolt/slide), ads_rustle, dryfire, and fire.
+   */
+  public playWeaponCue(cue: BodycamWeaponAudioCue, options?: BodycamWeaponCueOptions): void {
+    if (cue === 'fire') {
+      const pos = options?.position ?? new THREE.Vector3();
+      this.playGunshot(
+        pos,
+        options?.weightClass ?? 'carbine',
+        Boolean(options?.suppressed),
+        Boolean(options?.isSubsonic),
+      );
+      if (options?.muzzleComp && !options?.suppressed && this.ctx && this.dryBus && this.noiseBuffer) {
+        // Extra crisp compensator port crack
+        const t = this.ctx.currentTime;
+        const crack = this.ctx.createBufferSource();
+        crack.buffer = this.noiseBuffer;
+        const hp = this.ctx.createBiquadFilter();
+        hp.type = 'bandpass';
+        hp.frequency.setValueAtTime(2650, t);
+        hp.Q.value = 1.2;
+        const cg = this.ctx.createGain();
+        cg.gain.setValueAtTime(0.42, t);
+        cg.gain.exponentialRampToValueAtTime(0.001, t + 0.085);
+        crack.connect(hp);
+        hp.connect(cg);
+        this.connectToOutputBuses(cg, true);
+        crack.start(t, Math.random() * 0.6, 0.10);
+      }
+      return;
+    }
+    if (cue === 'mode_toggle') {
+      this.playTacticalSwitchClick(true);
+      return;
+    }
+    if (cue === 'dryfire') {
+      this.playDryFire();
+      return;
+    }
+    if (cue === 'gunsmith_snap') {
+      this.ensureInitialized();
+      if (!this.ctx || !this.dryBus || !this.noiseBuffer) return;
+      const ctx = this.ctx;
+      const t = ctx.currentTime;
+      const amp = THREE.MathUtils.clamp(options?.intensity ?? 1.0, 0.3, 1.6);
+
+      // Stage 1: Crisp Picatinny / dovetail rail slide friction
+      const slide = ctx.createBufferSource();
+      slide.buffer = this.noiseBuffer;
+      const sbp = ctx.createBiquadFilter();
+      sbp.type = 'bandpass';
+      sbp.frequency.setValueAtTime(2600, t);
+      sbp.frequency.exponentialRampToValueAtTime(1400, t + 0.036);
+      sbp.Q.value = 3.4;
+      const sg = ctx.createGain();
+      sg.gain.setValueAtTime(0.14 * amp, t);
+      sg.gain.exponentialRampToValueAtTime(0.001, t + 0.042);
+      slide.connect(sbp);
+      sbp.connect(sg);
+      sg.connect(this.dryBus);
+      slide.start(t, Math.random() * 1.1, 0.05);
+
+      // Stage 2: Spring detent ratchet click (~24ms)
+      const ratchet = ctx.createOscillator();
+      ratchet.type = 'square';
+      ratchet.frequency.setValueAtTime(3400, t + 0.022);
+      ratchet.frequency.exponentialRampToValueAtTime(1280, t + 0.044);
+      const rg = ctx.createGain();
+      rg.gain.setValueAtTime(0.19 * amp, t + 0.022);
+      rg.gain.exponentialRampToValueAtTime(0.001, t + 0.048);
+      ratchet.connect(rg);
+      rg.connect(this.dryBus);
+      ratchet.start(t + 0.022);
+      ratchet.stop(t + 0.052);
+
+      // Stage 3: Solid machined steel seating lock thud (~36ms)
+      const lock = ctx.createOscillator();
+      lock.type = 'triangle';
+      lock.frequency.setValueAtTime(520, t + 0.032);
+      lock.frequency.exponentialRampToValueAtTime(140, t + 0.075);
+      const lg = ctx.createGain();
+      lg.gain.setValueAtTime(0.24 * amp, t + 0.032);
+      lg.gain.exponentialRampToValueAtTime(0.001, t + 0.082);
+      lock.connect(lg);
+      lg.connect(this.dryBus);
+      lock.start(t + 0.032);
+      lock.stop(t + 0.088);
+      return;
+    }
+
+    this.ensureInitialized();
+    if (!this.ctx || !this.dryBus || !this.noiseBuffer) return;
+    const ctx = this.ctx;
+    const t = ctx.currentTime;
+    const amp = THREE.MathUtils.clamp(options?.intensity ?? 1.0, 0.2, 1.8);
+    const isPistol = options?.weightClass === 'pistol';
+    const pitchScale = isPistol ? 1.24 : options?.weightClass === 'heavy_rifle' ? 0.86 : 1.0;
+
+    if (cue === 'ads_rustle') {
+      // Soft tactical sleeve / stock cheek-weld rustle + micro sling contact
+      const src = ctx.createBufferSource();
+      src.buffer = this.noiseBuffer;
+      const bp = ctx.createBiquadFilter();
+      bp.type = 'bandpass';
+      bp.frequency.setValueAtTime(740 * pitchScale, t);
+      bp.frequency.exponentialRampToValueAtTime(480 * pitchScale, t + 0.13);
+      bp.Q.value = 1.7;
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0.001, t);
+      g.gain.linearRampToValueAtTime(0.068 * amp, t + 0.022);
+      g.gain.exponentialRampToValueAtTime(0.001, t + 0.145);
+      src.connect(bp);
+      bp.connect(g);
+      this.connectToOutputBuses(g);
+      src.start(t, Math.random() * 1.4, 0.16);
+      return;
+    }
+
+    if (cue === 'mag_out') {
+      // 1. Mag catch release click
+      const click = ctx.createOscillator();
+      click.type = 'square';
+      click.frequency.setValueAtTime(2100 * pitchScale, t);
+      click.frequency.exponentialRampToValueAtTime(780 * pitchScale, t + 0.018);
+      const cg = ctx.createGain();
+      cg.gain.setValueAtTime(0.16 * amp, t);
+      cg.gain.exponentialRampToValueAtTime(0.001, t + 0.024);
+      click.connect(cg);
+      this.connectToOutputBuses(cg);
+      click.start(t);
+      click.stop(t + 0.03);
+
+      // 2. Magazine body friction slide out of magwell
+      const slide = ctx.createBufferSource();
+      slide.buffer = this.noiseBuffer;
+      const bp = ctx.createBiquadFilter();
+      bp.type = 'bandpass';
+      bp.frequency.setValueAtTime(1650 * pitchScale, t + 0.015);
+      bp.frequency.exponentialRampToValueAtTime(920 * pitchScale, t + 0.12);
+      bp.Q.value = 2.8;
+      const sg = ctx.createGain();
+      sg.gain.setValueAtTime(0.001, t + 0.012);
+      sg.gain.linearRampToValueAtTime(0.15 * amp, t + 0.032);
+      sg.gain.exponentialRampToValueAtTime(0.001, t + 0.125);
+      slide.connect(bp);
+      bp.connect(sg);
+      this.connectToOutputBuses(sg);
+      slide.start(t + 0.012, Math.random() * 1.2, 0.14);
+      return;
+    }
+
+    if (cue === 'mag_in') {
+      // 1. Solid polymer/steel seating thump
+      const thump = ctx.createOscillator();
+      thump.type = 'triangle';
+      thump.frequency.setValueAtTime(240 * pitchScale, t);
+      thump.frequency.exponentialRampToValueAtTime(78, t + 0.055);
+      const tg = ctx.createGain();
+      tg.gain.setValueAtTime(0.28 * amp, t);
+      tg.gain.exponentialRampToValueAtTime(0.001, t + 0.068);
+      thump.connect(tg);
+      this.connectToOutputBuses(tg);
+      thump.start(t);
+      thump.stop(t + 0.075);
+
+      // 2. Positive locking latch snap
+      const latch = ctx.createOscillator();
+      latch.type = 'square';
+      latch.frequency.setValueAtTime(1920 * pitchScale, t + 0.026);
+      latch.frequency.exponentialRampToValueAtTime(640 * pitchScale, t + 0.058);
+      const bp = ctx.createBiquadFilter();
+      bp.type = 'bandpass';
+      bp.frequency.value = 2200 * pitchScale;
+      bp.Q.value = 1.8;
+      const lg = ctx.createGain();
+      lg.gain.setValueAtTime(0.22 * amp, t + 0.026);
+      lg.gain.exponentialRampToValueAtTime(0.001, t + 0.068);
+      latch.connect(bp);
+      bp.connect(lg);
+      this.connectToOutputBuses(lg);
+      latch.start(t + 0.026);
+      latch.stop(t + 0.075);
+      return;
+    }
+
+    if (cue === 'bolt_open' || cue === 'bolt_lock') {
+      const unlock = cue === 'bolt_open';
+      const click = ctx.createOscillator();
+      click.type = 'triangle';
+      click.frequency.setValueAtTime(unlock ? 1480 : 1220, t);
+      click.frequency.exponentialRampToValueAtTime(unlock ? 620 : 380, t + 0.042);
+      const cg = ctx.createGain();
+      cg.gain.setValueAtTime(0.24 * amp, t);
+      cg.gain.exponentialRampToValueAtTime(0.001, t + 0.052);
+      click.connect(cg);
+      this.connectToOutputBuses(cg, !unlock);
+      click.start(t);
+      click.stop(t + 0.06);
+      return;
+    }
+
+    if (cue === 'bolt_pull' || cue === 'bolt_push') {
+      const isPull = cue === 'bolt_pull';
+      const slide = ctx.createBufferSource();
+      slide.buffer = this.noiseBuffer;
+      const bp = ctx.createBiquadFilter();
+      bp.type = 'bandpass';
+      bp.frequency.setValueAtTime(isPull ? 1850 : 1550, t);
+      bp.frequency.exponentialRampToValueAtTime(isPull ? 2650 : 1150, t + 0.085);
+      bp.Q.value = 3.0;
+      const sg = ctx.createGain();
+      sg.gain.setValueAtTime(0.001, t);
+      sg.gain.linearRampToValueAtTime(0.18 * amp, t + 0.015);
+      sg.gain.exponentialRampToValueAtTime(0.001, t + 0.095);
+      slide.connect(bp);
+      bp.connect(sg);
+      this.connectToOutputBuses(sg);
+      slide.start(t, Math.random() * 1.1, 0.11);
+      return;
+    }
+
+    if (cue === 'suppressor_twist') {
+      // Fine-pitch machined steel barrel thread friction scrape + subtle tactile collar rub
+      const scrape = ctx.createBufferSource();
+      scrape.buffer = this.noiseBuffer;
+      const bp = ctx.createBiquadFilter();
+      bp.type = 'bandpass';
+      const baseHz = (2400 + Math.random() * 320) * pitchScale;
+      bp.frequency.setValueAtTime(baseHz, t);
+      bp.frequency.exponentialRampToValueAtTime(baseHz * 1.38, t + 0.085);
+      bp.frequency.exponentialRampToValueAtTime(baseHz * 0.92, t + 0.16);
+      bp.Q.value = 5.2;
+      const sg = ctx.createGain();
+      sg.gain.setValueAtTime(0.001, t);
+      sg.gain.linearRampToValueAtTime(0.145 * amp, t + 0.025);
+      sg.gain.exponentialRampToValueAtTime(0.001, t + 0.17);
+      scrape.connect(bp);
+      bp.connect(sg);
+      this.connectToOutputBuses(sg);
+      scrape.start(t, Math.random() * 1.2, 0.19);
+
+      // High harmonic metallic thread ring overtone
+      const ring = ctx.createOscillator();
+      ring.type = 'triangle';
+      ring.frequency.setValueAtTime(3180 * pitchScale, t + 0.01);
+      ring.frequency.exponentialRampToValueAtTime(2680 * pitchScale, t + 0.13);
+      const rg = ctx.createGain();
+      rg.gain.setValueAtTime(0.001, t + 0.01);
+      rg.gain.linearRampToValueAtTime(0.042 * amp, t + 0.04);
+      rg.gain.exponentialRampToValueAtTime(0.001, t + 0.14);
+      ring.connect(rg);
+      this.connectToOutputBuses(rg);
+      ring.start(t + 0.01);
+      ring.stop(t + 0.15);
+      return;
+    }
+
+    if (cue === 'suppressor_lock') {
+      // Crisp steel barrel-shoulder seating detent click + damped solid collar stop
+      const detent = ctx.createOscillator();
+      detent.type = 'square';
+      detent.frequency.setValueAtTime(3650 * pitchScale, t);
+      detent.frequency.exponentialRampToValueAtTime(1180 * pitchScale, t + 0.026);
+      const dbp = ctx.createBiquadFilter();
+      dbp.type = 'bandpass';
+      dbp.frequency.value = 2600 * pitchScale;
+      dbp.Q.value = 2.4;
+      const dg = ctx.createGain();
+      dg.gain.setValueAtTime(0.24 * amp, t);
+      dg.gain.exponentialRampToValueAtTime(0.001, t + 0.036);
+      detent.connect(dbp);
+      dbp.connect(dg);
+      this.connectToOutputBuses(dg);
+      detent.start(t);
+      detent.stop(t + 0.042);
+
+      const seat = ctx.createOscillator();
+      seat.type = 'triangle';
+      seat.frequency.setValueAtTime(480 * pitchScale, t + 0.008);
+      seat.frequency.exponentialRampToValueAtTime(145 * pitchScale, t + 0.068);
+      const sg = ctx.createGain();
+      sg.gain.setValueAtTime(0.22 * amp, t + 0.008);
+      sg.gain.exponentialRampToValueAtTime(0.001, t + 0.078);
+      seat.connect(sg);
+      this.connectToOutputBuses(sg);
+      seat.start(t + 0.008);
+      seat.stop(t + 0.085);
+      return;
+    }
+
+    // 'rack': 2-stage steel bolt carrier / slide pull back + spring slam forward into battery
+    const pull = ctx.createBufferSource();
+    pull.buffer = this.noiseBuffer;
+    const pbp = ctx.createBiquadFilter();
+    pbp.type = 'bandpass';
+    pbp.frequency.setValueAtTime(2150 * pitchScale, t);
+    pbp.frequency.exponentialRampToValueAtTime(3100 * pitchScale, t + 0.068);
+    pbp.Q.value = 3.2;
+    const pg = ctx.createGain();
+    pg.gain.setValueAtTime(0.001, t);
+    pg.gain.linearRampToValueAtTime(0.19 * amp, t + 0.015);
+    pg.gain.exponentialRampToValueAtTime(0.001, t + 0.08);
+    pull.connect(pbp);
+    pbp.connect(pg);
+    this.connectToOutputBuses(pg);
+    pull.start(t, Math.random() * 1.1, 0.09);
+
+    // Stage 2: steel bolt/slide slam forward (~95ms later)
+    const slamT = t + (isPistol ? 0.08 : 0.105);
+    const slam = ctx.createOscillator();
+    slam.type = 'sawtooth';
+    slam.frequency.setValueAtTime(1680 * pitchScale, slamT);
+    slam.frequency.exponentialRampToValueAtTime(420 * pitchScale, slamT + 0.045);
+    const sbp = ctx.createBiquadFilter();
+    sbp.type = 'bandpass';
+    sbp.frequency.value = 2100 * pitchScale;
+    sbp.Q.value = 1.9;
+    const sg = ctx.createGain();
+    sg.gain.setValueAtTime(0.26 * amp, slamT);
+    sg.gain.exponentialRampToValueAtTime(0.001, slamT + 0.055);
+    slam.connect(sbp);
+    sbp.connect(sg);
+    this.connectToOutputBuses(sg, true);
+    slam.start(slamT);
+    slam.stop(slamT + 0.062);
+  }
+
+  /**
+   * Diegetic hold-breath audio cues:
+   *  - 'inhale': soft close-mic bandpass intake sweep on engaging steady aim
+   *  - 'exhale': relaxed release exhale when releasing early
+   *  - 'exhale_depleted': sharp depleted exhale gasp + follow-up recovery breath
+   *  - 'low_o2_pulse': subtle sub-bass double cardiac thump when breath reserve is critically low
+   */
+  public playBreathCue(kind: BodycamBreathCueKind, intensity = 1.0): void {
+    this.ensureInitialized();
+    if (!this.ctx || !this.dryBus) return;
+    const ctx = this.ctx;
+    const t = ctx.currentTime;
+    const amp = THREE.MathUtils.clamp(intensity, 0.35, 1.35);
+
+    if (kind === 'low_o2_pulse') {
+      const vol = (0.075 + Math.min(1, amp) * 0.075);
+      for (const offset of [0, 0.16]) {
+        const osc = ctx.createOscillator();
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(offset === 0 ? 58 : 48, t + offset);
+        osc.frequency.exponentialRampToValueAtTime(28, t + offset + 0.11);
+        const g = ctx.createGain();
+        g.gain.setValueAtTime(vol * (offset === 0 ? 1 : 0.72), t + offset);
+        g.gain.exponentialRampToValueAtTime(0.001, t + offset + 0.12);
+        osc.connect(g);
+        g.connect(this.dryBus);
+        osc.start(t + offset);
+        osc.stop(t + offset + 0.13);
+      }
+      return;
+    }
+
+    if (!this.noiseBuffer) return;
+
+    if (kind === 'inhale') {
+      const src = ctx.createBufferSource();
+      src.buffer = this.noiseBuffer;
+      const bp = ctx.createBiquadFilter();
+      bp.type = 'bandpass';
+      bp.frequency.setValueAtTime(360, t);
+      bp.frequency.exponentialRampToValueAtTime(780, t + 0.24);
+      bp.Q.value = 1.9;
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0.001, t);
+      g.gain.linearRampToValueAtTime(0.062 * amp, t + 0.14);
+      g.gain.exponentialRampToValueAtTime(0.001, t + 0.29);
+      src.connect(bp);
+      bp.connect(g);
+      g.connect(this.dryBus);
+      src.start(t, Math.random() * 0.5, 0.32);
+      return;
+    }
+
+    const depleted = kind === 'exhale_depleted';
+    const src = ctx.createBufferSource();
+    src.buffer = this.noiseBuffer;
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.setValueAtTime(depleted ? 840 : 610, t);
+    bp.frequency.exponentialRampToValueAtTime(depleted ? 310 : 340, t + (depleted ? 0.46 : 0.34));
+    bp.Q.value = depleted ? 1.45 : 1.65;
+    const g = ctx.createGain();
+    const peak = (depleted ? 0.145 : 0.082) * amp;
+    const dur = depleted ? 0.50 : 0.35;
+    g.gain.setValueAtTime(0.001, t);
+    g.gain.linearRampToValueAtTime(peak, t + 0.05);
+    g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+    src.connect(bp);
+    bp.connect(g);
+    g.connect(this.dryBus);
+    src.start(t, Math.random() * 0.5, dur + 0.04);
+
+    if (depleted) {
+      // Secondary recovery intake gasp so depletion feels physically distinct from early release
+      const rT = t + 0.54;
+      const rec = ctx.createBufferSource();
+      rec.buffer = this.noiseBuffer;
+      const rbp = ctx.createBiquadFilter();
+      rbp.type = 'bandpass';
+      rbp.frequency.setValueAtTime(420, rT);
+      rbp.frequency.exponentialRampToValueAtTime(860, rT + 0.28);
+      rbp.Q.value = 1.6;
+      const rg = ctx.createGain();
+      rg.gain.setValueAtTime(0.001, rT);
+      rg.gain.linearRampToValueAtTime(0.088 * amp, rT + 0.14);
+      rg.gain.exponentialRampToValueAtTime(0.001, rT + 0.38);
+      rec.connect(rbp);
+      rbp.connect(rg);
+      rg.connect(this.dryBus);
+      rec.start(rT, Math.random() * 0.5, 0.42);
+    }
+  }
+
+  public dispose(): void {
+    try {
+      this.windSource?.stop();
+    } catch {
+      // already stopped
+    }
+    if (this.ctx) {
+      void this.ctx.close();
+      this.ctx = null;
+    }
+    this.initialized = false;
+  }
+}
