@@ -89,6 +89,11 @@ export const MultiplayerHubPanel: React.FC<MultiplayerHubPanelProps> = ({
   }
 
   const availableMaps = mode === 'infection' ? ZOMBIE_MAPS : BATTLE_MAPS;
+  const isInfMode = mode === 'infection';
+  const maxAllowedPlayers = isInfMode ? 4 : 8;
+  const effectiveMaxPlayers = Math.min(maxPlayers, maxAllowedPlayers);
+  const maxAllowedBots = isInfMode ? Math.max(0, effectiveMaxPlayers - 1) : 10;
+  const effectiveBotCount = botsEnabled ? Math.min(botCount, maxAllowedBots) : 0;
 
   const handleJoinSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -112,9 +117,9 @@ export const MultiplayerHubPanel: React.FC<MultiplayerHubPanelProps> = ({
         mode,
         battleRule,
         mapId,
-        maxPlayers,
-        botsEnabled,
-        botCount: botsEnabled ? botCount : 0,
+        maxPlayers: effectiveMaxPlayers,
+        botsEnabled: effectiveBotCount > 0,
+        botCount: effectiveBotCount,
         killLimit,
         botDifficulty,
       });
@@ -293,6 +298,8 @@ export const MultiplayerHubPanel: React.FC<MultiplayerHubPanelProps> = ({
                     if (v === 'infection') {
                       setMode('infection');
                       setMapId('kino_theater');
+                      setMaxPlayers(4);
+                      setBotCount((c) => Math.min(c, 3));
                     } else {
                       setMode('battle');
                       setBattleRule(v === 'battle_ffa' ? 'ffa' : 'tdm');
@@ -325,28 +332,34 @@ export const MultiplayerHubPanel: React.FC<MultiplayerHubPanelProps> = ({
               </div>
             </div>
 
-            {/* Max Players (2..8) & AI Bots ON/OFF + Stepper */}
+            {/* Max Players & AI Bots ON/OFF + Stepper */}
             <div className="mt-3.5 grid grid-cols-2 gap-3">
               <div className="border border-neutral-800 bg-neutral-900/60 p-3">
                 <div className="font-mono-tabular text-[10px] uppercase tracking-wider text-neutral-400">
-                  Max Players (2–8)
+                  Max Players (2–{maxAllowedPlayers})
                 </div>
                 <div className="mt-2 flex items-center justify-between">
                   <button
                     type="button"
-                    disabled={maxPlayers <= 2}
-                    onClick={() => setMaxPlayers((p) => Math.max(2, p - 1))}
+                    disabled={effectiveMaxPlayers <= 2}
+                    onClick={() => {
+                      const next = Math.max(2, effectiveMaxPlayers - 1);
+                      setMaxPlayers(next);
+                      if (isInfMode) {
+                        setBotCount((c) => Math.min(c, Math.max(0, next - 1)));
+                      }
+                    }}
                     className="cursor-pointer border border-neutral-700 bg-neutral-950 p-1.5 text-neutral-200 hover:border-amber-400 disabled:opacity-35"
                   >
                     <Minus className="h-3.5 w-3.5" />
                   </button>
                   <span className="font-display text-xl font-bold text-neutral-50">
-                    {maxPlayers}
+                    {effectiveMaxPlayers}
                   </span>
                   <button
                     type="button"
-                    disabled={maxPlayers >= 8}
-                    onClick={() => setMaxPlayers((p) => Math.min(8, p + 1))}
+                    disabled={effectiveMaxPlayers >= maxAllowedPlayers}
+                    onClick={() => setMaxPlayers(Math.min(maxAllowedPlayers, effectiveMaxPlayers + 1))}
                     className="cursor-pointer border border-neutral-700 bg-neutral-950 p-1.5 text-neutral-200 hover:border-amber-400 disabled:opacity-35"
                   >
                     <Plus className="h-3.5 w-3.5" />
@@ -356,29 +369,32 @@ export const MultiplayerHubPanel: React.FC<MultiplayerHubPanelProps> = ({
 
               <div className="border border-neutral-800 bg-neutral-900/60 p-3">
                 <div className="flex items-center justify-between font-mono-tabular text-[10px] uppercase tracking-wider text-neutral-400">
-                  <span>AI Bots</span>
+                  <span>{isInfMode ? `Ally Bots (0–${maxAllowedBots})` : 'AI Bots'}</span>
                   <button
                     type="button"
+                    disabled={maxAllowedBots <= 0}
                     onClick={() => {
                       const next = !botsEnabled;
                       setBotsEnabled(next);
-                      if (next && botCount === 0) setBotCount(6);
+                      if (next && effectiveBotCount === 0) {
+                        setBotCount(isInfMode ? maxAllowedBots : 6);
+                      }
                     }}
-                    className={`cursor-pointer border px-1.5 py-0.5 text-[10px] font-semibold ${
-                      botsEnabled
+                    className={`cursor-pointer border px-1.5 py-0.5 text-[10px] font-semibold disabled:opacity-35 ${
+                      effectiveBotCount > 0
                         ? 'border-emerald-500/70 bg-emerald-950/50 text-emerald-300'
                         : 'border-neutral-700 bg-neutral-950 text-neutral-400'
                     }`}
                   >
-                    {botsEnabled ? 'ON' : 'OFF'}
+                    {effectiveBotCount > 0 ? 'ON' : 'OFF'}
                   </button>
                 </div>
                 <div className="mt-2 flex items-center justify-between">
                   <button
                     type="button"
-                    disabled={!botsEnabled || botCount <= 0}
+                    disabled={effectiveBotCount <= 0}
                     onClick={() => {
-                      const next = Math.max(0, botCount - 1);
+                      const next = Math.max(0, effectiveBotCount - 1);
                       setBotCount(next);
                       if (next === 0) setBotsEnabled(false);
                     }}
@@ -387,24 +403,29 @@ export const MultiplayerHubPanel: React.FC<MultiplayerHubPanelProps> = ({
                     <Minus className="h-3.5 w-3.5" />
                   </button>
                   <span className="font-display text-xl font-bold text-neutral-50">
-                    {botsEnabled ? botCount : 0}
+                    {effectiveBotCount}
                   </span>
                   <button
                     type="button"
-                    disabled={botCount >= 10}
+                    disabled={effectiveBotCount >= maxAllowedBots}
                     onClick={() => {
                       setBotsEnabled(true);
-                      setBotCount((c) => Math.min(10, c + 1));
+                      setBotCount(Math.min(maxAllowedBots, effectiveBotCount + 1));
                     }}
                     className="cursor-pointer border border-neutral-700 bg-neutral-950 p-1.5 text-neutral-200 hover:border-amber-400 disabled:opacity-35"
                   >
                     <Plus className="h-3.5 w-3.5" />
                   </button>
                 </div>
+                {isInfMode && (
+                  <div className="mt-1 font-mono-tabular text-[9px] text-sky-300/85">
+                    Always friendly · fills empty squad slots
+                  </div>
+                )}
               </div>
             </div>
 
-            {mode === 'battle' && (
+            {mode === 'battle' ? (
               <div className="mt-3.5 grid grid-cols-2 gap-3">
                 <div>
                   <label className="block font-mono-tabular text-[10px] uppercase tracking-wider text-neutral-400">
@@ -437,6 +458,23 @@ export const MultiplayerHubPanel: React.FC<MultiplayerHubPanelProps> = ({
                   </select>
                 </div>
               </div>
+            ) : (
+              effectiveBotCount > 0 && (
+                <div className="mt-3.5">
+                  <label className="block font-mono-tabular text-[10px] uppercase tracking-wider text-neutral-400">
+                    Friendly Bot Difficulty
+                  </label>
+                  <select
+                    value={botDifficulty}
+                    onChange={(e) => setBotDifficulty(e.target.value as BotDifficultyId)}
+                    className="mt-1 w-full cursor-pointer border border-neutral-700 bg-neutral-900 px-2.5 py-1.5 font-mono-tabular text-xs text-neutral-100"
+                  >
+                    <option value="recruit">Recruit</option>
+                    <option value="tactical">Tactical</option>
+                    <option value="veteran">Veteran</option>
+                  </select>
+                </div>
+              )
             )}
 
             <button

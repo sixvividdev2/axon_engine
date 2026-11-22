@@ -417,6 +417,10 @@ export interface SyncedBotState {
   yaw: number;
   alive: boolean;
   firing: boolean;
+  crouch?: number;
+  lean?: number;
+  vaulting?: boolean;
+  vaultProgress?: number;
   hp: number;
   maxHp: number;
   kills: number;
@@ -485,6 +489,7 @@ export interface SyncedZombieState {
   windup: boolean;
   stagger: boolean;
   enteringWindow: boolean;
+  entryStage?: 'approach' | 'tear' | 'vault' | 'pursue';
   spawnerId: string | null;
   entryPos: [number, number, number] | null;
 }
@@ -521,7 +526,27 @@ export interface GameZombiesSyncPacket {
   powerOn: boolean;
   openedDoorIds: string[];
   unlockedZoneIds: string[];
+  barriers?: Record<string, number>;
   zombies: SyncedZombieState[];
+  ts: number;
+}
+
+export interface GameBarrierRepairRequestPacket {
+  type: 'game:barrier_repair_request';
+  senderUserId?: string;
+  senderUsername?: string;
+  barrierId: string;
+  ts: number;
+}
+
+export interface GameBarrierUpdatePacket {
+  type: 'game:barrier_update';
+  senderUserId?: string;
+  senderIsHost?: boolean;
+  barrierId: string;
+  planksRemaining: number;
+  repairedByUserId?: string | null;
+  pointsAwarded?: number;
   ts: number;
 }
 
@@ -637,6 +662,8 @@ export type GameSyncPacket =
   | GameBotHitPlayerPacket
   | GameZombieSpawnPacket
   | GameZombiesSyncPacket
+  | GameBarrierRepairRequestPacket
+  | GameBarrierUpdatePacket
   | GameZombieDamagePacket
   | GameZombieKilledPacket
   | GameZombieHitPlayerPacket

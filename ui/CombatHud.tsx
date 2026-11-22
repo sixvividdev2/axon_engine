@@ -339,6 +339,11 @@ export const CombatHud: React.FC<CombatHudProps> = ({
                 <div className={snapshot.powerOn ? 'text-amber-300' : 'text-neutral-400'}>
                   Power: {snapshot.powerOn ? 'ONLINE' : 'OFFLINE'}
                 </div>
+                {snapshot.friendlyBotsTotal > 0 && (
+                  <div className="text-sky-300">
+                    Allied Bots: {snapshot.friendlyBotsAlive}/{snapshot.friendlyBotsTotal}
+                  </div>
+                )}
               </div>
             </div>
 
@@ -358,21 +363,48 @@ export const CombatHud: React.FC<CombatHudProps> = ({
             )}
           </div>
 
-          {/* Center-Bottom [F] Interact Prompt */}
+          {/* Center-Bottom [F] Interact / Hold [F] Barrier Repair Prompt */}
           {snapshot.pointerLocked && snapshot.nearbyPrompt && (
-            <div className="fixed bottom-24 left-1/2 -translate-x-1/2 border border-neutral-700 bg-neutral-950/92 px-4 py-2 text-center font-mono-tabular text-xs">
-              <div className="font-semibold uppercase tracking-wider text-neutral-50">
-                [F] {snapshot.nearbyPrompt.actionText}
+            <div className="fixed bottom-24 left-1/2 min-w-[260px] -translate-x-1/2 border border-neutral-700 bg-neutral-950/92 px-4 py-2 text-center font-mono-tabular text-xs">
+              <div className="flex items-center justify-center gap-2 font-semibold uppercase tracking-wider text-neutral-50">
+                <span>
+                  {snapshot.nearbyPrompt.isHoldAction ? 'HOLD [F]' : '[F]'}{' '}
+                  {snapshot.nearbyPrompt.actionText}
+                </span>
                 {snapshot.nearbyPrompt.cost > 0 && (
                   <span
-                    className={`ml-2 ${
+                    className={
                       snapshot.nearbyPrompt.canAfford ? 'text-amber-300' : 'text-red-400'
-                    }`}
+                    }
                   >
                     {snapshot.nearbyPrompt.cost} PTS
                   </span>
                 )}
               </div>
+              {snapshot.nearbyPrompt.isHoldAction &&
+                typeof snapshot.nearbyPrompt.planksRemaining === 'number' &&
+                typeof snapshot.nearbyPrompt.maxPlanks === 'number' && (
+                  <div className="mt-1.5 flex flex-col gap-1">
+                    <div className="flex items-center justify-between text-[10px] uppercase tracking-wider text-neutral-300">
+                      <span>
+                        Planks: {snapshot.nearbyPrompt.planksRemaining} /{' '}
+                        {snapshot.nearbyPrompt.maxPlanks}
+                      </span>
+                      <span className="text-amber-300">+5 PTS / Plank</span>
+                    </div>
+                    <div className="h-1.5 w-full overflow-hidden bg-neutral-800">
+                      <div
+                        className="h-full bg-amber-400 transition-all duration-75"
+                        style={{
+                          width: `${Math.min(
+                            100,
+                            Math.round((snapshot.nearbyPrompt.holdProgress ?? 0) * 100),
+                          )}%`,
+                        }}
+                      />
+                    </div>
+                  </div>
+                )}
               {snapshot.nearbyPrompt.blockedReason && (
                 <div className="mt-0.5 text-[10px] uppercase tracking-wider text-red-400">
                   {snapshot.nearbyPrompt.blockedReason}
@@ -569,7 +601,7 @@ export const CombatHud: React.FC<CombatHudProps> = ({
           <span>V Bash</span>
           <span>X Kick</span>
           {isBattle && <span>Tab Scoreboard</span>}
-          {isInfection && <span className="text-amber-300">F Interact</span>}
+          {isInfection && <span className="text-amber-300">F Interact · Hold F Repair</span>}
           <span>F1 Optics</span>
         </div>
       )}

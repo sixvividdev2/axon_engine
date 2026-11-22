@@ -44,6 +44,8 @@ const DEFAULT_BATTLE_CONFIG: BattleMatchConfig = {
 
 const DEFAULT_INFECTION_CONFIG: InfectionMatchConfig = {
   mapId: 'kino_theater',
+  botCount: 0,
+  botDifficulty: 'tactical',
 };
 
 function PlaygroundView({ onReturnToMenu }: { onReturnToMenu: () => void }) {
@@ -332,11 +334,17 @@ function AppShell() {
     const activeLoadout = loadoutStore.getActiveSlot();
     const selectedTacticalId =
       tacticalEquipmentStore.getSelection().equipmentId || activeLoadout.tacticalEquipmentId;
+    const maxInfectionBots = Math.max(0, st.maxPlayers - st.members.length);
     const params: CombatSessionParams =
       st.mode === 'infection'
         ? {
             mode: 'infection',
-            infectionConfig: { mapId: st.mapId, tacticalEquipmentId: selectedTacticalId },
+            infectionConfig: {
+              mapId: st.mapId,
+              botCount: st.botsEnabled ? Math.min(st.botCount, maxInfectionBots) : 0,
+              botDifficulty: st.botDifficulty,
+              tacticalEquipmentId: selectedTacticalId,
+            },
             multiplayer: mpBridge,
           }
         : {

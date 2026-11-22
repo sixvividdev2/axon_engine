@@ -68,6 +68,8 @@ import {
   MapInteractable,
 } from '../maps/types';
 import {
+  GameBarrierRepairRequestPacket,
+  GameBarrierUpdatePacket,
   GameBotDamagePacket,
   GameBotFirePacket,
   GameBotHitPlayerPacket,
@@ -132,6 +134,10 @@ export interface NearbyInteractPrompt {
   cost: number;
   canAfford: boolean;
   blockedReason: string | null;
+  isHoldAction?: boolean;
+  holdProgress?: number;
+  planksRemaining?: number;
+  maxPlanks?: number;
 }
 
 export interface CombatSessionSnapshot {
@@ -201,6 +207,8 @@ export interface CombatSessionSnapshot {
   powerOn: boolean;
   perks: InfectionPerkId[];
   nearbyPrompt: NearbyInteractPrompt | null;
+  friendlyBotsAlive: number;
+  friendlyBotsTotal: number;
   gameOver: boolean;
 
   // Tactical Equipment & Grenades
@@ -349,13 +357,19 @@ export class CombatSessionEngine {
   private gameOver = false;
   private infectionRecordSaved = false;
 
-  // Infection economy & stations
+  // Infection economy, stations & hold-F window barrier repair
   private points = 500;
   private powerOn = false;
   private readonly perks = new Set<InfectionPerkId>();
   private readonly pointsPopups: PointsPopup[] = [];
   private nextPopupId = 1;
   private nearbyInteractable: MapInteractable | null = null;
+  private interactKeyHeld = false;
+  private repairingBarrierId: string | null = null;
+  private barrierRepairProgress = 0;
+  private barrierRepairPendingRequest = false;
+  private barrierRepairReqSentAtMs = 0;
+  private readonly _tmpBarrierPos = new THREE.Vector3();
 
   // Weapon firing & animation timers
   private isFiring = false;
@@ -508,7 +522,11 @@ export class CombatSessionEngine {
       this.localUniformId = resolveOperatorUniformId(params.mode, this.localBattleTeam);
     }
 
-    // Strictly separate AI instantiation based on mode, applying Special Event AI/Zombie tuning & Client Replica flag
+    // Build unified world adapter combining static map geometry, optional rolling terrain, and dynamic actors
+    // (created before AI so BattleBotAI receives the live adapter for real vaulting/climbing geometry probes)
+    this.adapter = this.createCombatWorldAdapter();
+
+    // Instantiate mode AI systems, applying Special Event AI/Zombie tuning, vaulting adapter & Client Replica flag
     if (params.mode === 'battle') {
       this.botAI = new BattleBotAI(
         this.scene,
@@ -524,6 +542,7 @@ export class CombatSessionEngine {
           aiRespawnEnabled: evCfg?.aiRespawnEnabled,
           isClientReplica,
           maxAnisotropy,
+          worldAdapter: this.adapter,
         },
       );
     } else {
@@ -535,10 +554,34 @@ export class CombatSessionEngine {
         waveBreakIntervalSec: evCfg?.waveBreakIntervalSec,
         isClientReplica,
       });
-    }
 
-    // Build unified world adapter combining static map geometry, optional rolling terrain, and dynamic actors
-    this.adapter = this.createCombatWorldAdapter();
+      // Friendly AI squadmates in Infection mode (0 up to open squad slots, always allied)
+      const requestedInfectionBots = Math.max(0, Math.min(3, Math.round(params.infectionConfig.botCount ?? 0)));
+      if (requestedInfectionBots > 0) {
+        this.botAI = new BattleBotAI(
+          this.scene,
+          this.map,
+          this.audio,
+          'tdm',
+          requestedInfectionBots,
+          params.infectionConfig.botDifficulty ?? 'tactical',
+          {
+            aiHealth: evCfg?.aiHealth ?? 120,
+            aiAccuracyMult: evCfg?.aiAccuracyMult,
+            aiMoveSpeedMult: evCfg?.aiMoveSpeedMult,
+            aiRespawnEnabled: false,
+            isClientReplica,
+            maxAnisotropy,
+            coopInfectionMode: true,
+            worldAdapter: this.adapter,
+          },
+        );
+        this.botAI.setInfectionZones(
+          this.zombieAI.getUnlockedZoneIds(),
+          this.zombieAI.getOpenedDoorIds(),
+        );
+      }
+    }
 
     // SDK Viewmodel, Skeleton, Animator, Controller, PostProcess, Scope & Ballistics
     this.weaponRig = new WeaponRig(this.scene, this.isSoftwareGl, this.audio);
@@ -1157,7 +1200,9 @@ export class CombatSessionEngine {
     // === PHASE 5: HOST-AUTHORITATIVE AI BOT & INFECTION ZOMBIE REPLICATION ===
     if (type === 'game:bots_sync' && this.botAI && !this.isMpHost) {
       this.botAI.applySyncSnapshot(raw as unknown as GameBotsSyncPacket);
-      this.checkBattleVictory();
+      if (this.params.mode === 'battle') {
+        this.checkBattleVictory();
+      }
       return;
     }
 
@@ -1168,6 +1213,7 @@ export class CombatSessionEngine {
     }
 
     if (type === 'game:bot_damage' && this.botAI && this.isMpHost) {
+      if (this.params.mode === 'infection') return;
       const pkt = raw as unknown as GameBotDamagePacket;
       const attackerTeam: BattleTeamId =
         this.params.mode === 'battle' && this.params.battleConfig.rule === 'ffa'
@@ -1248,6 +1294,7 @@ export class CombatSessionEngine {
           this.zombieAI.unlockZone(zoneId);
         }
       }
+      this.syncBotInfectionZones();
       if (pkt.round > prevRound && this.spectating && !this.playerAlive && !this.gameOver) {
         this.reviveCoopInfectionPlayer(pkt.round);
       }
@@ -1275,6 +1322,7 @@ export class CombatSessionEngine {
           this.zombieAI.unlockZone(zoneId);
         }
       }
+      this.syncBotInfectionZones();
       return;
     }
 
@@ -1322,10 +1370,13 @@ export class CombatSessionEngine {
       this._tmpImpactPoint.set(pkt.px, pkt.py, pkt.pz);
       this.zombieAI.playVisualDeath(pkt.zombieId, this._tmpImpactPoint);
       const killerMember = this.mp.members.find((m) => m.userId === pkt.killerUserId);
+      const killerBotInfo = pkt.killerUserId.startsWith('bot_')
+        ? this.botAI?.getBotInfo(pkt.killerUserId)
+        : null;
       const killerName =
         pkt.killerUserId === this.mp.localUserId
           ? this.mp.localUsername
-          : (killerMember?.username ?? 'SURVIVOR');
+          : (killerBotInfo?.name ?? killerMember?.username ?? 'SURVIVOR');
       const weaponLabel = pkt.melee
         ? 'MELEE'
         : pkt.weaponId
@@ -1470,6 +1521,7 @@ export class CombatSessionEngine {
       if (pkt.unlockedZoneId && this.zombieAI) {
         this.zombieAI.unlockZone(pkt.unlockedZoneId);
       }
+      this.syncBotInfectionZones();
       return;
     }
 
@@ -1501,6 +1553,77 @@ export class CombatSessionEngine {
         3.0,
       );
       this.emitSnapshot();
+      return;
+    }
+
+    // Host-authoritative window barrier plank repair validation
+    if (
+      type === 'game:barrier_repair_request' &&
+      this.params.mode === 'infection' &&
+      this.isMpHost &&
+      this.zombieAI
+    ) {
+      const pkt = raw as unknown as GameBarrierRepairRequestPacket;
+      const barrier = this.zombieAI.getBarrierById(pkt.barrierId);
+      if (!barrier || barrier.getPlanksRemaining() >= barrier.maxPlanks) return;
+      const requesterId = pkt.senderUserId ?? '';
+      if (requesterId) {
+        const senderActor = this.remotePlayers
+          .getAliveHumanTargets()
+          .find((h) => h.id === requesterId);
+        if (senderActor) {
+          const dist = Math.hypot(
+            barrier.interactPos[0] - senderActor.pos.x,
+            barrier.interactPos[2] - senderActor.pos.z,
+          );
+          if (dist > 5.2) return;
+        }
+      }
+      if (barrier.repairPlank()) {
+        this._tmpBarrierPos.set(barrier.sillPos[0], barrier.sillPos[1], barrier.sillPos[2]);
+        this.audio.playImpact(this._tmpBarrierPos, 'wood');
+        const updPkt: GameBarrierUpdatePacket = {
+          type: 'game:barrier_update',
+          barrierId: barrier.id,
+          planksRemaining: barrier.getPlanksRemaining(),
+          repairedByUserId: requesterId || undefined,
+          pointsAwarded: 5,
+          ts: Date.now(),
+        };
+        this.mp.sendMessage(updPkt as unknown as Record<string, unknown>);
+      }
+      return;
+    }
+
+    if (type === 'game:barrier_update' && this.params.mode === 'infection' && this.zombieAI) {
+      const pkt = raw as unknown as GameBarrierUpdatePacket;
+      if (!pkt.senderIsHost) return;
+      const barrier = this.zombieAI.getBarrierById(pkt.barrierId);
+      if (barrier) {
+        const prev = barrier.getPlanksRemaining();
+        barrier.setPlankCount(pkt.planksRemaining);
+        if (pkt.planksRemaining !== prev) {
+          this._tmpBarrierPos.set(barrier.sillPos[0], barrier.sillPos[1], barrier.sillPos[2]);
+          this.audio.playImpact(this._tmpBarrierPos, 'wood');
+        }
+      }
+      if (pkt.repairedByUserId === this.mp.localUserId) {
+        this.barrierRepairPendingRequest = false;
+        const pts = Math.max(0, Math.round(pkt.pointsAwarded ?? 0));
+        if (pts > 0) {
+          this.addPoints(pts, 'BARRIER REPAIR');
+        }
+      }
+      this.emitSnapshot();
+    }
+  }
+
+  private syncBotInfectionZones(): void {
+    if (this.botAI && this.zombieAI) {
+      this.botAI.setInfectionZones(
+        this.zombieAI.getUnlockedZoneIds(),
+        this.zombieAI.getOpenedDoorIds(),
+      );
     }
   }
 
@@ -2010,6 +2133,8 @@ export class CombatSessionEngine {
     }
 
     if (ud?.combatActorType === 'bot' && this.botAI) {
+      // Friendly Infection AI bots never take friendly fire from human operators
+      if (this.params.mode === 'infection') return;
       const botId = String(ud.actorId);
       const hitZone = String(ud.hitZone ?? 'thorax');
       const baseDmg = this.computeWeaponBaseDamage(ev);
@@ -2292,6 +2417,7 @@ export class CombatSessionEngine {
     }
 
     if (ud?.combatActorType === 'bot' && this.botAI) {
+      if (this.params.mode === 'infection') return;
       const botId = String(ud.actorId);
       if (this.mp && !this.isMpHost) {
         const info = this.botAI.getBotInfo(botId);
@@ -2515,6 +2641,13 @@ export class CombatSessionEngine {
       if (it.activated && (it.kind === 'buyable_door' || it.kind === 'power_switch' || it.kind === 'perk_machine')) {
         continue;
       }
+      // Skip window barriers that are already fully intact (all planks in place)
+      if (it.kind === 'window_barrier') {
+        const barrier = this.zombieAI?.getBarrierById(it.barrierId ?? it.id);
+        if (!barrier || barrier.getPlanksRemaining() >= barrier.maxPlanks) {
+          continue;
+        }
+      }
       const dx = it.position[0] - p.x;
       const dy = it.position[1] - (p.y + 1.1);
       const dz = it.position[2] - p.z;
@@ -2526,6 +2659,80 @@ export class CombatSessionEngine {
       }
     }
     this.nearbyInteractable = best;
+  }
+
+  private updateBarrierRepair(dt: number, simActive: boolean): void {
+    const it = this.nearbyInteractable;
+    if (
+      !simActive ||
+      this.params.mode !== 'infection' ||
+      !this.playerAlive ||
+      !this.pointerLocked ||
+      !this.interactKeyHeld ||
+      !it ||
+      it.kind !== 'window_barrier' ||
+      !this.zombieAI
+    ) {
+      this.repairingBarrierId = null;
+      this.barrierRepairProgress = 0;
+      this.barrierRepairPendingRequest = false;
+      return;
+    }
+
+    const barrierId = it.barrierId ?? it.id;
+    const barrier = this.zombieAI.getBarrierById(barrierId);
+    if (!barrier || barrier.getPlanksRemaining() >= barrier.maxPlanks) {
+      this.repairingBarrierId = null;
+      this.barrierRepairProgress = 0;
+      this.barrierRepairPendingRequest = false;
+      return;
+    }
+
+    if (this.repairingBarrierId !== barrier.id) {
+      this.repairingBarrierId = barrier.id;
+      this.barrierRepairProgress = 0;
+      this.barrierRepairPendingRequest = false;
+    }
+
+    if (this.barrierRepairPendingRequest) {
+      if (performance.now() - this.barrierRepairReqSentAtMs > 1200) {
+        this.barrierRepairPendingRequest = false;
+      }
+      return;
+    }
+
+    // Hold [F] for 0.78s per plank replaced -> +5 PTS per plank
+    this.barrierRepairProgress += dt / 0.78;
+    if (this.barrierRepairProgress >= 1.0) {
+      this.barrierRepairProgress = 0;
+      if (this.mp && !this.isMpHost) {
+        this.barrierRepairPendingRequest = true;
+        this.barrierRepairReqSentAtMs = performance.now();
+        const reqPkt: GameBarrierRepairRequestPacket = {
+          type: 'game:barrier_repair_request',
+          barrierId: barrier.id,
+          ts: Date.now(),
+        };
+        this.mp.sendMessage(reqPkt as unknown as Record<string, unknown>);
+      } else if (barrier.repairPlank()) {
+        this.addPoints(5, 'BARRIER REPAIR');
+        this._tmpBarrierPos.set(barrier.sillPos[0], barrier.sillPos[1], barrier.sillPos[2]);
+        this.audio.playImpact(this._tmpBarrierPos, 'wood');
+        this.audio.playGearRattle('weapon_swap', 0.35);
+        if (this.mp && this.isMpHost) {
+          const updPkt: GameBarrierUpdatePacket = {
+            type: 'game:barrier_update',
+            barrierId: barrier.id,
+            planksRemaining: barrier.getPlanksRemaining(),
+            repairedByUserId: this.mp.localUserId,
+            pointsAwarded: 5,
+            ts: Date.now(),
+          };
+          this.mp.sendMessage(updPkt as unknown as Record<string, unknown>);
+        }
+        this.emitSnapshot();
+      }
+    }
   }
 
   private buildNearbyPrompt(): NearbyInteractPrompt | null {
@@ -2605,6 +2812,25 @@ export class CombatSessionEngine {
       };
     }
 
+    if (it.kind === 'window_barrier') {
+      const barrier = this.zombieAI?.getBarrierById(it.barrierId ?? it.id);
+      if (!barrier || barrier.getPlanksRemaining() >= barrier.maxPlanks) return null;
+      const planks = barrier.getPlanksRemaining();
+      return {
+        id: it.id,
+        kind: it.kind,
+        label: barrier.label,
+        actionText: `Repair ${barrier.label} (+5 PTS / Plank)`,
+        cost: 0,
+        canAfford: true,
+        blockedReason: null,
+        isHoldAction: true,
+        holdProgress: this.repairingBarrierId === barrier.id ? this.barrierRepairProgress : 0,
+        planksRemaining: planks,
+        maxPlanks: barrier.maxPlanks,
+      };
+    }
+
     return null;
   }
 
@@ -2637,6 +2863,7 @@ export class CombatSessionEngine {
         }
       }
       this.zombieAI?.unlockZoneAndDoor(it.id, it.unlocksZoneId);
+      this.syncBotInfectionZones();
       if (!silent) {
         this.audio.playGearRattle('weapon_swap', 0.9);
         this.showToast(
@@ -3076,6 +3303,10 @@ export class CombatSessionEngine {
       this.input.leanRight = false;
       this.input.holdBreath = false;
       this.input.vault = false;
+      this.interactKeyHeld = false;
+      this.repairingBarrierId = null;
+      this.barrierRepairProgress = 0;
+      this.barrierRepairPendingRequest = false;
       if (this.grenadeSystem.isDrawn() && !this.grenadeSystem.isLeverReleased()) {
         this.grenadeSystem.cancelCook();
       }
@@ -3233,9 +3464,13 @@ export class CombatSessionEngine {
         this.input.leanRight = true;
         break;
       case 'KeyF':
+        this.interactKeyHeld = true;
         if (!e.repeat) {
           if (this.params.mode === 'infection' && this.nearbyInteractable) {
-            this.triggerInteract();
+            // Window barriers use continuous Hold [F] repair; all other interactables trigger on press
+            if (this.nearbyInteractable.kind !== 'window_barrier') {
+              this.triggerInteract();
+            }
           } else {
             this.toggleFlashlight();
           }
@@ -3337,6 +3572,12 @@ export class CombatSessionEngine {
         break;
       case 'KeyE':
         this.input.leanRight = false;
+        break;
+      case 'KeyF':
+        this.interactKeyHeld = false;
+        this.repairingBarrierId = null;
+        this.barrierRepairProgress = 0;
+        this.barrierRepairPendingRequest = false;
         break;
       case 'Space':
         this.input.vault = false;
@@ -3644,23 +3885,39 @@ export class CombatSessionEngine {
       this.syncBeltEquipmentMesh();
     }
 
-    // Step active AI system (strictly separated, Host-authoritative in multiplayer!)
+    // Step active AI system (Host-authoritative in multiplayer; Infection supports friendly AI squadmates)
     if (simActive) {
       const localId = this.mp?.localUserId ?? 'player';
       const remoteHumans = this.remotePlayers?.getAliveHumanTargets() ?? [];
+      const battleHumans: BattleHumanTarget[] = [
+        {
+          id: localId,
+          name: this.mp?.localUsername ?? 'YOU',
+          team: this.localBattleTeam,
+          pos: this.controller.position,
+          alive: this.playerAlive,
+        },
+        ...remoteHumans,
+      ];
+      const onHostBotFire =
+        this.mp && this.isMpHost
+          ? (botId: string, origin: Readonly<THREE.Vector3>, end: Readonly<THREE.Vector3>) => {
+              const firePkt: GameBotFirePacket = {
+                type: 'game:bot_fire',
+                botId,
+                ox: Number(origin.x.toFixed(3)),
+                oy: Number(origin.y.toFixed(3)),
+                oz: Number(origin.z.toFixed(3)),
+                ex: Number(end.x.toFixed(3)),
+                ey: Number(end.y.toFixed(3)),
+                ez: Number(end.z.toFixed(3)),
+                ts: Date.now(),
+              };
+              this.mp!.sendMessage(firePkt as unknown as Record<string, unknown>);
+            }
+          : undefined;
 
-      if (this.botAI) {
-        const battleHumans: BattleHumanTarget[] = [
-          {
-            id: localId,
-            name: this.mp?.localUsername ?? 'YOU',
-            team: this.localBattleTeam,
-            pos: this.controller.position,
-            alive: this.playerAlive,
-          },
-          ...remoteHumans,
-        ];
-
+      if (this.params.mode === 'battle' && this.botAI) {
         this.botAI.update(
           dt,
           this.controller.position,
@@ -3688,33 +3945,20 @@ export class CombatSessionEngine {
             }
           },
           battleHumans,
-          this.mp && this.isMpHost
-            ? (botId, origin, end) => {
-                const firePkt: GameBotFirePacket = {
-                  type: 'game:bot_fire',
-                  botId,
-                  ox: Number(origin.x.toFixed(3)),
-                  oy: Number(origin.y.toFixed(3)),
-                  oz: Number(origin.z.toFixed(3)),
-                  ex: Number(end.x.toFixed(3)),
-                  ey: Number(end.y.toFixed(3)),
-                  ez: Number(end.z.toFixed(3)),
-                  ts: Date.now(),
-                };
-                this.mp!.sendMessage(firePkt as unknown as Record<string, unknown>);
-              }
-            : undefined,
+          onHostBotFire,
           (a, b) => this.grenadeSystem.isLineBlockedBySmoke(a, b),
           () => this.grenadeSystem.getActiveSmokeClouds(),
         );
         this.checkBattleVictory();
-      } else if (this.zombieAI) {
-        const infectionHumans: InfectionHumanTarget[] = [
+      } else if (this.params.mode === 'infection' && this.zombieAI) {
+        const allyBotTargets = this.botAI ? this.botAI.getAliveAllyTargets() : [];
+        const infectionTargets: InfectionHumanTarget[] = [
           { id: localId, pos: this.controller.position, alive: this.playerAlive },
           ...remoteHumans.map((r) => ({ id: r.id, pos: r.pos, alive: r.alive })),
+          ...allyBotTargets,
         ];
 
-        // Check full squad wipe when local player is spectating in Co-op Infection
+        // Check full human squad wipe when local player is spectating in Co-op Infection
         if (this.mp && this.spectating && !this.playerAlive && remoteHumans.length === 0) {
           this.triggerInfectionGameOver();
         }
@@ -3724,7 +3968,9 @@ export class CombatSessionEngine {
           this.controller.position,
           this.playerAlive,
           (dmg, _attackerPos, targetUserId) => {
-            if (!targetUserId || targetUserId === localId || targetUserId === 'player') {
+            if (targetUserId && targetUserId.startsWith('bot_')) {
+              this.botAI?.applyZombieDamageToBot(targetUserId, dmg);
+            } else if (!targetUserId || targetUserId === localId || targetUserId === 'player') {
               this.applyPlayerDamage(dmg, 'INFECTED');
             } else if (this.mp && this.isMpHost) {
               const hitPkt: GameZombieHitPlayerPacket = {
@@ -3739,6 +3985,7 @@ export class CombatSessionEngine {
           (completedRound, bonus) => {
             this.addPoints(bonus, `ROUND ${completedRound} BONUS`);
             this.replenishInfectionRoundGrenade();
+            this.botAI?.reviveAllDownedBots(this.controller.position);
             this.showToast(`Round ${completedRound} Cleared · +${bonus} PTS · +1 Grenade`, 3.4);
             if (this.spectating && !this.playerAlive && !this.gameOver) {
               this.reviveCoopInfectionPlayer(completedRound + 1);
@@ -3753,16 +4000,82 @@ export class CombatSessionEngine {
               this.mp.sendMessage(roundPkt as unknown as Record<string, unknown>);
             }
           },
-          infectionHumans,
+          infectionTargets,
           this.mp && this.isMpHost
             ? (spawnPkt) => {
                 this.mp!.sendMessage(spawnPkt as unknown as Record<string, unknown>);
               }
             : undefined,
+          this.mp && this.isMpHost
+            ? (barrierId, planksRemaining) => {
+                const updPkt: GameBarrierUpdatePacket = {
+                  type: 'game:barrier_update',
+                  barrierId,
+                  planksRemaining,
+                  ts: Date.now(),
+                };
+                this.mp!.sendMessage(updPkt as unknown as Record<string, unknown>);
+              }
+            : undefined,
         );
+
+        // Step friendly co-op AI squadmates fighting alongside humans against the zombie horde
+        if (this.botAI) {
+          const zombieTargets = this.zombieAI.getAliveZombieTargets();
+          this.botAI.update(
+            dt,
+            this.controller.position,
+            this.playerAlive,
+            true,
+            () => {
+              // Friendly Infection bots never deal damage to human squadmates
+            },
+            battleHumans,
+            onHostBotFire,
+            (a, b) => this.grenadeSystem.isLineBlockedBySmoke(a, b),
+            () => this.grenadeSystem.getActiveSmokeClouds(),
+            zombieTargets,
+            (hitEv) => {
+              if (!this.zombieAI) return;
+              const res = this.zombieAI.applyBulletDamage(
+                hitEv.zombieId,
+                hitEv.damage,
+                hitEv.hitZone,
+                hitEv.impactPoint,
+                hitEv.impactDir,
+              );
+              if (res.killed) {
+                this.pushMpKillfeed({
+                  killerName: hitEv.shooterName,
+                  killerTeam: 'A',
+                  victimName: 'INFECTED',
+                  victimTeam: 'B',
+                  headshot: res.headshot,
+                  weaponLabel: 'CARBINE',
+                });
+                if (this.mp && this.isMpHost) {
+                  const killedPkt: GameZombieKilledPacket = {
+                    type: 'game:zombie_killed',
+                    zombieId: hitEv.zombieId,
+                    killerUserId: hitEv.shooterId,
+                    headshot: res.headshot,
+                    melee: false,
+                    pointsAwarded: 0,
+                    weaponId: 'm4a1',
+                    px: Number(hitEv.impactPoint.x.toFixed(3)),
+                    py: Number(hitEv.impactPoint.y.toFixed(3)),
+                    pz: Number(hitEv.impactPoint.z.toFixed(3)),
+                    ts: Date.now(),
+                  };
+                  this.mp.sendMessage(killedPkt as unknown as Record<string, unknown>);
+                }
+              }
+            },
+          );
+        }
       }
 
-      // Host drift-free 20 Hz authoritative AI Bot / Zombie + Kino door/zone state broadcast
+      // Host drift-free 20 Hz authoritative AI Bot / Zombie + Kino door/zone/barrier state broadcast
       if (this.mp && this.isMpHost) {
         this.aiSyncAccum += dt;
         if (this.aiSyncAccum >= 0.05) {
@@ -3771,7 +4084,8 @@ export class CombatSessionEngine {
             this.mp.sendMessage(
               this.botAI.exportSyncSnapshot() as unknown as Record<string, unknown>,
             );
-          } else if (this.zombieAI) {
+          }
+          if (this.zombieAI) {
             this.mp.sendMessage(
               this.zombieAI.exportSyncSnapshot(this.powerOn) as unknown as Record<string, unknown>,
             );
@@ -3780,8 +4094,9 @@ export class CombatSessionEngine {
       }
     }
 
-    // Update nearby interactable in Infection
+    // Update nearby interactable & continuous Hold [F] barrier repair in Infection
     this.updateNearbyInteractable();
+    this.updateBarrierRepair(dt, simActive);
 
     // Post-process & render
     this.controller.getWhipVelocity(this._whipVel);
@@ -3946,6 +4261,8 @@ export class CombatSessionEngine {
       powerOn: this.powerOn,
       perks: Array.from(this.perks),
       nearbyPrompt: this.buildNearbyPrompt(),
+      friendlyBotsAlive: this.params.mode === 'infection' ? (this.botAI?.getAliveBotCount() ?? 0) : 0,
+      friendlyBotsTotal: this.params.mode === 'infection' ? (this.botAI?.getTotalBotCount() ?? 0) : 0,
       gameOver: this.gameOver,
 
       tacticalEquipmentId: this.tacticalEquipmentId,

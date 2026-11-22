@@ -592,10 +592,16 @@ export class LobbyRoomDO {
       const mode: LobbyModeId = ev ? ev.config.mode : body.mode;
       const battleRule = ev ? ev.config.battleRule : body.battleRule;
       const mapId = ev ? ev.config.mapId : body.mapId;
-      const maxPlayers = Math.max(2, Math.min(8, Math.round(ev ? ev.config.maxPlayers : body.maxPlayers)));
+      const rawMax = Math.round(ev ? ev.config.maxPlayers : body.maxPlayers);
+      const maxPlayers =
+        mode === 'infection'
+          ? Math.max(2, Math.min(4, Number.isFinite(rawMax) ? rawMax : 4))
+          : Math.max(2, Math.min(8, Number.isFinite(rawMax) ? rawMax : 8));
+      const maxBotsAllowed = mode === 'infection' ? Math.max(0, maxPlayers - 1) : 10;
       const botsEnabled = ev ? ev.config.botsEnabled : Boolean(body.botsEnabled);
+      const rawBotCount = Math.round(ev ? ev.config.botCount : body.botCount);
       const botCount = botsEnabled
-        ? Math.max(0, Math.min(10, Math.round(ev ? ev.config.botCount : body.botCount)))
+        ? Math.max(0, Math.min(maxBotsAllowed, Number.isFinite(rawBotCount) ? rawBotCount : maxBotsAllowed))
         : 0;
       const killfeedPolicy = ev
         ? (ev.config.killfeedPolicy ?? 'player_choice')
@@ -801,12 +807,19 @@ export class LobbyRoomDO {
           username,
           rank,
           prestige,
-          team: this.pickBalancedTeam(st.members),
+          team: st.mode === 'infection' ? 'A' : this.pickBalancedTeam(st.members),
           ready: false,
           isHost: userId === st.hostUserId,
           connected: true,
           joinedAt: Date.now(),
         });
+        if (st.mode === 'infection') {
+          const maxInfBots = Math.max(0, st.maxPlayers - st.members.length);
+          if (st.botCount > maxInfBots) {
+            st.botCount = maxInfBots;
+            st.botsEnabled = st.botCount > 0;
+          }
+        }
         this.pushSystemChat(
           validEventHash
             ? `${username} joined via Event Hash Code.`
@@ -890,9 +903,14 @@ export class LobbyRoomDO {
         st.visibility = patch.visibility;
       }
       if (patch.mode === 'battle' || patch.mode === 'infection') {
+        const prevMode = st.mode;
         st.mode = patch.mode;
-        if (st.mode === 'infection' && st.mapId !== 'kino_theater') {
-          st.mapId = 'kino_theater';
+        if (st.mode === 'infection') {
+          if (st.mapId !== 'kino_theater') st.mapId = 'kino_theater';
+          if (prevMode !== 'infection' && st.maxPlayers > 4) {
+            st.maxPlayers = Math.max(4, st.members.length);
+          }
+          for (const m of st.members) m.team = 'A';
         } else if (st.mode === 'battle' && st.mapId === 'kino_theater') {
           st.mapId = 'pripyat_block';
         }
@@ -909,18 +927,23 @@ export class LobbyRoomDO {
         st.mapId = patch.mapId;
       }
       if (typeof patch.maxPlayers === 'number') {
+        const upperCap = st.mode === 'infection' ? Math.max(4, st.members.length) : 8;
         st.maxPlayers = Math.max(
           Math.max(2, st.members.length),
-          Math.min(8, Math.round(patch.maxPlayers)),
+          Math.min(upperCap, Math.round(patch.maxPlayers)),
         );
       }
+      const maxBotCap = st.mode === 'infection' ? Math.max(0, st.maxPlayers - st.members.length) : 10;
       if (typeof patch.botsEnabled === 'boolean') {
-        st.botsEnabled = patch.botsEnabled;
+        st.botsEnabled = patch.botsEnabled && maxBotCap > 0;
         if (!st.botsEnabled) st.botCount = 0;
-        else if (st.botCount === 0) st.botCount = 6;
+        else if (st.botCount === 0) st.botCount = Math.min(maxBotCap, st.mode === 'infection' ? maxBotCap : 6);
       }
       if (typeof patch.botCount === 'number') {
-        st.botCount = Math.max(0, Math.min(10, Math.round(patch.botCount)));
+        st.botCount = Math.max(0, Math.min(maxBotCap, Math.round(patch.botCount)));
+        st.botsEnabled = st.botCount > 0;
+      } else if (st.botCount > maxBotCap) {
+        st.botCount = maxBotCap;
         st.botsEnabled = st.botCount > 0;
       }
       if (typeof patch.killLimit === 'number') {

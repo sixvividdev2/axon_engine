@@ -20,6 +20,8 @@ export interface BattleMatchConfig {
 
 export interface InfectionMatchConfig {
   mapId: string;
+  botCount?: number;
+  botDifficulty?: BotDifficultyId;
   tacticalEquipmentId?: TacticalEquipmentId;
 }
 
@@ -52,11 +54,40 @@ export interface ZombieSpawnerDef {
   id: string;
   /** Active only when this zone is unlocked */
   zoneId: string;
+  /** Deep hallway spawn position behind the barricaded window */
   spawnPos: [number, number, number];
-  /** First interior nav node just inside the barricaded window */
+  /** Stand position just outside the window jamb where zombie reaches to tear off planks */
+  windowOuterPos?: [number, number, number];
+  /** Window sill center (x, sillTopY, z) vaulted over once all barrier planks are removed */
+  sillPos?: [number, number, number];
+  /** First interior landing spot just inside the barricaded window */
   entryPos: [number, number, number];
+  /** Unit normal pointing from spawn hallway into the interior room */
+  windowNormal?: [number, number, number];
+  /** Total planks guarding this window barrier (default 5) */
+  maxPlanks?: number;
   entryNodeId: string;
   yaw: number;
+}
+
+export interface MapWindowBarrier {
+  id: string;
+  spawnerId: string;
+  zoneId: string;
+  label: string;
+  interactPos: [number, number, number];
+  sillPos: [number, number, number];
+  windowOuterPos: [number, number, number];
+  entryPos: [number, number, number];
+  windowNormal: [number, number, number];
+  maxPlanks: number;
+  getPlanksRemaining: () => number;
+  /** Tears off one plank (returns true if a plank was removed) */
+  tearPlank: () => boolean;
+  /** Replaces one plank (returns true if a plank was repaired) */
+  repairPlank: () => boolean;
+  /** Sets exact plank count (used for multiplayer sync or round reset) */
+  setPlankCount: (count: number) => void;
 }
 
 export type MapInteractableKind =
@@ -64,7 +95,8 @@ export type MapInteractableKind =
   | 'power_switch'
   | 'wall_buy'
   | 'mystery_crate'
-  | 'perk_machine';
+  | 'perk_machine'
+  | 'window_barrier';
 
 export type InfectionPerkId = 'vitality' | 'rapid_handling';
 
@@ -83,6 +115,8 @@ export interface MapInteractable {
   /** Wall-buy / Perk fields */
   weaponId?: string;
   perkId?: InfectionPerkId;
+  /** Window barrier link */
+  barrierId?: string;
   activated: boolean;
 }
 
@@ -115,6 +149,8 @@ export interface BuiltMapInstance {
   };
   /** Optional terrain height sampler for rolling outdoor maps */
   terrainHeightAt?: (x: number, z: number) => number;
+  /** Interactive barricaded zombie windows */
+  windowBarriers?: MapWindowBarrier[];
   interactables: MapInteractable[];
   lightingPreset: MapLightingPreset;
   setPowerState?: (powered: boolean) => void;

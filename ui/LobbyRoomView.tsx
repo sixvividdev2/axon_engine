@@ -75,8 +75,16 @@ export const LobbyRoomView: React.FC<LobbyRoomViewProps> = ({ onOpenLoadoutWorkb
   const ev = lobby.specialEvent;
   const isSpecialEvent = Boolean(ev);
   const isTdm = lobby.mode === 'battle' && lobby.battleRule === 'tdm';
+  const isInfection = lobby.mode === 'infection';
   const myMember = lobby.members.find((m) => m.userId === user.id);
-  const availableMaps = lobby.mode === 'infection' ? ZOMBIE_MAPS : BATTLE_MAPS;
+  const availableMaps = isInfection ? ZOMBIE_MAPS : BATTLE_MAPS;
+  const maxAllowedPlayers = isInfection ? Math.max(4, lobby.members.length) : 8;
+  const maxAllowedBots = isInfection
+    ? Math.max(0, lobby.maxPlayers - lobby.members.length)
+    : 10;
+  const effectiveBotCount = lobby.botsEnabled
+    ? Math.min(lobby.botCount, maxAllowedBots)
+    : 0;
 
   const copyCode = (text: string, which: 'lobby' | 'event') => {
     void navigator.clipboard?.writeText(text);
@@ -320,7 +328,12 @@ export const LobbyRoomView: React.FC<LobbyRoomViewProps> = ({ onOpenLoadoutWorkb
                   onChange={(e) => {
                     const v = e.target.value;
                     if (v === 'infection') {
-                      updateSettings({ mode: 'infection', mapId: 'kino_theater' });
+                      const nextMax = Math.max(lobby.members.length, Math.min(4, lobby.maxPlayers));
+                      updateSettings({
+                        mode: 'infection',
+                        mapId: 'kino_theater',
+                        maxPlayers: Math.max(2, nextMax),
+                      });
                     } else {
                       updateSettings({
                         mode: 'battle',
@@ -366,11 +379,11 @@ export const LobbyRoomView: React.FC<LobbyRoomViewProps> = ({ onOpenLoadoutWorkb
             </div>
           </div>
 
-          {/* Max Players (2..8) & AI Bots ON/OFF + Stepper */}
+          {/* Max Players & AI Bots ON/OFF + Stepper */}
           <div className="grid grid-cols-2 gap-3">
             <div className="border border-neutral-800 bg-neutral-900/50 p-3">
               <div className="font-mono-tabular text-[10px] uppercase tracking-wider text-neutral-400">
-                Max Players (2–8)
+                Max Players (2–{maxAllowedPlayers})
               </div>
               {isHost ? (
                 <div className="mt-2 flex items-center justify-between">
@@ -387,8 +400,10 @@ export const LobbyRoomView: React.FC<LobbyRoomViewProps> = ({ onOpenLoadoutWorkb
                   </span>
                   <button
                     type="button"
-                    disabled={lobby.maxPlayers >= 8}
-                    onClick={() => updateSettings({ maxPlayers: lobby.maxPlayers + 1 })}
+                    disabled={lobby.maxPlayers >= maxAllowedPlayers}
+                    onClick={() =>
+                      updateSettings({ maxPlayers: Math.min(maxAllowedPlayers, lobby.maxPlayers + 1) })
+                    }
                     className="cursor-pointer border border-neutral-700 bg-neutral-950 p-1.5 text-neutral-200 hover:border-amber-400 disabled:opacity-35"
                   >
                     <Plus className="h-3.5 w-3.5" />
@@ -403,22 +418,34 @@ export const LobbyRoomView: React.FC<LobbyRoomViewProps> = ({ onOpenLoadoutWorkb
 
             <div className="border border-neutral-800 bg-neutral-900/50 p-3">
               <div className="flex items-center justify-between font-mono-tabular text-[10px] uppercase tracking-wider text-neutral-400">
-                <span>AI Bots</span>
+                <span>{isInfection ? `Ally Bots (0–${maxAllowedBots})` : 'AI Bots'}</span>
                 {isHost ? (
                   <button
                     type="button"
-                    onClick={() => updateSettings({ botsEnabled: !lobby.botsEnabled })}
-                    className={`cursor-pointer border px-1.5 py-0.5 text-[10px] font-semibold ${
-                      lobby.botsEnabled
+                    disabled={maxAllowedBots <= 0}
+                    onClick={() => {
+                      const nextEnabled = effectiveBotCount === 0;
+                      updateSettings({
+                        botsEnabled: nextEnabled,
+                        botCount: nextEnabled
+                          ? Math.min(
+                              maxAllowedBots,
+                              Math.max(1, lobby.botCount || (isInfection ? maxAllowedBots : 6)),
+                            )
+                          : 0,
+                      });
+                    }}
+                    className={`cursor-pointer border px-1.5 py-0.5 text-[10px] font-semibold disabled:opacity-35 ${
+                      effectiveBotCount > 0
                         ? 'border-emerald-500/70 bg-emerald-950/50 text-emerald-300'
                         : 'border-neutral-700 bg-neutral-950 text-neutral-400'
                     }`}
                   >
-                    {lobby.botsEnabled ? 'ON' : 'OFF'}
+                    {effectiveBotCount > 0 ? 'ON' : 'OFF'}
                   </button>
                 ) : (
-                  <span className={lobby.botsEnabled ? 'text-emerald-300' : 'text-neutral-500'}>
-                    {lobby.botsEnabled ? 'ON' : 'OFF'}
+                  <span className={effectiveBotCount > 0 ? 'text-emerald-300' : 'text-neutral-500'}>
+                    {effectiveBotCount > 0 ? 'ON' : 'OFF'}
                   </span>
                 )}
               </div>
@@ -426,20 +453,26 @@ export const LobbyRoomView: React.FC<LobbyRoomViewProps> = ({ onOpenLoadoutWorkb
                 <div className="mt-2 flex items-center justify-between">
                   <button
                     type="button"
-                    disabled={!lobby.botsEnabled || lobby.botCount <= 0}
-                    onClick={() => updateSettings({ botCount: Math.max(0, lobby.botCount - 1) })}
+                    disabled={effectiveBotCount <= 0}
+                    onClick={() => {
+                      const next = Math.max(0, effectiveBotCount - 1);
+                      updateSettings({ botsEnabled: next > 0, botCount: next });
+                    }}
                     className="cursor-pointer border border-neutral-700 bg-neutral-950 p-1.5 text-neutral-200 hover:border-amber-400 disabled:opacity-35"
                   >
                     <Minus className="h-3.5 w-3.5" />
                   </button>
                   <span className="font-display text-xl font-bold text-neutral-50">
-                    {lobby.botsEnabled ? lobby.botCount : 0}
+                    {effectiveBotCount}
                   </span>
                   <button
                     type="button"
-                    disabled={lobby.botCount >= 10}
+                    disabled={effectiveBotCount >= maxAllowedBots}
                     onClick={() =>
-                      updateSettings({ botsEnabled: true, botCount: Math.min(10, lobby.botCount + 1) })
+                      updateSettings({
+                        botsEnabled: true,
+                        botCount: Math.min(maxAllowedBots, effectiveBotCount + 1),
+                      })
                     }
                     className="cursor-pointer border border-neutral-700 bg-neutral-950 p-1.5 text-neutral-200 hover:border-amber-400 disabled:opacity-35"
                   >
@@ -448,14 +481,21 @@ export const LobbyRoomView: React.FC<LobbyRoomViewProps> = ({ onOpenLoadoutWorkb
                 </div>
               ) : (
                 <div className="mt-1.5 font-mono-tabular text-sm font-semibold text-neutral-100">
-                  {lobby.botsEnabled ? `${lobby.botCount} Bots` : 'Players Only'}
+                  {effectiveBotCount > 0
+                    ? `${effectiveBotCount} ${isInfection ? 'Friendly ' : ''}Bot${effectiveBotCount === 1 ? '' : 's'}`
+                    : 'Players Only'}
+                </div>
+              )}
+              {isInfection && (
+                <div className="mt-1 font-mono-tabular text-[9px] text-sky-300/85">
+                  {lobby.members.length} Human + {effectiveBotCount} Ally · Always Friendly
                 </div>
               )}
             </div>
           </div>
 
-          {/* Battle Kill Limit & Difficulty */}
-          {lobby.mode === 'battle' && (
+          {/* Battle Kill Limit & Difficulty (or Infection Friendly Bot Difficulty) */}
+          {lobby.mode === 'battle' ? (
             <div className="grid grid-cols-2 gap-3">
               <div>
                 <div className="font-mono-tabular text-[10px] uppercase tracking-wider text-neutral-400">
@@ -502,6 +542,31 @@ export const LobbyRoomView: React.FC<LobbyRoomViewProps> = ({ onOpenLoadoutWorkb
                 )}
               </div>
             </div>
+          ) : (
+            effectiveBotCount > 0 && (
+              <div>
+                <div className="font-mono-tabular text-[10px] uppercase tracking-wider text-neutral-400">
+                  Friendly Bot Difficulty
+                </div>
+                {isHost ? (
+                  <select
+                    value={lobby.botDifficulty}
+                    onChange={(e) =>
+                      updateSettings({ botDifficulty: e.target.value as BotDifficultyId })
+                    }
+                    className="mt-1 w-full cursor-pointer border border-neutral-700 bg-neutral-900 px-2.5 py-1.5 font-mono-tabular text-xs text-neutral-100"
+                  >
+                    <option value="recruit">Recruit</option>
+                    <option value="tactical">Tactical</option>
+                    <option value="veteran">Veteran</option>
+                  </select>
+                ) : (
+                  <div className="mt-1 font-mono-tabular text-xs capitalize text-neutral-200">
+                    {lobby.botDifficulty}
+                  </div>
+                )}
+              </div>
+            )
           )}
 
           {/* Host Killfeed Policy Override & Personal Toggle */}

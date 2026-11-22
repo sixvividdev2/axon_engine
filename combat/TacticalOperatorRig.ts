@@ -56,6 +56,12 @@ export interface TacticalCombatPose {
   firingVibration: number;
   /** Torso flinch pitch in radians */
   flinchPitch: number;
+  /** 0..1 active vault/climb animation blend */
+  vaultBlend?: number;
+  /** 0..1 normalized progress through vault/climb maneuver */
+  vaultProgress?: number;
+  /** Vault maneuver kind for distinct brace vs mantle posture */
+  vaultKind?: 'VAULT_OVER' | 'CLIMB_ONTO' | 'HIGH_MANTLE';
 }
 
 export interface BuiltTacticalOperatorRig {
@@ -114,6 +120,8 @@ const _shR = new THREE.Vector3();
 const _gripL = new THREE.Vector3();
 const _gripR = new THREE.Vector3();
 const _reloadL = new THREE.Vector3();
+const _vaultBraceL = new THREE.Vector3();
+const _vaultBraceR = new THREE.Vector3();
 const _poleL = new THREE.Vector3();
 const _poleR = new THREE.Vector3();
 const _armAxisX = new THREE.Vector3();
@@ -926,10 +934,13 @@ export class TacticalOperatorRigFactory {
       const cant = THREE.MathUtils.clamp(pose.cantBlend, 0, 1);
       const reload = THREE.MathUtils.clamp(pose.reloadBlend, 0, 1);
       const recoil = THREE.MathUtils.clamp(pose.recoilKick, 0, 1.5);
+      const vaultW = THREE.MathUtils.clamp(pose.vaultBlend ?? 0, 0, 1);
+      const vaultProg = THREE.MathUtils.clamp(pose.vaultProgress ?? 0.5, 0, 1);
+      const vaultPeak = Math.sin(vaultProg * Math.PI);
+      const isHighMantle = pose.vaultKind === 'HIGH_MANTLE';
 
-      // 1. Lower Body: anatomical crouch + stride (facing -Z, legs hang -Y:
-      //    thigh forward = +X, knee bends strictly backward = -X, ankle compensates = -(thigh+knee))
-      const moveWeight = THREE.MathUtils.clamp((pose.speedMps - 0.15) / 2.2, 0, 1);
+      // 1. Lower Body: anatomical crouch + stride + vault/climb knee-tuck
+      const moveWeight = THREE.MathUtils.clamp((pose.speedMps - 0.15) / 2.2, 0, 1) * (1 - vaultW * 0.85);
       const strideAmp = (pose.sprint ? 0.56 : 0.40) * (1 - crouch * 0.35) * moveWeight;
 
       const baseThigh = 0.08 + crouch * 0.72; // forward hip flexion (+X)
@@ -940,49 +951,62 @@ export class TacticalOperatorRigFactory {
       const sinR = -sinL;
       const cosR = -cosL;
 
-      // Left leg
+      // Left leg (leads the hurdle tuck during vault/climb)
       const swingL = sinL * strideAmp;
       const liftL = Math.max(0, -cosL) * strideAmp * 0.78;
       const trailL = Math.max(0, -sinL) * strideAmp * 0.65;
-      const thighXL = baseThigh + swingL * 0.85 + liftL * 0.35;
-      const kneeXL = Math.min(-0.06, baseKnee - liftL * 0.95 - trailL * 0.55);
+      const vaultLegLead = Math.sin(Math.min(1, vaultProg * 1.35) * Math.PI);
+      const vaultLegTrail = Math.sin(Math.max(0, (vaultProg - 0.18) / 0.82) * Math.PI);
+
+      const thighXL = baseThigh + swingL * 0.85 + liftL * 0.35 + vaultW * vaultLegLead * 1.05;
+      const kneeXL = Math.min(-0.06, baseKnee - liftL * 0.95 - trailL * 0.55 - vaultW * vaultLegLead * 1.45);
       const ankleXL = -(thighXL + kneeXL);
 
-      // Right leg
+      // Right leg (trails slightly behind lead leg over obstacle)
       const swingR = sinR * strideAmp;
       const liftR = Math.max(0, -cosR) * strideAmp * 0.78;
       const trailR = Math.max(0, -sinR) * strideAmp * 0.65;
-      const thighXR = baseThigh + swingR * 0.85 + liftR * 0.35;
-      const kneeXR = Math.min(-0.06, baseKnee - liftR * 0.95 - trailR * 0.55);
+      const thighXR = baseThigh + swingR * 0.85 + liftR * 0.35 + vaultW * vaultLegTrail * 0.88;
+      const kneeXR = Math.min(-0.06, baseKnee - liftR * 0.95 - trailR * 0.55 - vaultW * vaultLegTrail * 1.28);
       const ankleXR = -(thighXR + kneeXR);
 
-      leftLegParts.hipPivot.rotation.set(thighXL, 0.05, 0);
+      leftLegParts.hipPivot.rotation.set(thighXL, 0.05, vaultW * vaultPeak * 0.14);
       leftLegParts.kneePivot.rotation.set(kneeXL, 0, 0);
       leftLegParts.anklePivot.rotation.set(ankleXL, 0, 0);
 
-      rightLegParts.hipPivot.rotation.set(thighXR, -0.05, 0);
+      rightLegParts.hipPivot.rotation.set(thighXR, -0.05, -vaultW * vaultPeak * 0.1);
       rightLegParts.kneePivot.rotation.set(kneeXR, 0, 0);
       rightLegParts.anklePivot.rotation.set(ankleXR, 0, 0);
 
-      // Compute exact pelvis Y so the lowest planted boot sole rests flat on y = 0 (no float/sink)
+      // Compute exact pelvis Y so the lowest planted boot sole rests flat on y = 0 (and lifts cleanly while vaulting)
       const reachL = thighLen * Math.cos(thighXL) + shinLen * Math.cos(thighXL + kneeXL);
       const reachR = thighLen * Math.cos(thighXR) + shinLen * Math.cos(thighXR + kneeXR);
       const groundedPelvisY = Math.max(reachL, reachR) + ankleHeight;
-      pelvisGroup.position.set(0, Math.max(0.46, groundedPelvisY), 0);
+      const vaultPelvisY = THREE.MathUtils.lerp(Math.max(0.46, groundedPelvisY), restPelvisY - 0.06, vaultW * 0.65);
+      pelvisGroup.position.set(0, vaultPelvisY, 0);
       pelvisGroup.rotation.set(0, 0, 0);
 
-      // 2. Upper Body lean, crouch forward cant, and hit flinch
+      // 2. Upper Body lean, crouch forward cant, vault athletic pitch, and hit flinch
       const crouchTorsoForward = -crouch * 0.12;
-      upperBody.position.set(lean * 0.06, 0.035, 0);
-      upperBody.rotation.set(crouchTorsoForward + pose.flinchPitch, 0, -lean * 0.24);
+      const vaultTorsoForward = -vaultW * (vaultPeak * 0.36 + (isHighMantle ? 0.18 * vaultPeak : 0));
+      const vaultRoll = vaultW * vaultPeak * (isHighMantle ? 0.04 : 0.18);
+      upperBody.position.set(lean * 0.06 * (1 - vaultW), 0.035, -vaultW * vaultPeak * 0.05);
+      upperBody.rotation.set(
+        crouchTorsoForward + vaultTorsoForward + pose.flinchPitch,
+        0,
+        -lean * 0.24 * (1 - vaultW) + vaultRoll,
+      );
 
       // 3. Head aim pitch tracking + subtle cheek-weld roll
-      const cheekWeldRoll = (ads - pointAim * 0.35) * 0.11;
-      headGroup.rotation.set(pitch * 0.76, 0, -cheekWeldRoll);
+      const cheekWeldRoll = (ads - pointAim * 0.35) * 0.11 * (1 - vaultW);
+      headGroup.rotation.set(pitch * 0.76 * (1 - vaultW * 0.6) - vaultW * vaultPeak * 0.18, 0, -cheekWeldRoll);
 
       // 4. Local weaponSocket placement on upper chest / right shoulder ready-mount
-      const primaryAdsW = Math.max(0, ads - Math.max(pointAim, cant));
-      const cantW = Math.max(pointAim, cant);
+      const effAds = ads * (1 - vaultW);
+      const effPointAim = pointAim * (1 - vaultW);
+      const effCant = cant * (1 - vaultW);
+      const primaryAdsW = Math.max(0, effAds - Math.max(effPointAim, effCant));
+      const cantW = Math.max(effPointAim, effCant);
 
       // Hip / Combat Ready (stock seated in right shoulder pocket, barrel forward)
       let wx = 0.138 * torsoW;
@@ -1008,26 +1032,35 @@ export class TacticalOperatorRigFactory {
       wz = THREE.MathUtils.lerp(wz, -0.175, reload);
       wepYaw = THREE.MathUtils.lerp(wepYaw, 0.30, reload);
 
+      // Vault/climb retention tuck (keeps rifle controlled at right ribcage while left hand braces ledge)
+      if (vaultW > 0.005) {
+        wx = THREE.MathUtils.lerp(wx, 0.20 * torsoW, vaultW);
+        wy = THREE.MathUtils.lerp(wy, 0.22, vaultW);
+        wz = THREE.MathUtils.lerp(wz, -0.12, vaultW);
+        wepYaw = THREE.MathUtils.lerp(wepYaw, -0.22, vaultW);
+      }
+
       const recoilZKick = recoil * 0.045 + Math.abs(pose.firingVibration) * 0.35;
       const recoilPitchKick = recoil * 0.095 + pose.firingVibration;
-      const cantRollRad = pointAim * 0.61 + cant * 0.70;
+      const cantRollRad = effPointAim * 0.61 + effCant * 0.70;
       const reloadPitchOffset = -reload * 0.42;
       const reloadRollOffset = reload * 0.42;
+      const vaultWepPitch = -vaultW * 0.48;
+      const vaultWepRoll = -vaultW * 0.28;
 
       weaponSocket.position.set(wx, wy, wz + recoilZKick);
       weaponSocket.rotation.set(
-        pitch + recoilPitchKick + reloadPitchOffset,
+        pitch * (1 - vaultW) + recoilPitchKick + reloadPitchOffset + vaultWepPitch,
         wepYaw,
-        cantRollRad + reloadRollOffset,
+        cantRollRad + reloadRollOffset + vaultWepRoll,
       );
       weaponPivot.position.set(0, 0, 0);
       weaponPivot.rotation.set(0, 0, 0);
 
-      // 5. Two-bone Arm IK in upperBody local space -> hands stay locked on grip & handguard
+      // 5. Two-bone Arm IK in upperBody local space -> hands stay locked on grip/handguard or brace ledge on vault
       _shR.set(shoulderX, shoulderY, -0.015);
       _shL.set(-shoulderX, shoulderY, -0.015);
 
-      // Transform local rifle anchors into upperBody space via weaponSocket transform
       _gripR.copy(rightGripLocal).applyQuaternion(weaponSocket.quaternion).add(weaponSocket.position);
       _gripL.copy(leftHandguardLocal).applyQuaternion(weaponSocket.quaternion).add(weaponSocket.position);
 
@@ -1036,9 +1069,23 @@ export class TacticalOperatorRigFactory {
         _gripL.lerp(_reloadL, reload);
       }
 
+      if (vaultW > 0.005) {
+        // Left hand reaches forward/down (vault/climb) or up-then-down (high mantle) to plant firmly on obstacle
+        const braceY = isHighMantle
+          ? THREE.MathUtils.lerp(shoulderY + 0.34, 0.08, vaultProg)
+          : THREE.MathUtils.lerp(0.24, 0.04, vaultProg);
+        _vaultBraceL.set(-shoulderX * 0.92, braceY, -0.36);
+        _gripL.lerp(_vaultBraceL, vaultW);
+
+        if (isHighMantle) {
+          _vaultBraceR.set(shoulderX * 0.85, braceY + 0.04, -0.34);
+          _gripR.lerp(_vaultBraceR, vaultW * 0.72);
+        }
+      }
+
       // Natural tactical elbow poles (down, slightly outward & back; shift with canted roll)
       _poleR.set(shoulderX + 0.22 + cantRollRad * 0.14, shoulderY - 0.36, 0.16);
-      _poleL.set(-shoulderX - 0.16, shoulderY - 0.38 - cantRollRad * 0.08, 0.05);
+      _poleL.set(-shoulderX - 0.16 - vaultW * 0.14, shoulderY - 0.38 - cantRollRad * 0.08 + vaultW * 0.18, 0.05 + vaultW * 0.12);
 
       // Solve Right Arm
       solveTwoBoneIK(_shR, _gripR, _poleR, upperArmLen, lowerArmLen, _ikRes);

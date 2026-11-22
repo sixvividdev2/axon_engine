@@ -1,5 +1,16 @@
 import * as THREE from 'three';
-import { ActiveSmokeCloudInfo, ArticulatedRagdoll, BodycamAudio } from '../bodycam-sdk';
+import {
+  ActiveSmokeCloudInfo,
+  ArticulatedRagdoll,
+  BodycamAudio,
+  IBodycamWorldAdapter,
+} from '../bodycam-sdk';
+import {
+  createVaultCandidate,
+  VaultCandidate,
+  VaultDetector,
+  VaultKind,
+} from '../bodycam-sdk/movement/VaultDetector';
 import {
   normalizeOperatorId,
   OperatorId,
@@ -74,6 +85,22 @@ export interface BattleHumanTarget {
   alive: boolean;
 }
 
+export interface BattleZombieTarget {
+  id: string;
+  pos: THREE.Vector3;
+  enteringWindow?: boolean;
+}
+
+export interface BotZombieHitEvent {
+  zombieId: string;
+  damage: number;
+  hitZone: string;
+  impactPoint: THREE.Vector3;
+  impactDir: THREE.Vector3;
+  shooterId: string;
+  shooterName: string;
+}
+
 export interface BattleBotTuningOptions {
   aiHealth?: number;
   aiAccuracyMult?: number;
@@ -81,6 +108,10 @@ export interface BattleBotTuningOptions {
   aiRespawnEnabled?: boolean;
   isClientReplica?: boolean;
   maxAnisotropy?: number;
+  /** When true, all bots are permanently friendly squadmates fighting zombies in Infection mode */
+  coopInfectionMode?: boolean;
+  /** World physics adapter enabling AI operators to vault, climb, and mantle real geometry */
+  worldAdapter?: IBodycamWorldAdapter;
 }
 
 interface DifficultyParams {
@@ -131,19 +162,18 @@ const DIFFICULTY_TABLE: Record<BotDifficultyId, DifficultyParams> = {
   },
 };
 
-const CALLSIGNS_A = ['ALPHA-1', 'VALKYRIE', 'KESTREL', 'SIERRA', 'NOMAD', 'ATHENA'];
-const CALLSIGNS_B = ['LYNX', 'VOLK-2', 'NOVA', 'GRANIT', 'IRIS', 'BERKUT'];
-const CALLSIGNS_FFA = [
-  'SPECTRE',
-  'VALKYRIE',
-  'VOLK',
-  'SIERRA',
-  'NOMAD',
-  'LYNX',
-  'BISHOP',
-  'ATHENA',
-  'FALCON',
-  'NOVA',
+const MALE_CALLSIGNS_A = ['ALPHA-1', 'KESTREL', 'NOMAD', 'BISHOP', 'FALCON'];
+const FEMALE_CALLSIGNS_A = ['VALKYRIE', 'SIERRA', 'ATHENA', 'VESPERS', 'LYRA'];
+const MALE_CALLSIGNS_B = ['VOLK-2', 'GRANIT', 'BERKUT', 'SOKOL', 'VIKTOR'];
+const FEMALE_CALLSIGNS_B = ['LYNX', 'NOVA', 'IRIS', 'ZARYA', 'KATYA'];
+const MALE_CALLSIGNS_FFA = ['SPECTRE', 'VOLK', 'NOMAD', 'BISHOP', 'FALCON', 'GRANIT'];
+const FEMALE_CALLSIGNS_FFA = ['VALKYRIE', 'SIERRA', 'LYNX', 'ATHENA', 'NOVA', 'IRIS'];
+
+// Door-gated edges matching KinoTheaterMap so friendly Infection bots never path through locked doors
+const INFECTION_DOOR_GATED_EDGES: ReadonlyArray<[string, string, string]> = [
+  ['ww_door_aud', 'aud_pit_w', 'door_west_auditorium'],
+  ['ew_door_aud', 'aud_pit_e', 'door_east_auditorium'],
+  ['aud_back_w', 'proj_ramp', 'door_projector'],
 ];
 
 interface BotActor {
@@ -174,14 +204,41 @@ interface BotActor {
   firingVisualTimer: number;
   recoilKick: number;
 
-  // Navigation
+  // Tactical posture (crouch, corner lean) & vaulting/climbing state
+  crouchBlend: number;
+  targetCrouch: number;
+  netCrouch: number;
+  leanBlend: number;
+  targetLean: number;
+  netLean: number;
+  postureEvalTimer: number;
+
+  vaultActive: boolean;
+  vaultKind: VaultKind;
+  vaultStartPos: THREE.Vector3;
+  vaultApexPos: THREE.Vector3;
+  vaultEndPos: THREE.Vector3;
+  vaultT: number;
+  vaultDuration: number;
+  vaultCooldown: number;
+  vaultProbeTimer: number;
+  vaultCrouchFinish: boolean;
+  netVaulting: boolean;
+  netVaultProgress: number;
+
+  // Navigation & stuck recovery
   path: NavNode[];
   pathIndex: number;
   repathTimer: number;
   goalNodeId: string | null;
+  stuckTimer: number;
+  lastProgressX: number;
+  lastProgressZ: number;
+  avoidDir: number;
+  unstuckBoostTimer: number;
 
   // Combat AI
-  targetId: string | null; // 'player' or another bot.id
+  targetId: string | null; // 'human:...' | 'zombie:...' | bot.id
   hasLos: boolean;
   losTimer: number;
   reactionTimer: number;
@@ -236,7 +293,15 @@ export class BattleBotAI {
   private readonly diff: DifficultyParams;
   private readonly aiMaxHp: number;
   private readonly aiRespawnEnabled: boolean;
+  private readonly coopInfectionMode: boolean;
+  private readonly worldAdapter: IBodycamWorldAdapter | null;
+  private readonly vaultDetector = new VaultDetector();
+  private readonly _vaultCandidate: VaultCandidate = createVaultCandidate();
   private isClientReplica: boolean;
+
+  // Zone/door gating for friendly Infection bots
+  private readonly unlockedZones = new Set<string>(['lobby', 'default']);
+  private readonly openedDoors = new Set<string>();
 
   public scoreA = 0;
   public scoreB = 0;
@@ -255,6 +320,7 @@ export class BattleBotAI {
   private readonly _tmpTarget = new THREE.Vector3();
   private readonly _tmpMuzzle = new THREE.Vector3();
   private readonly _tmpMid = new THREE.Vector3();
+  private readonly _tmpToTarget = new THREE.Vector3();
   private readonly _tmpUp = new THREE.Vector3(0, 1, 0);
   private readonly _poseScratch: TacticalCombatPose = {
     crouchBlend: 0,
@@ -270,6 +336,9 @@ export class BattleBotAI {
     recoilKick: 0,
     firingVibration: 0,
     flinchPitch: 0,
+    vaultBlend: 0,
+    vaultProgress: 0,
+    vaultKind: 'VAULT_OVER',
   };
 
   constructor(
@@ -284,6 +353,8 @@ export class BattleBotAI {
     this.map = map;
     this.audio = audio;
     this.rule = rule;
+    this.coopInfectionMode = Boolean(tuning?.coopInfectionMode);
+    this.worldAdapter = tuning?.worldAdapter ?? map.physics.createAdapter();
     const baseDiff = DIFFICULTY_TABLE[difficulty];
     const accMult = Math.max(0.25, Math.min(2.5, tuning?.aiAccuracyMult ?? 1.0));
     const spdMult = Math.max(0.5, Math.min(2.0, tuning?.aiMoveSpeedMult ?? 1.0));
@@ -293,7 +364,10 @@ export class BattleBotAI {
       reactionSec: baseDiff.reactionSec / Math.sqrt(accMult),
       moveSpeed: baseDiff.moveSpeed * spdMult,
     };
-    this.aiMaxHp = Math.max(25, Math.min(400, Math.round(tuning?.aiHealth ?? 100)));
+    this.aiMaxHp = Math.max(
+      25,
+      Math.min(400, Math.round(tuning?.aiHealth ?? (this.coopInfectionMode ? 150 : 100))),
+    );
     this.aiRespawnEnabled = tuning?.aiRespawnEnabled ?? true;
     this.isClientReplica = Boolean(tuning?.isClientReplica);
 
@@ -313,37 +387,69 @@ export class BattleBotAI {
       this.tracers.push({ active: false, life: 0, maxLife: 0.085, mesh: m });
     }
 
-    // Spawn bots balanced across teams (Player is on Team A in TDM; 0 = Players Only)
+    // Spawn bots with guaranteed balanced mix of FEMALE and MALE operators
     const clampedCount = Math.max(0, Math.min(10, botCount));
     let countA = 0;
     let countB = 0;
+    let maleCountA = 0;
+    let femaleCountA = 0;
+    let maleCountB = 0;
+    let femaleCountB = 0;
+    let maleCountFfa = 0;
+    let femaleCountFfa = 0;
+    const startFemalePolarity = clampedCount === 1 ? Math.random() < 0.5 : false;
 
     for (let i = 0; i < clampedCount; i++) {
       let team: BattleTeamId = 'FFA';
-      let name = CALLSIGNS_FFA[i % CALLSIGNS_FFA.length];
+      let name = '';
       let weaponLabel = i % 2 === 0 ? 'AKM 7.62' : 'M4A1 5.56';
-      let operatorId: OperatorId = i % 2 === 0 ? 'MALE' : 'FEMALE';
+      let operatorId: OperatorId;
 
-      if (rule === 'tdm') {
+      if (this.coopInfectionMode) {
+        // Always friendly Team A squadmates in Infection mode; alternating Female/Male mix
+        team = 'A';
+        const isFemale = startFemalePolarity ? i % 2 === 0 : i % 2 === 1;
+        operatorId = isFemale ? 'FEMALE' : 'MALE';
+        name = isFemale
+          ? FEMALE_CALLSIGNS_A[femaleCountA++ % FEMALE_CALLSIGNS_A.length]
+          : MALE_CALLSIGNS_A[maleCountA++ % MALE_CALLSIGNS_A.length];
+        weaponLabel = i % 2 === 0 ? 'M4A1 5.56' : 'HK416 5.56';
+        countA++;
+      } else if (rule === 'tdm') {
         // Player occupies 1 slot on Team A -> put slightly more bots on Team B so totals stay even
         const teamATotalWithPlayer = countA + 1;
         if (teamATotalWithPlayer <= countB) {
           team = 'A';
-          name = CALLSIGNS_A[countA % CALLSIGNS_A.length];
+          const isFemale = countA % 2 === 0;
+          operatorId = isFemale ? 'FEMALE' : 'MALE';
+          name = isFemale
+            ? FEMALE_CALLSIGNS_A[femaleCountA++ % FEMALE_CALLSIGNS_A.length]
+            : MALE_CALLSIGNS_A[maleCountA++ % MALE_CALLSIGNS_A.length];
           weaponLabel = countA % 2 === 0 ? 'M4A1 5.56' : 'HK416 5.56';
-          operatorId = countA % 2 === 0 ? 'MALE' : 'FEMALE';
           countA++;
         } else {
           team = 'B';
-          name = CALLSIGNS_B[countB % CALLSIGNS_B.length];
+          const isFemale = countB % 2 === 1;
+          operatorId = isFemale ? 'FEMALE' : 'MALE';
+          name = isFemale
+            ? FEMALE_CALLSIGNS_B[femaleCountB++ % FEMALE_CALLSIGNS_B.length]
+            : MALE_CALLSIGNS_B[maleCountB++ % MALE_CALLSIGNS_B.length];
           weaponLabel = countB % 2 === 0 ? 'AKM 7.62' : 'AKS-74U';
-          operatorId = countB % 2 === 0 ? 'FEMALE' : 'MALE';
           countB++;
         }
+      } else {
+        // FFA: guaranteed balanced mix of Female & Male operators
+        const isFemale = startFemalePolarity ? i % 2 === 0 : i % 2 === 1;
+        operatorId = isFemale ? 'FEMALE' : 'MALE';
+        name = isFemale
+          ? FEMALE_CALLSIGNS_FFA[femaleCountFfa++ % FEMALE_CALLSIGNS_FFA.length]
+          : MALE_CALLSIGNS_FFA[maleCountFfa++ % MALE_CALLSIGNS_FFA.length];
       }
 
       const id = `bot_${i}`;
-      const uniformId = resolveOperatorUniformId('battle', team);
+      const uniformId: OperatorUniformId = this.coopInfectionMode
+        ? 'infection'
+        : resolveOperatorUniformId('battle', team);
       const rig = this.rigFactory.buildOperator('bot', id, uniformId, operatorId);
       this.group.add(rig.root);
 
@@ -373,10 +479,34 @@ export class BattleBotAI {
         hasNetState: false,
         firingVisualTimer: 0,
         recoilKick: 0,
+        crouchBlend: 0,
+        targetCrouch: 0,
+        netCrouch: 0,
+        leanBlend: 0,
+        targetLean: 0,
+        netLean: 0,
+        postureEvalTimer: Math.random() * 0.25,
+        vaultActive: false,
+        vaultKind: 'VAULT_OVER',
+        vaultStartPos: new THREE.Vector3(),
+        vaultApexPos: new THREE.Vector3(),
+        vaultEndPos: new THREE.Vector3(),
+        vaultT: 0,
+        vaultDuration: 0.65,
+        vaultCooldown: 0.5,
+        vaultProbeTimer: Math.random() * 0.25,
+        vaultCrouchFinish: false,
+        netVaulting: false,
+        netVaultProgress: 0,
         path: [],
         pathIndex: 0,
         repathTimer: Math.random() * 0.6,
         goalNodeId: null,
+        stuckTimer: 0,
+        lastProgressX: 0,
+        lastProgressZ: 0,
+        avoidDir: Math.random() < 0.5 ? -1 : 1,
+        unstuckBoostTimer: 0,
         targetId: null,
         hasLos: false,
         losTimer: Math.random() * 0.16,
@@ -403,6 +533,8 @@ export class BattleBotAI {
 
       this.bots.push(bot);
       this.spawnBot(bot, new THREE.Vector3(0, 0, 0), i);
+      bot.lastProgressX = bot.pos.x;
+      bot.lastProgressZ = bot.pos.z;
       bot.netPos.copy(bot.pos);
       bot.netYaw = bot.yaw;
     }
@@ -582,6 +714,62 @@ export class BattleBotAI {
     bot.hitMeshes = rig.hitMeshes;
   }
 
+  public setInfectionZones(unlockedZones: Iterable<string>, openedDoors: Iterable<string>): void {
+    this.unlockedZones.clear();
+    for (const z of unlockedZones) this.unlockedZones.add(z);
+    this.openedDoors.clear();
+    for (const d of openedDoors) this.openedDoors.add(d);
+    for (let i = 0; i < this.bots.length; i++) {
+      this.bots[i].repathTimer = 0;
+    }
+  }
+
+  public getAliveAllyTargets(): Array<{ id: string; pos: THREE.Vector3; alive: boolean }> {
+    const out: Array<{ id: string; pos: THREE.Vector3; alive: boolean }> = [];
+    for (let i = 0; i < this.bots.length; i++) {
+      const b = this.bots[i];
+      if (!b.alive) continue;
+      out.push({ id: b.id, pos: b.pos, alive: true });
+    }
+    return out;
+  }
+
+  public getAliveBotCount(): number {
+    let c = 0;
+    for (let i = 0; i < this.bots.length; i++) {
+      if (this.bots[i].alive) c++;
+    }
+    return c;
+  }
+
+  public getTotalBotCount(): number {
+    return this.bots.length;
+  }
+
+  public applyZombieDamageToBot(botId: string, damage: number): boolean {
+    const bot = this.bots.find((b) => b.id === botId);
+    if (!bot || !bot.alive) return false;
+    bot.hp -= damage;
+    bot.flinchTimer = 0.22;
+    if (bot.hp <= 0) {
+      this.killBot(bot, 'INFECTED', 'B', false, 'CLAWS');
+      bot.respawnTimer = this.coopInfectionMode ? 14.0 : 4.0;
+      return true;
+    }
+    return false;
+  }
+
+  public reviveAllDownedBots(anchorPos: Readonly<THREE.Vector3>): void {
+    for (let i = 0; i < this.bots.length; i++) {
+      const b = this.bots[i];
+      if (!b.alive) {
+        this.spawnBot(b, anchorPos, i);
+      } else {
+        b.hp = b.maxHp;
+      }
+    }
+  }
+
   public exportSyncSnapshot(): GameBotsSyncPacket {
     const bots: SyncedBotState[] = this.bots.map((b) => ({
       id: b.id,
@@ -599,6 +787,10 @@ export class BattleBotAI {
       kills: b.kills,
       deaths: b.deaths,
       firing: b.muzzleFlashTimer > 0 || b.burstShotsLeft > 0,
+      crouch: Number(b.crouchBlend.toFixed(2)),
+      lean: Number(b.leanBlend.toFixed(2)),
+      vaulting: b.vaultActive,
+      vaultProgress: b.vaultActive ? Number(b.vaultT.toFixed(2)) : 0,
     }));
     return {
       type: 'game:bots_sync',
@@ -620,7 +812,7 @@ export class BattleBotAI {
       if (!bot) continue;
 
       const resolvedUniform: OperatorUniformId =
-        sb.uniformId ?? resolveOperatorUniformId('battle', sb.team);
+        sb.uniformId ?? (this.coopInfectionMode ? 'infection' : resolveOperatorUniformId('battle', sb.team));
       if (bot.uniformId !== resolvedUniform) {
         bot.uniformId = resolvedUniform;
         bot.rig.applyUniform(resolvedUniform);
@@ -642,6 +834,10 @@ export class BattleBotAI {
       bot.deaths = sb.deaths;
       bot.netPos.set(sb.x, sb.y, sb.z);
       bot.netYaw = sb.yaw;
+      bot.netCrouch = typeof sb.crouch === 'number' ? sb.crouch : 0;
+      bot.netLean = typeof sb.lean === 'number' ? sb.lean : 0;
+      bot.netVaulting = Boolean(sb.vaulting);
+      bot.netVaultProgress = typeof sb.vaultProgress === 'number' ? sb.vaultProgress : 0.5;
       if (sb.firing) {
         bot.firingVisualTimer = Math.max(bot.firingVisualTimer, 0.14);
       }
@@ -658,6 +854,7 @@ export class BattleBotAI {
         bot.muzzleFlash.visible = false;
         bot.firingVisualTimer = 0;
         bot.recoilKick = 0;
+        bot.vaultActive = false;
         bot.rig.resetRagdollPose();
         bot.ragdoll.initializeFromStandingPose(bot.pos, bot.yaw, bot.vel);
         this._tmpDir.set(Math.sin(bot.yaw), 0.14, Math.cos(bot.yaw)).normalize();
@@ -713,7 +910,7 @@ export class BattleBotAI {
       return { hit: false, botId, botName: '', killed: false, headshot: false, friendlyIgnored: false };
     }
     const resolvedTeam: BattleTeamId = attackerTeam ?? (this.rule === 'tdm' ? 'A' : 'FFA');
-    if (this.rule === 'tdm' && bot.team === resolvedTeam) {
+    if (this.coopInfectionMode || (this.rule === 'tdm' && bot.team === resolvedTeam)) {
       return {
         hit: false,
         botId: bot.id,
@@ -1010,8 +1207,222 @@ export class BattleBotAI {
   }
 
   private isHostilePair(aTeam: BattleTeamId, bTeam: BattleTeamId): boolean {
+    if (this.coopInfectionMode) return false;
     if (this.rule === 'ffa') return true;
     return aTeam !== bTeam;
+  }
+
+  private isInfectionEdgeBlocked(aId: string, bId: string): boolean {
+    if (!this.coopInfectionMode) return false;
+    for (let i = 0; i < INFECTION_DOOR_GATED_EDGES.length; i++) {
+      const [u, v, doorId] = INFECTION_DOOR_GATED_EDGES[i];
+      if ((aId === u && bId === v) || (aId === v && bId === u)) {
+        if (!this.openedDoors.has(doorId)) return true;
+      }
+    }
+    return false;
+  }
+
+  private findBotPath(startId: string, goalId: string): NavNode[] {
+    const zones = this.coopInfectionMode ? this.unlockedZones : undefined;
+    const doors = this.coopInfectionMode ? this.openedDoors : undefined;
+    const raw = findNavPath(this.map.navGraph, startId, goalId, zones, doors);
+    if (!this.coopInfectionMode) return raw;
+    for (let i = 0; i < raw.length - 1; i++) {
+      if (this.isInfectionEdgeBlocked(raw[i].id, raw[i + 1].id)) {
+        return this.bfsDoorSafe(startId, goalId);
+      }
+    }
+    return raw;
+  }
+
+  private bfsDoorSafe(startId: string, goalId: string): NavNode[] {
+    const queue: string[] = [startId];
+    const visited = new Set<string>([startId]);
+    const parent = new Map<string, string>();
+    const byId = this.map.navGraph.byId;
+    while (queue.length > 0) {
+      const curId = queue.shift()!;
+      if (curId === goalId) {
+        const out: NavNode[] = [];
+        let p: string | undefined = curId;
+        while (p) {
+          const n = byId.get(p);
+          if (n) out.push(n);
+          p = parent.get(p);
+        }
+        out.reverse();
+        return out;
+      }
+      const cur = byId.get(curId);
+      if (!cur) continue;
+      for (const nbId of cur.neighbors) {
+        if (visited.has(nbId)) continue;
+        const nb = byId.get(nbId);
+        if (!nb) continue;
+        if (!this.unlockedZones.has(nb.zoneId)) continue;
+        if (nb.requiredDoorId && !this.openedDoors.has(nb.requiredDoorId)) continue;
+        if (this.isInfectionEdgeBlocked(curId, nbId)) continue;
+        visited.add(nbId);
+        parent.set(nbId, curId);
+        queue.push(nbId);
+      }
+    }
+    return [];
+  }
+
+  private isPointBlockedXZ(x: number, z: number, baseY: number, radius: number, minH = 0.36, maxH = 1.7): boolean {
+    if (
+      x < this.map.physics.boundsMinX + radius ||
+      x > this.map.physics.boundsMaxX - radius ||
+      z < this.map.physics.boundsMinZ + radius ||
+      z > this.map.physics.boundsMaxZ - radius
+    ) {
+      return true;
+    }
+    const rSq = radius * radius;
+    const pyMin = baseY + minH;
+    const pyMax = baseY + maxH;
+    const boxes = this.map.physics.boxes;
+    for (let i = 0; i < boxes.length; i++) {
+      const b = boxes[i];
+      if (b.blocksMovement === false) continue;
+      if (pyMax <= b.minY + 0.02 || pyMin >= b.maxY - 0.02) continue;
+      const qx = THREE.MathUtils.clamp(x, b.minX, b.maxX);
+      const qz = THREE.MathUtils.clamp(z, b.minZ, b.maxZ);
+      const dx = x - qx;
+      const dz = z - qz;
+      if (dx * dx + dz * dz < rSq) return true;
+    }
+    return false;
+  }
+
+  private isWalkSegmentClear(x0: number, z0: number, x1: number, z1: number, baseY: number, radius: number): boolean {
+    const dist = Math.hypot(x1 - x0, z1 - z0);
+    if (dist < 0.25) return true;
+    const steps = Math.min(12, Math.max(2, Math.ceil(dist / 0.65)));
+    for (let s = 1; s < steps; s++) {
+      const t = s / steps;
+      if (this.isPointBlockedXZ(x0 + (x1 - x0) * t, z0 + (z1 - z0) * t, baseY, radius)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private hasLowCoverNearby(x: number, baseY: number, z: number): boolean {
+    const boxes = this.map.physics.boxes;
+    const searchR = 1.45;
+    for (let i = 0; i < boxes.length; i++) {
+      const b = boxes[i];
+      if (b.blocksMovement === false) continue;
+      const h = b.maxY - baseY;
+      if (h < 0.55 || h > 1.38) continue;
+      const qx = THREE.MathUtils.clamp(x, b.minX, b.maxX);
+      const qz = THREE.MathUtils.clamp(z, b.minZ, b.maxZ);
+      const dx = x - qx;
+      const dz = z - qz;
+      if (dx * dx + dz * dz < searchR * searchR) return true;
+    }
+    return false;
+  }
+
+  private tryTriggerBotVault(bot: BotActor, moveDirX: number, moveDirZ: number): boolean {
+    if (!this.worldAdapter || bot.vaultActive || bot.vaultCooldown > 0) return false;
+    const moveYaw = Math.atan2(-moveDirX, -moveDirZ);
+    const ok = this.vaultDetector.detect(this.worldAdapter, bot.pos, moveYaw, true, this._vaultCandidate);
+    if (!ok || !this._vaultCandidate.valid) return false;
+
+    const cand = this._vaultCandidate;
+    // Keep bots strictly inside playable map bounds (never vault out through zombie perimeter windows)
+    if (
+      cand.landPos.x < this.map.physics.boundsMinX + 0.75 ||
+      cand.landPos.x > this.map.physics.boundsMaxX - 0.75 ||
+      cand.landPos.z < this.map.physics.boundsMinZ + 0.75 ||
+      cand.landPos.z > this.map.physics.boundsMaxZ - 0.75
+    ) {
+      return false;
+    }
+    if (this.coopInfectionMode) {
+      // Avoid vaulting across into locked zones
+      const destNode = findNearestNavNode(this.map.navGraph, cand.landPos, this.unlockedZones, this.openedDoors);
+      if (!destNode || Math.hypot(destNode.position[0] - cand.landPos.x, destNode.position[2] - cand.landPos.z) > 8.5) {
+        return false;
+      }
+    }
+
+    bot.vaultActive = true;
+    bot.vaultKind = cand.kind;
+    bot.vaultStartPos.copy(bot.pos);
+    bot.vaultApexPos.copy(cand.apexPos);
+    bot.vaultEndPos.copy(cand.landPos);
+    bot.vaultT = 0;
+    bot.vaultDuration =
+      cand.kind === 'HIGH_MANTLE' ? 0.92 : cand.kind === 'CLIMB_ONTO' ? 0.68 : 0.60;
+    bot.vaultCrouchFinish = cand.mustCrouchOnFinish;
+    bot.targetYaw = moveYaw;
+    bot.yaw = moveYaw;
+    bot.burstShotsLeft = 0;
+    this.audio.playImpact(bot.pos, cand.surface === 'metal' ? 'metal' : 'wood');
+    return true;
+  }
+
+  private evaluateTacticalPosture(bot: BotActor, targetPos: Readonly<THREE.Vector3> | null): void {
+    if (!bot.hasLos || !targetPos) {
+      bot.targetCrouch = bot.vaultCrouchFinish ? 0.85 : 0;
+      bot.targetLean = 0;
+      return;
+    }
+
+    const dx = targetPos.x - bot.pos.x;
+    const dz = targetPos.z - bot.pos.z;
+    const dist = Math.hypot(dx, dz);
+
+    // Right vector in XZ relative to bot facing (-sin(yaw), -cos(yaw))
+    const rightX = Math.cos(bot.yaw);
+    const rightZ = -Math.sin(bot.yaw);
+
+    // Probe left & right shoulders at chest height for nearby cover corners to lean around
+    const sideDist = 0.78;
+    const leftWall = this.isPointBlockedXZ(
+      bot.pos.x - rightX * sideDist,
+      bot.pos.z - rightZ * sideDist,
+      bot.pos.y,
+      0.26,
+      0.7,
+      1.65,
+    );
+    const rightWall = this.isPointBlockedXZ(
+      bot.pos.x + rightX * sideDist,
+      bot.pos.z + rightZ * sideDist,
+      bot.pos.y,
+      0.26,
+      0.7,
+      1.65,
+    );
+
+    if (leftWall && !rightWall) {
+      bot.targetLean = 0.88; // Wall on left -> lean right to peek around corner
+    } else if (rightWall && !leftWall) {
+      bot.targetLean = -0.88; // Wall on right -> lean left to peek around corner
+    } else if (dist > 6.5 && !this.coopInfectionMode) {
+      // Subtle tactical combat lean synced with strafe direction in gunfights
+      bot.targetLean = bot.strafeDir * 0.42;
+    } else {
+      bot.targetLean = 0;
+    }
+
+    // Crouch behind low cover or when engaging at mid/long range (never crouch when backpedaling from close zombies)
+    const nearLowCover = this.hasLowCoverNearby(bot.pos.x, bot.pos.y, bot.pos.z);
+    if (this.coopInfectionMode && dist < 7.0) {
+      bot.targetCrouch = 0;
+    } else if (nearLowCover && dist > 5.0) {
+      bot.targetCrouch = 0.82;
+    } else if (dist > 14.5 && !this.coopInfectionMode) {
+      bot.targetCrouch = 0.55;
+    } else {
+      bot.targetCrouch = 0;
+    }
   }
 
   public update(
@@ -1024,6 +1435,8 @@ export class BattleBotAI {
     onBotFire?: (botId: string, origin: Readonly<THREE.Vector3>, end: Readonly<THREE.Vector3>) => void,
     isLineBlockedBySmoke?: (a: Readonly<THREE.Vector3>, b: Readonly<THREE.Vector3>) => boolean,
     getActiveSmokeClouds?: () => readonly ActiveSmokeCloudInfo[],
+    zombieTargets?: ReadonlyArray<BattleZombieTarget>,
+    onHitZombie?: (ev: BotZombieHitEvent) => void,
   ): void {
     // Update pooled tracers
     for (let i = 0; i < this.tracers.length; i++) {
@@ -1064,12 +1477,8 @@ export class BattleBotAI {
           bot.muzzleFlashTimer -= dt;
           if (bot.muzzleFlashTimer <= 0) bot.muzzleFlash.visible = false;
         }
-        if (bot.flinchTimer > 0) {
-          bot.flinchTimer = Math.max(0, bot.flinchTimer - dt);
-        }
-        if (bot.firingVisualTimer > 0) {
-          bot.firingVisualTimer = Math.max(0, bot.firingVisualTimer - dt);
-        }
+        if (bot.flinchTimer > 0) bot.flinchTimer = Math.max(0, bot.flinchTimer - dt);
+        if (bot.firingVisualTimer > 0) bot.firingVisualTimer = Math.max(0, bot.firingVisualTimer - dt);
         bot.recoilKick = Math.max(0, bot.recoilKick - dt * 7.2);
 
         const prevX = bot.pos.x;
@@ -1082,6 +1491,9 @@ export class BattleBotAI {
         while (yawDelta < -Math.PI) yawDelta += Math.PI * 2;
         bot.yaw += yawDelta * rotAlpha;
 
+        bot.crouchBlend = THREE.MathUtils.damp(bot.crouchBlend, bot.netCrouch, 10, dt);
+        bot.leanBlend = THREE.MathUtils.damp(bot.leanBlend, bot.netLean, 10, dt);
+
         if (speedHoriz > 0.2) {
           bot.walkCycle += dt * speedHoriz * 2.55;
         }
@@ -1089,8 +1501,8 @@ export class BattleBotAI {
         const isAimingFire = bot.firingVisualTimer > 0;
         const flinchPitch = bot.flinchTimer > 0 ? Math.sin(bot.flinchTimer * 35) * 0.16 : 0;
         const pose = this._poseScratch;
-        pose.crouchBlend = 0;
-        pose.leanBlend = 0;
+        pose.crouchBlend = bot.crouchBlend;
+        pose.leanBlend = bot.leanBlend;
         pose.aimPitch = 0;
         pose.adsBlend = isAimingFire ? 0.72 : 0.12;
         pose.pointAimBlend = 0;
@@ -1102,6 +1514,9 @@ export class BattleBotAI {
         pose.recoilKick = bot.recoilKick;
         pose.firingVibration = isAimingFire ? Math.sin(performance.now() * 0.055) * 0.014 : 0;
         pose.flinchPitch = flinchPitch;
+        pose.vaultBlend = bot.netVaulting ? 1 : 0;
+        pose.vaultProgress = bot.netVaultProgress;
+        pose.vaultKind = 'VAULT_OVER';
 
         bot.bodyPivot.rotation.set(0, 0, 0);
         bot.bodyPivot.position.set(0, 0, 0);
@@ -1119,11 +1534,13 @@ export class BattleBotAI {
             {
               id: 'player',
               name: 'YOU',
-              team: this.rule === 'tdm' ? 'A' : 'FFA',
+              team: this.coopInfectionMode || this.rule === 'tdm' ? 'A' : 'FFA',
               pos: playerPos as THREE.Vector3,
               alive: playerAlive,
             },
           ];
+
+    const zombies = zombieTargets ?? [];
 
     for (let i = 0; i < this.bots.length; i++) {
       const bot = this.bots[i];
@@ -1152,31 +1569,77 @@ export class BattleBotAI {
         continue;
       }
 
-      // Muzzle flash timer
       if (bot.muzzleFlashTimer > 0) {
         bot.muzzleFlashTimer -= dt;
-        if (bot.muzzleFlashTimer <= 0) {
-          bot.muzzleFlash.visible = false;
-        }
+        if (bot.muzzleFlashTimer <= 0) bot.muzzleFlash.visible = false;
       }
-
-      if (bot.flinchTimer > 0) {
-        bot.flinchTimer = Math.max(0, bot.flinchTimer - dt);
-      }
-      if (bot.firingVisualTimer > 0) {
-        bot.firingVisualTimer = Math.max(0, bot.firingVisualTimer - dt);
-      }
+      if (bot.flinchTimer > 0) bot.flinchTimer = Math.max(0, bot.flinchTimer - dt);
+      if (bot.firingVisualTimer > 0) bot.firingVisualTimer = Math.max(0, bot.firingVisualTimer - dt);
+      if (bot.vaultCooldown > 0) bot.vaultCooldown = Math.max(0, bot.vaultCooldown - dt);
+      if (bot.vaultProbeTimer > 0) bot.vaultProbeTimer = Math.max(0, bot.vaultProbeTimer - dt);
+      if (bot.unstuckBoostTimer > 0) bot.unstuckBoostTimer = Math.max(0, bot.unstuckBoostTimer - dt);
       bot.recoilKick = Math.max(0, bot.recoilKick - dt * 7.2);
 
-      // 1. Target Acquisition & Throttled LoS check across ALL human operators & hostile bots
+      // === ACTIVE VAULT / CLIMB / HIGH-MANTLE EXECUTION ===
+      if (bot.vaultActive) {
+        bot.vaultT = Math.min(1, bot.vaultT + dt / Math.max(0.2, bot.vaultDuration));
+        const t = bot.vaultT;
+        if (t < 0.5) {
+          const u = t * 2;
+          const ease = u * u * (3 - 2 * u);
+          bot.pos.lerpVectors(bot.vaultStartPos, bot.vaultApexPos, ease);
+        } else {
+          const u = (t - 0.5) * 2;
+          const ease = u * u * (3 - 2 * u);
+          bot.pos.lerpVectors(bot.vaultApexPos, bot.vaultEndPos, ease);
+        }
+
+        const pose = this._poseScratch;
+        pose.crouchBlend = bot.vaultCrouchFinish ? t * 0.85 : 0;
+        pose.leanBlend = 0;
+        pose.aimPitch = 0;
+        pose.adsBlend = 0;
+        pose.pointAimBlend = 0;
+        pose.cantBlend = 0;
+        pose.reloadBlend = 0;
+        pose.speedMps = 2.6;
+        pose.walkCycle = bot.walkCycle;
+        pose.sprint = false;
+        pose.recoilKick = 0;
+        pose.firingVibration = 0;
+        pose.flinchPitch = 0;
+        pose.vaultBlend = Math.sin(t * Math.PI);
+        pose.vaultProgress = t;
+        pose.vaultKind = bot.vaultKind;
+
+        bot.bodyPivot.rotation.set(0, 0, 0);
+        bot.bodyPivot.position.set(0, 0, 0);
+        bot.rig.applyCombatPose(pose);
+        bot.root.position.copy(bot.pos);
+        bot.root.rotation.set(0, bot.yaw, 0);
+
+        if (bot.vaultT >= 1) {
+          bot.pos.copy(bot.vaultEndPos);
+          bot.vaultActive = false;
+          bot.vaultCooldown = 1.65;
+          bot.lastProgressX = bot.pos.x;
+          bot.lastProgressZ = bot.pos.z;
+          bot.stuckTimer = 0;
+          bot.repathTimer = 0.05;
+        }
+        continue;
+      }
+
+      // 1. Target Acquisition & Throttled LoS check
       bot.losTimer -= dt;
       let targetPos: THREE.Vector3 | null = null;
       let targetBot: BotActor | null = null;
       let targetHuman: BattleHumanTarget | null = null;
+      let targetZombie: BattleZombieTarget | null = null;
 
       if (bot.losTimer <= 0) {
         bot.losTimer = 0.14 + Math.random() * 0.06;
-        this._tmpOrigin.set(bot.pos.x, bot.pos.y + BOT_EYE_Y, bot.pos.z);
+        this._tmpOrigin.set(bot.pos.x, bot.pos.y + BOT_EYE_Y - bot.crouchBlend * 0.42, bot.pos.z);
 
         let bestId: string | null = null;
         let bestDist = this.diff.visionRangeM;
@@ -1185,46 +1648,66 @@ export class BattleBotAI {
         const activeSmokeClouds = getActiveSmokeClouds ? getActiveSmokeClouds() : [];
         let blockedBySmoke = false;
 
-        // Consider ALL living human players (Host + joined teammates/opponents)
-        for (let h = 0; h < humans.length; h++) {
-          const hm = humans[h];
-          if (!hm.alive || !this.isHostilePair(bot.team, hm.team)) continue;
-          this._tmpTarget.set(hm.pos.x, hm.pos.y + 1.42, hm.pos.z);
-          const d = this._tmpOrigin.distanceTo(this._tmpTarget);
-          if (d < bestDist) {
-            if (isLineBlockedBySmoke && isLineBlockedBySmoke(this._tmpOrigin, this._tmpTarget)) {
-              blockedBySmoke = true;
-              continue;
+        if (this.coopInfectionMode) {
+          // Friendly Infection squadmates strictly target zombies (never humans or teammates!)
+          for (let zIdx = 0; zIdx < zombies.length; zIdx++) {
+            const zt = zombies[zIdx];
+            this._tmpTarget.set(zt.pos.x, zt.pos.y + 1.24, zt.pos.z);
+            const d = this._tmpOrigin.distanceTo(this._tmpTarget);
+            // Slightly prioritize closer & interior zombies over hallway zombies
+            const effDist = d + (zt.enteringWindow ? 3.5 : 0);
+            if (effDist < bestDist) {
+              if (isLineBlockedBySmoke && isLineBlockedBySmoke(this._tmpOrigin, this._tmpTarget)) {
+                blockedBySmoke = true;
+                continue;
+              }
+              if (this.hasLineOfSight(this._tmpOrigin, this._tmpTarget)) {
+                bestDist = effDist;
+                bestId = `zombie:${zt.id}`;
+                bestLos = true;
+              }
             }
-            if (this.hasLineOfSight(this._tmpOrigin, this._tmpTarget)) {
-              bestDist = d;
-              bestId = `human:${hm.id}`;
-              bestLos = true;
+          }
+        } else {
+          // Battle Mode: Consider hostile humans & hostile bots
+          for (let h = 0; h < humans.length; h++) {
+            const hm = humans[h];
+            if (!hm.alive || !this.isHostilePair(bot.team, hm.team)) continue;
+            this._tmpTarget.set(hm.pos.x, hm.pos.y + 1.42, hm.pos.z);
+            const d = this._tmpOrigin.distanceTo(this._tmpTarget);
+            if (d < bestDist) {
+              if (isLineBlockedBySmoke && isLineBlockedBySmoke(this._tmpOrigin, this._tmpTarget)) {
+                blockedBySmoke = true;
+                continue;
+              }
+              if (this.hasLineOfSight(this._tmpOrigin, this._tmpTarget)) {
+                bestDist = d;
+                bestId = `human:${hm.id}`;
+                bestLos = true;
+              }
+            }
+          }
+
+          for (let j = 0; j < this.bots.length; j++) {
+            if (i === j) continue;
+            const other = this.bots[j];
+            if (!other.alive || !this.isHostilePair(bot.team, other.team)) continue;
+            this._tmpTarget.set(other.pos.x, other.pos.y + 1.32, other.pos.z);
+            const d = this._tmpOrigin.distanceTo(this._tmpTarget);
+            if (d < bestDist) {
+              if (isLineBlockedBySmoke && isLineBlockedBySmoke(this._tmpOrigin, this._tmpTarget)) {
+                blockedBySmoke = true;
+                continue;
+              }
+              if (this.hasLineOfSight(this._tmpOrigin, this._tmpTarget)) {
+                bestDist = d;
+                bestId = other.id;
+                bestLos = true;
+              }
             }
           }
         }
 
-        // Consider other hostile bots
-        for (let j = 0; j < this.bots.length; j++) {
-          if (i === j) continue;
-          const other = this.bots[j];
-          if (!other.alive || !this.isHostilePair(bot.team, other.team)) continue;
-          this._tmpTarget.set(other.pos.x, other.pos.y + 1.32, other.pos.z);
-          const d = this._tmpOrigin.distanceTo(this._tmpTarget);
-          if (d < bestDist) {
-            if (isLineBlockedBySmoke && isLineBlockedBySmoke(this._tmpOrigin, this._tmpTarget)) {
-              blockedBySmoke = true;
-              continue;
-            }
-            if (this.hasLineOfSight(this._tmpOrigin, this._tmpTarget)) {
-              bestDist = d;
-              bestId = other.id;
-              bestLos = true;
-            }
-          }
-        }
-
-        // Detect nearby screening smoke clouds so bots react tactically (flank / watch perimeter)
         if (activeSmokeClouds.length > 0) {
           let nearestCloud: ActiveSmokeCloudInfo | null = null;
           let nearestSq = 24 * 24;
@@ -1244,13 +1727,13 @@ export class BattleBotAI {
 
         if (bestLos && bestId) {
           if (bot.targetId !== bestId) {
-            bot.reactionTimer = this.diff.reactionSec;
+            bot.reactionTimer = this.diff.reactionSec * (this.coopInfectionMode ? 0.72 : 1.0);
           }
           bot.targetId = bestId;
           bot.hasLos = true;
         } else {
           bot.hasLos = false;
-          if (blockedBySmoke || Math.random() < 0.25) {
+          if (blockedBySmoke || this.coopInfectionMode || Math.random() < 0.25) {
             bot.targetId = null;
             bot.burstShotsLeft = 0;
           }
@@ -1258,7 +1741,17 @@ export class BattleBotAI {
       }
 
       // Resolve live target position
-      if (bot.targetId === 'player') {
+      if (bot.targetId && bot.targetId.startsWith('zombie:')) {
+        const zid = bot.targetId.slice(7);
+        const zt = zombies.find((item) => item.id === zid);
+        if (zt) {
+          targetZombie = zt;
+          targetPos = this._tmpTarget.set(zt.pos.x, zt.pos.y + 1.24, zt.pos.z);
+        } else {
+          bot.targetId = null;
+          bot.hasLos = false;
+        }
+      } else if (bot.targetId === 'player') {
         const hm = humans[0];
         if (hm && hm.alive && this.isHostilePair(bot.team, hm.team)) {
           targetHuman = hm;
@@ -1279,7 +1772,7 @@ export class BattleBotAI {
         }
       } else if (bot.targetId) {
         const other = this.bots.find((b) => b.id === bot.targetId && b.alive);
-        if (other) {
+        if (other && this.isHostilePair(bot.team, other.team)) {
           targetBot = other;
           targetPos = this._tmpTarget.set(other.pos.x, other.pos.y + 1.32, other.pos.z);
         } else {
@@ -1288,13 +1781,19 @@ export class BattleBotAI {
         }
       }
 
-      // 2. Navigation / Cover Movement
+      // Evaluate tactical crouching & corner leaning periodically
+      bot.postureEvalTimer -= dt;
+      if (bot.postureEvalTimer <= 0) {
+        bot.postureEvalTimer = 0.24 + Math.random() * 0.1;
+        this.evaluateTacticalPosture(bot, targetPos);
+      }
+
+      // 2. Navigation / Cover Movement / Squad Follow
       let moveX = 0;
       let moveZ = 0;
-      const moveSpeed = this.diff.moveSpeed;
+      const moveSpeed = this.diff.moveSpeed * (1 - bot.crouchBlend * 0.28);
 
       if (bot.hasLos && targetPos) {
-        // Face target + strafe/peek tactically
         const dx = targetPos.x - bot.pos.x;
         const dz = targetPos.z - bot.pos.z;
         const horizDist = Math.hypot(dx, dz);
@@ -1308,17 +1807,22 @@ export class BattleBotAI {
 
         const nx = horizDist > 0.01 ? dx / horizDist : 0;
         const nz = horizDist > 0.01 ? dz / horizDist : -1;
-        // Strafe perpendicular + maintain ideal engagement distance (8m–18m)
         const strafeX = -nz * bot.strafeDir;
         const strafeZ = nx * bot.strafeDir;
         let radial = 0;
-        if (horizDist > 18) radial = 0.55;
-        else if (horizDist < 6.5) radial = -0.6;
+        if (this.coopInfectionMode) {
+          // Keep safe distance from melee zombies (backpedal urgently when < 5.5m!)
+          if (horizDist < 5.5) radial = -0.95;
+          else if (horizDist > 16) radial = 0.35;
+        } else {
+          if (horizDist > 18) radial = 0.55;
+          else if (horizDist < 6.5) radial = -0.6;
+        }
 
-        moveX = (strafeX * 0.72 + nx * radial) * moveSpeed * 0.65;
-        moveZ = (strafeZ * 0.72 + nz * radial) * moveSpeed * 0.65;
+        moveX = (strafeX * 0.72 + nx * radial) * moveSpeed * 0.68;
+        moveZ = (strafeZ * 0.72 + nz * radial) * moveSpeed * 0.68;
 
-        // 3. Burst-Fire Engagement (suppressed while flashbang-stunned)
+        // 3. Burst-Fire Engagement
         if (bot.stunTimer > 0) {
           bot.stunTimer = Math.max(0, bot.stunTimer - dt);
           bot.burstShotsLeft = 0;
@@ -1343,10 +1847,18 @@ export class BattleBotAI {
               bot.fireTimer = this.diff.fireIntervalSec;
               bot.burstShotsLeft -= 1;
               if (bot.burstShotsLeft <= 0) {
-                bot.burstCooldown = this.diff.burstPauseSec * (0.8 + Math.random() * 0.45);
+                bot.burstCooldown = this.diff.burstPauseSec * (0.75 + Math.random() * 0.45);
               }
-
-              this.fireBotRound(bot, targetPos, targetBot, targetHuman, onDamagePlayer, onBotFire);
+              this.fireBotRound(
+                bot,
+                targetPos,
+                targetBot,
+                targetHuman,
+                targetZombie,
+                onDamagePlayer,
+                onBotFire,
+                onHitZombie,
+              );
             }
           }
         }
@@ -1356,7 +1868,6 @@ export class BattleBotAI {
         }
         if (bot.smokeAlertTimer > 0) {
           bot.smokeAlertTimer = Math.max(0, bot.smokeAlertTimer - dt);
-          // Tactical smoke reaction: circle/flank laterally around smoke plume while watching edge
           const dx = bot.smokeCloudPos.x - bot.pos.x;
           const dz = bot.smokeCloudPos.z - bot.pos.z;
           const dist = Math.max(0.5, Math.hypot(dx, dz));
@@ -1364,50 +1875,106 @@ export class BattleBotAI {
           const nz = dz / dist;
           const flankX = -nz * bot.smokeFlankDir;
           const flankZ = nx * bot.smokeFlankDir;
-          // Back out if standing inside dense smoke; otherwise orbit perimeter at ~9-12m
           const radial = dist < 5.2 ? -0.85 : dist > 13.5 ? 0.35 : 0.0;
           moveX = (flankX * 0.82 + nx * radial) * moveSpeed * 0.78;
           moveZ = (flankZ * 0.82 + nz * radial) * moveSpeed * 0.78;
           bot.targetYaw = Math.atan2(-dx, -dz);
         } else {
-          // Patrol / Advance across NavGraph toward cover or hostile sector
+          // Patrol / Advance across NavGraph with door-safe A* and string-pulling
+          const zones = this.coopInfectionMode ? this.unlockedZones : undefined;
+          const doors = this.coopInfectionMode ? this.openedDoors : undefined;
+
           bot.repathTimer -= dt;
           if (bot.repathTimer <= 0 || bot.pathIndex >= bot.path.length) {
-            bot.repathTimer = 1.6 + Math.random() * 1.2;
-            const startNode = findNearestNavNode(this.map.navGraph, bot.pos);
+            bot.repathTimer = 1.2 + Math.random() * 0.9;
+            const startNode = findNearestNavNode(this.map.navGraph, bot.pos, zones, doors);
             if (startNode) {
-              const nodes = this.map.navGraph.nodes;
               let goalNode: NavNode | null = null;
 
-              // 55% chance pursue nearest hostile area, 45% pick tactical cover node
-              if (Math.random() < 0.55) {
-                const hostileHumans = humans.filter(
-                  (hm) => hm.alive && this.isHostilePair(bot.team, hm.team),
-                );
-                if (hostileHumans.length > 0 && Math.random() < 0.65) {
-                  const chosenH = hostileHumans[Math.floor(Math.random() * hostileHumans.length)];
-                  goalNode = findNearestNavNode(this.map.navGraph, chosenH.pos);
-                } else {
-                  const hostiles = this.bots.filter(
-                    (o) => o.alive && o.id !== bot.id && this.isHostilePair(bot.team, o.team),
-                  );
-                  if (hostiles.length > 0) {
-                    const chosen = hostiles[Math.floor(Math.random() * hostiles.length)];
-                    goalNode = findNearestNavNode(this.map.navGraph, chosen.pos);
+              if (this.coopInfectionMode) {
+                // Friendly Infection bots support living human players & patrol unlocked sectors
+                const aliveHumans = humans.filter((hm) => hm.alive);
+                const anchor = aliveHumans.length > 0 ? aliveHumans[i % aliveHumans.length] : null;
+                const distToAnchor = anchor
+                  ? Math.hypot(anchor.pos.x - bot.pos.x, anchor.pos.z - bot.pos.z)
+                  : 0;
+
+                if (anchor && distToAnchor > 7.5) {
+                  // Follow human squadmate through unlocked rooms
+                  goalNode = findNearestNavNode(this.map.navGraph, anchor.pos, zones, doors);
+                } else if (zombies.length > 0 && Math.random() < 0.6) {
+                  // Move toward nearest active interior zombie's sector
+                  const nearestZ = zombies.find((z) => !z.enteringWindow) ?? zombies[0];
+                  if (nearestZ) {
+                    goalNode = findNearestNavNode(this.map.navGraph, nearestZ.pos, zones, doors);
                   }
                 }
-              }
-              if (!goalNode || goalNode.id === startNode.id) {
-                const coverNodes = nodes.filter((n) => n.isCover && n.id !== startNode.id);
-                const pool = coverNodes.length > 0 && Math.random() < 0.7 ? coverNodes : nodes;
-                goalNode = pool[Math.floor(Math.random() * pool.length)];
+                if (!goalNode || goalNode.id === startNode.id) {
+                  const unlockedNodes = this.map.navGraph.nodes.filter(
+                    (n) =>
+                      this.unlockedZones.has(n.zoneId) &&
+                      (!n.requiredDoorId || this.openedDoors.has(n.requiredDoorId)) &&
+                      n.id !== startNode.id,
+                  );
+                  if (unlockedNodes.length > 0) {
+                    goalNode = unlockedNodes[Math.floor(Math.random() * unlockedNodes.length)];
+                  }
+                }
+              } else {
+                const nodes = this.map.navGraph.nodes;
+                if (Math.random() < 0.58) {
+                  const hostileHumans = humans.filter(
+                    (hm) => hm.alive && this.isHostilePair(bot.team, hm.team),
+                  );
+                  if (hostileHumans.length > 0 && Math.random() < 0.65) {
+                    const chosenH = hostileHumans[Math.floor(Math.random() * hostileHumans.length)];
+                    goalNode = findNearestNavNode(this.map.navGraph, chosenH.pos);
+                  } else {
+                    const hostiles = this.bots.filter(
+                      (o) => o.alive && o.id !== bot.id && this.isHostilePair(bot.team, o.team),
+                    );
+                    if (hostiles.length > 0) {
+                      const chosen = hostiles[Math.floor(Math.random() * hostiles.length)];
+                      goalNode = findNearestNavNode(this.map.navGraph, chosen.pos);
+                    }
+                  }
+                }
+                if (!goalNode || goalNode.id === startNode.id) {
+                  const coverNodes = nodes.filter((n) => n.isCover && n.id !== startNode.id);
+                  const pool = coverNodes.length > 0 && Math.random() < 0.7 ? coverNodes : nodes;
+                  goalNode = pool[Math.floor(Math.random() * pool.length)];
+                }
               }
 
               if (goalNode && goalNode.id !== startNode.id) {
-                bot.path = findNavPath(this.map.navGraph, startNode.id, goalNode.id);
+                bot.path = this.findBotPath(startNode.id, goalNode.id);
                 bot.pathIndex = bot.path.length > 1 ? 1 : 0;
                 bot.goalNodeId = goalNode.id;
               }
+            }
+          }
+
+          // String-pulling: skip redundant waypoint when clear walkable corridor exists on same level
+          while (bot.pathIndex + 1 < bot.path.length) {
+            const curWp = bot.path[bot.pathIndex];
+            const nextWp = bot.path[bot.pathIndex + 1];
+            const dyCur = Math.abs(curWp.position[1] - bot.pos.y);
+            const dyNext = Math.abs(nextWp.position[1] - bot.pos.y);
+            if (
+              dyCur < 0.85 &&
+              dyNext < 0.85 &&
+              this.isWalkSegmentClear(
+                bot.pos.x,
+                bot.pos.z,
+                nextWp.position[0],
+                nextWp.position[2],
+                bot.pos.y,
+                BOT_RADIUS * 0.95,
+              )
+            ) {
+              bot.pathIndex++;
+            } else {
+              break;
             }
           }
 
@@ -1416,12 +1983,71 @@ export class BattleBotAI {
             const dx = wp.position[0] - bot.pos.x;
             const dz = wp.position[2] - bot.pos.z;
             const dist = Math.hypot(dx, dz);
-            if (dist < 0.95) {
+            if (dist < 0.92) {
               bot.pathIndex++;
             } else {
-              moveX = (dx / dist) * moveSpeed;
-              moveZ = (dz / dist) * moveSpeed;
-              bot.targetYaw = Math.atan2(-dx, -dz);
+              let dirX = dx / dist;
+              let dirZ = dz / dist;
+
+              // Check obstacle ahead -> try tactical vault/climb first, otherwise whisker-steer around!
+              const probeDist = 0.92;
+              const fwdBlocked = this.isPointBlockedXZ(
+                bot.pos.x + dirX * probeDist,
+                bot.pos.z + dirZ * probeDist,
+                bot.pos.y,
+                BOT_RADIUS * 0.9,
+              );
+
+              if (fwdBlocked && bot.vaultProbeTimer <= 0) {
+                bot.vaultProbeTimer = 0.24;
+                if (this.tryTriggerBotVault(bot, dirX, dirZ)) {
+                  continue;
+                }
+              }
+
+              if (fwdBlocked || bot.unstuckBoostTimer > 0) {
+                const cosA = 0.78;
+                const sinA = 0.62;
+                const leftX = dirX * cosA - dirZ * sinA;
+                const leftZ = dirX * sinA + dirZ * cosA;
+                const rightX = dirX * cosA + dirZ * sinA;
+                const rightZ = -dirX * sinA + dirZ * cosA;
+
+                const leftClear = !this.isPointBlockedXZ(
+                  bot.pos.x + leftX * probeDist,
+                  bot.pos.z + leftZ * probeDist,
+                  bot.pos.y,
+                  BOT_RADIUS * 0.88,
+                );
+                const rightClear = !this.isPointBlockedXZ(
+                  bot.pos.x + rightX * probeDist,
+                  bot.pos.z + rightZ * probeDist,
+                  bot.pos.y,
+                  BOT_RADIUS * 0.88,
+                );
+
+                if (leftClear && !rightClear) {
+                  dirX = leftX;
+                  dirZ = leftZ;
+                  bot.avoidDir = 1;
+                } else if (rightClear && !leftClear) {
+                  dirX = rightX;
+                  dirZ = rightZ;
+                  bot.avoidDir = -1;
+                } else {
+                  const perpX = -dirZ * bot.avoidDir;
+                  const perpZ = dirX * bot.avoidDir;
+                  dirX = dirX * 0.35 + perpX * 0.65;
+                  dirZ = dirZ * 0.35 + perpZ * 0.65;
+                  const nl = Math.hypot(dirX, dirZ) || 1;
+                  dirX /= nl;
+                  dirZ /= nl;
+                }
+              }
+
+              moveX = dirX * moveSpeed;
+              moveZ = dirZ * moveSpeed;
+              bot.targetYaw = Math.atan2(-dirX, -dirZ);
             }
           }
         }
@@ -1435,15 +2061,32 @@ export class BattleBotAI {
         const sx = bot.pos.x - other.pos.x;
         const sz = bot.pos.z - other.pos.z;
         const dSq = sx * sx + sz * sz;
-        if (dSq > 1e-4 && dSq < 1.1) {
+        if (dSq > 1e-4 && dSq < 1.15) {
           const d = Math.sqrt(dSq);
-          const push = (1.05 - d) * 3.0;
+          const push = (1.08 - d) * 3.0;
           moveX += (sx / d) * push;
           moveZ += (sz / d) * push;
         }
       }
 
-      // Integrate horizontal motion with simple AABB collision push-out + ground snapping
+      // Also keep friendly Infection bots from standing directly inside a human player
+      if (this.coopInfectionMode) {
+        for (let h = 0; h < humans.length; h++) {
+          const hm = humans[h];
+          if (!hm.alive) continue;
+          const sx = bot.pos.x - hm.pos.x;
+          const sz = bot.pos.z - hm.pos.z;
+          const dSq = sx * sx + sz * sz;
+          if (dSq > 1e-4 && dSq < 1.44) {
+            const d = Math.sqrt(dSq);
+            const push = (1.2 - d) * 3.2;
+            moveX += (sx / d) * push;
+            moveZ += (sz / d) * push;
+          }
+        }
+      }
+
+      // Integrate horizontal motion with AABB collision push-out + ground snapping
       const nextX = THREE.MathUtils.clamp(
         bot.pos.x + moveX * dt,
         this.map.physics.boundsMinX + 0.6,
@@ -1461,13 +2104,39 @@ export class BattleBotAI {
       const targetGroundY = this.sampleGroundY(bot.pos.x, bot.pos.z, bot.pos.y);
       bot.pos.y = THREE.MathUtils.damp(bot.pos.y, targetGroundY, 14, dt);
 
-      // Smooth yaw turn
+      // Stuck detection -> attempt vault/climb or recover via lateral sidestep & repath
+      const desiredSpeed = Math.hypot(moveX, moveZ);
+      if (desiredSpeed > 0.6) {
+        bot.stuckTimer += dt;
+        if (bot.stuckTimer >= 0.52) {
+          const moved = Math.hypot(bot.pos.x - bot.lastProgressX, bot.pos.z - bot.lastProgressZ);
+          bot.lastProgressX = bot.pos.x;
+          bot.lastProgressZ = bot.pos.z;
+          bot.stuckTimer = 0;
+          if (moved < 0.16) {
+            const vaulted = this.tryTriggerBotVault(bot, moveX / desiredSpeed, moveZ / desiredSpeed);
+            if (!vaulted) {
+              bot.avoidDir = -bot.avoidDir;
+              bot.unstuckBoostTimer = 0.55;
+              bot.repathTimer = 0;
+            }
+          }
+        }
+      } else {
+        bot.stuckTimer = 0;
+        bot.lastProgressX = bot.pos.x;
+        bot.lastProgressZ = bot.pos.z;
+      }
+
+      // Smooth yaw turn & tactical posture damping
       let yawDelta = bot.targetYaw - bot.yaw;
       while (yawDelta > Math.PI) yawDelta -= Math.PI * 2;
       while (yawDelta < -Math.PI) yawDelta += Math.PI * 2;
       bot.yaw += yawDelta * Math.min(1, dt * 10);
 
-      // Articulated stride, local weaponSocket shoulder mount, and 2-bone arm IK
+      bot.crouchBlend = THREE.MathUtils.damp(bot.crouchBlend, bot.targetCrouch, 9, dt);
+      bot.leanBlend = THREE.MathUtils.damp(bot.leanBlend, bot.targetLean, 10, dt);
+
       const speedHoriz = Math.hypot(moveX, moveZ);
       if (speedHoriz > 0.2) {
         bot.walkCycle += dt * speedHoriz * 2.55;
@@ -1483,12 +2152,16 @@ export class BattleBotAI {
       let aimPitch = 0;
       if (bot.hasLos && targetPos) {
         const horizDist = Math.max(0.5, Math.hypot(targetPos.x - bot.pos.x, targetPos.z - bot.pos.z));
-        aimPitch = THREE.MathUtils.clamp(Math.atan2(targetPos.y - (bot.pos.y + 1.36), horizDist), -0.75, 0.75);
+        aimPitch = THREE.MathUtils.clamp(
+          Math.atan2(targetPos.y - (bot.pos.y + 1.36 - bot.crouchBlend * 0.42), horizDist),
+          -0.75,
+          0.75,
+        );
       }
 
       const pose = this._poseScratch;
-      pose.crouchBlend = 0;
-      pose.leanBlend = 0;
+      pose.crouchBlend = bot.crouchBlend;
+      pose.leanBlend = bot.leanBlend;
       pose.aimPitch = aimPitch;
       pose.adsBlend = isAimingFire ? 0.76 : 0.12;
       pose.pointAimBlend = 0;
@@ -1496,10 +2169,13 @@ export class BattleBotAI {
       pose.reloadBlend = 0;
       pose.speedMps = speedHoriz;
       pose.walkCycle = bot.walkCycle;
-      pose.sprint = !bot.hasLos && speedHoriz > 3.2;
+      pose.sprint = !bot.hasLos && bot.crouchBlend < 0.25 && speedHoriz > 3.1;
       pose.recoilKick = bot.recoilKick;
       pose.firingVibration = bot.firingVisualTimer > 0 ? Math.sin(performance.now() * 0.055) * 0.014 : 0;
       pose.flinchPitch = flinchPitch;
+      pose.vaultBlend = 0;
+      pose.vaultProgress = 0;
+      pose.vaultKind = 'VAULT_OVER';
 
       bot.bodyPivot.rotation.set(0, 0, 0);
       bot.bodyPivot.position.set(0, 0, 0);
@@ -1514,11 +2190,11 @@ export class BattleBotAI {
     let cz = z;
     const r = BOT_RADIUS;
     const rSq = r * r;
-    const pyMin = baseY + 0.36; // allow stepping up stairs & ramps cleanly
+    const pyMin = baseY + 0.36;
     const pyMax = baseY + 1.72;
 
     const boxes = this.map.physics.boxes;
-    for (let pass = 0; pass < 2; pass++) {
+    for (let pass = 0; pass < 3; pass++) {
       for (let i = 0; i < boxes.length; i++) {
         const b = boxes[i];
         if (b.blocksMovement === false) continue;
@@ -1536,7 +2212,15 @@ export class BattleBotAI {
             cx += (dx / d) * pen;
             cz += (dz / d) * pen;
           } else {
-            cx += r;
+            const dl = Math.abs(cx - b.minX);
+            const dr = Math.abs(b.maxX - cx);
+            const df = Math.abs(cz - b.minZ);
+            const db = Math.abs(b.maxZ - cz);
+            const m = Math.min(dl, dr, df, db);
+            if (m === dl) cx = b.minX - r;
+            else if (m === dr) cx = b.maxX + r;
+            else if (m === df) cz = b.minZ - r;
+            else cz = b.maxZ + r;
           }
         }
       }
@@ -1549,22 +2233,22 @@ export class BattleBotAI {
     targetPos: Readonly<THREE.Vector3>,
     targetBot: BotActor | null,
     targetHuman: BattleHumanTarget | null,
+    targetZombie: BattleZombieTarget | null,
     onDamagePlayer: (ev: BotPlayerDamageEvent) => void,
     onBotFire?: (botId: string, origin: Readonly<THREE.Vector3>, end: Readonly<THREE.Vector3>) => void,
+    onHitZombie?: (ev: BotZombieHitEvent) => void,
   ): void {
-    // Muzzle position in world space
     shooter.muzzleFlash.visible = true;
     shooter.muzzleFlashTimer = 0.055;
     shooter.firingVisualTimer = 0.16;
     shooter.recoilKick = Math.min(1, shooter.recoilKick + 0.85);
     shooter.muzzleFlash.getWorldPosition(this._tmpMuzzle);
 
-    // Compute aimed direction with difficulty spread
     this._tmpDir.subVectors(targetPos, this._tmpMuzzle);
     const dist = Math.max(0.5, this._tmpDir.length());
     this._tmpDir.divideScalar(dist);
 
-    const spread = this.diff.spreadRad;
+    const spread = this.diff.spreadRad * (1 - shooter.crouchBlend * 0.18);
     this._tmpDir.x += (Math.random() - 0.5) * spread * 2;
     this._tmpDir.y += (Math.random() - 0.5) * spread * 1.5;
     this._tmpDir.z += (Math.random() - 0.5) * spread * 2;
@@ -1574,7 +2258,6 @@ export class BattleBotAI {
     this.spawnTracer(this._tmpMuzzle, endPos);
     onBotFire?.(shooter.id, this._tmpMuzzle, endPos);
 
-    // Spatialized gunshot audio
     this.audio.playWeaponCue('fire', {
       position: this._tmpMuzzle,
       weightClass: 'carbine',
@@ -1583,21 +2266,31 @@ export class BattleBotAI {
       intensity: 0.72,
     });
 
-    // Accuracy hit roll scaled by distance & angular error
-    const toTarget = new THREE.Vector3().subVectors(targetPos, this._tmpMuzzle).normalize();
-    const cosErr = THREE.MathUtils.clamp(toTarget.dot(this._tmpDir), -1, 1);
+    this._tmpToTarget.subVectors(targetPos, this._tmpMuzzle).normalize();
+    const cosErr = THREE.MathUtils.clamp(this._tmpToTarget.dot(this._tmpDir), -1, 1);
     const angErr = Math.acos(cosErr);
-    const hitAngleLimit = Math.atan2(0.46, Math.max(2.5, dist));
+    const hitAngleLimit = Math.atan2(targetZombie ? 0.56 : 0.46, Math.max(2.5, dist));
 
     if (angErr <= hitAngleLimit) {
-      if (targetBot) {
+      if (targetZombie && onHitZombie) {
+        const hs = Math.random() < 0.24;
+        onHitZombie({
+          zombieId: targetZombie.id,
+          damage: this.diff.damagePerShot * 1.9,
+          hitZone: hs ? 'head' : 'thorax',
+          impactPoint: targetPos.clone(),
+          impactDir: this._tmpDir.clone(),
+          shooterId: shooter.id,
+          shooterName: shooter.name,
+        });
+      } else if (targetBot) {
         const hs = Math.random() < 0.16;
         targetBot.hp -= this.diff.damagePerShot * (hs ? 2.0 : 1.0);
         targetBot.flinchTimer = 0.14;
         if (targetBot.hp <= 0) {
           this.killBot(targetBot, shooter.name, shooter.team, hs, shooter.weaponLabel, shooter);
         }
-      } else if (targetHuman) {
+      } else if (targetHuman && !this.coopInfectionMode) {
         onDamagePlayer({
           targetUserId: targetHuman.id,
           damage: this.diff.damagePerShot,

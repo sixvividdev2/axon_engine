@@ -4,6 +4,7 @@ import {
   BuiltMapInstance,
   findNavPath,
   findNearestNavNode,
+  MapWindowBarrier,
   NavNode,
   ZombieSpawnerDef,
 } from '../maps/types';
@@ -34,6 +35,15 @@ export interface InfectionHumanTarget {
   alive: boolean;
 }
 
+export interface ZombieTargetDescriptor {
+  id: string;
+  pos: THREE.Vector3;
+  enteringWindow: boolean;
+  entryStage: ZombieEntryStage;
+}
+
+export type ZombieEntryStage = 'approach' | 'tear' | 'vault' | 'pursue';
+
 export interface InfectionZombieTuningOptions {
   zombieHealthMult?: number;
   zombieMoveSpeedMult?: number;
@@ -60,16 +70,30 @@ interface ZombieActor {
   hasNetState: boolean;
   netWindup: boolean;
   netStagger: boolean;
+  netEntryStage: ZombieEntryStage;
 
-  // Spawner climb-in phase before entering navGraph
+  // Spawner hallway -> tear planks -> vault sill state machine
   enteringWindow: boolean;
+  entryStage: ZombieEntryStage;
   spawnerId: string | null;
+  windowOuterPos: THREE.Vector3;
+  sillPos: THREE.Vector3;
   entryPos: THREE.Vector3;
+  vaultStartPos: THREE.Vector3;
+  vaultT: number;
+  tearTimer: number;
+  tearAnimPhase: number;
+  hallwayLateralOffset: number;
 
-  // Navigation
+  // Navigation & stuck recovery
   path: NavNode[];
   pathIndex: number;
   repathTimer: number;
+  stuckTimer: number;
+  lastProgressX: number;
+  lastProgressZ: number;
+  avoidDir: number;
+  unstuckBoostTimer: number;
 
   // Melee attack
   windupTimer: number;
@@ -101,12 +125,14 @@ const ZOMBIE_ATTACK_RANGE = 1.85;
 const ZOMBIE_ATTACK_WINDUP = 0.36;
 const ZOMBIE_ATTACK_DAMAGE = 28;
 const ZOMBIE_ATTACK_COOLDOWN = 0.96;
+const ZOMBIE_PLANK_TEAR_SEC = 1.15;
+const ZOMBIE_WINDOW_VAULT_SEC = 0.92;
 
 // Explicit doorway edges in Der Lichtspielhaus gated by individual doors (even if auditorium is unlocked from opposite wing)
 const DOOR_GATED_EDGES: ReadonlyArray<[string, string, string]> = [
-  ['ww_n', 'aud_pit_w', 'door_west_auditorium'],
-  ['ew_n', 'aud_pit_e', 'door_east_auditorium'],
-  ['lob_w_up', 'proj_ramp', 'door_projector'],
+  ['ww_door_aud', 'aud_pit_w', 'door_west_auditorium'],
+  ['ew_door_aud', 'aud_pit_e', 'door_east_auditorium'],
+  ['aud_back_w', 'proj_ramp', 'door_projector'],
 ];
 
 /**
@@ -147,6 +173,9 @@ export class InfectionZombieAI {
   // Zone & door unlock state
   private readonly unlockedZones = new Set<string>(['lobby', 'default']);
   private readonly openedDoors = new Set<string>();
+  private readonly barriersBySpawnerId = new Map<string, MapWindowBarrier>();
+  private readonly barriersById = new Map<string, MapWindowBarrier>();
+  private readonly targetScratch: ZombieTargetDescriptor[] = [];
 
   // Pooled blood-burst particles (InstancedMesh = 1 draw call)
   private readonly bloodParticles: BloodBurstParticle[] = [];
@@ -156,6 +185,8 @@ export class InfectionZombieAI {
   private readonly _quat = new THREE.Quaternion();
   private readonly _scale = new THREE.Vector3();
   private readonly _zeroScale = new THREE.Vector3(0, 0, 0);
+  private readonly _hidePos = new THREE.Vector3(0, -50, 0);
+  private readonly _tmpAudioPos = new THREE.Vector3();
 
   // Shared zombie geometries/materials
   private readonly geoLeg: THREE.BoxGeometry;
@@ -183,6 +214,13 @@ export class InfectionZombieAI {
     this.zombieSpawnAmountMult = Math.max(0.25, Math.min(3.0, tuning?.zombieSpawnAmountMult ?? 1.0));
     this.waveBreakIntervalSec = Math.max(2, Math.min(30, tuning?.waveBreakIntervalSec ?? 4.5));
     this.isClientReplica = Boolean(tuning?.isClientReplica);
+
+    if (map.windowBarriers) {
+      for (const b of map.windowBarriers) {
+        this.barriersBySpawnerId.set(b.spawnerId, b);
+        this.barriersById.set(b.id, b);
+      }
+    }
 
     scene.add(this.group);
 
@@ -242,6 +280,43 @@ export class InfectionZombieAI {
 
   public getHitMeshes(): THREE.Object3D[] {
     return this.activeHitMeshes;
+  }
+
+  public getAliveZombieTargets(): ZombieTargetDescriptor[] {
+    this.targetScratch.length = 0;
+    for (let i = 0; i < this.zombies.length; i++) {
+      const z = this.zombies[i];
+      if (!z.alive) continue;
+      this.targetScratch.push({
+        id: z.id,
+        pos: z.pos,
+        enteringWindow: z.enteringWindow,
+        entryStage: z.entryStage,
+      });
+    }
+    return this.targetScratch;
+  }
+
+  public getBarrierById(barrierId: string): MapWindowBarrier | undefined {
+    return this.barriersById.get(barrierId);
+  }
+
+  public getBarrierCounts(): Record<string, number> {
+    const out: Record<string, number> = {};
+    for (const [id, b] of this.barriersById) {
+      out[id] = b.getPlanksRemaining();
+    }
+    return out;
+  }
+
+  public applyBarrierCounts(counts?: Record<string, number>): void {
+    if (!counts) return;
+    for (const [id, count] of Object.entries(counts)) {
+      const b = this.barriersById.get(id);
+      if (b && b.getPlanksRemaining() !== count) {
+        b.setPlankCount(count);
+      }
+    }
   }
 
   private rebuildActiveHitMeshes(): void {
@@ -357,6 +432,7 @@ export class InfectionZombieAI {
         windup: z.windupTimer > 0,
         stagger: z.staggerTimer > 0,
         enteringWindow: z.enteringWindow,
+        entryStage: z.entryStage,
         spawnerId: z.spawnerId,
         entryPos: z.enteringWindow
           ? [
@@ -379,6 +455,7 @@ export class InfectionZombieAI {
       powerOn,
       openedDoorIds: Array.from(this.openedDoors),
       unlockedZoneIds: Array.from(this.unlockedZones),
+      barriers: this.getBarrierCounts(),
       zombies,
       ts: Date.now(),
     };
@@ -450,6 +527,9 @@ export class InfectionZombieAI {
         this.unlockedZones.add(zid);
       }
     }
+    if (pkt.barriers) {
+      this.applyBarrierCounts(pkt.barriers);
+    }
 
     const seenIds = new Set<string>();
     let hitMeshesDirty = false;
@@ -484,6 +564,8 @@ export class InfectionZombieAI {
       z.netWindup = sz.windup;
       z.netStagger = sz.stagger;
       z.enteringWindow = Boolean(sz.enteringWindow);
+      z.netEntryStage = sz.entryStage ?? (sz.enteringWindow ? 'approach' : 'pursue');
+      z.entryStage = z.netEntryStage;
       if (sz.spawnerId) z.spawnerId = sz.spawnerId;
       if (sz.entryPos) {
         z.entryPos.set(sz.entryPos[0], sz.entryPos[1], sz.entryPos[2]);
@@ -642,6 +724,23 @@ export class InfectionZombieAI {
     bodyPivot.add(leftLeg, rightLeg, torso, stain, head, eyeL, eyeR, leftArm, rightArm);
     this.group.add(root);
 
+    const spawnerDef = spawnerId
+      ? this.map.spawnPoints.zombieSpawners.find((s) => s.id === spawnerId)
+      : undefined;
+    const outerVec = spawnerDef?.windowOuterPos
+      ? new THREE.Vector3(spawnerDef.windowOuterPos[0], spawnerDef.windowOuterPos[1], spawnerDef.windowOuterPos[2])
+      : new THREE.Vector3(sx, sy, sz);
+    const entryVec = entryPos
+      ? new THREE.Vector3(entryPos[0], entryPos[1], entryPos[2])
+      : new THREE.Vector3(sx, sy, sz);
+    const sillVec = spawnerDef?.sillPos
+      ? new THREE.Vector3(spawnerDef.sillPos[0], spawnerDef.sillPos[1], spawnerDef.sillPos[2])
+      : new THREE.Vector3(
+          (outerVec.x + entryVec.x) * 0.5,
+          sy + 0.94,
+          (outerVec.z + entryVec.z) * 0.5,
+        );
+
     const z: ZombieActor = {
       id,
       alive: true,
@@ -659,14 +758,26 @@ export class InfectionZombieAI {
       hasNetState: false,
       netWindup: false,
       netStagger: false,
+      netEntryStage: enteringWindow ? 'approach' : 'pursue',
       enteringWindow,
+      entryStage: enteringWindow ? 'approach' : 'pursue',
       spawnerId,
-      entryPos: entryPos
-        ? new THREE.Vector3(entryPos[0], entryPos[1], entryPos[2])
-        : new THREE.Vector3(sx, sy, sz),
+      windowOuterPos: outerVec,
+      sillPos: sillVec,
+      entryPos: entryVec,
+      vaultStartPos: new THREE.Vector3(sx, sy, sz),
+      vaultT: 0,
+      tearTimer: 0.55,
+      tearAnimPhase: 0,
+      hallwayLateralOffset: (Math.random() - 0.5) * 0.45,
       path: [],
       pathIndex: 0,
       repathTimer: 0.1,
+      stuckTimer: 0,
+      lastProgressX: sx,
+      lastProgressZ: sz,
+      avoidDir: Math.random() < 0.5 ? -1 : 1,
+      unstuckBoostTimer: 0,
       windupTimer: 0,
       attackCooldown: 0.4,
       deathTimer: 0,
@@ -695,6 +806,10 @@ export class InfectionZombieAI {
     const id = `zombie_${this.nextZombieUid++}`;
     const maxHp = this.computeZombieHpForRound(this.round);
     const speed = this.computeZombieSpeedForRound(this.round);
+    // Face directly from deep hallway toward window (mesh front is -Z)
+    const targetX = spawner.windowOuterPos ? spawner.windowOuterPos[0] : spawner.entryPos[0];
+    const targetZ = spawner.windowOuterPos ? spawner.windowOuterPos[2] : spawner.entryPos[2];
+    const initYaw = Math.atan2(-(targetX - spawner.spawnPos[0]), -(targetZ - spawner.spawnPos[2]));
     const z = this.createZombieActor(
       id,
       maxHp,
@@ -702,7 +817,7 @@ export class InfectionZombieAI {
       spawner.spawnPos[0],
       spawner.spawnPos[1],
       spawner.spawnPos[2],
-      spawner.yaw,
+      initYaw,
       true,
       spawner.entryPos,
       spawner.id,
@@ -721,7 +836,7 @@ export class InfectionZombieAI {
       x: Number(spawner.spawnPos[0].toFixed(3)),
       y: Number(spawner.spawnPos[1].toFixed(3)),
       z: Number(spawner.spawnPos[2].toFixed(3)),
-      yaw: Number(spawner.yaw.toFixed(4)),
+      yaw: Number(initYaw.toFixed(4)),
       entryPos: [
         Number(spawner.entryPos[0].toFixed(3)),
         Number(spawner.entryPos[1].toFixed(3)),
@@ -951,6 +1066,57 @@ export class InfectionZombieAI {
     return [];
   }
 
+  /**
+   * Fast 2D walkable corridor clearance test against solid physics AABBs (used for path smoothing & whiskers).
+   */
+  private isPointBlockedXZ(x: number, z: number, baseY: number, radius: number): boolean {
+    if (
+      x < this.map.physics.boundsMinX + radius ||
+      x > this.map.physics.boundsMaxX - radius ||
+      z < this.map.physics.boundsMinZ + radius ||
+      z > this.map.physics.boundsMaxZ - radius
+    ) {
+      return true;
+    }
+    const rSq = radius * radius;
+    const pyMin = baseY + 0.36;
+    const pyMax = baseY + 1.62;
+    const boxes = this.map.physics.boxes;
+    for (let i = 0; i < boxes.length; i++) {
+      const b = boxes[i];
+      if (b.blocksMovement === false) continue;
+      if (pyMax <= b.minY + 0.02 || pyMin >= b.maxY - 0.02) continue;
+      const qx = THREE.MathUtils.clamp(x, b.minX, b.maxX);
+      const qz = THREE.MathUtils.clamp(z, b.minZ, b.maxZ);
+      const dx = x - qx;
+      const dz = z - qz;
+      if (dx * dx + dz * dz < rSq) return true;
+    }
+    return false;
+  }
+
+  private isWalkSegmentClear(
+    x0: number,
+    z0: number,
+    x1: number,
+    z1: number,
+    baseY: number,
+    radius: number,
+  ): boolean {
+    const dist = Math.hypot(x1 - x0, z1 - z0);
+    if (dist < 0.25) return true;
+    const steps = Math.min(12, Math.max(2, Math.ceil(dist / 0.65)));
+    for (let s = 1; s < steps; s++) {
+      const t = s / steps;
+      const px = x0 + (x1 - x0) * t;
+      const pz = z0 + (z1 - z0) * t;
+      if (this.isPointBlockedXZ(px, pz, baseY, radius)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
   public update(
     dt: number,
     playerPos: Readonly<THREE.Vector3>,
@@ -959,6 +1125,7 @@ export class InfectionZombieAI {
     onRoundComplete: (completedRound: number, bonusPoints: number) => void,
     humanTargets?: InfectionHumanTarget[],
     onZombieSpawn?: (pkt: GameZombieSpawnPacket) => void,
+    onBarrierChanged?: (barrierId: string, planksRemaining: number) => void,
   ): void {
     // 1. Update blood burst InstancedMesh
     let anyBloodMoved = false;
@@ -969,7 +1136,7 @@ export class InfectionZombieAI {
       p.life -= dt;
       if (p.life <= 0) {
         p.active = false;
-        this._mat4.compose(new THREE.Vector3(0, -50, 0), this._quat, this._zeroScale);
+        this._mat4.compose(this._hidePos, this._quat, this._zeroScale);
         this.bloodInstanced.setMatrixAt(i, this._mat4);
       } else {
         p.vel.y -= 9.5 * dt;
@@ -1024,31 +1191,42 @@ export class InfectionZombieAI {
 
         z.walkCycle += dt * Math.max(1.2, spd * 2.9);
         const stride = Math.min(0.65, spd * 0.18);
-        z.leftLeg.rotation.x = Math.sin(z.walkCycle) * stride;
-        z.rightLeg.rotation.x = -Math.sin(z.walkCycle) * stride;
-
-        if (z.netWindup) {
-          z.leftArm.rotation.x = Math.PI * 0.78;
-          z.rightArm.rotation.x = Math.PI * 0.78;
-        } else if (z.enteringWindow) {
-          // Climbing through barricaded window frame
-          z.leftArm.rotation.x = Math.PI * 0.62 + Math.sin(z.walkCycle * 1.4) * 0.22;
-          z.rightArm.rotation.x = Math.PI * 0.62 - Math.sin(z.walkCycle * 1.4) * 0.22;
+        if (z.netEntryStage === 'vault') {
+          z.leftLeg.rotation.x = -0.82;
+          z.rightLeg.rotation.x = -0.62;
+          z.leftArm.rotation.x = Math.PI * 0.72;
+          z.rightArm.rotation.x = Math.PI * 0.72;
+          z.bodyPivot.rotation.set(0.45, 0, 0);
+        } else if (z.netEntryStage === 'tear') {
+          z.tearAnimPhase += dt * 5.2;
+          const rip = Math.sin(z.tearAnimPhase);
+          z.leftLeg.rotation.x = 0.06;
+          z.rightLeg.rotation.x = -0.06;
+          z.leftArm.rotation.x = Math.PI * 0.62 + rip * 0.34;
+          z.rightArm.rotation.x = Math.PI * 0.62 - rip * 0.24;
+          z.bodyPivot.rotation.set(-0.08 + rip * 0.12, 0, 0);
         } else {
-          z.leftArm.rotation.x = Math.PI * 0.44 + Math.sin(z.walkCycle) * 0.18;
-          z.rightArm.rotation.x = Math.PI * 0.44 - Math.sin(z.walkCycle) * 0.18;
+          z.leftLeg.rotation.x = Math.sin(z.walkCycle) * stride;
+          z.rightLeg.rotation.x = -Math.sin(z.walkCycle) * stride;
+          if (z.netWindup) {
+            z.leftArm.rotation.x = Math.PI * 0.78;
+            z.rightArm.rotation.x = Math.PI * 0.78;
+          } else {
+            z.leftArm.rotation.x = Math.PI * 0.44 + Math.sin(z.walkCycle) * 0.18;
+            z.rightArm.rotation.x = Math.PI * 0.44 - Math.sin(z.walkCycle) * 0.18;
+          }
+          const staggerLean = z.staggerTimer > 0 || z.netStagger ? -0.22 : 0;
+          const swayRoll = Math.sin(z.walkCycle * 0.5) * 0.08;
+          z.bodyPivot.rotation.set(staggerLean, 0, swayRoll);
         }
 
-        const staggerLean = z.staggerTimer > 0 || z.netStagger ? -0.22 : z.enteringWindow ? 0.16 : 0;
-        const swayRoll = Math.sin(z.walkCycle * 0.5) * 0.08;
-        z.bodyPivot.rotation.set(staggerLean, 0, swayRoll);
         z.root.position.copy(z.pos);
         z.root.rotation.set(0, z.yaw, 0);
       }
       return;
     }
 
-    // Build list of living human survivors (Host + co-op squadmates)
+    // Build list of living survivors (humans + friendly AI squadmates)
     const aliveSurvivors: InfectionHumanTarget[] =
       humanTargets && humanTargets.length > 0
         ? humanTargets.filter((h) => h.alive)
@@ -1070,11 +1248,9 @@ export class InfectionZombieAI {
       this.spawnTimer -= dt;
       if (this.spawnTimer <= 0) {
         this.spawnOneZombie(anchorPositions, onZombieSpawn);
-        // Faster spawn cadence on higher rounds
         this.spawnTimer = Math.max(0.45, (2.05 - this.round * 0.14) / Math.sqrt(this.zombieSpawnAmountMult));
       }
     } else if (this.toSpawnThisRound === 0 && activeAlive === 0 && anySurvivorAlive) {
-      // Round cleared!
       const bonus = this.round * 100;
       onRoundComplete(this.round, bonus);
       this.intermissionSec = this.waveBreakIntervalSec;
@@ -1082,6 +1258,16 @@ export class InfectionZombieAI {
 
     const scaledWindup = ZOMBIE_ATTACK_WINDUP / this.zombieAttackSpeedMult;
     const scaledCooldown = ZOMBIE_ATTACK_COOLDOWN / this.zombieAttackSpeedMult;
+    const scaledTearSec = Math.max(0.55, ZOMBIE_PLANK_TEAR_SEC / Math.sqrt(this.zombieAttackSpeedMult));
+
+    // Track per-window active tearer & active vaulter so zombies queue cleanly at windows
+    const windowHasTearer = new Set<string>();
+    const windowHasVaulter = new Set<string>();
+    for (let i = 0; i < this.zombies.length; i++) {
+      const z = this.zombies[i];
+      if (!z.alive || !z.spawnerId) continue;
+      if (z.entryStage === 'vault') windowHasVaulter.add(z.spawnerId);
+    }
 
     // 3. Step all zombies
     for (let i = this.zombies.length - 1; i >= 0; i--) {
@@ -1101,55 +1287,229 @@ export class InfectionZombieAI {
 
       if (z.attackCooldown > 0) z.attackCooldown = Math.max(0, z.attackCooldown - dt);
       if (z.staggerTimer > 0) z.staggerTimer = Math.max(0, z.staggerTimer - dt);
+      if (z.unstuckBoostTimer > 0) z.unstuckBoostTimer = Math.max(0, z.unstuckBoostTimer - dt);
 
-      // Exponentially damp horizontal knockback
       const kbDamp = Math.exp(-7.5 * dt);
       z.knockbackVelX *= kbDamp;
       z.knockbackVelZ *= kbDamp;
 
-      let moveX = z.knockbackVelX;
-      let moveZ = z.knockbackVelZ;
+      let moveX = z.entryStage === 'pursue' ? z.knockbackVelX : 0;
+      let moveZ = z.entryStage === 'pursue' ? z.knockbackVelZ : 0;
 
-      // Choose nearest living survivor for pursuit & melee strikes
+      // === WINDOW HALLWAY -> SEQUENTIAL PLANK TEARING -> PHYSICAL VAULT STATE MACHINE ===
+      if (z.entryStage !== 'pursue') {
+        const barrier = z.spawnerId ? this.barriersBySpawnerId.get(z.spawnerId) : undefined;
+        const planksLeft = barrier ? barrier.getPlanksRemaining() : 0;
+
+        if (z.entryStage === 'approach') {
+          // Walk from deep dark hallway right up to window outer stand spot
+          const dx = z.windowOuterPos.x - z.pos.x;
+          const dz = z.windowOuterPos.z - z.pos.z;
+          const dist = Math.hypot(dx, dz);
+
+          if (dist < 0.24) {
+            z.pos.x = z.windowOuterPos.x;
+            z.pos.z = z.windowOuterPos.z;
+            z.pos.y = z.windowOuterPos.y;
+            if (planksLeft > 0) {
+              z.entryStage = 'tear';
+              z.tearTimer = scaledTearSec * 0.85;
+            } else if (!z.spawnerId || !windowHasVaulter.has(z.spawnerId)) {
+              z.entryStage = 'vault';
+              z.vaultStartPos.copy(z.pos);
+              z.vaultT = 0;
+              if (z.spawnerId) windowHasVaulter.add(z.spawnerId);
+            } else {
+              // Wait at window until previous zombie clears sill
+              z.entryStage = 'tear';
+              z.tearTimer = 0.25;
+            }
+          } else {
+            const walkSpd = z.staggerTimer > 0 ? z.speed * 0.25 : Math.max(1.35, z.speed * 0.78);
+            const vx = (dx / dist) * walkSpd;
+            const vz = (dz / dist) * walkSpd;
+            z.pos.x += vx * dt;
+            z.pos.z += vz * dt;
+            z.pos.y = THREE.MathUtils.damp(z.pos.y, z.windowOuterPos.y, 12, dt);
+            z.yaw = Math.atan2(-dx, -dz);
+
+            z.walkCycle += dt * Math.max(1.2, walkSpd * 2.9);
+            const stride = Math.min(0.6, walkSpd * 0.18);
+            z.leftLeg.rotation.x = Math.sin(z.walkCycle) * stride;
+            z.rightLeg.rotation.x = -Math.sin(z.walkCycle) * stride;
+            z.leftArm.rotation.x = Math.PI * 0.48 + Math.sin(z.walkCycle) * 0.16;
+            z.rightArm.rotation.x = Math.PI * 0.48 - Math.sin(z.walkCycle) * 0.16;
+            const staggerLean = z.staggerTimer > 0 ? -0.22 : 0.06;
+            z.bodyPivot.rotation.set(staggerLean, 0, Math.sin(z.walkCycle * 0.5) * 0.07);
+          }
+
+          z.root.position.copy(z.pos);
+          z.root.rotation.set(0, z.yaw, 0);
+          continue;
+        }
+
+        if (z.entryStage === 'tear') {
+          // Face cleanly straight through the window
+          const faceX = z.entryPos.x - z.windowOuterPos.x;
+          const faceZ = z.entryPos.z - z.windowOuterPos.z;
+          z.yaw = Math.atan2(-faceX, -faceZ);
+          z.pos.x = THREE.MathUtils.damp(z.pos.x, z.windowOuterPos.x, 8, dt);
+          z.pos.z = THREE.MathUtils.damp(z.pos.z, z.windowOuterPos.z, 8, dt);
+          z.pos.y = THREE.MathUtils.damp(z.pos.y, z.windowOuterPos.y, 12, dt);
+
+          if (planksLeft <= 0) {
+            // All planks removed -> vault through if sill is clear!
+            if (!z.spawnerId || !windowHasVaulter.has(z.spawnerId)) {
+              z.entryStage = 'vault';
+              z.vaultStartPos.copy(z.pos);
+              z.vaultT = 0;
+              if (z.spawnerId) windowHasVaulter.add(z.spawnerId);
+            }
+          } else {
+            // Only one zombie tears the active plank at a time; others reach/wait behind
+            const isActiveTearer = !z.spawnerId || !windowHasTearer.has(z.spawnerId);
+            if (isActiveTearer && z.spawnerId) {
+              windowHasTearer.add(z.spawnerId);
+            }
+
+            if (isActiveTearer && z.staggerTimer <= 0) {
+              z.tearTimer -= dt;
+              z.tearAnimPhase += dt * 5.8;
+              const pullWave = Math.sin(z.tearAnimPhase);
+              // Two-handed plank wrenching motion
+              z.leftArm.rotation.x = Math.PI * 0.64 + pullWave * 0.36;
+              z.rightArm.rotation.x = Math.PI * 0.64 - pullWave * 0.24;
+              z.leftLeg.rotation.x = 0.08;
+              z.rightLeg.rotation.x = -0.08;
+              z.bodyPivot.rotation.set(-0.08 + pullWave * 0.14, 0, Math.sin(z.tearAnimPhase * 0.5) * 0.06);
+
+              if (z.tearTimer <= 0 && barrier) {
+                if (barrier.tearPlank()) {
+                  this._tmpAudioPos.copy(z.sillPos);
+                  this.audio.playImpact(this._tmpAudioPos, 'wood');
+                  onBarrierChanged?.(barrier.id, barrier.getPlanksRemaining());
+                }
+                z.tearTimer = scaledTearSec;
+              }
+            } else {
+              // Waiting or briefly staggered at window
+              z.tearAnimPhase += dt * 2.4;
+              z.leftArm.rotation.x = Math.PI * 0.52 + Math.sin(z.tearAnimPhase) * 0.12;
+              z.rightArm.rotation.x = Math.PI * 0.52 - Math.sin(z.tearAnimPhase) * 0.12;
+              z.leftLeg.rotation.x = 0;
+              z.rightLeg.rotation.x = 0;
+              z.bodyPivot.rotation.set(z.staggerTimer > 0 ? -0.24 : 0.04, 0, 0);
+            }
+          }
+
+          z.root.position.copy(z.pos);
+          z.root.rotation.set(0, z.yaw, 0);
+          continue;
+        }
+
+        if (z.entryStage === 'vault') {
+          // If a player nailed a plank back up right at the start of the vault (<15%), abort back to tearing!
+          if (planksLeft > 0 && z.vaultT < 0.16) {
+            z.entryStage = 'tear';
+            z.tearTimer = scaledTearSec * 0.85;
+            z.pos.copy(z.windowOuterPos);
+            z.root.position.copy(z.pos);
+            continue;
+          }
+
+          const vaultDur = Math.max(0.62, ZOMBIE_WINDOW_VAULT_SEC / Math.max(0.85, this.zombieMoveSpeedMult));
+          z.vaultT = Math.min(1, z.vaultT + dt / vaultDur);
+          const t = z.vaultT;
+
+          // Smooth 3-stage physical climb & vault over the window sill:
+          // [0..0.38] Hoist onto window sill, [0.38..0.72] Swing body/legs cleanly over sill, [0.72..1.0] Land inside room
+          const sillPeakY = z.sillPos.y + 0.14;
+          if (t < 0.38) {
+            const u = t / 0.38;
+            const ease = u * u * (3 - 2 * u);
+            z.pos.x = THREE.MathUtils.lerp(z.vaultStartPos.x, z.sillPos.x, ease * 0.72);
+            z.pos.z = THREE.MathUtils.lerp(z.vaultStartPos.z, z.sillPos.z, ease * 0.72);
+            z.pos.y = THREE.MathUtils.lerp(z.vaultStartPos.y, sillPeakY, ease);
+            z.bodyPivot.rotation.set(ease * 0.52, 0, 0);
+            z.leftArm.rotation.x = Math.PI * (0.55 + ease * 0.28);
+            z.rightArm.rotation.x = Math.PI * (0.55 + ease * 0.28);
+            z.leftLeg.rotation.x = -ease * 0.88;
+            z.rightLeg.rotation.x = -ease * 0.45;
+          } else if (t < 0.74) {
+            const u = (t - 0.38) / 0.36;
+            const ease = u * u * (3 - 2 * u);
+            const midX = THREE.MathUtils.lerp(z.sillPos.x, z.entryPos.x, 0.52);
+            const midZ = THREE.MathUtils.lerp(z.sillPos.z, z.entryPos.z, 0.52);
+            z.pos.x = THREE.MathUtils.lerp(THREE.MathUtils.lerp(z.vaultStartPos.x, z.sillPos.x, 0.72), midX, ease);
+            z.pos.z = THREE.MathUtils.lerp(THREE.MathUtils.lerp(z.vaultStartPos.z, z.sillPos.z, 0.72), midZ, ease);
+            // Keep hips cleanly above sill top with slight apex arc
+            z.pos.y = sillPeakY + Math.sin(u * Math.PI) * 0.18;
+            z.bodyPivot.rotation.set(0.52 - ease * 0.16, 0, Math.sin(u * Math.PI) * 0.14);
+            z.leftArm.rotation.x = Math.PI * 0.78 - ease * 0.35;
+            z.rightArm.rotation.x = Math.PI * 0.78 - ease * 0.35;
+            z.leftLeg.rotation.x = -0.88 + ease * 0.35;
+            z.rightLeg.rotation.x = -0.45 - ease * 0.48;
+          } else {
+            const u = (t - 0.74) / 0.26;
+            const ease = u * u * (3 - 2 * u);
+            const midX = THREE.MathUtils.lerp(z.sillPos.x, z.entryPos.x, 0.52);
+            const midZ = THREE.MathUtils.lerp(z.sillPos.z, z.entryPos.z, 0.52);
+            z.pos.x = THREE.MathUtils.lerp(midX, z.entryPos.x, ease);
+            z.pos.z = THREE.MathUtils.lerp(midZ, z.entryPos.z, ease);
+            z.pos.y = THREE.MathUtils.lerp(sillPeakY, z.entryPos.y, ease);
+            z.bodyPivot.rotation.set(0.36 * (1 - ease), 0, 0);
+            z.leftArm.rotation.x = Math.PI * 0.44;
+            z.rightArm.rotation.x = Math.PI * 0.44;
+            z.leftLeg.rotation.x = -0.53 * (1 - ease);
+            z.rightLeg.rotation.x = -0.93 * (1 - ease);
+          }
+
+          const faceX = z.entryPos.x - z.sillPos.x;
+          const faceZ = z.entryPos.z - z.sillPos.z;
+          z.yaw = Math.atan2(-faceX, -faceZ);
+          z.root.position.copy(z.pos);
+          z.root.rotation.set(0, z.yaw, 0);
+
+          if (z.vaultT >= 1) {
+            z.pos.copy(z.entryPos);
+            z.entryStage = 'pursue';
+            z.enteringWindow = false;
+            z.repathTimer = 0;
+            z.lastProgressX = z.pos.x;
+            z.lastProgressZ = z.pos.z;
+            z.stuckTimer = 0;
+            this._tmpAudioPos.copy(z.entryPos);
+            this.audio.playImpact(this._tmpAudioPos, 'wood');
+          }
+          continue;
+        }
+      }
+
+      // === INTERIOR PURSUIT & REFINED PATHFINDING ===
       let nearestTarget: InfectionHumanTarget | null = null;
       let nearestDistSq = Infinity;
       for (let s = 0; s < aliveSurvivors.length; s++) {
         const sv = aliveSurvivors[s];
         const dx = sv.pos.x - z.pos.x;
+        const dy = (sv.pos.y - z.pos.y) * 1.4;
         const dz = sv.pos.z - z.pos.z;
-        const dSq = dx * dx + dz * dz;
+        const dSq = dx * dx + dy * dy + dz * dz;
         if (dSq < nearestDistSq) {
           nearestDistSq = dSq;
           nearestTarget = sv;
         }
       }
 
-      if (z.enteringWindow) {
-        // Step through barricaded window into interior entryPos
-        const dx = z.entryPos.x - z.pos.x;
-        const dz = z.entryPos.z - z.pos.z;
-        const dist = Math.hypot(dx, dz);
-        if (dist < 0.42) {
-          z.enteringWindow = false;
-          z.repathTimer = 0;
-        } else {
-          const climbSpd = Math.max(1.5, z.speed * 0.72);
-          moveX += (dx / dist) * climbSpd;
-          moveZ += (dz / dist) * climbSpd;
-          z.yaw = Math.atan2(-dx, -dz);
-        }
-      } else if (nearestTarget) {
+      if (nearestTarget) {
         const targetPos = nearestTarget.pos;
         const dxP = targetPos.x - z.pos.x;
         const dyP = Math.abs(targetPos.y - z.pos.y);
         const dzP = targetPos.z - z.pos.z;
         const distToPlayer = Math.hypot(dxP, dzP);
 
-        // Melee windup & hit execution
         if (z.windupTimer > 0) {
           z.windupTimer -= dt;
           z.yaw = Math.atan2(-dxP, -dzP);
-          // Raise arms during windup lunge
           z.leftArm.rotation.x = Math.PI * 0.78;
           z.rightArm.rotation.x = Math.PI * 0.78;
 
@@ -1163,14 +1523,19 @@ export class InfectionZombieAI {
         } else if (distToPlayer <= ZOMBIE_ATTACK_RANGE && dyP < 1.5 && z.attackCooldown <= 0 && z.staggerTimer <= 0) {
           z.windupTimer = scaledWindup;
         } else if (z.staggerTimer <= 0) {
-          // Navigate directly if very close on same level, otherwise follow door-safe NavGraph
           let steerX = dxP;
           let steerZ = dzP;
 
-          if (distToPlayer > 4.2 || dyP > 0.9) {
+          // Direct pursuit only when close, same elevation, AND unobstructed walkable line!
+          const canChaseDirect =
+            distToPlayer < 6.5 &&
+            dyP < 0.75 &&
+            this.isWalkSegmentClear(z.pos.x, z.pos.z, targetPos.x, targetPos.z, z.pos.y, ZOMBIE_RADIUS * 0.92);
+
+          if (!canChaseDirect) {
             z.repathTimer -= dt;
             if (z.repathTimer <= 0 || z.pathIndex >= z.path.length) {
-              z.repathTimer = 0.55 + Math.random() * 0.35;
+              z.repathTimer = 0.48 + Math.random() * 0.28;
               const startNode = findNearestNavNode(
                 this.map.navGraph,
                 z.pos,
@@ -1189,12 +1554,36 @@ export class InfectionZombieAI {
               }
             }
 
+            // String-pulling: skip redundant intermediate waypoint if next waypoint has clear walkable corridor & close elevation
+            while (z.pathIndex + 1 < z.path.length) {
+              const curWp = z.path[z.pathIndex];
+              const nextWp = z.path[z.pathIndex + 1];
+              const dyNext = Math.abs(nextWp.position[1] - z.pos.y);
+              const dyCur = Math.abs(curWp.position[1] - z.pos.y);
+              if (
+                dyNext < 0.85 &&
+                dyCur < 0.85 &&
+                this.isWalkSegmentClear(
+                  z.pos.x,
+                  z.pos.z,
+                  nextWp.position[0],
+                  nextWp.position[2],
+                  z.pos.y,
+                  ZOMBIE_RADIUS * 0.95,
+                )
+              ) {
+                z.pathIndex++;
+              } else {
+                break;
+              }
+            }
+
             if (z.pathIndex < z.path.length) {
               const wp = z.path[z.pathIndex];
               const wx = wp.position[0] - z.pos.x;
               const wz = wp.position[2] - z.pos.z;
               const wd = Math.hypot(wx, wz);
-              if (wd < 0.9) {
+              if (wd < 0.85) {
                 z.pathIndex++;
               } else {
                 steerX = wx;
@@ -1203,24 +1592,90 @@ export class InfectionZombieAI {
             }
           }
 
-          const sLen = Math.hypot(steerX, steerZ);
+          let sLen = Math.hypot(steerX, steerZ);
           if (sLen > 0.05) {
-            moveX += (steerX / sLen) * z.speed;
-            moveZ += (steerZ / sLen) * z.speed;
-            const desiredYaw = Math.atan2(-steerX, -steerZ);
+            let dirX = steerX / sLen;
+            let dirZ = steerZ / sLen;
+
+            // Local obstacle-avoidance whiskers (prevents getting caught on ticket kiosk, seat rows, pillars)
+            const probeDist = 0.85;
+            const fwdBlocked = this.isPointBlockedXZ(
+              z.pos.x + dirX * probeDist,
+              z.pos.z + dirZ * probeDist,
+              z.pos.y,
+              ZOMBIE_RADIUS * 0.92,
+            );
+            if (fwdBlocked || z.unstuckBoostTimer > 0) {
+              const cosA = 0.78;
+              const sinA = 0.62;
+              const leftX = dirX * cosA - dirZ * sinA;
+              const leftZ = dirX * sinA + dirZ * cosA;
+              const rightX = dirX * cosA + dirZ * sinA;
+              const rightZ = -dirX * sinA + dirZ * cosA;
+
+              const leftClear = !this.isPointBlockedXZ(
+                z.pos.x + leftX * probeDist,
+                z.pos.z + leftZ * probeDist,
+                z.pos.y,
+                ZOMBIE_RADIUS * 0.88,
+              );
+              const rightClear = !this.isPointBlockedXZ(
+                z.pos.x + rightX * probeDist,
+                z.pos.z + rightZ * probeDist,
+                z.pos.y,
+                ZOMBIE_RADIUS * 0.88,
+              );
+
+              if (leftClear && !rightClear) {
+                dirX = leftX;
+                dirZ = leftZ;
+                z.avoidDir = 1;
+              } else if (rightClear && !leftClear) {
+                dirX = rightX;
+                dirZ = rightZ;
+                z.avoidDir = -1;
+              } else {
+                // Both or neither clear: steer perpendicular along preferred avoidDir
+                const perpX = -dirZ * z.avoidDir;
+                const perpZ = dirX * z.avoidDir;
+                dirX = dirX * 0.35 + perpX * 0.65;
+                dirZ = dirZ * 0.35 + perpZ * 0.65;
+                const nl = Math.hypot(dirX, dirZ) || 1;
+                dirX /= nl;
+                dirZ /= nl;
+              }
+            }
+
+            moveX += dirX * z.speed;
+            moveZ += dirZ * z.speed;
+            const desiredYaw = Math.atan2(-dirX, -dirZ);
             let dyaw = desiredYaw - z.yaw;
             while (dyaw > Math.PI) dyaw -= Math.PI * 2;
             while (dyaw < -Math.PI) dyaw += Math.PI * 2;
             z.yaw += dyaw * Math.min(1, dt * 8.5);
           }
+
+          // Stuck detection & automatic recovery
+          z.stuckTimer += dt;
+          if (z.stuckTimer >= 0.55) {
+            const moved = Math.hypot(z.pos.x - z.lastProgressX, z.pos.z - z.lastProgressZ);
+            z.lastProgressX = z.pos.x;
+            z.lastProgressZ = z.pos.z;
+            z.stuckTimer = 0;
+            if (moved < 0.16 && distToPlayer > ZOMBIE_ATTACK_RANGE + 0.25) {
+              z.avoidDir = -z.avoidDir;
+              z.unstuckBoostTimer = 0.55;
+              z.repathTimer = 0;
+            }
+          }
         }
       }
 
-      // Zombie-zombie crowd separation (prevents stacking into 1 mesh)
+      // Zombie-zombie crowd separation (only among interior pursuing zombies)
       for (let j = 0; j < this.zombies.length; j++) {
         if (i === j) continue;
         const o = this.zombies[j];
-        if (!o.alive) continue;
+        if (!o.alive || o.entryStage !== 'pursue') continue;
         const sx = z.pos.x - o.pos.x;
         const sz = z.pos.z - o.pos.z;
         const dSq = sx * sx + sz * sz;
@@ -1232,17 +1687,12 @@ export class InfectionZombieAI {
         }
       }
 
-      // Integrate position & collide with solid world boxes (skip while climbing through spawn window)
+      // Integrate position & collide with solid world boxes
       const nextX = z.pos.x + moveX * dt;
       const nextZ = z.pos.z + moveZ * dt;
-      if (z.enteringWindow) {
-        z.pos.x = nextX;
-        z.pos.z = nextZ;
-      } else {
-        const res = this.resolveZombieXZ(nextX, z.pos.y, nextZ);
-        z.pos.x = res.x;
-        z.pos.z = res.z;
-      }
+      const res = this.resolveZombieXZ(nextX, z.pos.y, nextZ);
+      z.pos.x = res.x;
+      z.pos.z = res.z;
 
       const groundY = this.map.physics.getGroundHeight(z.pos.x, z.pos.z, z.pos.y, 0.85, 0.14);
       z.pos.y = THREE.MathUtils.damp(z.pos.y, groundY, 14, dt);
@@ -1277,7 +1727,7 @@ export class InfectionZombieAI {
     const pyMax = baseY + 1.65;
 
     const boxes = this.map.physics.boxes;
-    for (let pass = 0; pass < 2; pass++) {
+    for (let pass = 0; pass < 3; pass++) {
       for (let i = 0; i < boxes.length; i++) {
         const b = boxes[i];
         if (b.blocksMovement === false) continue;
@@ -1295,7 +1745,16 @@ export class InfectionZombieAI {
             cx += (dx / d) * pen;
             cz += (dz / d) * pen;
           } else {
-            cx += r;
+            // Inside AABB: push out nearest face cleanly
+            const dl = Math.abs(cx - b.minX);
+            const dr = Math.abs(b.maxX - cx);
+            const df = Math.abs(cz - b.minZ);
+            const db = Math.abs(b.maxZ - cz);
+            const m = Math.min(dl, dr, df, db);
+            if (m === dl) cx = b.minX - r;
+            else if (m === dr) cx = b.maxX + r;
+            else if (m === df) cz = b.minZ - r;
+            else cz = b.maxZ + r;
           }
         }
       }

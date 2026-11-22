@@ -26,6 +26,7 @@ import {
   IMapDefinition,
   MapInteractable,
   MapLightingPreset,
+  MapWindowBarrier,
   NavNode,
   ZombieSpawnerDef,
 } from './types';
@@ -337,25 +338,416 @@ function buildKinoTheater(
 
   physics.addInteriorZone({ minX: -22, maxX: 13, minY: 0, maxY: 9, minZ: -24, maxZ: 22, material: 'wood' });
 
-  // === 2. MAIN ARCHITECTURAL WALLS & CEILINGS (Non-overlapping corner joints) ===
+  // === 2. MAIN ARCHITECTURAL WALLS, FRAMED ZOMBIE WINDOWS & DARK SPAWN HALLWAYS ===
   const H = 7.6;
-  addSolidBox(0, H * 0.5, 22.2, 26.45, H, 0.5, matTheaterWall);
-  addSolidBox(0, H * 0.5, -24.2, 44.9, H, 0.5, matTheaterWall);
-  addSolidBox(-22.2, H * 0.5, -4.75, 0.5, H, 38.4, matTheaterWall);
+  const WINDOW_WIDTH = 1.92;
+  const WINDOW_SILL_H = 0.94;
+  const WINDOW_OPEN_H = 1.46; // sill 0.94 -> header 2.40m
+  const MAX_BARRIER_PLANKS = 5;
+
+  const matHallwayWall = trackMat(
+    new THREE.MeshStandardMaterial({
+      color: 0x101417,
+      roughness: 0.96,
+      metalness: 0.04,
+    }),
+  );
+  const matHallwayFloor = trackMat(
+    new THREE.MeshStandardMaterial({
+      color: 0x0d1012,
+      roughness: 0.94,
+      metalness: 0.05,
+    }),
+  );
+  const matWindowFrame = trackMat(
+    new THREE.MeshStandardMaterial({
+      color: 0x2a1d15,
+      roughness: 0.78,
+      metalness: 0.14,
+    }),
+  );
+  const matNailIron = trackMat(
+    new THREE.MeshStandardMaterial({
+      color: 0x3b4046,
+      roughness: 0.45,
+      metalness: 0.85,
+    }),
+  );
+
+  interface WindowSpec {
+    spawnerId: string;
+    zoneId: string;
+    label: string;
+    centerAlong: number;
+    baseY: number;
+    entryNodeId: string;
+    hallwayDepth?: number;
+  }
+
+  interface PlankAnimItem {
+    group: THREE.Group;
+    restPos: THREE.Vector3;
+    restRot: THREE.Euler;
+    outwardDir: THREE.Vector3; // points into hallway (-windowNormal)
+    state: 'attached' | 'tearing' | 'removed' | 'repairing';
+    animT: number;
+  }
+
+  const zombieSpawners: ZombieSpawnerDef[] = [];
+  const windowBarriers: MapWindowBarrier[] = [];
+  const plankAnimItems: PlankAnimItem[] = [];
+
+  const plankBoardGeo = trackGeo(new THREE.BoxGeometry(WINDOW_WIDTH + 0.22, 0.19, 0.06));
+  const plankNailGeo = trackGeo(new THREE.CylinderGeometry(0.016, 0.016, 0.075, 6));
+  plankNailGeo.rotateX(Math.PI * 0.5);
+
+  const buildWindowAndHallway = (
+    axis: 'x' | 'z',
+    fixedCoord: number,
+    thickness: number,
+    wallHeight: number,
+    wallMat: THREE.Material,
+    normalSign: 1 | -1,
+    spec: WindowSpec,
+  ): void => {
+    const winW = WINDOW_WIDTH;
+    const baseY = spec.baseY;
+    const sillTopY = baseY + WINDOW_SILL_H;
+    const headBotY = sillTopY + WINDOW_OPEN_H;
+    const hallDepth = spec.hallwayDepth ?? 3.6;
+
+    // Normal pointing from hallway INTO playable room
+    const nx = axis === 'z' ? normalSign : 0;
+    const nz = axis === 'x' ? normalSign : 0;
+    // Outward direction into hallway
+    const ox = -nx;
+    const oz = -nz;
+
+    const cx = axis === 'x' ? spec.centerAlong : fixedCoord;
+    const cz = axis === 'z' ? spec.centerAlong : fixedCoord;
+
+    // 1. Lower sill wall (0 -> sillTopY) — solid collider blocks player from stepping into hallway
+    if (sillTopY > 0.05) {
+      if (axis === 'x') {
+        addSolidBox(cx, sillTopY * 0.5, cz, winW, sillTopY, thickness, wallMat);
+      } else {
+        addSolidBox(cx, sillTopY * 0.5, cz, thickness, sillTopY, winW, wallMat);
+      }
+    }
+    // 2. Upper header wall (headBotY -> wallHeight)
+    const headH = Math.max(0.1, wallHeight - headBotY);
+    if (axis === 'x') {
+      addSolidBox(cx, headBotY + headH * 0.5, cz, winW, headH, thickness, wallMat);
+    } else {
+      addSolidBox(cx, headBotY + headH * 0.5, cz, thickness, headH, winW, wallMat);
+    }
+
+    // 3. Recessed architectural window frame (left jamb, right jamb, sill ledge, header trim)
+    const frameDepth = thickness + 0.08;
+    const frameGroup = new THREE.Group();
+    frameGroup.position.set(cx, sillTopY, cz);
+    // Align local +Z to point into the playable room (windowNormal)
+    const frameYaw = Math.atan2(nx, nz);
+    frameGroup.rotation.y = frameYaw;
+
+    const jambGeo = trackGeo(new THREE.BoxGeometry(0.11, WINDOW_OPEN_H + 0.08, frameDepth));
+    const leftJamb = new THREE.Mesh(jambGeo, matWindowFrame);
+    leftJamb.position.set(-winW * 0.5 + 0.055, WINDOW_OPEN_H * 0.5, 0);
+    const rightJamb = new THREE.Mesh(jambGeo, matWindowFrame);
+    rightJamb.position.set(winW * 0.5 - 0.055, WINDOW_OPEN_H * 0.5, 0);
+
+    const sillLedge = new THREE.Mesh(
+      trackGeo(new THREE.BoxGeometry(winW + 0.14, 0.09, frameDepth + 0.1)),
+      matWindowFrame,
+    );
+    sillLedge.position.set(0, -0.02, 0);
+    const headerTrim = new THREE.Mesh(
+      trackGeo(new THREE.BoxGeometry(winW + 0.14, 0.11, frameDepth + 0.06)),
+      matWindowFrame,
+    );
+    headerTrim.position.set(0, WINDOW_OPEN_H + 0.03, 0);
+    frameGroup.add(leftJamb, rightJamb, sillLedge, headerTrim);
+    sceneGroup.add(frameGroup);
+
+    // 4. Enclosed dark spawn hallway behind the window (aligned flush to exterior face of wall)
+    const hallW = winW + 0.72;
+    const hallH = 3.05;
+    const wallHalfT = thickness * 0.5;
+    const hallCenterDist = wallHalfT + hallDepth * 0.5;
+    const hallGroup = new THREE.Group();
+    hallGroup.position.set(cx + ox * hallCenterDist, baseY, cz + oz * hallCenterDist);
+    hallGroup.rotation.y = frameYaw;
+
+    // Hallway floor
+    const hFloor = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(hallW, 0.12, hallDepth)), matHallwayFloor);
+    hFloor.position.set(0, -0.04, 0);
+    // Hallway ceiling
+    const hCeil = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(hallW + 0.24, 0.16, hallDepth + 0.2)), matHallwayWall);
+    hCeil.position.set(0, hallH, 0);
+    // Hallway left & right masonry walls + back wall
+    const hSideGeo = trackGeo(new THREE.BoxGeometry(0.24, hallH, hallDepth + 0.12));
+    const hLeft = new THREE.Mesh(hSideGeo, matHallwayWall);
+    hLeft.position.set(-hallW * 0.5 - 0.04, hallH * 0.5, 0);
+    const hRight = new THREE.Mesh(hSideGeo, matHallwayWall);
+    hRight.position.set(hallW * 0.5 + 0.04, hallH * 0.5, 0);
+    const hBack = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(hallW + 0.28, hallH, 0.24)), matHallwayWall);
+    hBack.position.set(0, hallH * 0.5, -hallDepth * 0.5 - 0.06);
+
+    // Subtle dark architectural ribs inside hallway so zombie silhouette reads clearly
+    const ribGeo = trackGeo(new THREE.BoxGeometry(0.14, hallH - 0.1, 0.14));
+    for (const rz of [-hallDepth * 0.25, hallDepth * 0.2]) {
+      const rl = new THREE.Mesh(ribGeo, matCastIron);
+      rl.position.set(-hallW * 0.5 + 0.08, hallH * 0.5, rz);
+      const rr = new THREE.Mesh(ribGeo, matCastIron);
+      rr.position.set(hallW * 0.5 - 0.08, hallH * 0.5, rz);
+      hallGroup.add(rl, rr);
+    }
+
+    hallGroup.add(hFloor, hCeil, hLeft, hRight, hBack);
+    sceneGroup.add(hallGroup);
+
+    // If hallway protrudes into an interior wing (e.g. auditorium side shafts), add exterior box collider so players walk cleanly around it
+    if (hallDepth <= 2.6) {
+      const minX = Math.min(cx + ox * wallHalfT, cx + ox * (wallHalfT + hallDepth)) - (axis === 'x' ? hallW * 0.55 : 0.08);
+      const maxX = Math.max(cx + ox * wallHalfT, cx + ox * (wallHalfT + hallDepth)) + (axis === 'x' ? hallW * 0.55 : 0.08);
+      const minZ = Math.min(cz + oz * wallHalfT, cz + oz * (wallHalfT + hallDepth)) - (axis === 'z' ? hallW * 0.55 : 0.08);
+      const maxZ = Math.max(cz + oz * wallHalfT, cz + oz * (wallHalfT + hallDepth)) + (axis === 'z' ? hallW * 0.55 : 0.08);
+      physics.addBox({
+        minX,
+        maxX,
+        minY: 0,
+        maxY: baseY + hallH + 0.2,
+        minZ,
+        maxZ,
+        surface: 'concrete',
+        blocksMovement: true,
+      });
+    }
+
+    // 5. Mount 5 aligned wooden barrier planks flush across the window jambs (ZERO floating)
+    const plankItems: PlankAnimItem[] = [];
+    const plankTilts = [-0.032, 0.026, -0.022, 0.034, -0.028];
+    const plankDepthOffsets = [0.025, -0.015, 0.03, -0.01, 0.02];
+
+    for (let k = 0; k < MAX_BARRIER_PLANKS; k++) {
+      const pGroup = new THREE.Group();
+      const board = new THREE.Mesh(plankBoardGeo, matBarricadeWood);
+      board.castShadow = !isSoftwareGl && qProfile.castShadows;
+      board.receiveShadow = !isSoftwareGl && qProfile.castShadows;
+      const nailL = new THREE.Mesh(plankNailGeo, matNailIron);
+      nailL.position.set(-(winW * 0.5 - 0.04), 0, 0.01);
+      const nailR = new THREE.Mesh(plankNailGeo, matNailIron);
+      nailR.position.set(winW * 0.5 - 0.04, 0, 0.01);
+      pGroup.add(board, nailL, nailR);
+
+      const yFrac = (k + 0.5) / MAX_BARRIER_PLANKS;
+      const py = sillTopY + 0.08 + yFrac * (WINDOW_OPEN_H - 0.16);
+      // Mount flush against the room-facing window jamb surface (slight recess inside jamb)
+      const faceOffset = wallHalfT * 0.45 + plankDepthOffsets[k];
+      const restPos = new THREE.Vector3(cx + nx * faceOffset, py, cz + nz * faceOffset);
+      const restRot = new THREE.Euler(0, frameYaw, plankTilts[k]);
+
+      pGroup.position.copy(restPos);
+      pGroup.rotation.copy(restRot);
+      sceneGroup.add(pGroup);
+
+      const item: PlankAnimItem = {
+        group: pGroup,
+        restPos,
+        restRot,
+        outwardDir: new THREE.Vector3(ox, 0, oz),
+        state: 'attached',
+        animT: 1,
+      };
+      plankItems.push(item);
+      plankAnimItems.push(item);
+    }
+
+    let planksRemaining = MAX_BARRIER_PLANKS;
+
+    const applyPlankCountImmediate = (targetCount: number): void => {
+      const clamped = Math.max(0, Math.min(MAX_BARRIER_PLANKS, Math.round(targetCount)));
+      planksRemaining = clamped;
+      for (let i = 0; i < plankItems.length; i++) {
+        const it = plankItems[i];
+        if (i < clamped) {
+          it.state = 'attached';
+          it.animT = 1;
+          it.group.visible = true;
+          it.group.position.copy(it.restPos);
+          it.group.rotation.copy(it.restRot);
+        } else {
+          it.state = 'removed';
+          it.animT = 1;
+          it.group.visible = false;
+        }
+      }
+    };
+
+    const tearPlank = (): boolean => {
+      if (planksRemaining <= 0) return false;
+      planksRemaining -= 1;
+      const item = plankItems[planksRemaining];
+      item.state = 'tearing';
+      item.animT = 0;
+      item.group.visible = true;
+      return true;
+    };
+
+    const repairPlank = (): boolean => {
+      if (planksRemaining >= MAX_BARRIER_PLANKS) return false;
+      const item = plankItems[planksRemaining];
+      planksRemaining += 1;
+      item.state = 'repairing';
+      item.animT = 0;
+      item.group.visible = true;
+      return true;
+    };
+
+    const spawnDist = wallHalfT + Math.max(1.85, hallDepth - 0.65);
+    const outerStandDist = wallHalfT + 0.72;
+    const entryDist = wallHalfT + 1.18;
+    const interactDist = wallHalfT + 1.12;
+
+    const spawnPos: [number, number, number] = [cx + ox * spawnDist, baseY, cz + oz * spawnDist];
+    const windowOuterPos: [number, number, number] = [cx + ox * outerStandDist, baseY, cz + oz * outerStandDist];
+    const sillPos: [number, number, number] = [cx, sillTopY, cz];
+    const entryPos: [number, number, number] = [cx + nx * entryDist, baseY, cz + nz * entryDist];
+    const interactPos: [number, number, number] = [cx + nx * interactDist, baseY + 1.15, cz + nz * interactDist];
+    const windowNormal: [number, number, number] = [nx, 0, nz];
+    const yaw = Math.atan2(nx, nz);
+
+    zombieSpawners.push({
+      id: spec.spawnerId,
+      zoneId: spec.zoneId,
+      spawnPos,
+      windowOuterPos,
+      sillPos,
+      entryPos,
+      windowNormal,
+      maxPlanks: MAX_BARRIER_PLANKS,
+      entryNodeId: spec.entryNodeId,
+      yaw,
+    });
+
+    const barrierId = `bar_${spec.spawnerId}`;
+    windowBarriers.push({
+      id: barrierId,
+      spawnerId: spec.spawnerId,
+      zoneId: spec.zoneId,
+      label: spec.label,
+      interactPos,
+      sillPos,
+      windowOuterPos,
+      entryPos,
+      windowNormal,
+      maxPlanks: MAX_BARRIER_PLANKS,
+      getPlanksRemaining: () => planksRemaining,
+      tearPlank,
+      repairPlank,
+      setPlankCount: applyPlankCountImmediate,
+    });
+
+    interactables.push({
+      id: barrierId,
+      kind: 'window_barrier',
+      label: spec.label,
+      cost: 0,
+      position: interactPos,
+      radiusM: 2.35,
+      barrierId,
+      activated: false,
+    });
+  };
+
+  const addSegmentedWallWithWindows = (
+    axis: 'x' | 'z',
+    fixedCoord: number,
+    spanStart: number,
+    spanEnd: number,
+    thickness: number,
+    wallHeight: number,
+    wallMat: THREE.Material,
+    normalSign: 1 | -1,
+    windows: WindowSpec[],
+  ): void => {
+    const sorted = [...windows].sort((a, b) => a.centerAlong - b.centerAlong);
+    let cursor = spanStart;
+
+    for (const w of sorted) {
+      const wStart = w.centerAlong - WINDOW_WIDTH * 0.5;
+      const wEnd = w.centerAlong + WINDOW_WIDTH * 0.5;
+      if (wStart > cursor + 0.04) {
+        const segLen = wStart - cursor;
+        const segMid = (cursor + wStart) * 0.5;
+        if (axis === 'x') {
+          addSolidBox(segMid, wallHeight * 0.5, fixedCoord, segLen, wallHeight, thickness, wallMat);
+        } else {
+          addSolidBox(fixedCoord, wallHeight * 0.5, segMid, thickness, wallHeight, segLen, wallMat);
+        }
+      }
+      buildWindowAndHallway(axis, fixedCoord, thickness, wallHeight, wallMat, normalSign, w);
+      cursor = wEnd;
+    }
+
+    if (spanEnd > cursor + 0.04) {
+      const segLen = spanEnd - cursor;
+      const segMid = (cursor + spanEnd) * 0.5;
+      if (axis === 'x') {
+        addSolidBox(segMid, wallHeight * 0.5, fixedCoord, segLen, wallHeight, thickness, wallMat);
+      } else {
+        addSolidBox(fixedCoord, wallHeight * 0.5, segMid, thickness, wallHeight, segLen, wallMat);
+      }
+    }
+  };
+
+  // South Lobby Wall (z = 22.2, x in [-13.225, 13.225]) with 2 framed windows + hallways
+  addSegmentedWallWithWindows('x', 22.2, -13.225, 13.225, 0.5, H, matTheaterWall, -1, [
+    { spawnerId: 'sp_lob_sw', zoneId: 'lobby', label: 'Foyer South-West Window', centerAlong: -5.5, baseY: 0.04, entryNodeId: 'lob_sw' },
+    { spawnerId: 'sp_lob_se', zoneId: 'lobby', label: 'Foyer South-East Window', centerAlong: 5.5, baseY: 0.04, entryNodeId: 'lob_se' },
+  ]);
+
+  // North Stage Back Wall (z = -24.2, x in [-22.45, 22.45]) with 2 backstage flank windows + hallways
+  addSegmentedWallWithWindows('x', -24.2, -22.45, 22.45, 0.5, H, matTheaterWall, 1, [
+    { spawnerId: 'sp_stage_w', zoneId: 'auditorium', label: 'Backstage West Window', centerAlong: -11.3, baseY: 0.85, entryNodeId: 'stage_l' },
+    { spawnerId: 'sp_stage_e', zoneId: 'auditorium', label: 'Backstage East Window', centerAlong: 11.3, baseY: 0.85, entryNodeId: 'stage_r' },
+  ]);
+
+  // West Wing Outer Wall (x = -22.2, z in [-23.95, 14.45]) with 2 windows + hallways
+  addSegmentedWallWithWindows('z', -22.2, -23.95, 14.45, 0.5, H, matTheaterWall, 1, [
+    { spawnerId: 'sp_ww_2', zoneId: 'west_wing', label: 'Dressing Wing North Window', centerAlong: -7.0, baseY: 0.04, entryNodeId: 'ww_n' },
+    { spawnerId: 'sp_ww_1', zoneId: 'west_wing', label: 'Dressing Wing South Window', centerAlong: 2.5, baseY: 0.04, entryNodeId: 'ww_mid' },
+  ]);
   addSolidBox(-17.5875, H * 0.5, 14.2, 8.725, H, 0.5, matTheaterWall);
-  addSolidBox(22.2, 3.8, -4.75, 0.5, 7.6, 38.4, matAlley);
+
+  // East Back Alley Outer Wall (x = 22.2, z in [-23.95, 14.45]) with 2 windows + hallways
+  addSegmentedWallWithWindows('z', 22.2, -23.95, 14.45, 0.5, 7.6, matAlley, -1, [
+    { spawnerId: 'sp_ew_2', zoneId: 'east_wing', label: 'Alley North Window', centerAlong: -7.0, baseY: 0.0, entryNodeId: 'ew_n' },
+    { spawnerId: 'sp_ew_1', zoneId: 'east_wing', label: 'Alley South Window', centerAlong: 2.5, baseY: 0.0, entryNodeId: 'ew_mid' },
+  ]);
   addSolidBox(17.5875, 3.8, 14.2, 8.725, 7.6, 0.5, matAlley);
 
+  // Lobby/Auditorium Divider Wall (z = 8.0)
   addSolidBox(0, H * 0.5, 8.0, 25.55, H, 0.5, matTheaterWall);
 
-  addSolidBox(-13.0, H * 0.5, 17.075, 0.45, H, 9.75, matTheaterWall);
-  addSolidBox(-13.0, H * 0.5, -0.5, 0.45, H, 18.6, matTheaterWall);
+  // West Interior Divider Wall (x = -13.0): Lobby West Window (z=19.8) + Auditorium West Window (z=0.5)
+  addSegmentedWallWithWindows('z', -13.0, 12.2, 21.95, 0.45, H, matTheaterWall, 1, [
+    { spawnerId: 'sp_lob_w1', zoneId: 'lobby', label: 'Foyer West Alcove Window', centerAlong: 19.8, baseY: 0.04, entryNodeId: 'lob_w_alcove' },
+  ]);
+  addSegmentedWallWithWindows('z', -13.0, -9.8, 8.8, 0.45, H, matTheaterWall, 1, [
+    { spawnerId: 'sp_aud_w', zoneId: 'auditorium', label: 'Auditorium West Window', centerAlong: 0.5, baseY: 0.64, entryNodeId: 'aud_aisle_w', hallwayDepth: 2.35 },
+  ]);
   addSolidBox(-13.0, H * 0.5, -18.575, 0.45, H, 10.75, matTheaterWall);
   addSolidBox(-13.0, 5.4, 10.5, 0.45, 4.4, 3.4, matTheaterWall);
   addSolidBox(-13.0, 5.4, -11.5, 0.45, 4.4, 3.4, matTheaterWall);
 
-  addSolidBox(13.0, H * 0.5, 17.075, 0.45, H, 9.75, matTheaterWall);
-  addSolidBox(13.0, H * 0.5, -0.5, 0.45, H, 18.6, matTheaterWall);
+  // East Interior Divider Wall (x = 13.0): Lobby East Window (z=19.8) + Auditorium East Window (z=0.5)
+  addSegmentedWallWithWindows('z', 13.0, 12.2, 21.95, 0.45, H, matTheaterWall, -1, [
+    { spawnerId: 'sp_lob_e1', zoneId: 'lobby', label: 'Foyer East Alcove Window', centerAlong: 19.8, baseY: 0.04, entryNodeId: 'lob_e_alcove' },
+  ]);
+  addSegmentedWallWithWindows('z', 13.0, -9.8, 8.8, 0.45, H, matTheaterWall, -1, [
+    { spawnerId: 'sp_aud_e', zoneId: 'auditorium', label: 'Auditorium East Window', centerAlong: 0.5, baseY: 0.64, entryNodeId: 'aud_aisle_e', hallwayDepth: 2.35 },
+  ]);
   addSolidBox(13.0, H * 0.5, -18.575, 0.45, H, 10.75, matTheaterWall);
   addSolidBox(13.0, 5.4, 10.5, 0.45, 4.4, 3.4, matTheaterWall);
   addSolidBox(13.0, 5.4, -11.5, 0.45, 4.4, 3.4, matTheaterWall);
@@ -504,8 +896,8 @@ function buildKinoTheater(
   const screenMesh = new THREE.Mesh(trackGeo(new THREE.PlaneGeometry(15.5, 5.4)), matScreen);
   screenMesh.position.set(0, 4.1, -23.84);
   sceneGroup.add(screenMesh);
-  addSolidBox(-9.5, 3.65, -23.45, 3.8, 5.6, 0.8, matVelvet, 'wood');
-  addSolidBox(9.5, 3.65, -23.45, 3.8, 5.6, 0.8, matVelvet, 'wood');
+  addSolidBox(-8.6, 3.65, -23.45, 2.0, 5.6, 0.8, matVelvet, 'wood');
+  addSolidBox(8.6, 3.65, -23.45, 2.0, 5.6, 0.8, matVelvet, 'wood');
   addSolidBox(0, 6.9, -23.35, 22.8, 0.9, 0.9, matVelvet, 'wood');
   addSolidBox(0, 6.42, -22.88, 22.8, 0.14, 0.12, matBrass, 'metal');
 
@@ -1008,69 +1400,61 @@ function buildKinoTheater(
     }
   };
 
-  // === 10. BARRICADED ZOMBIE ENTRY WINDOWS & SPAWNERS ===
-  const zombieSpawners: ZombieSpawnerDef[] = [
-    { id: 'sp_lob_w1', zoneId: 'lobby', spawnPos: [-12.2, 0, 18.2], entryPos: [-9.8, 0, 18.2], entryNodeId: 'lob_w', yaw: Math.PI * 0.5 },
-    { id: 'sp_lob_e1', zoneId: 'lobby', spawnPos: [12.2, 0, 18.2], entryPos: [9.8, 0, 18.2], entryNodeId: 'lob_e', yaw: -Math.PI * 0.5 },
-    { id: 'sp_lob_sw', zoneId: 'lobby', spawnPos: [-5.5, 0, 21.4], entryPos: [-5.5, 0, 18.5], entryNodeId: 'lob_sw', yaw: Math.PI },
-    { id: 'sp_lob_se', zoneId: 'lobby', spawnPos: [5.5, 0, 21.4], entryPos: [5.5, 0, 18.5], entryNodeId: 'lob_se', yaw: Math.PI },
-    { id: 'sp_ww_1', zoneId: 'west_wing', spawnPos: [-21.4, 0, 4.5], entryPos: [-18.2, 0, 4.5], entryNodeId: 'ww_mid', yaw: Math.PI * 0.5 },
-    { id: 'sp_ww_2', zoneId: 'west_wing', spawnPos: [-21.4, 0, -6.5], entryPos: [-18.2, 0, -6.5], entryNodeId: 'ww_n', yaw: Math.PI * 0.5 },
-    { id: 'sp_ew_1', zoneId: 'east_wing', spawnPos: [21.4, 0, 4.5], entryPos: [18.2, 0, 4.5], entryNodeId: 'ew_mid', yaw: -Math.PI * 0.5 },
-    { id: 'sp_ew_2', zoneId: 'east_wing', spawnPos: [21.4, 0, -6.5], entryPos: [18.2, 0, -6.5], entryNodeId: 'ew_n', yaw: -Math.PI * 0.5 },
-    { id: 'sp_aud_w', zoneId: 'auditorium', spawnPos: [-11.8, 0.55, 0.5], entryPos: [-10.2, 0.55, 0.5], entryNodeId: 'aud_aisle_w', yaw: Math.PI * 0.5 },
-    { id: 'sp_aud_e', zoneId: 'auditorium', spawnPos: [11.8, 0.55, 0.5], entryPos: [10.2, 0.55, 0.5], entryNodeId: 'aud_aisle_e', yaw: -Math.PI * 0.5 },
-    { id: 'sp_stage_w', zoneId: 'auditorium', spawnPos: [-11.5, 0.85, -22.2], entryPos: [-8.8, 0.85, -20.5], entryNodeId: 'stage_l', yaw: Math.PI * 0.25 },
-    { id: 'sp_stage_e', zoneId: 'auditorium', spawnPos: [11.5, 0.85, -22.2], entryPos: [8.8, 0.85, -20.5], entryNodeId: 'stage_r', yaw: -Math.PI * 0.25 },
-  ];
-
-  const slatGeo = trackGeo(new THREE.BoxGeometry(0.14, 0.2, 1.9));
-  const slatInst = new THREE.InstancedMesh(slatGeo, matBarricadeWood, zombieSpawners.length * 3);
-  let slatIdx = 0;
-  for (const sp of zombieSpawners) {
-    for (let k = 0; k < 3; k++) {
-      dummy.position.set(sp.spawnPos[0], sp.spawnPos[1] + 0.65 + k * 0.55, sp.spawnPos[2]);
-      dummy.rotation.set(0, sp.yaw - Math.PI * 0.5, (k - 1) * 0.08);
-      dummy.scale.set(1, 1, 1);
-      dummy.updateMatrix();
-      slatInst.setMatrixAt(slatIdx++, dummy.matrix);
-    }
-  }
-  slatInst.instanceMatrix.needsUpdate = true;
-  slatInst.computeBoundingSphere();
-  sceneGroup.add(slatInst);
-
-  // === 11. ZONE-GATED NAVGRAPH ===
+  // === 10. ZONE-GATED NAVGRAPH (With Staircases, Kiosk Bypass, Stage Ramps & Projector Ramp) ===
   const rawNodes: NavNode[] = [
-    { id: 'lob_c', position: [0, 0.04, 11.2], zoneId: 'lobby', neighbors: ['lob_w', 'lob_e', 'lob_sw', 'lob_se'] },
-    { id: 'lob_w', position: [-9.2, 0.04, 11.0], zoneId: 'lobby', neighbors: ['lob_c', 'lob_sw', 'ww_s'] },
-    { id: 'lob_e', position: [9.2, 0.04, 11.0], zoneId: 'lobby', neighbors: ['lob_c', 'lob_se', 'ew_s'] },
-    { id: 'lob_sw', position: [-6.5, 0.04, 17.6], zoneId: 'lobby', neighbors: ['lob_c', 'lob_w', 'lob_se', 'lob_mez'] },
-    { id: 'lob_se', position: [6.5, 0.04, 17.6], zoneId: 'lobby', neighbors: ['lob_c', 'lob_e', 'lob_sw', 'lob_mez'] },
-    { id: 'lob_mez', position: [0, 3.12, 19.6], zoneId: 'lobby', neighbors: ['lob_sw', 'lob_se'] },
+    // Grand Foyer Ground Level (routed cleanly around Ticket Kiosk at x in [-1.9,1.9], z in [13.8,16.6])
+    { id: 'lob_c', position: [0, 0.04, 11.2], zoneId: 'lobby', neighbors: ['lob_w', 'lob_e', 'lob_w_mid', 'lob_e_mid'] },
+    { id: 'lob_w', position: [-9.2, 0.04, 10.8], zoneId: 'lobby', neighbors: ['lob_c', 'lob_w_mid', 'lob_stair_w_bot', 'ww_s'] },
+    { id: 'lob_e', position: [9.2, 0.04, 10.8], zoneId: 'lobby', neighbors: ['lob_c', 'lob_e_mid', 'lob_stair_e_bot', 'ew_s'] },
+    { id: 'lob_w_mid', position: [-5.5, 0.04, 14.8], zoneId: 'lobby', neighbors: ['lob_c', 'lob_w', 'lob_sw'], isCover: true, coverNormal: [1, 0] },
+    { id: 'lob_e_mid', position: [5.5, 0.04, 14.8], zoneId: 'lobby', neighbors: ['lob_c', 'lob_e', 'lob_se'], isCover: true, coverNormal: [-1, 0] },
+    { id: 'lob_sw', position: [-5.5, 0.04, 19.2], zoneId: 'lobby', neighbors: ['lob_w_mid', 'lob_s_mid', 'lob_w_alcove'] },
+    { id: 'lob_s_mid', position: [0, 0.04, 19.2], zoneId: 'lobby', neighbors: ['lob_sw', 'lob_se'] },
+    { id: 'lob_se', position: [5.5, 0.04, 19.2], zoneId: 'lobby', neighbors: ['lob_e_mid', 'lob_s_mid', 'lob_e_alcove'] },
+    { id: 'lob_w_alcove', position: [-10.5, 0.04, 19.8], zoneId: 'lobby', neighbors: ['lob_sw'] },
+    { id: 'lob_e_alcove', position: [10.5, 0.04, 19.8], zoneId: 'lobby', neighbors: ['lob_se'] },
 
-    { id: 'ww_s', position: [-16.8, 0.04, 10.5], zoneId: 'west_wing', requiredDoorId: 'door_west_wing', neighbors: ['lob_w', 'ww_mid'] },
-    { id: 'ww_mid', position: [-17.5, 0.04, 1.0], zoneId: 'west_wing', neighbors: ['ww_s', 'ww_n'] },
-    { id: 'ww_n', position: [-17.2, 0.04, -11.5], zoneId: 'west_wing', neighbors: ['ww_mid', 'aud_pit_w'] },
+    // Twin Lobby Staircases -> Mezzanine Overlook
+    { id: 'lob_stair_w_bot', position: [-10.6, 0.04, 12.2], zoneId: 'lobby', neighbors: ['lob_w', 'lob_stair_w_mid'] },
+    { id: 'lob_stair_w_mid', position: [-10.6, 1.58, 15.4], zoneId: 'lobby', neighbors: ['lob_stair_w_bot', 'lob_mez_w'] },
+    { id: 'lob_mez_w', position: [-9.8, 3.12, 19.6], zoneId: 'lobby', neighbors: ['lob_stair_w_mid', 'lob_mez'] },
+    { id: 'lob_mez', position: [0, 3.12, 19.8], zoneId: 'lobby', neighbors: ['lob_mez_w', 'lob_mez_e'], isCover: true, coverNormal: [0, -1] },
+    { id: 'lob_mez_e', position: [9.8, 3.12, 19.6], zoneId: 'lobby', neighbors: ['lob_mez', 'lob_stair_e_mid'] },
+    { id: 'lob_stair_e_mid', position: [10.6, 1.58, 15.4], zoneId: 'lobby', neighbors: ['lob_mez_e', 'lob_stair_e_bot'] },
+    { id: 'lob_stair_e_bot', position: [10.6, 0.04, 12.2], zoneId: 'lobby', neighbors: ['lob_e', 'lob_stair_e_mid'] },
 
-    { id: 'ew_s', position: [16.8, 0, 10.5], zoneId: 'east_wing', requiredDoorId: 'door_east_wing', neighbors: ['lob_e', 'ew_mid'] },
-    { id: 'ew_mid', position: [17.5, 0, 1.0], zoneId: 'east_wing', neighbors: ['ew_s', 'ew_n'] },
-    { id: 'ew_n', position: [17.2, 0, -11.5], zoneId: 'east_wing', neighbors: ['ew_mid', 'aud_pit_e'] },
+    // West Dressing Wing
+    { id: 'ww_s', position: [-16.6, 0.04, 10.5], zoneId: 'west_wing', requiredDoorId: 'door_west_wing', neighbors: ['lob_w', 'ww_mid'] },
+    { id: 'ww_mid', position: [-18.2, 0.04, 2.5], zoneId: 'west_wing', neighbors: ['ww_s', 'ww_n'] },
+    { id: 'ww_n', position: [-18.0, 0.04, -7.0], zoneId: 'west_wing', neighbors: ['ww_mid', 'ww_door_aud'] },
+    { id: 'ww_door_aud', position: [-16.8, 0.04, -11.5], zoneId: 'west_wing', neighbors: ['ww_n', 'aud_pit_w'] },
 
-    { id: 'aud_pit_w', position: [-10.6, 0.04, -11.5], zoneId: 'auditorium', neighbors: ['ww_n', 'aud_aisle_w', 'aud_pit_c', 'stage_l'] },
+    // East Moonlit Back Alley
+    { id: 'ew_s', position: [16.6, 0.0, 10.5], zoneId: 'east_wing', requiredDoorId: 'door_east_wing', neighbors: ['lob_e', 'ew_mid'] },
+    { id: 'ew_mid', position: [18.2, 0.0, 2.5], zoneId: 'east_wing', neighbors: ['ew_s', 'ew_n'] },
+    { id: 'ew_n', position: [18.0, 0.0, -7.0], zoneId: 'east_wing', neighbors: ['ew_mid', 'ew_door_aud'] },
+    { id: 'ew_door_aud', position: [16.8, 0.0, -11.5], zoneId: 'east_wing', neighbors: ['ew_n', 'aud_pit_e'] },
+
+    // Main Auditorium & Stage
+    { id: 'aud_pit_w', position: [-10.4, 0.04, -11.5], zoneId: 'auditorium', neighbors: ['ww_door_aud', 'aud_aisle_w', 'aud_pit_c', 'stage_ramp_l'] },
     { id: 'aud_pit_c', position: [0, 0.04, -11.5], zoneId: 'auditorium', neighbors: ['aud_pit_w', 'aud_pit_e', 'aud_center_mid'] },
-    { id: 'aud_pit_e', position: [10.6, 0.04, -11.5], zoneId: 'auditorium', neighbors: ['ew_n', 'aud_aisle_e', 'aud_pit_c', 'stage_r'] },
-    { id: 'aud_aisle_w', position: [-10.6, 0.6, 0], zoneId: 'auditorium', neighbors: ['aud_pit_w', 'aud_back_w'] },
-    { id: 'aud_center_mid', position: [0, 0.6, 0], zoneId: 'auditorium', neighbors: ['aud_pit_c', 'aud_back_c'] },
-    { id: 'aud_aisle_e', position: [10.6, 0.6, 0], zoneId: 'auditorium', neighbors: ['aud_pit_e', 'aud_back_e'] },
-    { id: 'aud_back_w', position: [-10.6, 1.15, 6.2], zoneId: 'auditorium', neighbors: ['aud_aisle_w', 'aud_back_c', 'proj_booth'] },
+    { id: 'aud_pit_e', position: [10.4, 0.04, -11.5], zoneId: 'auditorium', neighbors: ['ew_door_aud', 'aud_aisle_e', 'aud_pit_c', 'stage_ramp_r'] },
+    { id: 'aud_aisle_w', position: [-10.6, 0.64, 0.5], zoneId: 'auditorium', neighbors: ['aud_pit_w', 'aud_back_w'] },
+    { id: 'aud_center_mid', position: [0, 0.64, 0.5], zoneId: 'auditorium', neighbors: ['aud_pit_c', 'aud_back_c'] },
+    { id: 'aud_aisle_e', position: [10.6, 0.64, 0.5], zoneId: 'auditorium', neighbors: ['aud_pit_e', 'aud_back_e'] },
+    { id: 'aud_back_w', position: [-10.8, 1.15, 6.0], zoneId: 'auditorium', neighbors: ['aud_aisle_w', 'aud_back_c', 'proj_ramp'] },
     { id: 'aud_back_c', position: [0, 1.15, 6.2], zoneId: 'auditorium', neighbors: ['aud_back_w', 'aud_back_e', 'aud_center_mid'] },
     { id: 'aud_back_e', position: [10.6, 1.15, 6.2], zoneId: 'auditorium', neighbors: ['aud_aisle_e', 'aud_back_c'] },
-    { id: 'stage_l', position: [-7.5, 0.85, -18.5], zoneId: 'auditorium', neighbors: ['aud_pit_w', 'stage_c'] },
-    { id: 'stage_c', position: [0, 0.85, -18.5], zoneId: 'auditorium', neighbors: ['stage_l', 'stage_r'] },
-    { id: 'stage_r', position: [7.5, 0.85, -18.5], zoneId: 'auditorium', neighbors: ['aud_pit_e', 'stage_c'] },
 
-    { id: 'proj_booth', position: [0, PROJ_Y, 5.6], zoneId: 'projector', requiredDoorId: 'door_projector', neighbors: ['aud_back_w'] },
+    { id: 'stage_ramp_l', position: [-9.2, 0.45, -13.8], zoneId: 'auditorium', neighbors: ['aud_pit_w', 'stage_l'] },
+    { id: 'stage_ramp_r', position: [9.2, 0.45, -13.8], zoneId: 'auditorium', neighbors: ['aud_pit_e', 'stage_r'] },
+    { id: 'stage_l', position: [-9.2, 0.85, -18.8], zoneId: 'auditorium', neighbors: ['stage_ramp_l', 'stage_c'] },
+    { id: 'stage_c', position: [0, 0.85, -18.5], zoneId: 'auditorium', neighbors: ['stage_l', 'stage_r'] },
+    { id: 'stage_r', position: [9.2, 0.85, -18.8], zoneId: 'auditorium', neighbors: ['stage_ramp_r', 'stage_c'] },
+
+    // Projector Booth Ramp & Platform
+    { id: 'proj_ramp', position: [-8.2, 2.65, 6.0], zoneId: 'projector', requiredDoorId: 'door_projector', neighbors: ['aud_back_w', 'proj_booth'] },
+    { id: 'proj_booth', position: [0, PROJ_Y, 5.8], zoneId: 'projector', requiredDoorId: 'door_projector', neighbors: ['proj_ramp'] },
   ];
 
   physics.setRaycastMeshes(raycastMeshes);
@@ -1083,12 +1467,18 @@ function buildKinoTheater(
     raycastMeshes,
     navGraph: buildNavGraph(rawNodes),
     spawnPoints: {
-      teamA: [{ position: [0, 0.04, 11.4], yaw: 0 }],
+      teamA: [
+        { position: [0, 0.04, 11.4], yaw: 0 },
+        { position: [-3.2, 0.04, 11.4], yaw: 0 },
+        { position: [3.2, 0.04, 11.4], yaw: 0 },
+        { position: [-6.0, 0.04, 11.2], yaw: 0 },
+      ],
       teamB: [{ position: [0, 0.85, -18.0], yaw: Math.PI }],
       ffa: [{ position: [0, 0.04, 11.4], yaw: 0 }],
       playerStart: { position: [0, 0.04, 11.4], yaw: 0, zoneId: 'lobby' },
       zombieSpawners,
     },
+    windowBarriers,
     interactables,
     lightingPreset: LIGHTING_PRESET,
     setPowerState,
@@ -1110,6 +1500,45 @@ function buildKinoTheater(
       westLamp.intensity = 4.6 + Math.sin(elapsedSec * 9.2) * 0.45;
       meteorShard.rotation.y = elapsedSec * 0.65;
       meteorLight.intensity = 2.4 + Math.sin(elapsedSec * 2.6) * 0.6;
+
+      // Animate plank tear-off & repair snapping
+      for (let i = 0; i < plankAnimItems.length; i++) {
+        const it = plankAnimItems[i];
+        if (it.state === 'tearing') {
+          it.animT = Math.min(1, it.animT + dt / 0.36);
+          const ease = it.animT * it.animT;
+          it.group.position.copy(it.restPos);
+          it.group.position.addScaledVector(it.outwardDir, ease * 0.85);
+          it.group.position.y -= ease * 0.92;
+          it.group.rotation.set(
+            it.restRot.x + ease * 0.72,
+            it.restRot.y + ease * 0.34,
+            it.restRot.z + ease * 0.48,
+          );
+          if (it.animT >= 1) {
+            it.state = 'removed';
+            it.group.visible = false;
+          }
+        } else if (it.state === 'repairing') {
+          it.animT = Math.min(1, it.animT + dt / 0.24);
+          const inv = 1 - it.animT;
+          const easeInv = inv * inv;
+          it.group.position.copy(it.restPos);
+          // Slide briskly from inside the room onto the window jambs
+          it.group.position.addScaledVector(it.outwardDir, -easeInv * 0.48);
+          it.group.position.y -= easeInv * 0.22;
+          it.group.rotation.set(
+            it.restRot.x - easeInv * 0.25,
+            it.restRot.y,
+            it.restRot.z + easeInv * 0.16,
+          );
+          if (it.animT >= 1) {
+            it.state = 'attached';
+            it.group.position.copy(it.restPos);
+            it.group.rotation.copy(it.restRot);
+          }
+        }
+      }
     },
     dispose: () => {
       scene.remove(sceneGroup);

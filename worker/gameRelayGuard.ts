@@ -32,6 +32,7 @@ const HOST_ONLY_GAME_TYPES = new Set<string>([
   'game:zombie_spawn',
   'game:zombie_killed',
   'game:zombie_hit_player',
+  'game:barrier_update',
   'game:round_complete',
   'game:map_interact',
   'game:map_interact_rejected',
@@ -47,6 +48,7 @@ const ALLOWED_GAME_TYPES = new Set<string>([
   'game:respawn',
   'game:bot_damage',
   'game:zombie_damage',
+  'game:barrier_repair_request',
   'game:map_interact_request',
 ]);
 
@@ -268,6 +270,22 @@ export function validateAndSanitizeGameMessage(
     if (!targetId || !Number.isFinite(rawDmg) || rawDmg <= 0) return null;
     safePayload.targetUserId = targetId;
     safePayload.damage = Math.max(1, Math.min(150, Math.round(rawDmg)));
+  } else if (type === 'game:barrier_repair_request') {
+    const barrierId = String(parsed.barrierId ?? '').trim().slice(0, 64);
+    if (!barrierId) return null;
+    safePayload.barrierId = barrierId;
+    targetUserId = st.hostUserId;
+  } else if (type === 'game:barrier_update') {
+    const barrierId = String(parsed.barrierId ?? '').trim().slice(0, 64);
+    if (!barrierId) return null;
+    safePayload.barrierId = barrierId;
+    safePayload.planksRemaining = Math.floor(clampFinite(parsed.planksRemaining, 0, 12, 0));
+    if (typeof parsed.repairedByUserId === 'string') {
+      safePayload.repairedByUserId = parsed.repairedByUserId.trim().slice(0, 64);
+    }
+    if (parsed.pointsAwarded !== undefined) {
+      safePayload.pointsAwarded = Math.floor(clampFinite(parsed.pointsAwarded, 0, 100, 0));
+    }
   } else if (type === 'game:map_interact_request') {
     const kind = parsed.kind;
     const interactableId = String(parsed.interactableId ?? '').trim().slice(0, 64);

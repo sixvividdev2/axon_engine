@@ -50,6 +50,7 @@ interface MainMenuHubProps {
 }
 
 const BOT_COUNTS = [4, 6, 8, 10] as const;
+const INFECTION_BOT_COUNTS = [0, 1, 2, 3] as const;
 const KILL_LIMITS = [20, 30, 40, 50] as const;
 const DIFFICULTIES: Array<{ id: BotDifficultyId; label: string }> = [
   { id: 'recruit', label: 'Recruit' },
@@ -655,10 +656,77 @@ export const MainMenuHub: React.FC<MainMenuHubProps> = ({
                 <MapSelector
                   maps={ZOMBIE_MAPS}
                   selectedMapId={infectionConfig.mapId}
-                  onSelectMap={(mapId) => setInfectionConfig({ mapId })}
+                  onSelectMap={(mapId) =>
+                    setInfectionConfig((prev) => ({
+                      ...prev,
+                      mapId,
+                    }))
+                  }
                   theme="infection"
                   infectionRecords={infectionRecords}
                 />
+              </div>
+
+              {/* Friendly AI Squadmates (0–3 filling 4-operator squad) & Difficulty */}
+              <div className="grid grid-cols-1 gap-3 border border-red-950/80 bg-neutral-950/88 p-4 md:grid-cols-12">
+                <div className="md:col-span-5">
+                  <div className="font-mono-tabular text-[10px] uppercase tracking-[0.18em] text-sky-300">
+                    Friendly AI Squadmates (0–3)
+                  </div>
+                  <div className="mt-0.5 font-mono-tabular text-[11px] text-neutral-400">
+                    Always allied · fills remaining slots in your 4-operator squad
+                  </div>
+                </div>
+                <div className="flex items-center gap-1.5 md:col-span-4">
+                  {INFECTION_BOT_COUNTS.map((cnt) => {
+                    const active = (infectionConfig.botCount ?? 0) === cnt;
+                    return (
+                      <button
+                        key={cnt}
+                        type="button"
+                        onClick={() =>
+                          setInfectionConfig((prev) => ({
+                            ...prev,
+                            botCount: cnt,
+                          }))
+                        }
+                        className={`flex-1 cursor-pointer border py-2 font-mono-tabular text-xs font-semibold transition-colors ${
+                          active
+                            ? 'border-sky-400 bg-sky-500/20 text-sky-200'
+                            : 'border-neutral-800 bg-neutral-900 text-neutral-400 hover:border-neutral-600 hover:text-neutral-200'
+                        }`}
+                      >
+                        {cnt === 0 ? 'Solo' : `${cnt} Bot${cnt > 1 ? 's' : ''}`}
+                      </button>
+                    );
+                  })}
+                </div>
+                <div className="flex items-center gap-1 md:col-span-3">
+                  {DIFFICULTIES.map((d) => {
+                    const active = (infectionConfig.botDifficulty ?? 'tactical') === d.id;
+                    const disabled = (infectionConfig.botCount ?? 0) === 0;
+                    return (
+                      <button
+                        key={d.id}
+                        type="button"
+                        disabled={disabled}
+                        onClick={() =>
+                          setInfectionConfig((prev) => ({
+                            ...prev,
+                            botDifficulty: d.id,
+                          }))
+                        }
+                        className={`flex-1 cursor-pointer border py-2 font-mono-tabular text-[10px] font-semibold uppercase transition-colors disabled:opacity-35 ${
+                          active
+                            ? 'border-red-500 bg-red-600/25 text-red-100'
+                            : 'border-neutral-800 bg-neutral-900 text-neutral-400 hover:text-neutral-200'
+                        }`}
+                      >
+                        {d.label}
+                      </button>
+                    );
+                  })}
+                </div>
               </div>
 
               {/* Starting Belt Grenade Selector for Infection */}
@@ -700,14 +768,16 @@ export const MainMenuHub: React.FC<MainMenuHubProps> = ({
 
               <div className="flex flex-wrap items-center justify-between gap-3 border-t border-red-950/80 pt-3">
                 <div className="font-mono-tabular text-[11px] text-neutral-300">
-                  Buyable Doors · Backstage Power Switch · Wall-Buys &amp; Ammo Refills · 950 PTS
-                  Mystery Crate · Vitality &amp; Rapid Handling Perks
+                  Hold [F] Repair Window Barriers (+5 PTS) · Buyable Doors · Backstage Power ·
+                  Wall-Buys &amp; Mystery Crate · Allied Bots
                 </div>
                 <button
                   type="button"
                   onClick={() =>
                     onLaunchInfection({
                       ...infectionConfig,
+                      botCount: infectionConfig.botCount ?? 0,
+                      botDifficulty: infectionConfig.botDifficulty ?? 'tactical',
                       tacticalEquipmentId: tacticalSelection.equipmentId,
                     })
                   }
