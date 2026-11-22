@@ -1,0 +1,6 @@
+{
+  "name": "Cordon-04 // Bodycam Survival",
+  "description": "Post-apocalyptic bodycam survival FPS featuring decoupled free-aim, real-world projectile ballistics, sound-driven zombie AI, and persistent IndexedDB saves.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

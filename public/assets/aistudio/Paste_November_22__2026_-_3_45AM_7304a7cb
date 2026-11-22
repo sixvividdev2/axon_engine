@@ -1,0 +1,355 @@
+animate the attach / remove suppressor function realistically, where he twists the supressor off naturally and stows it, blocks shooting while your doing that. Also only allow this to work IF your weapon HAS a supressor (i.e it has one already on it, or has one attached from the gunsmith bench - a gun that never had a suppressor cant make one appear).
+
+
+
+
+
+
+
+
+Do NOT write code or edit files yet. Stay in Plan Mode.
+
+First, inspect my existing project files (player controller, camera/bodycam setup, weapon system, physics/ragdoll setup, and any existing 3D models/assets in public/ or src/).
+
+Then compare my existing codebase against the architecture plan below and give me:
+1. Answers to the 4 "Open Questions" based on what is actually in my repo (plus flag if real .glb operator assets exist yet or if we need a contract-compliant dev proxy rig first).
+2. Any file path adjustments needed so the new modules fit cleanly into my current folder structure.
+3. A step-by-step 5-phase build checklist (Phase 1: Preview UI & Store, Phase 2: Validator & Spawn, Phase 3: Weapon Socket & IK, Phase 4: Secondary Physics Solver, Phase 5: Ragdoll & Tests) where each phase leaves the app compiling and runnable.
+
+Wait for my approval before switching to Build Mode or editing any files.
+
+---
+
+
+
+# Pre-Implementation Plan: Bodycam FPS Operator Selection, Shared Rig Contract & Secondary Physics
+
+---
+
+## 1. Architecture Overview
+
+The feature introduces a **selectable `MALE` / `FEMALE` operator pipeline** built on a single shared skeletal/socket/collider contract so all weapons, animations, bodycam sightlines, world shadows, and ragdolls operate identically without per-operator or per-weapon hacks.
+
+### Core Architectural Pillars
+1. **Isolated Preview Stage & Selection Persistence (`Pre-Deployment`)**:
+   - A dedicated lightweight `THREE.Scene` + three-point tactical lighting rig renders the selected operator in an interactive turntable preview (pointer-drag orbit with inertia, clamped pitch/zoom, idle/weapon-ready pose).
+   - Selection is persisted to versioned browser storage (`localStorage`) with in-memory fallback and query-parameter override (`?operator=male|female`) for deterministic test automation.
+2. **Contract-First Asset Loader & Rig Parity Gate (`Load Time`)**:
+   - Both `operator_male.glb` and `operator_female.glb` are validated on load against a single `OperatorRigManifest` schema before entering the active scene or preview.
+   - Missing bones, sockets, IK targets, morph channels, or hit-zone colliders produce a structured `RigValidationReport`. Production runtime triggers a safe fallback to the verified default operator; CI/test builds fail fast in `STRICT` mode.
+3. **Unified Bodycam Rig (`Runtime Presentation`)**:
+   - First-person bodycam viewmodel, world shadow silhouette, and ragdoll states drive **one canonical `THREE.SkinnedMesh` hierarchy** rather than separate viewmodel vs. third-person skeletons.
+   - A dedicated `socket_bodycam_mount` (upper-chest/collarbone mount) or camera-synced neck/chest visibility mask ensures downward pitch reveals torso, plate carrier, arms, and legs cleanly while excluding head/helmet geometry from obstructing the lens (retaining head/helmet shadow casting via shadow-pass material/layer handling).
+4. **Fixed-Step Allocation-Free Secondary Physics (`Simulation Loop`)**:
+   - A Structure-of-Arrays (SoA) `Float32Array` damped harmonic spring solver runs in a fixed-timestep accumulator (`120 Hz`), consuming kinematic deltas and weapon recoil impulses to drive **clamped additive offsets** on dedicated secondary bones and/or corrective morph targets.
+   - Rigid tactical gear (plate carrier, pouches, holsters, rigid straps) remains parented exclusively to primary skeletal bones so secondary soft-tissue motion never unseats equipment.
+
+```
++-----------------------------+      persists ID      +-------------------------------+
+| OperatorSelectUI & Preview  | --------------------> | OperatorSelectionStore        |
+| (Isolated Scene + Orbit)    |                       | (localStorage + test override)|
++-----------------------------+                       +---------------+---------------+
+                                                                      | reads on spawn
+                                                                      v
++-----------------------------+    validates GLB      +-------------------------------+
+| OperatorAssetLoader         | --------------------> | PlayerSpawnController         |
+| + RigParityValidator        |   RigValidationReport | (Spawns BodycamRig + Ragdoll) |
++-----------------------------+                       +---------------+---------------+
+                                                                      |
+         +------------------------------------------------------------+
+         | per-frame & fixed-step runtime
+         v
++-----------------------------+    kinematics/recoil  +-------------------------------+
+| AnimationMixer + 2-Bone IK  | --------------------> | SecondarySpringSolver (120Hz) |
+| (Base pose + Left-Hand IK)  |                       | (Flat Float32Array, 0 allocs) |
++--------------+--------------+                       +---------------+---------------+
+               |                                                      | clamped offsets
+               +-------------------------->+--------------------------+
+                                           v
+                              +-------------------------+
+                              | SkinnedMesh & Sockets   |
+                              | (Bodycam / Shadows /    |
+                              |  Weapon / Ragdoll Sync) |
+                              +-------------------------+
+```
+
+---
+
+## 2. File & Module Plan
+
+```text
+src/
+├── operator/
+│   ├── OperatorTypes.ts                 # OperatorId ('MALE' | 'FEMALE'), asset metadata, state enums
+│   ├── OperatorSelectionStore.ts        # Persisted selection (localStorage), validation, test URL override
+│   ├── OperatorRigContract.ts           # Canonical bone names, sockets, IK targets, hit-zones, scale/pose rules
+│   ├── OperatorAssetManifest.ts         # JSON/TS manifest definitions & per-operator secondary physics presets
+│   ├── OperatorRigValidator.ts          # Runtime schema/parity checker + RigValidationReport + fallback logic
+│   └── OperatorAssetLoader.ts           # GLTFLoader wrapper, texture/LOD setup, caching, validator integration
+├── ui/
+│   └── operator-select/
+│       ├── OperatorSelectController.ts  # State binding between DOM UI, selection store, and 3D preview
+│       ├── OperatorPreviewStage.ts      # Isolated Three.js scene, 3-point lighting, rotatable platform, idle anim
+│       └── OperatorSelectView.ts        # Accessible DOM/CSS overlay (MALE/FEMALE toggle, stats/deploy CTA)
+├── player/
+│   ├── PlayerSpawnController.ts         # Consumes persisted selection, initializes rig, camera, and weapons
+│   ├── BodycamRigController.ts          # Unified SkinnedMesh manager: AnimMixer, weapon attach, head/shadow mask
+│   ├── TwoBoneIKSolver.ts               # Allocation-free analytic 2-bone IK (left hand -> weapon grip target)
+│   ├── WeaponSocketCoordinator.ts       # Attaches weapon rig to socket_weapon_r, resolves ADS & inspect offsets
+│   └── HitZoneRagdollController.ts      # Maps hit-zone colliders & swaps/blends SkinnedMesh to physics ragdoll
+├── physics/
+│   ├── SecondarySpringSolver.ts         # Allocation-free fixed-step damped harmonic spring solver (SoA Float32Array)
+│   ├── SecondaryPhysicsChannels.ts      # Channel descriptors (female chest/glute, male bicep/tricep/forearm)
+│   └── SecondaryRigApplier.ts           # Writes clamped solver outputs to secondary bones / morphTargetInfluences
+└── telemetry/
+    └── RuntimePerfMonitor.ts            # Frame-time budget tracking & optional dev allocation/bounds telemetry
+
+tests/
+├── unit/
+│   ├── OperatorRigValidator.test.ts     # Missing bone/socket/collider detection, fallback behavior, parity diff
+│   ├── SecondarySpringSolver.test.ts    # Determinism, impulse response, clamp saturation, zero-alloc check
+│   └── OperatorSelectionStore.test.ts   # Persistence round-trip, corrupted storage fallback, URL override
+├── integration/
+│   ├── SpawnAndSwapFlow.test.ts         # Selection -> Spawn -> Bodycam rig init -> Weapon socket attach
+│   ├── IKAndADSAlignment.test.ts        # Left-hand IK error & ADS sightline centerline checks across operators
+│   └── RagdollTransition.test.ts        # Hit-zone mapping & skeletal bone-to-ragdoll body alignment
+└── e2e/
+    ├── bodycam-pose-matrix.spec.ts      # Playwright WebGL harness capturing pose/camera screenshots & metrics
+    └── fixtures/
+        └── parity-bad-rig.glb           # Deliberately broken GLB fixture for validator negative testing
+```
+
+---
+
+## 3. Asset Contract & Validation Rules
+
+### 3.1 Upstream Authoring Boundary (Strict)
+- **Authored in DCC (Blender/Maya/Substance) & exported as `.glb`**:
+  - Anatomical body sculpting, edge-loop topology, UVs, PBR textures (Albedo, Normal, ORM), cloth/gear draping, skin weights, and hand-to-grip reference poses.
+  - Dedicated secondary deformation bones (and/or subtle corrective morph targets for male arm flex/jiggle) authored cleanly so rigid gear weights remain 100% bound to primary structural bones (`spine_02`, `spine_03`, `pelvis`, etc.).
+- **Prohibited at Runtime**:
+  - No procedural mesh sculpting, skin-weight painting, vertex buffer rebuilding, or per-frame normal recalculation.
+
+### 3.2 Shared Rig Contract (`OperatorRigContract`)
+
+| Contract Domain | Canonical Requirement (Identical for `MALE` & `FEMALE`) |
+| :--- | :--- |
+| **Coordinate & Scale** | Units in meters (`1.0 unit = 1.0m`); `+Y` up; `+Z` character forward (glTF 2.0 standard); root origin `(0, 0, 0)` between feet on ground plane; bind pose A-pose (`35°` arm abduction) with zero non-uniform scale (`scale = [1, 1, 1]`). |
+| **Primary Skeleton Bones** | `root`, `pelvis`, `spine_01`, `spine_02`, `spine_03`, `neck_01`, `head`, `clavicle_l/r`, `upperarm_l/r`, `lowerarm_l/r`, `hand_l/r`, `thigh_l/r`, `calf_l/r`, `foot_l/r`, `toe_l/r` (+ standard finger hierarchy `thumb/index/middle/ring/pinky_01..03_l/r`). |
+| **Secondary Soft-Tissue Bones** *(present in both rigs; unused channels weighted `0` or locked)* | `sec_chest_l`, `sec_chest_r` (parent: `spine_03`)<br>`sec_glute_l`, `sec_glute_r` (parent: `pelvis`)<br>`sec_bicep_l`, `sec_bicep_r`, `sec_tricep_l`, `sec_tricep_r` (parent: `upperarm_l/r`)<br>`sec_forearm_l`, `sec_forearm_r` (parent: `lowerarm_l/r`) |
+| **Sockets & Mounts** | `socket_weapon_r` (child of `hand_r`), `socket_weapon_holster` (child of `pelvis` or `thigh_r`), `socket_bodycam_mount` (child of `spine_03`, positioned forward of upper chest/plate carrier to clear gear). |
+| **IK Targets & Hints** | On Weapon GLB: `ik_hand_l_target`, `ik_hand_r_target` (grip alignment). On Operator Rig: `ik_pole_elbow_l`, `ik_pole_elbow_r`. |
+| **Hit-Zone Collider Nodes** | Named empty/collider nodes or bounding proxies mapped 1:1: `hz_head`, `hz_neck`, `hz_chest`, `hz_abdomen`, `hz_pelvis`, `hz_upperarm_l/r`, `hz_forearm_l/r`, `hz_hand_l/r`, `hz_thigh_l/r`, `hz_calf_l/r`, `hz_foot_l/r`. |
+| **Animation Compatibility** | Retarget-free playback of shared `AnimationClip` tracks targeting canonical bone names; normalized rest-pose bone orientations so rotation-only animation tracks produce identical weapon angles. |
+| **LOD & Budget** | `LOD0` (Preview & First-Person/Active World): `<= 55k` tris, `<= 4` PBR material slots, max `2048x2048` textures; `LOD1` (Mid-range world): `<= 22k` tris; `LOD2` (Distant/Shadow): `<= 8k` tris. |
+
+### 3.3 Manifest Schema & Validation Rules
+Each operator ships with a manifest entry checked by `OperatorRigValidator` against the parsed `GLTF` scene graph:
+1. **Structural Completeness**: Every required bone, secondary bone, socket, IK pole, and hit-zone node exists and is unique (no duplicate names).
+2. **Hierarchy & Parenting Parity**: Exact parent-child chain match against `CANONICAL_BONE_PARENTS` (e.g., `socket_weapon_r.parent.name === 'hand_r'`).
+3. **Transform Sanity**: Root and bone scales within `1.0 ± 0.001`; `socket_bodycam_mount` forward offset lies outside torso collision bounds.
+4. **Cross-Operator Parity Check (Boot / CI Gate)**: Compares `MALE` vs. `FEMALE` parsed hierarchies, bone local rest axes (`dot(axisMale, axisFemale) > 0.999`), and clip track target coverage.
+5. **Failure & Fallback Behavior**:
+   - Returns `RigValidationReport { valid: boolean, operatorId, errors: ValidationIssue[], warnings: ValidationIssue[] }`.
+   - **`STRICT` mode (CI/Tests)**: Throws `RigContractViolationError` with diff report.
+   - **`SAFE_FALLBACK` mode (Browser Runtime)**: Logs structured error telemetry, blocks spawning the broken rig, and swaps to the verified fallback operator (`MALE` by default; if both fail, spawns a minimal diagnostic proxy with warning banner rather than crashing the render loop).
+
+---
+
+## 4. End-to-End Data Flow
+
+### 4.1 Pre-Deployment to Spawn Flow
+1. `OperatorSelectView` initializes `OperatorSelectionStore` (reads `localStorage` key `bfps.operator.v1`, validates `'MALE' | 'FEMALE'`).
+2. `OperatorSelectController` requests `OperatorAssetLoader.loadOperator(selectedId)` -> runs `OperatorRigValidator` -> mounts validated `LOD0` rig onto `OperatorPreviewStage` turntable.
+3. User rotates preview (pointer drag updates turntable yaw/pitch within clamped bounds) and toggles `MALE` / `FEMALE`; `OperatorSelectionStore` persists selection immediately.
+4. User clicks **Deploy**: `OperatorPreviewStage` disposes preview-only render targets/listeners (retaining cached GLTF/textures in `OperatorAssetLoader`), and `PlayerSpawnController` reads `OperatorSelectionStore.getSelected()` to instantiate `BodycamRigController` + `HitZoneRagdollController`.
+
+### 4.2 Per-Frame & Fixed-Step Runtime Data Flow
+
+```
+[1. Gameplay Inputs]
+  - Player world velocity (v_world), ground state, crouch factor, stride phase/cadence
+  - Discrete impulses: jumpImpulse, landingImpulse, weaponRecoilImpulse (vec3)
+        |
+        v
+[2. Animation & Kinematics Update (Variable dt)]
+  - AnimationMixer.update(dt) -> writes base local transforms to primary bones
+  - Update world matrices for spine/weapon chain -> resolve socket_weapon_r
+  - TwoBoneIKSolver.solve() -> adjusts upperarm_l / lowerarm_l / hand_l to lock onto weapon's ik_hand_l_target
+        |
+        v
+[3. Kinematic Feature Extraction (Zero-alloc scratch vectors)]
+  - Transform world velocity & head/torso angular velocity into operator local space (spine_03 / pelvis frames)
+  - Compute stride vertical/lateral excitation from locomotion cadence
+  - Enqueue pending jump/landing/recoil impulses into SecondarySpringSolver accumulator
+        |
+        v
+[4. Fixed-Step Secondary Physics Loop (120 Hz, max 4 substeps/frame)]
+  - Accumulator += clampedFrameDt
+  - While accumulator >= FIXED_DT:
+      - Step all active Float32Array SoA spring channels (stiffness, damping, mass, external accel + queued impulses)
+      - Enforce velocity clamp & position displacement clamp per channel
+      - Clear consumed impulse queue; accumulator -= FIXED_DT
+  - Compute interpolation alpha = accumulator / FIXED_DT (optional linear blend between prevOffset & currOffset)
+        |
+        v
+[5. Clamped Offset Application (SecondaryRigApplier)]
+  - Write clamped translational/rotational deltas to dedicated sec_* bone local transforms (Additive over rest offset)
+  - Write optional clamped bicep/tricep/forearm flex/jiggle weights to morphTargetInfluences
+  - Rigid gear bones remain untouched by secondary offsets
+        |
+        v
+[6. SkinnedMesh & Camera Sync]
+  - scene.updateMatrixWorld() / skeleton.update() uploads bone textures to GPU
+  - Sync bodycam THREE.PerspectiveCamera to socket_bodycam_mount (with ADS/headbob blend)
+  - Apply head/helmet first-person visibility mask (preserving shadow cast)
+  - Sync HitZoneRagdollController bounding capsules/OBBs to current bone matrices (or hand over bone transforms from physics world on death)
+```
+
+---
+
+## 5. Physics Solver API & Clamp Specification
+
+### 5.1 Design Rules
+- **Allocation-Free Steady State**: All channel states live in pre-allocated `Float32Array` buffers sized at initialization (`MAX_CHANNELS = 16`, 3 scalar axes per 3D channel = up to 48 scalar springs). Zero `new`, zero closures, zero array allocations inside `step()` or `update()`.
+- **Update Order inside Fixed Step (`FIXED_DT = 1 / 120`, `MAX_SUBSTEPS = 4`)**:
+  1. Latch and decay frame impulses into channel velocity (`vel += impulse * impulseScale / mass`).
+  2. Compute external driving acceleration from local-space body acceleration, gravity projection, and stride/recoil terms.
+  3. Integrate semi-implicit Euler spring-damper:
+     - `acc = (-k * pos - c * vel + externalForce) / mass`
+     - `vel = clamp(vel + acc * dt, -maxVel, maxVel)`
+     - `pos = clamp(pos + vel * dt, minPos, maxPos)`
+     - If `pos` hits clamp boundary and `vel` pushes outward, zero/damp outward `vel` (`vel *= -restitution`, default `0.0` to prevent boundary buzzing).
+  4. Decay transient impulses after consumption.
+
+### 5.2 Solver TypeScript API Contract
+
+```typescript
+export type SecondaryChannelId =
+  | 'CHEST_L' | 'CHEST_R'
+  | 'GLUTE_L' | 'GLUTE_R'
+  | 'BICEP_L' | 'BICEP_R'
+  | 'TRICEP_L' | 'TRICEP_R'
+  | 'FOREARM_L' | 'FOREARM_R';
+
+export interface SecondaryChannelConfig {
+  id: SecondaryChannelId;
+  targetBoneName: string;       // e.g. 'sec_chest_l'
+  morphTargetName?: string;     // optional subtle volume/flex morph
+  enabled: boolean;             // operator preset enables/disables
+  stiffness: [number, number, number]; // N/m per local axis (X lateral, Y vertical, Z depth)
+  damping: [number, number, number];   // Ns/m per local axis
+  mass: number;                        // effective mass (kg)
+  minOffsetMeters: [number, number, number];
+  maxOffsetMeters: [number, number, number];
+  maxVelocityMps: number;
+  recoilCoupling: number;       // 0..1 scaling of weapon recoil impulse
+  strideCoupling: number;       // 0..1 scaling of locomotion cadence wave
+  rotationalCouplingRad: [number, number, number]; // pitch/yaw/roll rad per meter of displacement
+}
+
+export interface SecondarySolverInputs {
+  frameDeltaSec: number;        // clamped upstream to <= 0.05s
+  localAccelX: number;          // m/s^2 in torso/limb local frame
+  localAccelY: number;
+  localAccelZ: number;
+  stridePhaseRad: number;       // continuous gait phase [0, 2*PI)
+  strideSpeedNorm: number;      // 0 (idle) .. 1 (sprint)
+  recoilImpulseX: number;       // instantaneous N*s-equivalent kick
+  recoilImpulseY: number;
+  recoilImpulseZ: number;
+  landingImpulseY: number;      // downward impact impulse on touchdown
+}
+
+export interface ISecondarySpringSolver {
+  configure(configs: readonly SecondaryChannelConfig[]): void;
+  reset(): void;
+  /** Advances fixed-step accumulator; zero heap allocations. */
+  step(inputs: Readonly<SecondarySolverInputs>): void;
+  /** Writes interpolated clamped offsets into caller's pre-allocated Float32Array (len = channels * 3). */
+  readPositionOffsets(outOffsets: Float32Array): void;
+  readRotationOffsets(outEulerRad: Float32Array): void;
+}
+```
+
+### 5.3 Internal SoA Buffer Layout (`MAX_SCALAR_SPRINGS = 48`)
+- `pos: Float32Array(48)` / `prevPos: Float32Array(48)` / `vel: Float32Array(48)`
+- `stiffness: Float32Array(48)` / `damping: Float32Array(48)` / `invMass: Float32Array(48)`
+- `minPos: Float32Array(48)` / `maxPos: Float32Array(48)` / `maxVel: Float32Array(48)`
+- `recoilScale: Float32Array(48)` / `strideScale: Float32Array(48)`
+- Single pre-allocated `SecondarySolverInputs` reusable struct owned by `BodycamRigController`.
+
+### 5.4 Channel Tuning & Strict Clamp Bounds
+
+| Operator | Channel Group | Stiffness `(X, Y, Z)` | Damping Ratio ($\zeta$) | Effective Mass | Max Linear Clamp (Meters) | Max Rotational Clamp | Max Velocity |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **FEMALE** | `CHEST_L / R` | `(160, 140, 180)` | `0.55` (underdamped subtle settle) | `0.45 kg` | `X: ±0.008`, `Y: [-0.014, +0.010]`, `Z: [-0.006, +0.010]` | `±0.06 rad` (~3.4°) | `0.45 m/s` |
+| **FEMALE** | `GLUTE_L / R` | `(210, 190, 220)` | `0.62` | `0.75 kg` | `X: ±0.006`, `Y: [-0.010, +0.008]`, `Z: ±0.008` | `±0.04 rad` (~2.3°) | `0.35 m/s` |
+| **FEMALE** | `BICEP / TRICEP / FOREARM` | Disabled or micro (`> 350`) | `0.85` | `0.25 kg` | `±0.002` | `±0.015 rad` | `0.15 m/s` |
+| **MALE** | `BICEP_L / R`, `TRICEP_L / R` | `(320, 300, 340)` | `0.78` (tight micro-oscillation) | `0.35 kg` | `X: ±0.003`, `Y: ±0.004`, `Z: ±0.003` | `±0.02 rad` (~1.1°) | `0.22 m/s` |
+| **MALE** | `FOREARM_L / R` | `(420, 400, 420)` | `0.82` | `0.22 kg` | `X: ±0.002`, `Y: ±0.003`, `Z: ±0.002` | `±0.015 rad` | `0.18 m/s` |
+| **MALE** | `CHEST / GLUTE` | Disabled (`enabled: false`) | — | — | `0.0` (locked) | `0.0` | `0.0` |
+
+> **Gear Stability Guarantee**: Total female chest displacement is strictly bounded to `<= 14 mm` vertically and `<= 10 mm` forward, keeping plate carrier straps and tactical chest rigs clear via authored clearance (`>= 18 mm` strap/rig standoff in rest pose + non-deforming gear bones).
+
+---
+
+## 6. Acceptance & Test Plan
+
+### 6.1 Automated Test Suites (Vitest + Headless WebGL / Playwright)
+
+| Check Category | Test Mechanism | Quantitative Pass Criteria |
+| :--- | :--- | :--- |
+| **Rig Parity & Validator** | Unit + Integration (`OperatorRigValidator.test.ts`) | `0` missing bones/sockets/IK targets/hit-zones across `MALE` & `FEMALE`; rest-pose bone axis dot product `> 0.999`; broken fixture triggers `RigValidationReport.valid === false` and safe fallback to `MALE` in runtime mode. |
+| **Selection Persistence** | Unit (`OperatorSelectionStore.test.ts`) | Round-trip save/load for `MALE` and `FEMALE`; invalid stored value falls back cleanly to `'MALE'`; URL override takes precedence cleanly. |
+| **Weapon Socket & Grip Alignment** | Integration (`IKAndADSAlignment.test.ts`) | `weapon_root` world delta from `socket_weapon_r` `< 0.5 mm` (`0.0005 m`) and `< 0.1°`; right-hand palm grip origin error `< 2.0 mm` for all weapon configs (no per-weapon special cases). |
+| **Left-Hand IK Convergence** | Integration (`IKAndADSAlignment.test.ts`) | Distance between `hand_l` grip anchor and weapon `ik_hand_l_target` `< 3.0 mm` across `idle`, `sprint`, `crouch`, `ADS`, and post-recoil frames for both operators. |
+| **ADS Sightline Alignment** | Integration + Render Check | Optic reticle/iron-sight axis aligns within `< 1.0 px` (or `< 0.25 mrad`) of screen center `(0.5, 0.5)` during ADS for both `MALE` and `FEMALE`; center `20%` viewport radius contains `0` body/gear/strap pixels blocking optic aperture. |
+| **Bodycam Downward Pitch Occlusion** | Playwright Visual + Depth/Bounds Check (`bodycam-pose-matrix.spec.ts`) | At `-65°` and `-85°` downward camera pitch, upper chest/plate carrier/arms/legs are visible in frame, `0` head/helmet triangles intersect camera near-plane (`near = 0.05m`), and weapon/optic clearance remains unobstructed when raising back to `0°`. |
+| **Gear/Strap Clipping Bounds** | Bounding-Box / Surface Clearance Telemetry | Secondary bone world-space offsets never exceed configured clamp bounds; AABB/capsule overlap checks between `sec_chest_*` proxy spheres and plate-carrier inner surface remain `>= 2.0 mm` clearance under max sprint + landing impulse. |
+| **Ragdoll Transition** | Integration (`RagdollTransition.test.ts`) | All 15 `hz_*` hit-zone colliders map 1:1 to ragdoll bodies; frame-0 ragdoll handoff preserves bone world positions within `< 2.0 mm` and orientation within `< 0.5°` (zero visual pop/teleport). |
+| **Zero Per-Frame Allocations** | Unit (`SecondarySpringSolver.test.ts`) + Chrome DevTools Heap Snapshot | Spy/counter + V8 `--trace-gc` / `performance.memory` / allocation timeline over `10,000` consecutive `step()` + `readPositionOffsets()` calls shows `0` bytes allocated and `0` GC pauses triggered by the physics loop. |
+| **Frame-Time Budget** | Perf Benchmark (Desktop mid-tier GPU / Headless SwiftShader baseline) | Secondary physics solver + IK + rig offset application `< 0.35 ms` / frame total on reference CPU; preview stage steady `60 fps` (`< 16.6 ms` frame time); gameplay rig delta `< 0.8 ms` CPU overhead vs. baseline rig. |
+
+### 6.2 Camera & Pose Verification Matrix
+Executed automatically via Playwright headless WebGL harness (`bodycam-pose-matrix.spec.ts`) for **both `MALE` and `FEMALE`**, generating golden reference screenshots + pixel/depth assertions:
+
+| Pose / State | Camera Pitch / Mode | Assertions Captured |
+| :--- | :--- | :--- |
+| **Pre-Deployment Preview** | Turntable `0°`, `45°`, `180°`, `270°` yaw | Lit silhouette, turntable rotation responsiveness, zero Z-fighting on gear/straps, clean switching `MALE <-> FEMALE`. |
+| **Idle (Bodycam)** | `0°` level & `-45°` down | Weapon ready posture, unobstructed center sightline, chest/arms visible at `-45°`. |
+| **Steep Downward Pitch (Bodycam)** | `-70°` & `-85°` pitch (both operators) | Explicit occlusion check: female chest/plate carrier never clips near-plane or obscures lower weapon grip; no stray head/neck inside lens. |
+| **Sprint** | `0°` level & `-35°` down | Secondary spring excitation visible on chest/glute (F) & arms (M) within clamp limits; left-hand IK stays locked on handguard. |
+| **Crouch** | `0°` level & `-60°` down | Thigh/pelvis/chest clearance maintained; glute/chest clamps prevent gear penetration during crouch transition. |
+| **ADS (Aim Down Sights)** | `0°` level + recoil impulse burst | Optic reticle centered; zero torso/strap/shoulder intrusion into sight aperture; recoil impulse triggers bounded micro-settle without shifting optic alignment. |
+| **Reload** | `0°` level & `-25°` down | Left-hand IK blend weight smoothly transitions `1 -> 0 -> 1` for magazine swap; weapon stays anchored to `socket_weapon_r`. |
+| **Weapon Inspection** | `0°` level | Full weapon + forearms/hands visible cleanly; male forearm/bicep micro-motion bounded; no hand-to-receiver clipping. |
+| **Ragdoll Transition** | Third-person observer cam + bodycam death cam | Impact on `hz_chest` / `hz_head` triggers seamless animated-to-ragdoll handoff; secondary springs decay smoothly to zero on death. |
+
+---
+
+## 7. Technical Risks, Open Questions & Responsibility Split
+
+### 7.1 Technical Risks & Mitigations
+
+| Risk | Severity | Mitigation Strategy |
+| :--- | :--- | :--- |
+| **Female chest/plate-carrier clipping under high downward pitch or sprint+landing impulses** | High | Author `>= 18 mm` tactical vest/strap clearance in rest pose, strictly clamp `sec_chest_*` Z/Y displacement (`<= 10-14 mm`), and verify via automated `-70°/-85°` bodycam screenshot & proxy overlap tests. |
+| **Head/helmet geometry blocking bodycam lens while still needing world shadow silhouette** | High | Isolate head/helmet into a distinct submesh/material group; render with a shadow-only/first-person-hidden state (or dedicated `THREE.Layers` camera exclusion verified against `WebGLShadowMap`) rather than scaling `head` bone to `0` (which breaks shadow silhouettes). |
+| **Animation retargeting drift between Male and Female shoulder widths** | Medium | Enforce identical bone rest-pose orientations and pelvis-to-hand reach tolerances in `OperatorRigValidator`, plus runtime `TwoBoneIKSolver` on the left arm so hand-to-weapon grip never floats regardless of torso proportions. |
+| **Three.js `AnimationMixer` overwriting secondary bone offsets** | Medium | Keep primary animations targeting primary bones (`spine_03`, `upperarm_l`, etc.) and apply secondary physics exclusively to dedicated child bones (`sec_*`) *after* `mixer.update()` and *before* `updateMatrixWorld()`. |
+| **GLTF loader stalls when switching operators in Preview UI** | Medium | Preload/cache both operator GLBs in `OperatorAssetLoader` (or stream `LOD0` with progress indicator), keeping GPU texture uploads bounded (`<= 2048x2048` compressed KTX2/BasisU if available). |
+
+### 7.2 Open Questions to Lock Before Implementation
+1. **Bodycam Mount Archetype**: Is the camera mounted strictly at shoulder/collarbone (`socket_bodycam_mount` offset slightly right/chest-level, authentic Axon-style tilt) or eye-level with bodycam lens distortion/FOV? *(Affects `socket_bodycam_mount` coordinates and ADS camera blend curve.)*
+2. **Physics Engine Backing Ragdoll**: Is `HitZoneRagdollController` binding to an existing physics library (`rapier3d-compat`, `cannon-es`, `ammo.js`) or a custom capsule/verlet solver? *(Needs confirmation so collider shapes in GLB match the exact engine adapter.)*
+3. **World Shadow Rendering in Three.js**: Will local player shadows use a hidden third-person shadow-caster pass or the same `SkinnedMesh` with head submesh layer/material masking? *(Determines exact `BodycamRigController` submesh tagging.)*
+4. **Morph Targets vs. Pure Secondary Bones for Male Arms**: Should male bicep/tricep/forearm micro-motion use `sec_*` bones exclusively or drive 1–2 subtle volume-preserving morph targets alongside micro bone offsets? *(Bone-only is lighter on vertex shaders; morphs look cleaner under tight sleeves.)*
+
+### 7.3 Ownership Split: Asset Authoring vs. Runtime Implementation vs. Acceptance Gates
+
+| Workstream | Owner / Scope | Concrete Deliverables |
+| :--- | :--- | :--- |
+| **1. Upstream Asset Authoring** *(DCC / Tech Art)* | Modeling, topology, UVs, PBR textures, gear draping, skin weights, `sec_*` bones, sockets (`socket_weapon_r`, `socket_bodycam_mount`), IK targets, `hz_*` collider proxies, shared animations, LOD0–LOD2 export. | `operator_male.glb`, `operator_female.glb`, weapon GLBs with `ik_hand_l_target`, shared `.glb`/`.gltf` animation clips. |
+| **2. Runtime Implementation** *(TypeScript / Three.js)* | Selection UI + turntable preview, `localStorage` persistence, `OperatorRigValidator`, `PlayerSpawnController`, `BodycamRigController`, `TwoBoneIKSolver`, `SecondarySpringSolver` (SoA `Float32Array`), `HitZoneRagdollController`. | Modules under `src/operator/`, `src/ui/`, `src/player/`, `src/physics/` passing strict TypeScript build. |
+| **3. Acceptance Gates** *(Automated CI / QA)* | Rig parity CI check on asset commit, Vitest solver/zero-alloc/IK/ragdoll unit & integration suites, Playwright WebGL pose-matrix visual & clearance regression suite, frame-budget benchmarks. | Green CI pipeline (`tests/unit`, `tests/integration`, `tests/e2e`), golden pose screenshots signed off for both operators. |

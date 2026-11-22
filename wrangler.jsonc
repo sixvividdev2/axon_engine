@@ -1,0 +1,38 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "axon-engine",
+  "main": "worker/index.ts",
+  "compatibility_date": "2025-09-01",
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*", "/ws/*"]
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "axon-engine-db",
+      "database_id": "62daa72a-2759-4c26-87fd-5aa1e47f07d9",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "SOCIAL_HUB",
+        "class_name": "SocialHubDO"
+      },
+      {
+        "name": "LOBBY_ROOM",
+        "class_name": "LobbyRoomDO"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["SocialHubDO", "LobbyRoomDO"]
+    }
+  ]
+}
