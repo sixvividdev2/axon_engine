@@ -26,8 +26,10 @@ import { RankUpCinematic } from './ui/RankUpCinematic';
 import { SocialHubDrawer } from './ui/SocialHubDrawer';
 import { SocialInviteToast } from './ui/SocialInviteToast';
 import { UnifiedLoadoutWorkbench } from './ui/UnifiedLoadoutWorkbench';
+import { HideoutView } from './hideout/HideoutView';
 
 type ActiveView =
+  | { kind: 'hideout' }
   | { kind: 'menu'; tab: HubTabId }
   | { kind: 'playground' }
   | { kind: 'combat'; params: CombatSessionParams; sessionKey: number; isMultiplayer: boolean };
@@ -324,7 +326,7 @@ function AppShell() {
   const [battleConfig, setBattleConfig] = useState<BattleMatchConfig>(DEFAULT_BATTLE_CONFIG);
   const [infectionConfig, setInfectionConfig] =
     useState<InfectionMatchConfig>(DEFAULT_INFECTION_CONFIG);
-  const [view, setView] = useState<ActiveView>({ kind: 'menu', tab: 'battle' });
+  const [view, setView] = useState<ActiveView>({ kind: 'hideout' });
   const lastHandledSignalSeqRef = useRef<number>(0);
 
   // React to authoritative multiplayer lobby match start / restart / return-all-to-lobby signals
@@ -440,36 +442,52 @@ function AppShell() {
 
   return (
     <>
-      {view.kind === 'menu' && (
-        <MainMenuHub
-          initialTab={view.tab}
-          initialBattleConfig={battleConfig}
-          initialInfectionConfig={infectionConfig}
+      {view.kind === 'hideout' && (
+        <HideoutView
+          onOpenClassicHub={(tab) => setView({ kind: 'menu', tab })}
           onLaunchPlayground={() => setView({ kind: 'playground' })}
-          onLaunchBattle={(cfg) => {
-            setBattleConfig(cfg);
-            setView({
-              kind: 'combat',
-              params: { mode: 'battle', battleConfig: cfg },
-              sessionKey: Date.now(),
-              isMultiplayer: false,
-            });
-          }}
-          onLaunchInfection={(cfg) => {
-            setInfectionConfig(cfg);
-            setView({
-              kind: 'combat',
-              params: { mode: 'infection', infectionConfig: cfg },
-              sessionKey: Date.now(),
-              isMultiplayer: false,
-            });
-          }}
         />
+      )}
+
+      {view.kind === 'menu' && (
+        <div className="relative h-screen w-screen overflow-hidden">
+          <button
+            type="button"
+            onClick={() => setView({ kind: 'hideout' })}
+            className="fixed bottom-4 left-4 z-50 border border-amber-500/50 bg-[#101216]/95 px-4 py-2 text-xs font-semibold text-amber-200 transition-colors hover:border-amber-400 hover:bg-[#191d24] whitespace-nowrap"
+          >
+            Return to 3D Hideout
+          </button>
+          <MainMenuHub
+            initialTab={view.tab}
+            initialBattleConfig={battleConfig}
+            initialInfectionConfig={infectionConfig}
+            onLaunchPlayground={() => setView({ kind: 'playground' })}
+            onLaunchBattle={(cfg) => {
+              setBattleConfig(cfg);
+              setView({
+                kind: 'combat',
+                params: { mode: 'battle', battleConfig: cfg },
+                sessionKey: Date.now(),
+                isMultiplayer: false,
+              });
+            }}
+            onLaunchInfection={(cfg) => {
+              setInfectionConfig(cfg);
+              setView({
+                kind: 'combat',
+                params: { mode: 'infection', infectionConfig: cfg },
+                sessionKey: Date.now(),
+                isMultiplayer: false,
+              });
+            }}
+          />
+        </div>
       )}
 
       {view.kind === 'playground' && (
         <PlaygroundView
-          onReturnToMenu={() => setView({ kind: 'menu', tab: 'playground' })}
+          onReturnToMenu={() => setView({ kind: 'hideout' })}
         />
       )}
 
@@ -487,10 +505,13 @@ function AppShell() {
             })
           }
           onReturnToMenu={(tab) =>
-            setView({
-              kind: 'menu',
-              tab: view.isMultiplayer ? 'multiplayer' : (tab ?? 'battle'),
-            })
+            setView(
+              view.isMultiplayer
+                ? { kind: 'menu', tab: 'multiplayer' }
+                : tab
+                  ? { kind: 'hideout' }
+                  : { kind: 'hideout' },
+            )
           }
         />
       )}

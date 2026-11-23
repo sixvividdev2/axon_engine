@@ -31,6 +31,23 @@ import { WeaponRig } from './WeaponRig';
 export type BodycamCombatMove = 'NONE' | 'LEFT_JAB' | 'RIGHT_CROSS' | 'ARMED_BASH' | 'PUSH_KICK';
 export type BodycamKickTriggerResult = 'ok' | 'busy' | 'airborne' | 'dual_leg_trauma';
 
+/**
+ * Optional world-space IK hand override for diegetic interactions such as
+ * two-handed Gun Wall weapon hang/grab swaps in the 3D Hideout.
+ */
+export interface ExternalHandIkOverride {
+  active: boolean;
+  rightWeight: number;
+  rightWorldPos: THREE.Vector3;
+  rightWorldQuat: THREE.Quaternion;
+  rightGripCurl: number;
+  leftWeight: number;
+  leftWorldPos: THREE.Vector3;
+  leftWorldQuat: THREE.Quaternion;
+  leftGripCurl: number;
+  suppressWeaponHardLock: boolean;
+}
+
 function smoothstep(edge0: number, edge1: number, x: number): number {
   const t = THREE.MathUtils.clamp((x - edge0) / Math.max(1e-5, edge1 - edge0), 0, 1);
   return t * t * (3 - 2 * t);
@@ -296,11 +313,26 @@ export class CharacterAnimator {
     recoilImpulse: 0,
   };
 
+  // External world-space hand IK override (e.g., Gun Wall two-handed swap choreography)
+  private externalHandOverride: Readonly<ExternalHandIkOverride> | null = null;
+  private readonly _extRPosRoot = new THREE.Vector3();
+  private readonly _extRQuatRoot = new THREE.Quaternion();
+  private readonly _extLPosRoot = new THREE.Vector3();
+  private readonly _extLQuatRoot = new THREE.Quaternion();
+
   constructor(skeleton: CharacterSkeleton, weaponRig: WeaponRig, audio?: IBodycamAudioSource) {
     this.skeleton = skeleton;
     this.weaponRig = weaponRig;
     this.audio = audio;
     this.secondaryApplier = new SecondaryPhysicsRigApplier(skeleton);
+  }
+
+  public setExternalHandOverride(override: Readonly<ExternalHandIkOverride> | null): void {
+    this.externalHandOverride = override;
+  }
+
+  public clearExternalHandOverride(): void {
+    this.externalHandOverride = null;
   }
 
   public setPdaDevice(pda: TacticalPdaDevice | null): void {
@@ -1956,31 +1988,50 @@ export class CharacterAnimator {
       this.rightGrenadeReturnTimer = Math.max(0, this.rightGrenadeReturnTimer - dt);
     }
 
+    const extIk = this.externalHandOverride && this.externalHandOverride.active ? this.externalHandOverride : null;
+    const extRightW = extIk ? THREE.MathUtils.clamp(extIk.rightWeight, 0, 1) : 0;
+    if (extIk && extRightW > 0.001) {
+      this._extRPosRoot.copy(extIk.rightWorldPos);
+      this.skeleton.root.worldToLocal(this._extRPosRoot);
+      this._extRQuatRoot.copy(extIk.rightWorldQuat).premultiply(this._rootWorldQuatInv);
+      this._rDesiredRoot.lerp(this._extRPosRoot, extRightW);
+      if (isUnarmed) {
+        this._rDesiredQuatRoot.copy(this._extRQuatRoot);
+      } else {
+        this._rDesiredQuatRoot.slerp(this._extRQuatRoot, extRightW);
+      }
+      rightGripCurl = THREE.MathUtils.lerp(rightGripCurl, extIk.rightGripCurl, extRightW);
+    }
+
     const usePdaRightQuat = pdaActiveHold && pdaIkW > 0.35;
     const useGrenadeRightQuat = grenadeActiveHold && grenadeIkW > 0.25;
+    const useExtRightQuat = extRightW > 0.05;
     if (
       this.equipBlendTimer > 0 ||
       vaultPinR > 0.001 ||
       boltHandW > 0.001 ||
       pdaActiveHold ||
       grenadeActiveHold ||
+      useExtRightQuat ||
       this.rightPdaReturnTimer > 0 ||
       this.rightGrenadeReturnTimer > 0
     ) {
       this.rightHandBlender.blendTo(
         this._rDesiredRoot,
-        isUnarmed && !usePdaRightQuat && !useGrenadeRightQuat
+        isUnarmed && !usePdaRightQuat && !useGrenadeRightQuat && !useExtRightQuat
           ? this.rightHandBlender.quaternion
           : this._rDesiredQuatRoot,
         rightGripCurl,
         1,
         vaultPinR > 0.001
           ? 36
-          : grenadeActiveHold || pdaActiveHold || this.rightPdaReturnTimer > 0 || this.rightGrenadeReturnTimer > 0
-            ? 32
-            : boltHandW > 0.001
-              ? 34
-              : 32,
+          : useExtRightQuat
+            ? 42
+            : grenadeActiveHold || pdaActiveHold || this.rightPdaReturnTimer > 0 || this.rightGrenadeReturnTimer > 0
+              ? 32
+              : boltHandW > 0.001
+                ? 34
+                : 32,
         dt,
       );
     } else {
@@ -2066,7 +2117,7 @@ export class CharacterAnimator {
     this.skeleton.root.updateMatrixWorld(true);
     solveTwoBoneIK(this._shoulderR, this._rTargetRoot, this._poleR, armR.upperLen, armR.lowerLen, this.rightArmIK);
     orientLimbAlongYInRootSpace(armR.upperArm, this.skeleton.root, this._shoulderR, this.rightArmIK.midPos, this._poleR);
-    if (isUnarmed && !usePdaRightQuat && !useGrenadeRightQuat) {
+    if (isUnarmed && !usePdaRightQuat && !useGrenadeRightQuat && !useExtRightQuat) {
       this.computeUnarmedForearmAlignedHandQuat(1, this.rightArmIK.dir2, rightPronation, this._handAlignedQuat);
       if (vaultPinR > 0.001) {
         this._handAlignedQuat.slerp(this._vaultHandQuatRoot, vaultPinR);
@@ -2184,7 +2235,9 @@ export class CharacterAnimator {
         ? Math.max(rigState.adsBlend, rigState.cantBlend, rigState.pointAimBlend)
         : 0;
     const hardLockW =
-      (1 - aimLockWeightPost) * (1 - smoothstep(0.02, 0.25, Math.max(pdaIkW, grenadeIkW)));
+      extIk?.suppressWeaponHardLock
+        ? 0
+        : (1 - aimLockWeightPost) * (1 - smoothstep(0.02, 0.25, Math.max(pdaIkW, grenadeIkW)));
 
     if (!isUnarmed && vaultPinR < 0.12 && boltHandW < 0.02 && hardLockW > 0.001) {
       armR.hand.root.getWorldPosition(this._solvedHandRWorldPos);
@@ -2658,6 +2711,21 @@ export class CharacterAnimator {
       }
     }
 
+    const extLeftW = extIk ? THREE.MathUtils.clamp(extIk.leftWeight, 0, 1) : 0;
+    if (extIk && extLeftW > 0.001) {
+      leftOverridden = true;
+      this._extLPosRoot.copy(extIk.leftWorldPos);
+      this.skeleton.root.worldToLocal(this._extLPosRoot);
+      this._extLQuatRoot.copy(extIk.leftWorldQuat).premultiply(this._rootWorldQuatInv);
+      this._lDesiredRoot.lerp(this._extLPosRoot, extLeftW);
+      if (isUnarmed) {
+        this._lDesiredQuatRoot.copy(this._extLQuatRoot);
+      } else {
+        this._lDesiredQuatRoot.slerp(this._extLQuatRoot, extLeftW);
+      }
+      leftGripCurl = THREE.MathUtils.lerp(leftGripCurl, extIk.leftGripCurl, extLeftW);
+    }
+
     if (this.wasLeftOverridden && !leftOverridden) {
       this.leftActionReturnTimer = 0.14;
     }
@@ -2668,21 +2736,24 @@ export class CharacterAnimator {
 
     const usePdaLeftQuat = pdaActiveHold && pdaIkW > 0.35;
     const useGrenadeLeftQuat = grenadeActiveHold && grenadeIkW > 0.25;
+    const useExtLeftQuat = extLeftW > 0.05;
     if (leftOverridden || this.equipBlendTimer > 0 || this.leftActionReturnTimer > 0) {
       this.leftHandBlender.blendTo(
         this._lDesiredRoot,
-        isUnarmed && !usePdaLeftQuat && !useGrenadeLeftQuat
+        isUnarmed && !usePdaLeftQuat && !useGrenadeLeftQuat && !useExtLeftQuat
           ? this.leftHandBlender.quaternion
           : this._lDesiredQuatRoot,
         leftGripCurl,
         1,
         vaultPinL > 0.001
           ? 38
-          : grenadeActiveHold || pdaActiveHold
-            ? 32
-            : leftOverridden
-              ? 30
-              : 34,
+          : useExtLeftQuat
+            ? 42
+            : grenadeActiveHold || pdaActiveHold
+              ? 32
+              : leftOverridden
+                ? 30
+                : 34,
         dt,
       );
     } else {
@@ -2700,7 +2771,7 @@ export class CharacterAnimator {
     // 4. Solve Left Arm 2-Bone IK + Forearm-Aligned Zero-Hyperextension Wrist Orientation
     solveTwoBoneIK(this._shoulderL, this._lTargetRoot, this._poleL, armL.upperLen, armL.lowerLen, this.leftArmIK);
     orientLimbAlongYInRootSpace(armL.upperArm, this.skeleton.root, this._shoulderL, this.leftArmIK.midPos, this._poleL);
-    if (isUnarmed && !usePdaLeftQuat && !useGrenadeLeftQuat) {
+    if (isUnarmed && !usePdaLeftQuat && !useGrenadeLeftQuat && !useExtLeftQuat) {
       this.computeUnarmedForearmAlignedHandQuat(-1, this.leftArmIK.dir2, leftPronation, this._handAlignedQuat);
       if (vaultPinL > 0.001) {
         this._handAlignedQuat.slerp(this._vaultHandQuatRoot, vaultPinL);

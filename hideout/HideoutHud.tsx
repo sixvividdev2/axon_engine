@@ -1,0 +1,320 @@
+import React from 'react';
+import {
+  Crosshair,
+  Shield,
+  Sliders,
+  User,
+  Users,
+  Volume2,
+  Wrench,
+} from 'lucide-react';
+import { useAuth } from '../context/AuthContext';
+import { useSocial } from '../context/SocialContext';
+import {
+  GRAPHICS_QUALITY_ORDER,
+  GRAPHICS_QUALITY_PROFILES,
+  GraphicsQualityId,
+  useGraphicsQuality,
+} from '../data/graphicsQuality';
+import { HubTabId } from '../ui/MainMenuHub';
+import { HideoutSnapshot } from './HideoutSessionController';
+
+interface HideoutHudProps {
+  snapshot: HideoutSnapshot;
+  modalOpen: boolean;
+  onRequestLock: () => void;
+  onOpenGunsmith: () => void;
+  onOpenOperatorGear: () => void;
+  onVolumeChange: (volume: number) => void;
+  onGraphicsChange: (quality: GraphicsQualityId) => void;
+  onOpenClassicHub: (tab: HubTabId) => void;
+  onLaunchPlayground: () => void;
+}
+
+/**
+ * Minimal diegetic Hideout HUD & ESC Pause Overlay.
+ * Follows zero viewport occlusion, zero backdrop-filter over WebGL,
+ * zero static pill clutter, and zero pulsing status dots.
+ */
+export const HideoutHud: React.FC<HideoutHudProps> = ({
+  snapshot,
+  modalOpen,
+  onRequestLock,
+  onOpenGunsmith,
+  onOpenOperatorGear,
+  onVolumeChange,
+  onGraphicsChange,
+  onOpenClassicHub,
+  onLaunchPlayground,
+}) => {
+  const { user, openAuthModal, openAccountSettings } = useAuth();
+  const { openDrawer: openSocialDrawer, incomingRequests } = useSocial();
+  const [graphicsQuality, setGraphicsQuality] = useGraphicsQuality();
+
+  const showLiveHud = snapshot.pointerLocked && !snapshot.pauseOpen && !modalOpen;
+  const showEntryPrompt = !snapshot.pointerLocked && !snapshot.pauseOpen && !modalOpen;
+  const showPauseMenu = snapshot.pauseOpen && !modalOpen;
+
+  return (
+    <div className="pointer-events-none fixed inset-0 z-10 select-none">
+      {/* Subtle top-left room location readout (clean unboxed typography) */}
+      {!showPauseMenu && !modalOpen && (
+        <div className="fixed left-6 top-5 flex items-baseline gap-3 text-neutral-200/85">
+          <span className="font-display text-sm font-semibold tracking-wider text-neutral-100">
+            {snapshot.currentRoomLabel}
+          </span>
+          <span className="text-xs text-neutral-500" aria-hidden="true">
+            ·
+          </span>
+          <span className="font-mono-tabular text-xs text-neutral-400">
+            {snapshot.fps} FPS
+          </span>
+        </div>
+      )}
+
+      {/* Subtle bottom-right equipped weapon readout when exploring */}
+      {showLiveHud && (
+        <div className="fixed bottom-5 right-6 text-right">
+          <div className="font-display text-sm font-semibold tracking-wide text-neutral-100">
+            {snapshot.equippedWeaponName}
+          </div>
+          {snapshot.equippedWeaponId !== 'unarmed' && (
+            <div className="mt-0.5 flex items-center justify-end gap-2 font-mono-tabular text-xs text-neutral-400">
+              <span>{snapshot.equippedCaliber}</span>
+              <span aria-hidden="true">·</span>
+              <span className="text-amber-400">
+                {snapshot.ammoInMag}/{snapshot.ammoReserve}
+              </span>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Contextual interact dot (hidden by default; white when near, yellow when ready) + [E] prompt */}
+      {showLiveHud && snapshot.interactReticleState !== 'hidden' && (
+        <div className="fixed inset-0 flex flex-col items-center justify-center">
+          <div
+            className={`h-1.5 w-1.5 rounded-full transition-transform duration-150 ${
+              snapshot.interactReticleState === 'ready'
+                ? 'scale-125 bg-amber-400'
+                : 'bg-neutral-100/80'
+            }`}
+          />
+
+          {snapshot.prompt && (
+            <div
+              className="mt-5 flex flex-col items-center gap-1.5 px-3.5 py-2 border border-white/12 bg-[#0d0f12]/90"
+              style={{ borderRadius: 4 }}
+            >
+              <div className="flex items-center gap-2.5 text-sm font-medium text-neutral-100 whitespace-nowrap">
+                <kbd className="inline-flex h-6 min-w-6 items-center justify-center border border-amber-500/60 bg-amber-500/15 px-1.5 font-mono-tabular text-xs font-semibold text-amber-300">
+                  {snapshot.prompt.key}
+                </kbd>
+                <span>{snapshot.prompt.label}</span>
+              </div>
+              {snapshot.prompt.secondaryKey && snapshot.prompt.secondaryLabel && (
+                <div className="flex items-center gap-2 text-xs text-neutral-400 whitespace-nowrap">
+                  <kbd className="inline-flex h-5 min-w-5 items-center justify-center border border-white/15 bg-white/5 px-1 font-mono-tabular text-[11px] font-medium text-neutral-200">
+                    {snapshot.prompt.secondaryKey}
+                  </kbd>
+                  <span>{snapshot.prompt.secondaryLabel}</span>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Compact status toast (Personal Stash, Resupply, Weapon Swap) */}
+      {snapshot.toastMessage && !showPauseMenu && !modalOpen && (
+        <div className="fixed bottom-14 left-1/2 -translate-x-1/2 border border-amber-500/35 bg-[#0e1013]/92 px-4 py-2 text-xs font-medium text-amber-100">
+          {snapshot.toastMessage}
+        </div>
+      )}
+
+      {/* Non-blocking initial spawn entry prompt (3D Arsenal Room remains 100% visible) */}
+      {showEntryPrompt && (
+        <div className="pointer-events-auto fixed bottom-8 left-1/2 -translate-x-1/2 flex flex-col items-center gap-2">
+          <button
+            type="button"
+            onClick={onRequestLock}
+            className="flex items-center gap-3 border border-amber-500/55 bg-[#101216]/94 px-6 py-3 text-sm font-semibold tracking-wide text-neutral-100 transition-colors hover:border-amber-400 hover:bg-[#16191f] whitespace-nowrap"
+          >
+            <Crosshair className="h-4 w-4 text-amber-400" />
+            <span>Click to Enter Hideout</span>
+          </button>
+          <div className="flex items-center gap-3 text-xs text-neutral-400">
+            <span>WASD Move</span>
+            <span aria-hidden="true">·</span>
+            <span>E Interact</span>
+            <span aria-hidden="true">·</span>
+            <span>I Inspect</span>
+            <span aria-hidden="true">·</span>
+            <span>ESC Menu</span>
+          </div>
+        </div>
+      )}
+
+      {/* Minimal ESC Pause Overlay (solid surface, zero backdrop-filter) */}
+      {showPauseMenu && (
+        <div className="pointer-events-auto fixed inset-0 flex items-center justify-center bg-[#07080a]/78 p-6">
+          <div className="w-full max-w-md border border-white/12 bg-[#101216] p-6 text-neutral-100 shadow-2xl">
+            <div className="flex items-baseline justify-between border-b border-white/10 pb-4">
+              <div>
+                <h2 className="font-display text-2xl font-semibold tracking-wide text-neutral-50">
+                  Hideout Paused
+                </h2>
+                <p className="mt-0.5 text-xs text-neutral-400">
+                  {snapshot.currentRoomLabel} · {snapshot.equippedWeaponName}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={onRequestLock}
+                className="bg-amber-600 px-4 py-2 text-xs font-semibold text-neutral-950 transition-colors hover:bg-amber-500 whitespace-nowrap"
+              >
+                Resume
+              </button>
+            </div>
+
+            {/* Hideout Stations */}
+            <div className="mt-5 space-y-2">
+              <div className="text-xs font-medium text-neutral-400">Hideout Stations</div>
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  type="button"
+                  onClick={onOpenGunsmith}
+                  className="flex items-center justify-center gap-2 border border-white/10 bg-[#171a20] px-3 py-2.5 text-xs font-medium text-neutral-100 transition-colors hover:border-amber-500/50 hover:bg-[#1d2128] whitespace-nowrap"
+                >
+                  <Wrench className="h-3.5 w-3.5 text-amber-400" />
+                  <span>Gunsmith Bench</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={onOpenOperatorGear}
+                  className="flex items-center justify-center gap-2 border border-white/10 bg-[#171a20] px-3 py-2.5 text-xs font-medium text-neutral-100 transition-colors hover:border-amber-500/50 hover:bg-[#1d2128] whitespace-nowrap"
+                >
+                  <Shield className="h-3.5 w-3.5 text-amber-400" />
+                  <span>Operator Gear</span>
+                </button>
+              </div>
+            </div>
+
+            {/* Temporary Phase 1-3 Match Access (before Phase 4 Laptop & Phase 5 Portal) */}
+            <div className="mt-5 space-y-2">
+              <div className="text-xs font-medium text-neutral-400">Deploy & Training</div>
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  type="button"
+                  onClick={() => onOpenClassicHub('battle')}
+                  className="border border-white/10 bg-[#171a20] px-3 py-2 text-xs font-medium text-neutral-200 transition-colors hover:border-white/25 hover:bg-[#1d2128] whitespace-nowrap"
+                >
+                  Battle Modes
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onOpenClassicHub('infection')}
+                  className="border border-white/10 bg-[#171a20] px-3 py-2 text-xs font-medium text-neutral-200 transition-colors hover:border-red-500/45 hover:bg-[#1d2128] whitespace-nowrap"
+                >
+                  Zombies Infection
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onOpenClassicHub('multiplayer')}
+                  className="border border-white/10 bg-[#171a20] px-3 py-2 text-xs font-medium text-neutral-200 transition-colors hover:border-white/25 hover:bg-[#1d2128] whitespace-nowrap"
+                >
+                  Multiplayer Squads
+                </button>
+                <button
+                  type="button"
+                  onClick={onLaunchPlayground}
+                  className="border border-white/10 bg-[#171a20] px-3 py-2 text-xs font-medium text-neutral-200 transition-colors hover:border-white/25 hover:bg-[#1d2128] whitespace-nowrap"
+                >
+                  Calibration Gym
+                </button>
+              </div>
+            </div>
+
+            {/* Audio & Graphics Controls */}
+            <div className="mt-5 space-y-3 border-t border-white/10 pt-4">
+              <div className="flex items-center justify-between gap-4">
+                <label
+                  htmlFor="hideout-master-vol"
+                  className="flex items-center gap-2 text-xs font-medium text-neutral-300 whitespace-nowrap"
+                >
+                  <Volume2 className="h-3.5 w-3.5 text-neutral-400" />
+                  <span>Master Audio</span>
+                </label>
+                <div className="flex items-center gap-2.5">
+                  <input
+                    id="hideout-master-vol"
+                    type="range"
+                    min={0}
+                    max={100}
+                    value={Math.round(snapshot.masterVolume * 100)}
+                    onChange={(e) => onVolumeChange(Number(e.target.value) / 100)}
+                    className="h-1.5 w-32 accent-amber-500"
+                  />
+                  <span className="w-9 text-right font-mono-tabular text-xs text-neutral-400">
+                    {Math.round(snapshot.masterVolume * 100)}%
+                  </span>
+                </div>
+              </div>
+
+              <div className="flex items-center justify-between gap-3">
+                <span className="flex items-center gap-2 text-xs font-medium text-neutral-300 whitespace-nowrap">
+                  <Sliders className="h-3.5 w-3.5 text-neutral-400" />
+                  <span>Graphics</span>
+                </span>
+                <div className="flex items-center gap-1 bg-[#171a20] p-0.5">
+                  {GRAPHICS_QUALITY_ORDER.map((q) => {
+                    const active = graphicsQuality === q;
+                    return (
+                      <button
+                        key={q}
+                        type="button"
+                        onClick={() => {
+                          setGraphicsQuality(q);
+                          onGraphicsChange(q);
+                        }}
+                        className={`px-2.5 py-1 text-[11px] font-medium transition-colors whitespace-nowrap ${
+                          active
+                            ? 'bg-amber-600 text-neutral-950'
+                            : 'text-neutral-400 hover:text-neutral-100'
+                        }`}
+                      >
+                        {GRAPHICS_QUALITY_PROFILES[q].label}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            </div>
+
+            {/* Account & Social Footer Actions */}
+            <div className="mt-5 flex items-center justify-between border-t border-white/10 pt-4">
+              <button
+                type="button"
+                onClick={() => (user ? openAccountSettings() : openAuthModal())}
+                className="flex items-center gap-2 text-xs font-medium text-neutral-300 transition-colors hover:text-neutral-100 whitespace-nowrap"
+              >
+                <User className="h-3.5 w-3.5 text-neutral-400" />
+                <span>{user ? user.username : 'Sign In / Account'}</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => openSocialDrawer()}
+                className="flex items-center gap-2 text-xs font-medium text-neutral-300 transition-colors hover:text-neutral-100 whitespace-nowrap"
+              >
+                <Users className="h-3.5 w-3.5 text-neutral-400" />
+                <span>
+                  Social{incomingRequests.length > 0 ? ` (${incomingRequests.length})` : ''}
+                </span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
