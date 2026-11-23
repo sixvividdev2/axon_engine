@@ -2,7 +2,9 @@ import React, { useMemo, useState } from 'react';
 import {
   AlertTriangle,
   ArrowLeftRight,
+  Award,
   Check,
+  Compass,
   Crosshair,
   HeartPulse,
   Lock,
@@ -23,22 +25,36 @@ import {
 } from './PermadeathService';
 import { shardStore } from './ShardStore';
 import {
+  ARMOR_PLATE_CATALOG,
   CHARACTER_SLOT_IDS,
   CharacterBodyType,
   CharacterSlotId,
   getSecureContainerCapacity,
   getStandingTier,
+  OPENWORLD_CONTRACT_CATALOG,
   PMC_FACTIONS,
   PmcFactionId,
+  QUARTERMASTER_ATTACHMENT_OFFERS,
   QUARTERMASTER_FIREARM_OFFERS,
   SHARD_RULES,
   ShardMode,
   SUB_FACTION_LIST,
   SUB_FACTION_MAP,
   SubFactionId,
+  TRADER_LIST,
+  TRADER_MAP,
+  TraderId,
 } from './types';
 
-type SubTabId = 'shards_reputation' | 'arsenal_stash' | 'hospital_permadeath';
+type SubTabId =
+  | 'shards_reputation'
+  | 'traders_unlocks'
+  | 'arsenal_stash'
+  | 'hospital_permadeath';
+
+interface PerimeterOpsTerminalPanelProps {
+  onDeployOpenWorld?: (slotId: CharacterSlotId) => void;
+}
 
 function formatUsd(amount: number): string {
   return `$${Math.max(0, Math.round(amount)).toLocaleString()}`;
@@ -47,10 +63,12 @@ function formatUsd(amount: number): string {
 /**
  * Perimeter Operations Ready Room Terminal Panel.
  * Manages the 3-slot persistent Character Roster, Dual-Shard (`PvPvE` / `PvE`) state,
- * isolated per-character 3D Hideout Arsenal Wall, Stash vs Secure Container,
- * 3 regional sub-faction reputation meters, and scaled Field Hospital / Permadeath loop.
+ * per-character trader/contract/weapon/optic/armor-plate unlock entitlements,
+ * isolated 3D Hideout Arsenal Wall, Stash vs Secure Container, and Field Hospital / Permadeath loop.
  */
-export const PerimeterOpsTerminalPanel: React.FC = () => {
+export const PerimeterOpsTerminalPanel: React.FC<PerimeterOpsTerminalPanelProps> = ({
+  onDeployOpenWorld,
+}) => {
   const { roster, shards, activeCharacter, activeShard, bankruptcy } = useHideoutShardAdapter();
 
   const [subTab, setSubTab] = useState<SubTabId>('shards_reputation');
@@ -166,6 +184,79 @@ export const PerimeterOpsTerminalPanel: React.FC = () => {
     );
   };
 
+  const handleLevelUpTrader = (traderId: TraderId) => {
+    if (!activeCharacter) return;
+    const res = characterRoster.levelUpTrader(activeCharacter.slotId, traderId);
+    if (!res.ok) {
+      setActionNotice(res.error ?? 'Unable to level up trader.');
+      return;
+    }
+    const trader = TRADER_MAP[traderId];
+    shardStore.recordDiscreteTransition(
+      activeCharacter.shardMode,
+      'trader_level_up',
+      `${activeCharacter.callsign} advanced ${trader.name} to Lv ${res.newLevel} (character-scoped unlocks)`,
+    );
+    const unlockedCount =
+      (res.newlyUnlockedWeapons?.length ?? 0) +
+      (res.newlyUnlockedAttachments?.length ?? 0) +
+      (res.newlyUnlockedArmorPlates?.length ?? 0);
+    setActionNotice(
+      `${activeCharacter.callsign} reached ${trader.name} Lv ${res.newLevel} (+${unlockedCount} new entitlements unlocked strictly for this character).`,
+    );
+  };
+
+  const handleCompleteContract = (contractId: string) => {
+    if (!activeCharacter) return;
+    const res = characterRoster.completeContract(activeCharacter.slotId, contractId);
+    if (!res.ok) {
+      setActionNotice(res.error ?? 'Unable to complete contract.');
+      return;
+    }
+    shardStore.recordDiscreteTransition(
+      activeCharacter.shardMode,
+      'contract_completed',
+      `${activeCharacter.callsign} completed contract ${contractId} (per-character unlock entitlements granted)`,
+    );
+    setActionNotice(
+      `Contract completed for ${activeCharacter.callsign}: unlocked ${res.newlyUnlockedWeapons?.length ?? 0} firearm(s), ${res.newlyUnlockedAttachments?.length ?? 0} optic/attachment(s), and ${res.newlyUnlockedArmorPlates?.length ?? 0} armor plate(s) exclusively on this slot.`,
+    );
+  };
+
+  const handlePurchaseAttachment = (attachmentId: string, label: string, priceUsd: number) => {
+    if (!activeCharacter) return;
+    const res = characterRoster.purchaseAttachmentToCharacter(
+      activeCharacter.slotId,
+      attachmentId,
+      priceUsd,
+    );
+    if (!res.ok) {
+      setActionNotice(res.error ?? 'Unable to buy attachment.');
+      return;
+    }
+    shardStore.recordDiscreteTransition(
+      activeCharacter.shardMode,
+      'trader_purchase',
+      `${activeCharacter.callsign} purchased ${label} for ${formatUsd(priceUsd)}`,
+    );
+    setActionNotice(`Purchased ${label} for ${formatUsd(priceUsd)} into ${activeCharacter.callsign}'s stash.`);
+  };
+
+  const handlePurchaseArmorPlate = (plateId: string, plateName: string) => {
+    if (!activeCharacter) return;
+    const res = characterRoster.purchaseArmorPlateToCharacter(activeCharacter.slotId, plateId, true);
+    if (!res.ok) {
+      setActionNotice(res.error ?? 'Unable to buy armor plate.');
+      return;
+    }
+    shardStore.recordDiscreteTransition(
+      activeCharacter.shardMode,
+      'trader_purchase',
+      `${activeCharacter.callsign} equipped ${plateName}`,
+    );
+    setActionNotice(`Purchased & equipped ${plateName} on ${activeCharacter.callsign}.`);
+  };
+
   const handleAdjustStanding = (subFactionId: SubFactionId, delta: number) => {
     if (!activeCharacter) return;
     const updated = characterRoster.updateSubFactionStanding(
@@ -233,7 +324,7 @@ export const PerimeterOpsTerminalPanel: React.FC = () => {
           </p>
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           <span className="font-mono-tabular text-xs text-neutral-400">
             Active Hideout Context:{' '}
             <strong className="font-semibold text-neutral-100">
@@ -242,6 +333,16 @@ export const PerimeterOpsTerminalPanel: React.FC = () => {
                 : 'Classic Career Mode'}
             </strong>
           </span>
+          {activeCharacter && onDeployOpenWorld && (
+            <button
+              type="button"
+              onClick={() => onDeployOpenWorld(activeCharacter.slotId)}
+              className="flex cursor-pointer items-center gap-1.5 border border-amber-400 bg-amber-500/20 px-3.5 py-1.5 text-xs font-semibold text-amber-100 transition-colors hover:bg-amber-500 hover:text-neutral-950 whitespace-nowrap shrink-0"
+            >
+              <Compass className="h-3.5 w-3.5" />
+              <span>Deploy to 4km Perimeter</span>
+            </button>
+          )}
           {activeCharacter && (
             <button
               type="button"
@@ -292,10 +393,13 @@ export const PerimeterOpsTerminalPanel: React.FC = () => {
             {lastDeathOutcome.outcome === 'permadeath_wiped' ? (
               <div className="font-mono-tabular text-xs text-red-200/90">
                 Cash at death {formatUsd(lastDeathOutcome.cashAtDeath)} &lt; Medevac fee{' '}
-                {formatUsd(lastDeathOutcome.requiredFee)} · Stash, Arsenal Wall, vehicles &amp;
-                reputation permanently wiped · Corpse logged in{' '}
-                {lastDeathOutcome.droppedCorpse.shardMode} shard (
-                {lastDeathOutcome.droppedCorpse.droppedWeaponIds.length} weapons dropped).
+                {formatUsd(lastDeathOutcome.requiredFee)} · Purged{' '}
+                {lastDeathOutcome.wipedSummary.unlockedWeapons} weapon unlocks,{' '}
+                {lastDeathOutcome.wipedSummary.unlockedAttachments} optics,{' '}
+                {lastDeathOutcome.wipedSummary.unlockedArmorPlates} armor plates,{' '}
+                {lastDeathOutcome.wipedSummary.stashItemCount} stash stacks &amp;{' '}
+                {lastDeathOutcome.wipedSummary.ownedVehicleCount} vehicles · Corpse logged in{' '}
+                {lastDeathOutcome.droppedCorpse.shardMode} shard.
               </div>
             ) : (
               <div className="font-mono-tabular text-xs text-amber-200/90">
@@ -648,6 +752,18 @@ export const PerimeterOpsTerminalPanel: React.FC = () => {
               </button>
               <button
                 type="button"
+                onClick={() => setSubTab('traders_unlocks')}
+                className={`flex cursor-pointer items-center gap-1.5 border px-3 py-1.5 text-xs font-semibold transition-colors whitespace-nowrap ${
+                  subTab === 'traders_unlocks'
+                    ? 'border-emerald-400 bg-emerald-500/18 text-emerald-100'
+                    : 'border-white/10 bg-[#151a22] text-neutral-400 hover:text-neutral-100'
+                }`}
+              >
+                <Award className="h-3.5 w-3.5" />
+                <span>Traders &amp; Unlocks</span>
+              </button>
+              <button
+                type="button"
                 onClick={() => setSubTab('arsenal_stash')}
                 className={`flex cursor-pointer items-center gap-1.5 border px-3 py-1.5 text-xs font-semibold transition-colors whitespace-nowrap ${
                   subTab === 'arsenal_stash'
@@ -850,6 +966,207 @@ export const PerimeterOpsTerminalPanel: React.FC = () => {
             </div>
           )}
 
+          {/* SUB-TAB 1B: PER-CHARACTER TRADERS, CONTRACTS & UNLOCK ENTITLEMENTS */}
+          {subTab === 'traders_unlocks' && (
+            <div className="space-y-4">
+              <div className="flex flex-wrap items-center justify-between gap-2 border border-white/10 bg-[#10151d] px-3.5 py-2.5 text-xs text-neutral-300">
+                <span>
+                  <strong className="text-neutral-100">Character-Scoped Unlocks:</strong> All trader
+                  levels, contracts, weapon/optic/armor-plate purchase clearances belong strictly to{' '}
+                  <span className="font-mono-tabular text-amber-300">{activeCharacter.callsign}</span>{' '}
+                  (never account-wide) and wipe completely on permadeath.
+                </span>
+                <span className="font-mono-tabular text-[11px] text-neutral-400">
+                  Unlocked: {activeCharacter.unlocks.unlockedWeaponIds.length} Firearms ·{' '}
+                  {activeCharacter.unlocks.unlockedAttachmentIds.length} Optics/Mods ·{' '}
+                  {activeCharacter.unlocks.unlockedArmorPlateIds.length} Armor Plates
+                </span>
+              </div>
+
+              <div className="grid grid-cols-1 gap-4 lg:grid-cols-12">
+                {/* Traders & Field Contracts */}
+                <div className="space-y-3 lg:col-span-6">
+                  <div className="text-xs font-semibold text-neutral-200">
+                    Per-Character Trader Levels
+                  </div>
+                  <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                    {TRADER_LIST.map((tr) => {
+                      const lv = activeCharacter.unlocks.traderLevels[tr.id] ?? 1;
+                      const maxed = lv >= tr.maxLevel;
+                      return (
+                        <div
+                          key={tr.id}
+                          className="flex flex-col justify-between border border-white/10 bg-[#11151c] p-3 text-xs"
+                        >
+                          <div>
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="font-semibold text-neutral-100">{tr.name}</span>
+                              <span className="font-mono-tabular text-emerald-300">
+                                Lv {lv}/{tr.maxLevel}
+                              </span>
+                            </div>
+                            <div className="mt-0.5 text-[11px] text-neutral-400">{tr.role}</div>
+                          </div>
+                          <button
+                            type="button"
+                            disabled={maxed}
+                            onClick={() => handleLevelUpTrader(tr.id)}
+                            className={`mt-2.5 border px-2.5 py-1 text-xs font-medium whitespace-nowrap ${
+                              maxed
+                                ? 'cursor-default border-white/8 bg-[#10141b] text-neutral-500'
+                                : 'cursor-pointer border-emerald-500/50 bg-emerald-950/40 text-emerald-200 hover:bg-emerald-500 hover:text-neutral-950'
+                            }`}
+                          >
+                            {maxed ? 'Max Level Reached' : `Advance to Lv ${lv + 1}`}
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  <div className="text-xs font-semibold text-neutral-200">
+                    Perimeter Field Contracts (Grants Firearm, Optic &amp; Plate Unlocks)
+                  </div>
+                  <div className="space-y-2">
+                    {OPENWORLD_CONTRACT_CATALOG.map((ct) => {
+                      const done = activeCharacter.unlocks.completedContractIds.includes(ct.id);
+                      return (
+                        <div
+                          key={ct.id}
+                          className="flex items-center justify-between gap-3 border border-white/10 bg-[#11151c] p-3 text-xs"
+                        >
+                          <div className="min-w-0">
+                            <div className="font-semibold text-neutral-100">{ct.title}</div>
+                            <div className="mt-0.5 text-[11px] text-neutral-400">{ct.summary}</div>
+                            <div className="mt-1 font-mono-tabular text-[11px] text-neutral-300">
+                              Reward {formatUsd(ct.cashRewardUsd)} · +{ct.unlocksWeaponIds.length}{' '}
+                              Weapons · +{ct.unlocksAttachmentIds.length} Optics/Mods · +
+                              {ct.unlocksArmorPlateIds.length} Plates
+                            </div>
+                          </div>
+                          <button
+                            type="button"
+                            disabled={done}
+                            onClick={() => handleCompleteContract(ct.id)}
+                            className={`border px-3 py-1.5 font-mono-tabular text-[11px] font-semibold whitespace-nowrap shrink-0 ${
+                              done
+                                ? 'cursor-default border-emerald-500/35 bg-emerald-500/12 text-emerald-300'
+                                : 'cursor-pointer border-amber-400/65 bg-amber-500/15 text-amber-200 hover:bg-amber-500 hover:text-neutral-950'
+                            }`}
+                          >
+                            {done ? 'Completed' : 'Complete Contract'}
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {/* Per-Character Optics/Attachments & Armor Plates */}
+                <div className="space-y-3 lg:col-span-6">
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="font-semibold text-neutral-200">
+                      Optics &amp; Attachments ({activeCharacter.callsign} Entitlements)
+                    </span>
+                    <span className="font-mono-tabular text-emerald-300">
+                      Cash {formatUsd(activeCharacter.cash)}
+                    </span>
+                  </div>
+                  <div className="grid max-h-[210px] grid-cols-1 gap-1.5 overflow-y-auto pr-1 sm:grid-cols-2">
+                    {QUARTERMASTER_ATTACHMENT_OFFERS.map((att) => {
+                      const unlocked = activeCharacter.unlocks.unlockedAttachmentIds.includes(
+                        att.attachmentId,
+                      );
+                      const affordable = activeCharacter.cash >= att.priceUsd;
+                      return (
+                        <div
+                          key={att.attachmentId}
+                          className="flex items-center justify-between gap-2 border border-white/10 bg-[#141922] px-2.5 py-2 text-xs"
+                        >
+                          <div className="min-w-0">
+                            <div className="truncate font-medium text-neutral-100">{att.label}</div>
+                            <div className="font-mono-tabular text-[11px] text-neutral-400">
+                              {att.slotLabel} · {formatUsd(att.priceUsd)}
+                            </div>
+                          </div>
+                          <button
+                            type="button"
+                            disabled={!unlocked || !affordable}
+                            onClick={() =>
+                              handlePurchaseAttachment(att.attachmentId, att.label, att.priceUsd)
+                            }
+                            className={`border px-2.5 py-1 font-mono-tabular text-[11px] font-semibold whitespace-nowrap shrink-0 ${
+                              !unlocked
+                                ? 'cursor-not-allowed border-white/8 bg-[#10141b] text-neutral-500'
+                                : !affordable
+                                  ? 'cursor-not-allowed border-white/8 bg-[#10141b] text-neutral-500'
+                                  : 'cursor-pointer border-amber-400/65 bg-amber-500/15 text-amber-200 hover:bg-amber-500 hover:text-neutral-950'
+                            }`}
+                          >
+                            {unlocked ? 'Buy' : `Lv ${att.requiredTraderLevel} Lock`}
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  <div className="text-xs font-semibold text-neutral-200">
+                    Ballistic Armor Plates (Equipped:{' '}
+                    <span className="font-mono-tabular text-amber-200">
+                      {activeCharacter.equippedKit.armorName ?? 'None'}
+                    </span>
+                    )
+                  </div>
+                  <div className="space-y-1.5">
+                    {ARMOR_PLATE_CATALOG.map((plate) => {
+                      const unlocked = activeCharacter.unlocks.unlockedArmorPlateIds.includes(
+                        plate.id,
+                      );
+                      const equipped = activeCharacter.equippedKit.armorPlateId === plate.id;
+                      const affordable = activeCharacter.cash >= plate.priceUsd;
+                      return (
+                        <div
+                          key={plate.id}
+                          className="flex items-center justify-between gap-2 border border-white/10 bg-[#141922] px-3 py-2 text-xs"
+                        >
+                          <div className="min-w-0">
+                            <div className="truncate font-medium text-neutral-100">
+                              {plate.name}
+                            </div>
+                            <div className="font-mono-tabular text-[11px] text-neutral-400">
+                              {plate.ratingLabel} · {plate.weightKg}kg · Dur {plate.durability} ·{' '}
+                              {formatUsd(plate.priceUsd)}
+                            </div>
+                          </div>
+                          <button
+                            type="button"
+                            disabled={!unlocked || equipped || !affordable}
+                            onClick={() => handlePurchaseArmorPlate(plate.id, plate.name)}
+                            className={`border px-2.5 py-1 font-mono-tabular text-[11px] font-semibold whitespace-nowrap shrink-0 ${
+                              equipped
+                                ? 'cursor-default border-emerald-500/40 bg-emerald-500/15 text-emerald-300'
+                                : !unlocked
+                                  ? 'cursor-not-allowed border-white/8 bg-[#10141b] text-neutral-500'
+                                  : !affordable
+                                    ? 'cursor-not-allowed border-white/8 bg-[#10141b] text-neutral-500'
+                                    : 'cursor-pointer border-amber-400/65 bg-amber-500/15 text-amber-200 hover:bg-amber-500 hover:text-neutral-950'
+                            }`}
+                          >
+                            {equipped
+                              ? 'Equipped'
+                              : unlocked
+                                ? 'Buy & Equip'
+                                : `Lv ${plate.requiredTraderLevel} Lock`}
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
           {/* SUB-TAB 2: ISOLATED ARSENAL WALL, QUARTERMASTER & STASH/SECURE CONTAINER */}
           {subTab === 'arsenal_stash' && (
             <div className="grid grid-cols-1 gap-4 lg:grid-cols-12">
@@ -911,13 +1228,16 @@ export const PerimeterOpsTerminalPanel: React.FC = () => {
                     {QUARTERMASTER_FIREARM_OFFERS.map((offer) => {
                       const prof = resolveWeaponProfile(offer.weaponId);
                       const owned = activeCharacter.arsenal.ownedWeaponIds.includes(offer.weaponId);
+                      const unlockedForChar = activeCharacter.unlocks.unlockedWeaponIds.includes(
+                        offer.weaponId,
+                      );
                       const reqStanding =
                         offer.subFactionRequired && offer.minStanding !== undefined
                           ? (activeCharacter.subFactionStanding[offer.subFactionRequired] ?? 0) <
                             offer.minStanding
                           : false;
                       const affordable = activeCharacter.cash >= offer.priceUsd;
-                      const disabled = owned || reqStanding || !affordable;
+                      const disabled = owned || !unlockedForChar || reqStanding || !affordable;
                       return (
                         <div
                           key={offer.weaponId}
@@ -926,7 +1246,8 @@ export const PerimeterOpsTerminalPanel: React.FC = () => {
                           <div className="min-w-0">
                             <div className="truncate font-medium text-neutral-100">{prof.name}</div>
                             <div className="font-mono-tabular text-[11px] text-neutral-400">
-                              {formatUsd(offer.priceUsd)}
+                              {formatUsd(offer.priceUsd)} · {TRADER_MAP[offer.traderId].name} Lv{' '}
+                              {offer.requiredTraderLevel}
                               {offer.subFactionRequired && offer.minStanding !== undefined
                                 ? ` · ${SUB_FACTION_MAP[offer.subFactionRequired].shortName} +${offer.minStanding}`
                                 : ''}
@@ -944,7 +1265,13 @@ export const PerimeterOpsTerminalPanel: React.FC = () => {
                                   : 'cursor-pointer border-amber-400/65 bg-amber-500/15 text-amber-200 hover:bg-amber-500 hover:text-neutral-950'
                             }`}
                           >
-                            {owned ? 'Owned' : reqStanding ? 'Rep Lock' : 'Buy'}
+                            {owned
+                              ? 'Owned'
+                              : !unlockedForChar
+                                ? 'Trader Lock'
+                                : reqStanding
+                                  ? 'Rep Lock'
+                                  : 'Buy'}
                           </button>
                         </div>
                       );

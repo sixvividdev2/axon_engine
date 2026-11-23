@@ -70,11 +70,20 @@ export type CharacterDeathOutcome =
   | {
       outcome: 'permadeath_wiped';
       slotId: CharacterSlotId;
+      wipedCharacterId: string;
       callsign: string;
       requiredFee: number;
       cashAtDeath: number;
       shortfall: number;
       droppedCorpse: DroppedCorpseEntity;
+      wipedSummary: {
+        unlockedWeapons: number;
+        unlockedAttachments: number;
+        unlockedArmorPlates: number;
+        completedContracts: number;
+        stashItemCount: number;
+        ownedVehicleCount: number;
+      };
     };
 
 /**
@@ -211,22 +220,34 @@ export function processCharacterDeath(
   );
 
   // 2. Permadeath Bankruptcy Check: cash < respawn fee => permanent character deletion
+  // Wipes 100% of this characterId's unlocks, stored gear, cash, vehicles, and reputation
+  // while leaving account-level roster slots and sibling characters untouched.
   if (isBankrupt) {
     const shortfall = requiredFee - character.cash;
+    const wipedSummary = {
+      unlockedWeapons: character.unlocks.unlockedWeaponIds.length,
+      unlockedAttachments: character.unlocks.unlockedAttachmentIds.length,
+      unlockedArmorPlates: character.unlocks.unlockedArmorPlateIds.length,
+      completedContracts: character.unlocks.completedContractIds.length,
+      stashItemCount: character.stashItems.length,
+      ownedVehicleCount: character.ownedVehicleKeys.length,
+    };
     roster.deleteCharacter(character.slotId);
     shards.recordDiscreteTransition(
       character.shardMode,
       'permadeath_wipe',
-      `${character.callsign} (${character.slotId}) wiped — cash $${character.cash.toLocaleString()} below $${requiredFee.toLocaleString()} Field Hospital fee`,
+      `${character.callsign} (${character.slotId}) wiped — cash $${character.cash.toLocaleString()} below $${requiredFee.toLocaleString()} Field Hospital fee (unlocks, stash & vehicles purged)`,
     );
     return {
       outcome: 'permadeath_wiped',
       slotId: character.slotId,
+      wipedCharacterId: character.characterId,
       callsign: character.callsign,
       requiredFee,
       cashAtDeath: character.cash,
       shortfall,
       droppedCorpse,
+      wipedSummary,
     };
   }
 

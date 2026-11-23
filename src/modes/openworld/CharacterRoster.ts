@@ -9,22 +9,30 @@ import { resolveBaseCaliberId } from '../../../data/calibers';
 import { normalizeLoadoutWeaponId } from '../../../data/loadoutStore';
 import { getDefaultReserveForCaliber } from '../../../hideout/HideoutStateStore';
 import {
+  ARMOR_PLATE_MAP,
   CHARACTER_SLOT_IDS,
   CharacterArsenalState,
   CharacterBodyType,
   CharacterSlotId,
+  CharacterUnlockEntitlements,
   CreateCharacterInput,
   getSecureContainerCapacity,
   InventoryItemRecord,
+  OPENWORLD_CONTRACT_MAP,
   OpenWorldCharacter,
   OpenWorldStorageLike,
+  OwnedVehicleKeyRecord,
   PMC_FACTIONS,
   PmcFactionId,
+  QUARTERMASTER_ATTACHMENT_OFFERS,
+  QUARTERMASTER_FIREARM_OFFERS,
   resolveDefaultStorage,
   ShardMode,
   STANDING_MAX,
   STANDING_MIN,
   SubFactionId,
+  TRADER_MAP,
+  TraderId,
 } from './types';
 
 export interface CharacterRosterState {
@@ -49,6 +57,31 @@ export interface PurchaseWeaponResult {
   remainingCash?: number;
 }
 
+export interface PurchaseEntitlementResult {
+  ok: boolean;
+  error?: string;
+  remainingCash?: number;
+}
+
+export interface CompleteContractResult {
+  ok: boolean;
+  error?: string;
+  character?: OpenWorldCharacter;
+  newlyUnlockedWeapons?: string[];
+  newlyUnlockedAttachments?: string[];
+  newlyUnlockedArmorPlates?: string[];
+}
+
+export interface TraderLevelUpResult {
+  ok: boolean;
+  error?: string;
+  newLevel?: number;
+  character?: OpenWorldCharacter;
+  newlyUnlockedWeapons?: string[];
+  newlyUnlockedAttachments?: string[];
+  newlyUnlockedArmorPlates?: string[];
+}
+
 const DEFAULT_STORAGE_KEY = 'axon_openworld_roster_v1';
 const MAX_ARSENAL_WALL_SLOTS = 12;
 export const STARTING_CHARACTER_CASH_USD = 12000;
@@ -71,6 +104,34 @@ const DEFAULT_AMMO_RESERVE: Readonly<Record<string, number>> = {
 
 function makeItemId(prefix: string): string {
   return `${prefix}_${Math.random().toString(36).slice(2, 9)}`;
+}
+
+function mergeUnique(base: readonly string[], additions: readonly string[]): string[] {
+  const seen = new Set(base);
+  const out = [...base];
+  for (const id of additions) {
+    if (id && !seen.has(id)) {
+      seen.add(id);
+      out.push(id);
+    }
+  }
+  return out;
+}
+
+function buildStarterUnlocks(faction: PmcFactionId): CharacterUnlockEntitlements {
+  const spec = PMC_FACTIONS[faction];
+  return {
+    unlockedWeaponIds: mergeUnique(spec.starterWeaponIds, spec.starterUnlockedWeaponIds),
+    unlockedAttachmentIds: [...spec.starterUnlockedAttachmentIds],
+    unlockedArmorPlateIds: [...spec.starterUnlockedArmorPlateIds],
+    traderLevels: {
+      quartermaster_pmc: 1,
+      syndicate_broker: 1,
+      militia_armorer: 1,
+      alpine_specialist: 1,
+    },
+    completedContractIds: [],
+  };
 }
 
 function buildStarterStashAndSecure(faction: PmcFactionId): {
@@ -296,6 +357,13 @@ function cloneCharacter(c: OpenWorldCharacter): OpenWorldCharacter {
         Object.entries(c.arsenal.weaponAttachments).map(([k, v]) => [k, { ...v }]),
       ),
     },
+    unlocks: {
+      unlockedWeaponIds: [...c.unlocks.unlockedWeaponIds],
+      unlockedAttachmentIds: [...c.unlocks.unlockedAttachmentIds],
+      unlockedArmorPlateIds: [...c.unlocks.unlockedArmorPlateIds],
+      traderLevels: { ...c.unlocks.traderLevels },
+      completedContractIds: [...c.unlocks.completedContractIds],
+    },
     equippedKit: {
       ...c.equippedKit,
       backpackItems: c.equippedKit.backpackItems.map((it) => ({ ...it })),
@@ -347,6 +415,40 @@ function sanitizeLoadedCharacter(
 
   const wallRackSlots = reconcileRackSlots(ownedUnique, rawRack, equippedWeaponId);
 
+  const starterUnlocks = buildStarterUnlocks(pmcFaction);
+  const rawUnlocks = obj.unlocks;
+  const clampTraderLevel = (traderId: TraderId, val: unknown): number => {
+    const max = TRADER_MAP[traderId].maxLevel;
+    if (typeof val !== 'number' || !Number.isFinite(val)) return 1;
+    return Math.max(1, Math.min(max, Math.floor(val)));
+  };
+
+  const unlocks: CharacterUnlockEntitlements = {
+    unlockedWeaponIds: Array.isArray(rawUnlocks?.unlockedWeaponIds)
+      ? mergeUnique(
+          ownedUnique,
+          rawUnlocks.unlockedWeaponIds
+            .map((id) => normalizeLoadoutWeaponId(id, ''))
+            .filter((id) => Boolean(id)),
+        )
+      : mergeUnique(starterUnlocks.unlockedWeaponIds, ownedUnique),
+    unlockedAttachmentIds: Array.isArray(rawUnlocks?.unlockedAttachmentIds)
+      ? mergeUnique([], rawUnlocks.unlockedAttachmentIds.filter((s): s is string => typeof s === 'string'))
+      : [...starterUnlocks.unlockedAttachmentIds],
+    unlockedArmorPlateIds: Array.isArray(rawUnlocks?.unlockedArmorPlateIds)
+      ? mergeUnique([], rawUnlocks.unlockedArmorPlateIds.filter((s): s is string => typeof s === 'string'))
+      : [...starterUnlocks.unlockedArmorPlateIds],
+    traderLevels: {
+      quartermaster_pmc: clampTraderLevel('quartermaster_pmc', rawUnlocks?.traderLevels?.quartermaster_pmc),
+      syndicate_broker: clampTraderLevel('syndicate_broker', rawUnlocks?.traderLevels?.syndicate_broker),
+      militia_armorer: clampTraderLevel('militia_armorer', rawUnlocks?.traderLevels?.militia_armorer),
+      alpine_specialist: clampTraderLevel('alpine_specialist', rawUnlocks?.traderLevels?.alpine_specialist),
+    },
+    completedContractIds: Array.isArray(rawUnlocks?.completedContractIds)
+      ? mergeUnique([], rawUnlocks.completedContractIds.filter((s): s is string => typeof s === 'string'))
+      : [],
+  };
+
   const clampStanding = (val: unknown): number => {
     if (typeof val !== 'number' || !Number.isFinite(val)) return 0;
     return Math.max(STANDING_MIN, Math.min(STANDING_MAX, Math.round(val)));
@@ -396,9 +498,11 @@ function sanitizeLoadedCharacter(
           ? { ...obj.arsenal.weaponAttachments }
           : {},
     },
+    unlocks,
     equippedKit: {
       primaryWeaponId: obj.equippedKit?.primaryWeaponId ?? null,
       secondaryWeaponId: obj.equippedKit?.secondaryWeaponId ?? null,
+      armorPlateId: obj.equippedKit?.armorPlateId ?? factionSpec.starterArmorPlateId,
       armorName: obj.equippedKit?.armorName ?? null,
       rigName: obj.equippedKit?.rigName ?? null,
       backpackItems: Array.isArray(obj.equippedKit?.backpackItems)
@@ -415,7 +519,7 @@ function sanitizeLoadedCharacter(
         typeof obj.missions?.completedContracts === 'number' &&
         Number.isFinite(obj.missions.completedContracts)
           ? Math.max(0, Math.floor(obj.missions.completedContracts))
-          : 0,
+          : unlocks.completedContractIds.length,
       activeContractIds: Array.isArray(obj.missions?.activeContractIds)
         ? [...obj.missions.activeContractIds]
         : [],
@@ -453,9 +557,11 @@ type RosterListener = (state: CharacterRosterState) => void;
 
 /**
  * Three-Character Account Roster (`slot_0` – `slot_2`).
- * - Permanent creation-locked attributes: `shardMode`, `pmcFaction`, `bodyType`, `callsign`.
- * - 100% isolated progression per character: cash, stash, 3D Hideout Arsenal Wall,
- *   mission progression, owned vehicle keys, and 3 regional sub-faction reputation meters.
+ * - Account/Roster level: 3 character slots and shard/faction creation rules.
+ * - Per-character (`characterId`) isolation: cash, stash, 3D Hideout Arsenal Wall,
+ *   weapon/attachment/armor-plate/trader unlock entitlements, contracts, owned vehicle keys,
+ *   and 3 regional sub-faction reputation meters.
+ * - Permadeath wipes 100% of that character's unlocks, stored gear, cash, and vehicles with the slot.
  * - Persists strictly on discrete state transitions (zero per-frame writes).
  */
 export class CharacterRoster {
@@ -589,6 +695,7 @@ export class CharacterRoster {
     const factionSpec = PMC_FACTIONS[pmcFaction];
     const starterItems = buildStarterStashAndSecure(pmcFaction);
     const starterArsenal = buildStarterArsenal(pmcFaction);
+    const starterUnlocks = buildStarterUnlocks(pmcFaction);
     const secondaryStarter =
       factionSpec.starterWeaponIds.find((w) => {
         const prof = resolveWeaponProfile(w);
@@ -608,9 +715,11 @@ export class CharacterRoster {
       secureContainerTier: '2x2',
       secureContainerItems: starterItems.secureContainerItems,
       arsenal: starterArsenal,
+      unlocks: starterUnlocks,
       equippedKit: {
         primaryWeaponId: factionSpec.starterEquippedWeaponId,
         secondaryWeaponId: secondaryStarter,
+        armorPlateId: factionSpec.starterArmorPlateId,
         armorName: factionSpec.starterArmorName,
         rigName: factionSpec.starterRigName,
         backpackItems: starterItems.backpackItems,
@@ -716,6 +825,174 @@ export class CharacterRoster {
     });
   }
 
+  // =========================================================================
+  // PER-CHARACTER UNLOCK ENTITLEMENTS (Weapons, Attachments/Optics, Armor Plates, Traders, Contracts)
+  // =========================================================================
+
+  public isWeaponUnlockedForCharacter(slotId: CharacterSlotId, weaponId: string): boolean {
+    const c = this.state.slots[slotId];
+    if (!c) return false;
+    const canonical = normalizeLoadoutWeaponId(weaponId, '');
+    if (!canonical) return false;
+    return (
+      c.unlocks.unlockedWeaponIds.includes(canonical) ||
+      c.arsenal.ownedWeaponIds.includes(canonical)
+    );
+  }
+
+  public isAttachmentUnlockedForCharacter(slotId: CharacterSlotId, attachmentId: string): boolean {
+    const c = this.state.slots[slotId];
+    if (!c) return false;
+    return c.unlocks.unlockedAttachmentIds.includes(attachmentId);
+  }
+
+  public isArmorPlateUnlockedForCharacter(slotId: CharacterSlotId, armorPlateId: string): boolean {
+    const c = this.state.slots[slotId];
+    if (!c) return false;
+    return c.unlocks.unlockedArmorPlateIds.includes(armorPlateId);
+  }
+
+  /**
+   * Levels up a specific trader for ONE character (`characterId`), unlocking that trader level's
+   * firearm, optic/attachment, and armor plate entitlements exclusively inside this character's profile.
+   */
+  public levelUpTrader(slotId: CharacterSlotId, traderId: TraderId): TraderLevelUpResult {
+    const current = this.state.slots[slotId];
+    if (!current) return { ok: false, error: 'Character slot not found.' };
+    const trader = TRADER_MAP[traderId];
+    if (!trader) return { ok: false, error: 'Unknown trader.' };
+
+    const curLevel = current.unlocks.traderLevels[traderId] ?? 1;
+    if (curLevel >= trader.maxLevel) {
+      return { ok: false, error: `${trader.name} is already at max level (Lv ${trader.maxLevel}).` };
+    }
+
+    const nextLevel = curLevel + 1;
+    const reward = trader.levelUnlocks[nextLevel];
+    const prevWeapons = new Set(current.unlocks.unlockedWeaponIds);
+    const prevAttachments = new Set(current.unlocks.unlockedAttachmentIds);
+    const prevPlates = new Set(current.unlocks.unlockedArmorPlateIds);
+
+    const updated = this.mutateCharacter(slotId, (c) => {
+      c.unlocks.traderLevels[traderId] = nextLevel;
+      if (reward) {
+        c.unlocks.unlockedWeaponIds = mergeUnique(c.unlocks.unlockedWeaponIds, reward.weapons);
+        c.unlocks.unlockedAttachmentIds = mergeUnique(
+          c.unlocks.unlockedAttachmentIds,
+          reward.attachments,
+        );
+        c.unlocks.unlockedArmorPlateIds = mergeUnique(
+          c.unlocks.unlockedArmorPlateIds,
+          reward.armorPlates,
+        );
+      }
+      // Keep progression tier aligned with highest trader progression
+      const maxTraderLv = Math.max(...Object.values(c.unlocks.traderLevels));
+      if (maxTraderLv > c.missions.progressionTier) {
+        c.missions.progressionTier = Math.min(6, maxTraderLv);
+      }
+    });
+
+    if (!updated) return { ok: false, error: 'Failed to update trader level.' };
+    return {
+      ok: true,
+      newLevel: nextLevel,
+      character: updated,
+      newlyUnlockedWeapons: updated.unlocks.unlockedWeaponIds.filter((id) => !prevWeapons.has(id)),
+      newlyUnlockedAttachments: updated.unlocks.unlockedAttachmentIds.filter(
+        (id) => !prevAttachments.has(id),
+      ),
+      newlyUnlockedArmorPlates: updated.unlocks.unlockedArmorPlateIds.filter(
+        (id) => !prevPlates.has(id),
+      ),
+    };
+  }
+
+  /**
+   * Completes a contract for ONE character (`characterId`), granting its cash reward, standing,
+   * trader level advancement, and firearm/optic/armor-plate unlock entitlements exclusively to this slot.
+   */
+  public completeContract(slotId: CharacterSlotId, contractId: string): CompleteContractResult {
+    const current = this.state.slots[slotId];
+    if (!current) return { ok: false, error: 'Character slot not found.' };
+    const contract = OPENWORLD_CONTRACT_MAP[contractId];
+    if (!contract) return { ok: false, error: 'Unknown contract ID.' };
+    if (current.unlocks.completedContractIds.includes(contractId)) {
+      return { ok: false, error: 'Contract already completed by this character.' };
+    }
+
+    const prevWeapons = new Set(current.unlocks.unlockedWeaponIds);
+    const prevAttachments = new Set(current.unlocks.unlockedAttachmentIds);
+    const prevPlates = new Set(current.unlocks.unlockedArmorPlateIds);
+
+    const updated = this.mutateCharacter(slotId, (c) => {
+      c.unlocks.completedContractIds = mergeUnique(c.unlocks.completedContractIds, [contractId]);
+      c.missions.completedContracts += 1;
+      c.cash = Math.max(0, Math.round(c.cash + contract.cashRewardUsd));
+
+      // Apply contract direct unlock entitlements strictly to this characterId
+      c.unlocks.unlockedWeaponIds = mergeUnique(
+        c.unlocks.unlockedWeaponIds,
+        contract.unlocksWeaponIds,
+      );
+      c.unlocks.unlockedAttachmentIds = mergeUnique(
+        c.unlocks.unlockedAttachmentIds,
+        contract.unlocksAttachmentIds,
+      );
+      c.unlocks.unlockedArmorPlateIds = mergeUnique(
+        c.unlocks.unlockedArmorPlateIds,
+        contract.unlocksArmorPlateIds,
+      );
+
+      // Advance trader level if contract grants higher level, applying any intermediate trader unlocks
+      if (contract.grantsTraderLevel) {
+        const trader = TRADER_MAP[contract.traderId];
+        const curLv = c.unlocks.traderLevels[contract.traderId] ?? 1;
+        const targetLv = Math.min(trader.maxLevel, Math.max(curLv, contract.grantsTraderLevel));
+        for (let lv = curLv + 1; lv <= targetLv; lv++) {
+          const lvReward = trader.levelUnlocks[lv];
+          if (lvReward) {
+            c.unlocks.unlockedWeaponIds = mergeUnique(c.unlocks.unlockedWeaponIds, lvReward.weapons);
+            c.unlocks.unlockedAttachmentIds = mergeUnique(
+              c.unlocks.unlockedAttachmentIds,
+              lvReward.attachments,
+            );
+            c.unlocks.unlockedArmorPlateIds = mergeUnique(
+              c.unlocks.unlockedArmorPlateIds,
+              lvReward.armorPlates,
+            );
+          }
+        }
+        c.unlocks.traderLevels[contract.traderId] = targetLv;
+      }
+
+      if (contract.subFactionId && contract.standingDelta !== 0) {
+        const curStand = c.subFactionStanding[contract.subFactionId] ?? 0;
+        c.subFactionStanding[contract.subFactionId] = Math.max(
+          STANDING_MIN,
+          Math.min(STANDING_MAX, Math.round(curStand + contract.standingDelta)),
+        );
+      }
+
+      // Scale mission tier smoothly with contract completions
+      const targetTier = Math.min(6, 1 + Math.floor(c.missions.completedContracts / 1));
+      c.missions.progressionTier = Math.max(c.missions.progressionTier, targetTier);
+    });
+
+    if (!updated) return { ok: false, error: 'Failed to complete contract.' };
+    return {
+      ok: true,
+      character: updated,
+      newlyUnlockedWeapons: updated.unlocks.unlockedWeaponIds.filter((id) => !prevWeapons.has(id)),
+      newlyUnlockedAttachments: updated.unlocks.unlockedAttachmentIds.filter(
+        (id) => !prevAttachments.has(id),
+      ),
+      newlyUnlockedArmorPlates: updated.unlocks.unlockedArmorPlateIds.filter(
+        (id) => !prevPlates.has(id),
+      ),
+    };
+  }
+
   public purchaseWeaponToArsenal(
     slotId: CharacterSlotId,
     weaponId: string,
@@ -726,8 +1003,20 @@ export class CharacterRoster {
     const canonical = normalizeLoadoutWeaponId(weaponId, '');
     if (!canonical) return { ok: false, error: 'Unknown firearm ID.' };
     if (current.arsenal.ownedWeaponIds.includes(canonical)) {
-      return { ok: false, error: 'Firearm already owned in this character\'s Arsenal.' };
+      return { ok: false, error: "Firearm already owned in this character's Arsenal." };
     }
+
+    // Per-character unlock entitlement check (never account-wide)
+    if (!current.unlocks.unlockedWeaponIds.includes(canonical)) {
+      const offer = QUARTERMASTER_FIREARM_OFFERS.find((o) => o.weaponId === canonical);
+      const traderName = offer ? TRADER_MAP[offer.traderId].name : 'Trader';
+      const reqLv = offer ? offer.requiredTraderLevel : 2;
+      return {
+        ok: false,
+        error: `Locked for ${current.callsign} — requires ${traderName} Lv ${reqLv} or contract unlock.`,
+      };
+    }
+
     const cleanPrice = Math.max(0, Math.round(priceUsd));
     if (current.cash < cleanPrice) {
       return { ok: false, error: 'Insufficient cash for this purchase.' };
@@ -751,6 +1040,119 @@ export class CharacterRoster {
       }
     });
     return { ok: true, remainingCash: updated?.cash ?? 0 };
+  }
+
+  public purchaseAttachmentToCharacter(
+    slotId: CharacterSlotId,
+    attachmentId: string,
+    priceUsd?: number,
+  ): PurchaseEntitlementResult {
+    const current = this.state.slots[slotId];
+    if (!current) return { ok: false, error: 'Character slot not found.' };
+    const offer = QUARTERMASTER_ATTACHMENT_OFFERS.find((o) => o.attachmentId === attachmentId);
+    if (!current.unlocks.unlockedAttachmentIds.includes(attachmentId)) {
+      const traderName = offer ? TRADER_MAP[offer.traderId].name : 'Trader';
+      const reqLv = offer ? offer.requiredTraderLevel : 2;
+      return {
+        ok: false,
+        error: `Optic/attachment locked for ${current.callsign} — unlock via ${traderName} Lv ${reqLv} or contract.`,
+      };
+    }
+
+    const cleanPrice = Math.max(0, Math.round(priceUsd ?? offer?.priceUsd ?? 800));
+    if (current.cash < cleanPrice) {
+      return { ok: false, error: 'Insufficient cash for this attachment.' };
+    }
+
+    const updated = this.mutateCharacter(slotId, (c) => {
+      c.cash = Math.max(0, c.cash - cleanPrice);
+      c.stashItems.push({
+        instanceId: makeItemId('att'),
+        itemId: attachmentId,
+        name: offer?.label ?? attachmentId,
+        category: 'gear',
+        quantity: 1,
+        valueUsd: cleanPrice,
+        slots: 1,
+      });
+    });
+    return { ok: true, remainingCash: updated?.cash ?? 0 };
+  }
+
+  public purchaseArmorPlateToCharacter(
+    slotId: CharacterSlotId,
+    armorPlateId: string,
+    equipImmediately = true,
+  ): PurchaseEntitlementResult {
+    const current = this.state.slots[slotId];
+    if (!current) return { ok: false, error: 'Character slot not found.' };
+    const plate = ARMOR_PLATE_MAP[armorPlateId];
+    if (!plate) return { ok: false, error: 'Unknown armor plate ID.' };
+    if (!current.unlocks.unlockedArmorPlateIds.includes(armorPlateId)) {
+      const traderName = TRADER_MAP[plate.traderId].name;
+      return {
+        ok: false,
+        error: `Armor plate locked for ${current.callsign} — requires ${traderName} Lv ${plate.requiredTraderLevel} or contract unlock.`,
+      };
+    }
+    if (current.cash < plate.priceUsd) {
+      return { ok: false, error: 'Insufficient cash for this armor plate.' };
+    }
+
+    const updated = this.mutateCharacter(slotId, (c) => {
+      c.cash = Math.max(0, c.cash - plate.priceUsd);
+      if (equipImmediately) {
+        c.equippedKit.armorPlateId = plate.id;
+        c.equippedKit.armorName = plate.name;
+      } else {
+        c.stashItems.push({
+          instanceId: makeItemId('plate'),
+          itemId: plate.id,
+          name: plate.name,
+          category: 'armor_plate',
+          quantity: 1,
+          valueUsd: plate.priceUsd,
+          slots: 2,
+        });
+      }
+    });
+    return { ok: true, remainingCash: updated?.cash ?? 0 };
+  }
+
+  public addOwnedVehicleKey(
+    slotId: CharacterSlotId,
+    vehicle: OwnedVehicleKeyRecord,
+  ): OpenWorldCharacter | null {
+    return this.mutateCharacter(slotId, (c) => {
+      const idx = c.ownedVehicleKeys.findIndex((v) => v.vehicleId === vehicle.vehicleId);
+      if (idx >= 0) {
+        c.ownedVehicleKeys[idx] = { ...vehicle };
+      } else {
+        c.ownedVehicleKeys.push({ ...vehicle });
+      }
+    });
+  }
+
+  public setDeploymentState(
+    slotId: CharacterSlotId,
+    deploymentState: 'hideout' | 'deployed',
+  ): OpenWorldCharacter | null {
+    return this.mutateCharacter(slotId, (c) => {
+      c.deploymentState = deploymentState;
+    });
+  }
+
+  public recordExfil(
+    slotId: CharacterSlotId,
+    cashRewardUsd = 0,
+  ): OpenWorldCharacter | null {
+    return this.mutateCharacter(slotId, (c) => {
+      c.deploymentState = 'hideout';
+      c.exfilsCount += 1;
+      if (cashRewardUsd > 0) {
+        c.cash = Math.max(0, Math.round(c.cash + cashRewardUsd));
+      }
+    });
   }
 
   public commitArsenalRackSwap(
@@ -970,7 +1372,7 @@ export class CharacterRoster {
   /**
    * Called exclusively by PermadeathService when a solvent character pays their Field Hospital fee
    * and respawns after a full-drop death. Drops deployed/equipped weapons & field kit while keeping
-   * Secure Container items and un-deployed Hideout Arsenal / Stash assets intact.
+   * Secure Container items, earned unlock entitlements, and un-deployed Hideout Stash intact.
    */
   public applyFieldHospitalRespawn(
     slotId: CharacterSlotId,
@@ -985,7 +1387,6 @@ export class CharacterRoster {
       c.deploymentState = 'hideout';
       c.lastHospitalId = hospitalId;
 
-      // Remove dropped field weapons from this character's owned Arsenal Wall
       const remainingOwned = c.arsenal.ownedWeaponIds.filter((id) => !droppedSet.has(id));
       const nextEquipped =
         c.arsenal.equippedWeaponId !== 'unarmed' && !droppedSet.has(c.arsenal.equippedWeaponId)
@@ -1000,10 +1401,10 @@ export class CharacterRoster {
         nextEquipped,
       );
 
-      // Clear full-drop field kit (Secure Container items remain 100% untouched!)
       c.equippedKit = {
         primaryWeaponId: nextEquipped !== 'unarmed' ? nextEquipped : null,
         secondaryWeaponId: null,
+        armorPlateId: null,
         armorName: null,
         rigName: null,
         backpackItems: [],

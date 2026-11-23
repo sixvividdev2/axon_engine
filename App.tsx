@@ -27,9 +27,11 @@ import { SocialHubDrawer } from './ui/SocialHubDrawer';
 import { SocialInviteToast } from './ui/SocialInviteToast';
 import { UnifiedLoadoutWorkbench } from './ui/UnifiedLoadoutWorkbench';
 import { HideoutView } from './hideout/HideoutView';
+import { CharacterSlotId, OpenWorldView } from './src/modes/openworld';
 
 type ActiveView =
   | { kind: 'hideout' }
+  | { kind: 'openworld'; slotId: CharacterSlotId | null }
   | { kind: 'menu'; tab: HubTabId }
   | { kind: 'playground' }
   | { kind: 'combat'; params: CombatSessionParams; sessionKey: number; isMultiplayer: boolean };
@@ -466,8 +468,16 @@ function AppShell() {
               isMultiplayer: false,
             });
           }}
+          onLaunchOpenWorld={(slotId) => setView({ kind: 'openworld', slotId })}
           onOpenClassicHub={(tab) => setView({ kind: 'menu', tab })}
           onLaunchPlayground={() => setView({ kind: 'playground' })}
+        />
+      )}
+
+      {view.kind === 'openworld' && (
+        <OpenWorldView
+          slotId={view.slotId}
+          onExitToHideout={() => setView({ kind: 'hideout' })}
         />
       )}
 

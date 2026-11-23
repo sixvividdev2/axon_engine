@@ -178,6 +178,9 @@ describe('Phase 1: Roster, Dual Shards, Permadeath & Hideout Wiring', () => {
       bodyType: 'male',
       activate: true,
     });
+    // HK416 is locked at Quartermaster Lv 1 until Character A earns the Lv 2 unlock entitlement
+    expect(roster.purchaseWeaponToArsenal('slot_0', 'hk416', 4600).ok).toBe(false);
+    expect(roster.levelUpTrader('slot_0', 'quartermaster_pmc').ok).toBe(true);
     // Purchase HK416 exclusively on Character A
     const buyA = roster.purchaseWeaponToArsenal('slot_0', 'hk416', 4600);
     expect(buyA.ok).toBe(true);

@@ -19,7 +19,11 @@ import { HideoutHud } from './HideoutHud';
 import { HideoutOpsLaptopModal, OpsLaptopTabId } from './HideoutOpsLaptopModal';
 import { ReadyRoomBriefingState } from './HideoutReadyRoom';
 import { HideoutSessionController, HideoutSnapshot } from './HideoutSessionController';
-import { useHideoutShardAdapter } from '../src/modes/openworld';
+import {
+  CharacterSlotId,
+  hideoutShardAdapter,
+  useHideoutShardAdapter,
+} from '../src/modes/openworld';
 
 interface HideoutViewProps {
   battleConfig: BattleMatchConfig;
@@ -28,6 +32,7 @@ interface HideoutViewProps {
   onChangeInfectionConfig: (next: InfectionMatchConfig) => void;
   onLaunchBattle: (config: BattleMatchConfig) => void;
   onLaunchInfection: (config: InfectionMatchConfig) => void;
+  onLaunchOpenWorld?: (slotId: CharacterSlotId) => void;
   onOpenClassicHub: (tab: HubTabId) => void;
   onLaunchPlayground: () => void;
 }
@@ -46,6 +51,7 @@ export const HideoutView: React.FC<HideoutViewProps> = ({
   onChangeInfectionConfig,
   onLaunchBattle,
   onLaunchInfection,
+  onLaunchOpenWorld,
   onOpenClassicHub,
   onLaunchPlayground,
 }) => {
@@ -271,6 +277,14 @@ export const HideoutView: React.FC<HideoutViewProps> = ({
             setActiveModal('none');
             onLaunchInfection(cfg);
           }}
+          onDeployOpenWorld={
+            onLaunchOpenWorld
+              ? (slotId) => {
+                  setActiveModal('none');
+                  onLaunchOpenWorld(slotId);
+                }
+              : undefined
+          }
           onLaunchPlayground={() => {
             setActiveModal('none');
             onLaunchPlayground();
@@ -287,8 +301,12 @@ export const HideoutView: React.FC<HideoutViewProps> = ({
           <UnifiedLoadoutWorkbench
             careerRank={effectiveRank}
             getWeaponProgress={getWeaponProgress}
-            isWeaponUnlocked={isWeaponUnlocked}
-            isAttachmentUnlocked={isAttachmentUnlocked}
+            isWeaponUnlocked={(wid) =>
+              hideoutShardAdapter.isWeaponOwnedInActiveContext(wid, isWeaponUnlocked)
+            }
+            isAttachmentUnlocked={(attId) =>
+              hideoutShardAdapter.isAttachmentUnlockedInActiveContext(attId, isAttachmentUnlocked)
+            }
             onClose={closeModalAndResume}
             closeLabel="Return to Hideout"
           />

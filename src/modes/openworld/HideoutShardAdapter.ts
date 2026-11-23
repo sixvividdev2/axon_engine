@@ -199,6 +199,23 @@ export class HideoutShardAdapter {
     return classicUnlockCheck(weaponId);
   }
 
+  public isAttachmentUnlockedInActiveContext(
+    attachmentId: string,
+    classicUnlockCheck: (attachmentId: string) => boolean,
+  ): boolean {
+    const active = this.roster.getActiveCharacter();
+    if (active) {
+      return active.unlocks.unlockedAttachmentIds.includes(attachmentId);
+    }
+    return classicUnlockCheck(attachmentId);
+  }
+
+  public isArmorPlateUnlockedInActiveContext(armorPlateId: string): boolean {
+    const active = this.roster.getActiveCharacter();
+    if (!active) return true;
+    return active.unlocks.unlockedArmorPlateIds.includes(armorPlateId);
+  }
+
   public syncOwnedWeapons(
     classicUnlockCheck: (weaponId: string) => boolean,
   ): HideoutArsenalSnapshot {

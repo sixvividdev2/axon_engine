@@ -31,7 +31,11 @@ import {
 import { MapSelector } from '../ui/MapSelector';
 import { MultiplayerHubPanel } from '../ui/MultiplayerHubPanel';
 import { WeatherTimeControls } from '../ui/WeatherTimeControls';
-import { PerimeterOpsTerminalPanel, useHideoutShardAdapter } from '../src/modes/openworld';
+import {
+  CharacterSlotId,
+  PerimeterOpsTerminalPanel,
+  useHideoutShardAdapter,
+} from '../src/modes/openworld';
 
 export type OpsLaptopTabId = 'perimeter' | 'battle' | 'multiplayer' | 'infection';
 
@@ -43,6 +47,7 @@ interface HideoutOpsLaptopModalProps {
   onChangeInfectionConfig: (next: InfectionMatchConfig) => void;
   onDeployBattle: (config: BattleMatchConfig) => void;
   onDeployInfection: (config: InfectionMatchConfig) => void;
+  onDeployOpenWorld?: (slotId: CharacterSlotId) => void;
   onLaunchPlayground: () => void;
   onOpenGunsmith: () => void;
   onOpenOperatorGear: () => void;
@@ -71,6 +76,7 @@ export const HideoutOpsLaptopModal: React.FC<HideoutOpsLaptopModalProps> = ({
   onChangeInfectionConfig,
   onDeployBattle,
   onDeployInfection,
+  onDeployOpenWorld,
   onLaunchPlayground,
   onOpenGunsmith,
   onOpenOperatorGear,
@@ -259,7 +265,9 @@ export const HideoutOpsLaptopModal: React.FC<HideoutOpsLaptopModalProps> = ({
 
         {/* Terminal Body */}
         <div className="flex-1 overflow-y-auto px-6 py-5">
-          {activeTab === 'perimeter' && <PerimeterOpsTerminalPanel />}
+          {activeTab === 'perimeter' && (
+            <PerimeterOpsTerminalPanel onDeployOpenWorld={onDeployOpenWorld} />
+          )}
 
           {activeTab === 'battle' && (
             <div className="flex flex-col gap-5">

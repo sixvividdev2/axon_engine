@@ -20,6 +20,12 @@ export type SubFactionId =
   | 'highland_militia'
   | 'alpine_remnant';
 
+export type TraderId =
+  | 'quartermaster_pmc'
+  | 'syndicate_broker'
+  | 'militia_armorer'
+  | 'alpine_specialist';
+
 export type StandingTier = 'Hostile' | 'Neutral' | 'Trusted';
 
 export type SecureContainerTier = '2x2' | '3x3';
@@ -31,6 +37,7 @@ export type InventoryItemCategory =
   | 'medical'
   | 'ammo'
   | 'gear'
+  | 'armor_plate'
   | 'barter';
 
 export type DiscreteTransitionType =
@@ -42,10 +49,20 @@ export type DiscreteTransitionType =
   | 'field_hospital_respawn'
   | 'permadeath_wipe'
   | 'trader_purchase'
+  | 'trader_level_up'
+  | 'contract_completed'
   | 'sector_flip'
   | 'stash_update'
   | 'arsenal_update'
   | 'reputation_update';
+
+export type OpenWorldBiomeId =
+  | 'coastal_port_marsh'
+  | 'temperate_conifer_valley'
+  | 'highland_steppe_quarry'
+  | 'alpine_ridge_dam';
+
+export type OpenWorldWeatherId = 'clear' | 'coastal_fog' | 'mountain_rain';
 
 export interface OpenWorldStorageLike {
   getItem(key: string): string | null;
@@ -100,7 +117,11 @@ export interface PmcFactionSpec {
   readonly homeHospitalName: string;
   readonly doctrine: string;
   readonly starterWeaponIds: readonly string[];
+  readonly starterUnlockedWeaponIds: readonly string[];
+  readonly starterUnlockedAttachmentIds: readonly string[];
+  readonly starterUnlockedArmorPlateIds: readonly string[];
   readonly starterEquippedWeaponId: string;
+  readonly starterArmorPlateId: string;
   readonly starterArmorName: string;
   readonly starterRigName: string;
 }
@@ -116,8 +137,12 @@ export const PMC_FACTIONS: Readonly<Record<PmcFactionId, PmcFactionSpec>> = {
     homeHospitalName: 'Alpha Forward Surgical Bay',
     doctrine: 'NATO modular carbines, coastal-to-steppe rapid intervention.',
     starterWeaponIds: ['m4a1', 'hk_mp5', 'glock_17'],
+    starterUnlockedWeaponIds: ['m4a1', 'hk_mp5', 'remington_870', 'mosin_m91_30', 'glock_17', 'beretta_m9'],
+    starterUnlockedAttachmentIds: ['rail_mp5_claw', 'optic_t2_red_dot', 'tac_flashlight', 'grip_angled_afg'],
+    starterUnlockedArmorPlateIds: ['plate_nij3_steel'],
     starterEquippedWeaponId: 'm4a1',
-    starterArmorName: 'JPC-2 Plate Carrier (NIJ III)',
+    starterArmorPlateId: 'plate_nij3_steel',
+    starterArmorName: 'JPC-2 Plate Carrier (NIJ III Steel)',
     starterRigName: 'Mk4 Micro Chest Rig',
   },
   pmc_bravo: {
@@ -130,8 +155,12 @@ export const PMC_FACTIONS: Readonly<Record<PmcFactionId, PmcFactionSpec>> = {
     homeHospitalName: 'Bravo Field Trauma Clinic',
     doctrine: 'Heavy Eastern-bloc rifles, breacher shotguns, alpine endurance.',
     starterWeaponIds: ['akm_762', 'aks74u', 'remington_870', 'makarov_pm'],
+    starterUnlockedWeaponIds: ['akm_762', 'aks74u', 'remington_870', 'mosin_m91_30', 'makarov_pm', 'glock_17'],
+    starterUnlockedAttachmentIds: ['rail_b13_dovetail', 'optic_kobra_rd', 'tac_flashlight', 'muzzle_comp_ak'],
+    starterUnlockedArmorPlateIds: ['plate_gost4_granit'],
     starterEquippedWeaponId: 'akm_762',
-    starterArmorName: '6B45 Ratnik Vest (GOST 4)',
+    starterArmorPlateId: 'plate_gost4_granit',
+    starterArmorName: '6B45 Ratnik Vest (GOST 4 Granit)',
     starterRigName: 'Smersh AK Harness',
   },
 } as const;
@@ -144,6 +173,7 @@ export interface SubFactionSpec {
   readonly hospitalId: string;
   readonly hospitalName: string;
   readonly rivalId: SubFactionId;
+  readonly traderId: TraderId;
   readonly summary: string;
 }
 
@@ -156,6 +186,7 @@ export const SUB_FACTION_LIST: readonly SubFactionSpec[] = [
     hospitalId: 'hosp_syndicate_drydock',
     hospitalName: 'Delta Drydock Aid Station',
     rivalId: 'highland_militia',
+    traderId: 'syndicate_broker',
     summary: 'Controls container terminals, patrol barges, and maritime black-market imports.',
   },
   {
@@ -166,6 +197,7 @@ export const SUB_FACTION_LIST: readonly SubFactionSpec[] = [
     hospitalId: 'hosp_militia_quarry',
     hospitalName: 'Quarry Ridge Field Triage',
     rivalId: 'alpine_remnant',
+    traderId: 'militia_armorer',
     summary: 'Holds logging arteries, freight yards, and armored quarry checkpoints.',
   },
   {
@@ -176,6 +208,7 @@ export const SUB_FACTION_LIST: readonly SubFactionSpec[] = [
     hospitalId: 'hosp_remnant_dam',
     hospitalName: 'Dam Summit Med-Bunker',
     rivalId: 'dockworkers_syndicate',
+    traderId: 'alpine_specialist',
     summary: 'Guards fortified hydroelectric bunkers, radar arrays, and high-tier vaults.',
   },
 ] as const;
@@ -183,6 +216,255 @@ export const SUB_FACTION_LIST: readonly SubFactionSpec[] = [
 export const SUB_FACTION_MAP: Readonly<Record<SubFactionId, SubFactionSpec>> = Object.fromEntries(
   SUB_FACTION_LIST.map((f) => [f.id, f]),
 ) as Record<SubFactionId, SubFactionSpec>;
+
+export interface TraderSpec {
+  readonly id: TraderId;
+  readonly name: string;
+  readonly role: string;
+  readonly subFactionId?: SubFactionId;
+  readonly maxLevel: number;
+  readonly levelUnlocks: Readonly<
+    Record<
+      number,
+      {
+        readonly weapons: readonly string[];
+        readonly attachments: readonly string[];
+        readonly armorPlates: readonly string[];
+      }
+    >
+  >;
+}
+
+export const TRADER_LIST: readonly TraderSpec[] = [
+  {
+    id: 'quartermaster_pmc',
+    name: 'PMC Quartermaster',
+    role: 'Home FOB Armory & Ballistic Plates',
+    maxLevel: 4,
+    levelUnlocks: {
+      2: {
+        weapons: ['hk416', 'ak105'],
+        attachments: ['optic_eotech_holo', 'grip_vertical_rk'],
+        armorPlates: ['plate_nij3a_ceramic'],
+      },
+      3: {
+        weapons: ['sig_mcx'],
+        attachments: ['optic_lpvo_1_6', 'tac_peq_combo', 'mag_m4_60_quad'],
+        armorPlates: ['plate_nij4_composite'],
+      },
+      4: {
+        weapons: ['benelli_m4'],
+        attachments: ['optic_razor_1_6', 'muzzle_pbs4_545'],
+        armorPlates: ['plate_gost5_titanium'],
+      },
+    },
+  },
+  {
+    id: 'syndicate_broker',
+    name: 'Delta Maritime Broker',
+    role: 'Coastal Port Smuggled Optics & Suppressors',
+    subFactionId: 'dockworkers_syndicate',
+    maxLevel: 3,
+    levelUnlocks: {
+      2: {
+        weapons: ['benelli_m4'],
+        attachments: ['muzzle_9mm_suppressor', 'optic_rmr_type2'],
+        armorPlates: ['plate_nij3a_ceramic'],
+      },
+      3: {
+        weapons: ['sig_mcx'],
+        attachments: ['muzzle_salvo_12ga', 'canted_t2_red_dot'],
+        armorPlates: ['plate_nij4_composite'],
+      },
+    },
+  },
+  {
+    id: 'militia_armorer',
+    name: 'Quarry Field Armorer',
+    role: 'Highland DMRs & Eastern Ballistics',
+    subFactionId: 'highland_militia',
+    maxLevel: 3,
+    levelUnlocks: {
+      2: {
+        weapons: ['ak105'],
+        attachments: ['optic_pso1_4x', 'mag_ak_45_bakelite'],
+        armorPlates: ['plate_gost4_granit'],
+      },
+      3: {
+        weapons: ['dragunov_svd'],
+        attachments: ['optic_pso1m2', 'muzzle_pbs4_545'],
+        armorPlates: ['plate_gost5_titanium'],
+      },
+    },
+  },
+  {
+    id: 'alpine_specialist',
+    name: 'Dam Summit Ordnance',
+    role: 'Alpine Long-Range Optics & Heavy Plates',
+    subFactionId: 'alpine_remnant',
+    maxLevel: 3,
+    levelUnlocks: {
+      2: {
+        weapons: ['mk14_ebr'],
+        attachments: ['optic_lpvo_1_6', 'tac_laser_red'],
+        armorPlates: ['plate_nij4_composite'],
+      },
+      3: {
+        weapons: ['mk14_ebr'],
+        attachments: ['optic_nightforce_atacr', 'muzzle_338_suppressor'],
+        armorPlates: ['plate_gost5_titanium'],
+      },
+    },
+  },
+] as const;
+
+export const TRADER_MAP: Readonly<Record<TraderId, TraderSpec>> = Object.fromEntries(
+  TRADER_LIST.map((t) => [t.id, t]),
+) as Record<TraderId, TraderSpec>;
+
+export interface ArmorPlateCatalogEntry {
+  readonly id: string;
+  readonly name: string;
+  readonly ratingLabel: string;
+  readonly weightKg: number;
+  readonly priceUsd: number;
+  readonly durability: number;
+  readonly traderId: TraderId;
+  readonly requiredTraderLevel: number;
+}
+
+export const ARMOR_PLATE_CATALOG: readonly ArmorPlateCatalogEntry[] = [
+  {
+    id: 'plate_nij3_steel',
+    name: 'NIJ III AR500 Steel Plate',
+    ratingLabel: 'NIJ III',
+    weightKg: 3.4,
+    priceUsd: 1100,
+    durability: 60,
+    traderId: 'quartermaster_pmc',
+    requiredTraderLevel: 1,
+  },
+  {
+    id: 'plate_gost4_granit',
+    name: 'GOST 4 Granit Ceramic Plate',
+    ratingLabel: 'GOST 4',
+    weightKg: 2.9,
+    priceUsd: 1650,
+    durability: 72,
+    traderId: 'militia_armorer',
+    requiredTraderLevel: 1,
+  },
+  {
+    id: 'plate_nij3a_ceramic',
+    name: 'NIJ III+ UHMWPE Ceramic Plate',
+    ratingLabel: 'NIJ III+',
+    weightKg: 2.1,
+    priceUsd: 2400,
+    durability: 80,
+    traderId: 'quartermaster_pmc',
+    requiredTraderLevel: 2,
+  },
+  {
+    id: 'plate_nij4_composite',
+    name: 'NIJ IV Boron-Carbide Composite',
+    ratingLabel: 'NIJ IV',
+    weightKg: 2.7,
+    priceUsd: 3800,
+    durability: 95,
+    traderId: 'alpine_specialist',
+    requiredTraderLevel: 2,
+  },
+  {
+    id: 'plate_gost5_titanium',
+    name: 'GOST 5A Titanium-Ceramic Heavy Plate',
+    ratingLabel: 'GOST 5A',
+    weightKg: 3.9,
+    priceUsd: 5200,
+    durability: 115,
+    traderId: 'quartermaster_pmc',
+    requiredTraderLevel: 4,
+  },
+] as const;
+
+export const ARMOR_PLATE_MAP: Readonly<Record<string, ArmorPlateCatalogEntry>> = Object.fromEntries(
+  ARMOR_PLATE_CATALOG.map((p) => [p.id, p]),
+);
+
+export interface OpenWorldContractSpec {
+  readonly id: string;
+  readonly title: string;
+  readonly traderId: TraderId;
+  readonly subFactionId?: SubFactionId;
+  readonly biomeId: OpenWorldBiomeId;
+  readonly cashRewardUsd: number;
+  readonly standingDelta: number;
+  readonly grantsTraderLevel?: number;
+  readonly unlocksWeaponIds: readonly string[];
+  readonly unlocksAttachmentIds: readonly string[];
+  readonly unlocksArmorPlateIds: readonly string[];
+  readonly summary: string;
+}
+
+export const OPENWORLD_CONTRACT_CATALOG: readonly OpenWorldContractSpec[] = [
+  {
+    id: 'contract_port_manifest',
+    title: 'Port Pier Manifest Sweep',
+    traderId: 'syndicate_broker',
+    subFactionId: 'dockworkers_syndicate',
+    biomeId: 'coastal_port_marsh',
+    cashRewardUsd: 3200,
+    standingDelta: 25,
+    grantsTraderLevel: 2,
+    unlocksWeaponIds: ['benelli_m4'],
+    unlocksAttachmentIds: ['optic_rmr_type2', 'muzzle_9mm_suppressor'],
+    unlocksArmorPlateIds: ['plate_nij3a_ceramic'],
+    summary: 'Recover shipping manifests from the Delta Container Pier to unlock Syndicate CQB hardware.',
+  },
+  {
+    id: 'contract_valley_convoy',
+    title: 'Timberline Rail Yard Recon',
+    traderId: 'quartermaster_pmc',
+    biomeId: 'temperate_conifer_valley',
+    cashRewardUsd: 3800,
+    standingDelta: 0,
+    grantsTraderLevel: 2,
+    unlocksWeaponIds: ['hk416', 'ak105'],
+    unlocksAttachmentIds: ['optic_eotech_holo', 'grip_vertical_rk'],
+    unlocksArmorPlateIds: ['plate_nij3a_ceramic'],
+    summary: 'Tag freight locomotives in the Conifer Valley to authorize Tier-2 Quartermaster carbines and EOTech optics.',
+  },
+  {
+    id: 'contract_quarry_relay',
+    title: 'Quarry Radar Telemetry',
+    traderId: 'militia_armorer',
+    subFactionId: 'highland_militia',
+    biomeId: 'highland_steppe_quarry',
+    cashRewardUsd: 4600,
+    standingDelta: 30,
+    grantsTraderLevel: 3,
+    unlocksWeaponIds: ['dragunov_svd'],
+    unlocksAttachmentIds: ['optic_pso1_4x', 'optic_pso1m2', 'muzzle_pbs4_545'],
+    unlocksArmorPlateIds: ['plate_gost5_titanium'],
+    summary: 'Deliver radar telemetry chips to the Quarry Field Armorer for SVD DMR and PSO optic purchase clearance.',
+  },
+  {
+    id: 'contract_dam_vault',
+    title: 'Hydroelectric Dam Overlook',
+    traderId: 'alpine_specialist',
+    subFactionId: 'alpine_remnant',
+    biomeId: 'alpine_ridge_dam',
+    cashRewardUsd: 6400,
+    standingDelta: 35,
+    grantsTraderLevel: 3,
+    unlocksWeaponIds: ['mk14_ebr', 'sig_mcx'],
+    unlocksAttachmentIds: ['optic_lpvo_1_6', 'optic_nightforce_atacr', 'tac_peq_combo'],
+    unlocksArmorPlateIds: ['plate_nij4_composite'],
+    summary: 'Secure Alpine weather station drives to unlock Mk14 EBR, LPVO/ATACR long-range optics, and NIJ IV composite plates.',
+  },
+] as const;
+
+export const OPENWORLD_CONTRACT_MAP: Readonly<Record<string, OpenWorldContractSpec>> =
+  Object.fromEntries(OPENWORLD_CONTRACT_CATALOG.map((c) => [c.id, c]));
 
 export const STANDING_MIN = -100;
 export const STANDING_MAX = 100;
@@ -216,6 +498,7 @@ export interface InventoryItemRecord {
 export interface EquippedFieldKit {
   primaryWeaponId: string | null;
   secondaryWeaponId: string | null;
+  armorPlateId: string | null;
   armorName: string | null;
   rigName: string | null;
   backpackItems: InventoryItemRecord[];
@@ -229,6 +512,18 @@ export interface CharacterArsenalState {
   ammoVariantByWeapon: Record<string, string>;
   zeroDistanceByWeapon: Record<string, number>;
   weaponAttachments: Record<string, WeaponAttachments>;
+}
+
+/**
+ * Per-character unlock entitlements (strictly bound to `characterId`, never account-wide).
+ * Wiped completely if this character triggers permadeath.
+ */
+export interface CharacterUnlockEntitlements {
+  unlockedWeaponIds: string[];
+  unlockedAttachmentIds: string[];
+  unlockedArmorPlateIds: string[];
+  traderLevels: Record<TraderId, number>;
+  completedContractIds: string[];
 }
 
 export interface CharacterMissionState {
@@ -259,6 +554,7 @@ export interface OpenWorldCharacter {
   secureContainerTier: SecureContainerTier;
   secureContainerItems: InventoryItemRecord[];
   arsenal: CharacterArsenalState;
+  unlocks: CharacterUnlockEntitlements;
   equippedKit: EquippedFieldKit;
   missions: CharacterMissionState;
   ownedVehicleKeys: OwnedVehicleKeyRecord[];
@@ -327,27 +623,51 @@ export interface ShardWorldState {
 export interface OpenWorldQuartermasterOffer {
   readonly weaponId: string;
   readonly priceUsd: number;
+  readonly traderId: TraderId;
+  readonly requiredTraderLevel: number;
   readonly factionAffinity?: PmcFactionId;
   readonly subFactionRequired?: SubFactionId;
   readonly minStanding?: number;
 }
 
 export const QUARTERMASTER_FIREARM_OFFERS: readonly OpenWorldQuartermasterOffer[] = [
-  { weaponId: 'm4a1', priceUsd: 3200, factionAffinity: 'pmc_alpha' },
-  { weaponId: 'hk_mp5', priceUsd: 2400, factionAffinity: 'pmc_alpha' },
-  { weaponId: 'hk416', priceUsd: 4600, factionAffinity: 'pmc_alpha' },
-  { weaponId: 'sig_mcx', priceUsd: 4800, factionAffinity: 'pmc_alpha' },
-  { weaponId: 'akm_762', priceUsd: 2900, factionAffinity: 'pmc_bravo' },
-  { weaponId: 'aks74u', priceUsd: 2200, factionAffinity: 'pmc_bravo' },
-  { weaponId: 'ak105', priceUsd: 3600, factionAffinity: 'pmc_bravo' },
-  { weaponId: 'remington_870', priceUsd: 1850 },
-  { weaponId: 'benelli_m4', priceUsd: 3900 },
-  { weaponId: 'mosin_m91_30', priceUsd: 2100 },
-  { weaponId: 'dragunov_svd', priceUsd: 5400, subFactionRequired: 'highland_militia', minStanding: 25 },
-  { weaponId: 'mk14_ebr', priceUsd: 6200, subFactionRequired: 'alpine_remnant', minStanding: 50 },
-  { weaponId: 'glock_17', priceUsd: 950 },
-  { weaponId: 'makarov_pm', priceUsd: 650 },
-  { weaponId: 'beretta_m9', priceUsd: 1100 },
+  { weaponId: 'm4a1', priceUsd: 3200, traderId: 'quartermaster_pmc', requiredTraderLevel: 1, factionAffinity: 'pmc_alpha' },
+  { weaponId: 'hk_mp5', priceUsd: 2400, traderId: 'quartermaster_pmc', requiredTraderLevel: 1, factionAffinity: 'pmc_alpha' },
+  { weaponId: 'hk416', priceUsd: 4600, traderId: 'quartermaster_pmc', requiredTraderLevel: 2, factionAffinity: 'pmc_alpha' },
+  { weaponId: 'sig_mcx', priceUsd: 4800, traderId: 'quartermaster_pmc', requiredTraderLevel: 3, factionAffinity: 'pmc_alpha' },
+  { weaponId: 'akm_762', priceUsd: 2900, traderId: 'quartermaster_pmc', requiredTraderLevel: 1, factionAffinity: 'pmc_bravo' },
+  { weaponId: 'aks74u', priceUsd: 2200, traderId: 'quartermaster_pmc', requiredTraderLevel: 1, factionAffinity: 'pmc_bravo' },
+  { weaponId: 'ak105', priceUsd: 3600, traderId: 'militia_armorer', requiredTraderLevel: 2, factionAffinity: 'pmc_bravo' },
+  { weaponId: 'remington_870', priceUsd: 1850, traderId: 'quartermaster_pmc', requiredTraderLevel: 1 },
+  { weaponId: 'benelli_m4', priceUsd: 3900, traderId: 'syndicate_broker', requiredTraderLevel: 2 },
+  { weaponId: 'mosin_m91_30', priceUsd: 2100, traderId: 'quartermaster_pmc', requiredTraderLevel: 1 },
+  { weaponId: 'dragunov_svd', priceUsd: 5400, traderId: 'militia_armorer', requiredTraderLevel: 3, subFactionRequired: 'highland_militia', minStanding: 25 },
+  { weaponId: 'mk14_ebr', priceUsd: 6200, traderId: 'alpine_specialist', requiredTraderLevel: 2, subFactionRequired: 'alpine_remnant', minStanding: 50 },
+  { weaponId: 'glock_17', priceUsd: 950, traderId: 'quartermaster_pmc', requiredTraderLevel: 1 },
+  { weaponId: 'makarov_pm', priceUsd: 650, traderId: 'quartermaster_pmc', requiredTraderLevel: 1 },
+  { weaponId: 'beretta_m9', priceUsd: 1100, traderId: 'quartermaster_pmc', requiredTraderLevel: 1 },
+] as const;
+
+export interface OpenWorldAttachmentOffer {
+  readonly attachmentId: string;
+  readonly label: string;
+  readonly slotLabel: string;
+  readonly priceUsd: number;
+  readonly traderId: TraderId;
+  readonly requiredTraderLevel: number;
+}
+
+export const QUARTERMASTER_ATTACHMENT_OFFERS: readonly OpenWorldAttachmentOffer[] = [
+  { attachmentId: 'optic_t2_red_dot', label: 'Aimpoint Micro T-2 Red Dot', slotLabel: 'Optic', priceUsd: 650, traderId: 'quartermaster_pmc', requiredTraderLevel: 1 },
+  { attachmentId: 'optic_kobra_rd', label: 'Kobra EKP-1S-03 Reflex', slotLabel: 'Optic', priceUsd: 580, traderId: 'militia_armorer', requiredTraderLevel: 1 },
+  { attachmentId: 'optic_eotech_holo', label: 'EOTech EXPS3 Holographic', slotLabel: 'Optic', priceUsd: 1150, traderId: 'quartermaster_pmc', requiredTraderLevel: 2 },
+  { attachmentId: 'optic_rmr_type2', label: 'Trijicon RMR Type 2', slotLabel: 'Optic', priceUsd: 890, traderId: 'syndicate_broker', requiredTraderLevel: 2 },
+  { attachmentId: 'optic_pso1_4x', label: 'PSO-1 4x24 Prism Scope', slotLabel: 'Optic', priceUsd: 1450, traderId: 'militia_armorer', requiredTraderLevel: 2 },
+  { attachmentId: 'optic_lpvo_1_6', label: '1-6x24 Tactical LPVO', slotLabel: 'Optic', priceUsd: 2200, traderId: 'alpine_specialist', requiredTraderLevel: 2 },
+  { attachmentId: 'optic_nightforce_atacr', label: 'ATACR 4-16x42 F1 Sniper Scope', slotLabel: 'Optic', priceUsd: 3400, traderId: 'alpine_specialist', requiredTraderLevel: 3 },
+  { attachmentId: 'muzzle_9mm_suppressor', label: '9mm Tactical Suppressor', slotLabel: 'Muzzle', priceUsd: 1100, traderId: 'syndicate_broker', requiredTraderLevel: 2 },
+  { attachmentId: 'muzzle_pbs4_545', label: 'PBS-4 Rifle Suppressor', slotLabel: 'Muzzle', priceUsd: 1850, traderId: 'militia_armorer', requiredTraderLevel: 3 },
+  { attachmentId: 'tac_peq_combo', label: 'AN/PEQ-15 IR/Vis Laser', slotLabel: 'Tactical', priceUsd: 1600, traderId: 'quartermaster_pmc', requiredTraderLevel: 3 },
 ] as const;
 
 export function resolveDefaultStorage(): OpenWorldStorageLike | null {
