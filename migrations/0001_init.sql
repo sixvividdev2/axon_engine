@@ -117,3 +117,13 @@ CREATE TABLE IF NOT EXISTS active_lobbies (
 
 CREATE INDEX IF NOT EXISTS idx_active_lobbies_vis ON active_lobbies(visibility, status, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_active_lobbies_event_hash ON active_lobbies(event_hash_code);
+
+CREATE TABLE IF NOT EXISTS recent_matches (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  completed_at INTEGER NOT NULL,
+  payload_json TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_recent_matches_user ON recent_matches(user_id, completed_at DESC);
+

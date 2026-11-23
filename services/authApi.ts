@@ -1,6 +1,7 @@
 import {
   MatchProgressionSummary,
   MatchResultInput,
+  RecentMatchRecord,
   WeaponProgressRecord,
 } from '../data/progression';
 
@@ -22,6 +23,7 @@ export interface AccountProfile {
   createdAt: number;
   weaponProgress: Record<string, WeaponProgressRecord>;
   unlockedAttachments: string[];
+  recentMatches: RecentMatchRecord[];
 }
 
 export class ApiError extends Error {

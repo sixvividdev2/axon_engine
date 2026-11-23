@@ -25,10 +25,12 @@ import {
 } from '../data/graphicsQuality';
 import { useKillfeedPreference } from '../data/killfeedSettings';
 import { useLoadoutStore } from '../data/loadoutStore';
+import { guestRecentMatchStore, useGuestRecentMatches } from '../data/recentMatchStore';
 import { MapSelector } from './MapSelector';
 import { MenuBackdrop3D, MenuBackdropMood } from './MenuBackdrop3D';
 import { MultiplayerHubPanel } from './MultiplayerHubPanel';
 import { OperatorSelectPanel } from './OperatorSelectPanel';
+import { RecentMatchesPanel } from './RecentMatchesPanel';
 import { UnifiedLoadoutWorkbench } from './UnifiedLoadoutWorkbench';
 import { useOperatorSelection } from '../bodycam-sdk/operator/OperatorSelectionStore';
 import { OPERATOR_PROFILES } from '../bodycam-sdk/operator/OperatorTypes';
@@ -91,6 +93,8 @@ export const MainMenuHub: React.FC<MainMenuHubProps> = ({
   const [battleConfig, setBattleConfig] = useState<BattleMatchConfig>(initialBattleConfig);
   const [infectionConfig, setInfectionConfig] =
     useState<InfectionMatchConfig>(initialInfectionConfig);
+  const guestRecentMatches = useGuestRecentMatches();
+  const recentMatches = user ? (user.recentMatches ?? []) : guestRecentMatches;
 
   const infectionRecords: Record<string, InfectionMapRecord> = useMemo(() => {
     const sm = new SaveManager();
@@ -641,6 +645,13 @@ export const MainMenuHub: React.FC<MainMenuHubProps> = ({
                   Deploy Match
                 </button>
               </div>
+
+              <RecentMatchesPanel
+                matches={recentMatches}
+                isGuest={!user}
+                accent="amber"
+                onClearGuestHistory={() => guestRecentMatchStore.clear()}
+              />
             </div>
           )}
 
@@ -815,6 +826,13 @@ export const MainMenuHub: React.FC<MainMenuHubProps> = ({
                   Enter Infection
                 </button>
               </div>
+
+              <RecentMatchesPanel
+                matches={recentMatches}
+                isGuest={!user}
+                accent="red"
+                onClearGuestHistory={() => guestRecentMatchStore.clear()}
+              />
             </div>
           )}
 

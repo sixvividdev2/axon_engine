@@ -24,10 +24,15 @@ import {
   SpecialEventRecord,
 } from './data/multiplayer';
 import {
+  appendRecentMatch,
   applyMatchProgression,
+  buildRecentMatchRecord,
   CareerProgressionState,
   getStarterUnlockedAttachments,
-  MatchResultInput,
+  MAX_RECENT_MATCHES,
+  RecentMatchRecord,
+  sanitizeMatchResultInput,
+  sanitizeRecentMatchRecord,
   WeaponProgressRecord,
 } from './data/progression';
 import {
@@ -76,6 +81,7 @@ interface LocalUserRecord {
   updatedAt: number;
   weaponProgress: Record<string, WeaponProgressRecord>;
   unlockedAttachments: string[];
+  recentMatches?: RecentMatchRecord[];
 }
 
 interface LocalSessionRecord {
@@ -430,6 +436,11 @@ function broadcastPresenceToFriends(userId: string, presence: UserPresenceState)
 
 function serializeAccount(u: LocalUserRecord) {
   const unlockedSet = new Set<string>([...getStarterUnlockedAttachments(), ...u.unlockedAttachments]);
+  const recentMatches = (Array.isArray(u.recentMatches) ? u.recentMatches : [])
+    .map((m) => sanitizeRecentMatchRecord(m))
+    .filter((m): m is RecentMatchRecord => m !== null)
+    .sort((a, b) => b.completedAt - a.completedAt)
+    .slice(0, MAX_RECENT_MATCHES);
   return {
     id: u.id,
     email: u.email,
@@ -448,6 +459,7 @@ function serializeAccount(u: LocalUserRecord) {
     createdAt: u.createdAt,
     weaponProgress: u.weaponProgress,
     unlockedAttachments: Array.from(unlockedSet),
+    recentMatches,
   };
 }
 
@@ -691,6 +703,7 @@ async function startServer() {
       updatedAt: now,
       weaponProgress: {},
       unlockedAttachments: getStarterUnlockedAttachments(),
+      recentMatches: [],
     };
 
     store.users[userId] = record;
@@ -820,6 +833,7 @@ async function startServer() {
     user.highestInfectionRound = 0;
     user.weaponProgress = {};
     user.unlockedAttachments = getStarterUnlockedAttachments();
+    user.recentMatches = [];
     user.updatedAt = Date.now();
     persistStore();
 
@@ -833,8 +847,8 @@ async function startServer() {
       return;
     }
 
-    const body = req.body as MatchResultInput | undefined;
-    if (!body || (body.mode !== 'battle' && body.mode !== 'infection')) {
+    const body = sanitizeMatchResultInput(req.body);
+    if (!body) {
       res.status(400).json({ error: 'Invalid match progression payload.' });
       return;
     }
@@ -861,6 +875,15 @@ async function startServer() {
         body,
       );
 
+    const now = Date.now();
+    const recentRecord = buildRecentMatchRecord(body, {
+      id: generateId(),
+      completedAt: now,
+      netXp: summary.breakdown.netXp,
+      cashEarned: summary.breakdown.cashEarned,
+      isGuest: false,
+    });
+
     user.rank = nextCareer.rank;
     user.xp = nextCareer.xp;
     user.prestige = nextCareer.prestige;
@@ -874,7 +897,12 @@ async function startServer() {
     user.highestInfectionRound = nextCareer.highestInfectionRound;
     user.weaponProgress = nextWeaponProgress;
     user.unlockedAttachments = Array.from(nextUnlockedAttachments);
-    user.updatedAt = Date.now();
+    user.recentMatches = appendRecentMatch(
+      Array.isArray(user.recentMatches) ? user.recentMatches : [],
+      recentRecord,
+      MAX_RECENT_MATCHES,
+    );
+    user.updatedAt = now;
     persistStore();
 
     res.json({ user: serializeAccount(user), summary });

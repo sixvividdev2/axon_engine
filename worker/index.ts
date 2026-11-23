@@ -16,9 +16,13 @@ import {
 } from '../data/multiplayer';
 import {
   applyMatchProgression,
+  buildRecentMatchRecord,
   CareerProgressionState,
   getStarterUnlockedAttachments,
-  MatchResultInput,
+  MAX_RECENT_MATCHES,
+  RecentMatchRecord,
+  sanitizeMatchResultInput,
+  sanitizeRecentMatchRecord,
   WeaponProgressRecord,
 } from '../data/progression';
 import {
@@ -72,6 +76,12 @@ interface DbWeaponProgressRow {
 
 interface DbAttachmentRow {
   attachment_id: string;
+}
+
+interface DbRecentMatchRow {
+  id: string;
+  completed_at: number;
+  payload_json: string;
 }
 
 interface DbSpecialEventRow {
@@ -245,7 +255,7 @@ async function fetchPresenceBatch(
 }
 
 async function loadAccountPayload(db: D1Database, userRow: DbUserRow) {
-  const [wpRes, attRes] = await Promise.all([
+  const [wpRes, attRes, rmRes] = await Promise.all([
     db
       .prepare('SELECT weapon_id, xp, level, kills FROM weapon_progress WHERE user_id = ?')
       .bind(userRow.id)
@@ -254,6 +264,13 @@ async function loadAccountPayload(db: D1Database, userRow: DbUserRow) {
       .prepare('SELECT attachment_id FROM unlocked_attachments WHERE user_id = ?')
       .bind(userRow.id)
       .all<DbAttachmentRow>(),
+    db
+      .prepare(
+        'SELECT id, completed_at, payload_json FROM recent_matches WHERE user_id = ? ORDER BY completed_at DESC LIMIT ?',
+      )
+      .bind(userRow.id, MAX_RECENT_MATCHES)
+      .all<DbRecentMatchRow>()
+      .catch(() => ({ results: [] as DbRecentMatchRow[] })),
   ]);
 
   const weaponProgress: Record<string, WeaponProgressRecord> = {};
@@ -269,6 +286,17 @@ async function loadAccountPayload(db: D1Database, userRow: DbUserRow) {
   const unlockedSet = new Set<string>(getStarterUnlockedAttachments());
   for (const row of attRes.results ?? []) {
     unlockedSet.add(row.attachment_id);
+  }
+
+  const recentMatches: RecentMatchRecord[] = [];
+  for (const row of rmRes.results ?? []) {
+    try {
+      const parsed = JSON.parse(row.payload_json);
+      const clean = sanitizeRecentMatchRecord(parsed);
+      if (clean) recentMatches.push(clean);
+    } catch {
+      // Ignore malformed stored match row
+    }
   }
 
   return {
@@ -289,6 +317,7 @@ async function loadAccountPayload(db: D1Database, userRow: DbUserRow) {
     createdAt: userRow.created_at,
     weaponProgress,
     unlockedAttachments: Array.from(unlockedSet),
+    recentMatches,
   };
 }
 
@@ -729,6 +758,7 @@ export default {
           ).bind(now, userRow.id),
           env.DB.prepare('DELETE FROM weapon_progress WHERE user_id = ?').bind(userRow.id),
           env.DB.prepare('DELETE FROM unlocked_attachments WHERE user_id = ?').bind(userRow.id),
+          env.DB.prepare('DELETE FROM recent_matches WHERE user_id = ?').bind(userRow.id),
           ...starterAttachments.map((attId) =>
             env.DB.prepare(
               'INSERT OR IGNORE INTO unlocked_attachments (user_id, attachment_id, unlocked_at) VALUES (?, ?, ?)',
@@ -747,8 +777,9 @@ export default {
         const userRow = await authenticateRequest(request, env.DB);
         if (!userRow) return json({ error: 'Sign in to save match progression.' }, 401);
 
-        const body = await readJsonBody<MatchResultInput>(request);
-        if (!body || (body.mode !== 'battle' && body.mode !== 'infection')) {
+        const rawBody = await readJsonBody<unknown>(request);
+        const body = sanitizeMatchResultInput(rawBody);
+        if (!body) {
           return json({ error: 'Invalid match progression payload.' }, 400);
         }
 
@@ -776,6 +807,14 @@ export default {
           );
 
         const now = Date.now();
+        const recentRecord = buildRecentMatchRecord(body, {
+          id: generateId(),
+          completedAt: now,
+          netXp: summary.breakdown.netXp,
+          cashEarned: summary.breakdown.cashEarned,
+          isGuest: false,
+        });
+
         const stmts = [
           env.DB.prepare(
             `UPDATE users
@@ -818,6 +857,22 @@ export default {
             ).bind(userRow.id, attId, now),
           );
         }
+
+        stmts.push(
+          env.DB.prepare(
+            `INSERT INTO recent_matches (id, user_id, completed_at, payload_json)
+             VALUES (?, ?, ?, ?)`,
+          ).bind(recentRecord.id, userRow.id, recentRecord.completedAt, JSON.stringify(recentRecord)),
+          env.DB.prepare(
+            `DELETE FROM recent_matches
+             WHERE user_id = ? AND id NOT IN (
+               SELECT id FROM recent_matches
+               WHERE user_id = ?
+               ORDER BY completed_at DESC
+               LIMIT ?
+             )`,
+          ).bind(userRow.id, userRow.id, MAX_RECENT_MATCHES),
+        );
 
         await env.DB.batch(stmts);
 

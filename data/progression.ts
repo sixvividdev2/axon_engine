@@ -1,4 +1,6 @@
 import { ATTACHMENTS, WEAPON_COMPAT_META } from './attachments';
+import { SDK_WEAPON_PROFILES } from '../bodycam-sdk/weaponProfiles';
+import { TACTICAL_EQUIPMENT_CATALOG } from './tacticalEquipment';
 
 export const MAX_RANK = 100;
 export const MAX_PRESTIGE = 10;
@@ -132,15 +134,45 @@ export interface MatchMvpHighlight {
 
 export interface MatchResultInput {
   mode: 'battle' | 'infection';
+  battleRule?: 'tdm' | 'ffa';
   kills: number;
   headshots: number;
   deaths: number;
   outcome: 'victory' | 'defeat' | 'completed';
   infectionRound?: number;
   weaponKills: Record<string, number>;
+  mapId?: string;
   mapName?: string;
   matchDurationSec?: number;
   combatants?: CombatantMatchStats[];
+}
+
+export const MAX_RECENT_MATCHES = 5;
+
+export interface RecentMatchWeaponStat {
+  weaponId: string;
+  weaponName: string;
+  kills: number;
+}
+
+export interface RecentMatchRecord {
+  id: string;
+  completedAt: number;
+  mode: 'battle' | 'infection';
+  battleRule?: 'tdm' | 'ffa';
+  infectionRound?: number;
+  mapId?: string;
+  mapName: string;
+  outcome: 'victory' | 'defeat' | 'completed';
+  kills: number;
+  deaths: number;
+  headshots: number;
+  kdDisplay: string;
+  durationSec: number;
+  netXp: number;
+  cashEarned: number;
+  isGuest: boolean;
+  weaponStats: RecentMatchWeaponStat[];
 }
 
 export interface GunLevelDelta {
@@ -1047,3 +1079,491 @@ export function buildGuestMatchSummary(input: MatchResultInput): MatchProgressio
     gunDeltas: [],
   };
 }
+
+const SPECIAL_MATCH_WEAPON_NAMES: Readonly<Record<string, string>> = {
+  tactical_knife: 'Tactical Knife',
+  crowbar: 'Crowbar',
+  rgd5_frag: 'RGD-5 Frag',
+  grenade: 'Frag Grenade',
+  melee: 'Melee Takedown',
+};
+
+const MATCH_MAP_FALLBACK_NAMES: Readonly<Record<string, string>> = {
+  pripyat_block: 'Pripyat Block',
+  timberline_compound: 'Timberline Valley',
+  korsakov_substation: 'Korsakov Substation',
+  kino_theater: 'Kino Theater',
+};
+
+export function resolveMatchWeaponName(weaponId: string): string {
+  const id = String(weaponId ?? '').trim();
+  if (!id) return 'Unknown Weapon';
+
+  const profile = SDK_WEAPON_PROFILES[id];
+  if (profile?.name && profile.id !== 'unarmed') {
+    return profile.name;
+  }
+
+  if (Object.prototype.hasOwnProperty.call(TACTICAL_EQUIPMENT_CATALOG, id)) {
+    return TACTICAL_EQUIPMENT_CATALOG[id as keyof typeof TACTICAL_EQUIPMENT_CATALOG].name;
+  }
+
+  const special = SPECIAL_MATCH_WEAPON_NAMES[id];
+  if (special) return special;
+
+  return id
+    .replace(/[_-]+/g, ' ')
+    .trim()
+    .replace(/\b[a-z]/g, (ch) => ch.toUpperCase());
+}
+
+function generateRecentMatchId(): string {
+  if (typeof globalThis.crypto?.randomUUID === 'function') {
+    return globalThis.crypto.randomUUID();
+  }
+  return `match_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+export function sanitizeMatchResultInput(raw: unknown): MatchResultInput | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const obj = raw as Record<string, unknown>;
+  if (obj.mode !== 'battle' && obj.mode !== 'infection') return null;
+
+  const kills = Math.max(0, Math.min(10000, Math.floor(Number(obj.kills) || 0)));
+  const deaths = Math.max(0, Math.min(10000, Math.floor(Number(obj.deaths) || 0)));
+  const headshots = Math.max(0, Math.min(kills, Math.floor(Number(obj.headshots) || 0)));
+  const outcome: 'victory' | 'defeat' | 'completed' =
+    obj.outcome === 'victory' || obj.outcome === 'defeat' || obj.outcome === 'completed'
+      ? obj.outcome
+      : obj.mode === 'infection'
+        ? 'completed'
+        : 'defeat';
+
+  const battleRule: 'tdm' | 'ffa' | undefined =
+    obj.mode === 'battle'
+      ? obj.battleRule === 'ffa'
+        ? 'ffa'
+        : obj.battleRule === 'tdm'
+          ? 'tdm'
+          : undefined
+      : undefined;
+
+  const infectionRound =
+    obj.mode === 'infection' && obj.infectionRound !== undefined
+      ? Math.max(1, Math.min(1000, Math.floor(Number(obj.infectionRound) || 1)))
+      : undefined;
+
+  const mapId =
+    typeof obj.mapId === 'string' && obj.mapId.trim()
+      ? obj.mapId.trim().slice(0, 64)
+      : undefined;
+  const mapName =
+    typeof obj.mapName === 'string' && obj.mapName.trim()
+      ? obj.mapName.trim().slice(0, 80)
+      : undefined;
+
+  const matchDurationSec =
+    obj.matchDurationSec !== undefined
+      ? Math.max(1, Math.min(86400, Math.round(Number(obj.matchDurationSec) || 1)))
+      : undefined;
+
+  const weaponKills: Record<string, number> = {};
+  if (obj.weaponKills && typeof obj.weaponKills === 'object') {
+    let count = 0;
+    for (const [k, v] of Object.entries(obj.weaponKills as Record<string, unknown>)) {
+      if (count >= 48) break;
+      const wid = String(k).trim().slice(0, 64);
+      const wKills = Math.max(0, Math.min(10000, Math.floor(Number(v) || 0)));
+      if (wid && wKills > 0) {
+        weaponKills[wid] = wKills;
+        count += 1;
+      }
+    }
+  }
+
+  const combatants = Array.isArray(obj.combatants)
+    ? obj.combatants
+        .slice(0, 32)
+        .filter((c): c is CombatantMatchStats => Boolean(c && typeof c === 'object'))
+        .map(sanitizeCombatantStats)
+    : undefined;
+
+  return {
+    mode: obj.mode,
+    battleRule,
+    kills,
+    headshots,
+    deaths,
+    outcome,
+    infectionRound,
+    weaponKills,
+    mapId,
+    mapName,
+    matchDurationSec,
+    combatants,
+  };
+}
+
+export function buildRecentMatchRecord(
+  input: MatchResultInput,
+  opts: {
+    id?: string;
+    completedAt?: number;
+    netXp: number;
+    cashEarned: number;
+    isGuest: boolean;
+  },
+): RecentMatchRecord {
+  const kills = Math.max(0, Math.floor(input.kills || 0));
+  const deaths = Math.max(0, Math.floor(input.deaths || 0));
+  const headshots = Math.max(0, Math.min(kills, Math.floor(input.headshots || 0)));
+  const durationSec = Math.max(1, Math.round(input.matchDurationSec ?? 0));
+  const { kdDisplay } = formatKdDisplay(kills, deaths);
+
+  const weaponStats: RecentMatchWeaponStat[] = Object.entries(input.weaponKills || {})
+    .map(([rawId, rawKills]) => {
+      const weaponId = String(rawId).trim();
+      const wKills = Math.max(0, Math.floor(rawKills || 0));
+      return {
+        weaponId,
+        weaponName: resolveMatchWeaponName(weaponId),
+        kills: wKills,
+      };
+    })
+    .filter((w) => w.weaponId.length > 0 && w.kills > 0)
+    .sort((a, b) => b.kills - a.kills || a.weaponName.localeCompare(b.weaponName));
+
+  const mapId = input.mapId?.trim() || undefined;
+  const fallbackMap =
+    (mapId ? MATCH_MAP_FALLBACK_NAMES[mapId] : undefined) ??
+    (input.mode === 'infection' ? 'Kino Theater' : 'Combat Sector');
+
+  return {
+    id: opts.id?.trim() || generateRecentMatchId(),
+    completedAt: typeof opts.completedAt === 'number' && Number.isFinite(opts.completedAt)
+      ? Math.round(opts.completedAt)
+      : Date.now(),
+    mode: input.mode,
+    battleRule: input.mode === 'battle' ? input.battleRule : undefined,
+    infectionRound:
+      input.mode === 'infection' && typeof input.infectionRound === 'number'
+        ? Math.max(1, Math.floor(input.infectionRound))
+        : undefined,
+    mapId,
+    mapName: input.mapName?.trim() || fallbackMap,
+    outcome: input.outcome,
+    kills,
+    deaths,
+    headshots,
+    kdDisplay,
+    durationSec,
+    netXp: Math.round(opts.netXp || 0),
+    cashEarned: Math.max(0, Math.round(opts.cashEarned || 0)),
+    isGuest: Boolean(opts.isGuest),
+    weaponStats,
+  };
+}
+
+export function sanitizeRecentMatchRecord(raw: unknown): RecentMatchRecord | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const obj = raw as Record<string, unknown>;
+  if (obj.mode !== 'battle' && obj.mode !== 'infection') return null;
+
+  const id = typeof obj.id === 'string' && obj.id.trim() ? obj.id.trim().slice(0, 100) : generateRecentMatchId();
+  const completedAt =
+    typeof obj.completedAt === 'number' && Number.isFinite(obj.completedAt) && obj.completedAt > 0
+      ? Math.round(obj.completedAt)
+      : Date.now();
+  const kills = Math.max(0, Math.floor(Number(obj.kills) || 0));
+  const deaths = Math.max(0, Math.floor(Number(obj.deaths) || 0));
+  const headshots = Math.max(0, Math.min(kills, Math.floor(Number(obj.headshots) || 0)));
+  const durationSec = Math.max(1, Math.round(Number(obj.durationSec) || 1));
+  const outcome: 'victory' | 'defeat' | 'completed' =
+    obj.outcome === 'victory' || obj.outcome === 'defeat' || obj.outcome === 'completed'
+      ? obj.outcome
+      : obj.mode === 'infection'
+        ? 'completed'
+        : 'defeat';
+
+  const weaponStats: RecentMatchWeaponStat[] = Array.isArray(obj.weaponStats)
+    ? obj.weaponStats
+        .slice(0, 48)
+        .filter((w): w is Record<string, unknown> => Boolean(w && typeof w === 'object'))
+        .map((w) => {
+          const weaponId = String(w.weaponId ?? '').trim().slice(0, 64);
+          const wKills = Math.max(0, Math.floor(Number(w.kills) || 0));
+          const weaponName =
+            typeof w.weaponName === 'string' && w.weaponName.trim()
+              ? w.weaponName.trim().slice(0, 80)
+              : resolveMatchWeaponName(weaponId);
+          return { weaponId, weaponName, kills: wKills };
+        })
+        .filter((w) => w.weaponId.length > 0 && w.kills > 0)
+        .sort((a, b) => b.kills - a.kills || a.weaponName.localeCompare(b.weaponName))
+    : [];
+
+  const mapId =
+    typeof obj.mapId === 'string' && obj.mapId.trim()
+      ? obj.mapId.trim().slice(0, 64)
+      : undefined;
+  const mapName =
+    typeof obj.mapName === 'string' && obj.mapName.trim()
+      ? obj.mapName.trim().slice(0, 80)
+      : (mapId ? MATCH_MAP_FALLBACK_NAMES[mapId] : undefined) ??
+        (obj.mode === 'infection' ? 'Kino Theater' : 'Combat Sector');
+
+  const { kdDisplay } = formatKdDisplay(kills, deaths);
+
+  return {
+    id,
+    completedAt,
+    mode: obj.mode,
+    battleRule:
+      obj.mode === 'battle' && (obj.battleRule === 'tdm' || obj.battleRule === 'ffa')
+        ? obj.battleRule
+        : undefined,
+    infectionRound:
+      obj.mode === 'infection' && typeof obj.infectionRound === 'number' && obj.infectionRound > 0
+        ? Math.floor(obj.infectionRound)
+        : undefined,
+    mapId,
+    mapName,
+    outcome,
+    kills,
+    deaths,
+    headshots,
+    kdDisplay,
+    durationSec,
+    netXp: Math.round(Number(obj.netXp) || 0),
+    cashEarned: Math.max(0, Math.round(Number(obj.cashEarned) || 0)),
+    isGuest: Boolean(obj.isGuest),
+    weaponStats,
+  };
+}
+
+export function appendRecentMatch(
+  existing: readonly RecentMatchRecord[],
+  next: RecentMatchRecord,
+  limit = MAX_RECENT_MATCHES,
+): RecentMatchRecord[] {
+  const cap = Math.max(1, Math.floor(limit));
+  const deduped = [next, ...existing.filter((m) => m.id !== next.id)];
+  return deduped.sort((a, b) => b.completedAt - a.completedAt).slice(0, cap);
+}
+
+export type ComparisonTrend = 'better' | 'worse' | 'equal' | 'neutral';
+
+export interface RecentMatchMetricDelta {
+  deltaText: string;
+  trend: ComparisonTrend;
+}
+
+export interface RecentMatchComparison {
+  latest: RecentMatchRecord;
+  previous: RecentMatchRecord;
+  kills: RecentMatchMetricDelta;
+  deaths: RecentMatchMetricDelta;
+  kd: RecentMatchMetricDelta;
+  headshots: RecentMatchMetricDelta & {
+    latestPct: number;
+    previousPct: number;
+  };
+  duration: RecentMatchMetricDelta;
+  xp: RecentMatchMetricDelta & { comparable: boolean };
+  topWeapon: {
+    latestLabel: string;
+    previousLabel: string;
+    statusText: string;
+  };
+}
+
+function formatSignedDelta(value: number, suffix = ''): string {
+  if (value > 0) return `+${value.toLocaleString()}${suffix}`;
+  if (value < 0) return `${value.toLocaleString()}${suffix}`;
+  return `0${suffix}`;
+}
+
+function formatDurationDelta(deltaSec: number): string {
+  const sign = deltaSec > 0 ? '+' : deltaSec < 0 ? '-' : '';
+  const abs = Math.abs(Math.round(deltaSec));
+  const mins = Math.floor(abs / 60);
+  const secs = abs % 60;
+  return `${sign}${mins}:${secs.toString().padStart(2, '0')}`;
+}
+
+export function compareRecentMatches(
+  latest: RecentMatchRecord,
+  previous: RecentMatchRecord,
+): RecentMatchComparison {
+  const killsDiff = latest.kills - previous.kills;
+  const deathsDiff = latest.deaths - previous.deaths;
+  const hsDiff = latest.headshots - previous.headshots;
+  const durationDiff = latest.durationSec - previous.durationSec;
+
+  const latestKdVal = computeKdSortValue(latest.kills, latest.deaths);
+  const previousKdVal = computeKdSortValue(previous.kills, previous.deaths);
+  let kdDeltaText = '0.00';
+  let kdTrend: ComparisonTrend = 'equal';
+
+  if (latestKdVal === previousKdVal) {
+    kdDeltaText = '0.00';
+    kdTrend = 'equal';
+  } else if (!Number.isFinite(latestKdVal) && Number.isFinite(previousKdVal)) {
+    kdDeltaText = '+∞';
+    kdTrend = 'better';
+  } else if (Number.isFinite(latestKdVal) && !Number.isFinite(previousKdVal)) {
+    kdDeltaText = '-∞';
+    kdTrend = 'worse';
+  } else {
+    const kdDiff = latestKdVal - previousKdVal;
+    kdDeltaText = kdDiff > 0 ? `+${kdDiff.toFixed(2)}` : kdDiff.toFixed(2);
+    kdTrend = kdDiff > 0 ? 'better' : kdDiff < 0 ? 'worse' : 'equal';
+  }
+
+  const latestPct = latest.kills > 0 ? Math.round((latest.headshots / latest.kills) * 100) : 0;
+  const previousPct = previous.kills > 0 ? Math.round((previous.headshots / previous.kills) * 100) : 0;
+
+  const xpComparable = !latest.isGuest && !previous.isGuest;
+  const xpDiff = latest.netXp - previous.netXp;
+
+  const latestTop = latest.weaponStats[0] ?? null;
+  const previousTop = previous.weaponStats[0] ?? null;
+  const latestLabel = latestTop ? `${latestTop.weaponName} (×${latestTop.kills})` : 'None';
+  const previousLabel = previousTop ? `${previousTop.weaponName} (×${previousTop.kills})` : 'None';
+  let statusText = '—';
+  if (latestTop && previousTop) {
+    if (latestTop.weaponId === previousTop.weaponId) {
+      statusText = `Same (${formatSignedDelta(latestTop.kills - previousTop.kills)} kills)`;
+    } else {
+      statusText = 'Changed';
+    }
+  } else if (latestTop || previousTop) {
+    statusText = 'Changed';
+  }
+
+  return {
+    latest,
+    previous,
+    kills: {
+      deltaText: formatSignedDelta(killsDiff),
+      trend: killsDiff > 0 ? 'better' : killsDiff < 0 ? 'worse' : 'equal',
+    },
+    deaths: {
+      deltaText: formatSignedDelta(deathsDiff),
+      trend: deathsDiff < 0 ? 'better' : deathsDiff > 0 ? 'worse' : 'equal',
+    },
+    kd: {
+      deltaText: kdDeltaText,
+      trend: kdTrend,
+    },
+    headshots: {
+      deltaText: formatSignedDelta(hsDiff),
+      trend: hsDiff > 0 ? 'better' : hsDiff < 0 ? 'worse' : 'equal',
+      latestPct,
+      previousPct,
+    },
+    duration: {
+      deltaText: formatDurationDelta(durationDiff),
+      trend: 'neutral',
+    },
+    xp: {
+      comparable: xpComparable,
+      deltaText: xpComparable ? formatSignedDelta(xpDiff, ' XP') : 'Guest',
+      trend: !xpComparable
+        ? 'neutral'
+        : xpDiff > 0
+          ? 'better'
+          : xpDiff < 0
+            ? 'worse'
+            : 'equal',
+    },
+    topWeapon: {
+      latestLabel,
+      previousLabel,
+      statusText,
+    },
+  };
+}
+
+export interface MatchSummaryExportPayload {
+  schemaVersion: 1;
+  exportedAt: string;
+  match: {
+    id: string;
+    completedAt: number;
+    completedAtIso: string;
+    mode: 'battle' | 'infection';
+    battleRule: 'tdm' | 'ffa' | null;
+    infectionRound: number | null;
+    mapId: string | null;
+    mapName: string;
+    outcome: 'victory' | 'defeat' | 'completed';
+    durationSec: number;
+    isGuest: boolean;
+    stats: {
+      kills: number;
+      deaths: number;
+      headshots: number;
+      kdDisplay: string;
+      headshotAccuracyPct: number;
+      netXp: number;
+      cashEarned: number;
+    };
+    weaponStats: RecentMatchWeaponStat[];
+  };
+}
+
+export function buildMatchSummaryExportPayload(
+  match: RecentMatchRecord,
+  exportedAtIso = new Date().toISOString(),
+): MatchSummaryExportPayload {
+  const headshotAccuracyPct =
+    match.kills > 0 ? Math.round((match.headshots / match.kills) * 100) : 0;
+
+  return {
+    schemaVersion: 1,
+    exportedAt: exportedAtIso,
+    match: {
+      id: match.id,
+      completedAt: match.completedAt,
+      completedAtIso: new Date(match.completedAt).toISOString(),
+      mode: match.mode,
+      battleRule: match.battleRule ?? null,
+      infectionRound: match.infectionRound ?? null,
+      mapId: match.mapId ?? null,
+      mapName: match.mapName,
+      outcome: match.outcome,
+      durationSec: match.durationSec,
+      isGuest: match.isGuest,
+      stats: {
+        kills: match.kills,
+        deaths: match.deaths,
+        headshots: match.headshots,
+        kdDisplay: match.kdDisplay,
+        headshotAccuracyPct,
+        netXp: match.netXp,
+        cashEarned: match.cashEarned,
+      },
+      weaponStats: match.weaponStats.map((w) => ({
+        weaponId: w.weaponId,
+        weaponName: w.weaponName,
+        kills: w.kills,
+      })),
+    },
+  };
+}
+
+export function formatMatchExportFilename(match: RecentMatchRecord): string {
+  const datePart = new Date(match.completedAt).toISOString().slice(0, 10);
+  const mapSlug = (match.mapId || match.mapName || 'sector')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 28);
+  const idSlug = match.id
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '')
+    .slice(0, 8);
+  return `axon-match-${match.mode}-${mapSlug || 'sector'}-${datePart}-${idSlug || 'log'}.json`;
+}
+

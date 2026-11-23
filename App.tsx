@@ -10,7 +10,13 @@ import { AuthProvider, useAuth } from './context/AuthContext';
 import { LobbyProvider, useLobby } from './context/LobbyContext';
 import { SocialProvider, useSocial } from './context/SocialContext';
 import { loadoutStore } from './data/loadoutStore';
-import { buildGuestMatchSummary, MatchProgressionSummary, MatchResultInput } from './data/progression';
+import {
+  buildGuestMatchSummary,
+  buildRecentMatchRecord,
+  MatchProgressionSummary,
+  MatchResultInput,
+} from './data/progression';
+import { guestRecentMatchStore } from './data/recentMatchStore';
 import { GymEngine, GymSnapshot } from './gym/GymEngine';
 import { GymHud } from './gym/GymHud';
 import { GymTunerPanel } from './gym/GymTunerPanel';
@@ -245,24 +251,44 @@ function CombatSessionView({
 
     const matchInput: MatchResultInput = {
       mode: snapshot.mode,
+      battleRule: snapshot.mode === 'battle' ? snapshot.battleRule : undefined,
       kills: snapshot.playerKills,
       headshots: snapshot.playerHeadshots,
       deaths: snapshot.playerDeaths,
       outcome,
       infectionRound: snapshot.mode === 'infection' ? snapshot.roundState.round : undefined,
       weaponKills: snapshot.weaponKills,
+      mapId: snapshot.mapId,
       mapName: snapshot.mapName,
       matchDurationSec: snapshot.matchDurationSec,
       combatants,
     };
 
     if (!user) {
+      guestRecentMatchStore.recordMatch(
+        buildRecentMatchRecord(matchInput, {
+          netXp: 0,
+          cashEarned: 0,
+          isGuest: true,
+        }),
+      );
       setRankSummary(buildGuestMatchSummary(matchInput));
       return;
     }
 
     void commitMatch(matchInput).then((summary) => {
-      setRankSummary(summary ?? buildGuestMatchSummary(matchInput));
+      if (!summary) {
+        guestRecentMatchStore.recordMatch(
+          buildRecentMatchRecord(matchInput, {
+            netXp: 0,
+            cashEarned: 0,
+            isGuest: true,
+          }),
+        );
+        setRankSummary(buildGuestMatchSummary(matchInput));
+        return;
+      }
+      setRankSummary(summary);
     });
   }, [snapshot, user, commitMatch]);
 
