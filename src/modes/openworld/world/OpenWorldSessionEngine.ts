@@ -26,6 +26,8 @@ import {
   SDK_WEAPON_PROFILES,
   TacticalGrenadeSystem,
   TacticalPdaDevice,
+  type PdaCommsBlackoutZone,
+  type PdaConvoyMarker,
   type PdaHudTelemetry,
   type PdaPingMarker,
   VIEWMODEL_LAYER,
@@ -49,6 +51,27 @@ import {
 } from '../../../../data/tacticalEquipment';
 import { characterRoster } from '../CharacterRoster';
 import {
+  cloneCorpseLootSnapshot,
+  cloneTacticalInventory,
+  consumeOneGrenadeFromInventory,
+  countCompatibleReserveRounds,
+  countGrenadesInInventory,
+  extractItemByLocator,
+  findQuickReloadMagazine,
+  fireRoundFromWeaponSlot,
+  getLoadedAmmoCount,
+  getWeaponSlotByWeaponId,
+  peekItemByLocator,
+  peekNextRoundVariant,
+  swapMagazineIntoWeapon,
+} from '../inventory/TetrisInventoryCore';
+import type {
+  CorpseTacticalLootSnapshot,
+  ItemSourceLocator,
+  MedicalItem,
+  OperatorTacticalInventory,
+} from '../inventory/TetrisInventoryTypes';
+import {
   BankruptcyStatus,
   CharacterDeathOutcome,
   getBankruptcyStatus,
@@ -59,7 +82,9 @@ import {
   ARMOR_PLATE_MAP,
   bodyTypeToOperatorId,
   CharacterSlotId,
+  DynamicWorldEventKind,
   FactionSupplyPool,
+  FobTier,
   OpenWorldBiomeId,
   OpenWorldCharacter,
   OpenWorldWeatherId,
@@ -67,6 +92,7 @@ import {
   PmcFactionId,
   SUB_FACTION_MAP,
 } from '../types';
+import type { ExternalLootContext } from '../ui/TacticalInventoryModal';
 import {
   AiDamageToPlayerEvent,
   AiEliminationEvent,
@@ -75,13 +101,38 @@ import {
   OpenWorldAiDirector,
 } from './OpenWorldAiDirector';
 import { AtmosphereTelemetry, OpenWorldAtmosphere } from './OpenWorldAtmosphere';
+import { OpenWorldAmbienceAudio } from './OpenWorldAmbienceAudio';
 import { OpenWorldBodycamAdapter } from './OpenWorldBodycamAdapter';
 import { OpenWorldChunkStreamer, StreamerStats } from './OpenWorldChunkStreamer';
+import {
+  createObbRaycastHit,
+  getBakedHorizonTowers,
+  getBakedOpenWorldSites,
+  getBakedRiverBridges,
+  getBakedRoadSegments,
+} from './OpenWorldCivilizationTopology';
+import {
+  ConvoySummaryTelemetry,
+  OpenWorldConvoyDirector,
+} from './OpenWorldConvoyDirector';
+import {
+  OpenWorldEventDirector,
+  WorldEventTelemetry,
+} from './OpenWorldEventDirector';
+import {
+  FobTerminalStateSnapshot,
+  OpenWorldLogisticsEconomy,
+} from './OpenWorldLogisticsEconomy';
 import {
   OpenWorldInteractableContext,
   OpenWorldSectorManager,
   SectorRuntimeState,
 } from './OpenWorldSectorManager';
+import {
+  WildlifeManager,
+  WildlifeSummaryTelemetry,
+  WolfBitePlayerEvent,
+} from './WildlifeManager';
 import {
   createTerrainSample,
   getNearestLandmark,
@@ -97,6 +148,8 @@ export type OpenWorldNavMode = 'foot' | 'recon_flight';
 export type OpenWorldRenderPipeline = 'direct' | 'bodycam_post';
 export type OpenWorldNvgMode = 'none' | 'pvs7' | 'arnvg';
 
+export type OpenWorldModalKind = 'inventory' | 'fob_terminal' | 'corpse_loot' | 'event_loot' | null;
+
 export interface OpenWorldCombatTelemetry {
   hp: number;
   maxHp: number;
@@ -106,9 +159,13 @@ export interface OpenWorldCombatTelemetry {
   equippedWeaponId: string;
   equippedWeaponName: string;
   equippedCaliber: string;
+  activeRoundLabel: string;
   ammoInMag: number;
   magCapacity: number;
   ammoReserve: number;
+  rigQuickMagCount: number;
+  backpackReserveRounds: number;
+  hasChestRig: boolean;
   fireModeLabel: string;
   reloading: boolean;
   isAds: boolean;
@@ -121,12 +178,18 @@ export interface OpenWorldCombatTelemetry {
   damageFlashAlpha: number;
   hitMarkerAlpha: number;
   hitMarkerHeadshot: boolean;
+  bleedingRemainingSec: number;
+  sprintSlowRemainingSec: number;
 }
 
 export interface OpenWorldSessionSnapshot {
   character: OpenWorldCharacter | null;
   bankruptcy: BankruptcyStatus | null;
   pointerLocked: boolean;
+  activeModal: OpenWorldModalKind;
+  externalLoot: ExternalLootContext | null;
+  fobTerminalState: FobTerminalStateSnapshot | null;
+  fobTier: FobTier;
   navMode: OpenWorldNavMode;
   renderPipeline: OpenWorldRenderPipeline;
   lensPreset: BodycamLensPresetId;
@@ -147,8 +210,12 @@ export interface OpenWorldSessionSnapshot {
   streamer: StreamerStats;
   combat: OpenWorldCombatTelemetry;
   ai: AiSummaryTelemetry;
+  wildlife: WildlifeSummaryTelemetry;
   sectors: SectorRuntimeState[];
   activeSector: SectorRuntimeState | null;
+  commsBlackoutCount: number;
+  convoys: ConvoySummaryTelemetry[];
+  worldEvent: WorldEventTelemetry;
   territoryCounts: { pmc_alpha: number; pmc_bravo: number; neutral: number };
   pmcSupplyPools: Record<PmcFactionId, FactionSupplyPool>;
   interactable: OpenWorldInteractableContext | null;
@@ -177,6 +244,7 @@ const _muzzlePos = new THREE.Vector3();
 const _muzzleDir = new THREE.Vector3();
 const _flashTargetPos = new THREE.Vector3();
 const _whipVel = new THREE.Vector2();
+const _aiLosHitScratch = createObbRaycastHit();
 
 const RENDER_PREFS_STORAGE_KEY = 'axon_openworld_render_prefs_v1';
 
@@ -286,12 +354,13 @@ function detectSoftwareWebGl(): boolean {
 }
 
 /**
- * Generates a crisp procedural 4km × 4km topographic contour + biome + road + water map
+ * Generates a crisp procedural 4km × 4km topographic contour + biome + vector road network +
+ * river bridges + settlements + gas stations + checkpoints + horizon towers map
  * for the physical 3D handheld GPS PDA OLED (zero external textures / zero 404s).
  */
 function buildProcedural4kmTopoCanvas(): HTMLCanvasElement | null {
   if (typeof document === 'undefined') return null;
-  const size = 256;
+  const size = 512;
   const canvas = document.createElement('canvas');
   canvas.width = size;
   canvas.height = size;
@@ -301,12 +370,13 @@ function buildProcedural4kmTopoCanvas(): HTMLCanvasElement | null {
   const img = ctx.createImageData(size, size);
   const dst = img.data;
   const sample = createTerrainSample();
+  const worldSpan = WORLD_HALF_M * 2;
 
   for (let py = 0; py < size; py++) {
     // North (-Z) is top of map
-    const wz = -WORLD_HALF_M + (py / (size - 1)) * (WORLD_HALF_M * 2);
+    const wz = -WORLD_HALF_M + (py / (size - 1)) * worldSpan;
     for (let px = 0; px < size; px++) {
-      const wx = -WORLD_HALF_M + (px / (size - 1)) * (WORLD_HALF_M * 2);
+      const wx = -WORLD_HALF_M + (px / (size - 1)) * worldSpan;
       sampleOpenWorldTerrain(wx, wz, sample);
       const di = (py * size + px) * 4;
 
@@ -315,16 +385,12 @@ function buildProcedural4kmTopoCanvas(): HTMLCanvasElement | null {
       let b: number;
       if (sample.isWater) {
         r = 18;
-        g = 46;
-        b = 68;
-      } else if (sample.isRoad) {
-        r = 148;
-        g = 142;
-        b = 122;
+        g = 48;
+        b = 72;
       } else {
-        r = Math.round(sample.r * 195 + 18);
-        g = Math.round(sample.g * 205 + 22);
-        b = Math.round(sample.b * 185 + 18);
+        r = Math.round(sample.r * 185 + 16);
+        g = Math.round(sample.g * 195 + 20);
+        b = Math.round(sample.b * 175 + 16);
         // Crisp 35m topographic contour isolines
         const contourMod = Math.abs(sample.height) % 35;
         if (contourMod < 2.2) {
@@ -340,6 +406,140 @@ function buildProcedural4kmTopoCanvas(): HTMLCanvasElement | null {
     }
   }
   ctx.putImageData(img, 0, 0);
+
+  const toMapX = (wx: number) => ((wx + WORLD_HALF_M) / worldSpan) * size;
+  const toMapY = (wz: number) => ((wz + WORLD_HALF_M) / worldSpan) * size;
+
+  // 1. Vector Road Network Overlay (Dirt Trails dashed, FOB Spurs solid, Route 41 double-line)
+  const segments = getBakedRoadSegments();
+  ctx.lineCap = 'round';
+
+  // Dirt Trails (dashed tan lines)
+  ctx.save();
+  ctx.strokeStyle = 'rgba(186, 158, 118, 0.86)';
+  ctx.lineWidth = 1.6;
+  ctx.setLineDash([4, 3]);
+  ctx.beginPath();
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i];
+    if (seg.tier !== 'dirt_trail') continue;
+    ctx.moveTo(toMapX(seg.ax), toMapY(seg.az));
+    ctx.lineTo(toMapX(seg.bx), toMapY(seg.bz));
+  }
+  ctx.stroke();
+  ctx.restore();
+
+  // FOB Spurs & Connectors (dark outline + warm tarmac fill)
+  ctx.strokeStyle = 'rgba(22, 26, 30, 0.85)';
+  ctx.lineWidth = 4.2;
+  ctx.beginPath();
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i];
+    if (seg.tier !== 'fob_spur') continue;
+    ctx.moveTo(toMapX(seg.ax), toMapY(seg.az));
+    ctx.lineTo(toMapX(seg.bx), toMapY(seg.bz));
+  }
+  ctx.stroke();
+  ctx.strokeStyle = '#c8c4b8';
+  ctx.lineWidth = 2.2;
+  ctx.stroke();
+
+  // Route 41 Main Highway (prominent double-cased tactical corridor)
+  ctx.strokeStyle = 'rgba(18, 22, 26, 0.92)';
+  ctx.lineWidth = 6.2;
+  ctx.beginPath();
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i];
+    if (seg.tier !== 'highway') continue;
+    ctx.moveTo(toMapX(seg.ax), toMapY(seg.az));
+    ctx.lineTo(toMapX(seg.bx), toMapY(seg.bz));
+  }
+  ctx.stroke();
+  ctx.strokeStyle = '#e5b85c';
+  ctx.lineWidth = 3.2;
+  ctx.stroke();
+  ctx.strokeStyle = '#2a2e33';
+  ctx.lineWidth = 1.0;
+  ctx.stroke();
+
+  // 2. Steel-Truss River Bridges (crisp parallel deck ticks)
+  const bridges = getBakedRiverBridges();
+  for (let i = 0; i < bridges.length; i++) {
+    const br = bridges[i];
+    const x1 = toMapX(br.startX);
+    const y1 = toMapY(br.startZ);
+    const x2 = toMapX(br.endX);
+    const y2 = toMapY(br.endZ);
+    ctx.strokeStyle = '#e2f1ff';
+    ctx.lineWidth = 4.6;
+    ctx.beginPath();
+    ctx.moveTo(x1, y1);
+    ctx.lineTo(x2, y2);
+    ctx.stroke();
+    ctx.strokeStyle = '#1f2937';
+    ctx.lineWidth = 2.0;
+    ctx.stroke();
+  }
+
+  // 3. Settlements (Houses & Barns), Gas Stations & Military Checkpoints
+  const sites = getBakedOpenWorldSites();
+  for (let i = 0; i < sites.length; i++) {
+    const s = sites[i];
+    const mx = toMapX(s.x);
+    const my = toMapY(s.z);
+    if (s.kind === 'gas_station') {
+      // Amber square badge with white fuel dot
+      ctx.fillStyle = '#f59e0b';
+      ctx.fillRect(mx - 4, my - 4, 8, 8);
+      ctx.strokeStyle = '#111827';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(mx - 4, my - 4, 8, 8);
+      ctx.fillStyle = '#111827';
+      ctx.fillRect(mx - 1.5, my - 1.5, 3, 3);
+    } else if (s.kind === 'checkpoint') {
+      // Red/white tactical roadblock diamond
+      ctx.fillStyle = '#ef4444';
+      ctx.beginPath();
+      ctx.moveTo(mx, my - 4);
+      ctx.lineTo(mx + 4, my);
+      ctx.lineTo(mx, my + 4);
+      ctx.lineTo(mx - 4, my);
+      ctx.closePath();
+      ctx.fill();
+      ctx.strokeStyle = '#f8fafc';
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    } else if (s.kind === 'barn') {
+      ctx.fillStyle = '#b45309';
+      ctx.fillRect(mx - 2.5, my - 2.5, 5, 5);
+    } else {
+      ctx.fillStyle = '#e2e8f0';
+      ctx.fillRect(mx - 2, my - 2, 4, 4);
+    }
+  }
+
+  // 4. Vertical Horizon Landmarks (Water Towers = cyan circles, Radio Masts = crimson triangles)
+  const towers = getBakedHorizonTowers();
+  for (let i = 0; i < towers.length; i++) {
+    const tw = towers[i];
+    const mx = toMapX(tw.x);
+    const my = toMapY(tw.z);
+    if (tw.kind === 'water_tower') {
+      ctx.fillStyle = '#38bdf8';
+      ctx.beginPath();
+      ctx.arc(mx, my, 3, 0, Math.PI * 2);
+      ctx.fill();
+    } else {
+      ctx.fillStyle = '#f43f5e';
+      ctx.beginPath();
+      ctx.moveTo(mx, my - 4);
+      ctx.lineTo(mx + 3.5, my + 3);
+      ctx.lineTo(mx - 3.5, my + 3);
+      ctx.closePath();
+      ctx.fill();
+    }
+  }
+
   return canvas;
 }
 
@@ -385,11 +585,16 @@ export class OpenWorldSessionEngine {
   private readonly atmosphere: OpenWorldAtmosphere;
   private readonly streamer: OpenWorldChunkStreamer;
   private readonly sectorManager: OpenWorldSectorManager;
+  private readonly logisticsEconomy: OpenWorldLogisticsEconomy;
+  private readonly convoyDirector: OpenWorldConvoyDirector;
+  private readonly eventDirector: OpenWorldEventDirector;
   private readonly aiDirector: OpenWorldAiDirector;
   private readonly bodycamAdapter: OpenWorldBodycamAdapter;
 
   // Shared Axon Bodycam Core subsystems
   private readonly audio: BodycamAudio;
+  private readonly ambienceAudio: OpenWorldAmbienceAudio;
+  private readonly wildlifeManager: WildlifeManager;
   private readonly ballistics: BallisticsSolver;
   private readonly weaponRig: WeaponRig;
   private readonly skeleton: CharacterSkeleton;
@@ -420,6 +625,8 @@ export class OpenWorldSessionEngine {
   };
   private readonly _pdaMotionScratch = createPdaMotionState();
   private readonly _pdaPings: PdaPingMarker[] = [];
+  private readonly _pdaBlackoutZones: PdaCommsBlackoutZone[] = [];
+  private readonly _pdaConvoys: PdaConvoyMarker[] = [];
   private readonly _pdaTelemetryScratch: PdaHudTelemetry = {
     playerX: 0,
     playerZ: 0,
@@ -431,6 +638,8 @@ export class OpenWorldSessionEngine {
     modeLabel: 'PERIMETER OPS',
     zoneLabel: 'ALPHA FOB',
     pings: [],
+    commsBlackoutZones: [],
+    convoys: [],
   };
 
   private readonly corpseMarkerGroup = new THREE.Group();
@@ -441,6 +650,8 @@ export class OpenWorldSessionEngine {
   private readonly listeners = new Set<SnapshotListener>();
 
   private activeSlotId: CharacterSlotId | null = null;
+  private activeModal: OpenWorldModalKind = null;
+  private activeExternalLoot: ExternalLootContext | null = null;
   private navMode: OpenWorldNavMode = 'foot';
   private renderPipeline: OpenWorldRenderPipeline = 'direct';
   private nvgMode: OpenWorldNvgMode = 'none';
@@ -462,6 +673,11 @@ export class OpenWorldSessionEngine {
   private fireCooldown = 0;
   private reloadTimer = 0;
   private pendingReloadWeaponId: string | null = null;
+  private pendingReloadSpec: {
+    weaponId: string;
+    weaponSlotKey: 'primary' | 'secondary';
+    sourceLocator: ItemSourceLocator;
+  } | null = null;
   private tacticalEquipmentId: TacticalEquipmentId = DEFAULT_TACTICAL_EQUIPMENT_ID;
   private grenadeCount = 2;
   private shiftHeld = false;
@@ -469,6 +685,12 @@ export class OpenWorldSessionEngine {
   private damageFlashAlpha = 0;
   private hitMarkerAlpha = 0;
   private hitMarkerHeadshot = false;
+  private bleedingRemainingSec = 0;
+  private sprintSlowRemainingSec = 0;
+  private footstepSideSign = 1;
+  private lastPlayerX = 0;
+  private lastPlayerZ = 0;
+  private smoothPlayerSpeedMps = 0;
   private toastMessage: string | null = null;
   private toastTimerSec = 0;
   private activeInteractable: OpenWorldInteractableContext | null = null;
@@ -553,10 +775,14 @@ export class OpenWorldSessionEngine {
     this.atmosphere.sunLight.layers.enable(VIEWMODEL_LAYER);
     this.atmosphere.hemiLight.layers.enable(VIEWMODEL_LAYER);
 
-    this.streamer = new OpenWorldChunkStreamer(this.scene, this.isSoftwareGl);
+    this.streamer = new OpenWorldChunkStreamer(
+      this.scene,
+      this.isSoftwareGl,
+      this.atmosphere.fogUniforms,
+    );
 
     const maxAniso = Math.min(8, this.renderer.capabilities.getMaxAnisotropy());
-    // Phase 3 Dynamic Sector Control & Battle-Parity Tactical AI Squads
+    // Phase 3 & 4 Dynamic Sector Control, Supply-Coupled Logistics, Convoys & Dynamic Events
     this.sectorManager = new OpenWorldSectorManager(
       this.scene,
       (x, z) => this.streamer.sampleGroundHeight(x, z),
@@ -564,25 +790,78 @@ export class OpenWorldSessionEngine {
       shardStore,
       initialShard,
     );
+    this.logisticsEconomy = new OpenWorldLogisticsEconomy();
+    this.convoyDirector = new OpenWorldConvoyDirector(
+      this.scene,
+      (x, z) => this.streamer.sampleGroundHeight(x, z),
+    );
+    this.eventDirector = new OpenWorldEventDirector(
+      this.scene,
+      (x, z) => this.streamer.sampleGroundHeight(x, z),
+    );
     this.aiDirector = new OpenWorldAiDirector(
       this.scene,
       (x, z) => this.streamer.sampleGroundHeight(x, z),
       playerFaction,
       maxAniso,
+      (ax, ay, az, bx, by, bz) => {
+        const dx = bx - ax;
+        const dy = by - ay;
+        const dz = bz - az;
+        const dist = Math.hypot(dx, dy, dz);
+        if (dist < 0.35) return false;
+        const inv = 1 / dist;
+        _aiLosHitScratch.hit = false;
+        _aiLosHitScratch.distance = dist - 0.25;
+        return this.streamer.raycastActiveStructures(
+          ax,
+          ay,
+          az,
+          dx * inv,
+          dy * inv,
+          dz * inv,
+          0.25,
+          _aiLosHitScratch,
+        );
+      },
     );
 
-    // Bridge 4km heightfield & AI hitboxes into Axon's shared bodycam-sdk
+    // Bridge 4km heightfield, AI hitboxes, convoys, events & wildlife into Axon's shared bodycam-sdk
     this.bodycamAdapter = new OpenWorldBodycamAdapter(
       this.streamer,
       this.aiDirector,
       (origin, radius, kind) => {
         if (kind === 'gunshot' || kind === 'suppressed_gunshot') {
+          const db = kind === 'suppressed_gunshot' ? 124 : 158;
           this.aiDirector.notifyPlayerGunshot(origin.x, origin.z, radius);
+          this.sectorManager.notifyCombatAlert(origin.x, origin.z, radius);
+          this.ambienceAudio.onBallisticImpulse(
+            origin.x,
+            origin.z,
+            db,
+            this.controller.position.x,
+            this.controller.position.z,
+          );
+          this.wildlifeManager.onBallisticImpulse(origin.x, origin.z, db);
+        } else if (
+          kind === 'footstep_crouch' ||
+          kind === 'footstep_walk' ||
+          kind === 'footstep_sprint' ||
+          kind === 'landing'
+        ) {
+          // Alternating left/right boot contact coordinates for insect boot-squish check (< 0.22m)
+          this.footstepSideSign = -this.footstepSideSign;
+          const lateral = this.footstepSideSign * 0.14;
+          const cosY = Math.cos(this.controller.aimYaw);
+          const sinY = Math.sin(this.controller.aimYaw);
+          const footX = origin.x + cosY * lateral;
+          const footZ = origin.z - sinY * lateral;
+          this.wildlifeManager.handlePlayerFootstep(footX, origin.y, footZ);
         }
       },
     );
 
-    // Shared Axon Bodycam Audio, Ballistics, WeaponRig, ScopeRenderer, M/F Operator Rig, Animator, Controller, PDA & Grenades
+    // Shared Axon Bodycam Audio, Spatial Ambience Engine & Living Wildlife Ecosystem
     this.audio = new BodycamAudio();
     this.audio.setSettings(
       this.config.micClippingDrive,
@@ -590,6 +869,17 @@ export class OpenWorldSessionEngine {
       this.config.gearRattleGain,
     );
     this.audio.setInteriorAcoustics(false, 'outdoor');
+
+    this.ambienceAudio = new OpenWorldAmbienceAudio(this.audio);
+    this.wildlifeManager = new WildlifeManager(
+      this.scene,
+      (x, z) => this.streamer.sampleGroundHeight(x, z),
+      this.ambienceAudio,
+      this.isSoftwareGl,
+    );
+    this.bodycamAdapter.setWildlifeManager(this.wildlifeManager);
+    this.bodycamAdapter.setConvoyDirector(this.convoyDirector);
+    this.bodycamAdapter.setEventDirector(this.eventDirector);
 
     this.ballistics = new BallisticsSolver(this.scene);
 
@@ -719,17 +1009,36 @@ export class OpenWorldSessionEngine {
   }
 
   private syncCharacterLoadout(char: OpenWorldCharacter | null): void {
-    const plateId = char?.equippedKit.armorPlateId ?? 'plate_nij3_steel';
+    const plateId =
+      char?.tacticalInventory?.armorPlateId ?? char?.equippedKit.armorPlateId ?? 'plate_nij3_steel';
     const plateSpec = ARMOR_PLATE_MAP[plateId];
     this.maxArmorDurability = plateSpec?.durability ?? 60;
     this.armorDurability = this.maxArmorDurability;
     this.armorLabel = plateSpec ? `${plateSpec.ratingLabel} Plate` : 'NIJ III Plate';
 
+    if (char?.tacticalInventory) {
+      this.grenadeCount = countGrenadesInInventory(char.tacticalInventory);
+    }
+
     const weaponId =
-      char?.arsenal.equippedWeaponId && char.arsenal.equippedWeaponId !== 'unarmed'
+      char?.tacticalInventory?.primary.weaponId ??
+      (char?.arsenal.equippedWeaponId && char.arsenal.equippedWeaponId !== 'unarmed'
         ? char.arsenal.equippedWeaponId
-        : (char?.arsenal.ownedWeaponIds[0] ?? 'm4a1');
+        : (char?.arsenal.ownedWeaponIds[0] ?? 'm4a1'));
     this.equipWeapon(weaponId);
+  }
+
+  private getCurrentLoadedCountForWeapon(weaponId: string): number {
+    if (weaponId === 'unarmed') return 0;
+    const prof = resolveWeaponProfile(weaponId);
+    const char = this.getActiveCharacter();
+    if (char?.tacticalInventory) {
+      const slotKey = getWeaponSlotByWeaponId(char.tacticalInventory, prof.id);
+      if (slotKey) {
+        return getLoadedAmmoCount(char.tacticalInventory[slotKey]);
+      }
+    }
+    return this.magAmmoByWeapon[prof.id] ?? prof.magCapacity;
   }
 
   private equipWeapon(weaponId: string): void {
@@ -741,15 +1050,15 @@ export class OpenWorldSessionEngine {
     this.weaponRig.setWeaponProfile(prof, attachments);
 
     if (weaponId !== 'unarmed') {
-      if (this.magAmmoByWeapon[prof.id] === undefined) {
-        this.magAmmoByWeapon[prof.id] = prof.magCapacity;
-      }
-      this.weaponRig.setAmmoState(this.magAmmoByWeapon[prof.id], true);
+      const loaded = this.getCurrentLoadedCountForWeapon(prof.id);
+      this.magAmmoByWeapon[prof.id] = loaded;
+      this.weaponRig.setAmmoState(loaded, true);
       const zeroM = char?.arsenal.zeroDistanceByWeapon[prof.id] ?? getDefaultZeroDistanceM(prof.category);
       this.weaponRig.setZeroConfig(zeroM, 0, 0);
     }
     this.reloadTimer = 0;
     this.pendingReloadWeaponId = null;
+    this.pendingReloadSpec = null;
     this.isFiring = false;
     this.semiTriggerConsumed = false;
   }
@@ -758,6 +1067,13 @@ export class OpenWorldSessionEngine {
     const prof = resolveWeaponProfile(weaponId);
     const calId = resolveBaseCaliberId(prof.defaultCaliberId);
     const char = this.getActiveCharacter();
+    if (char?.tacticalInventory) {
+      const slotKey = getWeaponSlotByWeaponId(char.tacticalInventory, prof.id);
+      if (slotKey) {
+        const nextVar = peekNextRoundVariant(char.tacticalInventory[slotKey]);
+        if (nextVar) return nextVar;
+      }
+    }
     const stored = char?.arsenal.ammoVariantByWeapon[prof.id] as AmmoVariantId | undefined;
     if (stored && AMMO_VARIANTS[stored]?.caliberId === calId) {
       return AMMO_VARIANTS[stored];
@@ -767,6 +1083,10 @@ export class OpenWorldSessionEngine {
 
   private getReserveAmmoForWeapon(weaponId: string): number {
     if (weaponId === 'unarmed') return 0;
+    const char = this.getActiveCharacter();
+    if (char?.tacticalInventory) {
+      return countCompatibleReserveRounds(char.tacticalInventory, weaponId).rigAndBeltRounds;
+    }
     if (this.activeSlotId) {
       return characterRoster.getArsenalReserveForWeapon(this.activeSlotId, weaponId);
     }
@@ -837,6 +1157,7 @@ export class OpenWorldSessionEngine {
     this.camera.updateProjectionMatrix();
     this.renderer.setSize(w, h);
     this.postProcess?.setSize(w, h);
+    this.atmosphere.setSize(w, h);
   };
 
   private readonly onContextLost = (e: Event): void => {
@@ -879,6 +1200,18 @@ export class OpenWorldSessionEngine {
 
     // Global open-world hotkeys
     if (!e.repeat) {
+      if (e.code === 'Tab' || e.code === 'KeyI') {
+        e.preventDefault();
+        if (this.activeModal === 'inventory' || this.activeModal === 'corpse_loot' || this.activeModal === 'event_loot') {
+          this.closeActiveModal();
+        } else {
+          this.openInventory();
+        }
+        return;
+      }
+      if (this.activeModal !== null) {
+        return;
+      }
       if (e.code === 'KeyV') {
         this.setNavMode(this.navMode === 'foot' ? 'recon_flight' : 'foot');
         return;
@@ -891,6 +1224,12 @@ export class OpenWorldSessionEngine {
         this.cycleNvgMode();
         return;
       }
+      if (e.code === 'KeyX') {
+        if (this.activeInteractable?.kind === 'convoy_hijack') {
+          this.sabotageNearestConvoy();
+        }
+        return;
+      }
       if (e.code === 'KeyF') {
         if (this.activeInteractable) {
           this.executeFieldInteraction();
@@ -901,7 +1240,7 @@ export class OpenWorldSessionEngine {
       }
     }
 
-    if (this.navMode !== 'foot') return;
+    if (this.activeModal !== null || this.navMode !== 'foot') return;
 
     switch (e.code) {
       case 'KeyW':
@@ -1019,6 +1358,7 @@ export class OpenWorldSessionEngine {
 
   private readonly onMouseDown = (e: MouseEvent): void => {
     if (e.button === 1) e.preventDefault();
+    if (this.activeModal !== null) return;
     if (!this.pointerLocked) {
       if (e.target === this.renderer.domElement) {
         this.requestPointerLock();
@@ -1206,6 +1546,41 @@ export class OpenWorldSessionEngine {
       return;
     }
     const prof = resolveWeaponProfile(this.equippedWeaponId);
+    const char = this.getActiveCharacter();
+
+    // Phase 5 Chest Rig / Belt Quick Reload Enforcement:
+    // `[R]` strictly pulls loaded compatible magazines from the equipped Chest Rig or Belt!
+    // If none exist there (or no Chest Rig is worn), operator can always drag-reload inside [Tab] Inventory.
+    if (char?.tacticalInventory) {
+      const slotKey = getWeaponSlotByWeaponId(char.tacticalInventory, prof.id);
+      if (slotKey) {
+        const candidate = findQuickReloadMagazine(char.tacticalInventory, prof.id);
+        if (!candidate) {
+          this.showToast(
+            char.tacticalInventory.chestRig
+              ? 'No loaded mag in Chest Rig / Belt — press [Tab] to drag-reload from Backpack'
+              : 'No Chest Rig equipped — press [Tab] to drag-reload from Backpack',
+            4.0,
+          );
+          this.emitSnapshot();
+          return;
+        }
+        this.isFiring = false;
+        this.input.ads = false;
+        this.reloadTimer = Math.max(1.1, prof.reloadDurationSec);
+        this.pendingReloadWeaponId = prof.id;
+        this.pendingReloadSpec = {
+          weaponId: prof.id,
+          weaponSlotKey: slotKey,
+          sourceLocator: candidate.locator,
+        };
+        this.weaponRig.triggerReload(this.reloadTimer);
+        this.audio.playWeaponCue('mag_out', { intensity: 0.65 });
+        this.emitSnapshot();
+        return;
+      }
+    }
+
     const curMag = this.magAmmoByWeapon[prof.id] ?? prof.magCapacity;
     if (curMag >= prof.magCapacity) return;
     const reserve = this.getReserveAmmoForWeapon(prof.id);
@@ -1217,13 +1592,51 @@ export class OpenWorldSessionEngine {
     this.input.ads = false;
     this.reloadTimer = Math.max(1.1, prof.reloadDurationSec);
     this.pendingReloadWeaponId = prof.id;
+    this.pendingReloadSpec = null;
     this.weaponRig.triggerReload(this.reloadTimer);
     this.audio.playWeaponCue('mag_out', { intensity: 0.65 });
     this.emitSnapshot();
   }
 
+  /**
+   * Always-working Phase 5 Inventory Drag-and-Drop Fallback Reload:
+   * Works even with NO Chest Rig equipped (or pulling directly from Backpack / Secure / Loot Crate)
+   * AND triggers the real first-person `WeaponRig.triggerReload()` animation + audio!
+   */
+  public triggerInventoryDragReload(
+    weaponSlotKey: 'primary' | 'secondary',
+    sourceLocator: ItemSourceLocator,
+  ): void {
+    const char = this.getActiveCharacter();
+    if (!char?.tacticalInventory) return;
+    const slot = char.tacticalInventory[weaponSlotKey];
+    if (!slot.weaponId || slot.weaponId === 'unarmed') return;
+
+    const prof = resolveWeaponProfile(slot.weaponId);
+    if (this.equippedWeaponId !== prof.id) {
+      this.equipWeapon(prof.id);
+    }
+
+    // Close inventory modal so operator watches the real 1P reload animation in-world
+    this.closeActiveModal();
+    this.isFiring = false;
+    this.input.ads = false;
+    this.reloadTimer = Math.max(1.15, prof.reloadDurationSec);
+    this.pendingReloadWeaponId = prof.id;
+    this.pendingReloadSpec = {
+      weaponId: prof.id,
+      weaponSlotKey,
+      sourceLocator,
+    };
+    this.weaponRig.triggerReload(this.reloadTimer);
+    this.audio.playWeaponCue('mag_out', { intensity: 0.7 });
+    this.showToast(`Manual Drag-Reloading ${prof.name}...`, 2.6);
+    this.emitSnapshot();
+  }
+
   private tryFireShot(): void {
     if (
+      this.activeModal !== null ||
       this.navMode !== 'foot' ||
       this.equippedWeaponId === 'unarmed' ||
       this.fireCooldown > 0 ||
@@ -1237,26 +1650,62 @@ export class OpenWorldSessionEngine {
     }
 
     const prof = resolveWeaponProfile(this.equippedWeaponId);
-    const curAmmo = this.magAmmoByWeapon[prof.id] ?? prof.magCapacity;
     const isSingle = prof.fireMode === 'semi' || prof.fireMode === 'bolt' || prof.fireMode === 'pump';
     if (isSingle && this.semiTriggerConsumed) return;
 
-    if (curAmmo <= 0) {
-      this.weaponRig.triggerDryFire();
-      this.audio.playWeaponCue('dryfire', { intensity: 0.6 });
-      this.semiTriggerConsumed = true;
-      this.fireCooldown = 0.22;
-      this.showToast('Empty Magazine — Press [R] to Reload');
-      return;
+    const char = this.getActiveCharacter();
+    let activeAmmo: AmmoVariantDef = this.getActiveAmmoVariant(prof.id);
+    let nextAmmo = 0;
+
+    // Phase 5 LIFO Mixed-Ammo Magazine Firing: pops exact top round & feeds true AmmoVariantDef to BallisticsSolver
+    if (char?.tacticalInventory) {
+      const slotKey = getWeaponSlotByWeaponId(char.tacticalInventory, prof.id);
+      if (slotKey) {
+        const invClone = cloneTacticalInventory(char.tacticalInventory);
+        const firedVariant = fireRoundFromWeaponSlot(invClone[slotKey]);
+        if (!firedVariant) {
+          this.weaponRig.triggerDryFire();
+          this.audio.playWeaponCue('dryfire', { intensity: 0.6 });
+          this.semiTriggerConsumed = true;
+          this.fireCooldown = 0.22;
+          this.showToast('Empty Magazine — Press [R] (Rig) or [Tab] to Drag-Reload');
+          return;
+        }
+        activeAmmo = firedVariant;
+        nextAmmo = getLoadedAmmoCount(invClone[slotKey]);
+        this.magAmmoByWeapon[prof.id] = nextAmmo;
+        characterRoster.updateTacticalInventory(char.slotId, invClone);
+      } else {
+        const curAmmo = this.magAmmoByWeapon[prof.id] ?? prof.magCapacity;
+        if (curAmmo <= 0) {
+          this.weaponRig.triggerDryFire();
+          this.audio.playWeaponCue('dryfire', { intensity: 0.6 });
+          this.semiTriggerConsumed = true;
+          this.fireCooldown = 0.22;
+          this.showToast('Empty Magazine — Press [R] to Reload');
+          return;
+        }
+        nextAmmo = curAmmo - 1;
+        this.magAmmoByWeapon[prof.id] = nextAmmo;
+      }
+    } else {
+      const curAmmo = this.magAmmoByWeapon[prof.id] ?? prof.magCapacity;
+      if (curAmmo <= 0) {
+        this.weaponRig.triggerDryFire();
+        this.audio.playWeaponCue('dryfire', { intensity: 0.6 });
+        this.semiTriggerConsumed = true;
+        this.fireCooldown = 0.22;
+        this.showToast('Empty Magazine — Press [R] to Reload');
+        return;
+      }
+      nextAmmo = curAmmo - 1;
+      this.magAmmoByWeapon[prof.id] = nextAmmo;
     }
 
-    const nextAmmo = curAmmo - 1;
-    this.magAmmoByWeapon[prof.id] = nextAmmo;
     this.fireCooldown = 60 / Math.max(30, prof.rpm);
     if (isSingle) this.semiTriggerConsumed = true;
 
     const derived = this.weaponRig.getDerivedStats();
-    const activeAmmo = this.getActiveAmmoVariant(prof.id);
     const suppressed = derived.isSuppressed;
 
     this.weaponRig.getMuzzleWorldTransform(_muzzlePos, _muzzleDir, true);
@@ -1298,15 +1747,113 @@ export class OpenWorldSessionEngine {
       muzzleComp: derived.hasCompensator,
     });
 
-    // Notify nearby AI squads acoustically (suppressed rounds carry far less distance)
+    // Notify nearby AI squads, sector 4-state alert & living ecosystem acoustically
+    const shotDb = suppressed ? 124 : 158;
+    const acousticRange = suppressed ? 42 : 125;
     this.aiDirector.notifyPlayerGunshot(
       this.controller.position.x,
       this.controller.position.z,
-      suppressed ? 42 : 125,
+      acousticRange,
+    );
+    this.sectorManager.notifyCombatAlert(
+      this.controller.position.x,
+      this.controller.position.z,
+      acousticRange,
+    );
+    this.ambienceAudio.onBallisticImpulse(
+      this.controller.position.x,
+      this.controller.position.z,
+      shotDb,
+      this.controller.position.x,
+      this.controller.position.z,
+    );
+    this.wildlifeManager.onBallisticImpulse(
+      this.controller.position.x,
+      this.controller.position.z,
+      shotDb,
     );
   }
 
   private handleBallisticImpact(ev: Readonly<BallisticImpactEvent>): void {
+    // Disperse any daytime butterflies near bullet impact/path
+    this.wildlifeManager.notifyBulletPass(ev.point.x, ev.point.z, 7.5);
+
+    const char = this.getActiveCharacter();
+
+    // 1. Convoy Escort Guard hit
+    const convoyGuardId = ev.object?.userData?.openWorldConvoyGuardId as string | undefined;
+    if (convoyGuardId) {
+      const dmg = Math.max(24, Math.min(72, ev.impactEnergyJ * 0.024));
+      const res = this.convoyDirector.applyDamageToGuard(convoyGuardId, dmg, char);
+      if (res.blockedFriendly) {
+        this.showToast('Friendly Logistics Convoy — Hold Fire', 2.2);
+        return;
+      }
+      if (res.hit) {
+        this.hitMarkerAlpha = 1.0;
+        this.hitMarkerHeadshot = ev.object?.userData?.hitZone === 'head';
+        this.audio.playImpact(ev.point, 'metal');
+        if (res.convoyDisabled) {
+          this.showToast(
+            `${res.label} ESCORT NEUTRALIZED — Press [F] to Hijack/Reroute or [X] to Sabotage`,
+            5.0,
+          );
+        } else if (res.killed) {
+          this.killsThisSortie += 1;
+          this.showToast(`Convoy Escort Down (${res.label})`, 2.6);
+        }
+      }
+      return;
+    }
+
+    // 2. Dynamic World Event Guard hit
+    const eventGuardId = ev.object?.userData?.openWorldEventGuardId as string | undefined;
+    if (eventGuardId) {
+      const dmg = Math.max(24, Math.min(72, ev.impactEnergyJ * 0.024));
+      const res = this.eventDirector.applyDamageToGuard(eventGuardId, dmg);
+      if (res.hit) {
+        this.hitMarkerAlpha = 1.0;
+        this.hitMarkerHeadshot = ev.object?.userData?.hitZone === 'head';
+        this.audio.playImpact(ev.point, 'metal');
+        if (res.killed) {
+          this.killsThisSortie += 1;
+          if (res.allCleared) {
+            this.showToast('World Event Perimeter Cleared — Press [F] at Crate to Loot Salvage', 4.5);
+          } else {
+            this.showToast('World Event Guard Neutralized', 2.6);
+          }
+        }
+      }
+      return;
+    }
+
+    // 3. Living Wildlife hit
+    const wildlifeId = ev.object?.userData?.openWorldWildlifeId as string | undefined;
+    if (wildlifeId) {
+      const dmg = Math.max(24, Math.min(75, ev.impactEnergyJ * 0.024));
+      const res = this.wildlifeManager.applyDamageToEntity(
+        wildlifeId,
+        dmg,
+        this.controller.position.x,
+        this.controller.position.z,
+      );
+      if (res?.hit) {
+        this.hitMarkerAlpha = 1.0;
+        this.hitMarkerHeadshot = res.killed;
+        this.audio.playImpact(ev.point, 'wood');
+        if (res.killed) {
+          this.showToast(
+            res.species === 'wolf'
+              ? 'Timber Wolf Down — Approach & Press [F] to Field-Dress Pelt/Meat'
+              : 'Forest Deer Down — Approach & Press [F] to Field-Dress Hide/Venison',
+            4.2,
+          );
+        }
+      }
+      return;
+    }
+
+    // 4. AI Patrol / Garrison hit
     const aiId = ev.object?.userData?.openWorldAiId as string | undefined;
     if (!aiId) return;
 
@@ -1314,7 +1861,6 @@ export class OpenWorldSessionEngine {
     const hitZone: AiHitZone =
       rawZone === 'head' ? 'head' : rawZone === 'limb' ? 'limb' : 'torso';
     const baseDmg = Math.max(22, Math.min(68, ev.impactEnergyJ * 0.022));
-    const char = this.getActiveCharacter();
     const res = this.aiDirector.applyDamage(aiId, baseDmg, hitZone, char, ev.incomingDir);
 
     if (res.blockedFriendly) {
@@ -1345,6 +1891,14 @@ export class OpenWorldSessionEngine {
       this.handleAiElimination(k);
     }
     this.aiDirector.notifyPlayerGunshot(ev.position.x, ev.position.z, 175);
+    this.ambienceAudio.onBallisticImpulse(
+      ev.position.x,
+      ev.position.z,
+      172,
+      this.controller.position.x,
+      this.controller.position.z,
+    );
+    this.wildlifeManager.onBallisticImpulse(ev.position.x, ev.position.z, 172);
   }
 
   private handleAiElimination(ev: AiEliminationEvent): void {
@@ -1389,14 +1943,256 @@ export class OpenWorldSessionEngine {
     }
   }
 
+  private handleWolfBitePlayer(ev: WolfBitePlayerEvent): void {
+    if (this.playerHp <= 0 || this.navMode !== 'foot') return;
+    // Wolf bites target lower legs & forearms — direct HP damage + active bleeding + sprint slow
+    this.playerHp = Math.max(0, this.playerHp - ev.damageHp);
+    this.bleedingRemainingSec = Math.max(this.bleedingRemainingSec, ev.bleedDurationSec);
+    this.sprintSlowRemainingSec = Math.max(this.sprintSlowRemainingSec, ev.sprintSlowDurationSec);
+    this.damageFlashAlpha = Math.min(1.0, this.damageFlashAlpha + 0.85);
+    this.controller.applyRecoil(0.05, (Math.random() - 0.5) * 0.08, 0.025, 0.35);
+    this.audio.playMeleeImpact(
+      new THREE.Vector3(ev.originX, ev.originY, ev.originZ),
+      'cross',
+      'flesh',
+      1.1,
+    );
+    this.showToast('WOLF BITE · Bleeding & Leg Trauma (Sprint Impaired)', 4.2);
+
+    if (this.playerHp <= 0) {
+      this.triggerFieldDeathAtCurrentPosition(
+        undefined,
+        'KIA · Mauled by Timber Wolf Pack',
+      );
+    }
+  }
+
+  public openInventory(): void {
+    this.activeModal = 'inventory';
+    this.activeExternalLoot = null;
+    this.clearInputs();
+    this.exitPointerLock();
+    this.emitSnapshot();
+  }
+
+  public closeActiveModal(): void {
+    this.activeModal = null;
+    this.activeExternalLoot = null;
+    this.emitSnapshot();
+  }
+
+  public applyInventoryMutation(
+    nextInv: OperatorTacticalInventory,
+    nextExternal?: CorpseTacticalLootSnapshot | null,
+    statusNote?: string,
+  ): void {
+    const char = this.getActiveCharacter();
+    if (!char) return;
+    characterRoster.updateTacticalInventory(char.slotId, nextInv);
+    this.grenadeCount = countGrenadesInInventory(nextInv);
+
+    if (this.equippedWeaponId !== 'unarmed') {
+      const prof = resolveWeaponProfile(this.equippedWeaponId);
+      const slotKey = getWeaponSlotByWeaponId(nextInv, prof.id);
+      if (slotKey) {
+        const loaded = getLoadedAmmoCount(nextInv[slotKey]);
+        this.magAmmoByWeapon[prof.id] = loaded;
+        this.weaponRig.setAmmoState(loaded, true);
+      }
+    }
+
+    if (this.activeExternalLoot && nextExternal) {
+      if (this.activeExternalLoot.kind === 'corpse') {
+        shardStore.updateCorpseTacticalKit(char.shardMode, this.activeExternalLoot.id, nextExternal);
+        this.activeExternalLoot = { ...this.activeExternalLoot, lootKit: nextExternal };
+      } else if (this.activeExternalLoot.kind === 'event_crate') {
+        const cleared = this.eventDirector.markEventLootUpdated(nextExternal);
+        this.activeExternalLoot = { ...this.activeExternalLoot, lootKit: nextExternal };
+        if (cleared) {
+          characterRoster.adjustCash(char.slotId, 1800);
+          characterRoster.recordRotatingContractProgress(char.slotId, (rec) => rec.archetype === 'recon', 1);
+          this.showToast('WORLD EVENT CRATE CLEARED: +$1,800 Salvage Completion Bonus', 4.8);
+        }
+      }
+    }
+
+    if (statusNote) {
+      this.showToast(statusNote, 3.0);
+    }
+    this.emitSnapshot();
+  }
+
+  public useMedicalItemFromInventory(locator: ItemSourceLocator, _med: MedicalItem): void {
+    const char = this.getActiveCharacter();
+    if (!char?.tacticalInventory) return;
+    const inv = cloneTacticalInventory(char.tacticalInventory);
+    const target = peekItemByLocator(inv, locator, null);
+    if (!target || target.kind !== 'medical') return;
+
+    this.playerHp = Math.min(this.playerMaxHp, this.playerHp + target.healHp);
+    if (target.stopsBleed) this.bleedingRemainingSec = 0;
+    if (target.clearsSprintSlow) this.sprintSlowRemainingSec = 0;
+
+    target.usesRemaining -= 1;
+    if (target.usesRemaining <= 0) {
+      extractItemByLocator(inv, locator, null);
+    }
+    characterRoster.updateTacticalInventory(char.slotId, inv);
+    this.audio.playGearRattle('weapon_swap', 0.55);
+    this.showToast(`Applied ${target.name} (+${target.healHp} HP)`, 3.4);
+    this.emitSnapshot();
+  }
+
+  public fundFobUpgrade(): void {
+    const char = this.getActiveCharacter();
+    if (!char) return;
+    const res = this.logisticsEconomy.fundNextFobUpgrade(char, characterRoster, shardStore);
+    if (res.ok) {
+      this.sectorManager.syncFromShard(char.shardMode, characterRoster.getCharacter(char.slotId));
+      this.audio.playWeaponCue('mode_toggle', { intensity: 0.85 });
+    }
+    this.showToast(res.message, 4.8);
+    this.emitSnapshot();
+  }
+
+  public buyFobTraderOffer(offerId: string): void {
+    const char = this.getActiveCharacter();
+    if (!char) return;
+    const res = this.logisticsEconomy.purchaseTraderOffer(offerId, char, characterRoster, shardStore);
+    if (res.ok) {
+      if (res.equippedPlateId) {
+        const plateSpec = ARMOR_PLATE_MAP[res.equippedPlateId];
+        this.maxArmorDurability = plateSpec?.durability ?? 60;
+        this.armorDurability = this.maxArmorDurability;
+        this.armorLabel = plateSpec ? `${plateSpec.ratingLabel} Plate` : 'Armor Plate';
+      }
+      const refreshed = characterRoster.getCharacter(char.slotId);
+      if (refreshed?.tacticalInventory) {
+        this.grenadeCount = countGrenadesInInventory(refreshed.tacticalInventory);
+      }
+      this.audio.playWeaponCue('mag_in', { intensity: 0.65 });
+    }
+    this.showToast(res.message, 4.0);
+    this.emitSnapshot();
+  }
+
+  public acceptRotatingContract(slotIndex: number): void {
+    const char = this.getActiveCharacter();
+    if (!char?.contractBoard) return;
+    const target = char.contractBoard.find((rec) => rec.slotIndex === slotIndex) ?? char.contractBoard[slotIndex];
+    if (!target) return;
+    const updated = characterRoster.acceptRotatingContract(char.slotId, target.instanceId);
+    if (updated) {
+      this.showToast(`Accepted Contract: ${target.title} (${SUB_FACTION_MAP[target.subFactionId].shortName})`, 4.0);
+      this.emitSnapshot();
+    }
+  }
+
+  public completeRotatingContract(slotIndex: number): void {
+    const char = this.getActiveCharacter();
+    if (!char?.contractBoard) return;
+    const target = char.contractBoard.find((rec) => rec.slotIndex === slotIndex) ?? char.contractBoard[slotIndex];
+    if (!target) return;
+    const res = characterRoster.completeRotatingContract(char.slotId, target.instanceId);
+    if (res.ok && res.completed) {
+      this.audio.playWeaponCue('mode_toggle', { intensity: 0.8 });
+      this.showToast(
+        `Contract Complete: ${res.completed.title} (+$${res.completed.cashRewardUsd.toLocaleString()}, +${res.completed.standingGain} ${SUB_FACTION_MAP[res.completed.subFactionId].shortName})`,
+        5.0,
+      );
+      this.emitSnapshot();
+    }
+  }
+
+  public sabotageNearestConvoy(): void {
+    const char = this.getActiveCharacter();
+    if (!char) return;
+    const inter = this.activeInteractable;
+    if (!inter || inter.kind !== 'convoy_hijack') return;
+    const res = this.convoyDirector.sabotageConvoy(inter.id, char, characterRoster, shardStore);
+    if (res.ok) {
+      characterRoster.recordRotatingContractProgress(char.slotId, (rec) => rec.archetype === 'sabotage', 1);
+      this.audio.playWeaponCue('mode_toggle', { intensity: 0.9 });
+    }
+    this.showToast(res.message, 5.2);
+    this.emitSnapshot();
+  }
+
+  public triggerDynamicWorldEvent(kind: DynamicWorldEventKind): void {
+    const char = this.getActiveCharacter();
+    const faction: PmcFactionId = char?.pmcFaction ?? 'pmc_alpha';
+    const ev = this.eventDirector.triggerEvent(kind, faction);
+    if (ev.sectorId) {
+      this.sectorManager.markSectorContested(ev.sectorId);
+    }
+    this.audio.playWeaponCue('mode_toggle', { intensity: 0.75 });
+    this.showToast(`WORLD EVENT ACTIVE: ${ev.title} (${Math.round(ev.x)}, ${Math.round(ev.z)})`, 5.5);
+    this.emitSnapshot();
+  }
+
   public executeFieldInteraction(): void {
     const inter = this.activeInteractable;
     const char = this.getActiveCharacter();
-    if (!inter || !char) return;
+    if (!inter) return;
+
+    if (inter.kind === 'wildlife_harvest') {
+      const harvest = this.wildlifeManager.harvestCarcass(inter.id);
+      if (harvest) {
+        if (char) {
+          characterRoster.adjustCash(char.slotId, harvest.cashUsd);
+        }
+        this.showToast(harvest.summaryLabel, 4.5);
+        this.activeInteractable = null;
+        this.emitSnapshot();
+      }
+      return;
+    }
+
+    if (!char) return;
 
     if (!inter.canExecute) {
       this.showToast(inter.blockedReason ?? 'Action currently unavailable.');
       this.emitSnapshot();
+      return;
+    }
+
+    if (inter.kind === 'fob_terminal') {
+      this.activeModal = 'fob_terminal';
+      this.activeExternalLoot = null;
+      this.clearInputs();
+      this.exitPointerLock();
+      this.audio.playWeaponCue('mode_toggle', { intensity: 0.55 });
+      this.emitSnapshot();
+      return;
+    }
+
+    if (inter.kind === 'convoy_hijack') {
+      const res = this.convoyDirector.hijackAndRerouteConvoy(inter.id, char, characterRoster, shardStore);
+      if (res.ok) {
+        characterRoster.recordRotatingContractProgress(char.slotId, (rec) => rec.archetype === 'supply', 1);
+        this.audio.playWeaponCue('mode_toggle', { intensity: 0.85 });
+      }
+      this.showToast(res.message, 5.2);
+      this.emitSnapshot();
+      return;
+    }
+
+    if (inter.kind === 'world_event_crate') {
+      const ev = this.eventDirector.getActiveEvent();
+      if (ev) {
+        this.activeModal = 'event_loot';
+        this.activeExternalLoot = {
+          kind: 'event_crate',
+          id: ev.eventId,
+          title: ev.title,
+          subtitle: ev.summary,
+          lootKit: cloneCorpseLootSnapshot(ev.lootKit),
+        };
+        this.clearInputs();
+        this.exitPointerLock();
+        this.audio.playGearRattle('weapon_swap', 0.55);
+        this.emitSnapshot();
+      }
       return;
     }
 
@@ -1410,21 +2206,44 @@ export class OpenWorldSessionEngine {
 
     if (inter.kind === 'fob_resupply') {
       characterRoster.resupplyArsenalAmmo(char.slotId);
-      const prof = resolveWeaponProfile(this.equippedWeaponId);
-      if (this.equippedWeaponId !== 'unarmed') {
-        this.magAmmoByWeapon[prof.id] = prof.magCapacity;
-        this.weaponRig.setAmmoState(prof.magCapacity, true);
-      }
       this.playerHp = this.playerMaxHp;
       this.armorDurability = this.maxArmorDurability;
-      this.grenadeCount = getTacticalEquipmentDef(this.tacticalEquipmentId).maxCarry;
+      this.bleedingRemainingSec = 0;
+      this.sprintSlowRemainingSec = 0;
       this.audio.playWeaponCue('mag_in', { intensity: 0.8 });
-      this.showToast('FOB Medbay & Armory: 100% HP, Fresh Plate & Full Ammo Restored');
+      this.showToast('FOB Surgical Medbay: 100% HP, Bleeding/Trauma Cured & Armor Repaired');
       this.emitSnapshot();
       return;
     }
 
     if (inter.kind === 'corpse') {
+      const corpse = shardStore
+        .getShard(char.shardMode)
+        .corpses.find((c) => c.corpseId === inter.id);
+      if (!corpse) {
+        this.showToast('Corpse already cleared.');
+        return;
+      }
+      if (char.shardMode === 'PvE' && corpse.ownerCharacterId !== char.characterId) {
+        this.showToast('PvE Shard Rule: Only the corpse owner may recover dropped gear.');
+        return;
+      }
+      if (corpse.droppedTacticalKit) {
+        this.activeModal = 'corpse_loot';
+        this.activeExternalLoot = {
+          kind: 'corpse',
+          id: corpse.corpseId,
+          title: `KIA Corpse · ${corpse.ownerCallsign}`,
+          subtitle: `${corpse.shardMode} Full-Drop · ${corpse.causeOfDeath} · Drag items or swap Backpack/Rig`,
+          lootKit: cloneCorpseLootSnapshot(corpse.droppedTacticalKit),
+        };
+        this.clearInputs();
+        this.exitPointerLock();
+        this.audio.playGearRattle('weapon_swap', 0.6);
+        this.emitSnapshot();
+        return;
+      }
+
       const lootRes = shardStore.lootAndRemoveCorpse(
         char.shardMode,
         inter.id,
@@ -1497,7 +2316,12 @@ export class OpenWorldSessionEngine {
     sp.sightMisalignPitch = rigState.sightMisalignPitch;
     sp.elapsed = this.elapsedSec;
     sp.mainAvgLuminance = this.postProcess ? this.postProcess.getAverageLuminance() : 0.22;
-    this.scopeRenderer.renderScopePass(sp);
+    this.atmosphere.setGodraysEnabledForPass(false);
+    try {
+      this.scopeRenderer.renderScopePass(sp);
+    } finally {
+      this.atmosphere.setGodraysEnabledForPass(true);
+    }
   }
 
   private ensurePostProcess(): BodycamPostProcess {
@@ -1513,7 +2337,10 @@ export class OpenWorldSessionEngine {
         Math.max(1, this.container.clientHeight),
       );
       this.postProcess.setNvgState(this.nvgMode, this.nvgMode !== 'none', false);
-      this.postProcess.setBeforeMainRenderCallback(() => this.runScopeRenderPass());
+      this.postProcess.setBeforeMainRenderCallback(() => {
+        this.runScopeRenderPass();
+        this.atmosphere.prepareGodrays(this.renderer, this.camera);
+      });
     }
     return this.postProcess;
   }
@@ -1590,7 +2417,12 @@ export class OpenWorldSessionEngine {
   }
 
   public setWeather(weather: OpenWorldWeatherId): void {
-    this.atmosphere.setWeather(weather);
+    this.atmosphere.transitionToWeather(weather, 4.0);
+    this.emitSnapshot();
+  }
+
+  public setAutoWeatherCycle(enabled: boolean): void {
+    this.atmosphere.setAutoWeatherCycle(enabled);
     this.emitSnapshot();
   }
 
@@ -1668,6 +2500,8 @@ export class OpenWorldSessionEngine {
       // Recover at home FOB / Field Hospital with fresh vitals & remaining starter weapon
       this.playerHp = this.playerMaxHp;
       this.armorDurability = this.maxArmorDurability;
+      this.bleedingRemainingSec = 0;
+      this.sprintSlowRemainingSec = 0;
       this.aiDirector.resetProvocations();
       const respawnLandmark =
         outcome.updatedCharacter.pmcFaction === 'pmc_bravo'
@@ -1785,12 +2619,102 @@ export class OpenWorldSessionEngine {
     const py = this.navMode === 'foot' ? this.controller.position.y + 1.45 : this.flightY;
     const pz = this.navMode === 'foot' ? this.controller.position.z : this.flightZ;
 
+    // Tick wolf-bite bleeding & leg-trauma sprint slow
+    if (this.bleedingRemainingSec > 0 && this.playerHp > 0 && this.navMode === 'foot') {
+      this.bleedingRemainingSec = Math.max(0, this.bleedingRemainingSec - dt);
+      this.playerHp = Math.max(0, this.playerHp - dt * 1.45);
+      this.damageFlashAlpha = Math.max(
+        this.damageFlashAlpha,
+        0.12 + Math.sin(this.elapsedSec * 5.2) * 0.06,
+      );
+      if (this.playerHp <= 0) {
+        this.triggerFieldDeathAtCurrentPosition(undefined, 'KIA · Exsanguination from Wolf Bite');
+      }
+    }
+    if (this.sprintSlowRemainingSec > 0) {
+      this.sprintSlowRemainingSec = Math.max(0, this.sprintSlowRemainingSec - dt);
+    }
+
+    // Track horizontal speed smoothly for wind velocity & cricket proximity ducking
+    const moveStep = Math.hypot(px - this.lastPlayerX, pz - this.lastPlayerZ);
+    const instSpeed = dt > 0.001 ? Math.min(25, moveStep / dt) : 0;
+    this.smoothPlayerSpeedMps = this.smoothPlayerSpeedMps * 0.85 + instSpeed * 0.15;
+    this.lastPlayerX = px;
+    this.lastPlayerZ = pz;
+
     // Stream 3x3 active / 5x5 mid-range rings on chunk crossing
     this.streamer.update(px, pz);
 
-    // Update 90-minute day/night lighting, sky dome, fog, and rain
+    // Update 90-minute day/night lighting, sky dome, fog, rain & roadside night emissives
     this.atmosphere.update(dt, px, py, pz);
+    const nightFactor = this.atmosphere.getNightFactor();
+    this.streamer.setNightFactor(nightFactor);
     const atmoTel = this.atmosphere.getTelemetry();
+    const currentBiome = this.sampleBiomeAt(px, pz);
+
+    // Derive dynamic weather wind speed, gust envelope & wetness for audio + GPU foliage shader
+    const altitudeWindBoost = THREE.MathUtils.clamp((py - 40) / 340, 0, 1) * 5.5;
+    const baseWindMps =
+      atmoTel.weather === 'mountain_rain'
+        ? 11.5
+        : atmoTel.weather === 'coastal_fog'
+          ? 6.2
+          : 3.4;
+    const gust01 = Math.max(
+      0,
+      Math.sin(this.elapsedSec * 0.31) * 0.55 + Math.sin(this.elapsedSec * 0.77 + 1.4) * 0.45,
+    );
+    const windSpeedMps = baseWindMps + altitudeWindBoost + gust01 * 3.8;
+    const wetness01 = atmoTel.weather === 'mountain_rain' ? 0.92 : atmoTel.weather === 'coastal_fog' ? 0.35 : 0.0;
+
+    this.audio.setWindWeather(windSpeedMps, gust01, atmoTel.weather === 'mountain_rain' ? 0.85 : 0);
+    this.streamer.updateFoliageWindAndGrass(
+      this.elapsedSec,
+      windSpeedMps,
+      gust01,
+      wetness01,
+      px,
+      pz,
+    );
+
+    // Update Spatial Ambience Engine (Wind/Foliage + Water/Marsh beds, Night Owls, Proximity-Ducked Crickets)
+    this.ambienceAudio.update({
+      dt,
+      timeOfDayHours: atmoTel.timeOfDayHours,
+      nightFactor,
+      weather: atmoTel.weather,
+      windSpeedMps,
+      gust01,
+      playerX: px,
+      playerY: py,
+      playerZ: pz,
+      playerSpeedMps: this.smoothPlayerSpeedMps,
+      biome: currentBiome,
+      nearbyTreeRoosts: this.streamer.getActiveTreeRoosts(),
+    });
+
+    // Update Living Ecosystem (Wolf Packs, Deer Herds, Physical Frogs, Daytime Butterflies, Spiders & Ants)
+    this.wildlifeManager.update({
+      dt,
+      elapsedSec: this.elapsedSec,
+      timeOfDayHours: atmoTel.timeOfDayHours,
+      nightFactor,
+      windSpeedMps,
+      isRaining: atmoTel.weather === 'mountain_rain',
+      playerX: px,
+      playerY: py,
+      playerZ: pz,
+      playerYawRad: this.navMode === 'foot' ? this.controller.aimYaw : this.flightYaw,
+      playerSpeedMps: this.smoothPlayerSpeedMps,
+      playerCrouched: this.input.crouch,
+      playerSprinting: this.controller.isSprinting,
+      playerAlive: this.playerHp > 0,
+      playerOnFoot: this.navMode === 'foot',
+      flashlightOn: this.flashlightOn,
+      nearbyLogs: this.streamer.getActiveLogAnchors(),
+      nearbyRocks: this.streamer.getActiveRockAnchors(),
+      onWolfBitePlayer: (ev) => this.handleWolfBitePlayer(ev),
+    });
 
     // Update Phase 3 Tactical AI Squads (vision scaled by Atmosphere + Flashlight)
     this.aiDirector.update(
@@ -1807,23 +2731,103 @@ export class OpenWorldSessionEngine {
       (ev) => this.handleIncomingAiDamage(ev),
     );
 
-    // Update Phase 3 Dynamic Territory Control & Sector Beacons
+    // Update Phase 3 & 4 Dynamic Territory Control, Supply Depots, Convoys, World Events & FOB Restock
     const capEv = this.sectorManager.update(dt, px, pz, activeChar, (secId) =>
       this.aiDirector.getHostileGarrisonCount(secId, activeChar),
     );
     if (capEv) {
       this.audio.playWeaponCue('mode_toggle', { intensity: 0.85 });
+      if (activeChar) {
+        characterRoster.recordRotatingContractProgress(activeChar.slotId, (rec) => rec.archetype === 'recon', 1);
+      }
       this.showToast(
         `SECTOR CAPTURED: ${capEv.sectorName} flipped to ${PMC_FACTIONS[capEv.newOwner].name} (+$${capEv.cashBonusUsd.toLocaleString()} & Supply Boost)`,
         5.5,
       );
     }
 
-    // Update nearest contextual 3D interactable
-    this.activeInteractable =
-      this.navMode === 'foot'
-        ? this.sectorManager.findNearestInteractable(px, pz, activeChar)
-        : null;
+    if (activeChar) {
+      const shard = shardStore.getShard(activeChar.shardMode);
+      this.logisticsEconomy.update(
+        dt,
+        shard.pmcSupplyPools[activeChar.pmcFaction],
+        shard.restockPenaltySec[activeChar.pmcFaction] ?? 0,
+      );
+    }
+
+    const convoyNotice = this.convoyDirector.update(
+      dt,
+      px,
+      pz,
+      activeChar,
+      characterRoster,
+      shardStore,
+    );
+    if (convoyNotice) {
+      this.showToast(convoyNotice, 5.0);
+    }
+
+    const spawnedEvent = this.eventDirector.update(
+      dt,
+      atmoTel.timeOfDayHours,
+      activeChar?.pmcFaction ?? 'pmc_alpha',
+    );
+    if (spawnedEvent) {
+      if (spawnedEvent.sectorId) {
+        this.sectorManager.markSectorContested(spawnedEvent.sectorId);
+      }
+      this.showToast(`DYNAMIC WORLD EVENT: ${spawnedEvent.title} — Check GPS PDA`, 5.5);
+    }
+
+    // Update nearest contextual 3D interactable (FOB Terminal, Convoys, Event Crates, Corpses, Contracts & Wildlife)
+    if (this.navMode === 'foot' && this.activeModal === null) {
+      const candidates: OpenWorldInteractableContext[] = [];
+      const sectorInter = this.sectorManager.findNearestInteractable(px, pz, activeChar);
+      if (sectorInter) candidates.push(sectorInter);
+
+      const harvestPrompt = this.wildlifeManager.findNearestHarvestableCarcass(px, pz);
+      if (harvestPrompt) {
+        candidates.push({
+          kind: 'wildlife_harvest',
+          id: harvestPrompt.entityId,
+          label: harvestPrompt.label,
+          sublabel: harvestPrompt.sublabel,
+          distanceM: harvestPrompt.distanceM,
+          canExecute: true,
+        });
+      }
+
+      const convoyPrompt = this.convoyDirector.findNearestInteractableConvoy(px, pz, activeChar);
+      if (convoyPrompt) {
+        candidates.push({
+          kind: 'convoy_hijack',
+          id: convoyPrompt.convoyId,
+          label: convoyPrompt.label,
+          sublabel: convoyPrompt.sublabel,
+          distanceM: convoyPrompt.distanceM,
+          canExecute: convoyPrompt.canHijackOrSabotage,
+          blockedReason: convoyPrompt.blockedReason,
+        });
+      }
+
+      const eventPrompt = this.eventDirector.findNearestInteractableCrate(px, pz);
+      if (eventPrompt) {
+        candidates.push({
+          kind: 'world_event_crate',
+          id: eventPrompt.eventId,
+          label: eventPrompt.label,
+          sublabel: eventPrompt.sublabel,
+          distanceM: eventPrompt.distanceM,
+          canExecute: eventPrompt.canExecute,
+          blockedReason: eventPrompt.blockedReason,
+        });
+      }
+
+      candidates.sort((a, b) => a.distanceM - b.distanceM);
+      this.activeInteractable = candidates[0] ?? null;
+    } else {
+      this.activeInteractable = null;
+    }
 
     // Step ballistic projectiles & grenades
     this.ballistics.update(dt, this.bodycamAdapter, (ev) => this.handleBallisticImpact(ev));
@@ -1833,7 +2837,14 @@ export class OpenWorldSessionEngine {
       this.grenadeSystem.update(dt, _camPos);
       const launched = this.grenadeSystem.consumeLastLaunchedThrow();
       if (launched || (wasLive && !this.grenadeSystem.isLeverReleased())) {
-        this.grenadeCount = Math.max(0, this.grenadeCount - 1);
+        if (activeChar?.tacticalInventory) {
+          const invClone = cloneTacticalInventory(activeChar.tacticalInventory);
+          consumeOneGrenadeFromInventory(invClone);
+          characterRoster.updateTacticalInventory(activeChar.slotId, invClone);
+          this.grenadeCount = countGrenadesInInventory(invClone);
+        } else {
+          this.grenadeCount = Math.max(0, this.grenadeCount - 1);
+        }
       }
     }
 
@@ -1889,6 +2900,8 @@ export class OpenWorldSessionEngine {
   private renderDirectTwoPass(): void {
     // Render Battle-mode PiP Scope lens texture before world Pass 1 when magnified optic is equipped
     this.runScopeRenderPass();
+    // Prepare half-res sun/cloud/terrain occlusion & radial scatter godrays prior to Layer 0 pass
+    this.atmosphere.prepareGodrays(this.renderer, this.camera);
 
     const prevAutoClear = this.renderer.autoClear;
     const prevShadowAutoUpdate = this.renderer.shadowMap.autoUpdate;
@@ -1945,7 +2958,11 @@ export class OpenWorldSessionEngine {
 
     this.input.adsMode = this.armedAdsMode;
     this.input.sprint =
-      !pdaBusy && this.shiftHeld && this.input.forward && !this.input.ads;
+      !pdaBusy &&
+      this.sprintSlowRemainingSec <= 0 &&
+      this.shiftHeld &&
+      this.input.forward &&
+      !this.input.ads;
     this.input.holdBreath =
       !pdaBusy && this.shiftHeld && this.input.ads && this.equippedWeaponId !== 'unarmed';
 
@@ -1956,18 +2973,37 @@ export class OpenWorldSessionEngine {
       this.reloadTimer = Math.max(0, this.reloadTimer - dt);
       if (this.reloadTimer <= 0 && this.pendingReloadWeaponId) {
         const wId = this.pendingReloadWeaponId;
+        const spec = this.pendingReloadSpec;
         this.pendingReloadWeaponId = null;
+        this.pendingReloadSpec = null;
         if (wId === this.equippedWeaponId) {
           const prof = resolveWeaponProfile(wId);
-          const curMag = this.magAmmoByWeapon[prof.id] ?? 0;
-          const needed = Math.max(0, prof.magCapacity - curMag);
-          const taken = this.activeSlotId
-            ? characterRoster.consumeArsenalReserve(this.activeSlotId, prof.id, needed)
-            : needed;
-          const nextAmmo = curMag + taken;
-          this.magAmmoByWeapon[prof.id] = nextAmmo;
-          this.weaponRig.setAmmoState(nextAmmo, true);
-          this.audio.playWeaponCue('mag_in', { intensity: 0.72 });
+          if (spec && activeChar?.tacticalInventory) {
+            const invClone = cloneTacticalInventory(activeChar.tacticalInventory);
+            const swapRes = swapMagazineIntoWeapon(
+              invClone,
+              spec.weaponSlotKey,
+              spec.sourceLocator,
+              this.activeExternalLoot?.lootKit ?? null,
+            );
+            if (swapRes.ok) {
+              characterRoster.updateTacticalInventory(activeChar.slotId, invClone);
+              const nextAmmo = getLoadedAmmoCount(invClone[spec.weaponSlotKey]);
+              this.magAmmoByWeapon[prof.id] = nextAmmo;
+              this.weaponRig.setAmmoState(nextAmmo, true);
+              this.audio.playWeaponCue('mag_in', { intensity: 0.75 });
+            }
+          } else {
+            const curMag = this.magAmmoByWeapon[prof.id] ?? 0;
+            const needed = Math.max(0, prof.magCapacity - curMag);
+            const taken = this.activeSlotId
+              ? characterRoster.consumeArsenalReserve(this.activeSlotId, prof.id, needed)
+              : needed;
+            const nextAmmo = curMag + taken;
+            this.magAmmoByWeapon[prof.id] = nextAmmo;
+            this.weaponRig.setAmmoState(nextAmmo, true);
+            this.audio.playWeaponCue('mag_in', { intensity: 0.72 });
+          }
         }
       }
     }
@@ -2026,8 +3062,22 @@ export class OpenWorldSessionEngine {
     const atmo = this.atmosphere.getTelemetry();
     const nearest = getNearestLandmark(this.controller.position.x, this.controller.position.z);
     const bk = activeChar ? getBankruptcyStatus(activeChar) : null;
+    const playerFaction: PmcFactionId = activeChar?.pmcFaction ?? 'pmc_alpha';
 
-    // Populate pre-allocated sector + corpse pings array cleanly
+    // 1. Comms Tower Regional Fog-of-War blackout zones
+    this._pdaBlackoutZones.length = 0;
+    const blackouts = this.sectorManager.getCommsBlackoutZonesForFaction(playerFaction);
+    for (let i = 0; i < blackouts.length; i++) {
+      const bz = blackouts[i];
+      this._pdaBlackoutZones.push({
+        x: bz.x,
+        z: bz.z,
+        radiusM: bz.radiusM,
+        label: bz.label.toUpperCase(),
+      });
+    }
+
+    // 2. Sector, World Event & Corpse pings (obscured inside uncaptured Comms Tower Fog-of-War)
     this._pdaPings.length = 0;
     const sectors = this.sectorManager.getSectorsSnapshot();
     for (let i = 0; i < sectors.length; i++) {
@@ -2044,6 +3094,17 @@ export class OpenWorldSessionEngine {
               : 'danger',
       });
     }
+
+    const activeEvt = this.eventDirector.getActiveEvent();
+    if (activeEvt && !activeEvt.lootClaimed) {
+      this._pdaPings.push({
+        x: activeEvt.x,
+        z: activeEvt.z,
+        label: activeEvt.kind === 'black_box_drop' ? 'BLACK-BOX' : 'WORLD EVT',
+        kind: 'contact',
+      });
+    }
+
     if (activeChar) {
       const shardCorpses = shardStore.getShard(activeChar.shardMode).corpses;
       for (let i = 0; i < Math.min(6, shardCorpses.length); i++) {
@@ -2057,6 +3118,25 @@ export class OpenWorldSessionEngine {
       }
     }
 
+    // 3. Convoy & Barge markers (friendly always visible; hostile visible only when Comms Tower covers region)
+    this._pdaConvoys.length = 0;
+    const convoys = this.convoyDirector.getTelemetrySnapshot();
+    for (let i = 0; i < convoys.length; i++) {
+      const cv = convoys[i];
+      if (cv.state === 'hijacked' || cv.state === 'sabotaged') continue;
+      const friendly = cv.ownerFaction === playerFaction;
+      if (!friendly && !this.sectorManager.isPointCoveredByComms(cv.x, cv.z, playerFaction)) {
+        continue;
+      }
+      this._pdaConvoys.push({
+        x: cv.x,
+        z: cv.z,
+        label: cv.kind === 'supply_barge' ? 'BARGE' : 'CONVOY',
+        friendly,
+        disabled: cv.state === 'disabled_awaiting_action',
+      });
+    }
+
     const t = this._pdaTelemetryScratch;
     t.playerX = this.controller.position.x;
     t.playerZ = this.controller.position.z;
@@ -2066,6 +3146,8 @@ export class OpenWorldSessionEngine {
     t.modeLabel = activeChar ? `PERIMETER · ${activeChar.shardMode}` : 'PERIMETER OPS';
     t.zoneLabel = nearest.landmark.shortLabel.toUpperCase();
     t.pings = this._pdaPings;
+    t.commsBlackoutZones = this._pdaBlackoutZones;
+    t.convoys = this._pdaConvoys;
     t.characterCallsign = activeChar?.callsign;
     t.shardLabel = activeChar?.shardMode;
     t.factionLabel = activeChar ? PMC_FACTIONS[activeChar.pmcFaction].shortName : undefined;
@@ -2138,16 +3220,31 @@ export class OpenWorldSessionEngine {
 
     const shardMode = character?.shardMode ?? 'PvPvE';
     const shard = shardStore.getShard(shardMode);
+    const faction: PmcFactionId = character?.pmcFaction ?? 'pmc_alpha';
     const prof: BodycamWeaponProfile = resolveWeaponProfile(this.equippedWeaponId);
-    const ammoInMag =
-      this.equippedWeaponId === 'unarmed'
-        ? 0
-        : (this.magAmmoByWeapon[prof.id] ?? prof.magCapacity);
+    const ammoInMag = this.getCurrentLoadedCountForWeapon(this.equippedWeaponId);
+    const reserveInfo =
+      character?.tacticalInventory && this.equippedWeaponId !== 'unarmed'
+        ? countCompatibleReserveRounds(character.tacticalInventory, this.equippedWeaponId)
+        : {
+            rigAndBeltRounds: this.getReserveAmmoForWeapon(this.equippedWeaponId),
+            rigAndBeltMags: 0,
+            backpackRounds: 0,
+          };
+    const nextRound =
+      this.equippedWeaponId !== 'unarmed' ? this.getActiveAmmoVariant(this.equippedWeaponId) : null;
 
     return {
       character,
       bankruptcy,
       pointerLocked: this.pointerLocked,
+      activeModal: this.activeModal,
+      externalLoot: this.activeExternalLoot,
+      fobTerminalState:
+        this.activeModal === 'fob_terminal' && character
+          ? this.logisticsEconomy.getFobTerminalSnapshot(character, shardStore)
+          : null,
+      fobTier: shardStore.getFobTier(shardMode, faction),
       navMode: this.navMode,
       renderPipeline: this.renderPipeline,
       lensPreset: this.config.lensPreset,
@@ -2175,9 +3272,13 @@ export class OpenWorldSessionEngine {
         equippedWeaponId: this.equippedWeaponId,
         equippedWeaponName: this.equippedWeaponId === 'unarmed' ? 'Unarmed' : prof.name,
         equippedCaliber: this.equippedWeaponId === 'unarmed' ? '' : prof.caliberLabel,
+        activeRoundLabel: nextRound ? nextRound.shortName : '',
         ammoInMag,
         magCapacity: this.equippedWeaponId === 'unarmed' ? 0 : prof.magCapacity,
-        ammoReserve: this.getReserveAmmoForWeapon(this.equippedWeaponId),
+        ammoReserve: reserveInfo.rigAndBeltRounds,
+        rigQuickMagCount: reserveInfo.rigAndBeltMags,
+        backpackReserveRounds: reserveInfo.backpackRounds,
+        hasChestRig: Boolean(character?.tacticalInventory?.chestRig),
         fireModeLabel:
           this.equippedWeaponId === 'unarmed'
             ? ''
@@ -2193,10 +3294,16 @@ export class OpenWorldSessionEngine {
         damageFlashAlpha: this.damageFlashAlpha,
         hitMarkerAlpha: this.hitMarkerAlpha,
         hitMarkerHeadshot: this.hitMarkerHeadshot,
+        bleedingRemainingSec: Math.round(this.bleedingRemainingSec * 10) / 10,
+        sprintSlowRemainingSec: Math.round(this.sprintSlowRemainingSec * 10) / 10,
       },
       ai: this.aiDirector.getTelemetry(),
+      wildlife: this.wildlifeManager.getTelemetry(),
       sectors: this.sectorManager.getSectorsSnapshot(),
       activeSector: this.sectorManager.getActiveSectorAt(px, pz),
+      commsBlackoutCount: this.sectorManager.getCommsBlackoutZonesForFaction(faction).length,
+      convoys: this.convoyDirector.getTelemetrySnapshot(),
+      worldEvent: this.eventDirector.getTelemetry(),
       territoryCounts: { ...shard.territoryCounts },
       pmcSupplyPools: {
         pmc_alpha: { ...shard.pmcSupplyPools.pmc_alpha },
@@ -2253,6 +3360,10 @@ export class OpenWorldSessionEngine {
     this.postProcess = null;
     this.scopeRenderer.dispose();
     this.aiDirector.dispose();
+    this.convoyDirector.dispose();
+    this.eventDirector.dispose();
+    this.wildlifeManager.dispose();
+    this.ambienceAudio.dispose();
     this.sectorManager.dispose();
     this.grenadeSystem.dispose();
     this.pdaDevice.dispose();

@@ -1,4 +1,24 @@
 import * as THREE from 'three';
+import type { BodycamInteriorSample, BodycamSurfaceMaterial } from '../../../../bodycam-sdk/types';
+import { OpenWorldArchitectureBuilder } from './OpenWorldArchitectureBuilder';
+import {
+  applyAtmosphericHeightFog,
+  type AtmoFogSharedUniforms,
+} from './OpenWorldAtmosphericFogShader';
+import { FoliageAnchorPoint, OpenWorldFoliageBuilder } from './OpenWorldFoliageBuilder';
+import {
+  hasOverheadClearanceAgainstObbs,
+  IndoorVolume,
+  isOnCivilizationClearance,
+  ObbRaycastHit,
+  queryBridgeDeckHeight,
+  raycastAgainstObbs,
+  resolveCapsuleHorizontalAgainstObbs,
+  sampleIndoorVolumeFromList,
+  sampleWalkDeckHeightFromList,
+  SolidObb,
+  WalkDeck,
+} from './OpenWorldCivilizationTopology';
 import {
   CHUNK_SIZE_M,
   chunkCoordToWorldCenter,
@@ -38,6 +58,12 @@ interface StreamedChunkRecord {
   readonly terrainGeo: THREE.BufferGeometry;
   readonly ownedGeometries: THREE.BufferGeometry[];
   readonly instancedMeshes: THREE.InstancedMesh[];
+  readonly solidObbs: SolidObb[];
+  readonly walkDecks: WalkDeck[];
+  readonly indoorVolumes: IndoorVolume[];
+  readonly treeRoosts: FoliageAnchorPoint[];
+  readonly logAnchors: FoliageAnchorPoint[];
+  readonly rockAnchors: FoliageAnchorPoint[];
   readonly collider: ActiveHeightfieldCollider | null;
   readonly instanceCount: number;
 }
@@ -189,7 +215,13 @@ export class OpenWorldChunkStreamer {
   private readonly horizonGroup = new THREE.Group();
 
   private readonly loadedChunks = new Map<string, StreamedChunkRecord>();
+  private readonly activeChunks: StreamedChunkRecord[] = [];
+  private readonly activeTreeRoosts: FoliageAnchorPoint[] = [];
+  private readonly activeLogAnchors: FoliageAnchorPoint[] = [];
+  private readonly activeRockAnchors: FoliageAnchorPoint[] = [];
   private readonly isSoftwareGl: boolean;
+  private readonly archBuilder: OpenWorldArchitectureBuilder;
+  private readonly foliageBuilder: OpenWorldFoliageBuilder;
 
   // Shared reusable materials & base geometries (disposed on streamer teardown)
   private readonly terrainTexture: THREE.CanvasTexture | null;
@@ -213,13 +245,21 @@ export class OpenWorldChunkStreamer {
   // Horizon proxy disposable resources
   private readonly horizonDisposables: Array<{ dispose(): void }> = [];
 
+  private readonly atmoFogUniforms?: AtmoFogSharedUniforms;
   private lastCenterCx = -999;
   private lastCenterCz = -999;
   private disposedChunkCount = 0;
   private activeInstanceCount = 0;
 
-  constructor(scene: THREE.Scene, isSoftwareGl = false) {
+  constructor(
+    scene: THREE.Scene,
+    isSoftwareGl = false,
+    atmoFogUniforms?: AtmoFogSharedUniforms,
+  ) {
     this.isSoftwareGl = isSoftwareGl;
+    this.atmoFogUniforms = atmoFogUniforms;
+    this.archBuilder = new OpenWorldArchitectureBuilder(isSoftwareGl, atmoFogUniforms);
+    this.foliageBuilder = new OpenWorldFoliageBuilder(scene, isSoftwareGl, atmoFogUniforms);
     this.rootGroup.name = 'openworld_streaming_root';
     this.chunksGroup.name = 'openworld_chunk_rings';
     this.horizonGroup.name = 'openworld_horizon_proxy';
@@ -252,6 +292,7 @@ export class OpenWorldChunkStreamer {
 
     this.canopyGeo = buildGroundedConiferCanopyGeo();
     this.canopyMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.88, metalness: 0.0 });
+    this.foliageBuilder.applyWindToConiferMaterial(this.canopyGeo, this.canopyMat);
 
     this.boulderGeo = new THREE.DodecahedronGeometry(1.0, 0);
     this.boulderGeo.translate(0, 0.55, 0);
@@ -268,6 +309,18 @@ export class OpenWorldChunkStreamer {
     this.midBuildingGeo = new THREE.BoxGeometry(10, 6.5, 14);
     this.midBuildingGeo.translate(0, 3.25, 0);
     this.midBuildingMat = new THREE.MeshStandardMaterial({ color: 0x676d74, roughness: 0.84, metalness: 0.14 });
+
+    if (this.atmoFogUniforms) {
+      applyAtmosphericHeightFog(this.activeTerrainMat, this.atmoFogUniforms);
+      applyAtmosphericHeightFog(this.midTerrainMat, this.atmoFogUniforms);
+      applyAtmosphericHeightFog(this.hlodTerrainMat, this.atmoFogUniforms);
+      applyAtmosphericHeightFog(this.trunkMat, this.atmoFogUniforms);
+      applyAtmosphericHeightFog(this.canopyMat, this.atmoFogUniforms);
+      applyAtmosphericHeightFog(this.boulderMat, this.atmoFogUniforms);
+      applyAtmosphericHeightFog(this.scrubMat, this.atmoFogUniforms);
+      applyAtmosphericHeightFog(this.containerMat, this.atmoFogUniforms);
+      applyAtmosphericHeightFog(this.midBuildingMat, this.atmoFogUniforms);
+    }
 
     this.buildHorizonProxyLayer();
     scene.add(this.rootGroup);
@@ -351,6 +404,15 @@ export class OpenWorldChunkStreamer {
       roughness: 0.3,
       metalness: 0.2,
     });
+    if (this.atmoFogUniforms) {
+      applyAtmosphericHeightFog(seaMat, this.atmoFogUniforms);
+      applyAtmosphericHeightFog(resMat, this.atmoFogUniforms);
+      applyAtmosphericHeightFog(concreteMat, this.atmoFogUniforms);
+      applyAtmosphericHeightFog(darkConcreteMat, this.atmoFogUniforms);
+      applyAtmosphericHeightFog(craneOrangeMat, this.atmoFogUniforms);
+      applyAtmosphericHeightFog(steelMat, this.atmoFogUniforms);
+      applyAtmosphericHeightFog(dishWhiteMat, this.atmoFogUniforms);
+    }
     this.horizonDisposables.push(
       concreteMat,
       darkConcreteMat,
@@ -505,6 +567,9 @@ export class OpenWorldChunkStreamer {
 
       this.horizonGroup.add(group);
     }
+
+    // 5. Persistent Steel-Truss River Bridges + Regional Water Towers & Guyed Radio Masts
+    this.archBuilder.populateHorizonCivilization(this.horizonGroup, this.horizonDisposables);
   }
 
   /**
@@ -553,10 +618,20 @@ export class OpenWorldChunkStreamer {
       this.chunksGroup.add(built.group);
     }
 
-    // Recompute active instance totals
+    // Recompute active chunk list, fauna anchors & instance totals (zero-GC iteration in hot path)
+    this.activeChunks.length = 0;
+    this.activeTreeRoosts.length = 0;
+    this.activeLogAnchors.length = 0;
+    this.activeRockAnchors.length = 0;
     let instances = 0;
     for (const rec of this.loadedChunks.values()) {
       instances += rec.instanceCount;
+      if (rec.lod === 'active') {
+        this.activeChunks.push(rec);
+        for (let i = 0; i < rec.treeRoosts.length; i++) this.activeTreeRoosts.push(rec.treeRoosts[i]);
+        for (let i = 0; i < rec.logAnchors.length; i++) this.activeLogAnchors.push(rec.logAnchors[i]);
+        for (let i = 0; i < rec.rockAnchors.length; i++) this.activeRockAnchors.push(rec.rockAnchors[i]);
+      }
     }
     this.activeInstanceCount = instances;
     return true;
@@ -597,12 +672,50 @@ export class OpenWorldChunkStreamer {
 
     const ownedGeometries: THREE.BufferGeometry[] = [terrainGeo];
     const instancedMeshes: THREE.InstancedMesh[] = [];
+    const solidObbs: SolidObb[] = [];
+    const walkDecks: WalkDeck[] = [];
+    const indoorVolumes: IndoorVolume[] = [];
+    const treeRoosts: FoliageAnchorPoint[] = [];
+    let logAnchors: FoliageAnchorPoint[] = [];
+    let rockAnchors: FoliageAnchorPoint[] = [];
     let instanceCount = 0;
 
     if (lod === 'active') {
-      instanceCount = this.populateActiveChunkProps(cx, cz, centerX, centerZ, group, instancedMeshes);
+      const archRes = this.archBuilder.populateActiveChunk(
+        cx,
+        cz,
+        centerX,
+        centerZ,
+        group,
+        ownedGeometries,
+        instancedMeshes,
+        solidObbs,
+        walkDecks,
+        indoorVolumes,
+      );
+      instanceCount += archRes.instanceCount;
+      instanceCount += this.populateActiveChunkProps(cx, cz, centerX, centerZ, group, instancedMeshes, treeRoosts);
+      const foliageRes = this.foliageBuilder.populateActiveChunkFoliage(
+        cx,
+        cz,
+        centerX,
+        centerZ,
+        group,
+        instancedMeshes,
+      );
+      instanceCount += foliageRes.instanceCount;
+      logAnchors = foliageRes.logAnchors;
+      rockAnchors = foliageRes.rockAnchors;
     } else {
-      instanceCount = this.populateMidChunkSilhouettes(cx, cz, centerX, centerZ, group, instancedMeshes);
+      instanceCount = this.archBuilder.populateMidChunk(
+        cx,
+        cz,
+        centerX,
+        centerZ,
+        group,
+        ownedGeometries,
+        instancedMeshes,
+      );
     }
 
     return {
@@ -614,6 +727,12 @@ export class OpenWorldChunkStreamer {
       terrainGeo,
       ownedGeometries,
       instancedMeshes,
+      solidObbs,
+      walkDecks,
+      indoorVolumes,
+      treeRoosts,
+      logAnchors,
+      rockAnchors,
       collider,
       instanceCount,
     };
@@ -626,6 +745,7 @@ export class OpenWorldChunkStreamer {
     centerZ: number,
     group: THREE.Group,
     outMeshes: THREE.InstancedMesh[],
+    outTreeRoosts: FoliageAnchorPoint[],
   ): number {
     const rand = mulberry32(chunkHash(cx, cz, 41));
 
@@ -653,8 +773,8 @@ export class OpenWorldChunkStreamer {
       const wz = centerZ + lz;
       sampleOpenWorldTerrain(wx, wz, _sample);
 
-      if (_sample.isWater || _sample.isRoad || _sample.isQuarryPit || _sample.slope > 0.44) continue;
-      if (isNearLandmark(wx, wz)) continue;
+      if (_sample.isWater || _sample.isRoad || _sample.isSitePad || _sample.isQuarryPit || _sample.slope > 0.44) continue;
+      if (isNearLandmark(wx, wz) || isOnCivilizationClearance(wx, wz, 3.8)) continue;
 
       let spawnChance = 0.0;
       if (_sample.biome === 'temperate_conifer_valley') spawnChance = 0.88;
@@ -671,6 +791,9 @@ export class OpenWorldChunkStreamer {
           yaw: rand() * Math.PI * 2,
           tint: rand(),
         });
+        if (_sample.biome === 'temperate_conifer_valley' && outTreeRoosts.length < 14) {
+          outTreeRoosts.push({ x: wx, y: _sample.height, z: wz });
+        }
       }
     }
 
@@ -682,7 +805,7 @@ export class OpenWorldChunkStreamer {
       const wx = centerX + lx;
       const wz = centerZ + lz;
       sampleOpenWorldTerrain(wx, wz, _sample);
-      if (_sample.isWater || _sample.isRoad || isNearLandmark(wx, wz)) continue;
+      if (_sample.isWater || _sample.isRoad || _sample.isSitePad || isNearLandmark(wx, wz) || isOnCivilizationClearance(wx, wz, 3.5)) continue;
 
       const rockProb =
         _sample.biome === 'alpine_ridge_dam' || _sample.isQuarryPit
@@ -713,7 +836,7 @@ export class OpenWorldChunkStreamer {
       const wx = centerX + lx;
       const wz = centerZ + lz;
       sampleOpenWorldTerrain(wx, wz, _sample);
-      if (_sample.isWater || _sample.isRoad || _sample.slope > 0.5 || isNearLandmark(wx, wz)) continue;
+      if (_sample.isWater || _sample.isRoad || _sample.isSitePad || _sample.slope > 0.5 || isNearLandmark(wx, wz) || isOnCivilizationClearance(wx, wz, 2.2)) continue;
       if (_sample.biome === 'alpine_ridge_dam' && _sample.height > 340) continue;
 
       if (rand() <= 0.65) {
@@ -732,7 +855,7 @@ export class OpenWorldChunkStreamer {
       }
     }
 
-    // 4. Tactical Industrial Shipping Containers / Field Barricades (near Port, Rail Yard, FOBs, Highways)
+    // 4. Tactical Industrial Shipping Containers / Field Barricades (near Port & Quarry, never blocking roads or buildings)
     const containerAttempts = 12;
     for (let i = 0; i < containerAttempts; i++) {
       const lx = (rand() - 0.5) * (CHUNK_SIZE_M - 24);
@@ -740,9 +863,9 @@ export class OpenWorldChunkStreamer {
       const wx = centerX + lx;
       const wz = centerZ + lz;
       sampleOpenWorldTerrain(wx, wz, _sample);
-      if (_sample.isWater || _sample.slope > 0.16) continue;
-      const industrialZone =
-        _sample.biome === 'coastal_port_marsh' || _sample.isQuarryPit || _sample.isRoad;
+      if (_sample.isWater || _sample.isRoad || _sample.isSitePad || _sample.slope > 0.16) continue;
+      if (isOnCivilizationClearance(wx, wz, 4.5)) continue;
+      const industrialZone = _sample.biome === 'coastal_port_marsh' || _sample.isQuarryPit;
       if (!industrialZone || rand() > 0.32) continue;
 
       containerPlacements.push({
@@ -860,62 +983,52 @@ export class OpenWorldChunkStreamer {
   }
 
   /**
-   * Mid-Range Shell (`5 × 5` outer ring): static building exterior silhouettes only;
-   * micro-foliage and interior props are culled to preserve the <= 7.0ms frametime budget.
+   * Synchronizes night-time emissives across streetlights, gas station canopies,
+   * checkpoint floodlights, and aviation beacons (zero dynamic PointLights).
    */
-  private populateMidChunkSilhouettes(
-    cx: number,
-    cz: number,
-    centerX: number,
-    centerZ: number,
-    group: THREE.Group,
-    outMeshes: THREE.InstancedMesh[],
-  ): number {
-    const rand = mulberry32(chunkHash(cx, cz, 97));
-    const placements: Array<{ lx: number; y: number; lz: number; sx: number; sy: number; sz: number; yaw: number }> = [];
+  public setNightFactor(nightFactor: number): void {
+    this.archBuilder.setNightFactor(nightFactor);
+  }
 
-    for (let i = 0; i < 4; i++) {
-      const lx = (rand() - 0.5) * (CHUNK_SIZE_M - 40);
-      const lz = (rand() - 0.5) * (CHUNK_SIZE_M - 40);
-      const wx = centerX + lx;
-      const wz = centerZ + lz;
-      sampleOpenWorldTerrain(wx, wz, _sample);
-      if (_sample.isWater || _sample.slope > 0.24) continue;
-      if (rand() > 0.52) continue;
+  public updateFoliageWindAndGrass(
+    elapsedSec: number,
+    windSpeedMps: number,
+    gust01: number,
+    wetness01: number,
+    playerX: number,
+    playerZ: number,
+  ): void {
+    this.foliageBuilder.update(
+      elapsedSec,
+      windSpeedMps,
+      gust01,
+      wetness01,
+      playerX,
+      playerZ,
+      (x, z) => this.sampleTerrainHeightOnly(x, z),
+    );
+  }
 
-      placements.push({
-        lx,
-        y: _sample.height - 0.5,
-        lz,
-        sx: 0.75 + rand() * 0.85,
-        sy: 0.65 + rand() * 0.9,
-        sz: 0.75 + rand() * 0.85,
-        yaw: rand() * Math.PI,
-      });
-    }
+  public getActiveTreeRoosts(): ReadonlyArray<FoliageAnchorPoint> {
+    return this.activeTreeRoosts;
+  }
 
-    if (placements.length === 0) return 0;
-    const shells = new THREE.InstancedMesh(this.midBuildingGeo, this.midBuildingMat, placements.length);
-    for (let i = 0; i < placements.length; i++) {
-      const p = placements[i];
-      _dummy.position.set(p.lx, p.y, p.lz);
-      _dummy.rotation.set(0, p.yaw, 0);
-      _dummy.scale.set(p.sx, p.sy, p.sz);
-      _dummy.updateMatrix();
-      shells.setMatrixAt(i, _dummy.matrix);
-    }
-    shells.instanceMatrix.needsUpdate = true;
-    shells.computeBoundingSphere();
-    group.add(shells);
-    outMeshes.push(shells);
-    return placements.length;
+  public getActiveLogAnchors(): ReadonlyArray<FoliageAnchorPoint> {
+    return this.activeLogAnchors;
+  }
+
+  public getActiveRockAnchors(): ReadonlyArray<FoliageAnchorPoint> {
+    return this.activeRockAnchors;
+  }
+
+  public getStreetlightEmissiveIntensity(): number {
+    return this.archBuilder.getStreetlightEmissiveIntensity();
   }
 
   /**
-   * Samples physics ground height from the active `3 × 3` chunk's bilinear heightfield collider,
-   * falling back seamlessly to exact `evaluateOpenWorldHeight(x, z)` if outside loaded active chunks.
+   * Samples raw bilinear terrain height (excluding buildings/bridges) from active chunks or exact evaluator.
    */
-  public sampleGroundHeight(worldX: number, worldZ: number): number {
+  public sampleTerrainHeightOnly(worldX: number, worldZ: number): number {
     const cx = worldToChunkCoord(worldX);
     const cz = worldToChunkCoord(worldZ);
     const rec = this.loadedChunks.get(chunkKey(cx, cz));
@@ -940,6 +1053,169 @@ export class OpenWorldChunkStreamer {
     const h0 = h00 + (h10 - h00) * tx;
     const h1 = h01 + (h11 - h01) * tx;
     return h0 + (h1 - h0) * tz;
+  }
+
+  /**
+   * Samples physics ground height from the active `3 × 3` chunk's bilinear heightfield collider,
+   * elevated cleanly onto river bridge decks when standing on a bridge span.
+   */
+  public sampleGroundHeight(worldX: number, worldZ: number): number {
+    const terrainH = this.sampleTerrainHeightOnly(worldX, worldZ);
+    const bridge = queryBridgeDeckHeight(worldX, worldZ);
+    if (bridge.onBridge) {
+      return Math.max(terrainH, bridge.deckY);
+    }
+    return terrainH;
+  }
+
+  /**
+   * Samples walkable ground height including active enterable building floors, gas forecourts,
+   * and steel-truss river bridge decks relative to the operator's current foot height.
+   */
+  public sampleGroundAndDeckHeight(worldX: number, worldZ: number, referenceY: number): number {
+    let bestH = this.sampleGroundHeight(worldX, worldZ);
+    const cx = worldToChunkCoord(worldX);
+    const cz = worldToChunkCoord(worldZ);
+    const rec = this.loadedChunks.get(chunkKey(cx, cz));
+    if (rec && rec.walkDecks.length > 0) {
+      const deck = sampleWalkDeckHeightFromList(rec.walkDecks, worldX, worldZ, referenceY);
+      if (deck.found && deck.topY > bestH) {
+        bestH = deck.topY;
+      }
+    }
+    return bestH;
+  }
+
+  public sampleWalkDeckSurface(
+    worldX: number,
+    worldZ: number,
+    referenceY: number,
+  ): BodycamSurfaceMaterial | null {
+    const cx = worldToChunkCoord(worldX);
+    const cz = worldToChunkCoord(worldZ);
+    const rec = this.loadedChunks.get(chunkKey(cx, cz));
+    if (rec && rec.walkDecks.length > 0) {
+      const deck = sampleWalkDeckHeightFromList(rec.walkDecks, worldX, worldZ, referenceY);
+      if (deck.found) return deck.surface;
+    }
+    const bridge = queryBridgeDeckHeight(worldX, worldZ);
+    if (bridge.onBridge) return 'asphalt';
+    return null;
+  }
+
+  /**
+   * Resolves horizontal player capsule collision against all solid OBB walls, vehicles,
+   * fuel pumps, shelving, guardrails, and bridge parapets in the current active chunk.
+   */
+  public resolveCapsuleHorizontal(
+    posX: number,
+    footY: number,
+    posZ: number,
+    radius: number,
+    height: number,
+    maxStepUpM: number,
+    outPos: { x: number; z: number; hitWall: boolean; wallNormalX: number; wallNormalZ: number },
+  ): void {
+    outPos.x = posX;
+    outPos.z = posZ;
+    outPos.hitWall = false;
+    outPos.wallNormalX = 0;
+    outPos.wallNormalZ = 0;
+
+    const cx = worldToChunkCoord(posX);
+    const cz = worldToChunkCoord(posZ);
+    const rec = this.loadedChunks.get(chunkKey(cx, cz));
+    if (!rec || rec.solidObbs.length === 0) return;
+
+    resolveCapsuleHorizontalAgainstObbs(
+      rec.solidObbs,
+      posX,
+      footY,
+      posZ,
+      radius,
+      height,
+      maxStepUpM,
+      outPos,
+    );
+  }
+
+  public hasOverheadClearance(
+    x: number,
+    baseY: number,
+    z: number,
+    radius: number,
+    crouchHeight: number,
+    standHeight: number,
+  ): boolean {
+    const cx = worldToChunkCoord(x);
+    const cz = worldToChunkCoord(z);
+    const rec = this.loadedChunks.get(chunkKey(cx, cz));
+    if (!rec || rec.solidObbs.length === 0) return true;
+    return hasOverheadClearanceAgainstObbs(
+      rec.solidObbs,
+      x,
+      baseY,
+      z,
+      radius,
+      crouchHeight,
+      standHeight,
+    );
+  }
+
+  /**
+   * Zero-GC raycast against all active `3 × 3` chunk solid structures (walls, roofs, vehicles,
+   * barriers, fuel dispensers, bridge guardrails). Leaves open doorways & windows clear!
+   */
+  public raycastActiveStructures(
+    ox: number,
+    oy: number,
+    oz: number,
+    dx: number,
+    dy: number,
+    dz: number,
+    near: number,
+    outHit: ObbRaycastHit,
+  ): boolean {
+    let anyHit = false;
+    for (let i = 0; i < this.activeChunks.length; i++) {
+      const obbs = this.activeChunks[i].solidObbs;
+      if (obbs.length === 0) continue;
+      if (raycastAgainstObbs(obbs, ox, oy, oz, dx, dy, dz, near, outHit)) {
+        anyHit = true;
+      }
+    }
+    return anyHit;
+  }
+
+  public sampleIndoorAt(
+    x: number,
+    y: number,
+    z: number,
+    outSample: BodycamInteriorSample,
+  ): void {
+    const cx = worldToChunkCoord(x);
+    const cz = worldToChunkCoord(z);
+    const rec = this.loadedChunks.get(chunkKey(cx, cz));
+    if (rec && rec.indoorVolumes.length > 0) {
+      const res = sampleIndoorVolumeFromList(rec.indoorVolumes, x, y, z);
+      outSample.isIndoor = res.isIndoor;
+      outSample.material = res.material;
+      return;
+    }
+    outSample.isIndoor = false;
+    outSample.material = 'outdoor';
+  }
+
+  public getActiveStructureStats(): { obbCount: number; deckCount: number; indoorVolumeCount: number } {
+    let obbCount = 0;
+    let deckCount = 0;
+    let indoorVolumeCount = 0;
+    for (let i = 0; i < this.activeChunks.length; i++) {
+      obbCount += this.activeChunks[i].solidObbs.length;
+      deckCount += this.activeChunks[i].walkDecks.length;
+      indoorVolumeCount += this.activeChunks[i].indoorVolumes.length;
+    }
+    return { obbCount, deckCount, indoorVolumeCount };
   }
 
   public getStats(): StreamerStats {
@@ -987,11 +1263,15 @@ export class OpenWorldChunkStreamer {
       this.disposeChunkRecord(rec);
     }
     this.loadedChunks.clear();
+    this.activeChunks.length = 0;
 
     for (const d of this.horizonDisposables) {
       d.dispose();
     }
     this.horizonDisposables.length = 0;
+
+    this.archBuilder.dispose();
+    this.foliageBuilder.dispose();
 
     this.terrainTexture?.dispose();
     this.activeTerrainMat.dispose();

@@ -487,6 +487,14 @@ export class OpenWorldAiDirector {
   private readonly sharedGeos: THREE.BufferGeometry[] = [];
   private readonly sharedMats: THREE.Material[] = [];
   private readonly sampleGroundHeight: (x: number, z: number) => number;
+  private readonly isLineOfSightBlocked?: (
+    ax: number,
+    ay: number,
+    az: number,
+    bx: number,
+    by: number,
+    bz: number,
+  ) => boolean;
 
   private activeNearbyCount = 0;
   private hostileEngagingCount = 0;
@@ -497,8 +505,17 @@ export class OpenWorldAiDirector {
     sampleGroundHeight: (x: number, z: number) => number,
     playerFaction: PmcFactionId,
     maxAnisotropy = 4,
+    isLineOfSightBlocked?: (
+      ax: number,
+      ay: number,
+      az: number,
+      bx: number,
+      by: number,
+      bz: number,
+    ) => boolean,
   ) {
     this.sampleGroundHeight = sampleGroundHeight;
+    this.isLineOfSightBlocked = isLineOfSightBlocked;
     this.rootGroup.name = 'openworld_ai_squads';
     scene.add(this.rootGroup);
 
@@ -1031,11 +1048,16 @@ export class OpenWorldAiDirector {
       }
 
       const relation = this.getRelationForAgent(a, character);
-      const canSeePlayer =
+      const inVisionRange =
         playerAlive &&
         playerIsFoot &&
         relation === 'hostile' &&
         distHoriz <= (a.alerted ? visionRangeM * 1.25 : visionRangeM);
+      const losBlocked =
+        inVisionRange && this.isLineOfSightBlocked
+          ? this.isLineOfSightBlocked(a.x, a.y + 1.48, a.z, playerX, playerY - 0.1, playerZ)
+          : false;
+      const canSeePlayer = inVisionRange && !losBlocked;
 
       if (canSeePlayer) {
         a.alerted = true;
@@ -1111,9 +1133,9 @@ export class OpenWorldAiDirector {
           }
         }
 
-        // Fire tactical bursts with real muzzle flash, recoil kick & reload cycle
+        // Fire tactical bursts with real muzzle flash, recoil kick & reload cycle (only with clear LOS)
         a.fireCooldown -= dt;
-        if (!a.reloading && a.fireCooldown <= 0 && distHoriz <= visionRangeM * 1.15) {
+        if (!a.reloading && !losBlocked && a.fireCooldown <= 0 && distHoriz <= visionRangeM * 1.15) {
           a.magAmmo = Math.max(0, a.magAmmo - 1);
           a.fireCooldown = 0.55 + ((i * 19 + Math.floor(a.walkCycle * 3)) % 7) * 0.13;
           a.rig.muzzleFlash.visible = true;

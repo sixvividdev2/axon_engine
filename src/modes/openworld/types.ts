@@ -1,5 +1,9 @@
 import type { WeaponAttachments } from '../../../data/attachments';
 import type { OperatorGearConfig, OperatorId } from '../../../bodycam-sdk/operator/OperatorTypes';
+import type {
+  CorpseTacticalLootSnapshot,
+  OperatorTacticalInventory,
+} from './inventory/TetrisInventoryTypes';
 
 export type CharacterSlotId = 'slot_0' | 'slot_1' | 'slot_2';
 
@@ -54,7 +58,189 @@ export type DiscreteTransitionType =
   | 'sector_flip'
   | 'stash_update'
   | 'arsenal_update'
-  | 'reputation_update';
+  | 'reputation_update'
+  | 'fob_upgrade'
+  | 'convoy_escort'
+  | 'convoy_hijack'
+  | 'convoy_sabotage'
+  | 'world_event_resolved'
+  | 'inventory_sync';
+
+export type FobTier = 1 | 2 | 3;
+
+export type SectorAlertState = 'calm' | 'alerted' | 'contested' | 'captured';
+
+export type SupplyStockTier = 'high' | 'strained' | 'starved';
+
+export type SupplyResourceKey = keyof FactionSupplyPool;
+
+export type ContractArchetype = 'recon' | 'hvt' | 'sabotage' | 'supply';
+
+export type DynamicWorldEventKind =
+  | 'black_box_drop'
+  | 'smuggler_boat'
+  | 'convoy_ambush'
+  | 'sector_counter_assault';
+
+export interface FobUpgradeSpec {
+  readonly tier: FobTier;
+  readonly name: string;
+  readonly cashCostUsd: number;
+  readonly minAvgSupplyPct: number;
+  readonly unlocksSummary: string;
+  readonly physicalUpgrades: readonly string[];
+  readonly upgradesSecureContainerTo3x3?: boolean;
+}
+
+export const FOB_UPGRADE_SPECS: Readonly<Record<FobTier, FobUpgradeSpec>> = {
+  1: {
+    tier: 1,
+    name: 'Tier 1 — Forward Staging Outpost',
+    cashCostUsd: 0,
+    minAvgSupplyPct: 0,
+    unlocksSummary: 'Basic Medbay, Quartermaster Terminal, Starter Rigs & 2x2 Secure Container.',
+    physicalUpgrades: ['Command Console', 'Field Medbay Cot'],
+  },
+  2: {
+    tier: 2,
+    name: 'Tier 2 — Fortified Logistics Hub',
+    cashCostUsd: 12000,
+    minAvgSupplyPct: 40,
+    unlocksSummary: 'Unlocks Smersh Rigs, 35L Rucksacks, AP Ammo Boxes, Surgical Bay & Optics Workbench.',
+    physicalUpgrades: ['Optics & Munitions Workbench', 'Reinforced Surgical Bay Shelter'],
+  },
+  3: {
+    tier: 3,
+    name: 'Tier 3 — Hardened Perimeter Stronghold',
+    cashCostUsd: 28000,
+    minAvgSupplyPct: 65,
+    unlocksSummary: 'Unlocks AVS Heavy Rigs, 55L Logistics Packs, Tungsten AP Rounds, Turret Towers & 3x3 Secure Container.',
+    physicalUpgrades: ['Reinforced Helipad Deck', 'Twin Perimeter Watch Turrets', 'Armor Repair Bay'],
+    upgradesSecureContainerTo3x3: true,
+  },
+} as const;
+
+export interface RotatingContractRecord {
+  readonly instanceId: string;
+  readonly templateId: string;
+  readonly slotIndex: 0 | 1 | 2;
+  readonly title: string;
+  readonly archetype: ContractArchetype;
+  readonly subFactionId: SubFactionId;
+  readonly targetSectorId: string;
+  readonly targetSectorLabel: string;
+  readonly summary: string;
+  readonly cashRewardUsd: number;
+  readonly standingGain: number;
+  readonly rivalPenalty: number;
+  readonly supplyBonus: Readonly<Partial<FactionSupplyPool>>;
+  accepted: boolean;
+  progress: number;
+  targetCount: number;
+  completed: boolean;
+}
+
+export interface RotatingContractTemplate {
+  readonly templateId: string;
+  readonly title: string;
+  readonly archetype: ContractArchetype;
+  readonly subFactionId: SubFactionId;
+  readonly targetSectorId: string;
+  readonly targetSectorLabel: string;
+  readonly summary: string;
+  readonly cashRewardUsd: number;
+  readonly standingGain: number;
+  readonly rivalPenalty: number;
+  readonly targetCount: number;
+  readonly supplyBonus: Readonly<Partial<FactionSupplyPool>>;
+}
+
+export const ROTATING_CONTRACT_TEMPLATES: readonly RotatingContractTemplate[] = [
+  {
+    templateId: 'rc_syndicate_recon_marsh',
+    title: 'Marsh Comms Sweep',
+    archetype: 'recon',
+    subFactionId: 'dockworkers_syndicate',
+    targetSectorId: 'comms_south_marsh',
+    targetSectorLabel: 'South Marsh Relay',
+    summary: 'Inspect the South Marsh Relay perimeter and clear hostile spotters.',
+    cashRewardUsd: 2600,
+    standingGain: 14,
+    rivalPenalty: -7,
+    targetCount: 1,
+    supplyBonus: { intel: 8, fuelParts: 6 },
+  },
+  {
+    templateId: 'rc_syndicate_supply_port',
+    title: 'Drydock Fuel Manifest',
+    archetype: 'supply',
+    subFactionId: 'dockworkers_syndicate',
+    targetSectorId: 'landmark_port_terminal',
+    targetSectorLabel: 'Coastal Port',
+    summary: 'Secure Coastal Port fuel reserves or intercept a hostile supply barge.',
+    cashRewardUsd: 3100,
+    standingGain: 16,
+    rivalPenalty: -8,
+    targetCount: 1,
+    supplyBonus: { fuelParts: 12, ammo: 5 },
+  },
+  {
+    templateId: 'rc_militia_hvt_valley',
+    title: 'Valley Munitions HVT',
+    archetype: 'hvt',
+    subFactionId: 'highland_militia',
+    targetSectorId: 'depot_valley_munitions',
+    targetSectorLabel: 'Valley Munitions',
+    summary: 'Eliminate hostile guards defending the Valley Munitions Depot.',
+    cashRewardUsd: 3400,
+    standingGain: 16,
+    rivalPenalty: -8,
+    targetCount: 2,
+    supplyBonus: { ammo: 12 },
+  },
+  {
+    templateId: 'rc_militia_sabotage_pine',
+    title: 'Pine Ridge Jammer Sabotage',
+    archetype: 'sabotage',
+    subFactionId: 'highland_militia',
+    targetSectorId: 'comms_pine_ridge',
+    targetSectorLabel: 'Pine Ridge Comms',
+    summary: 'Disrupt enemy signals at Pine Ridge Comms Tower or sabotage a hostile convoy.',
+    cashRewardUsd: 3800,
+    standingGain: 18,
+    rivalPenalty: -9,
+    targetCount: 1,
+    supplyBonus: { intel: 10, ammo: 6 },
+  },
+  {
+    templateId: 'rc_remnant_recon_alpine',
+    title: 'Alpine Signals Verification',
+    archetype: 'recon',
+    subFactionId: 'alpine_remnant',
+    targetSectorId: 'depot_alpine_signals',
+    targetSectorLabel: 'Alpine Signals',
+    summary: 'Verify encrypted telemetry arrays at the Alpine Signals Archive.',
+    cashRewardUsd: 4200,
+    standingGain: 18,
+    rivalPenalty: -9,
+    targetCount: 1,
+    supplyBonus: { intel: 14 },
+  },
+  {
+    templateId: 'rc_remnant_hvt_steppe',
+    title: 'Steppe Medbay Purge',
+    archetype: 'hvt',
+    subFactionId: 'alpine_remnant',
+    targetSectorId: 'depot_steppe_medbay',
+    targetSectorLabel: 'Steppe Med Depot',
+    summary: 'Neutralize hostile raiders around the Steppe Field Hospital Depot.',
+    cashRewardUsd: 4500,
+    standingGain: 20,
+    rivalPenalty: -10,
+    targetCount: 2,
+    supplyBonus: { medical: 14, intel: 6 },
+  },
+] as const;
 
 export type OpenWorldBiomeId =
   | 'coastal_port_marsh'
@@ -564,6 +750,10 @@ export interface OpenWorldCharacter {
   lastHospitalId: string;
   deathsCount: number;
   exfilsCount: number;
+  /** Phase 5 spatial Tetris Grid inventory, Chest Rig/Belt/Backpack gear & mixed LIFO magazines */
+  tacticalInventory?: OperatorTacticalInventory;
+  /** Phase 5 rotating 3-Slot Sub-Faction Contract Board */
+  contractBoard?: RotatingContractRecord[];
 }
 
 export interface CreateCharacterInput {
@@ -596,6 +786,8 @@ export interface DroppedCorpseEntity {
   droppedArmorName: string | null;
   droppedRigName: string | null;
   droppedItems: InventoryItemRecord[];
+  /** Full-drop Phase 5 tactical kit (weapons, chest rig, removable backpack w/ nested items, belt) */
+  droppedTacticalKit?: CorpseTacticalLootSnapshot;
   lootableByOtherPlayers: boolean;
   createdAtIso: string;
 }
@@ -613,6 +805,7 @@ export interface SectorControlRecord {
   sectorId: string;
   owner: SectorControlOwner;
   captureProgress: number; // 0..100 for current owner stability
+  alertState?: SectorAlertState;
   lastFlippedAtIso?: string;
 }
 
@@ -620,6 +813,9 @@ export interface ShardWorldState {
   mode: ShardMode;
   revision: number;
   pmcSupplyPools: Record<PmcFactionId, FactionSupplyPool>;
+  fobTiers: Record<PmcFactionId, FobTier>;
+  /** Extra restock delay (seconds) applied when rival convoys/barges are sabotaged */
+  restockPenaltySec: Record<PmcFactionId, number>;
   territoryCounts: {
     pmc_alpha: number;
     pmc_bravo: number;

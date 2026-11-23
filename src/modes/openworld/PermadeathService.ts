@@ -1,4 +1,5 @@
 import { CharacterRoster } from './CharacterRoster';
+import { buildCorpseLootSnapshotFromInventory } from './inventory/TetrisInventoryCore';
 import { ShardStore } from './ShardStore';
 import {
   CharacterSlotId,
@@ -198,6 +199,13 @@ export function processCharacterDeath(
 
   const isBankrupt = character.cash < requiredFee;
 
+  const droppedTacticalKit = character.tacticalInventory
+    ? buildCorpseLootSnapshotFromInventory(
+        character.tacticalInventory,
+        character.equippedKit.armorName,
+      )
+    : undefined;
+
   // 1. Spawn persistent full-drop corpse entity on that character's shard
   const droppedCorpse = shards.addDroppedCorpse(
     character.shardMode,
@@ -214,6 +222,7 @@ export function processCharacterDeath(
       droppedArmorName: character.equippedKit.armorName,
       droppedRigName: character.equippedKit.rigName,
       droppedItems,
+      droppedTacticalKit,
       createdAtIso: nowIso,
     },
     isBankrupt ? 'permadeath_wipe' : 'death',

@@ -29,6 +29,21 @@ export interface PdaPingMarker {
   ttlSec?: number;
 }
 
+export interface PdaCommsBlackoutZone {
+  x: number;
+  z: number;
+  radiusM: number;
+  label: string;
+}
+
+export interface PdaConvoyMarker {
+  x: number;
+  z: number;
+  label: string;
+  friendly: boolean;
+  disabled?: boolean;
+}
+
 export interface PdaHudTelemetry {
   playerX: number;
   playerZ: number;
@@ -41,6 +56,8 @@ export interface PdaHudTelemetry {
   zoneLabel?: string;
   allies?: readonly PdaAllyMarker[];
   pings?: readonly PdaPingMarker[];
+  commsBlackoutZones?: readonly PdaCommsBlackoutZone[];
+  convoys?: readonly PdaConvoyMarker[];
   characterCallsign?: string;
   shardLabel?: string;
   factionLabel?: string;
@@ -1395,6 +1412,23 @@ export class TacticalPdaDevice {
       }
     }
 
+    // Live Supply Convoys & Barges (only visible when not masked by Comms Fog-of-War)
+    if (this.telemetry.convoys) {
+      for (const cv of this.telemetry.convoys) {
+        const uv = this.worldToMapUV(cv.x, cv.z);
+        const pt = uvToScreen(uv.u, uv.v);
+        const col = cv.disabled ? '#f59e0b' : cv.friendly ? '#38bdf8' : '#f43f5e';
+        ctx.fillStyle = col;
+        ctx.strokeStyle = '#0f172a';
+        ctx.lineWidth = 2;
+        ctx.fillRect(pt.sx - 6, pt.sy - 4, 12, 8);
+        ctx.strokeRect(pt.sx - 6, pt.sy - 4, 12, 8);
+        ctx.font = 'bold 11px monospace';
+        ctx.textAlign = 'left';
+        ctx.fillText(cv.label.slice(0, 16).toUpperCase(), pt.sx + 9, pt.sy + 4);
+      }
+    }
+
     // Active Tactical Pings
     if (this.telemetry.pings) {
       for (const ping of this.telemetry.pings) {
@@ -1440,6 +1474,52 @@ export class TacticalPdaDevice {
         ctx.font = 'bold 12px monospace';
         ctx.textAlign = 'center';
         ctx.fillText(ally.name.slice(0, 10).toUpperCase(), pt.sx, pt.sy - 11);
+      }
+    }
+
+    // Phase 4 Regional Comms Tower Fog-of-War Static Overlays
+    if (this.telemetry.commsBlackoutZones && this.telemetry.commsBlackoutZones.length > 0) {
+      const worldSpanX = Math.max(1, this.mapAspectBounds.maxX - this.mapAspectBounds.minX);
+      for (const zone of this.telemetry.commsBlackoutZones) {
+        const uv = this.worldToMapUV(zone.x, zone.z);
+        const pt = uvToScreen(uv.u, uv.v);
+        const radPx = (zone.radiusM / worldSpanX) * drawSize;
+        ctx.save();
+        ctx.beginPath();
+        ctx.arc(pt.sx, pt.sy, radPx, 0, Math.PI * 2);
+        ctx.clip();
+
+        ctx.fillStyle = 'rgba(8, 12, 16, 0.72)';
+        ctx.fillRect(pt.sx - radPx, pt.sy - radPx, radPx * 2, radPx * 2);
+
+        // Animated horizontal RF static scanlines
+        ctx.strokeStyle = 'rgba(148, 163, 184, 0.22)';
+        ctx.lineWidth = 1.5;
+        const scanOffset = Math.floor(elapsed * 42) % 10;
+        ctx.beginPath();
+        for (let sy = pt.sy - radPx + scanOffset; sy < pt.sy + radPx; sy += 10) {
+          ctx.moveTo(pt.sx - radPx, sy);
+          ctx.lineTo(pt.sx + radPx, sy);
+        }
+        ctx.stroke();
+        ctx.restore();
+
+        ctx.strokeStyle = 'rgba(248, 113, 113, 0.75)';
+        ctx.lineWidth = 2;
+        ctx.setLineDash([8, 6]);
+        ctx.beginPath();
+        ctx.arc(pt.sx, pt.sy, radPx, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        ctx.fillStyle = '#fca5a5';
+        ctx.font = 'bold 13px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText(`NO COMMS · ${zone.label.toUpperCase()}`, pt.sx, pt.sy - 6);
+        ctx.fillStyle = '#94a3b8';
+        ctx.font = '11px monospace';
+        ctx.fillText('CAPTURE TOWER TO RESTORE GPS', pt.sx, pt.sy + 12);
+        ctx.textAlign = 'left';
       }
     }
 

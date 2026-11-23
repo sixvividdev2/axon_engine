@@ -2870,6 +2870,30 @@ export class BodycamAudio implements IBodycamAudioSource {
     };
   }
 
+  /**
+   * Exposes the active Web Audio context and chest-mic output buses so open-world
+   * environmental ambience and spatial wildlife audio share the same HRTF listener,
+   * interior muffling state, and chest-mic saturation/compressor chain.
+   */
+  public getExternalAudioBus(): {
+    ctx: AudioContext;
+    dryBus: GainNode;
+    wetBus: GainNode | null;
+    interiorWetBus: GainNode | null;
+    isIndoor: boolean;
+    listenerPos: Readonly<THREE.Vector3>;
+  } | null {
+    if (!this.ctx || !this.dryBus) return null;
+    return {
+      ctx: this.ctx,
+      dryBus: this.dryBus,
+      wetBus: this.wetBus,
+      interiorWetBus: this.interiorWetBus,
+      isIndoor: this.currentIndoor,
+      listenerPos: this.listenerPos,
+    };
+  }
+
   public dispose(): void {
     try {
       this.windSource?.stop();

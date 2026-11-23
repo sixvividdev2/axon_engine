@@ -305,4 +305,44 @@ describe('Phase 2 + Edge Cases: Per-Character Unlocks, Permadeath Boundary & 4km
 
     atmo.dispose();
   });
+
+  it('smoothly crossfades weather states, auto-cycles weather, and updates height-fog + sun-inscatter uniforms cleanly', () => {
+    const scene = new THREE.Scene();
+    const atmo = new OpenWorldAtmosphere(scene, true);
+
+    atmo.setTimeOfDay(6.2); // Golden-hour dawn
+    atmo.setWeather('clear');
+    atmo.update(0.016, 0, 50, 0);
+    const clearMist = atmo.fogUniforms.uAtmoFogParams.value.y;
+    const clearClouds = atmo.getTelemetry().cloudCoveragePct;
+    const dawnInscatter = atmo.fogUniforms.uAtmoScatterParams.value.x;
+    expect(dawnInscatter).toBeGreaterThan(0.35);
+
+    // Smooth crossfade toward coastal_fog interpolates monotonically over frames
+    atmo.transitionToWeather('coastal_fog', 4.0);
+    atmo.update(0.1, 0, 50, 0);
+    atmo.update(0.1, 0, 50, 0);
+    const midMist = atmo.fogUniforms.uAtmoFogParams.value.y;
+    const midClouds = atmo.getTelemetry().cloudCoveragePct;
+    expect(midMist).toBeGreaterThan(clearMist);
+    expect(midClouds).toBeGreaterThan(clearClouds);
+
+    // Auto-cycle toggle reflects in telemetry & cycles weather after timer elapses
+    atmo.setAutoWeatherCycle(true);
+    expect(atmo.getTelemetry().autoWeatherCycle).toBe(true);
+    atmo.setTimeScale(10);
+    for (let i = 0; i < 60; i++) {
+      atmo.update(0.1, 0, 50, 0);
+    }
+    atmo.setAutoWeatherCycle(false);
+    expect(atmo.getTelemetry().autoWeatherCycle).toBe(false);
+
+    // Chaining height fog onto OpenWorldChunkStreamer materials works cleanly in headless runtime
+    const streamer = new OpenWorldChunkStreamer(scene, true, atmo.fogUniforms);
+    streamer.update(0, 0);
+    expect(streamer.getStats().totalLoadedChunks).toBeGreaterThan(0);
+
+    streamer.dispose();
+    atmo.dispose();
+  });
 });

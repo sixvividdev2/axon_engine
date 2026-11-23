@@ -9,6 +9,12 @@ import { resolveBaseCaliberId } from '../../../data/calibers';
 import { normalizeLoadoutWeaponId } from '../../../data/loadoutStore';
 import { getDefaultReserveForCaliber } from '../../../hideout/HideoutStateStore';
 import {
+  buildStarterTacticalInventory,
+  cloneTacticalInventory,
+  resizeSecureContainer,
+} from './inventory/TetrisInventoryCore';
+import type { OperatorTacticalInventory } from './inventory/TetrisInventoryTypes';
+import {
   ARMOR_PLATE_MAP,
   CHARACTER_SLOT_IDS,
   CharacterArsenalState,
@@ -27,9 +33,13 @@ import {
   QUARTERMASTER_ATTACHMENT_OFFERS,
   QUARTERMASTER_FIREARM_OFFERS,
   resolveDefaultStorage,
+  ROTATING_CONTRACT_TEMPLATES,
+  RotatingContractRecord,
+  SecureContainerTier,
   ShardMode,
   STANDING_MAX,
   STANDING_MIN,
+  SUB_FACTION_MAP,
   SubFactionId,
   TRADER_MAP,
   TraderId,
@@ -341,6 +351,34 @@ function buildStarterArsenal(faction: PmcFactionId): CharacterArsenalState {
   };
 }
 
+function buildInitialContractBoard(): RotatingContractRecord[] {
+  // Always populate 3 distinct slots (one per sub-faction initially)
+  const picks = [
+    ROTATING_CONTRACT_TEMPLATES[0],
+    ROTATING_CONTRACT_TEMPLATES[2],
+    ROTATING_CONTRACT_TEMPLATES[4],
+  ];
+  return picks.map((tpl, idx) => ({
+    instanceId: makeItemId('rc'),
+    templateId: tpl.templateId,
+    slotIndex: idx as 0 | 1 | 2,
+    title: tpl.title,
+    archetype: tpl.archetype,
+    subFactionId: tpl.subFactionId,
+    targetSectorId: tpl.targetSectorId,
+    targetSectorLabel: tpl.targetSectorLabel,
+    summary: tpl.summary,
+    cashRewardUsd: tpl.cashRewardUsd,
+    standingGain: tpl.standingGain,
+    rivalPenalty: tpl.rivalPenalty,
+    supplyBonus: { ...tpl.supplyBonus },
+    accepted: idx === 0, // First slot pre-accepted so operators have an immediate field objective
+    progress: 0,
+    targetCount: tpl.targetCount,
+    completed: false,
+  }));
+}
+
 function cloneCharacter(c: OpenWorldCharacter): OpenWorldCharacter {
   return {
     ...c,
@@ -375,6 +413,12 @@ function cloneCharacter(c: OpenWorldCharacter): OpenWorldCharacter {
     ownedVehicleKeys: c.ownedVehicleKeys.map((v) => ({ ...v })),
     subFactionStanding: { ...c.subFactionStanding },
     operatorGear: { ...c.operatorGear },
+    tacticalInventory: c.tacticalInventory
+      ? cloneTacticalInventory(c.tacticalInventory)
+      : undefined,
+    contractBoard: c.contractBoard
+      ? c.contractBoard.map((r) => ({ ...r, supplyBonus: { ...r.supplyBonus } }))
+      : undefined,
   };
 }
 
@@ -550,6 +594,19 @@ function sanitizeLoadedCharacter(
       typeof obj.exfilsCount === 'number' && Number.isFinite(obj.exfilsCount)
         ? Math.max(0, Math.floor(obj.exfilsCount))
         : 0,
+    tacticalInventory: obj.tacticalInventory
+      ? cloneTacticalInventory(obj.tacticalInventory)
+      : buildStarterTacticalInventory(
+          pmcFaction,
+          obj.equippedKit?.primaryWeaponId ?? equippedWeaponId,
+          obj.equippedKit?.secondaryWeaponId ?? null,
+          obj.equippedKit?.armorPlateId ?? factionSpec.starterArmorPlateId,
+          obj.secureContainerTier === '3x3' ? '3x3' : '2x2',
+        ),
+    contractBoard:
+      Array.isArray(obj.contractBoard) && obj.contractBoard.length === 3
+        ? obj.contractBoard.map((r) => ({ ...r, supplyBonus: { ...r.supplyBonus } }))
+        : buildInitialContractBoard(),
   };
 }
 
@@ -745,6 +802,14 @@ export class CharacterRoster {
       lastHospitalId: factionSpec.homeHospitalId,
       deathsCount: 0,
       exfilsCount: 0,
+      tacticalInventory: buildStarterTacticalInventory(
+        pmcFaction,
+        factionSpec.starterEquippedWeaponId,
+        secondaryStarter,
+        factionSpec.starterArmorPlateId,
+        '2x2',
+      ),
+      contractBoard: buildInitialContractBoard(),
     };
 
     this.state = {
@@ -1440,7 +1505,197 @@ export class CharacterRoster {
         rigName: null,
         backpackItems: [],
       };
+
+      // Phase 5 Full-Drop Respawn: drop equipped weapons, chest rig, belt, and removable backpack
+      // while strictly retaining ONLY the Secure Container contents!
+      const retainedSecure = c.tacticalInventory
+        ? cloneTacticalInventory(c.tacticalInventory).secureContainer
+        : buildStarterTacticalInventory(c.pmcFaction, null, null, null, c.secureContainerTier)
+            .secureContainer;
+      c.tacticalInventory = {
+        primary: {
+          weaponId: nextEquipped !== 'unarmed' ? nextEquipped : null,
+          chamberedRound: null,
+          loadedMag: null,
+        },
+        secondary: {
+          weaponId: null,
+          chamberedRound: null,
+          loadedMag: null,
+        },
+        armorPlateId: null,
+        beltSlots: [null, null, null, null],
+        chestRig: null,
+        backpack: null,
+        secureContainer: retainedSecure,
+      };
     });
+  }
+
+  /**
+   * Discrete state transition write: persists an updated Phase 5 Tetris Tactical Inventory.
+   */
+  public updateTacticalInventory(
+    slotId: CharacterSlotId,
+    nextInv: OperatorTacticalInventory,
+  ): OpenWorldCharacter | null {
+    return this.mutateCharacter(slotId, (c) => {
+      c.tacticalInventory = cloneTacticalInventory(nextInv);
+      c.equippedKit.primaryWeaponId = nextInv.primary.weaponId;
+      c.equippedKit.secondaryWeaponId = nextInv.secondary.weaponId;
+      c.equippedKit.armorPlateId = nextInv.armorPlateId;
+      c.equippedKit.rigName = nextInv.chestRig?.name ?? null;
+    });
+  }
+
+  /**
+   * Upgrades the character's Secure Container tier (e.g. 2x2 -> 3x3 at FOB Tier 3).
+   */
+  public upgradeSecureContainerTier(
+    slotId: CharacterSlotId,
+    tier: SecureContainerTier,
+  ): OpenWorldCharacter | null {
+    return this.mutateCharacter(slotId, (c) => {
+      c.secureContainerTier = tier;
+      if (c.tacticalInventory) {
+        resizeSecureContainer(c.tacticalInventory, tier);
+      }
+    });
+  }
+
+  /**
+   * Accepts a contract slot on the 3-Slot Sub-Faction Contract Board.
+   */
+  public acceptRotatingContract(
+    slotId: CharacterSlotId,
+    contractInstanceId: string,
+  ): OpenWorldCharacter | null {
+    return this.mutateCharacter(slotId, (c) => {
+      if (!c.contractBoard || c.contractBoard.length !== 3) {
+        c.contractBoard = buildInitialContractBoard();
+      }
+      for (const rec of c.contractBoard) {
+        if (rec.instanceId === contractInstanceId && !rec.completed) {
+          rec.accepted = true;
+        }
+      }
+    });
+  }
+
+  /**
+   * Advances or completes a rotating contract on the 3-Slot Contract Board, applying
+   * cash reward, sub-faction standing gain, rival sub-faction standing penalty, and rotating a new contract into that slot.
+   */
+  public completeRotatingContract(
+    slotId: CharacterSlotId,
+    contractInstanceId: string,
+  ): {
+    ok: boolean;
+    completed?: RotatingContractRecord;
+    rivalId?: SubFactionId;
+    character?: OpenWorldCharacter;
+    error?: string;
+  } {
+    const cur = this.state.slots[slotId];
+    if (!cur) return { ok: false, error: 'Character slot not found.' };
+    const board = cur.contractBoard && cur.contractBoard.length === 3
+      ? cur.contractBoard
+      : buildInitialContractBoard();
+    const target = board.find((r) => r.instanceId === contractInstanceId);
+    if (!target) return { ok: false, error: 'Contract slot not found.' };
+
+    const sf = SUB_FACTION_MAP[target.subFactionId];
+    const rivalId = sf.rivalId;
+    const completedCopy: RotatingContractRecord = {
+      ...target,
+      completed: true,
+      progress: target.targetCount,
+      supplyBonus: { ...target.supplyBonus },
+    };
+
+    const updated = this.mutateCharacter(slotId, (c) => {
+      if (!c.contractBoard || c.contractBoard.length !== 3) {
+        c.contractBoard = buildInitialContractBoard();
+      }
+      c.cash = Math.max(0, Math.round(c.cash + target.cashRewardUsd));
+      c.missions.completedContracts += 1;
+
+      // Apply standing gain + rival penalty
+      const curSf = c.subFactionStanding[target.subFactionId] ?? 0;
+      c.subFactionStanding[target.subFactionId] = Math.max(
+        STANDING_MIN,
+        Math.min(STANDING_MAX, Math.round(curSf + target.standingGain)),
+      );
+      const curRival = c.subFactionStanding[rivalId] ?? 0;
+      c.subFactionStanding[rivalId] = Math.max(
+        STANDING_MIN,
+        Math.min(STANDING_MAX, Math.round(curRival + target.rivalPenalty)),
+      );
+
+      // Rotate a fresh non-duplicate contract into the completed slot
+      const activeTemplateIds = new Set(c.contractBoard.map((r) => r.templateId));
+      const candidates = ROTATING_CONTRACT_TEMPLATES.filter(
+        (t) => !activeTemplateIds.has(t.templateId),
+      );
+      const nextTpl =
+        candidates[Math.floor(Math.random() * candidates.length)] ??
+        ROTATING_CONTRACT_TEMPLATES[
+          (ROTATING_CONTRACT_TEMPLATES.findIndex((t) => t.templateId === target.templateId) + 1) %
+            ROTATING_CONTRACT_TEMPLATES.length
+        ];
+
+      c.contractBoard[target.slotIndex] = {
+        instanceId: makeItemId('rc'),
+        templateId: nextTpl.templateId,
+        slotIndex: target.slotIndex,
+        title: nextTpl.title,
+        archetype: nextTpl.archetype,
+        subFactionId: nextTpl.subFactionId,
+        targetSectorId: nextTpl.targetSectorId,
+        targetSectorLabel: nextTpl.targetSectorLabel,
+        summary: nextTpl.summary,
+        cashRewardUsd: nextTpl.cashRewardUsd,
+        standingGain: nextTpl.standingGain,
+        rivalPenalty: nextTpl.rivalPenalty,
+        supplyBonus: { ...nextTpl.supplyBonus },
+        accepted: false,
+        progress: 0,
+        targetCount: nextTpl.targetCount,
+        completed: false,
+      };
+    });
+
+    if (!updated) return { ok: false, error: 'Failed to persist contract completion.' };
+    return { ok: true, completed: completedCopy, rivalId, character: updated };
+  }
+
+  public recordRotatingContractProgress(
+    slotId: CharacterSlotId,
+    matcher: (rec: RotatingContractRecord) => boolean,
+    delta = 1,
+  ): RotatingContractRecord[] {
+    const cur = this.state.slots[slotId];
+    if (!cur?.contractBoard) return [];
+    const readyToComplete: RotatingContractRecord[] = [];
+    let changed = false;
+    for (const rec of cur.contractBoard) {
+      if (rec.accepted && !rec.completed && matcher(rec)) {
+        changed = true;
+        if (rec.progress + delta >= rec.targetCount) {
+          readyToComplete.push(rec);
+        }
+      }
+    }
+    if (!changed) return [];
+    this.mutateCharacter(slotId, (c) => {
+      if (!c.contractBoard) return;
+      for (const rec of c.contractBoard) {
+        if (rec.accepted && !rec.completed && matcher(rec)) {
+          rec.progress = Math.min(rec.targetCount, rec.progress + delta);
+        }
+      }
+    });
+    return readyToComplete;
   }
 
   public subscribe(fn: RosterListener): () => void {

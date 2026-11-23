@@ -58,11 +58,29 @@ export const OpenWorldView: React.FC<OpenWorldViewProps> = ({
           onSetNvgMode={(mode) => engineRef.current?.setNvgMode(mode)}
           onToggleFlashlight={() => engineRef.current?.toggleFlashlight()}
           onTogglePda={() => engineRef.current?.togglePda()}
+          onOpenInventory={() => engineRef.current?.openInventory()}
+          onCloseModal={() => engineRef.current?.closeActiveModal()}
+          onMutateInventory={(inv, ext, note) =>
+            engineRef.current?.applyInventoryMutation(inv, ext, note)
+          }
+          onTriggerDragReload={(slotKey, loc) =>
+            engineRef.current?.triggerInventoryDragReload(slotKey, loc)
+          }
+          onUseMedicalItem={(loc, med) =>
+            engineRef.current?.useMedicalItemFromInventory(loc, med)
+          }
+          onFundFobUpgrade={() => engineRef.current?.fundFobUpgrade()}
+          onBuyFobOffer={(offerId) => engineRef.current?.buyFobTraderOffer(offerId)}
+          onAcceptContract={(idx) => engineRef.current?.acceptRotatingContract(idx)}
+          onCompleteContract={(idx) => engineRef.current?.completeRotatingContract(idx)}
+          onSabotageConvoy={() => engineRef.current?.sabotageNearestConvoy()}
+          onTriggerWorldEvent={(kind) => engineRef.current?.triggerDynamicWorldEvent(kind)}
           onExecuteInteract={() => engineRef.current?.executeFieldInteraction()}
           onTeleportLandmark={(id) => engineRef.current?.teleportToLandmark(id)}
           onSetTimeOfDay={(h) => engineRef.current?.setTimeOfDay(h)}
           onSetTimeScale={(s) => engineRef.current?.setTimeScale(s)}
           onSetWeather={(w) => engineRef.current?.setWeather(w)}
+          onSetAutoWeather={(enabled) => engineRef.current?.setAutoWeatherCycle(enabled)}
           onExfilToHideout={handleExfil}
           onTriggerFieldDeath={() => engineRef.current?.triggerFieldDeathAtCurrentPosition()}
         />

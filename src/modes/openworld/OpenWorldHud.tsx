@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import {
   AlertTriangle,
+  Backpack,
   Camera,
   Check,
   ChevronDown,
@@ -16,17 +17,30 @@ import {
   LogOut,
   Map as MapIcon,
   Navigation,
+  Radio,
   Shield,
   Skull,
   Sun,
+  Truck,
+  Zap,
 } from 'lucide-react';
 import type { BodycamLensPresetId } from '../../../bodycam-sdk';
+import type {
+  CorpseTacticalLootSnapshot,
+  ItemSourceLocator,
+  MedicalItem,
+  OperatorTacticalInventory,
+} from './inventory/TetrisInventoryTypes';
 import {
+  DynamicWorldEventKind,
   OPENWORLD_CONTRACT_CATALOG,
   OpenWorldWeatherId,
   PMC_FACTIONS,
   SectorControlOwner,
+  SUB_FACTION_MAP,
 } from './types';
+import { FobTerminalModal } from './ui/FobTerminalModal';
+import { TacticalInventoryModal } from './ui/TacticalInventoryModal';
 import {
   OpenWorldNavMode,
   OpenWorldNvgMode,
@@ -43,11 +57,30 @@ interface OpenWorldHudProps {
   onSetNvgMode: (mode: OpenWorldNvgMode) => void;
   onToggleFlashlight: () => void;
   onTogglePda: () => void;
+  onOpenInventory: () => void;
+  onCloseModal: () => void;
+  onMutateInventory: (
+    nextInv: OperatorTacticalInventory,
+    nextExternal?: CorpseTacticalLootSnapshot | null,
+    statusNote?: string,
+  ) => void;
+  onTriggerDragReload: (
+    weaponSlotKey: 'primary' | 'secondary',
+    sourceLocator: ItemSourceLocator,
+  ) => void;
+  onUseMedicalItem: (locator: ItemSourceLocator, med: MedicalItem) => void;
+  onFundFobUpgrade: () => void;
+  onBuyFobOffer: (offerId: string) => void;
+  onAcceptContract: (slotIndex: number) => void;
+  onCompleteContract: (slotIndex: number) => void;
+  onSabotageConvoy: () => void;
+  onTriggerWorldEvent: (kind: DynamicWorldEventKind) => void;
   onExecuteInteract: () => void;
   onTeleportLandmark: (landmarkId: string) => void;
   onSetTimeOfDay: (hours: number) => void;
   onSetTimeScale: (scale: number) => void;
   onSetWeather: (weather: OpenWorldWeatherId) => void;
+  onSetAutoWeather: (enabled: boolean) => void;
   onExfilToHideout: () => void;
   onTriggerFieldDeath: () => void;
 }
@@ -104,11 +137,23 @@ export const OpenWorldHud: React.FC<OpenWorldHudProps> = ({
   onSetNvgMode,
   onToggleFlashlight,
   onTogglePda,
+  onOpenInventory,
+  onCloseModal,
+  onMutateInventory,
+  onTriggerDragReload,
+  onUseMedicalItem,
+  onFundFobUpgrade,
+  onBuyFobOffer,
+  onAcceptContract,
+  onCompleteContract,
+  onSabotageConvoy,
+  onTriggerWorldEvent,
   onExecuteInteract,
   onTeleportLandmark,
   onSetTimeOfDay,
   onSetTimeScale,
   onSetWeather,
+  onSetAutoWeather,
   onExfilToHideout,
   onTriggerFieldDeath,
 }) => {
@@ -190,41 +235,64 @@ export const OpenWorldHud: React.FC<OpenWorldHudProps> = ({
             <span aria-hidden="true">·</span>
             <span>{atmo.weatherLabel}</span>
             <span aria-hidden="true">·</span>
-            <span>AI Sight {snapshot.ai.effectiveVisionRangeM}m</span>
+            <span>FOB Tier {snapshot.fobTier}</span>
+            <span aria-hidden="true">·</span>
+            <span className={snapshot.commsBlackoutCount > 0 ? 'text-amber-300' : 'text-emerald-300'}>
+              Comms {3 - snapshot.commsBlackoutCount}/3
+            </span>
             <span aria-hidden="true">·</span>
             <span>{snapshot.drawCalls} calls</span>
           </div>
         </div>
 
-        {/* Center-Top Active Sector Capture Indicator (visible only inside capture perimeter) */}
-        {activeSector && !activeSector.isFob && (
-          <div className="border border-white/14 bg-[#0b0e13]/92 px-4 py-2 text-xs text-neutral-100">
-            <div className="flex items-center justify-between gap-4 font-mono-tabular">
-              <span className="flex items-center gap-1.5 font-semibold">
-                <Flag className={`h-3.5 w-3.5 ${ownerTagColor(activeSector.owner)}`} />
-                <span>{activeSector.shortLabel}</span>
+        {/* Center-Top Active Sector Capture OR Active World Event Banner */}
+        <div className="flex flex-col items-center gap-1.5">
+          {activeSector && !activeSector.isFob && (
+            <div className="border border-white/14 bg-[#0b0e13]/92 px-4 py-2 text-xs text-neutral-100">
+              <div className="flex items-center justify-between gap-4 font-mono-tabular">
+                <span className="flex items-center gap-1.5 font-semibold">
+                  <Flag className={`h-3.5 w-3.5 ${ownerTagColor(activeSector.owner)}`} />
+                  <span>{activeSector.shortLabel}</span>
+                  <span className="border border-white/12 px-1 text-[9px] uppercase text-neutral-300">
+                    {activeSector.alertState}
+                  </span>
+                </span>
+                <span className={`text-[11px] font-semibold ${ownerTagColor(activeSector.owner)}`}>
+                  {ownerShort(activeSector.owner)}
+                </span>
+              </div>
+              <div className="mt-1.5 h-1.5 w-56 bg-white/10">
+                <div
+                  className={`h-full transition-all duration-150 ${
+                    activeSector.contested ? 'bg-red-500' : 'bg-amber-400'
+                  }`}
+                  style={{ width: `${Math.round(activeSector.liveCapturePct)}%` }}
+                />
+              </div>
+              <div className="mt-1 font-mono-tabular text-[11px] text-neutral-400">
+                {activeSector.contested
+                  ? `Contested · Clear ${activeSector.hostileGarrisonCount} hostile(s)`
+                  : char && activeSector.owner === char.pmcFaction
+                    ? 'Sector Secured · Supply Line Active'
+                    : `Capturing Sector (${Math.round(activeSector.liveCapturePct)}%)`}
+              </div>
+            </div>
+          )}
+
+          {snapshot.worldEvent.activeEvent && !snapshot.worldEvent.activeEvent.lootClaimed && (
+            <div className="flex items-center gap-2.5 border border-red-500/55 bg-[#1a0f12]/92 px-3.5 py-1.5 font-mono-tabular text-[11px] text-red-100">
+              <Zap className="h-3.5 w-3.5 shrink-0 text-amber-300" />
+              <span className="font-semibold text-amber-200">
+                {snapshot.worldEvent.activeEvent.title}
               </span>
-              <span className={`text-[11px] font-semibold ${ownerTagColor(activeSector.owner)}`}>
-                {ownerShort(activeSector.owner)}
+              <span className="text-neutral-300">
+                ({snapshot.worldEvent.activeEvent.x}, {snapshot.worldEvent.activeEvent.z}) ·{' '}
+                {snapshot.worldEvent.activeEvent.guardsAlive} guard(s) ·{' '}
+                {snapshot.worldEvent.activeEvent.remainingSec}s
               </span>
             </div>
-            <div className="mt-1.5 h-1.5 w-52 bg-white/10">
-              <div
-                className={`h-full transition-all duration-150 ${
-                  activeSector.contested ? 'bg-red-500' : 'bg-amber-400'
-                }`}
-                style={{ width: `${Math.round(activeSector.liveCapturePct)}%` }}
-              />
-            </div>
-            <div className="mt-1 font-mono-tabular text-[11px] text-neutral-400">
-              {activeSector.contested
-                ? `Contested · Clear ${activeSector.hostileGarrisonCount} hostile(s)`
-                : char && activeSector.owner === char.pmcFaction
-                  ? 'Sector Secured · Supply Line Active'
-                  : `Capturing Sector (${Math.round(activeSector.liveCapturePct)}%)`}
-            </div>
-          </div>
-        )}
+          )}
+        </div>
 
         {/* Right Top: Render Pipeline Toggle, Pointer Lock & Exfil */}
         <div className="pointer-events-auto flex items-center gap-2">
@@ -287,24 +355,39 @@ export const OpenWorldHud: React.FC<OpenWorldHudProps> = ({
           </div>
         )}
 
-        {snapshot.interactable && snapshot.navMode === 'foot' && (
-          <button
-            type="button"
-            onClick={onExecuteInteract}
-            className={`pointer-events-auto flex cursor-pointer items-center gap-3 border px-4 py-2 text-left text-xs ${
-              snapshot.interactable.canExecute
-                ? 'border-amber-400/70 bg-[#12161d]/95 text-neutral-100 hover:border-amber-300'
-                : 'border-red-500/50 bg-[#1b1114]/95 text-red-100'
-            }`}
-          >
-            <span className="border border-amber-400/60 bg-amber-500/20 px-1.5 py-0.5 font-mono-tabular font-semibold text-amber-200">
-              F
-            </span>
-            <div>
-              <div className="font-semibold">{snapshot.interactable.label}</div>
-              <div className="text-[11px] text-neutral-400">{snapshot.interactable.sublabel}</div>
-            </div>
-          </button>
+        {snapshot.interactable && snapshot.navMode === 'foot' && snapshot.activeModal === null && (
+          <div className="pointer-events-auto flex flex-wrap items-center justify-center gap-2">
+            <button
+              type="button"
+              onClick={onExecuteInteract}
+              className={`flex cursor-pointer items-center gap-3 border px-4 py-2 text-left text-xs ${
+                snapshot.interactable.canExecute
+                  ? 'border-amber-400/70 bg-[#12161d]/95 text-neutral-100 hover:border-amber-300'
+                  : 'border-red-500/50 bg-[#1b1114]/95 text-red-100'
+              }`}
+            >
+              <span className="border border-amber-400/60 bg-amber-500/20 px-1.5 py-0.5 font-mono-tabular font-semibold text-amber-200">
+                F
+              </span>
+              <div>
+                <div className="font-semibold">{snapshot.interactable.label}</div>
+                <div className="text-[11px] text-neutral-400">{snapshot.interactable.sublabel}</div>
+              </div>
+            </button>
+
+            {snapshot.interactable.kind === 'convoy_hijack' && snapshot.interactable.canExecute && (
+              <button
+                type="button"
+                onClick={onSabotageConvoy}
+                className="flex cursor-pointer items-center gap-2 border border-red-500/70 bg-[#200f12]/95 px-3.5 py-2 text-xs font-semibold text-red-100 hover:border-red-400"
+              >
+                <span className="border border-red-400/60 bg-red-500/20 px-1.5 py-0.5 font-mono-tabular text-red-200">
+                  X
+                </span>
+                <span>Sabotage Cargo (-15 Supply / +180s Stall)</span>
+              </button>
+            )}
+          </div>
         )}
 
         {snapshot.lastDeathOutcome && (
@@ -352,6 +435,22 @@ export const OpenWorldHud: React.FC<OpenWorldHudProps> = ({
                 </span>
                 <span className="text-[11px] text-neutral-400">{combat.armorLabel}</span>
               </div>
+              {combat.bleedingRemainingSec > 0 && (
+                <>
+                  <span aria-hidden="true" className="text-neutral-600">·</span>
+                  <span className="font-semibold text-red-400">
+                    BLEED {Math.ceil(combat.bleedingRemainingSec)}s
+                  </span>
+                </>
+              )}
+              {combat.sprintSlowRemainingSec > 0 && (
+                <>
+                  <span aria-hidden="true" className="text-neutral-600">·</span>
+                  <span className="text-amber-300">
+                    LEG TRAUMA {Math.ceil(combat.sprintSlowRemainingSec)}s
+                  </span>
+                </>
+              )}
               {combat.killsThisSortie > 0 && (
                 <>
                   <span aria-hidden="true" className="text-neutral-600">·</span>
@@ -360,12 +459,14 @@ export const OpenWorldHud: React.FC<OpenWorldHudProps> = ({
               )}
             </div>
 
-            {/* Compact Bottom-Right Weapon & Ordnance Readout */}
-            <div className="flex items-center gap-3 border border-white/10 bg-[#0b0e13]/90 px-3.5 py-2 font-mono-tabular text-xs text-neutral-200">
+            {/* Compact Bottom-Right Weapon, Mixed-Ammo Chamber & Rig Readout */}
+            <div className="pointer-events-auto flex items-center gap-3 border border-white/10 bg-[#0b0e13]/90 px-3.5 py-2 font-mono-tabular text-xs text-neutral-200">
               <div>
                 <span className="font-semibold text-neutral-50">{combat.equippedWeaponName}</span>
-                {combat.equippedCaliber && (
-                  <span className="ml-2 text-[11px] text-neutral-400">{combat.equippedCaliber}</span>
+                {combat.activeRoundLabel && (
+                  <span className="ml-2 border border-sky-400/40 bg-sky-950/50 px-1.5 py-0.5 text-[10px] font-semibold text-sky-200">
+                    {combat.activeRoundLabel}
+                  </span>
                 )}
               </div>
               {combat.magCapacity > 0 && (
@@ -375,7 +476,15 @@ export const OpenWorldHud: React.FC<OpenWorldHudProps> = ({
                     <strong className={combat.ammoInMag <= 5 ? 'text-amber-400' : 'text-neutral-50'}>
                       {combat.reloading ? 'RLD' : combat.ammoInMag}
                     </strong>
-                    <span className="text-neutral-400"> / {combat.ammoReserve}</span>
+                    <span className="text-neutral-400">
+                      {' '}
+                      / {combat.rigQuickMagCount} Rig Mag{combat.rigQuickMagCount === 1 ? '' : 's'}
+                    </span>
+                    {combat.backpackReserveRounds > 0 && (
+                      <span className="ml-1 text-[10px] text-neutral-500">
+                        (+{combat.backpackReserveRounds} Pack)
+                      </span>
+                    )}
                   </span>
                 </>
               )}
@@ -384,6 +493,14 @@ export const OpenWorldHud: React.FC<OpenWorldHudProps> = ({
                 {combat.grenadeDrawn ? `ORD:${combat.grenadeHoldStage}` : `FRAG x${combat.grenadeCount}`}
               </span>
               <span aria-hidden="true" className="text-neutral-600">·</span>
+              <button
+                type="button"
+                onClick={onOpenInventory}
+                className="flex cursor-pointer items-center gap-1 border border-amber-400/45 bg-amber-950/40 px-2 py-0.5 text-[11px] font-semibold text-amber-200 hover:border-amber-300"
+              >
+                <Backpack className="h-3 w-3" />
+                <span>[Tab] Rig &amp; Pack</span>
+              </button>
               <span className={combat.isPdaOpen ? 'text-emerald-300' : 'text-neutral-400'}>
                 [M] PDA
               </span>
@@ -505,23 +622,88 @@ export const OpenWorldHud: React.FC<OpenWorldHudProps> = ({
                 )}
 
                 {dockTab === 'logistics' && (
-                  <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
-                    <div className="space-y-1.5 border border-white/10 bg-[#12161e] p-2.5 font-mono-tabular text-[11px]">
-                      <div className="flex items-center justify-between text-neutral-300">
-                        <span className="text-sky-300 font-semibold">PMC Alpha Supply Pool</span>
-                        <span>
-                          Ammo {snapshot.pmcSupplyPools.pmc_alpha.ammo}% · Med {snapshot.pmcSupplyPools.pmc_alpha.medical}% · Fuel {snapshot.pmcSupplyPools.pmc_alpha.fuelParts}% · Intel {snapshot.pmcSupplyPools.pmc_alpha.intel}%
-                        </span>
+                  <div className="space-y-2.5">
+                    <div className="grid grid-cols-1 gap-2.5 md:grid-cols-2">
+                      <div className="space-y-1.5 border border-white/10 bg-[#12161e] p-2.5 font-mono-tabular text-[11px]">
+                        <div className="flex items-center justify-between text-neutral-300">
+                          <span className="font-semibold text-sky-300">PMC Alpha Supply Pool</span>
+                          <span>
+                            Ammo {snapshot.pmcSupplyPools.pmc_alpha.ammo}% · Med {snapshot.pmcSupplyPools.pmc_alpha.medical}% · Fuel {snapshot.pmcSupplyPools.pmc_alpha.fuelParts}% · Intel {snapshot.pmcSupplyPools.pmc_alpha.intel}%
+                          </span>
+                        </div>
+                        <div className="flex items-center justify-between text-neutral-300">
+                          <span className="font-semibold text-amber-300">PMC Bravo Supply Pool</span>
+                          <span>
+                            Ammo {snapshot.pmcSupplyPools.pmc_bravo.ammo}% · Med {snapshot.pmcSupplyPools.pmc_bravo.medical}% · Fuel {snapshot.pmcSupplyPools.pmc_bravo.fuelParts}% · Intel {snapshot.pmcSupplyPools.pmc_bravo.intel}%
+                          </span>
+                        </div>
+                        <div className="border-t border-white/10 pt-1 text-[10px] text-neutral-400">
+                          Visit your physical Home FOB Logistics Terminal ([F]) to fund FOB Tier 1–3 upgrades &amp; purchase Supply-Coupled Trader stock.
+                        </div>
                       </div>
-                      <div className="flex items-center justify-between text-neutral-300">
-                        <span className="text-amber-300 font-semibold">PMC Bravo Supply Pool</span>
-                        <span>
-                          Ammo {snapshot.pmcSupplyPools.pmc_bravo.ammo}% · Med {snapshot.pmcSupplyPools.pmc_bravo.medical}% · Fuel {snapshot.pmcSupplyPools.pmc_bravo.fuelParts}% · Intel {snapshot.pmcSupplyPools.pmc_bravo.intel}%
-                        </span>
+
+                      <div className="space-y-1 border border-white/10 bg-[#12161e] p-2.5 font-mono-tabular text-[11px]">
+                        <div className="flex items-center gap-1.5 font-semibold text-neutral-200">
+                          <Truck className="h-3.5 w-3.5 text-amber-300" />
+                          <span>Live Supply Convoys &amp; Barges</span>
+                        </div>
+                        {snapshot.convoys.map((cv) => (
+                          <div key={cv.id} className="flex items-center justify-between text-[10px] text-neutral-300">
+                            <span className={cv.ownerFaction === 'pmc_alpha' ? 'text-sky-300' : 'text-amber-300'}>
+                              {cv.label}
+                            </span>
+                            <span>
+                              {cv.state === 'disabled_awaiting_action'
+                                ? 'DISABLED — [F] HIJACK / [X] SABOTAGE'
+                                : cv.state === 'en_route'
+                                  ? `EN ROUTE (${cv.aliveEscorts}/${cv.totalEscorts} Escorts)`
+                                  : cv.state.toUpperCase()}
+                            </span>
+                          </div>
+                        ))}
                       </div>
                     </div>
 
-                    <div className="flex flex-wrap items-center gap-1.5 border border-white/10 bg-[#12161e] p-2.5 text-[11px]">
+                    {/* 3-Slot Rotating Sub-Faction Contracts + Biome Terminal Contracts */}
+                    {char && char.contractBoard && char.contractBoard.length > 0 && (
+                      <div className="grid grid-cols-1 gap-2 md:grid-cols-3">
+                        {char.contractBoard.map((c) => (
+                          <div
+                            key={c.instanceId}
+                            className="flex items-center justify-between gap-2 border border-white/10 bg-[#12161e] px-2.5 py-1.5 font-mono-tabular text-[10px]"
+                          >
+                            <div className="min-w-0">
+                              <div className="truncate font-semibold text-neutral-100">
+                                [{c.archetype.toUpperCase()}] {c.title}
+                              </div>
+                              <div className="text-neutral-400">
+                                {SUB_FACTION_MAP[c.subFactionId].shortName} +{c.standingGain} · ${c.cashRewardUsd.toLocaleString()} · {c.progress}/{c.targetCount}
+                              </div>
+                            </div>
+                            {!c.accepted ? (
+                              <button
+                                type="button"
+                                onClick={() => onAcceptContract(c.slotIndex)}
+                                className="shrink-0 cursor-pointer border border-amber-400/60 bg-amber-950/50 px-2 py-1 text-amber-200 hover:bg-amber-900/60"
+                              >
+                                Accept
+                              </button>
+                            ) : (
+                              <button
+                                type="button"
+                                onClick={() => onCompleteContract(c.slotIndex)}
+                                className="shrink-0 cursor-pointer border border-emerald-400/60 bg-emerald-950/50 px-2 py-1 text-emerald-200 hover:bg-emerald-900/60"
+                              >
+                                Turn In
+                              </button>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+
+                    <div className="flex flex-wrap items-center gap-1.5 border border-white/10 bg-[#12161e] p-2 text-[10px]">
+                      <span className="font-mono-tabular text-neutral-400 mr-1">Biome Terminals:</span>
                       {OPENWORLD_CONTRACT_CATALOG.map((c) => {
                         const done = completedContracts.has(c.id);
                         return (
@@ -569,7 +751,7 @@ export const OpenWorldHud: React.FC<OpenWorldHudProps> = ({
                       </button>
                     </div>
 
-                    <div className="flex items-center gap-1.5">
+                    <div className="flex flex-wrap items-center gap-1.5">
                       {WEATHER_OPTIONS.map((w) => (
                         <button
                           key={w.id}
@@ -586,6 +768,20 @@ export const OpenWorldHud: React.FC<OpenWorldHudProps> = ({
                           <span>{w.label}</span>
                         </button>
                       ))}
+                      <button
+                        type="button"
+                        onClick={() => onSetAutoWeather(!atmo.autoWeatherCycle)}
+                        className={`cursor-pointer border px-2.5 py-1.5 text-xs font-mono-tabular transition-colors whitespace-nowrap shrink-0 ${
+                          atmo.autoWeatherCycle
+                            ? 'border-emerald-400/70 bg-emerald-950/60 text-emerald-200'
+                            : 'border-white/12 bg-[#141922] text-neutral-300 hover:border-white/30'
+                        }`}
+                      >
+                        {atmo.autoWeatherCycle ? 'Auto Cycle: ON' : 'Auto Cycle: OFF'}
+                      </button>
+                      <span className="ml-1 font-mono-tabular text-[11px] text-neutral-400 whitespace-nowrap">
+                        Clouds {atmo.cloudCoveragePct}% · Rays {atmo.godraysActive ? 'Active' : 'Standby'}
+                      </span>
                     </div>
                   </div>
                 )}
@@ -664,9 +860,36 @@ export const OpenWorldHud: React.FC<OpenWorldHudProps> = ({
                       </div>
                     </div>
 
+                    {/* Phase 5 Dynamic World Events Scheduler & Manual Triggers */}
+                    <div className="flex flex-wrap items-center justify-between gap-2 border-t border-white/10 pt-2">
+                      <div className="flex flex-wrap items-center gap-1.5 font-mono-tabular text-[11px]">
+                        <Radio className="h-3.5 w-3.5 text-amber-300" />
+                        <span className="text-neutral-300">
+                          World Events (Auto {snapshot.worldEvent.nextPeriodicEventSec}s):
+                        </span>
+                        {(
+                          [
+                            { id: 'black_box_drop', label: 'Black-Box Drop' },
+                            { id: 'smuggler_boat', label: 'Smuggler Boat' },
+                            { id: 'convoy_ambush', label: 'Convoy Ambush' },
+                            { id: 'sector_counter_assault', label: 'Counter-Assault' },
+                          ] as const
+                        ).map((ev) => (
+                          <button
+                            key={ev.id}
+                            type="button"
+                            onClick={() => onTriggerWorldEvent(ev.id)}
+                            className="cursor-pointer border border-amber-400/45 bg-amber-950/40 px-2 py-1 text-[10px] font-medium text-amber-200 hover:border-amber-300 hover:bg-amber-900/50 whitespace-nowrap shrink-0"
+                          >
+                            Trigger {ev.label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+
                     <div className="flex flex-wrap items-center justify-between gap-3 border-t border-white/10 pt-2">
                       <div className="font-mono-tabular text-[11px] text-neutral-400">
-                        LMB Fire · RMB ADS · MMB/B Cant · R Reload · G/4 Grenade · M GPS PDA · N NVG · F Interact · Q/E Lean · C Crouch · AI Alive: {snapshot.ai.totalAlive} ({snapshot.ai.hostileEngaging} Engaging) · Corpses: {snapshot.shardCorpseCount}
+                        [Tab] Tetris Rig &amp; Pack · LMB Fire · RMB ADS · R Rig Reload · G Grenade · M GPS PDA · N NVG · F Interact · X Sabotage · AI: {snapshot.ai.totalAlive} · Corpses: {snapshot.shardCorpseCount}
                       </div>
                       {char && (
                         <button
@@ -686,6 +909,40 @@ export const OpenWorldHud: React.FC<OpenWorldHudProps> = ({
           )}
         </div>
       </div>
+
+      {/* Phase 5 Interactive Tetris Grid Inventory & Corpse/Event Loot Modal */}
+      {(snapshot.activeModal === 'inventory' ||
+        snapshot.activeModal === 'corpse_loot' ||
+        snapshot.activeModal === 'event_loot') &&
+        char?.tacticalInventory && (
+          <TacticalInventoryModal
+            inventory={char.tacticalInventory}
+            externalLoot={snapshot.externalLoot}
+            playerHp={combat.hp}
+            maxHp={combat.maxHp}
+            bleeding={combat.bleedingRemainingSec > 0}
+            sprintSlow={combat.sprintSlowRemainingSec > 0}
+            onMutateInventory={onMutateInventory}
+            onTriggerDragReload={onTriggerDragReload}
+            onUseMedicalItem={onUseMedicalItem}
+            onClose={onCloseModal}
+          />
+        )}
+
+      {/* Phase 4 In-World Home FOB Logistics & Quartermaster Terminal Modal */}
+      {snapshot.activeModal === 'fob_terminal' && snapshot.fobTerminalState && char && (
+        <FobTerminalModal
+          terminal={snapshot.fobTerminalState}
+          cashUsd={char.cash}
+          callsign={char.callsign}
+          contractBoard={char.contractBoard ?? []}
+          onFundUpgrade={onFundFobUpgrade}
+          onBuyOffer={onBuyFobOffer}
+          onAcceptContract={onAcceptContract}
+          onCompleteContract={onCompleteContract}
+          onClose={onCloseModal}
+        />
+      )}
     </div>
   );
 };

@@ -1,8 +1,11 @@
 import { useEffect, useState } from 'react';
+import { cloneCorpseLootSnapshot } from './inventory/TetrisInventoryCore';
+import type { CorpseTacticalLootSnapshot } from './inventory/TetrisInventoryTypes';
 import {
   DiscreteTransitionType,
   DroppedCorpseEntity,
   FactionSupplyPool,
+  FobTier,
   OpenWorldStorageLike,
   PmcFactionId,
   resolveDefaultStorage,
@@ -43,31 +46,73 @@ function createInitialSectors(mode: ShardMode): Record<string, SectorControlReco
       sectorId: 'landmark_fob_alpha',
       owner: 'pmc_alpha',
       captureProgress: 100,
+      alertState: 'captured',
     },
     landmark_fob_bravo: {
       sectorId: 'landmark_fob_bravo',
       owner: 'pmc_bravo',
       captureProgress: 100,
+      alertState: 'captured',
     },
     landmark_port_terminal: {
       sectorId: 'landmark_port_terminal',
       owner: mode === 'PvE' ? 'pmc_alpha' : 'neutral',
       captureProgress: mode === 'PvE' ? 100 : 0,
+      alertState: mode === 'PvE' ? 'captured' : 'calm',
     },
     landmark_timberline_railyard: {
       sectorId: 'landmark_timberline_railyard',
       owner: 'neutral',
       captureProgress: 0,
+      alertState: 'calm',
     },
     landmark_steppe_quarry: {
       sectorId: 'landmark_steppe_quarry',
       owner: mode === 'PvE' ? 'pmc_bravo' : 'neutral',
       captureProgress: mode === 'PvE' ? 100 : 0,
+      alertState: mode === 'PvE' ? 'captured' : 'calm',
     },
     landmark_alpine_dam: {
       sectorId: 'landmark_alpine_dam',
       owner: 'neutral',
       captureProgress: 0,
+      alertState: 'calm',
+    },
+    comms_south_marsh: {
+      sectorId: 'comms_south_marsh',
+      owner: 'pmc_alpha',
+      captureProgress: 100,
+      alertState: 'captured',
+    },
+    comms_pine_ridge: {
+      sectorId: 'comms_pine_ridge',
+      owner: 'neutral',
+      captureProgress: 0,
+      alertState: 'calm',
+    },
+    comms_alpine_relay: {
+      sectorId: 'comms_alpine_relay',
+      owner: 'pmc_bravo',
+      captureProgress: 100,
+      alertState: 'captured',
+    },
+    depot_valley_munitions: {
+      sectorId: 'depot_valley_munitions',
+      owner: 'neutral',
+      captureProgress: 0,
+      alertState: 'calm',
+    },
+    depot_steppe_medbay: {
+      sectorId: 'depot_steppe_medbay',
+      owner: 'neutral',
+      captureProgress: 0,
+      alertState: 'calm',
+    },
+    depot_alpine_signals: {
+      sectorId: 'depot_alpine_signals',
+      owner: 'neutral',
+      captureProgress: 0,
+      alertState: 'calm',
     },
   };
 }
@@ -97,6 +142,14 @@ function createInitialShard(mode: ShardMode): ShardWorldState {
       pmc_alpha: createInitialSupplyPool(mode, 'pmc_alpha'),
       pmc_bravo: createInitialSupplyPool(mode, 'pmc_bravo'),
     },
+    fobTiers: {
+      pmc_alpha: 1,
+      pmc_bravo: 1,
+    },
+    restockPenaltySec: {
+      pmc_alpha: 0,
+      pmc_bravo: 0,
+    },
     territoryCounts: countTerritories(sectors),
     sectors,
     corpses: [],
@@ -116,12 +169,23 @@ function cloneShard(s: ShardWorldState): ShardWorldState {
       pmc_alpha: { ...s.pmcSupplyPools.pmc_alpha },
       pmc_bravo: { ...s.pmcSupplyPools.pmc_bravo },
     },
+    fobTiers: {
+      pmc_alpha: s.fobTiers.pmc_alpha,
+      pmc_bravo: s.fobTiers.pmc_bravo,
+    },
+    restockPenaltySec: {
+      pmc_alpha: s.restockPenaltySec.pmc_alpha,
+      pmc_bravo: s.restockPenaltySec.pmc_bravo,
+    },
     territoryCounts: { ...s.territoryCounts },
     sectors: clonedSectors,
     corpses: s.corpses.map((c) => ({
       ...c,
       droppedWeaponIds: [...c.droppedWeaponIds],
       droppedItems: c.droppedItems.map((it) => ({ ...it })),
+      droppedTacticalKit: c.droppedTacticalKit
+        ? cloneCorpseLootSnapshot(c.droppedTacticalKit)
+        : undefined,
     })),
     recentTransitions: s.recentTransitions.map((t) => ({ ...t })),
   };
@@ -196,6 +260,14 @@ export class ShardStore {
               intel: clampPct(src.pmcSupplyPools?.pmc_bravo?.intel, def.pmcSupplyPools.pmc_bravo.intel),
             },
           },
+          fobTiers: {
+            pmc_alpha: clampFobTier(src.fobTiers?.pmc_alpha),
+            pmc_bravo: clampFobTier(src.fobTiers?.pmc_bravo),
+          },
+          restockPenaltySec: {
+            pmc_alpha: Math.max(0, Math.round(Number(src.restockPenaltySec?.pmc_alpha) || 0)),
+            pmc_bravo: Math.max(0, Math.round(Number(src.restockPenaltySec?.pmc_bravo) || 0)),
+          },
           ...(() => {
             const mergedSectors: Record<string, SectorControlRecord> = { ...def.sectors };
             if (src.sectors && typeof src.sectors === 'object') {
@@ -207,6 +279,7 @@ export class ShardStore {
                     sectorId: secId,
                     owner,
                     captureProgress: clampPct(rec.captureProgress, owner === 'neutral' ? 0 : 100),
+                    alertState: rec.alertState ?? (owner === 'neutral' ? 'calm' : 'captured'),
                     lastFlippedAtIso: typeof rec.lastFlippedAtIso === 'string' ? rec.lastFlippedAtIso : undefined,
                   };
                 }
@@ -224,6 +297,9 @@ export class ShardStore {
                 lootableByOtherPlayers: SHARD_RULES[mode].corpseLootingPlayers,
                 droppedWeaponIds: Array.isArray(c.droppedWeaponIds) ? [...c.droppedWeaponIds] : [],
                 droppedItems: Array.isArray(c.droppedItems) ? c.droppedItems.map((it) => ({ ...it })) : [],
+                droppedTacticalKit: c.droppedTacticalKit
+                  ? cloneCorpseLootSnapshot(c.droppedTacticalKit)
+                  : undefined,
               }))
             : [],
           recentTransitions: Array.isArray(src.recentTransitions)
@@ -289,6 +365,9 @@ export class ShardStore {
       lootableByOtherPlayers: rules.corpseLootingPlayers,
       droppedWeaponIds: [...corpse.droppedWeaponIds],
       droppedItems: corpse.droppedItems.map((it) => ({ ...it })),
+      droppedTacticalKit: corpse.droppedTacticalKit
+        ? cloneCorpseLootSnapshot(corpse.droppedTacticalKit)
+        : undefined,
     };
 
     const shard = this.state.shards[mode];
@@ -546,6 +625,130 @@ export class ShardStore {
     this.persistAndEmit();
   }
 
+  /**
+   * Discrete state transition write: updates a corpse's remaining Tetris loot kit after partial looting.
+   */
+  public updateCorpseTacticalKit(
+    mode: ShardMode,
+    corpseId: string,
+    nextKit: CorpseTacticalLootSnapshot,
+  ): void {
+    const shard = this.state.shards[mode];
+    const idx = shard.corpses.findIndex((c) => c.corpseId === corpseId);
+    if (idx < 0) return;
+    const isEmpty =
+      !nextKit.primaryWeaponId &&
+      !nextKit.secondaryWeaponId &&
+      !nextKit.chestRig &&
+      !nextKit.backpack &&
+      nextKit.beltSlots.every((s) => s === null) &&
+      nextKit.looseGrid.items.length === 0;
+    const nextRev = shard.revision + 1;
+    const nextCorpses = isEmpty
+      ? shard.corpses.filter((c) => c.corpseId !== corpseId)
+      : shard.corpses.map((c, i) =>
+          i === idx
+            ? {
+                ...c,
+                droppedWeaponIds: [
+                  ...(nextKit.primaryWeaponId ? [nextKit.primaryWeaponId] : []),
+                  ...(nextKit.secondaryWeaponId ? [nextKit.secondaryWeaponId] : []),
+                ],
+                droppedTacticalKit: cloneCorpseLootSnapshot(nextKit),
+              }
+            : c,
+        );
+    this.state = {
+      shards: {
+        ...this.state.shards,
+        [mode]: {
+          ...shard,
+          revision: nextRev,
+          corpses: nextCorpses,
+        },
+      },
+    };
+    this.persistAndEmit();
+  }
+
+  /**
+   * Discrete state transition write: upgrades a PMC's Home FOB to Tier 2 or Tier 3 inside ONE shard.
+   */
+  public setFobTier(
+    mode: ShardMode,
+    faction: PmcFactionId,
+    tier: FobTier,
+    actorCallsign: string,
+  ): FobTier {
+    const shard = this.state.shards[mode];
+    const nextRev = shard.revision + 1;
+    this.state = {
+      shards: {
+        ...this.state.shards,
+        [mode]: {
+          ...shard,
+          revision: nextRev,
+          fobTiers: {
+            ...shard.fobTiers,
+            [faction]: tier,
+          },
+          recentTransitions: [
+            {
+              revision: nextRev,
+              type: 'fob_upgrade',
+              timestampIso: new Date().toISOString(),
+              summary: `${actorCallsign} upgraded ${faction === 'pmc_alpha' ? 'Alpha FOB' : 'Bravo FOB'} to Tier ${tier}`,
+            },
+            ...shard.recentTransitions,
+          ].slice(0, MAX_TRANSITION_LOG),
+        },
+      },
+    };
+    this.persistAndEmit();
+    return tier;
+  }
+
+  /**
+   * Discrete state transition write: applies a Trader restock delay penalty to a faction (e.g. convoy sabotage).
+   */
+  public applyRestockPenalty(
+    mode: ShardMode,
+    targetFaction: PmcFactionId,
+    penaltySec: number,
+    summary: string,
+  ): void {
+    const shard = this.state.shards[mode];
+    const nextRev = shard.revision + 1;
+    const prev = shard.restockPenaltySec[targetFaction] ?? 0;
+    this.state = {
+      shards: {
+        ...this.state.shards,
+        [mode]: {
+          ...shard,
+          revision: nextRev,
+          restockPenaltySec: {
+            ...shard.restockPenaltySec,
+            [targetFaction]: Math.min(900, Math.max(0, Math.round(prev + penaltySec))),
+          },
+          recentTransitions: [
+            {
+              revision: nextRev,
+              type: 'convoy_sabotage',
+              timestampIso: new Date().toISOString(),
+              summary,
+            },
+            ...shard.recentTransitions,
+          ].slice(0, MAX_TRANSITION_LOG),
+        },
+      },
+    };
+    this.persistAndEmit();
+  }
+
+  public getFobTier(mode: ShardMode, faction: PmcFactionId): FobTier {
+    return this.state.shards[mode].fobTiers[faction] ?? 1;
+  }
+
   public getAveragePmcSupplyPct(mode: ShardMode, faction: PmcFactionId): number {
     const p = this.state.shards[mode].pmcSupplyPools[faction];
     return Math.round((p.ammo + p.medical + p.fuelParts + p.intel) / 4);
@@ -562,6 +765,12 @@ export class ShardStore {
 function clampPct(raw: unknown, fallback: number): number {
   if (typeof raw !== 'number' || !Number.isFinite(raw)) return fallback;
   return Math.max(0, Math.min(100, Math.round(raw)));
+}
+
+function clampFobTier(raw: unknown): FobTier {
+  if (raw === 3) return 3;
+  if (raw === 2) return 2;
+  return 1;
 }
 
 export const shardStore = new ShardStore();
