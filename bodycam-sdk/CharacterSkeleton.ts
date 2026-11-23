@@ -2291,14 +2291,26 @@ export class CharacterSkeleton {
       setFinger(hand.ring, lerpStage(12, 46, 100), lerpStage(14, 52, 110), lerpStage(8, 28, 70));
       setFinger(hand.pinky, lerpStage(14, 54, 104), lerpStage(16, 58, 112), lerpStage(8, 32, 72));
 
-      hand.thumbProx.rotation.set(
-        THREE.MathUtils.lerp(0.08, THREE.MathUtils.lerp(-0.12, -0.52, fistT), relaxT),
-        s * THREE.MathUtils.lerp(0.18, THREE.MathUtils.lerp(0.36, 0.72, fistT), relaxT),
-        s * THREE.MathUtils.lerp(0.06, THREE.MathUtils.lerp(-0.10, -0.44, fistT), relaxT),
+      // Keep thumb naturally relaxed beside the index finger in ready stance; fold snugly across curled knuckles in fist
+      const thumbProxX = THREE.MathUtils.lerp(
+        THREE.MathUtils.lerp(-0.04, -0.14, relaxT),
+        -0.56,
+        fistT,
       );
+      const thumbProxY = THREE.MathUtils.lerp(
+        THREE.MathUtils.lerp(s * 0.24, s * 0.28, relaxT),
+        -s * 0.24,
+        fistT,
+      );
+      const thumbProxZ = THREE.MathUtils.lerp(
+        THREE.MathUtils.lerp(0, -s * 0.06, relaxT),
+        s * 0.12,
+        fistT,
+      );
+      hand.thumbProx.rotation.set(thumbProxX, thumbProxY, thumbProxZ);
       hand.thumbDist.rotation.set(
-        THREE.MathUtils.lerp(-0.06, THREE.MathUtils.lerp(-0.24, -0.78, fistT), relaxT),
-        0,
+        THREE.MathUtils.lerp(THREE.MathUtils.lerp(-0.06, -0.18, relaxT), -0.24, fistT),
+        THREE.MathUtils.lerp(THREE.MathUtils.lerp(0, -s * 0.12, relaxT), -s * 1.05, fistT),
         0,
       );
       return;

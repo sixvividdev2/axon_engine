@@ -17,6 +17,8 @@ import {
   createRaycastResult,
   DEFAULT_BODYCAM_SDK_CONFIG,
   DEFAULT_TRAUMA_MODIFIERS,
+  GrenadeDetonationEvent,
+  GrenadeHoldStage,
   IBodycamWorldAdapter,
   operatorAssetLoader,
   OperatorGearConfig,
@@ -26,6 +28,8 @@ import {
   ScopeRenderer,
   SDK_WEAPON_PROFILES,
   solveZeroPitchRad,
+  TacticalGrenadeSystem,
+  tacticalEquipmentStore,
   WeaponRig,
 } from '../bodycam-sdk';
 import {
@@ -44,6 +48,11 @@ import {
 } from '../data/calibers';
 import { graphicsQualityStore } from '../data/graphicsQuality';
 import { loadoutStore } from '../data/loadoutStore';
+import {
+  DEFAULT_TACTICAL_EQUIPMENT_ID,
+  getTacticalEquipmentDef,
+  TacticalEquipmentId,
+} from '../data/tacticalEquipment';
 import { DoorInteractOptionId } from '../doors/DestructibleDoorSystem';
 import { PlayerInteractAnimator } from '../doors/PlayerInteractAnimator';
 import { GunWallSwapChoreography } from './GunWallSwapChoreography';
@@ -89,10 +98,17 @@ export interface HideoutSnapshot {
   zeroDistanceM: number;
   hasVariableZoom: boolean;
   activeOpticZoom: number;
+  armedAdsMode: AdsMode;
   fireModeLabel: string;
   ammoInMag: number;
   magCapacity: number;
   ammoReserve: number;
+  grenadeDrawn: boolean;
+  grenadeHoldStage: GrenadeHoldStage;
+  grenadeName: string;
+  grenadeCount: number;
+  nvgActive: boolean;
+  irActive: boolean;
   isSwappingGunWall: boolean;
   interactReticleState: InteractReticleState;
   prompt: HideoutPromptState | null;
@@ -135,6 +151,9 @@ export class HideoutSessionController {
   private readonly postProcess: BodycamPostProcess;
   private readonly scopeRenderer: ScopeRenderer;
   private readonly swapChoreography: GunWallSwapChoreography;
+  private readonly grenadeSystem: TacticalGrenadeSystem;
+  private readonly irIlluminatorLight: THREE.SpotLight;
+  private readonly irIlluminatorTarget: THREE.Object3D;
   private readonly interactAnimator = new PlayerInteractAnimator();
   private readonly unsubOperatorGear: () => void;
   private readonly unsubLoadout: () => void;
@@ -161,6 +180,11 @@ export class HideoutSessionController {
   private equippedWeaponId = 'm4a1';
   private magAmmoByWeapon: Record<string, number> = {};
   private fireModeOverrideByWeapon: Record<string, 'auto' | 'semi'> = {};
+  private adsModeByWeapon: Record<string, AdsMode> = {};
+  private tacticalEquipmentId: TacticalEquipmentId = DEFAULT_TACTICAL_EQUIPMENT_ID;
+  private grenadeCount = 2;
+  private nvgFlipped = false;
+  private irIlluminatorOn = false;
   private isFiring = false;
   private semiTriggerConsumed = false;
   private fireCooldown = 0;
@@ -285,6 +309,7 @@ export class HideoutSessionController {
     this.world.doorSystem.setAudioVolume(this.config.masterVolume);
     this.world.gunRange.setAudioVolume(this.config.masterVolume);
     this.world.longRangeGallery.setAudioVolume(this.config.masterVolume);
+    this.world.electronics.setAudioVolume(this.config.masterVolume);
     this.ballistics = new BallisticsSolver(this.scene);
 
     this.adapter = this.world.physics.createAdapter({
@@ -305,7 +330,21 @@ export class HideoutSessionController {
           }
           return;
         }
-        // Allow kicking/bashing reactive range targets or the start paddle up close
+        // Check destructible bunker electronics (consoles, monitors, chronograph, lights, strobes)
+        const elecHit = this.world.electronics.handleImpact(
+          ev.object,
+          ev.point,
+          ev.normal,
+          this._camPos,
+        );
+        if (elecHit) {
+          if (!elecHit.alreadyBroken) {
+            this.showToast(`${elecHit.label} Damaged`);
+          }
+          this.emitSnapshot(true);
+          return;
+        }
+        // Allow kicking/bashing/punching reactive range targets or the start paddle up close
         if (ev.object?.userData?.hideoutRangeTarget) {
           const rangeHit = this.world.gunRange.handleBallisticImpact(
             {
@@ -332,6 +371,36 @@ export class HideoutSessionController {
           );
           if (rangeHit) {
             this.audio.playImpact(ev.point, rangeHit.isSteel ? 'steel_plate' : 'paper');
+            this.emitSnapshot(true);
+          }
+          return;
+        }
+        if (ev.object?.userData?.hideoutLongRangeTarget) {
+          const lrHit = this.world.longRangeGallery.handleBallisticImpact(
+            {
+              outcome: 'stop',
+              ammo: getDefaultAmmoVariant('9x19'),
+              weaponId: this.equippedWeaponId,
+              material: 'steel',
+              surface: 'metal',
+              object: ev.object,
+              point: ev.point,
+              normal: ev.normal,
+              incomingDir: ev.direction,
+              outgoingDir: ev.direction,
+              impactSpeedMs: 12,
+              impactEnergyJ: 120,
+              grazingAngleDeg: 90,
+              distanceM: 1,
+              isFragment: false,
+              bounceIndex: 0,
+              exitPoint: ev.point,
+              penetrationThicknessM: 0,
+            },
+            this._camPos,
+          );
+          if (lrHit) {
+            this.audio.playImpact(ev.point, lrHit.isSteel ? 'steel_plate' : 'paper');
             this.emitSnapshot(true);
           }
         }
@@ -370,6 +439,38 @@ export class HideoutSessionController {
 
     this.animator = new CharacterAnimator(this.skeleton, this.weaponRig, this.audio);
     this.controller = new BodycamController(this.camera, this.weaponRig, this.audio);
+
+    // IR illuminator spotlight attached to helmet/camera when NVG + IR Flood active
+    this.irIlluminatorTarget = new THREE.Object3D();
+    this.irIlluminatorTarget.position.set(0, 0, -10);
+    this.camera.add(this.irIlluminatorTarget);
+    this.irIlluminatorLight = new THREE.SpotLight(0xd8ffd8, 7.5, 42, Math.PI * 0.28, 0.55, 1.25);
+    this.irIlluminatorLight.position.set(0.06, 0.04, 0);
+    this.irIlluminatorLight.target = this.irIlluminatorTarget;
+    this.irIlluminatorLight.visible = false;
+    this.camera.add(this.irIlluminatorLight);
+
+    // Tactical Equipment / Grenade System (slot [4] / [H])
+    const activeLoadout = loadoutStore.getActiveSlot();
+    const initialEquip = tacticalEquipmentStore.getSelection();
+    this.tacticalEquipmentId = activeLoadout.tacticalEquipmentId ?? initialEquip.equipmentId;
+    this.grenadeCount = getTacticalEquipmentDef(this.tacticalEquipmentId).maxCarry;
+    this.grenadeSystem = new TacticalGrenadeSystem({
+      scene: this.scene,
+      physics: this.adapter,
+      worldRaycastMeshes: this.world.raycastMeshes,
+      worldBounds: {
+        minX: this.world.physics.boundsMinX,
+        maxX: this.world.physics.boundsMaxX,
+        minZ: this.world.physics.boundsMinZ,
+        maxZ: this.world.physics.boundsMaxZ,
+      },
+      audio: this.audio,
+      onDetonate: (ev) => this.handleGrenadeDetonation(ev),
+      onInHandDetonate: (ev) => this.handleGrenadeDetonation(ev, true),
+    });
+    this.animator.setGrenadeSystem(this.grenadeSystem);
+    this.syncBeltEquipmentMesh();
 
     // Spawn player inside the Arsenal Room facing the lit 3D Gun Wall (-Z)
     this.controller.position.set(0, 0, 1.95);
@@ -413,7 +514,7 @@ export class HideoutSessionController {
       sp.cantBlend = rigState.cantBlend;
       sp.opticParallaxStrength = this.config.opticParallaxStrength ?? 1.0;
       sp.reticleIlluminated = this.weaponRig.reticleIlluminated;
-      sp.flashlightOn = false;
+      sp.flashlightOn = this.weaponRig.flashlight.intensity > 0.1;
       sp.sightMisalignYaw = rigState.sightMisalignYaw;
       sp.sightMisalignPitch = rigState.sightMisalignPitch;
       sp.elapsed = this.elapsedSec;
@@ -456,9 +557,20 @@ export class HideoutSessionController {
       this.skeleton.applyGearConfig(nextGear);
       this.skeleton.setFirstPersonHeadShadowOnly(true);
       this.skeleton.enableArmViewmodelLayer();
+      if (nextGear.nvgMount === 'none' && this.nvgFlipped) {
+        this.nvgFlipped = false;
+        this.irIlluminatorOn = false;
+      }
+      this.syncNvgRuntime();
     });
 
     this.unsubLoadout = loadoutStore.subscribe(() => {
+      const slot = loadoutStore.getActiveSlot();
+      if (slot.tacticalEquipmentId !== this.tacticalEquipmentId) {
+        this.tacticalEquipmentId = slot.tacticalEquipmentId;
+        this.grenadeCount = getTacticalEquipmentDef(this.tacticalEquipmentId).maxCarry;
+        this.syncBeltEquipmentMesh();
+      }
       // Refresh currently held weapon attachments & Gun Wall mounted builds live
       if (!this.swapChoreography.isActive()) {
         this.applyEquippedWeaponRig(this.equippedWeaponId, false);
@@ -530,6 +642,7 @@ export class HideoutSessionController {
     this.world.doorSystem.setAudioVolume(clamped);
     this.world.gunRange.setAudioVolume(clamped);
     this.world.longRangeGallery.setAudioVolume(clamped);
+    this.world.electronics.setAudioVolume(clamped);
     this.emitSnapshot(true);
   }
 
@@ -580,6 +693,16 @@ export class HideoutSessionController {
     this.weaponRig.setWeaponProfile(profile, attachments);
     this.weaponRig.root.visible = !this.swapChoreography.isActive();
 
+    if (weaponId === 'unarmed') {
+      this.input.adsMode = 'PRIMARY';
+    } else {
+      // Validate armed aim mode if canted optic was removed at Gunsmith
+      if (this.adsModeByWeapon[profile.id] === 'CANTED' && !this.weaponRig.hasCantedOptic()) {
+        this.adsModeByWeapon[profile.id] = 'PRIMARY';
+      }
+      this.input.adsMode = this.getArmedAdsMode(profile.id);
+    }
+
     if (weaponId !== 'unarmed' && this.magAmmoByWeapon[profile.id] === undefined) {
       this.magAmmoByWeapon[profile.id] = profile.magCapacity;
     }
@@ -589,6 +712,221 @@ export class HideoutSessionController {
     if (playCue) {
       this.audio.playGearRattle('weapon_swap', 0.5);
     }
+  }
+
+  private getArmedAdsMode(weaponId = this.equippedWeaponId): AdsMode {
+    if (weaponId === 'unarmed') return 'PRIMARY';
+    const stored = this.adsModeByWeapon[weaponId] ?? 'PRIMARY';
+    if (stored === 'CANTED' && !this.weaponRig.hasCantedOptic()) {
+      this.adsModeByWeapon[weaponId] = 'PRIMARY';
+      return 'PRIMARY';
+    }
+    return stored;
+  }
+
+  private cycleAimMode(): void {
+    if (
+      this.equippedWeaponId === 'unarmed' ||
+      this.swapChoreography.isActive() ||
+      this.grenadeSystem.isDrawn() ||
+      this.weaponRig.isSuppressorActionActive()
+    ) {
+      return;
+    }
+    const prof = resolveWeaponProfile(this.equippedWeaponId);
+    const hasCanted = this.weaponRig.hasCantedOptic();
+    const order: AdsMode[] = hasCanted ? ['PRIMARY', 'CANTED', 'POINT_AIM'] : ['PRIMARY', 'POINT_AIM'];
+    const cur = this.getArmedAdsMode(prof.id);
+    const curIdx = order.indexOf(cur);
+    const next = order[(curIdx + 1) % order.length];
+    this.adsModeByWeapon[prof.id] = next;
+    this.input.adsMode = next;
+    this.audio.playTacticalSwitchClick(next !== 'PRIMARY');
+    const label =
+      next === 'POINT_AIM'
+        ? 'Point Aim Armed (RMB)'
+        : next === 'CANTED'
+          ? 'Canted Optic Armed (RMB)'
+          : 'Primary Optic ADS (RMB)';
+    this.showToast(label);
+    this.emitSnapshot(true);
+  }
+
+  private equipHideoutSlot(slot: 1 | 2 | 3): void {
+    if (this.swapChoreography.isActive() || this.weaponRig.isSuppressorActionActive()) return;
+    if (this.grenadeSystem.isDrawn()) {
+      this.handleGrenadeHolsterOrToss();
+    }
+    let nextId = 'unarmed';
+    if (slot === 1) {
+      const loadout = loadoutStore.getActiveSlot();
+      nextId = this.callbacks.isWeaponUnlocked(loadout.primaryWeaponId)
+        ? loadout.primaryWeaponId
+        : 'm4a1';
+    } else if (slot === 2) {
+      const loadout = loadoutStore.getActiveSlot();
+      nextId = this.callbacks.isWeaponUnlocked(loadout.secondaryWeaponId)
+        ? loadout.secondaryWeaponId
+        : 'glock_17';
+    }
+    if (nextId === this.equippedWeaponId) return;
+    this.input.ads = false;
+    this.isFiring = false;
+    this.semiTriggerConsumed = false;
+    hideoutStateStore.setEquippedWeaponDirect(nextId);
+    this.world.syncGunWallSlots(hideoutStateStore.getState().wallRackSlots);
+    this.applyEquippedWeaponRig(nextId, true);
+    const prof = resolveWeaponProfile(nextId);
+    this.showToast(nextId === 'unarmed' ? 'Unarmed (Fists)' : `Equipped ${prof.name}`);
+    this.emitSnapshot(true);
+  }
+
+  private syncBeltEquipmentMesh(): void {
+    const sel = tacticalEquipmentStore.getSelection();
+    this.skeleton.setBeltEquipment(
+      this.tacticalEquipmentId,
+      sel.beltSlot,
+      this.grenadeCount,
+      sel.mountOnBelt,
+    );
+  }
+
+  private handleGrenadeHolsterOrToss(): void {
+    if (!this.grenadeSystem.isDrawn()) return;
+    this.camera.getWorldPosition(this._camPos);
+    this.camera.getWorldDirection(this._lookDir).normalize();
+    const outcome = this.grenadeSystem.holsterOrTossOnSwitch(this._camPos, this._lookDir);
+    if (outcome === 'tossed') {
+      this.grenadeCount = Math.max(0, this.grenadeCount - 1);
+      this.syncBeltEquipmentMesh();
+      this.showToast('Live Grenade Tossed Clear');
+    } else if (outcome === 'holstered') {
+      this.showToast('Ordnance Holstered');
+    }
+  }
+
+  private drawOrHolsterGrenade(): void {
+    if (this.swapChoreography.isActive() || this.weaponRig.isSuppressorActionActive()) return;
+    if (this.grenadeSystem.isDrawn()) {
+      this.handleGrenadeHolsterOrToss();
+      this.emitSnapshot(true);
+      return;
+    }
+    if (this.grenadeCount <= 0) {
+      this.showToast('No Ordnance Remaining — Resupply at Ammo Box');
+      return;
+    }
+    this.isFiring = false;
+    this.input.ads = false;
+    this.reloadTimer = 0;
+    this.pendingReloadWeaponId = null;
+    if (this.weaponRig.isTubularReloading()) {
+      this.weaponRig.interruptTubularReload();
+    }
+    const def = getTacticalEquipmentDef(this.tacticalEquipmentId);
+    this.grenadeSystem.drawGrenade(def.id);
+    this.audio.playGearRattle('weapon_swap', 0.55);
+    this.showToast(`${def.shortName} Ready · [RMB] Pin/Spoon · [LMB] Throw`);
+    this.emitSnapshot(true);
+  }
+
+  private handleGrenadeDetonation(ev: GrenadeDetonationEvent, _inHand = false): void {
+    this.camera.getWorldPosition(this._camPos);
+    const dist = this._camPos.distanceTo(ev.position);
+    if (dist < 14) {
+      const shake = THREE.MathUtils.clamp(1 - dist / 14, 0.15, 1.0);
+      this.controller.applyRecoil(0.055 * shake, (Math.random() - 0.5) * 0.05 * shake, 0.02, 0.5);
+    }
+    if (ev.kind === 'flash' && dist < 16) {
+      this.postProcess.triggerNvgFlashSpike(1.2);
+    } else if (dist < 12) {
+      this.postProcess.triggerNvgFlashSpike(0.65);
+    }
+    // Blast shatters all Hideout electronic props & overhead lights within 6.5m
+    const broken = this.world.electronics.handleExplosion(ev.position, 6.5, this._camPos);
+    if (broken.length > 0) {
+      this.showToast(
+        broken.length === 1
+          ? `${broken[0].label} Destroyed`
+          : `${broken.length} Electronic Fixtures Destroyed`,
+      );
+    }
+    this.emitSnapshot(true);
+  }
+
+  private syncNvgRuntime(): void {
+    const mount = this.localGear.nvgMount;
+    const active = mount !== 'none' && this.nvgFlipped;
+    const irActive = active && this.irIlluminatorOn;
+    this.skeleton.setNvgFlipped(active);
+    this.postProcess.setNvgState(mount, active, irActive);
+    this.irIlluminatorLight.visible = irActive;
+    this.weaponRig.setNvgOpticalActive(active);
+    this.weaponRig.setIrLaserActive(irActive);
+    this.audio.setNvgTubeHum(active);
+  }
+
+  private toggleNvg(): void {
+    if (this.localGear.nvgMount === 'none') {
+      this.showToast('No NVG Mounted — Equip NVG in Operator Gear Locker');
+      return;
+    }
+    this.nvgFlipped = !this.nvgFlipped;
+    if (!this.nvgFlipped) {
+      this.irIlluminatorOn = false;
+    }
+    this.audio.playNvgFlipSound(this.nvgFlipped);
+    this.syncNvgRuntime();
+    const label = this.localGear.nvgMount === 'arnvg' ? 'RNVG-A (P45)' : 'PVS-7 NL2 (P43)';
+    this.showToast(this.nvgFlipped ? `${label} Deployed · [N] IR Flood` : `${label} Stowed`);
+    this.emitSnapshot(true);
+  }
+
+  private toggleIrOrReticle(): void {
+    if (this.nvgFlipped && this.localGear.nvgMount !== 'none') {
+      this.irIlluminatorOn = !this.irIlluminatorOn;
+      this.audio.playIrIlluminatorClick(this.irIlluminatorOn);
+      this.syncNvgRuntime();
+      this.showToast(this.irIlluminatorOn ? 'IR Illuminator + IR Laser: ON' : 'IR Illuminator: OFF');
+      this.emitSnapshot(true);
+      return;
+    }
+    if (this.equippedWeaponId !== 'unarmed') {
+      this.weaponRig.toggleReticleIllumination();
+      this.audio.playTacticalSwitchClick(this.weaponRig.reticleIlluminated);
+      this.showToast(
+        this.weaponRig.reticleIlluminated ? 'Optic Reticle Illumination: ON' : 'Optic Reticle Illumination: OFF',
+      );
+      this.emitSnapshot(true);
+    }
+  }
+
+  private toggleSuppressor(): void {
+    if (
+      this.equippedWeaponId === 'unarmed' ||
+      this.swapChoreography.isActive() ||
+      this.grenadeSystem.isDrawn() ||
+      this.reloadTimer > 0 ||
+      this.weaponRig.isTubularReloading()
+    ) {
+      return;
+    }
+    const weaponId = this.equippedWeaponId;
+    const res = this.weaponRig.triggerFieldSuppressorToggle((nowAttached) => {
+      if (this.equippedWeaponId !== weaponId) return;
+      this.syncWeaponBallistics();
+      this.showToast(nowAttached ? 'Suppressor Attached' : 'Suppressor Stowed');
+      this.emitSnapshot(true);
+    });
+    if (res === 'no_suppressor') {
+      this.showToast('No Suppressor Equipped');
+      return;
+    }
+    if (res === 'busy') return;
+    this.isFiring = false;
+    this.input.ads = false;
+    this.showToast(res === 'started_attach' ? 'Attaching Suppressor...' : 'Stowing Suppressor...');
+    this.emitSnapshot(true);
   }
 
   private getActiveBaseCaliberId(weaponId = this.equippedWeaponId): string {
@@ -736,8 +1074,10 @@ export class HideoutSessionController {
       this.magAmmoByWeapon[prof.id] = prof.magCapacity;
       this.weaponRig.setAmmoState(prof.magCapacity, true);
     }
+    this.grenadeCount = getTacticalEquipmentDef(this.tacticalEquipmentId).maxCarry;
+    this.syncBeltEquipmentMesh();
     this.audio.playWeaponCue('mag_in', { intensity: 0.85 });
-    this.showToast('Ammunition Resupplied');
+    this.showToast('Ammunition & Ordnance Resupplied');
     this.emitSnapshot(true);
   }
 
@@ -879,6 +1219,20 @@ export class HideoutSessionController {
         Math.max(16, ev.impactEnergyJ * 0.02),
       );
       this.audio.playImpact(ev.point, 'wood');
+      return;
+    }
+
+    const elecHit = this.world.electronics.handleImpact(
+      ev.object,
+      ev.point,
+      ev.normal,
+      this._camPos,
+    );
+    if (elecHit) {
+      if (!elecHit.alreadyBroken) {
+        this.showToast(`${elecHit.label} Damaged`);
+      }
+      this.emitSnapshot(true);
       return;
     }
 
@@ -1087,6 +1441,11 @@ export class HideoutSessionController {
         break;
       }
       case 'range_console': {
+        if (this.world.gunRange.isConsoleBroken()) {
+          this.audio.playWeaponCue('dryfire', { intensity: 0.45 });
+          this.showToast('Range Console Damaged — Reload Hideout to Repair');
+          break;
+        }
         if (this.world.getPropInteractPos('range_console', this._ikTargetPos)) {
           this.interactAnimator.trigger('PROP_INTERACT', this._ikTargetPos);
         }
@@ -1109,6 +1468,11 @@ export class HideoutSessionController {
         break;
       }
       case 'ballistics_console': {
+        if (this.world.longRangeGallery.isConsoleBroken()) {
+          this.audio.playWeaponCue('dryfire', { intensity: 0.45 });
+          this.showToast('Ballistics Console Damaged — Reload Hideout to Repair');
+          break;
+        }
         if (this.world.getPropInteractPos('ballistics_console', this._ikTargetPos)) {
           this.interactAnimator.trigger('PROP_INTERACT', this._ikTargetPos);
         }
@@ -1374,6 +1738,16 @@ export class HideoutSessionController {
     }
 
     if (meta.kind === 'range_console') {
+      if (this.world.gunRange.isConsoleBroken()) {
+        this.selectedOptionIndex = 0;
+        this.activePrompt = {
+          key: 'F',
+          targetLabel: 'Range Control Console',
+          options: [{ id: 'broken_console', label: 'Console Damaged', hint: 'Reload to Repair' }],
+          selectedIndex: 0,
+        };
+        return;
+      }
       const running = this.world.gunRange.isCourseRunning();
       const opts: HideoutPromptOption[] = [
         running
@@ -1393,6 +1767,16 @@ export class HideoutSessionController {
     }
 
     if (meta.kind === 'ballistics_console') {
+      if (this.world.longRangeGallery.isConsoleBroken()) {
+        this.selectedOptionIndex = 0;
+        this.activePrompt = {
+          key: 'F',
+          targetLabel: 'Ballistics Control Console',
+          options: [{ id: 'broken_console', label: 'Console Damaged', hint: 'Reload to Repair' }],
+          selectedIndex: 0,
+        };
+        return;
+      }
       const curDist = this.world.longRangeGallery.getTrolleyDistanceM();
       const nextDist = this.world.longRangeGallery.getNextTrolleyDistanceM();
       const zeroM = this.getZeroDistanceForWeapon(this.equippedWeaponId);
@@ -1451,6 +1835,9 @@ export class HideoutSessionController {
   };
 
   private readonly onMouseDown = (e: MouseEvent): void => {
+    if (e.button === 1) {
+      e.preventDefault();
+    }
     if (this.modalActive || this.pauseOpen) return;
     if (!this.pointerLocked) {
       if (e.target === this.renderer.domElement) {
@@ -1460,10 +1847,46 @@ export class HideoutSessionController {
     }
     this.audio.ensureInitialized();
     this.audio.setInteriorAcoustics(true, 'concrete');
+
+    // Authentic 4-stage grenade Manual of Arms when ordnance is drawn
+    if (this.grenadeSystem.isDrawn()) {
+      this.input.ads = false;
+      const stage = this.grenadeSystem.getHoldStage();
+      if (e.button === 2) {
+        if (stage === 'DRAWN') {
+          if (this.grenadeSystem.pullPin()) {
+            this.emitSnapshot(true);
+          }
+        } else if (stage === 'PIN_PULLED') {
+          if (this.grenadeSystem.releaseLever()) {
+            this.emitSnapshot(true);
+          }
+        }
+      } else if (e.button === 0 && (stage === 'PIN_PULLED' || stage === 'LEVER_RELEASED')) {
+        this.grenadeSystem.beginThrowInput();
+        this.emitSnapshot(true);
+      }
+      return;
+    }
+
+    if (e.button === 1) {
+      this.cycleAimMode();
+      return;
+    }
+
     if (e.button === 2 && !this.swapChoreography.isActive()) {
       this.animator.interruptInspect();
       this.input.ads = true;
-    } else if (e.button === 0 && this.equippedWeaponId !== 'unarmed' && !this.swapChoreography.isActive()) {
+    } else if (e.button === 0 && !this.swapChoreography.isActive()) {
+      if (this.equippedWeaponId === 'unarmed') {
+        // Unarmed jab (hip) or heavy power hook (holding RMB ready fists) works anywhere in Hideout
+        this.animator.interruptInspect();
+        this.animator.triggerUnarmedPunch(
+          this.controller,
+          this.input.ads && !this.controller.isSprinting,
+        );
+        return;
+      }
       const room = resolveHideoutRoom(this.controller.position.x, this.controller.position.z);
       if (room.id === 'gun_range') {
         this.currentRoomId = room.id;
@@ -1477,8 +1900,18 @@ export class HideoutSessionController {
     }
   };
 
+  private readonly onAuxClick = (e: MouseEvent): void => {
+    if (e.button === 1) {
+      e.preventDefault();
+    }
+  };
+
   private readonly onMouseUp = (e: MouseEvent): void => {
     if (e.button === 0) {
+      if (this.grenadeSystem.isThrowInputHeld()) {
+        this.grenadeSystem.releaseThrowInput();
+        this.emitSnapshot(true);
+      }
       this.isFiring = false;
       this.semiTriggerConsumed = false;
     } else if (e.button === 2) {
@@ -1645,14 +2078,31 @@ export class HideoutSessionController {
       case 'KeyL':
         if (!e.repeat && this.equippedWeaponId !== 'unarmed') {
           this.weaponRig.laserOn = !this.weaponRig.laserOn;
-          this.audio.playWeaponCue('mode_toggle', { intensity: 0.45 });
+          this.audio.playTacticalSwitchClick(this.weaponRig.laserOn);
+          this.showToast(this.weaponRig.laserOn ? 'Laser Sight: ON' : 'Laser Sight: OFF');
         }
         break;
       case 'KeyT':
         if (!e.repeat && this.equippedWeaponId !== 'unarmed') {
           const on = this.weaponRig.flashlight.intensity <= 0.1;
           this.weaponRig.flashlight.intensity = on ? 6.5 : 0;
-          this.audio.playWeaponCue('mode_toggle', { intensity: 0.45 });
+          this.audio.playTacticalSwitchClick(on);
+          this.showToast(on ? 'Weapon Light: ON' : 'Weapon Light: OFF');
+        }
+        break;
+      case 'KeyJ':
+        if (!e.repeat) {
+          this.toggleNvg();
+        }
+        break;
+      case 'KeyN':
+        if (!e.repeat) {
+          this.toggleIrOrReticle();
+        }
+        break;
+      case 'KeyG':
+        if (!e.repeat) {
+          this.toggleSuppressor();
         }
         break;
       case 'BracketRight':
@@ -1675,12 +2125,26 @@ export class HideoutSessionController {
           this.cycleZeroDistance(-1);
         }
         break;
+      case 'Digit1':
+        if (!e.repeat) {
+          this.equipHideoutSlot(1);
+        }
+        break;
+      case 'Digit2':
+        if (!e.repeat) {
+          this.equipHideoutSlot(2);
+        }
+        break;
+      case 'Digit3':
       case 'Digit0':
-        if (!e.repeat && !this.swapChoreography.isActive() && this.equippedWeaponId !== 'unarmed') {
-          hideoutStateStore.setEquippedWeaponDirect('unarmed');
-          this.world.syncGunWallSlots(hideoutStateStore.getState().wallRackSlots);
-          this.applyEquippedWeaponRig('unarmed', true);
-          this.emitSnapshot(true);
+        if (!e.repeat) {
+          this.equipHideoutSlot(3);
+        }
+        break;
+      case 'Digit4':
+      case 'KeyH':
+        if (!e.repeat) {
+          this.drawOrHolsterGrenade();
         }
         break;
     }
@@ -1737,6 +2201,7 @@ export class HideoutSessionController {
     document.addEventListener('pointerlockchange', this.onPointerLockChange);
     window.addEventListener('mousemove', this.onMouseMove);
     window.addEventListener('mousedown', this.onMouseDown);
+    window.addEventListener('auxclick', this.onAuxClick);
     window.addEventListener('mouseup', this.onMouseUp);
     window.addEventListener('wheel', this.onWheel, { passive: false });
     window.addEventListener('contextmenu', this.onContextMenu);
@@ -1802,11 +2267,24 @@ export class HideoutSessionController {
 
     if (!this.contextLost) {
       const swapping = this.swapChoreography.isActive();
-      this.input.sprint = this.shiftHeld && this.input.forward && !this.input.ads && !swapping;
-      this.input.holdBreath = this.shiftHeld && this.input.ads && !swapping;
-      this.input.adsMode = 'PRIMARY' as AdsMode;
+      const suppBusy = this.weaponRig.isSuppressorActionActive();
+      const grenadeDrawn = this.grenadeSystem.isDrawn();
+      if (suppBusy || grenadeDrawn) {
+        this.input.ads = false;
+      }
 
       const profile = this.getWeaponProfile(this.equippedWeaponId);
+      const baseAdsMode = this.getArmedAdsMode(profile.id);
+      const nodsForceCant =
+        this.nvgFlipped &&
+        this.localGear.nvgMount !== 'none' &&
+        this.input.ads &&
+        baseAdsMode === 'PRIMARY' &&
+        this.weaponRig.shouldForceNodsCantedAim(true);
+      this.input.adsMode = nodsForceCant ? 'POINT_AIM' : baseAdsMode;
+      this.input.sprint =
+        !suppBusy && this.shiftHeld && this.input.forward && !this.input.ads && !swapping;
+      this.input.holdBreath = !suppBusy && this.shiftHeld && this.input.ads && !swapping;
 
       // Step fire cooldown & box-magazine reload timer
       if (this.fireCooldown > 0) {
@@ -1844,9 +2322,9 @@ export class HideoutSessionController {
         100,
       );
 
-      // Update interactive Arsenal props, Gun Range targets/course & destructible bunker doors
-      this.world.updateProps(dt);
+      // Update interactive Arsenal props, Gun Range targets/course, destructible electronics & doors
       this.camera.getWorldPosition(this._camPos);
+      this.world.updateProps(dt, this._camPos);
       this.world.doorSystem.update(dt, this._camPos);
 
       // Update Gun Wall two-handed swap choreography or 1P left-hand interact IK BEFORE CharacterAnimator
@@ -1904,8 +2382,22 @@ export class HideoutSessionController {
         this.tryFireShot();
       }
 
-      // Step live ballistic projectiles, tracers, sparks & target/door impacts
+      // Step live ballistic projectiles, tracers, sparks, grenades & target/door/electronic impacts
       this.ballistics.update(dt, this.adapter, (ev) => this.handleBallisticImpact(ev));
+
+      const wasLiveGrenade = this.grenadeSystem.isLeverReleased();
+      this.grenadeSystem.update(dt, this._camPos);
+      const launched = this.grenadeSystem.consumeLastLaunchedThrow();
+      if (launched) {
+        this.grenadeCount = Math.max(0, this.grenadeCount - 1);
+        this.syncBeltEquipmentMesh();
+        this.audio.playGearRattle('weapon_swap', 0.65);
+        this.emitSnapshot(true);
+      } else if (wasLiveGrenade && !this.grenadeSystem.isLeverReleased()) {
+        this.grenadeCount = Math.max(0, this.grenadeCount - 1);
+        this.syncBeltEquipmentMesh();
+        this.emitSnapshot(true);
+      }
 
       const prevSig = this.activePrompt
         ? `${this.activePrompt.targetLabel ?? ''}|${this.activePrompt.selectedIndex}|${this.activePrompt.options.map((o) => `${o.id}:${o.label}:${o.hint ?? ''}`).join(',')}`
@@ -1950,6 +2442,7 @@ export class HideoutSessionController {
         : (this.magAmmoByWeapon[prof.id] ?? prof.magCapacity);
     const activeAmmo =
       this.equippedWeaponId === 'unarmed' ? null : this.getActiveAmmoVariant(prof.id);
+    const grenadeDef = getTacticalEquipmentDef(this.tacticalEquipmentId);
     return {
       pointerLocked: this.pointerLocked,
       pauseOpen: this.pauseOpen,
@@ -1962,10 +2455,17 @@ export class HideoutSessionController {
       zeroDistanceM: this.getZeroDistanceForWeapon(this.equippedWeaponId),
       hasVariableZoom: this.weaponRig.hasVariableZoom(),
       activeOpticZoom: this.weaponRig.getActiveOpticZoomMult(),
+      armedAdsMode: this.getArmedAdsMode(this.equippedWeaponId),
       fireModeLabel: this.getFireModeLabel(prof),
       ammoInMag,
       magCapacity: this.equippedWeaponId === 'unarmed' ? 0 : prof.magCapacity,
       ammoReserve: hideoutStateStore.getReserveForWeapon(this.equippedWeaponId),
+      grenadeDrawn: this.grenadeSystem.isDrawn(),
+      grenadeHoldStage: this.grenadeSystem.getHoldStage(),
+      grenadeName: grenadeDef.shortName,
+      grenadeCount: this.grenadeCount,
+      nvgActive: this.nvgFlipped && this.localGear.nvgMount !== 'none',
+      irActive: this.nvgFlipped && this.localGear.nvgMount !== 'none' && this.irIlluminatorOn,
       isSwappingGunWall: this.swapChoreography.isActive(),
       interactReticleState: this.interactReticleState,
       prompt: this.activePrompt
@@ -2000,6 +2500,7 @@ export class HideoutSessionController {
     document.removeEventListener('pointerlockchange', this.onPointerLockChange);
     window.removeEventListener('mousemove', this.onMouseMove);
     window.removeEventListener('mousedown', this.onMouseDown);
+    window.removeEventListener('auxclick', this.onAuxClick);
     window.removeEventListener('mouseup', this.onMouseUp);
     window.removeEventListener('wheel', this.onWheel);
     window.removeEventListener('contextmenu', this.onContextMenu);
@@ -2011,6 +2512,7 @@ export class HideoutSessionController {
 
     this.unsubOperatorGear();
     this.unsubLoadout();
+    this.grenadeSystem.dispose();
     this.ballistics.dispose();
     this.scene.remove(this.ballistics.group);
     this.swapChoreography.dispose();

@@ -5,6 +5,7 @@ import {
   BodycamSurfaceMaterial,
 } from '../bodycam-sdk';
 import { HideoutInteractableMeta } from './HideoutBunkerWorld';
+import { HideoutElectronicsSystem } from './HideoutElectronicsSystem';
 import { HideoutMaterialLibrary } from './HideoutMaterials';
 
 export type LongRangeTargetKind =
@@ -83,6 +84,7 @@ interface LongRangeSteelTarget {
   angVel: number;
   flashTimerSec: number;
   beaconTimerSec: number;
+  beaconBroken?: boolean;
 }
 
 interface PenetrationPanel {
@@ -519,11 +521,16 @@ export class HideoutLongRangeGallery {
 
   // Zero-GC scratch
   private readonly _tmpLocalHit = new THREE.Vector3();
+  private readonly electronics: HideoutElectronicsSystem;
+  private consoleBroken = false;
+  private monitorBroken = false;
+  private chronoBroken = false;
 
   constructor(
     parent: THREE.Object3D,
     physics: BodycamPhysicsWorld,
     materials: HideoutMaterialLibrary,
+    electronics: HideoutElectronicsSystem,
     raycastMeshes: THREE.Object3D[],
     interactableMeshes: THREE.Mesh[],
     isSoftwareGl: boolean,
@@ -534,6 +541,7 @@ export class HideoutLongRangeGallery {
   ) {
     this.physics = physics;
     this.materials = materials;
+    this.electronics = electronics;
     this.isSoftwareGl = isSoftwareGl;
     this.maxAniso = maxAniso;
     this.bestMoa100m = initialBestMoa100m;
@@ -550,6 +558,10 @@ export class HideoutLongRangeGallery {
     this.buildPenetrationTestRig(raycastMeshes);
     this.redrawMonitor();
     this.redrawChronoScreen();
+  }
+
+  public isConsoleBroken(): boolean {
+    return this.consoleBroken;
   }
 
   private trackGeo<T extends THREE.BufferGeometry>(g: T): T {
@@ -751,29 +763,6 @@ export class HideoutLongRangeGallery {
     this.root.add(pilasterInst);
     this.root.add(beamInst);
 
-    // Overhead fluorescent tube strips & focused non-shadow bay lights down the 100m tunnel
-    const lightZs = [4.0, 16.0, 28.2, 41.0, 53.2, 66.0, 78.2, 91.0, 102.5];
-    const housingGeo = this.trackGeo(new THREE.BoxGeometry(1.5, 0.08, 0.26));
-    const tubeGeo = this.trackGeo(new THREE.BoxGeometry(1.36, 0.04, 0.14));
-    const housingInst = new THREE.InstancedMesh(housingGeo, this.materials.darkSteel, lightZs.length);
-    const tubeInst = new THREE.InstancedMesh(tubeGeo, this.materials.warmLampEmissive, lightZs.length);
-    for (let i = 0; i < lightZs.length; i++) {
-      dummy.position.set(TUNNEL_CENTER_X, TUNNEL_HEIGHT - 0.14, lightZs[i]);
-      dummy.rotation.set(0, 0, 0);
-      dummy.updateMatrix();
-      housingInst.setMatrixAt(i, dummy.matrix);
-
-      dummy.position.set(TUNNEL_CENTER_X, TUNNEL_HEIGHT - 0.19, lightZs[i]);
-      dummy.updateMatrix();
-      tubeInst.setMatrixAt(i, dummy.matrix);
-    }
-    housingInst.instanceMatrix.needsUpdate = true;
-    housingInst.computeBoundingSphere();
-    tubeInst.instanceMatrix.needsUpdate = true;
-    tubeInst.computeBoundingSphere();
-    this.root.add(housingInst);
-    this.root.add(tubeInst);
-
     // Strategic gallery point lights at firing line + 25m / 50m / 75m / 100m target bays
     const pointLightSpecs: Array<[number, number, number, number, number, number]> = [
       [28.8, 4.1, 2.0, 0xffe4be, 9.5, 18],
@@ -782,10 +771,40 @@ export class HideoutLongRangeGallery {
       [29.2, 4.1, 78.2, 0xdde8f4, 8.8, 30],
       [29.8, 4.0, 102.2, 0xffdfb2, 13.5, 24],
     ];
+    const bayLights: THREE.PointLight[] = [];
     for (const [lx, ly, lz, color, intensity, dist] of pointLightSpecs) {
       const pl = new THREE.PointLight(color, intensity, dist, 1.3);
       pl.position.set(lx, ly, lz);
       this.root.add(pl);
+      bayLights.push(pl);
+    }
+
+    // Overhead fluorescent tube strips (individually breakable and linked to nearest bay light)
+    const lightZs = [4.0, 16.0, 28.2, 41.0, 53.2, 66.0, 78.2, 91.0, 102.5];
+    const housingGeo = this.trackGeo(new THREE.BoxGeometry(1.5, 0.08, 0.26));
+    const tubeGeo = this.trackGeo(new THREE.BoxGeometry(1.36, 0.04, 0.14));
+    for (let i = 0; i < lightZs.length; i++) {
+      const lz = lightZs[i];
+      const housing = new THREE.Mesh(housingGeo, this.materials.darkSteel);
+      housing.position.set(TUNNEL_CENTER_X, TUNNEL_HEIGHT - 0.14, lz);
+      this.root.add(housing);
+      const tube = new THREE.Mesh(tubeGeo, this.materials.warmLampEmissive);
+      tube.position.set(TUNNEL_CENTER_X, TUNNEL_HEIGHT - 0.19, lz);
+      this.root.add(tube);
+
+      const bayIdx = Math.min(bayLights.length - 1, Math.floor(i / 2));
+      this.electronics.registerNode(
+        {
+          id: `lr_lamp_${i}`,
+          label: '100m Gallery Fluorescent Light',
+          hitMeshes: [housing, tube],
+          emissiveMeshes: [tube],
+          linkedLights: [{ light: bayLights[bayIdx], dropFraction: i === lightZs.length - 1 ? 1.0 : 0.5 }],
+          sparkOrigin: new THREE.Vector3(TUNNEL_CENTER_X, TUNNEL_HEIGHT - 0.24, lz),
+          isLightFixture: true,
+        },
+        raycastMeshes,
+      );
     }
 
     // Firing-line safety stripe across Bay 3 (Z = 3.85)
@@ -990,6 +1009,7 @@ export class HideoutLongRangeGallery {
         roughness: 0.4,
       }),
     );
+    const chronoCanopies: THREE.Mesh[] = [];
     for (const sz of [-0.17, 0.17]) {
       for (const sx of [-0.21, 0.21]) {
         const rod = new THREE.Mesh(
@@ -1006,6 +1026,7 @@ export class HideoutLongRangeGallery {
       );
       canopy.position.set(0, 1.56, sz);
       chronoGroup.add(canopy);
+      chronoCanopies.push(canopy);
     }
 
     // Live chronograph LED readout face facing shooter (-Z)
@@ -1031,6 +1052,21 @@ export class HideoutLongRangeGallery {
     chronoScreen.position.set(0, 1.06, -0.215);
     chronoScreen.rotation.y = Math.PI;
     chronoGroup.add(chronoScreen);
+
+    this.electronics.registerNode(
+      {
+        id: 'lr_chronograph',
+        label: 'Optical Chronograph',
+        hitMeshes: [chronoBody, chronoScreen, ...chronoCanopies],
+        emissiveMaterials: [diffuserMat, chronoScreenMat],
+        sparkOrigin: new THREE.Vector3(28.55, 1.12, 4.25),
+        onBreak: () => {
+          this.chronoBroken = true;
+          this.drawBrokenChronoScreen();
+        },
+      },
+      raycastMeshes,
+    );
 
     // === DIEGETIC 3D SPOTTING & BALLISTICS TELEMETRY MONITOR (Right side of bench, X = 30.35, Z = 3.22) ===
     const monGroup = new THREE.Group();
@@ -1078,6 +1114,22 @@ export class HideoutLongRangeGallery {
     monFace.rotation.y = Math.PI;
     monGroup.add(monFace);
 
+    this.electronics.registerNode(
+      {
+        id: 'lr_spotting_monitor',
+        label: 'Ballistics Spotting Monitor',
+        hitMeshes: [monHousing, monFace],
+        emissiveMaterials: [monMat],
+        sparkOrigin: new THREE.Vector3(30.38, benchH + 0.44, 3.12),
+        isLightFixture: true,
+        onBreak: () => {
+          this.monitorBroken = true;
+          this.drawBrokenMonitor();
+        },
+      },
+      raycastMeshes,
+    );
+
     // === BALLISTICS BENCH CONTROL CONSOLE (Left side of bench, X = 26.72, Z = 3.05) ===
     const conGroup = new THREE.Group();
     conGroup.position.set(26.72, benchH, 3.06);
@@ -1100,6 +1152,8 @@ export class HideoutLongRangeGallery {
 
     // 3 tactile color-coded illuminated buttons (Trolley Drive, Optic Zero, Ammo Load)
     const btnColors = [0x38bdf8, 0xf59e0b, 0x22c55e];
+    const conBtns: THREE.Mesh[] = [];
+    const conBtnMats: THREE.MeshStandardMaterial[] = [];
     for (let i = 0; i < 3; i++) {
       const bMat = this.trackMat(
         new THREE.MeshStandardMaterial({
@@ -1113,6 +1167,8 @@ export class HideoutLongRangeGallery {
       btn.rotation.x = Math.PI * 0.5 - 0.45;
       btn.position.set(-0.18 + i * 0.18, 0.19, -0.19);
       conGroup.add(btn);
+      conBtns.push(btn);
+      conBtnMats.push(bMat);
     }
 
     const consoleProxy = new THREE.Mesh(this.trackGeo(new THREE.BoxGeometry(1.05, 0.7, 0.78)), proxyMat);
@@ -1124,6 +1180,20 @@ export class HideoutLongRangeGallery {
     this.root.add(consoleProxy);
     interactableMeshes.push(consoleProxy);
     this.consoleWorldPos.set(26.72, benchH + 0.22, 2.95);
+
+    this.electronics.registerNode(
+      {
+        id: 'lr_ballistics_console',
+        label: 'Ballistics Control Console',
+        hitMeshes: [conBox, conFace, ...conBtns],
+        emissiveMaterials: conBtnMats,
+        sparkOrigin: new THREE.Vector3(26.72, benchH + 0.2, 2.92),
+        onBreak: () => {
+          this.consoleBroken = true;
+        },
+      },
+      raycastMeshes,
+    );
   }
 
   private buildMotorizedTrolley(raycastMeshes: THREE.Object3D[]): void {
@@ -1254,6 +1324,7 @@ export class HideoutLongRangeGallery {
       frame.add(crossbar);
 
       let beaconMat: THREE.MeshStandardMaterial | null = null;
+      let beaconMesh: THREE.Mesh | null = null;
       if (withHitBeacon) {
         beaconMat = this.trackMat(
           new THREE.MeshStandardMaterial({
@@ -1263,12 +1334,12 @@ export class HideoutLongRangeGallery {
             roughness: 0.25,
           }),
         );
-        const beacon = new THREE.Mesh(
+        beaconMesh = new THREE.Mesh(
           this.trackGeo(new THREE.CylinderGeometry(0.085, 0.085, 0.14, 12)),
           beaconMat,
         );
-        beacon.position.set(0, postH + 0.11, 0);
-        frame.add(beacon);
+        beaconMesh.position.set(0, postH + 0.11, 0);
+        frame.add(beaconMesh);
       }
 
       const pivot = new THREE.Group();
@@ -1331,7 +1402,25 @@ export class HideoutLongRangeGallery {
         angVel: 0,
         flashTimerSec: 0,
         beaconTimerSec: 0,
+        beaconBroken: false,
       };
+      if (beaconMesh && beaconMat) {
+        this.electronics.registerNode(
+          {
+            id: `lr_beacon_${id}`,
+            label: `${distM}m Hit Strobe Beacon`,
+            hitMeshes: [beaconMesh],
+            emissiveMaterials: [beaconMat],
+            sparkOrigin: new THREE.Vector3(x, postH + 0.11, z),
+            isLightFixture: true,
+            onBreak: () => {
+              entry.beaconBroken = true;
+              entry.beaconTimerSec = 0;
+            },
+          },
+          raycastMeshes,
+        );
+      }
       this.steelTargets.push(entry);
       this.steelById.set(id, entry);
     };
@@ -1363,6 +1452,7 @@ export class HideoutLongRangeGallery {
       stand.add(post);
 
       let beaconMat: THREE.MeshStandardMaterial | null = null;
+      let beaconMesh: THREE.Mesh | null = null;
       if (withHitBeacon) {
         beaconMat = this.trackMat(
           new THREE.MeshStandardMaterial({
@@ -1378,12 +1468,12 @@ export class HideoutLongRangeGallery {
         );
         beaconPole.position.set(0.42, 0.95, 0.08);
         stand.add(beaconPole);
-        const beacon = new THREE.Mesh(
+        beaconMesh = new THREE.Mesh(
           this.trackGeo(new THREE.CylinderGeometry(0.085, 0.085, 0.14, 12)),
           beaconMat,
         );
-        beacon.position.set(0.42, 1.92, 0.08);
-        stand.add(beacon);
+        beaconMesh.position.set(0.42, 1.92, 0.08);
+        stand.add(beaconMesh);
       }
 
       const pivot = new THREE.Group();
@@ -1443,7 +1533,25 @@ export class HideoutLongRangeGallery {
         angVel: 0,
         flashTimerSec: 0,
         beaconTimerSec: 0,
+        beaconBroken: false,
       };
+      if (beaconMesh && beaconMat) {
+        this.electronics.registerNode(
+          {
+            id: `lr_beacon_${id}`,
+            label: `${distM}m Hit Strobe Beacon`,
+            hitMeshes: [beaconMesh],
+            emissiveMaterials: [beaconMat],
+            sparkOrigin: new THREE.Vector3(x + 0.42, 1.92, z + 0.08),
+            isLightFixture: true,
+            onBreak: () => {
+              entry.beaconBroken = true;
+              entry.beaconTimerSec = 0;
+            },
+          },
+          raycastMeshes,
+        );
+      }
       this.steelTargets.push(entry);
       this.steelById.set(id, entry);
     };
@@ -1697,6 +1805,7 @@ export class HideoutLongRangeGallery {
     bc: number;
     zeroDistanceM: number;
   }): void {
+    if (this.chronoBroken) return;
     const massKg = Math.max(0.001, params.bulletMassGrams * 0.001);
     const vMs = Math.max(1, params.muzzleVelocityMs);
     const energyJ = 0.5 * massKg * vMs * vMs;
@@ -1958,7 +2067,50 @@ export class HideoutLongRangeGallery {
     return null;
   }
 
+  private drawBrokenChronoScreen(): void {
+    const ctx = this.chronoCtx;
+    const w = this.chronoCanvas.width;
+    const h = this.chronoCanvas.height;
+    ctx.fillStyle = '#060709';
+    ctx.fillRect(0, 0, w, h);
+    ctx.strokeStyle = 'rgba(180, 195, 210, 0.38)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(w * 0.4, h * 0.5);
+    ctx.lineTo(w * 0.9, h * 0.1);
+    ctx.moveTo(w * 0.4, h * 0.5);
+    ctx.lineTo(w * 0.08, h * 0.85);
+    ctx.stroke();
+    this.chronoTex.needsUpdate = true;
+  }
+
+  private drawBrokenMonitor(): void {
+    const ctx = this.monitorCtx;
+    const w = this.monitorCanvas.width;
+    const h = this.monitorCanvas.height;
+    ctx.fillStyle = '#060709';
+    ctx.fillRect(0, 0, w, h);
+    ctx.strokeStyle = 'rgba(180, 195, 210, 0.34)';
+    ctx.lineWidth = 2.5;
+    const cx = w * 0.46;
+    const cy = h * 0.52;
+    for (let i = 0; i < 12; i++) {
+      const ang = (i / 12) * Math.PI * 2 + 0.18;
+      ctx.beginPath();
+      ctx.moveTo(cx, cy);
+      ctx.lineTo(cx + Math.cos(ang) * 440, cy + Math.sin(ang) * 320);
+      ctx.stroke();
+    }
+    ctx.fillStyle = '#252a33';
+    ctx.font = 'bold 26px "IBM Plex Mono", monospace';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('DISPLAY DAMAGED · NO SIGNAL', w * 0.5, h * 0.5);
+    this.monitorTex.needsUpdate = true;
+  }
+
   private redrawChronoScreen(): void {
+    if (this.chronoBroken) return;
     const ctx = this.chronoCtx;
     const w = this.chronoCanvas.width;
     const h = this.chronoCanvas.height;
@@ -1989,6 +2141,7 @@ export class HideoutLongRangeGallery {
   }
 
   private redrawMonitor(): void {
+    if (this.monitorBroken) return;
     const ctx = this.monitorCtx;
     const w = this.monitorCanvas.width;
     const h = this.monitorCanvas.height;
@@ -2194,7 +2347,7 @@ export class HideoutLongRangeGallery {
           s.plateMat.emissive.setHex(s.baseEmissiveHex);
         }
       }
-      if (s.beaconMat && s.beaconTimerSec > 0) {
+      if (s.beaconMat && !s.beaconBroken && s.beaconTimerSec > 0) {
         s.beaconTimerSec = Math.max(0, s.beaconTimerSec - clampedDt);
         if (s.beaconTimerSec > 0) {
           // Crisp 8 Hz strobe visible from 100m away through magnified optics

@@ -273,9 +273,21 @@ export const HideoutHud: React.FC<HideoutHudProps> = ({
       {showLiveHud && (
         <div className="fixed bottom-5 right-6 text-right">
           <div className="font-display text-sm font-semibold tracking-wide text-neutral-100">
-            {snapshot.equippedWeaponName}
+            {snapshot.grenadeDrawn ? snapshot.grenadeName : snapshot.equippedWeaponName}
           </div>
-          {snapshot.equippedWeaponId !== 'unarmed' && (
+          {snapshot.grenadeDrawn ? (
+            <div className="mt-0.5 flex items-center justify-end gap-2 font-mono-tabular text-xs text-neutral-400">
+              <span className="text-amber-300">
+                {snapshot.grenadeHoldStage === 'DRAWN'
+                  ? 'RMB Pull Pin'
+                  : snapshot.grenadeHoldStage === 'PIN_PULLED'
+                    ? 'LMB Throw · RMB Spoon'
+                    : 'LIVE FUSE · LMB Throw'}
+              </span>
+              <span aria-hidden="true">·</span>
+              <span className="text-neutral-200">{snapshot.grenadeCount} left</span>
+            </div>
+          ) : snapshot.equippedWeaponId !== 'unarmed' ? (
             <div className="mt-0.5 flex items-center justify-end gap-2 font-mono-tabular text-xs text-neutral-400">
               <span>{snapshot.activeAmmoLabel || snapshot.equippedCaliber}</span>
               <span aria-hidden="true">·</span>
@@ -284,6 +296,22 @@ export const HideoutHud: React.FC<HideoutHudProps> = ({
                 <>
                   <span aria-hidden="true">·</span>
                   <span className="text-sky-300">{snapshot.activeOpticZoom.toFixed(1)}x</span>
+                </>
+              )}
+              {snapshot.armedAdsMode !== 'PRIMARY' && (
+                <>
+                  <span aria-hidden="true">·</span>
+                  <span className="text-amber-300">
+                    {snapshot.armedAdsMode === 'POINT_AIM' ? 'Point Aim' : 'Canted Optic'}
+                  </span>
+                </>
+              )}
+              {snapshot.nvgActive && (
+                <>
+                  <span aria-hidden="true">·</span>
+                  <span className="text-emerald-300">
+                    {snapshot.irActive ? 'NVG + IR' : 'NVG'}
+                  </span>
                 </>
               )}
               {snapshot.fireModeLabel && (
@@ -296,6 +324,18 @@ export const HideoutHud: React.FC<HideoutHudProps> = ({
               <span className="text-amber-400">
                 {snapshot.ammoInMag}/{snapshot.ammoReserve}
               </span>
+            </div>
+          ) : (
+            <div className="mt-0.5 flex items-center justify-end gap-2 font-mono-tabular text-xs text-neutral-400">
+              <span>LMB Jab · RMB+LMB Hook</span>
+              {snapshot.nvgActive && (
+                <>
+                  <span aria-hidden="true">·</span>
+                  <span className="text-emerald-300">
+                    {snapshot.irActive ? 'NVG + IR' : 'NVG'}
+                  </span>
+                </>
+              )}
             </div>
           )}
         </div>

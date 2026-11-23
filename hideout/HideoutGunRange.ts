@@ -5,6 +5,7 @@ import {
   BodycamSurfaceMaterial,
 } from '../bodycam-sdk';
 import { HideoutInteractableMeta } from './HideoutBunkerWorld';
+import { HideoutElectronicsSystem } from './HideoutElectronicsSystem';
 import { HideoutMaterialLibrary } from './HideoutMaterials';
 
 export type RangeCoursePhase = 'idle' | 'countdown' | 'active' | 'finished';
@@ -418,11 +419,15 @@ export class HideoutGunRange {
 
   // Zero-GC scratch
   private readonly _tmpLocalHit = new THREE.Vector3();
+  private readonly electronics: HideoutElectronicsSystem;
+  private consoleBroken = false;
+  private scoreboardBroken = false;
 
   constructor(
     parent: THREE.Object3D,
     physics: BodycamPhysicsWorld,
     materials: HideoutMaterialLibrary,
+    electronics: HideoutElectronicsSystem,
     raycastMeshes: THREE.Object3D[],
     interactableMeshes: THREE.Mesh[],
     isSoftwareGl: boolean,
@@ -432,6 +437,7 @@ export class HideoutGunRange {
   ) {
     this.physics = physics;
     this.materials = materials;
+    this.electronics = electronics;
     this.isSoftwareGl = isSoftwareGl;
     this.maxAniso = maxAniso;
     this.bestScore = Math.max(0, Math.round(initialBestScore));
@@ -441,10 +447,14 @@ export class HideoutGunRange {
     parent.add(this.root);
 
     this.buildRangeArchitectureAndBooths(raycastMeshes, interactableMeshes);
-    this.buildOverheadScoreboard();
+    this.buildOverheadScoreboard(raycastMeshes);
     this.buildBay1ReactiveTargets(raycastMeshes);
     this.buildBay2CqbCourse(raycastMeshes);
     this.redrawScoreboard(true);
+  }
+
+  public isConsoleBroken(): boolean {
+    return this.consoleBroken;
   }
 
   private trackGeo<T extends THREE.BufferGeometry>(g: T): T {
@@ -545,13 +555,15 @@ export class HideoutGunRange {
     backstopLight.position.set(14.5, 4.1, 30.5);
     this.root.add(backstopLight);
 
-    // Overhead fluorescent strips across Bay 1 & Bay 2
-    for (const [lx, lz] of [
-      [10.8, 12.0],
-      [10.8, 25.0],
-      [19.2, 12.0],
-      [19.2, 24.0],
-    ]) {
+    // Overhead fluorescent strips across Bay 1 & Bay 2 (individually shootable/breakable)
+    const rangeLamps: Array<[number, number, THREE.PointLight]> = [
+      [10.8, 12.0, cqbMidLight],
+      [10.8, 25.0, backstopLight],
+      [19.2, 12.0, cqbMidLight],
+      [19.2, 24.0, backstopLight],
+    ];
+    for (let i = 0; i < rangeLamps.length; i++) {
+      const [lx, lz, linkedLight] = rangeLamps[i];
       const housing = new THREE.Mesh(
         this.trackGeo(new THREE.BoxGeometry(1.4, 0.08, 0.24)),
         this.materials.darkSteel,
@@ -564,6 +576,19 @@ export class HideoutGunRange {
       );
       tube.position.set(lx, 4.395, lz);
       this.root.add(tube);
+
+      this.electronics.registerNode(
+        {
+          id: `range_lamp_${i}`,
+          label: 'Overhead Fluorescent Light',
+          hitMeshes: [housing, tube],
+          emissiveMeshes: [tube],
+          linkedLights: [{ light: linkedLight, dropFraction: 0.5 }],
+          sparkOrigin: new THREE.Vector3(lx, 4.36, lz),
+          isLightFixture: true,
+        },
+        raycastMeshes,
+      );
     }
 
     // Painted firing-line safety stripe across full range width at Z = 3.85
@@ -755,6 +780,23 @@ export class HideoutGunRange {
     interactableMeshes.push(consoleProxy);
     this.consoleWorldPos.set(8.45, 1.12, 2.85);
 
+    this.electronics.registerNode(
+      {
+        id: 'range_console',
+        label: 'Range Control Console',
+        hitMeshes: [consoleChassis, consoleBezel, startBtn, resetBtn],
+        emissiveMaterials: [startBtnMat, resetBtnMat],
+        sparkOrigin: new THREE.Vector3(8.45, 1.14, 2.86),
+        onBreak: () => {
+          this.consoleBroken = true;
+          if (this.isCourseRunning()) {
+            this.abortCourse();
+          }
+        },
+      },
+      raycastMeshes,
+    );
+
     // === FIRING-LINE AMMO RESUPPLY BOX (X = 7.42, Z = 2.95 on Stall 1 bench) ===
     const ammoBox = new THREE.Mesh(
       this.trackGeo(new THREE.BoxGeometry(0.42, 0.24, 0.24)),
@@ -842,7 +884,7 @@ export class HideoutGunRange {
     raycastMeshes.push(paddleMesh);
   }
 
-  private buildOverheadScoreboard(): void {
+  private buildOverheadScoreboard(raycastMeshes: THREE.Object3D[]): void {
     const [c, ctx] = makeCanvas(1024, 256);
     this.scoreboardCanvas = c;
     this.scoreboardCtx = ctx;
@@ -879,9 +921,51 @@ export class HideoutGunRange {
     screen.position.set(0, 0, -0.095);
     screen.rotation.y = Math.PI; // Faces -Z toward firing line
     boardGroup.add(screen);
+
+    this.electronics.registerNode(
+      {
+        id: 'range_scoreboard',
+        label: 'Overhead Range Scoreboard',
+        hitMeshes: [casing, screen],
+        sparkOrigin: new THREE.Vector3(19.2, 3.64, 8.28),
+        isLightFixture: true,
+        onBreak: () => {
+          this.scoreboardBroken = true;
+          this.drawBrokenScoreboard();
+        },
+      },
+      raycastMeshes,
+    );
+  }
+
+  private drawBrokenScoreboard(): void {
+    const ctx = this.scoreboardCtx;
+    const W = this.scoreboardCanvas.width;
+    const H = this.scoreboardCanvas.height;
+    ctx.fillStyle = '#07080a';
+    ctx.fillRect(0, 0, W, H);
+    // Fractured glass spiderweb cracks
+    ctx.strokeStyle = 'rgba(180, 195, 210, 0.34)';
+    ctx.lineWidth = 2;
+    const cx = W * 0.52;
+    const cy = H * 0.48;
+    for (let i = 0; i < 11; i++) {
+      const ang = (i / 11) * Math.PI * 2 + 0.23;
+      ctx.beginPath();
+      ctx.moveTo(cx, cy);
+      ctx.lineTo(cx + Math.cos(ang) * 420, cy + Math.sin(ang) * 160);
+      ctx.stroke();
+    }
+    ctx.fillStyle = '#262b33';
+    ctx.font = 'bold 28px "IBM Plex Mono", monospace';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('NO SIGNAL · DISPLAY DAMAGED', W * 0.5, H * 0.5);
+    this.scoreboardTex.needsUpdate = true;
   }
 
   private redrawScoreboard(force = false): void {
+    if (this.scoreboardBroken) return;
     const acc = this.computeAccuracyPct();
     const key = `${this.phase}|${Math.ceil(this.countdownSec)}|${this.timeRemainingSec.toFixed(1)}|${this.score}|${this.hits}|${this.headshots}|${acc}|${this.bestScore}`;
     if (!force && key === this.lastBoardRenderKey) return;

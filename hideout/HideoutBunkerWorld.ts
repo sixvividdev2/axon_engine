@@ -11,6 +11,7 @@ import {
 import { loadoutStore } from '../data/loadoutStore';
 import { DestructibleDoorSystem } from '../doors/DestructibleDoorSystem';
 import { createHideoutMaterials, HideoutMaterialLibrary } from './HideoutMaterials';
+import { HideoutElectronicsSystem } from './HideoutElectronicsSystem';
 import { HideoutGunRange, HideoutGunRangeCallbacks } from './HideoutGunRange';
 import {
   HideoutLongRangeCallbacks,
@@ -74,6 +75,7 @@ export function resolveHideoutRoom(x: number, z: number): HideoutRoomBounds {
 export interface HideoutBunkerWorldHandle {
   physics: BodycamPhysicsWorld;
   materials: HideoutMaterialLibrary;
+  electronics: HideoutElectronicsSystem;
   doorSystem: DestructibleDoorSystem;
   gunRange: HideoutGunRange;
   longRangeGallery: HideoutLongRangeGallery;
@@ -92,7 +94,7 @@ export interface HideoutBunkerWorldHandle {
     outPos: THREE.Vector3,
     outQuat: THREE.Quaternion,
   ) => boolean;
-  updateProps: (dt: number) => void;
+  updateProps: (dt: number, listenerPos?: THREE.Vector3) => void;
   dispose: () => void;
 }
 
@@ -129,6 +131,7 @@ export function buildHideoutBunkerWorld(
   root.name = 'HideoutBunkerWorld';
   scene.add(root);
 
+  const electronics = new HideoutElectronicsSystem(root);
   const ownedGeos: THREE.BufferGeometry[] = [];
   const raycastMeshes: THREE.Object3D[] = [];
   const interactableMeshes: THREE.Mesh[] = [];
@@ -250,7 +253,14 @@ export function buildHideoutBunkerWorld(
     }
   };
 
-  const addOverheadLamp = (x: number, y: number, z: number, emissiveMat: THREE.Material): void => {
+  let lampCounter = 0;
+  const addOverheadLamp = (
+    x: number,
+    y: number,
+    z: number,
+    emissiveMat: THREE.Material,
+    linkedLights: Array<{ light: THREE.Light; dropFraction: number }> = [],
+  ): void => {
     const housing = new THREE.Mesh(
       trackGeo(new THREE.BoxGeometry(1.15, 0.08, 0.24)),
       materials.darkSteel,
@@ -261,6 +271,19 @@ export function buildHideoutBunkerWorld(
     const tube = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(1.02, 0.04, 0.14)), emissiveMat);
     tube.position.set(x, y - 0.045, z);
     root.add(tube);
+
+    electronics.registerNode(
+      {
+        id: `bunker_lamp_${lampCounter++}`,
+        label: 'Overhead Bunker Light',
+        hitMeshes: [housing, tube],
+        emissiveMeshes: [tube],
+        linkedLights,
+        sparkOrigin: new THREE.Vector3(x, y - 0.06, z),
+        isLightFixture: true,
+      },
+      raycastMeshes,
+    );
   };
 
   // ============================================================================
@@ -307,8 +330,14 @@ export function buildHideoutBunkerWorld(
   for (const bz of [-2.4, 0.0, 2.4]) {
     addBoxStructure(0, H_HUB - 0.14, bz, 11.0, 0.28, 0.24, materials.darkSteel, 'metal', false);
   }
-  addOverheadLamp(0, H_HUB - 0.29, -2.0, materials.warmLampEmissive);
-  addOverheadLamp(0, H_HUB - 0.29, 1.8, materials.warmLampEmissive);
+  addOverheadLamp(0, H_HUB - 0.29, -2.0, materials.warmLampEmissive, [
+    { light: arsenalKey, dropFraction: 0.5 },
+    { light: prepTableLamp, dropFraction: 0.5 },
+  ]);
+  addOverheadLamp(0, H_HUB - 0.29, 1.8, materials.warmLampEmissive, [
+    { light: arsenalKey, dropFraction: 0.5 },
+    { light: prepTableLamp, dropFraction: 0.5 },
+  ]);
 
   // Directional Room Plaques over each doorway inside the Arsenal Room
   const makePlaque = (
@@ -336,8 +365,12 @@ export function buildHideoutBunkerWorld(
   addBoxStructure(-16.75, H_HUB * 0.5, 0, 0.5, H_HUB, 10.6, materials.concreteWall, 'concrete');
   addBoxStructure(-11.5, H_HUB * 0.5, -5.25, 10.6, H_HUB, 0.5, materials.concreteWall, 'concrete');
   addBoxStructure(-11.5, H_HUB * 0.5, 5.25, 10.6, H_HUB, 0.5, materials.concreteWall, 'concrete');
-  addOverheadLamp(-11.5, H_HUB - 0.12, -1.8, materials.warmLampEmissive);
-  addOverheadLamp(-11.5, H_HUB - 0.12, 1.8, materials.warmLampEmissive);
+  addOverheadLamp(-11.5, H_HUB - 0.12, -1.8, materials.warmLampEmissive, [
+    { light: readyRoomLight, dropFraction: 0.5 },
+  ]);
+  addOverheadLamp(-11.5, H_HUB - 0.12, 1.8, materials.warmLampEmissive, [
+    { light: readyRoomLight, dropFraction: 0.5 },
+  ]);
 
   // --- ROOM 3: GUN RANGE SHELL (Bays 1 & 2: X ∈ [6.5, 24.5], Z ∈ [-10.0, 36.0]; opens East into Bay 3 100m Gallery) ---
   addBoxStructure(15.5, -0.1, 13.0, 18.6, 0.2, 47.0, materials.concreteFloor, 'concrete', false);
@@ -361,9 +394,16 @@ export function buildHideoutBunkerWorld(
   rangeLine.rotation.x = -Math.PI * 0.5;
   rangeLine.position.set(6.55, 0.015, 0);
   root.add(rangeLine);
-  addOverheadLamp(12.5, H_RANGE - 0.16, 0.0, materials.warmLampEmissive);
-  addOverheadLamp(18.5, H_RANGE - 0.16, 8.0, materials.warmLampEmissive);
-  addOverheadLamp(15.5, H_RANGE - 0.16, 20.0, materials.warmLampEmissive);
+  addOverheadLamp(12.5, H_RANGE - 0.16, 0.0, materials.warmLampEmissive, [
+    { light: rangeEntryLight, dropFraction: 0.6 },
+  ]);
+  addOverheadLamp(18.5, H_RANGE - 0.16, 8.0, materials.warmLampEmissive, [
+    { light: rangeEntryLight, dropFraction: 0.4 },
+    { light: rangeDownLight, dropFraction: 0.4 },
+  ]);
+  addOverheadLamp(15.5, H_RANGE - 0.16, 20.0, materials.warmLampEmissive, [
+    { light: rangeDownLight, dropFraction: 0.6 },
+  ]);
 
   // --- ROOM 4: ZOMBIES PORTAL ROOM SHELL (X ∈ [-4.5, 4.5], Z ∈ [5.5, 13.5]) ---
   addBoxStructure(0, -0.1, 9.5, 9.6, 0.2, 8.6, materials.concreteFloor, 'concrete', false);
@@ -378,7 +418,9 @@ export function buildHideoutBunkerWorld(
   containmentLine.rotation.x = -Math.PI * 0.5;
   containmentLine.position.set(0, 0.015, 5.55);
   root.add(containmentLine);
-  addOverheadLamp(0, H_HUB - 0.14, 9.5, materials.hazardRedEmissive);
+  addOverheadLamp(0, H_HUB - 0.14, 9.5, materials.hazardRedEmissive, [
+    { light: portalRoomLight, dropFraction: 1.0 },
+  ]);
 
   // ============================================================================
   // 2. ARSENAL ROOM HERO PROP A: OWNED-ONLY 3D GUN WALL (Z = -4.34)
@@ -417,13 +459,25 @@ export function buildHideoutBunkerWorld(
     gunWallGroup.add(sideFrame);
   }
 
-  // Overhead showcase linear light valance above Gun Wall
+  // Overhead showcase linear light valance above Gun Wall (destructible light bar)
   const valance = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(wallWidth - 0.2, 0.06, 0.24)), materials.darkSteel);
   valance.position.set(0, wallCenterY + wallHeight * 0.5 + 0.18, wallFaceZ + 0.14);
   gunWallGroup.add(valance);
   const valanceStrip = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(wallWidth - 0.36, 0.025, 0.06)), materials.warmLampEmissive);
   valanceStrip.position.set(0, wallCenterY + wallHeight * 0.5 + 0.145, wallFaceZ + 0.2);
   gunWallGroup.add(valanceStrip);
+  electronics.registerNode(
+    {
+      id: 'gun_wall_valance_light',
+      label: 'Gun Wall Valance Light',
+      hitMeshes: [valance, valanceStrip],
+      emissiveMeshes: [valanceStrip],
+      linkedLights: [{ light: gunWallWash, dropFraction: 1.0 }],
+      sparkOrigin: new THREE.Vector3(0, wallCenterY + wallHeight * 0.5 + 0.14, wallFaceZ + 0.2),
+      isLightFixture: true,
+    },
+    raycastMeshes,
+  );
 
   // Low steel bench lip along bottom of Gun Wall
   addBoxStructure(0, 0.34, -4.22, wallWidth + 0.2, 0.68, 0.52, materials.darkSteel, 'metal', true);
@@ -856,6 +910,7 @@ export function buildHideoutBunkerWorld(
     root,
     physics,
     materials,
+    electronics,
     raycastMeshes,
     interactableMeshes,
     isSoftwareGl,
@@ -871,6 +926,7 @@ export function buildHideoutBunkerWorld(
     root,
     physics,
     materials,
+    electronics,
     raycastMeshes,
     interactableMeshes,
     isSoftwareGl,
@@ -973,7 +1029,7 @@ export function buildHideoutBunkerWorld(
     cratePopTimer = 0.55;
   };
 
-  const updateProps = (dt: number): void => {
+  const updateProps = (dt: number, listenerPos?: THREE.Vector3): void => {
     const clampedDt = Math.min(dt, 0.05);
     // Smooth exponential damping for steel locker door swing (0° closed <-> +108° open outward into +X)
     const targetDoorAngle = lockerOpen ? THREE.MathUtils.degToRad(108) : 0;
@@ -990,9 +1046,10 @@ export function buildHideoutBunkerWorld(
       crateLidPivot.rotation.x = 0;
     }
 
-    // Step Gun Range reactive targets, 30s CQB course & 100m Long-Range Gallery
+    // Step Gun Range reactive targets, 30s CQB course, 100m Long-Range Gallery & sparks
     gunRange.update(clampedDt);
     longRangeGallery.update(clampedDt);
+    electronics.update(clampedDt, listenerPos);
   };
 
   const getSlotTransform = (
@@ -1037,6 +1094,7 @@ export function buildHideoutBunkerWorld(
   return {
     physics,
     materials,
+    electronics,
     doorSystem,
     gunRange,
     longRangeGallery,
@@ -1057,6 +1115,7 @@ export function buildHideoutBunkerWorld(
     dispose: () => {
       longRangeGallery.dispose();
       gunRange.dispose();
+      electronics.dispose();
       doorSystem.dispose();
       for (const slot of gunWallSlots) {
         if (slot.assembly) {
