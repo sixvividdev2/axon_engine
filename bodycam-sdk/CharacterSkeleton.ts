@@ -141,6 +141,7 @@ export class CharacterSkeleton {
   public readonly magPouchAnchor = new THREE.Object3D();
   public readonly beltEquipmentMount = new THREE.Group();
   public readonly throwHandSocket = new THREE.Object3D();
+  public readonly rightThumbTipSocket = new THREE.Object3D();
   public readonly leftPinPinchSocket = new THREE.Object3D();
   public readonly leftPocketAnchor = new THREE.Object3D();
   public readonly leftEyeAimAnchor = new THREE.Object3D();
@@ -709,6 +710,10 @@ export class CharacterSkeleton {
     this.throwHandSocket.position.set(0, -0.026, -0.042);
     this.rightArm.hand.root.add(this.throwHandSocket);
 
+    this.rightThumbTipSocket.name = 'right_thumb_tip_socket';
+    this.rightThumbTipSocket.position.set(0, -0.002, -0.024 * p.handScale);
+    this.rightArm.hand.thumbDist.add(this.rightThumbTipSocket);
+
     this.leftPinPinchSocket.name = 'left_pin_pinch_socket';
     this.leftPinPinchSocket.position.set(0.015, -0.014, -0.092);
     this.leftArm.hand.root.add(this.leftPinPinchSocket);
@@ -1236,13 +1241,13 @@ export class CharacterSkeleton {
 
     // Arms hanging cleanly downward along -Y (local +Y of arm bone points down -> rotation.x = Math.PI)
     const resetArm = (arm: ArticulatedArm, side: -1 | 1): void => {
-      arm.clavicle.position.set(side * p.clavicleOffsetX, 0.072, 0.008);
+      arm.clavicle.position.set(side * p.clavicleOffsetX, 0.092, 0.014);
       arm.clavicle.rotation.set(0, 0, 0);
 
-      arm.shoulderPivot.position.set(side * p.shoulderHalfSpanX, -0.012, -0.015);
+      arm.shoulderPivot.position.set(side * p.shoulderHalfSpanX, 0.002, 0.010);
       arm.shoulderPivot.rotation.set(0, 0, 0);
 
-      arm.upperArm.position.set(side * p.shoulderHalfSpanX, -0.012, -0.015);
+      arm.upperArm.position.set(side * p.shoulderHalfSpanX, 0.002, 0.010);
       arm.upperArm.rotation.set(Math.PI, 0, 0);
 
       arm.forearm.position.set(0, arm.upperLen, 0);
@@ -1545,12 +1550,12 @@ export class CharacterSkeleton {
 
     const clavicle = new THREE.Group();
     clavicle.name = `clavicle_${suffix}`;
-    clavicle.position.set(side * p.clavicleOffsetX, 0.072, 0.008);
+    clavicle.position.set(side * p.clavicleOffsetX, 0.092, 0.014);
     this.chest.add(clavicle);
 
     const shoulderPivot = new THREE.Object3D();
     shoulderPivot.name = `pivot_shoulder_${suffix}`;
-    shoulderPivot.position.set(side * p.shoulderHalfSpanX, -0.012, -0.015);
+    shoulderPivot.position.set(side * p.shoulderHalfSpanX, 0.002, 0.010);
     clavicle.add(shoulderPivot);
 
     // Canonical upperarm_l / upperarm_r strictly parented under clavicle_l / clavicle_r
@@ -1746,28 +1751,56 @@ export class CharacterSkeleton {
       root.add(dome);
     }
 
+    // Sculpted thenar eminence (thumb base muscle mound bridging palm smoothly into thumbProx)
+    const thenarMound = new THREE.Mesh(
+      this.geo(new THREE.SphereGeometry(0.0145 * hs, 10, 8)),
+      this.gloveMat,
+    );
+    thenarMound.scale.set(0.92, 0.78, 1.28);
+    thenarMound.position.set(-side * 0.022 * hs, -0.005 * hs, -0.019 * hs);
+    this.handGlovePrimaryMeshes.push(thenarMound);
+    root.add(thenarMound);
+
     const thumbProx = new THREE.Group();
     thumbProx.position.set(-side * 0.029 * hs, -0.0055 * hs, -0.022 * hs);
     thumbProx.rotation.set(0.14, side * 0.48, 0);
+    const thumbMcpCap = new THREE.Mesh(
+      this.geo(new THREE.SphereGeometry(0.0102 * hs, 10, 8)),
+      this.gloveMat,
+    );
+    thumbMcpCap.scale.set(1.04, 0.92, 1.04);
+    this.handGlovePrimaryMeshes.push(thumbMcpCap);
     const thumbProxMesh = new THREE.Mesh(
-      this.geo(new THREE.CylinderGeometry(0.0082 * hs, 0.0096 * hs, 0.029 * hs, 10)),
+      this.geo(new THREE.CylinderGeometry(0.0086 * hs, 0.0102 * hs, 0.029 * hs, 12)),
       this.gloveMat,
     );
     thumbProxMesh.rotation.x = Math.PI * 0.5;
     thumbProxMesh.position.set(0, 0, -0.0145 * hs);
     this.handGlovePrimaryMeshes.push(thumbProxMesh);
-    thumbProx.add(thumbProxMesh);
+    thumbProx.add(thumbMcpCap, thumbProxMesh);
 
     const thumbDist = new THREE.Group();
     thumbDist.position.set(0, 0, -0.029 * hs);
+    const thumbIpCap = new THREE.Mesh(
+      this.geo(new THREE.SphereGeometry(0.0088 * hs, 10, 8)),
+      this.gloveMat,
+    );
+    thumbIpCap.scale.set(1.06, 0.90, 1.04);
+    this.handGlovePrimaryMeshes.push(thumbIpCap);
     const thumbDistMesh = new THREE.Mesh(
-      this.geo(new THREE.CylinderGeometry(0.0065 * hs, 0.0080 * hs, 0.024 * hs, 10)),
+      this.geo(new THREE.CylinderGeometry(0.0072 * hs, 0.0086 * hs, 0.024 * hs, 12)),
       this.palmLeatherMat,
     );
     thumbDistMesh.rotation.x = Math.PI * 0.5;
     thumbDistMesh.position.set(0, 0, -0.012 * hs);
-    this.handGlovePalmMeshes.push(thumbDistMesh);
-    thumbDist.add(thumbDistMesh);
+    const thumbTipDome = new THREE.Mesh(
+      this.geo(new THREE.SphereGeometry(0.0074 * hs, 10, 8)),
+      this.palmLeatherMat,
+    );
+    thumbTipDome.scale.set(1.08, 0.84, 1.14);
+    thumbTipDome.position.set(0, -0.0005 * hs, -0.024 * hs);
+    this.handGlovePalmMeshes.push(thumbDistMesh, thumbTipDome);
+    thumbDist.add(thumbIpCap, thumbDistMesh, thumbTipDome);
     thumbProx.add(thumbDist);
     root.add(thumbProx);
 
@@ -2360,15 +2393,30 @@ export class CharacterSkeleton {
     hand.thumbDist.rotation.set(-0.48, 0, 0);
   }
 
+  // Pre-allocated scratch helpers for zero-GC analytic 2-segment PDA thumb IK
+  private readonly _thumbInvHandMat = new THREE.Matrix4();
+  private readonly _thumbTargetLocal = new THREE.Vector3();
+  private readonly _thumbToTarget = new THREE.Vector3();
+  private readonly _thumbDir = new THREE.Vector3();
+  private readonly _thumbPole = new THREE.Vector3(-0.45, 0.85, 0.25).normalize();
+  private readonly _thumbBendUp = new THREE.Vector3();
+  private readonly _thumbSeg1Dir = new THREE.Vector3();
+  private readonly _thumbXAxis = new THREE.Vector3();
+  private readonly _thumbYAxis = new THREE.Vector3();
+  private readonly _thumbZAxis = new THREE.Vector3();
+  private readonly _thumbBasisMat = new THREE.Matrix4();
+
   /**
    * Articulated tablet grip pose: fingers wrap cleanly around rear rubberized bezel while
-   * the right thumb physically reaches up to press the power switch or moves across the gimbaled joystick.
+   * the right thumb physically rests on the 3D gimbaled joystick cap (or reaches up to press
+   * the red power button) via an exact 2-segment analytic thumb contact solver.
    */
   public applyPdaHandPose(
     side: 'left' | 'right',
     powerPressWeight: number,
     joyX: number,
     joyY: number,
+    rightThumbWorldTarget?: Readonly<THREE.Vector3>,
   ): void {
     const hand = side === 'left' ? this.leftArm.hand : this.rightArm.hand;
     const s = hand.side;
@@ -2378,34 +2426,99 @@ export class CharacterSkeleton {
       f.distal.rotation.x = -THREE.MathUtils.degToRad(distDeg);
     };
 
-    // Fingers curved ergonomically behind the ruggedized tablet housing
-    setFinger(hand.index, 38, 52, 34);
-    setFinger(hand.middle, 44, 58, 38);
-    setFinger(hand.ring, 46, 60, 40);
-    setFinger(hand.pinky, 48, 62, 42);
+    // Fingers wrap organically behind the ruggedized tablet housing (natural spread + gentle curl)
+    setFinger(hand.index, 34, 48, 30);
+    setFinger(hand.middle, 40, 54, 34);
+    setFinger(hand.ring, 44, 58, 36);
+    setFinger(hand.pinky, 48, 60, 38);
 
     if (side === 'left') {
-      // Left thumb braces comfortably along left upper bezel edge
-      hand.thumbProx.rotation.set(0.06, s * 0.16, s * 0.12);
+      // Left thumb rests naturally upward-inward along the front-left bezel border (matching reference grip)
+      hand.thumbProx.rotation.set(0.04, -0.26, -0.14);
       hand.thumbDist.rotation.set(-0.18, 0, 0);
-    } else {
-      // Right thumb glides dynamically over the 3D gimbaled joystick, or reaches up & depresses power switch
-      const press = THREE.MathUtils.clamp(powerPressWeight, 0, 1);
-      const basePitch = 0.04 + joyY * 0.24;
-      const baseYaw = s * (0.28 + joyX * 0.22);
-      const baseRoll = -s * (0.06 - joyY * 0.12);
-
-      hand.thumbProx.rotation.set(
-        THREE.MathUtils.lerp(basePitch, 0.34, press),
-        THREE.MathUtils.lerp(baseYaw, s * 0.12, press),
-        THREE.MathUtils.lerp(baseRoll, s * 0.18, press),
-      );
-      hand.thumbDist.rotation.set(
-        THREE.MathUtils.lerp(-0.26 - joyY * 0.16, -0.44, press),
-        0,
-        0,
-      );
+      return;
     }
+
+    if (rightThumbWorldTarget) {
+      const len1 = Math.max(0.01, -hand.thumbDist.position.z);
+      const tipZ = Math.max(0.01, -this.rightThumbTipSocket.position.z);
+      const padY = -this.rightThumbTipSocket.position.y;
+      const len2 = Math.hypot(tipZ, padY);
+      const tipAngle = Math.atan2(padY, tipZ);
+
+      hand.root.updateWorldMatrix(true, false);
+      this._thumbInvHandMat.copy(hand.root.matrixWorld).invert();
+      this._thumbTargetLocal.copy(rightThumbWorldTarget).applyMatrix4(this._thumbInvHandMat);
+
+      this._thumbToTarget.copy(this._thumbTargetLocal).sub(hand.thumbProx.position);
+      const rawDist = this._thumbToTarget.length();
+      if (rawDist > 1e-4) {
+        const minDist = Math.abs(len1 - len2) + 0.004;
+        const maxDist = len1 + len2 - 0.0005;
+        const d = THREE.MathUtils.clamp(rawDist, minDist, maxDist);
+
+        this._thumbDir.copy(this._thumbToTarget).divideScalar(rawDist);
+
+        // Natural outward-forward arch pole so thumb bends smoothly over the front keypad without kinking
+        this._thumbPole.set(-0.62, 0.72, 0.30);
+        this._thumbBendUp
+          .copy(this._thumbPole)
+          .addScaledVector(this._thumbDir, -this._thumbPole.dot(this._thumbDir));
+        if (this._thumbBendUp.lengthSq() < 1e-6) {
+          this._thumbBendUp.set(0, 1, 0);
+        } else {
+          this._thumbBendUp.normalize();
+        }
+
+        const cosA = THREE.MathUtils.clamp((len1 * len1 + d * d - len2 * len2) / (2 * len1 * d), -1, 1);
+        const sinA = Math.sqrt(Math.max(0, 1 - cosA * cosA));
+        const cosB = THREE.MathUtils.clamp((len1 * len1 + len2 * len2 - d * d) / (2 * len1 * len2), -1, 1);
+        const flexDist = Math.PI - Math.acos(cosB);
+
+        // Segment 1 direction (-Z of thumbProx)
+        this._thumbSeg1Dir
+          .copy(this._thumbDir)
+          .multiplyScalar(cosA)
+          .addScaledVector(this._thumbBendUp, sinA)
+          .normalize();
+
+        // Orthonormal basis: -Z along proximal phalanx, +Y toward convex outer arch so -X flexion bends distal onto target
+        this._thumbZAxis.copy(this._thumbSeg1Dir).negate();
+        this._thumbYAxis
+          .copy(this._thumbBendUp)
+          .addScaledVector(this._thumbSeg1Dir, -this._thumbBendUp.dot(this._thumbSeg1Dir))
+          .normalize();
+        this._thumbXAxis.crossVectors(this._thumbYAxis, this._thumbZAxis).normalize();
+        this._thumbYAxis.crossVectors(this._thumbZAxis, this._thumbXAxis).normalize();
+
+        this._thumbBasisMat.makeBasis(this._thumbXAxis, this._thumbYAxis, this._thumbZAxis);
+        hand.thumbProx.quaternion.setFromRotationMatrix(this._thumbBasisMat);
+        hand.thumbDist.rotation.set(-(flexDist - tipAngle), 0, 0);
+        return;
+      }
+    }
+
+    // Fallback procedural Euler angles if no world contact point is provided
+    const press = THREE.MathUtils.clamp(powerPressWeight, 0, 1);
+    const basePitch = 0.04 + joyY * 0.28;
+    const baseYaw = s * (0.28 + joyX * 0.28);
+    const baseRoll = -s * (0.06 - joyY * 0.14);
+
+    hand.thumbProx.rotation.set(
+      THREE.MathUtils.lerp(basePitch, 0.34, press),
+      THREE.MathUtils.lerp(baseYaw, s * 0.12, press),
+      THREE.MathUtils.lerp(baseRoll, s * 0.18, press),
+    );
+    hand.thumbDist.rotation.set(
+      THREE.MathUtils.lerp(-0.26 - joyY * 0.20, -0.44, press),
+      0,
+      0,
+    );
+  }
+
+  public getRightThumbTipWorldPosition(outPos: THREE.Vector3): THREE.Vector3 {
+    this.rightThumbTipSocket.updateWorldMatrix(true, false);
+    return this.rightThumbTipSocket.getWorldPosition(outPos);
   }
 
   /**

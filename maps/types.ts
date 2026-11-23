@@ -5,6 +5,7 @@ import { TacticalEquipmentId } from '../data/tacticalEquipment';
 
 import type { TimeOfDayStartSetting, WeatherPresetId } from '../data/multiplayer';
 import type { DestructibleDoorSystem } from '../doors/DestructibleDoorSystem';
+import type { PenetrableSurfaceSystem } from '../doors/PenetrableSurfaceSystem';
 import type { WaterShaderUniforms } from '../engine/world/WaterShader';
 import type { NightLightEntry, WettableSurfaceEntry } from '../engine/world/WeatherTimeSystem';
 import type { WindShaderUniforms } from '../engine/world/WindFoliageShader';
@@ -176,6 +177,8 @@ export interface BuiltMapInstance {
   envBindings?: MapEnvBindings;
   /** Optional physical destructible hinged door system for combat maps */
   doorSystem?: DestructibleDoorSystem;
+  /** Optional melee-penetrable interior drywall / plywood / panel system */
+  penetrableSystem?: PenetrableSurfaceSystem;
   /** Shatters a breakable glass pane/window and disables its paired physics collider */
   shatterBreakable?: (
     objOrId: THREE.Object3D | string,

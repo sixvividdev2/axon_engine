@@ -4,6 +4,7 @@ import {
   BallisticImpactEvent,
   BodycamAudio,
   BodycamWeaponProfile,
+  computeTargetHingeAngularImpulse,
   IBodycamWorldAdapter,
   TerminalOutcome,
 } from '../bodycam-sdk';
@@ -101,10 +102,20 @@ export class GymBallistics {
     } else if (targetKind === 'steel_plate' && targetId) {
       const st = this.steelById.get(targetId);
       if (st) {
-        const massKg = (ev.ammo.bulletMassGrams / Math.max(1, ev.ammo.pellets)) * 0.001;
-        const momentum = massKg * ev.impactSpeedMs;
-        const kickDir = ev.incomingDir.z <= 0 ? 1 : -1;
-        st.hitAngVel += kickDir * THREE.MathUtils.clamp(momentum * 2.1, 1.8, 9.2);
+        st.hitAngVel += computeTargetHingeAngularImpulse({
+          pivot: st.pivot,
+          hitPointWorld: ev.point,
+          incomingDir: ev.incomingDir,
+          impactSpeedMs: ev.impactSpeedMs,
+          bulletMassGrams: ev.ammo.bulletMassGrams,
+          pellets: ev.ammo.pellets,
+          outcome: ev.outcome,
+          outgoingDir: ev.outgoingDir,
+          effectiveInertia: 0.24,
+          impulseScale: 0.72,
+          minDeltaRadSec: 1.6,
+          maxDeltaRadSec: 10.5,
+        });
         st.hitFlashTimer = 0.14;
         this.audio.playImpact(ev.point, 'steel_plate');
       }

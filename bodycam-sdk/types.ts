@@ -25,7 +25,7 @@ export type BodycamAcousticKind =
   | 'door'
   | 'impact';
 
-export type BodycamVaultMode = 'NONE' | 'VAULT_OVER' | 'CLIMB_ONTO' | 'HIGH_MANTLE';
+export type BodycamVaultMode = 'NONE' | 'VAULT_OVER' | 'CLIMB_ONTO' | 'HIGH_MANTLE' | 'SPIN_VAULT';
 
 export type BodycamMeleeAttackType = 'jab' | 'cross' | 'bash' | 'kick';
 
@@ -249,6 +249,8 @@ export interface BodycamInputState {
   holdBreath: boolean;
   /** Press/hold Space while moving forward toward a ledge to vault or mantle */
   vault?: boolean;
+  /** Optional explicit spin-vault trigger (otherwise double-tap Space triggers/upgrades to SPIN_VAULT) */
+  vaultSpin?: boolean;
 }
 
 export interface BodycamRecoilOptions {

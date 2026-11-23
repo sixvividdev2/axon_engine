@@ -85,6 +85,8 @@ export class ControllerStateReader {
       legTuckWeight: 0,
       headDuckWeight: 0,
       maxCameraWorldY: Infinity,
+      spinYawOffset: 0,
+      spinRollOffset: 0,
     },
   };
 

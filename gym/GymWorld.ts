@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import { GunsmithBench } from '../arena/GunsmithBench';
 import { BodycamPhysicsWorld, BodycamSurfaceMaterial } from '../bodycam-sdk';
+import { PenetrableSurfaceSystem } from '../doors/PenetrableSurfaceSystem';
 import { createGymTextures, createStencilSignTexture, GymTextureSet } from './GymTextures';
 
 export type GymZoneId =
@@ -58,6 +59,7 @@ export interface GymWorldHandle {
   steelTargets: ReactiveSteelTarget[];
   paperTargets: PaperShootingTarget[];
   gunsmithBench: GunsmithBench;
+  penetrableSurfaces: PenetrableSurfaceSystem;
   shatterBreakable: (
     object: THREE.Object3D,
     impactPoint: Readonly<THREE.Vector3>,
@@ -95,6 +97,7 @@ export function buildGymWorld(
   const raycastMeshes: THREE.Object3D[] = [];
   const steelTargets: ReactiveSteelTarget[] = [];
   const paperTargets: PaperShootingTarget[] = [];
+  const penetrableSurfaces = new PenetrableSurfaceSystem(scene, { isSoftwareGl });
 
   const trackGeo = <T extends THREE.BufferGeometry>(g: T): T => {
     ownedGeos.push(g);
@@ -969,6 +972,18 @@ export function buildGymWorld(
   witnessWood.userData.thicknessM = 0.04;
   witnessWood.userData.gymTargetKind = 'ballistic_barrier';
   witnessWood.userData.gymTargetLabel = 'RICOCHET WITNESS WOOD';
+  penetrableSurfaces.registerSurface({
+    id: 'gym_witness_wood',
+    mesh: witnessWood,
+    kind: 'plywood',
+    width: 1.6,
+    height: 1.4,
+    thickness: 0.04,
+    faceAxis: 'x',
+    floorY: 0,
+    maxHoles: 6,
+    hitsToBreach: 1,
+  });
 
   // 2) East Range Penetration Gauntlet: 6mm Sheet Steel, 4cm Timber, 12cm Concrete
   const steelBarrier = addSolidBox(19.6, 0.95, -12.0, 1.25, 1.5, 0.008, metalGrateMat, 'metal', true);
@@ -983,6 +998,18 @@ export function buildGymWorld(
   timberBarrier.userData.thicknessM = 0.04;
   timberBarrier.userData.gymTargetKind = 'ballistic_barrier';
   timberBarrier.userData.gymTargetLabel = '4CM TIMBER PLANK';
+  penetrableSurfaces.registerSurface({
+    id: 'gym_timber_barrier',
+    mesh: timberBarrier,
+    kind: 'plywood',
+    width: 1.25,
+    height: 1.5,
+    thickness: 0.04,
+    faceAxis: 'z',
+    floorY: 0,
+    maxHoles: 6,
+    hitsToBreach: 1,
+  });
   addFloorPlaque('4CM TIMBER', 'COVER PENETRATION', 21.4, -10.8, '#d49b5a', 1.6);
 
   const concreteBarrier = addSolidBox(23.2, 0.95, -12.0, 1.25, 1.5, 0.12, concreteWallMat, 'concrete', true);
@@ -1167,6 +1194,7 @@ export function buildGymWorld(
         glassShards.splice(i, 1);
       }
     }
+    penetrableSurfaces.update(clampedDt);
   };
 
   return {
@@ -1175,9 +1203,11 @@ export function buildGymWorld(
     steelTargets,
     paperTargets,
     gunsmithBench,
+    penetrableSurfaces,
     shatterBreakable,
     updateDynamicTargets,
     dispose: () => {
+      penetrableSurfaces.dispose();
       for (const sh of glassShards) scene.remove(sh.mesh);
       glassShards.length = 0;
       gunsmithBench.dispose();

@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import { BodycamPhysicsWorld, BodycamSurfaceMaterial } from '../bodycam-sdk';
 import { DestructibleDoorSystem } from '../doors/DestructibleDoorSystem';
+import { PenetrableSurfaceSystem } from '../doors/PenetrableSurfaceSystem';
 import { getGraphicsQualityProfile, GraphicsQualityId } from '../data/graphicsQuality';
 import { createStencilSignTexture } from '../gym/GymTextures';
 import {
@@ -670,6 +671,9 @@ function buildTimberlineCompound(
   addFlatRoadStrip(-10.5, 34, 11.0, 4.8, matDirtPath, 'gravel', 0.04);
 
   // === 4. ENTERABLE FURNISHED TIMBER CABIN HELPER (Villages & Lone Cabins) ===
+  const penetrableSystem = new PenetrableSurfaceSystem(sceneGroup, { isSoftwareGl });
+  let nextTimberPenIdx = 0;
+
   const buildCabin = (
     cx: number,
     cz: number,
@@ -697,6 +701,33 @@ function buildTimberlineCompound(
       material: 'wood',
     });
 
+    const registerCabinWoodWall = (
+      wx: number,
+      wy: number,
+      wz: number,
+      ww: number,
+      wh: number,
+      wd: number,
+    ): THREE.Mesh => {
+      const m = addSolidBox(wx, wy, wz, ww, wh, wd, matWood, 'wood');
+      if (wh >= 0.85 && Math.min(ww, wd) <= 0.34 && Math.max(ww, wd) >= 0.45) {
+        const faceAxis = ww < wd ? 'x' : 'z';
+        penetrableSystem.registerSurface({
+          id: `timber_cabin_wood_${nextTimberPenIdx++}`,
+          mesh: m,
+          kind: 'plywood',
+          width: faceAxis === 'x' ? wd : ww,
+          height: wh,
+          thickness: faceAxis === 'x' ? ww : wd,
+          faceAxis,
+          floorY: floorTop,
+          maxHoles: 6,
+          baseRadiusM: 0.132,
+        });
+      }
+      return m;
+    };
+
     const buildWallSide = (side: 'north' | 'south' | 'east' | 'west', hasDoor: boolean): void => {
       const isNS = side === 'north' || side === 'south';
       const span = isNS ? w : d - t * 2;
@@ -713,13 +744,13 @@ function buildTimberlineCompound(
         const seg = (span - doorW) * 0.5;
         const headerH = h - doorH;
         if (isNS) {
-          addSolidBox(cx - (doorW + seg) * 0.5, floorTop + h * 0.5, fixed, seg, h, t, matWood, 'wood');
-          addSolidBox(cx + (doorW + seg) * 0.5, floorTop + h * 0.5, fixed, seg, h, t, matWood, 'wood');
-          addSolidBox(cx, floorTop + doorH + headerH * 0.5, fixed, doorW, headerH, t, matWood, 'wood');
+          registerCabinWoodWall(cx - (doorW + seg) * 0.5, floorTop + h * 0.5, fixed, seg, h, t);
+          registerCabinWoodWall(cx + (doorW + seg) * 0.5, floorTop + h * 0.5, fixed, seg, h, t);
+          registerCabinWoodWall(cx, floorTop + doorH + headerH * 0.5, fixed, doorW, headerH, t);
         } else {
-          addSolidBox(fixed, floorTop + h * 0.5, cz - (doorW + seg) * 0.5, t, h, seg, matWood, 'wood');
-          addSolidBox(fixed, floorTop + h * 0.5, cz + (doorW + seg) * 0.5, t, h, seg, matWood, 'wood');
-          addSolidBox(fixed, floorTop + doorH + headerH * 0.5, cz, t, headerH, doorW, matWood, 'wood');
+          registerCabinWoodWall(fixed, floorTop + h * 0.5, cz - (doorW + seg) * 0.5, t, h, seg);
+          registerCabinWoodWall(fixed, floorTop + h * 0.5, cz + (doorW + seg) * 0.5, t, h, seg);
+          registerCabinWoodWall(fixed, floorTop + doorH + headerH * 0.5, cz, t, headerH, doorW);
         }
       } else {
         const winW = 1.9;
@@ -728,15 +759,15 @@ function buildTimberlineCompound(
         const jambH = h - sillH - headerH;
         const sideSeg = Math.max(0.45, (span - winW) * 0.5);
         if (isNS) {
-          addSolidBox(cx, floorTop + sillH * 0.5, fixed, span, sillH, t, matWood, 'wood');
-          addSolidBox(cx, floorTop + h - headerH * 0.5, fixed, span, headerH, t, matWood, 'wood');
-          addSolidBox(cx - (winW + sideSeg) * 0.5, floorTop + sillH + jambH * 0.5, fixed, sideSeg, jambH, t, matWood, 'wood');
-          addSolidBox(cx + (winW + sideSeg) * 0.5, floorTop + sillH + jambH * 0.5, fixed, sideSeg, jambH, t, matWood, 'wood');
+          registerCabinWoodWall(cx, floorTop + sillH * 0.5, fixed, span, sillH, t);
+          registerCabinWoodWall(cx, floorTop + h - headerH * 0.5, fixed, span, headerH, t);
+          registerCabinWoodWall(cx - (winW + sideSeg) * 0.5, floorTop + sillH + jambH * 0.5, fixed, sideSeg, jambH, t);
+          registerCabinWoodWall(cx + (winW + sideSeg) * 0.5, floorTop + sillH + jambH * 0.5, fixed, sideSeg, jambH, t);
         } else {
-          addSolidBox(fixed, floorTop + sillH * 0.5, cz, t, sillH, span, matWood, 'wood');
-          addSolidBox(fixed, floorTop + h - headerH * 0.5, cz, t, headerH, span, matWood, 'wood');
-          addSolidBox(fixed, floorTop + sillH + jambH * 0.5, cz - (winW + sideSeg) * 0.5, t, jambH, sideSeg, matWood, 'wood');
-          addSolidBox(fixed, floorTop + sillH + jambH * 0.5, cz + (winW + sideSeg) * 0.5, t, jambH, sideSeg, matWood, 'wood');
+          registerCabinWoodWall(fixed, floorTop + sillH * 0.5, cz, t, sillH, span);
+          registerCabinWoodWall(fixed, floorTop + h - headerH * 0.5, cz, t, headerH, span);
+          registerCabinWoodWall(fixed, floorTop + sillH + jambH * 0.5, cz - (winW + sideSeg) * 0.5, t, jambH, sideSeg);
+          registerCabinWoodWall(fixed, floorTop + sillH + jambH * 0.5, cz + (winW + sideSeg) * 0.5, t, jambH, sideSeg);
         }
       }
     };
@@ -1624,8 +1655,10 @@ function buildTimberlineCompound(
       nightLights,
     },
     doorSystem,
+    penetrableSystem,
     shatterBreakable,
     update: (dt, elapsedSec) => {
+      penetrableSystem.update(dt);
       // Smooth rotating radar dish + blinking aviation obstruction beacon
       radar.dishPivot.rotation.y += dt * 0.55;
       const blink = Math.sin(elapsedSec * 4.2) > 0.25;
@@ -1664,6 +1697,7 @@ function buildTimberlineCompound(
       }
     },
     dispose: () => {
+      penetrableSystem.dispose();
       doorSystem.dispose();
       scene.remove(sceneGroup);
       envTex.dispose();

@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { BodycamPhysicsWorld, PhysicsDynamicSlab } from '../bodycam-sdk/BodycamPhysics';
+import { PenetrableSurfaceSystem } from './PenetrableSurfaceSystem';
 
 export type DoorDamageState = 0 | 1 | 2 | 3;
 export type DoorHingeMode = 'attached' | 'sheared_flying' | 'splitting' | 'collapsed';
@@ -402,6 +403,7 @@ export class DestructibleDoorSystem {
   private readonly isSoftwareGl: boolean;
   private readonly materials: SharedDoorMaterials;
   private readonly synth = new DoorAudioSynth();
+  private readonly penSystem: PenetrableSurfaceSystem;
   private readonly trackedGeos: THREE.BufferGeometry[] = [];
   private readonly doors = new Map<string, DestructibleDoorRuntime>();
   private readonly doorList: DestructibleDoorRuntime[] = [];
@@ -432,6 +434,7 @@ export class DestructibleDoorSystem {
     this.particleRoot.name = 'DoorSplinterPool';
     parent.add(this.root);
     parent.add(this.particleRoot);
+    this.penSystem = new PenetrableSurfaceSystem(parent, { isSoftwareGl });
     this.initSplinterPool();
   }
 
@@ -632,8 +635,20 @@ export class DestructibleDoorSystem {
       slabMat,
     );
     lowerSlab.position.set(W * 0.5, splitY * 0.5, 0);
+    lowerSlab.userData.doorPenetrableId = `door_${spec.id}_lower`;
     tagDoorMesh(lowerSlab);
     lowerHalfGroup.add(lowerSlab);
+    this.penSystem.registerSurface({
+      id: `door_${spec.id}_lower`,
+      mesh: lowerSlab,
+      kind: 'wood_door',
+      width: W - 0.01,
+      height: splitY - 0.006,
+      thickness: T,
+      floorY: spec.hingePos[1],
+      maxHoles: 3,
+      hitsToBreach: 1,
+    });
 
     // Kick plate strip at bottom
     const kickPlate = new THREE.Mesh(
@@ -714,7 +729,19 @@ export class DestructibleDoorSystem {
       slabMat,
     );
     centerBreachPanel.position.set(holeCenterX, holeCenterY, 0);
+    centerBreachPanel.userData.doorPenetrableId = `door_${spec.id}_upper`;
     tagDoorMesh(centerBreachPanel, true);
+    this.penSystem.registerSurface({
+      id: `door_${spec.id}_upper`,
+      mesh: centerBreachPanel,
+      kind: 'wood_door',
+      width: holeW + 0.006,
+      height: holeH + 0.006,
+      thickness: T * 0.92,
+      floorY: spec.hingePos[1],
+      maxHoles: 4,
+      hitsToBreach: 1,
+    });
 
     upperHalfGroup.add(leftStile, rightStile, topRail, midBridgeRail, centerBreachPanel);
 
@@ -1199,6 +1226,8 @@ export class DestructibleDoorSystem {
     actorTeam?: 'A' | 'B' | 'FFA',
     fromRemote = false,
     explicitSeed?: number,
+    impactPoint?: Readonly<THREE.Vector3>,
+    hitObject?: THREE.Object3D | null,
   ): boolean {
     const d = this.doors.get(doorId);
     if (!d || d.hingeMode !== 'attached') return false;
@@ -1207,6 +1236,7 @@ export class DestructibleDoorSystem {
 
     const centerPos = this._tmpV3;
     this.getDoorCenterWorldPos(doorId, centerPos);
+    const hitPos = impactPoint ?? centerPos;
     const distM = centerPos.distanceTo(this.listenerPos);
     const isDestructive = isSprinting || horizontalSpeedMps >= SPRINT_DESTROY_SPEED_MPS;
     const swingDot = this.getSwingAlignmentDot(d, kickDir.x, kickDir.z);
@@ -1218,16 +1248,17 @@ export class DestructibleDoorSystem {
       if (!d.latched && openRatio >= 0.14) {
         d.softClosing = false;
         d.angularVel = -d.spec.swingSign * 9.8;
-        this.spawnBurst(centerPos, kickDir, 4, d.spec.hingePos[1], false);
+        this.spawnBurst(hitPos, kickDir, 4, d.spec.hingePos[1], false);
         this.synth.play('kick_breach', distM);
         this.emitAcoustic(d, centerPos, 18.0, 0.8, 'kick_breach', actorTeam);
         if (!fromRemote) {
-          this.emitBroadcast(d, 'close', centerPos, kickDir);
+          this.emitBroadcast(d, 'close', hitPos, kickDir);
         }
         return true;
       }
 
       // Closed / braced against jamb stop: NEVER opens toward the kicker!
+      // Carve a real boot-shaped see-through, shoot-through hole where the boot struck!
       d.angleRad = 0;
       d.angularVel = 0;
       d.latched = true;
@@ -1240,29 +1271,47 @@ export class DestructibleDoorSystem {
         const nextState: DoorDamageState = isDestructive
           ? 3
           : ((d.damageState + 1) as DoorDamageState);
-        this.setDamageStateVisuals(d, nextState);
+
+        const targetPenId =
+          typeof hitObject?.userData?.doorPenetrableId === 'string'
+            ? hitObject.userData.doorPenetrableId
+            : hitPos.y < d.spec.hingePos[1] + d.spec.height * 0.48
+              ? `door_${d.id}_lower`
+              : `door_${d.id}_upper`;
+        this.penSystem.applyMeleeImpact(targetPenId, hitPos, kickDir, 'kick', explicitSeed);
+
+        // Keep centerBreachPanel visible so the real carved boot hole stays rendered!
+        if (nextState < 3) {
+          this.setDamageStateVisuals(d, nextState);
+        } else {
+          d.damageState = 3;
+          d.dentOverlays.visible = false;
+          d.crackOverlays.visible = false;
+          d.breachSplinterRim.visible = false;
+          d.centerBreachPanel.visible = true;
+        }
         d.chipDamage = 0;
 
         const cue: DoorAudioCueKind =
           nextState === 3 ? 'wood_breach' : nextState === 2 ? 'wood_crack' : 'wood_dent';
         this.spawnBurst(
-          centerPos,
+          hitPos,
           kickDir,
-          nextState === 3 ? 20 : 11,
+          nextState === 3 ? 20 : 12,
           d.spec.hingePos[1],
           false,
         );
         this.synth.play(cue, distM);
         this.emitAcoustic(
           d,
-          centerPos,
+          hitPos,
           nextState === 3 ? 24.0 : 16.0,
           nextState === 3 ? 0.92 : 0.76,
           cue,
           actorTeam,
         );
         if (!fromRemote) {
-          this.emitBroadcast(d, 'melee_bash', centerPos, kickDir);
+          this.emitBroadcast(d, 'melee_bash', hitPos, kickDir);
         }
         return true;
       }
@@ -1280,10 +1329,17 @@ export class DestructibleDoorSystem {
         return true;
       }
 
-      // Walking kick on already-breached frame: heavy jamb shudder + wood thud
-      this.spawnBurst(centerPos, kickDir, 6, d.spec.hingePos[1], false);
+      // Walking kick on already-breached frame: enlarge/carve another hole at impact point + shudder
+      const targetPenId =
+        typeof hitObject?.userData?.doorPenetrableId === 'string'
+          ? hitObject.userData.doorPenetrableId
+          : hitPos.y < d.spec.hingePos[1] + d.spec.height * 0.48
+            ? `door_${d.id}_lower`
+            : `door_${d.id}_upper`;
+      this.penSystem.applyMeleeImpact(targetPenId, hitPos, kickDir, 'kick', explicitSeed);
+      this.spawnBurst(hitPos, kickDir, 8, d.spec.hingePos[1], false);
       this.synth.play('wood_dent', distM);
-      this.emitAcoustic(d, centerPos, 12.0, 0.58, 'wood_dent', actorTeam);
+      this.emitAcoustic(d, hitPos, 12.0, 0.58, 'wood_dent', actorTeam);
       return true;
     }
 
@@ -1513,6 +1569,8 @@ export class DestructibleDoorSystem {
     direction: Readonly<THREE.Vector3>,
     actorTeam?: 'A' | 'B' | 'FFA',
     fromRemote = false,
+    hitObject?: THREE.Object3D | null,
+    attackType: 'jab' | 'cross' | 'bash' | 'kick' = 'bash',
   ): DoorDamageState | null {
     const d = this.doors.get(doorId);
     if (!d || d.hingeMode !== 'attached') return null;
@@ -1523,14 +1581,27 @@ export class DestructibleDoorSystem {
       d.angularVel += d.spec.swingSign * 1.65;
     }
 
+    // Carve an actual see-through, shoot-through hole directly at the fist/buttstock impact point!
+    const targetPenId =
+      typeof hitObject?.userData?.doorPenetrableId === 'string'
+        ? hitObject.userData.doorPenetrableId
+        : impactPoint.y < d.spec.hingePos[1] + d.spec.height * 0.48
+          ? `door_${d.id}_lower`
+          : `door_${d.id}_upper`;
+    this.penSystem.applyMeleeImpact(targetPenId, impactPoint, direction, attackType);
+
     if (d.damageState < 3) {
       const nextState = (d.damageState + 1) as DoorDamageState;
-      this.setDamageStateVisuals(d, nextState);
+      d.damageState = nextState;
+      d.dentOverlays.visible = false;
+      d.crackOverlays.visible = false;
+      d.breachSplinterRim.visible = false;
+      d.centerBreachPanel.visible = true;
       d.chipDamage = 0;
 
       const cue: DoorAudioCueKind =
         nextState === 1 ? 'wood_dent' : nextState === 2 ? 'wood_crack' : 'wood_breach';
-      this.spawnBurst(impactPoint, direction, nextState === 3 ? 16 : 9, d.spec.hingePos[1], false);
+      this.spawnBurst(impactPoint, direction, nextState === 3 ? 16 : 11, d.spec.hingePos[1], false);
       this.synth.play(cue, distM);
       this.emitAcoustic(d, impactPoint, nextState === 3 ? 20 : 14, 0.78, cue, actorTeam);
 
@@ -1540,9 +1611,12 @@ export class DestructibleDoorSystem {
       return nextState;
     }
 
-    // Already at State 3: minor wood thud on remaining frame
-    this.spawnBurst(impactPoint, direction, 4, d.spec.hingePos[1], false);
+    // Already at State 3: minor wood thud + extra hole widening at impact spot
+    this.spawnBurst(impactPoint, direction, 6, d.spec.hingePos[1], false);
     this.synth.play('wood_dent', distM);
+    if (!fromRemote) {
+      this.emitBroadcast(d, 'melee_bash', impactPoint, direction);
+    }
     return 3;
   }
 
@@ -1635,6 +1709,8 @@ export class DestructibleDoorSystem {
     d.jambShudderTimer = 0;
     d.kickCooldownTimer = 0;
     d.hingePivot.rotation.set(0, 0, 0);
+    this.penSystem.repairSurface(`door_${d.id}_upper`);
+    this.penSystem.repairSurface(`door_${d.id}_lower`);
     this.setDamageStateVisuals(d, 0);
 
     d.dynamicSlab.active = true;
@@ -1655,6 +1731,7 @@ export class DestructibleDoorSystem {
   public update(dt: number, listenerPos?: Readonly<THREE.Vector3>): void {
     const clampedDt = Math.min(Math.max(dt, 0.0001), 0.05);
     if (listenerPos) this.listenerPos.copy(listenerPos);
+    this.penSystem.update(clampedDt, this.listenerPos);
 
     for (let i = 0; i < this.doorList.length; i++) {
       const d = this.doorList[i];
@@ -1942,17 +2019,24 @@ export class DestructibleDoorSystem {
 
     if (payload.action === 'melee_bash' && d.hingeMode === 'attached') {
       d.jambShudderTimer = 0.16;
-      if (payload.damageState > d.damageState) {
-        this.setDamageStateVisuals(d, payload.damageState);
-        const cue: DoorAudioCueKind =
-          payload.damageState === 1
-            ? 'wood_dent'
-            : payload.damageState === 2
-              ? 'wood_crack'
-              : 'wood_breach';
-        this.spawnBurst(pt, dir, payload.damageState === 3 ? 16 : 9, d.spec.hingePos[1], false);
-        this.synth.play(cue, pt.distanceTo(this.listenerPos));
-      }
+      const targetPenId =
+        pt.y < d.spec.hingePos[1] + d.spec.height * 0.48
+          ? `door_${d.id}_lower`
+          : `door_${d.id}_upper`;
+      this.penSystem.applyMeleeImpact(targetPenId, pt, dir, 'bash', payload.seed);
+      d.damageState = Math.max(d.damageState, payload.damageState) as DoorDamageState;
+      d.dentOverlays.visible = false;
+      d.crackOverlays.visible = false;
+      d.breachSplinterRim.visible = false;
+      d.centerBreachPanel.visible = true;
+      const cue: DoorAudioCueKind =
+        payload.damageState === 1
+          ? 'wood_dent'
+          : payload.damageState === 2
+            ? 'wood_crack'
+            : 'wood_breach';
+      this.spawnBurst(pt, dir, payload.damageState === 3 ? 16 : 9, d.spec.hingePos[1], false);
+      this.synth.play(cue, pt.distanceTo(this.listenerPos));
       return;
     }
 
@@ -2015,6 +2099,7 @@ export class DestructibleDoorSystem {
   }
 
   public dispose(): void {
+    this.penSystem.dispose();
     for (const g of this.trackedGeos) g.dispose();
     this.trackedGeos.length = 0;
     this.materials.woodBunker.dispose();

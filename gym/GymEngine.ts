@@ -15,7 +15,9 @@ import {
   BodycamWeaponProfile,
   CharacterAnimator,
   CharacterSkeleton,
+  computeTargetHingeAngularImpulse,
   createBodycamTelemetry,
+  createPdaMotionState,
   DEFAULT_BODYCAM_SDK_CONFIG,
   DEFAULT_TRAUMA_MODIFIERS,
   GrenadeDetonationEvent,
@@ -164,6 +166,7 @@ export class GymEngine {
   private readonly ballistics: GymBallistics;
   private readonly grenadeSystem: TacticalGrenadeSystem;
   private readonly pdaDevice: TacticalPdaDevice;
+  private readonly _pdaMotionScratch = createPdaMotionState();
   private readonly irIlluminatorLight: THREE.SpotLight;
   private readonly irIlluminatorTarget = new THREE.Object3D();
   private readonly unsubTacticalEquipment: () => void;
@@ -898,18 +901,44 @@ export class GymEngine {
         const st = this.world.steelTargets[i];
         const stPos = new THREE.Vector3();
         st.plateMesh.getWorldPosition(stPos);
+        const blastDir = stPos.clone().sub(ev.position);
+        if (blastDir.lengthSq() < 1e-5) {
+          blastDir.set(0, 0, -1);
+        } else {
+          blastDir.normalize();
+        }
         if (ev.kind === 'frag') {
           const fragRes = this.grenadeSystem.evaluateFragDamageAt(ev.position, stPos, ev.def);
           if (fragRes.damage > 2) {
             const kickScale = THREE.MathUtils.clamp(fragRes.damage / 110, 0.25, 1.4);
-            st.hitAngVel -= 14.5 * kickScale;
+            st.hitAngVel += computeTargetHingeAngularImpulse({
+              pivot: st.pivot,
+              hitPointWorld: stPos,
+              incomingDir: blastDir,
+              impactSpeedMs: 26 * kickScale,
+              bulletMassGrams: 120,
+              effectiveInertia: 0.22,
+              impulseScale: 1.0,
+              minDeltaRadSec: 2.8,
+              maxDeltaRadSec: 15.0,
+            });
             st.hitFlashTimer = 0.14;
           }
         } else {
           const d = stPos.distanceTo(ev.position);
           if (d <= ev.radiusM * 1.15) {
             const falloff = Math.max(0.2, 1 - d / (ev.radiusM * 1.15));
-            st.hitAngVel -= 5.0 * falloff;
+            st.hitAngVel += computeTargetHingeAngularImpulse({
+              pivot: st.pivot,
+              hitPointWorld: stPos,
+              incomingDir: blastDir,
+              impactSpeedMs: 12 * falloff,
+              bulletMassGrams: 90,
+              effectiveInertia: 0.22,
+              impulseScale: 1.0,
+              minDeltaRadSec: 1.2,
+              maxDeltaRadSec: 6.5,
+            });
             st.hitFlashTimer = 0.14;
           }
         }
@@ -1438,10 +1467,7 @@ export class GymEngine {
       return;
     }
     if (prof.holdClass === 'unarmed') {
-      const punch = this.animator.triggerUnarmedPunch(
-        this.controller,
-        this.input.ads && !this.controller.isSprinting,
-      );
+      const punch = this.animator.triggerUnarmedPunch(this.controller, this.input.ads);
       if (punch) {
         this.stamina = Math.max(0, this.stamina - (punch === 'cross' ? 0.065 : 0.04));
         this.adrenalineStress = THREE.MathUtils.clamp(this.adrenalineStress + 0.07, 0, 1);
@@ -1475,26 +1501,36 @@ export class GymEngine {
 
   private handleMeleeHit(ev: Readonly<BodycamMeleeHitEvent>): void {
     const ud = ev.object?.userData;
+    const penSurfaceId = ud?.penetrableSurfaceId as string | undefined;
+    if (penSurfaceId) {
+      this.world.penetrableSurfaces.applyMeleeImpact(
+        penSurfaceId,
+        ev.point,
+        ev.direction,
+        ev.attackType,
+      );
+      return;
+    }
     const targetKind = ud?.gymTargetKind as string | undefined;
     const targetId = ud?.gymTargetId as string | undefined;
     if (targetKind === 'steel_plate' && targetId) {
       const st = this.world.steelTargets.find((s) => s.id === targetId);
       if (st) {
-        // Plate hangs at -Y from top hinge: +X rotation swings the bottom plate toward -Z (away from striker).
-        // Bullets impart ~6.0–8.8 rad/s; kicks & punches deliver lighter, grounded kinetic swings.
-        const kickDir = ev.direction.z <= 0 ? 1 : -1;
-        const faceAlign = THREE.MathUtils.clamp(Math.abs(ev.direction.z), 0.45, 1.0);
-        const baseImpulse =
-          ev.attackType === 'kick'
-            ? ev.wellPlaced
-              ? 3.4
-              : 2.1
-            : ev.attackType === 'bash'
-              ? 2.35
-              : ev.attackType === 'cross'
-                ? 2.05
-                : 1.4;
-        st.hitAngVel += kickDir * baseImpulse * faceAlign;
+        const meleeMassG =
+          ev.attackType === 'kick' ? (ev.wellPlaced ? 950 : 650) : ev.attackType === 'bash' ? 680 : ev.attackType === 'cross' ? 560 : 400;
+        const meleeSpeedMs =
+          ev.attackType === 'kick' ? 11.5 : ev.attackType === 'cross' ? 9.5 : 7.5;
+        st.hitAngVel += computeTargetHingeAngularImpulse({
+          pivot: st.pivot,
+          hitPointWorld: ev.point,
+          incomingDir: ev.direction,
+          impactSpeedMs: meleeSpeedMs,
+          bulletMassGrams: meleeMassG,
+          effectiveInertia: 0.24,
+          impulseScale: 0.18,
+          minDeltaRadSec: 1.2,
+          maxDeltaRadSec: 4.5,
+        });
         st.hitFlashTimer = 0.06;
         this.audio.playImpact(ev.point, 'steel_plate');
         this.lastHit = {
@@ -1523,10 +1559,7 @@ export class GymEngine {
     const prof = this.getWeaponProfile();
     if (prof.holdClass === 'unarmed') {
       if (this.semiTriggerConsumed || this.controller.isVaulting()) return;
-      const punch = this.animator.triggerUnarmedPunch(
-        this.controller,
-        this.input.ads && !this.controller.isSprinting,
-      );
+      const punch = this.animator.triggerUnarmedPunch(this.controller, this.input.ads);
       if (punch) {
         this.semiTriggerConsumed = true;
         this.stamina = Math.max(0, this.stamina - (punch === 'cross' ? 0.065 : 0.04));
@@ -1654,6 +1687,7 @@ export class GymEngine {
     this.input.holdBreath = false;
     this.input.vault = false;
     this.grenadeSystem.resetHeldInputOnFocusLoss();
+    this.pdaDevice.setDragging(false);
   }
 
   private readonly onWindowBlur = (): void => {
@@ -1730,9 +1764,8 @@ export class GymEngine {
     // Clamp abnormal single-frame pointer jump spikes
     const dx = THREE.MathUtils.clamp(e.movementX, -140, 140);
     const dy = THREE.MathUtils.clamp(e.movementY, -140, 140);
-    if (this.pdaDevice.isOpen()) {
-      this.pdaDevice.applyMouseDelta(dx, dy);
-      this.controller.handleMouseMove(dx * 0.25, dy * 0.25, this.config);
+    if (this.pdaDevice.isOpen() && this.pdaDevice.isDragging()) {
+      this.pdaDevice.applyDragDelta(dx, dy);
       return;
     }
     this.controller.handleMouseMove(dx, dy, this.config);
@@ -1746,7 +1779,9 @@ export class GymEngine {
     this.audio.ensureInitialized();
 
     if (this.pdaDevice.isBlockingWeaponActions()) {
-      if (e.button === 2 && this.pdaDevice.isOpen()) {
+      if (e.button === 0 && this.pdaDevice.isOpen()) {
+        this.pdaDevice.setDragging(true);
+      } else if (e.button === 2 && this.pdaDevice.isOpen()) {
         this.pdaDevice.recenterOnPlayer();
       }
       return;
@@ -1802,6 +1837,9 @@ export class GymEngine {
 
   private readonly onMouseUp = (e: MouseEvent): void => {
     if (e.button === 0) {
+      if (this.pdaDevice.isDragging()) {
+        this.pdaDevice.setDragging(false);
+      }
       if (this.grenadeSystem.isThrowInputHeld()) {
         this.grenadeSystem.releaseThrowInput();
         this.emitSnapshot();
@@ -1997,7 +2035,9 @@ export class GymEngine {
         break;
       case 'Space':
         e.preventDefault();
-        this.input.vault = true;
+        if (!e.repeat) {
+          this.input.vault = true;
+        }
         break;
     }
   };
@@ -2182,9 +2222,16 @@ export class GymEngine {
     if (suppBusy || pdaBusy || grenadeDrawn) {
       this.input.ads = false;
     }
-    // Shift sprints ONLY when not aiming; while aiming, Shift (or Alt) exclusively engages Hold Breath
-    this.input.sprint = !suppBusy && this.shiftHeld && !this.input.ads;
-    this.input.holdBreath = !suppBusy && !pdaBusy && this.input.ads && (this.shiftHeld || this.altHeld);
+    const firearmAdsBlocking =
+      this.input.ads && prof.holdClass !== 'unarmed' && !grenadeDrawn;
+    // Shift sprints freely with fists guard up or grenade held; aiming a firearm engages Hold Breath instead
+    this.input.sprint = !suppBusy && !pdaBusy && this.shiftHeld && !firearmAdsBlocking;
+    this.input.holdBreath =
+      !suppBusy &&
+      !pdaBusy &&
+      this.input.ads &&
+      prof.holdClass !== 'unarmed' &&
+      (this.shiftHeld || this.altHeld);
 
     let isVaultingNow = false;
     if (!benchBusy) {
@@ -2232,13 +2279,14 @@ export class GymEngine {
         modeLabel: 'PLAYGROUND',
         zoneLabel: 'TESTING PLAYGROUND',
       });
-      this.controller.getVelocity(this._playerVelScratch);
-      const moveRatioPda = THREE.MathUtils.clamp(
-        Math.hypot(this._playerVelScratch.x, this._playerVelScratch.z) / 4.8,
-        0,
-        1.3,
+      this.controller.writePdaMotionState(this._pdaMotionScratch);
+      this.pdaDevice.update(
+        dt,
+        this.elapsedSec,
+        this._pdaMotionScratch.moveRatio,
+        this._pdaMotionScratch.isCrouched,
+        this._pdaMotionScratch,
       );
-      this.pdaDevice.update(dt, this.elapsedSec, moveRatioPda, this.controller.crouched);
 
       // 2. Step Full-Body Procedural IK Character Animator
       this.animator.update(dt, this.elapsedSec, this.controller, this.adapter, prof, this.input.ads);

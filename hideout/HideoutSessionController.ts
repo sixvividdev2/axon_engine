@@ -14,6 +14,7 @@ import {
   CharacterAnimator,
   CharacterSkeleton,
   createBodycamTelemetry,
+  createPdaMotionState,
   createRaycastResult,
   DEFAULT_BODYCAM_SDK_CONFIG,
   DEFAULT_TRAUMA_MODIFIERS,
@@ -30,6 +31,8 @@ import {
   solveZeroPitchRad,
   TacticalGrenadeSystem,
   tacticalEquipmentStore,
+  TacticalPdaDevice,
+  type PdaPingMarker,
   WeaponRig,
 } from '../bodycam-sdk';
 import {
@@ -111,6 +114,7 @@ export interface HideoutSnapshot {
   grenadeCount: number;
   nvgActive: boolean;
   irActive: boolean;
+  isPdaOpen: boolean;
   isSwappingGunWall: boolean;
   interactReticleState: InteractReticleState;
   prompt: HideoutPromptState | null;
@@ -120,6 +124,18 @@ export interface HideoutSnapshot {
   gunRange: GunRangeSnapshot;
   longRange: LongRangeSnapshot;
 }
+
+const HIDEOUT_PDA_MARKERS: readonly PdaPingMarker[] = [
+  { x: 0, z: 0, label: 'ARSENAL', kind: 'poi' },
+  { x: -11.5, z: 0, label: 'READY ROOM', kind: 'poi' },
+  { x: 0, z: 9.5, label: 'SECTOR 4', kind: 'danger' },
+  { x: 10.7, z: 14, label: 'BAY 1 · BALLISTICS', kind: 'poi' },
+  { x: 19.2, z: 16, label: 'BAY 2 · CQB', kind: 'poi' },
+  { x: 29.0, z: 28.2, label: '25M', kind: 'order' },
+  { x: 29.0, z: 53.2, label: '50M', kind: 'order' },
+  { x: 29.0, z: 78.2, label: '75M', kind: 'order' },
+  { x: 29.0, z: 103.2, label: '100M', kind: 'order' },
+];
 
 export interface HideoutControllerCallbacks {
   isWeaponUnlocked: (weaponId: string) => boolean;
@@ -157,6 +173,8 @@ export class HideoutSessionController {
   private readonly scopeRenderer: ScopeRenderer;
   private readonly swapChoreography: GunWallSwapChoreography;
   private readonly grenadeSystem: TacticalGrenadeSystem;
+  private readonly pdaDevice: TacticalPdaDevice;
+  private readonly _pdaMotionScratch = createPdaMotionState();
   private readonly irIlluminatorLight: THREE.SpotLight;
   private readonly irIlluminatorTarget: THREE.Object3D;
   private readonly interactAnimator = new PlayerInteractAnimator();
@@ -329,10 +347,33 @@ export class HideoutSessionController {
               ev.direction,
               horizSpeed,
               this.controller.isSprinting,
+              undefined,
+              false,
+              undefined,
+              ev.point,
+              ev.object,
             );
           } else {
-            this.world.doorSystem.applyMeleeBash(doorId, ev.point, ev.direction);
+            this.world.doorSystem.applyMeleeBash(
+              doorId,
+              ev.point,
+              ev.direction,
+              undefined,
+              false,
+              ev.object,
+              ev.attackType,
+            );
           }
+          return;
+        }
+        const penSurfaceId = ev.object?.userData?.penetrableSurfaceId as string | undefined;
+        if (penSurfaceId) {
+          this.world.penetrableSystem.applyMeleeImpact(
+            penSurfaceId,
+            ev.point,
+            ev.direction,
+            ev.attackType,
+          );
           return;
         }
         // Check destructible bunker electronics (consoles, monitors, chronograph, lights, strobes)
@@ -350,11 +391,19 @@ export class HideoutSessionController {
           return;
         }
         // Allow kicking/bashing/punching reactive range targets or the start paddle up close
+        const meleeMassG =
+          ev.attackType === 'kick' ? 950 : ev.attackType === 'bash' ? 680 : ev.attackType === 'cross' ? 520 : 380;
+        const meleeSpeedMs =
+          ev.attackType === 'kick' ? 14 : ev.attackType === 'cross' ? 11 : 9;
+        const meleeAmmo = {
+          ...getDefaultAmmoVariant('9x19'),
+          bulletMassGrams: meleeMassG,
+        };
         if (ev.object?.userData?.hideoutRangeTarget) {
           const rangeHit = this.world.gunRange.handleBallisticImpact(
             {
               outcome: 'stop',
-              ammo: getDefaultAmmoVariant('9x19'),
+              ammo: meleeAmmo,
               weaponId: this.equippedWeaponId,
               material: 'steel',
               surface: 'metal',
@@ -363,8 +412,8 @@ export class HideoutSessionController {
               normal: ev.normal,
               incomingDir: ev.direction,
               outgoingDir: ev.direction,
-              impactSpeedMs: 12,
-              impactEnergyJ: 120,
+              impactSpeedMs: meleeSpeedMs,
+              impactEnergyJ: ev.damageEnergyJ,
               grazingAngleDeg: 90,
               distanceM: 1,
               isFragment: false,
@@ -384,7 +433,7 @@ export class HideoutSessionController {
           const lrHit = this.world.longRangeGallery.handleBallisticImpact(
             {
               outcome: 'stop',
-              ammo: getDefaultAmmoVariant('9x19'),
+              ammo: meleeAmmo,
               weaponId: this.equippedWeaponId,
               material: 'steel',
               surface: 'metal',
@@ -393,8 +442,8 @@ export class HideoutSessionController {
               normal: ev.normal,
               incomingDir: ev.direction,
               outgoingDir: ev.direction,
-              impactSpeedMs: 12,
-              impactEnergyJ: 120,
+              impactSpeedMs: meleeSpeedMs,
+              impactEnergyJ: ev.damageEnergyJ,
               grazingAngleDeg: 90,
               distanceM: 1,
               isFragment: false,
@@ -444,6 +493,9 @@ export class HideoutSessionController {
 
     this.animator = new CharacterAnimator(this.skeleton, this.weaponRig, this.audio);
     this.controller = new BodycamController(this.camera, this.weaponRig, this.audio);
+    this.pdaDevice = new TacticalPdaDevice(this.audio);
+    this.camera.add(this.pdaDevice.root);
+    this.animator.setPdaDevice(this.pdaDevice);
 
     // IR illuminator spotlight attached to helmet/camera when NVG + IR Flood active
     this.irIlluminatorTarget = new THREE.Object3D();
@@ -585,6 +637,13 @@ export class HideoutSessionController {
     });
 
     this.bindEvents();
+
+    this.pdaDevice.captureOrthographicMap({
+      renderer: this.renderer,
+      scene: this.scene,
+      bounds: { minX: -20, maxX: 36, minZ: -14, maxZ: 110 },
+      excludeObjects: [this.skeleton.root, this.weaponRig.root, this.pdaDevice.root],
+    });
 
     if (!this.isSoftwareGl) {
       this.renderer.compile(this.scene, this.camera);
@@ -1891,6 +1950,21 @@ export class HideoutSessionController {
     }
   }
 
+  private togglePda(): void {
+    if (this.swapChoreography.isActive() || this.pauseOpen || this.modalActive) return;
+    const next = !this.pdaDevice.isOpen();
+    if (next) {
+      if (this.grenadeSystem.isDrawn() && !this.grenadeSystem.isPinPulled()) {
+        this.handleGrenadeHolsterOrToss();
+      }
+      this.isFiring = false;
+      this.input.ads = false;
+      this.reloadTimer = 0;
+    }
+    this.pdaDevice.setOpen(next);
+    this.emitSnapshot(true);
+  }
+
   private clearMovementInputs(): void {
     this.input.forward = false;
     this.input.backward = false;
@@ -1900,9 +1974,11 @@ export class HideoutSessionController {
     this.input.leanLeft = false;
     this.input.leanRight = false;
     this.input.ads = false;
+    this.input.vault = false;
     this.shiftHeld = false;
     this.isFiring = false;
     this.semiTriggerConsumed = false;
+    this.pdaDevice.setDragging(false);
   }
 
   private readonly onPointerLockChange = (): void => {
@@ -1921,7 +1997,13 @@ export class HideoutSessionController {
 
   private readonly onMouseMove = (e: MouseEvent): void => {
     if (!this.pointerLocked || this.pauseOpen || this.modalActive) return;
-    this.controller.handleMouseMove(e.movementX, e.movementY, this.config);
+    const dx = THREE.MathUtils.clamp(e.movementX, -140, 140);
+    const dy = THREE.MathUtils.clamp(e.movementY, -140, 140);
+    if (this.pdaDevice.isOpen() && this.pdaDevice.isDragging()) {
+      this.pdaDevice.applyDragDelta(dx, dy);
+      return;
+    }
+    this.controller.handleMouseMove(dx, dy, this.config);
   };
 
   private readonly onMouseDown = (e: MouseEvent): void => {
@@ -1937,6 +2019,15 @@ export class HideoutSessionController {
     }
     this.audio.ensureInitialized();
     this.audio.setInteriorAcoustics(true, 'concrete');
+
+    if (this.pdaDevice.isBlockingWeaponActions()) {
+      if (e.button === 0 && this.pdaDevice.isOpen()) {
+        this.pdaDevice.setDragging(true);
+      } else if (e.button === 2 && this.pdaDevice.isOpen()) {
+        this.pdaDevice.recenterOnPlayer();
+      }
+      return;
+    }
 
     // Authentic 4-stage grenade Manual of Arms when ordnance is drawn
     if (this.grenadeSystem.isDrawn()) {
@@ -1971,10 +2062,7 @@ export class HideoutSessionController {
       if (this.equippedWeaponId === 'unarmed') {
         // Unarmed jab (hip) or heavy power hook (holding RMB ready fists) works anywhere in Hideout
         this.animator.interruptInspect();
-        this.animator.triggerUnarmedPunch(
-          this.controller,
-          this.input.ads && !this.controller.isSprinting,
-        );
+        this.animator.triggerUnarmedPunch(this.controller, this.input.ads);
         return;
       }
       const room = resolveHideoutRoom(this.controller.position.x, this.controller.position.z);
@@ -1998,6 +2086,9 @@ export class HideoutSessionController {
 
   private readonly onMouseUp = (e: MouseEvent): void => {
     if (e.button === 0) {
+      if (this.pdaDevice.isDragging()) {
+        this.pdaDevice.setDragging(false);
+      }
       if (this.grenadeSystem.isThrowInputHeld()) {
         this.grenadeSystem.releaseThrowInput();
         this.emitSnapshot(true);
@@ -2015,6 +2106,11 @@ export class HideoutSessionController {
 
   private readonly onWheel = (e: WheelEvent): void => {
     if (!this.pointerLocked || this.pauseOpen || this.modalActive) return;
+    if (this.pdaDevice.isOpen()) {
+      e.preventDefault();
+      this.pdaDevice.applyWheel(e.deltaY);
+      return;
+    }
     if (this.activePrompt && this.activePrompt.options.length > 1) {
       e.preventDefault();
       const dir = e.deltaY > 0 ? 1 : -1;
@@ -2078,12 +2174,17 @@ export class HideoutSessionController {
         this.input.leanRight = true;
         break;
       case 'KeyF':
-        if (!e.repeat && this.activeTarget) {
+        if (!e.repeat && !this.pdaDevice.isBlockingWeaponActions() && this.activeTarget) {
           this.executeSelectedInteract();
         }
         break;
+      case 'KeyM':
+        if (!e.repeat) {
+          this.togglePda();
+        }
+        break;
       case 'KeyV':
-        if (!e.repeat && !this.swapChoreography.isActive()) {
+        if (!e.repeat && !this.swapChoreography.isActive() && !this.pdaDevice.isBlockingWeaponActions()) {
           this.animator.interruptInspect();
           this.input.ads = false;
           if (this.equippedWeaponId === 'unarmed') {
@@ -2095,22 +2196,32 @@ export class HideoutSessionController {
         }
         break;
       case 'KeyX':
-        if (!e.repeat && !this.swapChoreography.isActive()) {
+        if (!e.repeat && !this.swapChoreography.isActive() && !this.pdaDevice.isBlockingWeaponActions()) {
           this.animator.interruptInspect();
           this.input.ads = false;
           this.animator.triggerPushKick(this.controller, DEFAULT_TRAUMA_MODIFIERS);
         }
         break;
       case 'KeyI':
-        if (!e.repeat && this.equippedWeaponId !== 'unarmed' && !this.swapChoreography.isActive()) {
-          this.weaponRig.weaponAnimator.triggerInspect();
-        }
-        break;
-      case 'KeyR':
         if (
           !e.repeat &&
           this.equippedWeaponId !== 'unarmed' &&
           !this.swapChoreography.isActive() &&
+          !this.pdaDevice.isBlockingWeaponActions()
+        ) {
+          this.weaponRig.weaponAnimator.triggerInspect();
+        }
+        break;
+      case 'KeyR':
+        if (this.pdaDevice.isOpen()) {
+          if (!e.repeat) this.pdaDevice.recenterOnPlayer();
+          break;
+        }
+        if (
+          !e.repeat &&
+          this.equippedWeaponId !== 'unarmed' &&
+          !this.swapChoreography.isActive() &&
+          !this.pdaDevice.isBlockingWeaponActions() &&
           this.reloadTimer <= 0 &&
           !this.weaponRig.isTubularReloading()
         ) {
@@ -2153,7 +2264,12 @@ export class HideoutSessionController {
         }
         break;
       case 'KeyB':
-        if (!e.repeat && this.equippedWeaponId !== 'unarmed' && !this.swapChoreography.isActive()) {
+        if (
+          !e.repeat &&
+          this.equippedWeaponId !== 'unarmed' &&
+          !this.swapChoreography.isActive() &&
+          !this.pdaDevice.isBlockingWeaponActions()
+        ) {
           const prof = resolveWeaponProfile(this.equippedWeaponId);
           if (prof.fireMode === 'auto') {
             const cur = this.getEffectiveFireMode(prof);
@@ -2191,7 +2307,7 @@ export class HideoutSessionController {
         }
         break;
       case 'KeyG':
-        if (!e.repeat) {
+        if (!e.repeat && !this.pdaDevice.isBlockingWeaponActions()) {
           this.toggleSuppressor();
         }
         break;
@@ -2216,25 +2332,31 @@ export class HideoutSessionController {
         }
         break;
       case 'Digit1':
-        if (!e.repeat) {
+        if (!e.repeat && !this.pdaDevice.isBlockingWeaponActions()) {
           this.equipHideoutSlot(1);
         }
         break;
       case 'Digit2':
-        if (!e.repeat) {
+        if (!e.repeat && !this.pdaDevice.isBlockingWeaponActions()) {
           this.equipHideoutSlot(2);
         }
         break;
       case 'Digit3':
       case 'Digit0':
-        if (!e.repeat) {
+        if (!e.repeat && !this.pdaDevice.isBlockingWeaponActions()) {
           this.equipHideoutSlot(3);
         }
         break;
       case 'Digit4':
       case 'KeyH':
-        if (!e.repeat) {
+        if (!e.repeat && !this.pdaDevice.isBlockingWeaponActions()) {
           this.drawOrHolsterGrenade();
+        }
+        break;
+      case 'Space':
+        e.preventDefault();
+        if (!e.repeat && !this.pdaDevice.isOpen()) {
+          this.input.vault = true;
         }
         break;
     }
@@ -2264,6 +2386,9 @@ export class HideoutSessionController {
       case 'KeyE':
         this.input.leanRight = false;
         break;
+      case 'Space':
+        this.input.vault = false;
+        break;
     }
   };
 
@@ -2287,6 +2412,10 @@ export class HideoutSessionController {
     this.onResize();
   };
 
+  private readonly onWindowBlur = (): void => {
+    this.clearMovementInputs();
+  };
+
   private bindEvents(): void {
     document.addEventListener('pointerlockchange', this.onPointerLockChange);
     window.addEventListener('mousemove', this.onMouseMove);
@@ -2297,6 +2426,7 @@ export class HideoutSessionController {
     window.addEventListener('contextmenu', this.onContextMenu);
     window.addEventListener('keydown', this.onKeyDown);
     window.addEventListener('keyup', this.onKeyUp);
+    window.addEventListener('blur', this.onWindowBlur);
     window.addEventListener('resize', this.onResize);
     this.renderer.domElement.addEventListener('webglcontextlost', this.onContextLost);
     this.renderer.domElement.addEventListener('webglcontextrestored', this.onContextRestored);
@@ -2358,8 +2488,9 @@ export class HideoutSessionController {
     if (!this.contextLost) {
       const swapping = this.swapChoreography.isActive();
       const suppBusy = this.weaponRig.isSuppressorActionActive();
+      const pdaBusy = this.pdaDevice.isBlockingWeaponActions();
       const grenadeDrawn = this.grenadeSystem.isDrawn();
-      if (suppBusy || grenadeDrawn) {
+      if (suppBusy || pdaBusy || grenadeDrawn) {
         this.input.ads = false;
       }
 
@@ -2372,9 +2503,17 @@ export class HideoutSessionController {
         baseAdsMode === 'PRIMARY' &&
         this.weaponRig.shouldForceNodsCantedAim(true);
       this.input.adsMode = nodsForceCant ? 'POINT_AIM' : baseAdsMode;
+      const firearmAdsBlocking =
+        this.input.ads && this.equippedWeaponId !== 'unarmed' && !grenadeDrawn;
       this.input.sprint =
-        !suppBusy && this.shiftHeld && this.input.forward && !this.input.ads && !swapping;
-      this.input.holdBreath = !suppBusy && this.shiftHeld && this.input.ads && !swapping;
+        !suppBusy && !pdaBusy && this.shiftHeld && this.input.forward && !firearmAdsBlocking && !swapping;
+      this.input.holdBreath =
+        !suppBusy &&
+        !pdaBusy &&
+        this.shiftHeld &&
+        this.input.ads &&
+        this.equippedWeaponId !== 'unarmed' &&
+        !swapping;
 
       // Step fire cooldown & box-magazine reload timer
       if (this.fireCooldown > 0) {
@@ -2433,6 +2572,28 @@ export class HideoutSessionController {
         this.animator.setExternalHandOverride(null);
       }
 
+      // Update 3D Tactical PDA before IK animator consumes wrist sockets
+      this.pdaDevice.setTelemetry({
+        playerX: this.controller.position.x,
+        playerZ: this.controller.position.z,
+        playerYawRad: this.controller.aimYaw,
+        gameClockText: '12:00',
+        weatherLabel: 'BUNKER',
+        windSpeedMps: 0.0,
+        windAngleRad: 0.0,
+        modeLabel: 'HIDEOUT',
+        zoneLabel: this.currentRoomLabel.toUpperCase(),
+        pings: HIDEOUT_PDA_MARKERS,
+      });
+      this.controller.writePdaMotionState(this._pdaMotionScratch);
+      this.pdaDevice.update(
+        dt,
+        this.elapsedSec,
+        this._pdaMotionScratch.moveRatio,
+        this._pdaMotionScratch.isCrouched,
+        this._pdaMotionScratch,
+      );
+
       // Update full-body procedural skeleton & hand/finger IK
       this.animator.update(
         dt,
@@ -2443,6 +2604,8 @@ export class HideoutSessionController {
         this.input.ads,
       );
       this.animator.applyCameraAdditiveOverlay(this.camera);
+      this.weaponRig.root.visible =
+        !swapping && !this.grenadeSystem.isWeaponHidden() && !this.pdaDevice.isWeaponHidden();
 
       // Update spatial audio listener & indoor concrete bunker acoustic state
       this.camera.getWorldPosition(this._camPos);
@@ -2556,6 +2719,7 @@ export class HideoutSessionController {
       grenadeCount: this.grenadeCount,
       nvgActive: this.nvgFlipped && this.localGear.nvgMount !== 'none',
       irActive: this.nvgFlipped && this.localGear.nvgMount !== 'none' && this.irIlluminatorOn,
+      isPdaOpen: this.pdaDevice.isOpen(),
       isSwappingGunWall: this.swapChoreography.isActive(),
       interactReticleState: this.interactReticleState,
       prompt: this.activePrompt
@@ -2596,12 +2760,15 @@ export class HideoutSessionController {
     window.removeEventListener('contextmenu', this.onContextMenu);
     window.removeEventListener('keydown', this.onKeyDown);
     window.removeEventListener('keyup', this.onKeyUp);
+    window.removeEventListener('blur', this.onWindowBlur);
     window.removeEventListener('resize', this.onResize);
     this.renderer.domElement.removeEventListener('webglcontextlost', this.onContextLost);
     this.renderer.domElement.removeEventListener('webglcontextrestored', this.onContextRestored);
 
     this.unsubOperatorGear();
     this.unsubLoadout();
+    this.camera.remove(this.pdaDevice.root);
+    this.pdaDevice.dispose();
     this.grenadeSystem.dispose();
     this.ballistics.dispose();
     this.scene.remove(this.ballistics.group);

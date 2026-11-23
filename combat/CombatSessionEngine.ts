@@ -18,6 +18,7 @@ import {
   CharacterAnimator,
   CharacterSkeleton,
   createBodycamTelemetry,
+  createPdaMotionState,
   createRaycastResult,
   DEFAULT_BODYCAM_SDK_CONFIG,
   DEFAULT_TRAUMA_MODIFIERS,
@@ -460,6 +461,7 @@ export class CombatSessionEngine {
   private config: BodycamSDKConfig = { ...DEFAULT_BODYCAM_SDK_CONFIG };
   private readonly _runtimeConfig: BodycamSDKConfig = { ...DEFAULT_BODYCAM_SDK_CONFIG };
   private readonly telemetry: BodycamTelemetry = createBodycamTelemetry();
+  private readonly _pdaMotionScratch = createPdaMotionState();
   private readonly input: BodycamInputState = {
     forward: false,
     backward: false,
@@ -1645,8 +1647,8 @@ export class CombatSessionEngine {
 
     if (type === 'game:grenade_event') {
       const pkt = raw as unknown as GameGrenadeEventPacket;
-      if (!pkt.isBot && pkt.senderUserId === this.mp.localUserId) return;
-      if (pkt.isBot && this.isMpHost) return;
+      if (pkt.senderUserId && pkt.senderUserId === this.mp.localUserId) return;
+      if (pkt.isBot && this.isMpHost && pkt.kind !== 'belt_cookoff' && pkt.kind !== 'belt_dud') return;
       this._tmpImpactPoint.set(pkt.px, pkt.py, pkt.pz);
       this._tmpImpactDir.set(pkt.vx ?? 0, pkt.vy ?? 0, pkt.vz ?? 0);
       const meta = {
@@ -1671,6 +1673,36 @@ export class CombatSessionEngine {
         );
       } else if (pkt.kind === 'in_hand_detonate') {
         this.grenadeSystem.triggerRemoteDetonation(pkt.equipmentId, this._tmpImpactPoint, meta);
+      } else if (pkt.kind === 'belt_cookoff' || pkt.kind === 'belt_dud') {
+        if (pkt.isBot) {
+          this.botAI?.consumeBotBeltGrenade(pkt.actorId, pkt.equipmentId);
+        } else if (pkt.actorId === this.mp.localUserId) {
+          if (this.grenadeCount > 0) {
+            this.grenadeCount = Math.max(0, this.grenadeCount - 1);
+            this.syncBeltEquipmentMesh();
+            this.showToast(
+              pkt.kind === 'belt_cookoff'
+                ? `BELT ${getTacticalEquipmentDef(pkt.equipmentId).shortName} SHOT — DETONATION!`
+                : 'Belt Grenade Struck · Disabled',
+              2.4,
+            );
+            this.emitSnapshot();
+          }
+        } else {
+          this.remotePlayers?.consumeRemoteBeltGrenade(pkt.actorId);
+        }
+        if (pkt.kind === 'belt_cookoff') {
+          this.grenadeSystem.triggerRemoteDetonation(pkt.equipmentId, this._tmpImpactPoint, {
+            isRemote: true,
+            sourceId: pkt.senderUserId ? `human:${pkt.senderUserId}` : pkt.actorId,
+            sourceName: pkt.senderUsername ?? 'OPERATOR',
+            sourceTeam: (pkt.senderTeam === 'B' ? 'B' : 'A') as BattleTeamId,
+            sourceIsBot: false,
+          });
+        } else {
+          this.grenadeSystem.spawnBeltDudSpark(this._tmpImpactPoint);
+          this.audio.playImpact(this._tmpImpactPoint, 'steel_plate');
+        }
       }
       return;
     }
@@ -1707,7 +1739,7 @@ export class CombatSessionEngine {
         attackerTeam,
         pkt.senderUserId,
       );
-      if (this.playerAlive) {
+      if (this.playerAlive && pkt.hitZone !== 'belt_grenade') {
         const estEnergyJ = this.estimateEnergyFromWeaponOrDamage(pkt.weaponId, undefined, pkt.damage);
         this.tryRollLocalBeltGrenadeImpact(
           pkt.senderUsername ?? 'OPERATOR',
@@ -1715,7 +1747,7 @@ export class CombatSessionEngine {
           pkt.senderUserId,
           false,
           estEnergyJ,
-          pkt.hitZone === 'belt_grenade',
+          false,
         );
       }
 
@@ -2947,13 +2979,31 @@ export class CombatSessionEngine {
         const poppedEq =
           this.remotePlayers.consumeRemoteBeltGrenade(targetUserId) ??
           (isTacticalEquipmentId(ud.beltGrenadeEquipmentId) ? ud.beltGrenadeEquipmentId : 'm67_frag');
-        const detChance = computeBeltGrenadeDetonationChance(ev.impactEnergyJ, ev.ammo?.coreType);
+        const detChance = computeBeltGrenadeDetonationChance(
+          ev.impactEnergyJ,
+          ev.ammo?.coreType,
+          ev.ammo?.bulletMassGrams,
+        );
         const detonated = Math.random() < detChance;
 
         this.hitmarkerTimer = detonated ? 0.28 : 0.18;
         this.hitmarkerHeadshot = detonated;
         this.hitmarkerKill = false;
         this.remotePlayers.triggerHitFlinch(targetUserId);
+
+        const beltEvtPkt: GameGrenadeEventPacket = {
+          type: 'game:grenade_event',
+          actorId: targetUserId,
+          isBot: false,
+          team: this.localBattleTeam,
+          kind: detonated ? 'belt_cookoff' : 'belt_dud',
+          equipmentId: poppedEq,
+          px: Number(ev.point.x.toFixed(3)),
+          py: Number(ev.point.y.toFixed(3)),
+          pz: Number(ev.point.z.toFixed(3)),
+          ts: Date.now(),
+        };
+        this.mp.sendMessage(beltEvtPkt as unknown as Record<string, unknown>);
 
         if (detonated) {
           this.grenadeSystem.detonateImmediately(poppedEq, ev.point, {
@@ -3033,13 +3083,33 @@ export class CombatSessionEngine {
           : undefined;
         const poppedEq =
           this.botAI.consumeBotBeltGrenade(botId, preferredEq) ?? preferredEq ?? 'm67_frag';
-        const detChance = computeBeltGrenadeDetonationChance(ev.impactEnergyJ, ev.ammo?.coreType);
+        const detChance = computeBeltGrenadeDetonationChance(
+          ev.impactEnergyJ,
+          ev.ammo?.coreType,
+          ev.ammo?.bulletMassGrams,
+        );
         const detonated = Math.random() < detChance;
 
         this.hitmarkerTimer = detonated ? 0.28 : 0.18;
         this.hitmarkerHeadshot = detonated;
         this.hitmarkerKill = false;
         this.botAI.triggerVisualFlinch(botId);
+
+        if (this.mp) {
+          const beltEvtPkt: GameGrenadeEventPacket = {
+            type: 'game:grenade_event',
+            actorId: botId,
+            isBot: true,
+            team: botInfo.team,
+            kind: detonated ? 'belt_cookoff' : 'belt_dud',
+            equipmentId: poppedEq,
+            px: Number(ev.point.x.toFixed(3)),
+            py: Number(ev.point.y.toFixed(3)),
+            pz: Number(ev.point.z.toFixed(3)),
+            ts: Date.now(),
+          };
+          this.mp.sendMessage(beltEvtPkt as unknown as Record<string, unknown>);
+        }
 
         if (detonated) {
           this.grenadeSystem.detonateImmediately(poppedEq, ev.point, {
@@ -3293,7 +3363,7 @@ export class CombatSessionEngine {
     const meleeDmg = isKick ? 42 : ev.attackType === 'bash' ? 68 : 52;
     const kbSpeed = isKick ? 7.8 : 4.6;
 
-    // Physical Destructible Doors: melee bash -> progressive 0->1->2->3; kick -> velocity-based breach/destroy
+    // Physical Destructible Doors: melee bash/punch/kick -> exact geometric punch-through holes + hinge velocity
     if (ud?.destructibleDoorId && this.map.doorSystem) {
       const doorId = String(ud.destructibleDoorId);
       if (isKick) {
@@ -3305,18 +3375,84 @@ export class CombatSessionEngine {
           horizSpeed,
           this.controller.isSprinting,
           this.localBattleTeam,
+          false,
+          undefined,
+          ev.point,
+          ev.object,
         );
         this.lastKickHandlingTimer = 0.48;
       } else {
-        this.map.doorSystem.applyMeleeBash(doorId, ev.point, ev.direction, this.localBattleTeam);
+        this.map.doorSystem.applyMeleeBash(
+          doorId,
+          ev.point,
+          ev.direction,
+          this.localBattleTeam,
+          false,
+          ev.object,
+          ev.attackType,
+        );
       }
       this.emitSnapshot();
+      return;
+    }
+
+    // Drywall partitions, plywood barriers, and range panels: real see-through / shoot-through holes
+    if (ud?.penetrableSurfaceId && this.map.penetrableSystem) {
+      const pen = this.map.penetrableSystem.applyMeleeImpact(
+        String(ud.penetrableSurfaceId),
+        ev.point,
+        ev.direction,
+        ev.attackType,
+      );
+      if (pen.pierced) {
+        this.audio.playImpact(ev.point, 'wood');
+      }
       return;
     }
 
     if (ud?.combatActorType === 'remote_player' && this.mp && this.remotePlayers) {
       const targetUserId = String(ud.actorId);
       if (this.remotePlayers.isFriendly(targetUserId)) return;
+      if (ud?.hitZone === 'belt_grenade') {
+        const poppedEq =
+          this.remotePlayers.consumeRemoteBeltGrenade(targetUserId) ??
+          (isTacticalEquipmentId(ud.beltGrenadeEquipmentId) ? ud.beltGrenadeEquipmentId : 'm67_frag');
+        const detChance = computeBeltGrenadeDetonationChance(
+          isKick ? 540 : ev.attackType === 'bash' ? 440 : 280,
+          'ap',
+        );
+        const detonated = Math.random() < detChance;
+        this.hitmarkerTimer = detonated ? 0.28 : 0.18;
+        this.hitmarkerHeadshot = detonated;
+        this.remotePlayers.triggerHitFlinch(targetUserId);
+        const beltEvtPkt: GameGrenadeEventPacket = {
+          type: 'game:grenade_event',
+          actorId: targetUserId,
+          isBot: false,
+          team: this.localBattleTeam,
+          kind: detonated ? 'belt_cookoff' : 'belt_dud',
+          equipmentId: poppedEq,
+          px: Number(ev.point.x.toFixed(3)),
+          py: Number(ev.point.y.toFixed(3)),
+          pz: Number(ev.point.z.toFixed(3)),
+          ts: Date.now(),
+        };
+        this.mp.sendMessage(beltEvtPkt as unknown as Record<string, unknown>);
+        if (detonated) {
+          this.grenadeSystem.detonateImmediately(poppedEq, ev.point, {
+            sourceId: `human:${this.mp.localUserId}`,
+            sourceName: this.mp.localUsername,
+            sourceTeam: this.localBattleTeam,
+            sourceIsBot: false,
+          });
+          this.showToast(`BELT ${getTacticalEquipmentDef(poppedEq).shortName} DETONATED!`, 2.4);
+        } else {
+          this.grenadeSystem.spawnBeltDudSpark(ev.point);
+          this.audio.playImpact(ev.point, 'steel_plate');
+        }
+        this.emitSnapshot();
+        return;
+      }
       this.hitmarkerTimer = 0.22;
       this.hitmarkerHeadshot = false;
       this.hitmarkerKill = false;
@@ -3427,6 +3563,55 @@ export class CombatSessionEngine {
     if (ud?.combatActorType === 'bot' && this.botAI) {
       if (this.params.mode === 'infection') return;
       const botId = String(ud.actorId);
+      if (ud?.hitZone === 'belt_grenade') {
+        const botInfo = this.botAI.getBotInfo(botId);
+        if (!botInfo || !botInfo.alive) return;
+        if (this.params.mode === 'battle' && this.params.battleConfig.rule === 'tdm' && botInfo.team === this.localBattleTeam) {
+          return;
+        }
+        const preferredEq = isTacticalEquipmentId(ud.beltGrenadeEquipmentId)
+          ? ud.beltGrenadeEquipmentId
+          : undefined;
+        const poppedEq =
+          this.botAI.consumeBotBeltGrenade(botId, preferredEq) ?? preferredEq ?? 'm67_frag';
+        const detChance = computeBeltGrenadeDetonationChance(
+          isKick ? 540 : ev.attackType === 'bash' ? 440 : 280,
+          'ap',
+        );
+        const detonated = Math.random() < detChance;
+        this.hitmarkerTimer = detonated ? 0.28 : 0.18;
+        this.hitmarkerHeadshot = detonated;
+        this.botAI.triggerVisualFlinch(botId);
+        if (this.mp) {
+          const beltEvtPkt: GameGrenadeEventPacket = {
+            type: 'game:grenade_event',
+            actorId: botId,
+            isBot: true,
+            team: botInfo.team,
+            kind: detonated ? 'belt_cookoff' : 'belt_dud',
+            equipmentId: poppedEq,
+            px: Number(ev.point.x.toFixed(3)),
+            py: Number(ev.point.y.toFixed(3)),
+            pz: Number(ev.point.z.toFixed(3)),
+            ts: Date.now(),
+          };
+          this.mp.sendMessage(beltEvtPkt as unknown as Record<string, unknown>);
+        }
+        if (detonated) {
+          this.grenadeSystem.detonateImmediately(poppedEq, ev.point, {
+            sourceId: this.mp ? `human:${this.mp.localUserId}` : 'player',
+            sourceName: this.mp?.localUsername ?? 'YOU',
+            sourceTeam: this.localBattleTeam,
+            sourceIsBot: false,
+          });
+          this.showToast(`BELT ${getTacticalEquipmentDef(poppedEq).shortName} DETONATED!`, 2.4);
+        } else {
+          this.grenadeSystem.spawnBeltDudSpark(ev.point);
+          this.audio.playImpact(ev.point, 'steel_plate');
+        }
+        this.emitSnapshot();
+        return;
+      }
       if (this.mp && !this.isMpHost) {
         const info = this.botAI.getBotInfo(botId);
         if (!info || !info.alive) return;
@@ -4180,7 +4365,7 @@ export class CombatSessionEngine {
       if (this.semiTriggerConsumed || this.controller.isVaulting()) return;
       const punch = this.animator.triggerUnarmedPunch(
         this.controller,
-        this.input.ads && !this.controller.isSprinting,
+        this.input.ads,
       );
       if (punch) {
         this.semiTriggerConsumed = true;
@@ -4393,6 +4578,7 @@ export class CombatSessionEngine {
     this.barrierRepairProgress = 0;
     this.barrierRepairPendingRequest = false;
     this.grenadeSystem.resetHeldInputOnFocusLoss();
+    this.pdaDevice.setDragging(false);
   }
 
   private readonly onWindowBlur = (): void => {
@@ -4476,9 +4662,8 @@ export class CombatSessionEngine {
     }
     const dx = THREE.MathUtils.clamp(e.movementX, -140, 140);
     const dy = THREE.MathUtils.clamp(e.movementY, -140, 140);
-    if (this.pdaDevice.isOpen()) {
-      this.pdaDevice.applyMouseDelta(dx, dy);
-      this.controller.handleMouseMove(dx * 0.25, dy * 0.25, this.config);
+    if (this.pdaDevice.isOpen() && this.pdaDevice.isDragging()) {
+      this.pdaDevice.applyDragDelta(dx, dy);
       return;
     }
     this.controller.handleMouseMove(dx, dy, this.config);
@@ -4498,7 +4683,9 @@ export class CombatSessionEngine {
     this.audio.ensureInitialized();
 
     if (this.pdaDevice.isBlockingWeaponActions()) {
-      if (e.button === 2 && this.pdaDevice.isOpen()) {
+      if (e.button === 0 && this.pdaDevice.isOpen()) {
+        this.pdaDevice.setDragging(true);
+      } else if (e.button === 2 && this.pdaDevice.isOpen()) {
         this.pdaDevice.recenterOnPlayer();
       }
       return;
@@ -4561,6 +4748,9 @@ export class CombatSessionEngine {
 
   private readonly onMouseUp = (e: MouseEvent): void => {
     if (e.button === 0) {
+      if (this.pdaDevice.isDragging()) {
+        this.pdaDevice.setDragging(false);
+      }
       if (this.grenadeSystem.isThrowInputHeld()) {
         this.grenadeSystem.releaseThrowInput();
         this.emitSnapshot();
@@ -4777,7 +4967,9 @@ export class CombatSessionEngine {
         break;
       case 'Space':
         e.preventDefault();
-        this.input.vault = true;
+        if (!e.repeat) {
+          this.input.vault = true;
+        }
         break;
     }
   };
@@ -5433,7 +5625,8 @@ export class CombatSessionEngine {
       baseAdsMode === 'PRIMARY' &&
       this.weaponRig.shouldForceNodsCantedAim(true);
     this.input.adsMode = nodsForceCant ? 'POINT_AIM' : baseAdsMode;
-    this.input.sprint = !suppBusy && this.shiftHeld && !this.input.ads;
+    const firearmAdsBlocking = this.input.ads && prof.holdClass !== 'unarmed' && !grenadeDrawn;
+    this.input.sprint = !suppBusy && !pdaBusy && this.shiftHeld && !firearmAdsBlocking;
     this.input.holdBreath = !suppBusy && !pdaBusy && this.input.ads && (this.shiftHeld || this.altHeld);
 
     // In multiplayer, world stays live continuously even when Esc pause overlay is open
@@ -5599,6 +5792,7 @@ export class CombatSessionEngine {
 
     // Step map animated fixtures, physical destructible doors & dynamic 5x weather/day-night system
     this.map.update?.(dt, this.elapsedSec);
+    this.map.penetrableSystem?.update(dt, this.camera.position);
     if (this.map.doorSystem) {
       this.map.doorSystem.update(dt, this.camera.position);
       this.updateDoorInteractScan();
@@ -6378,12 +6572,20 @@ export class CombatSessionEngine {
       this.animator.triggerPushKick(this.controller, this.getActiveTraumaModifiers());
       this.reloadTimer = 0;
       this.lastKickHandlingTimer = 0.48;
+      const hasPushPt = this.map.doorSystem.getPushFaceWorldPos(
+        doorId,
+        this._doorCamPos,
+        this._doorIkPos,
+      );
       this.map.doorSystem.executeKick(
         doorId,
         this._doorCamDir,
         horizSpeed,
         this.controller.isSprinting,
         this.localBattleTeam,
+        false,
+        undefined,
+        hasPushPt ? this._doorIkPos : undefined,
       );
       this.emitSnapshot();
       return;
@@ -6463,7 +6665,7 @@ export class CombatSessionEngine {
       });
     }
 
-    const moveRatio = THREE.MathUtils.clamp(this.telemetry.speedMps / 4.8, 0, 1);
+    this.controller.writePdaMotionState(this._pdaMotionScratch);
     this.pdaDevice.setTelemetry({
       playerX: this.controller.position.x,
       playerZ: this.controller.position.z,
@@ -6476,7 +6678,13 @@ export class CombatSessionEngine {
       allies: this._pdaAllyBuf,
       pings: this._pdaPingBuf,
     });
-    this.pdaDevice.update(dt, this.elapsedSec, moveRatio, this.controller.crouched);
+    this.pdaDevice.update(
+      dt,
+      this.elapsedSec,
+      this._pdaMotionScratch.moveRatio,
+      this._pdaMotionScratch.isCrouched,
+      this._pdaMotionScratch,
+    );
   }
 
   private emitSnapshot(): void {

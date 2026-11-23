@@ -271,7 +271,7 @@ export const GymHud: React.FC<GymHudProps> = ({
           {snapshot.isPdaOpen ? (
             <>
               <span className="text-emerald-300">TAC-PDA ACTIVE</span>
-              <span>Mouse Pan</span>
+              <span>LMB+Drag Pan</span>
               <span>Wheel Zoom</span>
               <span>R / RMB Center</span>
               <span className="text-amber-300">M Stow PDA</span>

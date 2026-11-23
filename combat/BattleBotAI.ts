@@ -832,8 +832,9 @@ export class BattleBotAI {
       this.group.add(rig.root);
 
       const initialPouch = this.buildBotGrenadePouch(i);
-      const initialPrimaryGrenade: TacticalEquipmentId =
-        this.coopInfectionMode || i % 4 !== 1 ? 'm67_frag' : 'm84_flash';
+      const initialPrimaryGrenade: TacticalEquipmentId = this.coopInfectionMode
+        ? 'm67_frag'
+        : (['m67_frag', 'm84_flash', 'an_m14_thermite', 'm18_smoke'] as const)[i % 4];
 
       const bot: BotActor = {
         id,
@@ -1132,11 +1133,15 @@ export class BattleBotAI {
     if (this.coopInfectionMode) {
       return { m67_frag: 2, an_m14_thermite: 1 };
     }
-    if (seedIndex % 4 === 1) {
+    const mod = seedIndex % 4;
+    if (mod === 1) {
       return { m84_flash: 2, m67_frag: 1 };
     }
-    if (seedIndex % 4 === 3) {
-      return { m18_smoke: 1, m67_frag: 2 };
+    if (mod === 2) {
+      return { an_m14_thermite: 2, m67_frag: 1 };
+    }
+    if (mod === 3) {
+      return { m18_smoke: 2, m67_frag: 1 };
     }
     return { m67_frag: 2, m84_flash: 1 };
   }

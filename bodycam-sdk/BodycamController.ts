@@ -28,6 +28,7 @@ import {
   IBodycamWorldAdapter,
 } from './types';
 import { WeaponRig } from './WeaponRig';
+import type { PdaMotionState } from './TacticalPdaDevice';
 
 // === PRESERVED TUNED CONSTANTS (DO NOT FLATTEN) ===
 const STAND_EYE_HEIGHT = 1.42;
@@ -248,6 +249,8 @@ export class BodycamController {
   private lowBreathPulseTimer = 0;
   private breathVignette = 0;
   private holdBreathBlend = 0;
+  private lastBreathX = 0;
+  private lastBreathY = 0;
   private lastUpdateElapsed = -1;
 
   // Coupled upper-body / torso biomechanical recoil absorption springs
@@ -267,6 +270,8 @@ export class BodycamController {
   private readonly vaultController = new VaultController();
   private readonly _vaultCandidate: VaultCandidate = createVaultCandidate();
   private vaultCooldownSec = 0;
+  private doubleSpaceTimerSec = 0;
+  private spinDirToggle: -1 | 1 = 1;
   private lastVaultBlockReason: VaultBlockReason = 'none';
 
   // Pre-allocated scratch math objects (zero GC per frame)
@@ -414,6 +419,8 @@ export class BodycamController {
     this.jumpInitiated = false;
     this.peakFallSpeed = 0;
     this.prevVaultPressed = false;
+    this.doubleSpaceTimerSec = 0;
+    this.vaultCooldownSec = 0;
     this.strafeDip = 0;
     this.strafeDipVel = 0;
     this.torsoAbsorbPitch = 0;
@@ -501,6 +508,8 @@ export class BodycamController {
     this.lowBreathPulseTimer = 0;
     this.breathVignette = 0;
     this.holdBreathBlend = 0;
+    this.lastBreathX = 0;
+    this.lastBreathY = 0;
     this.lastUpdateElapsed = -1;
   }
 
@@ -834,15 +843,43 @@ export class BodycamController {
       this.coyoteTimer = Math.max(0, this.coyoteTimer - dt);
     }
 
-    const spaceEdge = input.vault && !this.prevVaultPressed;
-    this.prevVaultPressed = input.vault;
+    if (this.doubleSpaceTimerSec > 0) {
+      this.doubleSpaceTimerSec = Math.max(0, this.doubleSpaceTimerSec - dt);
+    }
 
-    // 0. Grounded Tactical Vault / Mantle Trigger (Space while moving forward or airborne near a ledge)
+    const spacePressed = Boolean(input.vault);
+    const spaceEdge = spacePressed && !this.prevVaultPressed;
+    this.prevVaultPressed = spacePressed;
+
+    let isDoubleSpace = Boolean(input.vaultSpin);
+    if (spaceEdge) {
+      if (this.doubleSpaceTimerSec > 0) {
+        isDoubleSpace = true;
+        this.doubleSpaceTimerSec = 0;
+      } else {
+        this.doubleSpaceTimerSec = 0.28;
+      }
+    }
+
+    const pickSpinDir = (): -1 | 1 => {
+      if (input.left && !input.right) return 1;
+      if (input.right && !input.left) return -1;
+      const d = this.spinDirToggle;
+      this.spinDirToggle = (this.spinDirToggle === 1 ? -1 : 1);
+      return d;
+    };
+
+    if (this.vaultController.isActive() && isDoubleSpace) {
+      this.vaultController.upgradeToSpinVault(pickSpinDir());
+    }
+
+    // 0. Grounded Tactical Vault / Mantle Trigger (Space while moving forward or airborne near a ledge;
+    //    double-tap Space triggers a full 360-degree spinning tactical vault over the obstacle)
     let triggeredVaultThisFrame = false;
     if (
       !this.vaultController.isActive() &&
       this.vaultCooldownSec <= 0 &&
-      input.vault &&
+      (spacePressed || isDoubleSpace) &&
       (input.forward || !this.grounded)
     ) {
       const found = this.vaultDetector.detect(
@@ -854,7 +891,14 @@ export class BodycamController {
         trauma,
       );
       if (found) {
-        this.vaultController.start(this._vaultCandidate, trauma, survivalMods, this.crouched);
+        this.vaultController.start(
+          this._vaultCandidate,
+          trauma,
+          survivalMods,
+          this.crouched,
+          isDoubleSpace,
+          isDoubleSpace ? pickSpinDir() : 1,
+        );
         if (this._vaultCandidate.isWindowBreach && !this.crouched) {
           this.audio.playGearRattle('crouch', 0.65);
         }
@@ -949,9 +993,10 @@ export class BodycamController {
       let relYaw = this.targetTorsoYaw - heading;
       while (relYaw > Math.PI) relYaw -= TWO_PI;
       while (relYaw < -Math.PI) relYaw += TWO_PI;
+      const nearestHeading = this.targetTorsoYaw - relYaw;
       const maxGlanceRad = THREE.MathUtils.degToRad(42);
       const clampedRel = THREE.MathUtils.clamp(relYaw, -maxGlanceRad, maxGlanceRad);
-      this.targetTorsoYaw = heading + clampedRel;
+      this.targetTorsoYaw = nearestHeading + clampedRel;
       this.targetTorsoPitch = THREE.MathUtils.clamp(this.targetTorsoPitch, -0.78, 0.72);
     }
 
@@ -1119,6 +1164,7 @@ export class BodycamController {
       const vaultDone = this.vaultController.update(dt, this.position, adapter, this.audio);
       if (vaultDone.completed) {
         this.vaultCooldownSec = 0.28;
+        this.doubleSpaceTimerSec = 0;
         if (vaultDone.mustCrouch) {
           this.wantCrouch = true;
           this.crouched = true;
@@ -1224,7 +1270,7 @@ export class BodycamController {
         input.sprint &&
         hasMoveInput &&
         !this.crouched &&
-        !input.ads &&
+        !isAiming &&
         stamina > 0.08 &&
         moveZ < 0.2;
       this.isSprinting = wantsSprint;
@@ -1434,6 +1480,9 @@ export class BodycamController {
 
       // Smooth physics-to-camera interpolated landing suspension proportional to vertical impact velocity
       if (this.grounded) {
+        if (!wasGrounded) {
+          this.doubleSpaceTimerSec = 0;
+        }
         const impactSpeed = Math.max(Math.abs(preVelY), this.peakFallSpeed);
         if (!wasGrounded && (impactSpeed > 1.5 || this.airTimeSec > 0.14)) {
           const effImpact = Math.max(impactSpeed, 2.2);
@@ -2014,6 +2063,8 @@ export class BodycamController {
       -BREATH_SWAY_CONFIG.weaponMaxDriftMeters * 1.6,
       BREATH_SWAY_CONFIG.weaponMaxDriftMeters * 1.6,
     );
+    this.lastBreathX = breathX;
+    this.lastBreathY = breathY;
 
     // 9. Position Chest-Mounted Camera with collar offset + step-up glide + smooth stride/jump headbob + landing suspension
     const rightX = cosY;
@@ -2067,7 +2118,12 @@ export class BodycamController {
       this.heelPitch +
       activeVaultState.cameraPitchOffset +
       swayPitch;
-    const baseChestYaw = this.torsoYaw + this.sympYaw + this.torsoAbsorbYaw * 0.35 + swayYaw;
+    const baseChestYaw =
+      this.torsoYaw +
+      activeVaultState.spinYawOffset +
+      this.sympYaw +
+      this.torsoAbsorbYaw * 0.35 +
+      swayYaw;
     const baseChestRoll =
       leanRoll +
       this.strafeRoll +
@@ -2076,6 +2132,7 @@ export class BodycamController {
       this.landingRoll +
       this.heelRoll +
       activeVaultState.cameraRollOffset +
+      activeVaultState.spinRollOffset +
       swayRoll;
 
     const targetStrainRoll =
@@ -2173,13 +2230,14 @@ export class BodycamController {
         this.jumpBobPitch * 0.55 +
         this.landingPitch * 0.55 +
         activeVaultState.cameraPitchOffset * 0.5,
-      this.torsoYaw + this.sympYaw * 0.4 + this.torsoAbsorbYaw,
+      this.torsoYaw + activeVaultState.spinYawOffset + this.sympYaw * 0.4 + this.torsoAbsorbYaw,
       leanRoll * 0.65 +
         this.strafeRoll * 0.5 +
         this.strideBobRoll * 0.45 +
         this.jumpBobRoll * 0.5 +
         this.landingRoll * 0.5 +
-        activeVaultState.cameraRollOffset * 0.55,
+        activeVaultState.cameraRollOffset * 0.55 +
+        activeVaultState.spinRollOffset * 0.72,
       'YXZ',
     );
     this._camQuat.setFromEuler(this._rigEuler);
@@ -2292,5 +2350,29 @@ export class BodycamController {
     out.weaponWeightClass = profile.weightClass;
     out.vaultActive = vState.active;
     out.vaultMode = vState.mode;
+  }
+
+  /** Populates pre-allocated zero-GC PdaMotionState snapshot from live locomotion, breathing, suspension & turn physics. */
+  public writePdaMotionState(out: PdaMotionState): PdaMotionState {
+    const horizSpeed = Math.hypot(this.velX, this.velZ);
+    out.bobPhase = this.bobPhase;
+    out.bobWeight = this.bobWeight;
+    out.moveRatio = THREE.MathUtils.clamp(horizSpeed / 4.8, 0, 1.35);
+    out.isMoving = horizSpeed > 0.14;
+    out.isSprinting = this.isSprinting;
+    out.isCrouched = this.crouched;
+    out.breathX = this.lastBreathX;
+    out.breathY = this.lastBreathY;
+    out.verticalOffset =
+      this.landingDipY +
+      this.jumpBobY * 0.65 +
+      this.heelDrop * 0.55 +
+      this.kneeShock * 0.55 +
+      this.takeoffHeave * 0.03;
+    out.localStrafeVel = this.prevLocalStrafeVel;
+    out.leanMeters = this.currentLean;
+    out.turnVelYaw = this.whipVelX;
+    out.turnVelPitch = this.whipVelY;
+    return out;
   }
 }

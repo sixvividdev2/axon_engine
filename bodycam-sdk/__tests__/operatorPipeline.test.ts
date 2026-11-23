@@ -2,7 +2,9 @@ import * as THREE from 'three';
 import { beforeAll, describe, expect, it } from 'vitest';
 import {
   ArticulatedRagdoll,
+  BodycamController,
   BodycamPhysicsWorld,
+  CharacterAnimator,
   CharacterSkeleton,
   DEFAULT_BODYCAM_SDK_CONFIG,
   OPERATOR_STORAGE_KEY,
@@ -19,6 +21,9 @@ import {
   TACTICAL_EQUIPMENT_STORAGE_KEY,
   TacticalEquipmentStore,
   TacticalGrenadeSystem,
+  TacticalPdaDevice,
+  createPdaMotionState,
+  PdaHudTelemetry,
   WeaponRig,
   buildTacticalEquipmentMesh,
   simulateMaterialPenetration,
@@ -1282,6 +1287,8 @@ describe('Phase 4 — Bone-Driven Tactical Grenade Manual of Arms, Survival Pari
         legTuckWeight: 0,
         headDuckWeight: 0,
         maxCameraWorldY: Infinity,
+        spinYawOffset: 0,
+        spinRollOffset: 0,
       },
     };
 
@@ -1519,6 +1526,700 @@ describe('Phase 4 — Bone-Driven Tactical Grenade Manual of Arms, Survival Pari
     expect(grenadeState!.payload.geq).toBe('m18_smoke');
     expect(grenadeState!.payload.gc).toBe(1);
     expect(grenadeState!.payload.gts).toBe('overhand');
+  });
+});
+
+describe('Phase 9 — Tactical PDA Click+Drag Grab-Sheet Pan, Zero-Snap GPS Unlock & Physical Thumb-on-Joystick', () => {
+  const makeTelemetry = (playerX = 25, playerZ = -20): PdaHudTelemetry => ({
+    playerX,
+    playerZ,
+    playerYawRad: 0.35,
+    gameClockText: '14:22',
+    weatherLabel: 'CLEAR',
+    windSpeedMps: 3.4,
+    windAngleRad: 0.5,
+    modeLabel: 'BATTLE',
+    zoneLabel: 'TIMBERLINE',
+    allies: [],
+    pings: [],
+  });
+
+  const advanceToActive = (pda: TacticalPdaDevice, tel: PdaHudTelemetry): void => {
+    pda.setTelemetry(tel);
+    pda.setOpen(true);
+    let elapsed = 0;
+    for (let i = 0; i < 65; i++) {
+      elapsed += 1 / 60;
+      pda.update(1 / 60, elapsed, 0, false);
+    }
+    expect(pda.getPhase()).toBe('ACTIVE');
+  };
+
+  const placeObjectWorldTransform = (
+    obj: THREE.Object3D,
+    worldPos: THREE.Vector3,
+    worldQuat: THREE.Quaternion,
+  ): void => {
+    const parent = obj.parent!;
+    parent.updateMatrixWorld(true);
+    const invParentMat = parent.matrixWorld.clone().invert();
+    const parentWorldQuat = new THREE.Quaternion();
+    parent.getWorldQuaternion(parentWorldQuat);
+    obj.position.copy(worldPos).applyMatrix4(invParentMat);
+    obj.quaternion.copy(parentWorldQuat).invert().multiply(worldQuat);
+    obj.updateMatrixWorld(true);
+  };
+
+  it('enforces drag-gated grab-sheet 1:1 panning, zero-snap unlock from off-center player UV, zoom & recenter', () => {
+    const pda = new TacticalPdaDevice();
+    // Default mapAspectBounds is [-48, 48] x [-48, 48], so (24, -19.2) maps to UV (0.75, 0.30)
+    const tel = makeTelemetry(24, -19.2);
+    advanceToActive(pda, tel);
+
+    expect(pda.isCenteredOnPlayer()).toBe(true);
+    const startUV = pda.getPanCenterUV();
+    expect(startUV.u).toBeCloseTo(0.75, 4);
+    expect(startUV.v).toBeCloseTo(0.30, 4);
+
+    // Free mouse look (dragging = false) must NOT pan map or break GPS lock
+    pda.applyMouseDelta(120, 80);
+    pda.applyDragDelta(-90, 60);
+    expect(pda.isCenteredOnPlayer()).toBe(true);
+    expect(pda.getPanCenterUV().u).toBeCloseTo(0.75, 4);
+    expect(pda.getPanCenterUV().v).toBeCloseTo(0.30, 4);
+    expect(pda.getThumbIntent()).toEqual({ x: 0, y: 0 });
+
+    // Hold LMB (setDragging(true)) and drag DOWN (dy > 0) -> grab-sheet pulls north (-V) into view
+    // with ZERO snap to map center (0.5, 0.5)
+    pda.setDragging(true);
+    expect(pda.isDragging()).toBe(true);
+    pda.applyDragDelta(0, 20);
+    expect(pda.isCenteredOnPlayer()).toBe(false);
+    const afterDown = pda.getPanCenterUV();
+    expect(afterDown.u).toBeCloseTo(0.75, 4);
+    expect(afterDown.v).toBeLessThan(0.30);
+    expect(afterDown.v).toBeGreaterThan(0.24); // started from 0.30, NOT snapped to 0.5
+    expect(pda.getThumbIntent().y).toBeLessThan(-0.2);
+
+    // Drag RIGHT (dx > 0) -> grab-sheet pulls west (-U) into view and pushes thumb right (+X)
+    pda.applyDragDelta(25, 0);
+    const afterRight = pda.getPanCenterUV();
+    expect(afterRight.u).toBeLessThan(afterDown.u);
+    expect(afterRight.u).toBeGreaterThan(0.68);
+    expect(pda.getThumbIntent().x).toBeGreaterThan(0.2);
+
+    // Wheel zoom in & out
+    const zoom0 = pda.getMapZoom();
+    pda.applyWheel(-120);
+    expect(pda.getMapZoom()).toBeGreaterThan(zoom0);
+    const zoomedIn = pda.getMapZoom();
+    pda.applyWheel(240);
+    expect(pda.getMapZoom()).toBeLessThan(zoomedIn);
+
+    // Releasing LMB + updating smoothly recenters thumbIntent while keeping free-pan position
+    pda.setDragging(false);
+    expect(pda.isDragging()).toBe(false);
+    let elapsed = 2.0;
+    for (let i = 0; i < 45; i++) {
+      elapsed += 1 / 60;
+      pda.update(1 / 60, elapsed, 0, false);
+    }
+    expect(Math.hypot(pda.getThumbIntent().x, pda.getThumbIntent().y)).toBeLessThan(0.02);
+    expect(pda.isCenteredOnPlayer()).toBe(false);
+
+    // R / RMB recenter restores GPS lock onto live player UV
+    pda.recenterOnPlayer();
+    expect(pda.isCenteredOnPlayer()).toBe(true);
+    expect(pda.getPanCenterUV().u).toBeCloseTo(0.75, 4);
+    expect(pda.getPanCenterUV().v).toBeCloseTo(0.30, 4);
+
+    // Stowing clears active drag cleanly and can be smoothly reversed mid-stow
+    pda.setDragging(true);
+    pda.setOpen(false);
+    expect(pda.isDragging()).toBe(false);
+    for (let i = 0; i < 10; i++) {
+      elapsed += 1 / 60;
+      pda.update(1 / 60, elapsed, 0, false);
+    }
+    pda.setOpen(true);
+    expect(pda.isOpen()).toBe(true);
+
+    pda.dispose();
+  });
+
+  it('places the articulated right thumbtip directly onto the 3D joystick cap and drives gimbal tilt for both MALE and FEMALE rigs', () => {
+    for (const opId of ['MALE', 'FEMALE'] as const) {
+      const scene = new THREE.Scene();
+      const camera = new THREE.PerspectiveCamera(75, 16 / 9, 0.02, 100);
+      camera.position.set(1.5, 1.65, -2.0);
+      camera.rotation.set(-0.18, 0.95, 0, 'YXZ'); // arbitrary non-North heading + pitch
+      camera.updateMatrixWorld(true);
+
+      const pda = new TacticalPdaDevice();
+      camera.add(pda.root);
+      scene.add(camera);
+
+      const tel = makeTelemetry(12, 8);
+      advanceToActive(pda, tel);
+      scene.updateMatrixWorld(true);
+
+      const skel = new CharacterSkeleton(1, 'team_a', opId);
+      scene.add(skel.root);
+
+      const gripPos = new THREE.Vector3();
+      const gripQuat = new THREE.Quaternion();
+      const thumbTarget = new THREE.Vector3();
+      const thumbTip = new THREE.Vector3();
+
+      // Mount right hand at the exact PDA right grip world transform
+      pda.getRightGripWorldTransform(gripPos, gripQuat);
+      placeObjectWorldTransform(skel.rightArm.hand.root, gripPos, gripQuat);
+
+      // 1. Neutral rest: right thumbtip rests squarely on center of 3D joystick cap (< 4mm)
+      //    with a gentle, organic interphalangeal curve (no sharp 90° mechanical kink)
+      pda.getRightThumbWorldTarget(thumbTarget);
+      skel.applyPdaHandPose('right', 0, 0, 0, thumbTarget);
+      skel.root.updateMatrixWorld(true);
+      skel.getRightThumbTipWorldPosition(thumbTip);
+      expect(thumbTip.distanceTo(thumbTarget)).toBeLessThan(0.004);
+      expect(Math.abs(skel.rightArm.hand.thumbDist.rotation.x)).toBeLessThan(1.15);
+
+      for (let i = 0; i < 20; i++) {
+        pda.driveJoystickFromThumbWorldPos(thumbTip, 1 / 60, 1.0);
+      }
+      expect(Math.abs(pda.getJoystickTilt().x)).toBeLessThan(0.08);
+      expect(Math.abs(pda.getJoystickTilt().y)).toBeLessThan(0.08);
+
+      // 2. LMB + Drag right & down: thumb moves with drag and physically drives joystick gimbal
+      pda.setDragging(true);
+      let elapsed = 2.0;
+      for (let i = 0; i < 12; i++) {
+        elapsed += 1 / 60;
+        pda.applyDragDelta(16, 12); // dx > 0 (+X), dy > 0 (-Y)
+        pda.update(1 / 60, elapsed, 0, false);
+        scene.updateMatrixWorld(true);
+
+        pda.getRightGripWorldTransform(gripPos, gripQuat);
+        placeObjectWorldTransform(skel.rightArm.hand.root, gripPos, gripQuat);
+
+        const intent = pda.getThumbIntent();
+        pda.getRightThumbWorldTarget(thumbTarget);
+        skel.applyPdaHandPose('right', 0, intent.x, intent.y, thumbTarget);
+        skel.root.updateMatrixWorld(true);
+        skel.getRightThumbTipWorldPosition(thumbTip);
+        expect(thumbTip.distanceTo(thumbTarget)).toBeLessThan(0.004);
+
+        pda.driveJoystickFromThumbWorldPos(thumbTip, 1 / 60, 1.0);
+      }
+
+      const deflected = pda.getJoystickTilt();
+      expect(deflected.x).toBeGreaterThan(0.35);
+      expect(deflected.y).toBeLessThan(-0.25);
+
+      // 3. Releasing drag smoothly recenters thumb and joystick gimbal to neutral
+      pda.setDragging(false);
+      for (let i = 0; i < 45; i++) {
+        elapsed += 1 / 60;
+        pda.update(1 / 60, elapsed, 0, false);
+        scene.updateMatrixWorld(true);
+
+        pda.getRightGripWorldTransform(gripPos, gripQuat);
+        placeObjectWorldTransform(skel.rightArm.hand.root, gripPos, gripQuat);
+
+        const intent = pda.getThumbIntent();
+        pda.getRightThumbWorldTarget(thumbTarget);
+        skel.applyPdaHandPose('right', 0, intent.x, intent.y, thumbTarget);
+        skel.root.updateMatrixWorld(true);
+        skel.getRightThumbTipWorldPosition(thumbTip);
+        pda.driveJoystickFromThumbWorldPos(thumbTip, 1 / 60, 1.0);
+      }
+      expect(Math.abs(pda.getJoystickTilt().x)).toBeLessThan(0.08);
+      expect(Math.abs(pda.getJoystickTilt().y)).toBeLessThan(0.08);
+
+      skel.dispose();
+      pda.dispose();
+    }
+  });
+});
+
+describe('Phase 10 — Anatomical Top-Side Shoulder Origin & Unarmed Side-Rest / Athletic Sprint / Guard-Sprint', () => {
+  it('seats shoulder pivots high and laterally outside the front chest plate on MALE, FEMALE, and Survival rigs', () => {
+    for (const opId of ['MALE', 'FEMALE'] as const) {
+      const skel = new CharacterSkeleton(1, 'team_a', opId);
+      skel.root.updateMatrixWorld(true);
+
+      const invChest = skel.chest.matrixWorld.clone().invert();
+      const shL = new THREE.Vector3();
+      const shR = new THREE.Vector3();
+      skel.leftArm.shoulderPivot.getWorldPosition(shL).applyMatrix4(invChest);
+      skel.rightArm.shoulderPivot.getWorldPosition(shR).applyMatrix4(invChest);
+
+      // Shoulders must sit high at the top torso ridge (>= 0.085m in chest local Y),
+      // wide outside the SAPI carrier (|X| >= 0.18m), and rearward in the coronal plane (Z > 0.015m)
+      expect(shL.y).toBeGreaterThanOrEqual(0.085);
+      expect(shR.y).toBeGreaterThanOrEqual(0.085);
+      expect(Math.abs(shL.x)).toBeGreaterThanOrEqual(0.18);
+      expect(Math.abs(shR.x)).toBeGreaterThanOrEqual(0.18);
+      expect(shL.z).toBeGreaterThan(0.015);
+      expect(shR.z).toBeGreaterThan(0.015);
+
+      expect(validateOperatorRig(skel.root, opId, 'STRICT').valid).toBe(true);
+      skel.dispose();
+    }
+
+    // Survival skeleton parity check
+    const survSkel = new SurvivalCharacterSkeleton();
+    survSkel.root.updateMatrixWorld(true);
+    const invSurvChest = survSkel.chest.matrixWorld.clone().invert();
+    const survShR = new THREE.Vector3();
+    survSkel.rightArm.shoulderPivot.getWorldPosition(survShR).applyMatrix4(invSurvChest);
+    expect(survShR.y).toBeGreaterThanOrEqual(0.085);
+    expect(survShR.x).toBeGreaterThanOrEqual(0.18);
+    expect(survShR.z).toBeGreaterThan(0.015);
+    survSkel.dispose();
+  });
+
+  it('rests unarmed arms at the sides even when looking straight down (-70°), pumps athletically on sprint, and preserves guard-sprint in SDK & Survival', () => {
+    // 1. Bodycam SDK CharacterAnimator
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(75, 16 / 9, 0.02, 100);
+    const world = new BodycamPhysicsWorld();
+    const adapter = world.createAdapter();
+    const skel = new CharacterSkeleton(1, 'team_a', 'MALE');
+    const weaponRig = new WeaponRig(scene, true);
+    const noopAudio = new Proxy(
+      {},
+      { get: () => () => {} },
+    ) as unknown as ConstructorParameters<typeof BodycamController>[2];
+    const controller = new BodycamController(camera, weaponRig, noopAudio);
+    const animator = new CharacterAnimator(skel, weaponRig);
+    scene.add(skel.root);
+
+    const unarmedProf = SDK_WEAPON_PROFILES.unarmed;
+    weaponRig.setWeaponProfile(unarmedProf);
+
+    const inputBase = {
+      forward: false,
+      backward: false,
+      left: false,
+      right: false,
+      sprint: false,
+      crouch: false,
+      leanLeft: false,
+      leanRight: false,
+      ads: false,
+      cant: false,
+      adsMode: 'PRIMARY' as const,
+      holdBreath: false,
+      vault: false,
+    };
+
+    // Pitch steeply downward (-70 deg) while unarmed idle
+    controller.torsoPitch = -1.22;
+    let elapsed = 0;
+    for (let i = 0; i < 40; i++) {
+      elapsed += 1 / 60;
+      controller.update(1 / 60, elapsed, inputBase, adapter, unarmedProf, DEFAULT_BODYCAM_SDK_CONFIG);
+      controller.torsoPitch = -1.22;
+      weaponRig.updateRig(
+        1 / 60,
+        elapsed,
+        unarmedProf,
+        0,
+        0,
+        false,
+        false,
+        false,
+        false,
+        0,
+        0,
+        0,
+        camera.position,
+        camera.quaternion,
+        adapter,
+        DEFAULT_BODYCAM_SDK_CONFIG,
+      );
+      animator.update(1 / 60, elapsed, controller, adapter, unarmedProf, false);
+    }
+
+    const shR = new THREE.Vector3();
+    const handR = new THREE.Vector3();
+    skel.rightArm.shoulderPivot.getWorldPosition(shR);
+    skel.rightArm.hand.root.getWorldPosition(handR);
+    skel.root.worldToLocal(shR);
+    skel.root.worldToLocal(handR);
+
+    // Side-rest invariant: hand hangs cleanly down beside the hip/thigh (y ~0.48..0.58m below shoulder,
+    // z stays close to shoulder coronal plane instead of floating 35cm out in front!)
+    expect(shR.y - handR.y).toBeGreaterThan(0.45);
+    expect(Math.abs(handR.z - shR.z)).toBeLessThan(0.12);
+    expect(handR.x).toBeGreaterThan(shR.x);
+
+    // Non-guard unarmed sprint -> athletic pumping arm pose (hand rises & drives forward/back dynamically)
+    const sprintInput = { ...inputBase, forward: true, sprint: true };
+    let maxSprintForward = 0;
+    let minSprintDrop = Infinity;
+    for (let i = 0; i < 55; i++) {
+      elapsed += 1 / 60;
+      controller.update(1 / 60, elapsed, sprintInput, adapter, unarmedProf, DEFAULT_BODYCAM_SDK_CONFIG);
+      weaponRig.updateRig(
+        1 / 60,
+        elapsed,
+        unarmedProf,
+        1.0,
+        (elapsed * 2.1) % 1,
+        false,
+        false,
+        true,
+        true,
+        0,
+        0,
+        0,
+        camera.position,
+        camera.quaternion,
+        adapter,
+        DEFAULT_BODYCAM_SDK_CONFIG,
+      );
+      animator.update(1 / 60, elapsed, controller, adapter, unarmedProf, false);
+      skel.rightArm.shoulderPivot.getWorldPosition(shR);
+      skel.rightArm.hand.root.getWorldPosition(handR);
+      skel.root.worldToLocal(shR);
+      skel.root.worldToLocal(handR);
+      maxSprintForward = Math.max(maxSprintForward, shR.z - handR.z);
+      minSprintDrop = Math.min(minSprintDrop, shR.y - handR.y);
+    }
+    expect(maxSprintForward).toBeGreaterThan(0.18);
+    expect(minSprintDrop).toBeLessThan(0.40);
+
+    // Guard-Sprint (Right-Click held + Sprint) -> raises fists cleanly into boxing guard
+    const guardSprintInput = { ...sprintInput, ads: true };
+    for (let i = 0; i < 30; i++) {
+      elapsed += 1 / 60;
+      controller.update(1 / 60, elapsed, guardSprintInput, adapter, unarmedProf, DEFAULT_BODYCAM_SDK_CONFIG);
+      weaponRig.updateRig(
+        1 / 60,
+        elapsed,
+        unarmedProf,
+        1.0,
+        (elapsed * 2.1) % 1,
+        true,
+        false,
+        true,
+        true,
+        0,
+        0,
+        0,
+        camera.position,
+        camera.quaternion,
+        adapter,
+        DEFAULT_BODYCAM_SDK_CONFIG,
+      );
+      animator.update(1 / 60, elapsed, controller, adapter, unarmedProf, true);
+    }
+    expect(animator.getUnarmedGuardBlend()).toBeGreaterThan(0.85);
+    skel.rightArm.shoulderPivot.getWorldPosition(shR);
+    skel.rightArm.hand.root.getWorldPosition(handR);
+    skel.root.worldToLocal(shR);
+    skel.root.worldToLocal(handR);
+    expect(shR.y - handR.y).toBeLessThan(0.20); // raised up in boxing guard
+
+    skel.dispose();
+    weaponRig.dispose();
+
+    // 2. Survival CharacterAnimator parity: side-rest on look-down + guard-sprint preserved
+    const survScene = new THREE.Scene();
+    const survSkel = new SurvivalCharacterSkeleton(1);
+    const survRig = new SurvivalWeaponRig(survScene, true);
+    const survAnim = new SurvivalCharacterAnimator(survSkel, survRig);
+    survScene.add(survSkel.root);
+
+    const makeSurvState = (overrides: Partial<CharacterDriverState> = {}): CharacterDriverState => ({
+      position: new THREE.Vector3(0, 0, 0),
+      torsoYaw: 0,
+      torsoPitch: -1.22,
+      spinePitch: -1.22,
+      aimYaw: 0,
+      aimPitch: 0,
+      lean: 0,
+      crouch: false,
+      sprint: false,
+      isAds: false,
+      isCanted: false,
+      isPointAim: false,
+      isMoving: false,
+      grounded: true,
+      velY: 0,
+      stepSmoothOffsetY: 0,
+      landingKneeBend: 0,
+      landingCompression: 0,
+      stridePhase: 0,
+      wallPullback: 0,
+      recoilSpring: { z: 0, pitch: 0, roll: 0 },
+      chestHeight: 1.4,
+      cameraWorldPos: new THREE.Vector3(0, 1.42, 0),
+      cameraWorldQuat: new THREE.Quaternion(),
+      vaultState: {
+        active: false,
+        kind: 'VAULT_OVER',
+        mode: 'NONE',
+        progress: 0,
+        handPinWeightL: 0,
+        handPinWeightR: 0,
+        handLWorld: new THREE.Vector3(),
+        handRWorld: new THREE.Vector3(),
+        wallNormal: new THREE.Vector3(0, 0, 1),
+        vaultForward: new THREE.Vector3(0, 0, -1),
+        weaponRetentionMode: 'NONE',
+        weaponRetentionBlend: 0,
+        cameraPitchOffset: 0,
+        cameraRollOffset: 0,
+        cameraDipOffset: 0,
+        crouchTransitionWeight: 0,
+        legTuckWeight: 0,
+        headDuckWeight: 0,
+        maxCameraWorldY: Infinity,
+        spinYawOffset: 0,
+        spinRollOffset: 0,
+      },
+      ...overrides,
+    });
+
+    const survUnarmed = WEAPONS.unarmed;
+    let sTime = 0;
+    for (let i = 0; i < 30; i++) {
+      sTime += 1 / 60;
+      survAnim.update(1 / 60, sTime, makeSurvState(), survUnarmed, () => 0, undefined, adapter, undefined, false);
+    }
+    survSkel.rightArm.shoulderPivot.getWorldPosition(shR);
+    survSkel.rightArm.hand.root.getWorldPosition(handR);
+    survSkel.root.worldToLocal(shR);
+    survSkel.root.worldToLocal(handR);
+    expect(shR.y - handR.y).toBeGreaterThan(0.45);
+    expect(Math.abs(handR.z - shR.z)).toBeLessThan(0.12);
+
+    // Guard-sprint in Survival preserves raised fists
+    for (let i = 0; i < 30; i++) {
+      sTime += 1 / 60;
+      survAnim.update(
+        1 / 60,
+        sTime,
+        makeSurvState({ torsoPitch: 0, spinePitch: 0, isMoving: true, sprint: true, isAds: true, stridePhase: (sTime * 2) % 1 }),
+        survUnarmed,
+        () => 0,
+        undefined,
+        adapter,
+        undefined,
+        true,
+      );
+    }
+    expect(survAnim.getUnarmedGuardBlend()).toBeGreaterThan(0.85);
+    survRig.dispose();
+    survSkel.dispose();
+  });
+});
+
+describe('Phase 11 — Coupled Tactical PDA Locomotion Sway, Sprint Pump, Inertia & Zero-Slip Hand Lock', () => {
+  it('drives PDA from live gait bob, sprint drop/pump, turn lag, strafe roll & lean tilt while keeping both hands welded (<2mm slip)', () => {
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(75, 16 / 9, 0.05, 100);
+    scene.add(camera);
+
+    const physics = new BodycamPhysicsWorld();
+    const adapter = physics.createAdapter();
+    const weaponRig = new WeaponRig(scene, true);
+    const noopAudio = new Proxy(
+      {},
+      { get: () => () => {} },
+    ) as unknown as ConstructorParameters<typeof BodycamController>[2];
+    const controller = new BodycamController(camera, weaponRig, noopAudio);
+    const skel = new CharacterSkeleton(1);
+    const animator = new CharacterAnimator(skel, weaponRig);
+    const pda = new TacticalPdaDevice();
+    camera.add(pda.root);
+    scene.add(skel.root);
+    animator.setPdaDevice(pda);
+
+    const prof = SDK_WEAPON_PROFILES.m4a1;
+    weaponRig.setWeaponProfile(prof);
+    const motion = createPdaMotionState();
+
+    const baseInput = {
+      forward: false,
+      backward: false,
+      left: false,
+      right: false,
+      sprint: false,
+      crouch: false,
+      leanLeft: false,
+      leanRight: false,
+      ads: false,
+      cant: false,
+      adsMode: 'PRIMARY' as const,
+      holdBreath: false,
+      vault: false,
+    };
+
+    const stepFrame = (
+      elapsed: number,
+      input: typeof baseInput,
+      mouseDx = 0,
+      mouseDy = 0,
+    ): void => {
+      if (mouseDx !== 0 || mouseDy !== 0) {
+        controller.handleMouseMove(mouseDx, mouseDy, DEFAULT_BODYCAM_SDK_CONFIG);
+      }
+      controller.update(1 / 60, elapsed, input, adapter, prof, DEFAULT_BODYCAM_SDK_CONFIG);
+      camera.updateMatrixWorld(true);
+      controller.writePdaMotionState(motion);
+      pda.update(1 / 60, elapsed, motion.moveRatio, motion.isCrouched, motion);
+      animator.update(1 / 60, elapsed, controller, adapter, prof, false);
+    };
+
+    // 1. Open PDA and settle into ACTIVE idle hold
+    pda.setOpen(true);
+    let elapsed = 0;
+    for (let i = 0; i < 65; i++) {
+      elapsed += 1 / 60;
+      stepFrame(elapsed, baseInput);
+    }
+    expect(pda.getPhase()).toBe('ACTIVE');
+    const chassis = pda.root.children[0];
+    const idleY = chassis.position.y;
+
+    // 2. Walking forward -> grounded figure-8 bob + <2mm hand-to-PDA lock on both hands
+    const walkInput = { ...baseInput, forward: true };
+    let walkMinX = Infinity;
+    let walkMaxX = -Infinity;
+    let walkMinY = Infinity;
+    let walkMaxY = -Infinity;
+    let maxWalkHandSlip = 0;
+    const handPos = new THREE.Vector3();
+    const sockPos = new THREE.Vector3();
+    const sockQuat = new THREE.Quaternion();
+
+    for (let i = 0; i < 80; i++) {
+      elapsed += 1 / 60;
+      stepFrame(elapsed, walkInput);
+      walkMinX = Math.min(walkMinX, chassis.position.x);
+      walkMaxX = Math.max(walkMaxX, chassis.position.x);
+      walkMinY = Math.min(walkMinY, chassis.position.y);
+      walkMaxY = Math.max(walkMaxY, chassis.position.y);
+
+      skel.rightArm.hand.root.getWorldPosition(handPos);
+      pda.getRightGripWorldTransform(sockPos, sockQuat);
+      maxWalkHandSlip = Math.max(maxWalkHandSlip, handPos.distanceTo(sockPos));
+
+      skel.leftArm.hand.root.getWorldPosition(handPos);
+      pda.getLeftGripWorldTransform(sockPos, sockQuat);
+      maxWalkHandSlip = Math.max(maxWalkHandSlip, handPos.distanceTo(sockPos));
+    }
+    const walkSpanX = walkMaxX - walkMinX;
+    const walkSpanY = walkMaxY - walkMinY;
+    expect(walkSpanX).toBeGreaterThan(0.010);
+    expect(walkSpanY).toBeGreaterThan(0.005);
+    expect(maxWalkHandSlip).toBeLessThan(0.002);
+
+    // 3. Sprinting -> lowers PDA smoothly and drives larger rhythmic stride pump while keeping screen active
+    const sprintInput = { ...baseInput, forward: true, sprint: true };
+    let sprintMinX = Infinity;
+    let sprintMaxX = -Infinity;
+    let sprintAvgY = 0;
+    let sprintSamples = 0;
+    let maxSprintHandSlip = 0;
+    for (let i = 0; i < 90; i++) {
+      elapsed += 1 / 60;
+      stepFrame(elapsed, sprintInput);
+      if (i >= 30) {
+        sprintMinX = Math.min(sprintMinX, chassis.position.x);
+        sprintMaxX = Math.max(sprintMaxX, chassis.position.x);
+        sprintAvgY += chassis.position.y;
+        sprintSamples += 1;
+
+        skel.rightArm.hand.root.getWorldPosition(handPos);
+        pda.getRightGripWorldTransform(sockPos, sockQuat);
+        maxSprintHandSlip = Math.max(maxSprintHandSlip, handPos.distanceTo(sockPos));
+
+        skel.leftArm.hand.root.getWorldPosition(handPos);
+        pda.getLeftGripWorldTransform(sockPos, sockQuat);
+        maxSprintHandSlip = Math.max(maxSprintHandSlip, handPos.distanceTo(sockPos));
+      }
+    }
+    sprintAvgY /= Math.max(1, sprintSamples);
+    expect(pda.getPhase()).toBe('ACTIVE');
+    expect(idleY - sprintAvgY).toBeGreaterThan(0.035); // lowered noticeably during sprint
+    expect(sprintMaxX - sprintMinX).toBeGreaterThan(walkSpanX * 1.6); // stronger stride pump
+    expect(maxSprintHandSlip).toBeLessThan(0.002); // zero slip even during sprint pump!
+
+    // 4a. Pure camera turn -> physical yaw/pitch/roll inertia lag + leftward lag shift (no strafe cancellation)
+    for (let i = 0; i < 35; i++) {
+      elapsed += 1 / 60;
+      stepFrame(elapsed, baseInput);
+    }
+    const neutralPosX = chassis.position.x;
+    const neutralRotZ = chassis.rotation.z;
+    const neutralRotY = chassis.rotation.y;
+
+    let peakTurnYawDelta = 0;
+    let minTurnPosX = Infinity;
+    let maxTurnHandSlip = 0;
+    for (let i = 0; i < 18; i++) {
+      elapsed += 1 / 60;
+      stepFrame(elapsed, baseInput, 28, -8);
+      peakTurnYawDelta = Math.max(peakTurnYawDelta, Math.abs(chassis.rotation.y - neutralRotY));
+      minTurnPosX = Math.min(minTurnPosX, chassis.position.x);
+
+      skel.rightArm.hand.root.getWorldPosition(handPos);
+      pda.getRightGripWorldTransform(sockPos, sockQuat);
+      maxTurnHandSlip = Math.max(maxTurnHandSlip, handPos.distanceTo(sockPos));
+
+      skel.leftArm.hand.root.getWorldPosition(handPos);
+      pda.getLeftGripWorldTransform(sockPos, sockQuat);
+      maxTurnHandSlip = Math.max(maxTurnHandSlip, handPos.distanceTo(sockPos));
+    }
+    expect(peakTurnYawDelta).toBeGreaterThan(0.020); // crisp grounded yaw inertia lag
+    expect(neutralPosX - minTurnPosX).toBeGreaterThan(0.004); // tablet lags left on rightward turn
+    expect(maxTurnHandSlip).toBeLessThan(0.002); // hands stay rigidly locked through turns!
+
+    // 4b. Strafe right + Lean right -> harmonious bank roll & tilt with zero hand slip
+    const strafeLean = { ...baseInput, right: true, leanRight: true };
+    let peakLeanStrafeRollDelta = 0;
+    for (let i = 0; i < 30; i++) {
+      elapsed += 1 / 60;
+      stepFrame(elapsed, strafeLean);
+      peakLeanStrafeRollDelta = Math.max(
+        peakLeanStrafeRollDelta,
+        Math.abs(chassis.rotation.z - neutralRotZ),
+      );
+
+      skel.rightArm.hand.root.getWorldPosition(handPos);
+      pda.getRightGripWorldTransform(sockPos, sockQuat);
+      maxTurnHandSlip = Math.max(maxTurnHandSlip, handPos.distanceTo(sockPos));
+
+      skel.leftArm.hand.root.getWorldPosition(handPos);
+      pda.getLeftGripWorldTransform(sockPos, sockQuat);
+      maxTurnHandSlip = Math.max(maxTurnHandSlip, handPos.distanceTo(sockPos));
+    }
+    expect(peakLeanStrafeRollDelta).toBeGreaterThan(0.055);
+    expect(maxTurnHandSlip).toBeLessThan(0.002);
+
+    // Right thumbtip still physically seated on the 3D joystick cap
+    const thumbTip = new THREE.Vector3();
+    const joyTarget = new THREE.Vector3();
+    skel.getRightThumbTipWorldPosition(thumbTip);
+    pda.getRightThumbWorldTarget(joyTarget);
+    expect(thumbTip.distanceTo(joyTarget)).toBeLessThan(0.004);
+
+    // Settling back to idle decays turn/strafe/lean tilt cleanly back toward neutral
+    for (let i = 0; i < 60; i++) {
+      elapsed += 1 / 60;
+      stepFrame(elapsed, baseInput);
+    }
+    expect(Math.abs(chassis.rotation.z - neutralRotZ)).toBeLessThan(0.015);
+    expect(Math.abs(chassis.rotation.y - neutralRotY)).toBeLessThan(0.015);
+
+    pda.dispose();
+    skel.dispose();
+    weaponRig.dispose();
   });
 });
 

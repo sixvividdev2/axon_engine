@@ -345,8 +345,22 @@ export const HideoutHud: React.FC<HideoutHudProps> = ({
         </div>
       )}
 
+      {/* Compact bottom-center PDA controls hint strip when TAC-PDA is open */}
+      {showLiveHud && snapshot.isPdaOpen && (
+        <div
+          className="fixed bottom-3 left-1/2 hidden -translate-x-1/2 items-center gap-2.5 whitespace-nowrap font-mono-tabular text-[10px] uppercase tracking-wider text-neutral-300/80 lg:flex"
+          style={{ textShadow: '0 1px 2px rgba(0,0,0,0.95)' }}
+        >
+          <span className="text-emerald-300">TAC-PDA ACTIVE</span>
+          <span>LMB+Drag Pan</span>
+          <span>Wheel Zoom</span>
+          <span>R / RMB Center</span>
+          <span className="text-amber-300">M Stow PDA</span>
+        </div>
+      )}
+
       {/* Contextual interact dot (hidden by default; white when near, yellow when ready) + [F] Scroll menu */}
-      {showLiveHud && snapshot.interactReticleState !== 'hidden' && (
+      {showLiveHud && !snapshot.isPdaOpen && snapshot.interactReticleState !== 'hidden' && (
         <div className="fixed inset-0 flex flex-col items-center justify-center">
           <div
             className={`h-1.5 w-1.5 rounded-full transition-transform duration-150 ${
@@ -440,6 +454,10 @@ export const HideoutHud: React.FC<HideoutHudProps> = ({
             <span>V Bash</span>
             <span aria-hidden="true">·</span>
             <span>X Kick</span>
+            <span aria-hidden="true">·</span>
+            <span>M PDA</span>
+            <span aria-hidden="true">·</span>
+            <span>Space / 2x Spin Vault</span>
             <span aria-hidden="true">·</span>
             <span>ESC Menu</span>
           </div>

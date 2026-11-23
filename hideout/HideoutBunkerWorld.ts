@@ -10,6 +10,7 @@ import {
 } from '../bodycam-sdk';
 import { loadoutStore } from '../data/loadoutStore';
 import { DestructibleDoorSystem } from '../doors/DestructibleDoorSystem';
+import { PenetrableSurfaceSystem } from '../doors/PenetrableSurfaceSystem';
 import { createHideoutMaterials, HideoutMaterialLibrary } from './HideoutMaterials';
 import { HideoutElectronicsSystem } from './HideoutElectronicsSystem';
 import { HideoutGunRange, HideoutGunRangeCallbacks } from './HideoutGunRange';
@@ -80,6 +81,7 @@ export interface HideoutBunkerWorldHandle {
   materials: HideoutMaterialLibrary;
   electronics: HideoutElectronicsSystem;
   doorSystem: DestructibleDoorSystem;
+  penetrableSystem: PenetrableSurfaceSystem;
   gunRange: HideoutGunRange;
   longRangeGallery: HideoutLongRangeGallery;
   readyRoom: HideoutReadyRoom;
@@ -136,7 +138,9 @@ export function buildHideoutBunkerWorld(
   scene.add(root);
 
   const electronics = new HideoutElectronicsSystem(root);
+  const penetrableSystem = new PenetrableSurfaceSystem(root, { isSoftwareGl });
   const ownedGeos: THREE.BufferGeometry[] = [];
+  const ownedMats: THREE.Material[] = [];
   const raycastMeshes: THREE.Object3D[] = [];
   const interactableMeshes: THREE.Mesh[] = [];
 
@@ -270,10 +274,12 @@ export function buildHideoutBunkerWorld(
       materials.darkSteel,
     );
     housing.position.set(x, y, z);
+    housing.userData.isRoof = true;
     root.add(housing);
 
     const tube = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(1.02, 0.04, 0.14)), emissiveMat);
     tube.position.set(x, y - 0.045, z);
+    tube.userData.isRoof = true;
     root.add(tube);
 
     electronics.registerNode(
@@ -303,7 +309,7 @@ export function buildHideoutBunkerWorld(
 
   // --- ROOM 1: ARSENAL ROOM (X ∈ [-5.5, 5.5], Z ∈ [-4.5, 4.5]) ---
   addBoxStructure(0, -0.1, 0, 12.2, 0.2, 10.2, materials.concreteFloor, 'concrete', false);
-  addBoxStructure(0, H_HUB + 0.1, 0, 12.2, 0.2, 10.2, materials.concreteCeiling, 'concrete', true, false);
+  addBoxStructure(0, H_HUB + 0.1, 0, 12.2, 0.2, 10.2, materials.concreteCeiling, 'concrete', true, false).userData.isRoof = true;
   // North Solid Wall (Gun Wall mounts here)
   addBoxStructure(0, H_HUB * 0.5, -4.75, 12.0, H_HUB, 0.5, materials.concreteWall, 'concrete');
 
@@ -332,7 +338,7 @@ export function buildHideoutBunkerWorld(
     }
   }
   for (const bz of [-2.4, 0.0, 2.4]) {
-    addBoxStructure(0, H_HUB - 0.14, bz, 11.0, 0.28, 0.24, materials.darkSteel, 'metal', false);
+    addBoxStructure(0, H_HUB - 0.14, bz, 11.0, 0.28, 0.24, materials.darkSteel, 'metal', false).userData.isRoof = true;
   }
   addOverheadLamp(0, H_HUB - 0.29, -2.0, materials.warmLampEmissive, [
     { light: arsenalKey, dropFraction: 0.5 },
@@ -365,7 +371,7 @@ export function buildHideoutBunkerWorld(
 
   // --- ROOM 2: READY ROOM SHELL (X ∈ [-16.5, -6.5], Z ∈ [-5.0, 5.0]) ---
   addBoxStructure(-11.5, -0.1, 0, 10.6, 0.2, 10.6, materials.concreteFloor, 'concrete', false);
-  addBoxStructure(-11.5, H_HUB + 0.1, 0, 10.6, 0.2, 10.6, materials.concreteCeiling, 'concrete', true, false);
+  addBoxStructure(-11.5, H_HUB + 0.1, 0, 10.6, 0.2, 10.6, materials.concreteCeiling, 'concrete', true, false).userData.isRoof = true;
   addBoxStructure(-16.75, H_HUB * 0.5, 0, 0.5, H_HUB, 10.6, materials.concreteWall, 'concrete');
   addBoxStructure(-11.5, H_HUB * 0.5, -5.25, 10.6, H_HUB, 0.5, materials.concreteWall, 'concrete');
   addBoxStructure(-11.5, H_HUB * 0.5, 5.25, 10.6, H_HUB, 0.5, materials.concreteWall, 'concrete');
@@ -378,7 +384,7 @@ export function buildHideoutBunkerWorld(
 
   // --- ROOM 3: GUN RANGE SHELL (Bays 1 & 2: X ∈ [6.5, 24.5], Z ∈ [-10.0, 36.0]; opens East into Bay 3 100m Gallery) ---
   addBoxStructure(15.5, -0.1, 13.0, 18.6, 0.2, 47.0, materials.concreteFloor, 'concrete', false);
-  addBoxStructure(15.5, H_RANGE + 0.1, 13.0, 18.6, 0.2, 47.0, materials.concreteCeiling, 'concrete', true, false);
+  addBoxStructure(15.5, H_RANGE + 0.1, 13.0, 18.6, 0.2, 47.0, materials.concreteCeiling, 'concrete', true, false).userData.isRoof = true;
   // East bulkhead at X = 24.75 split to create a wide 7.6m foyer archway (Z ∈ [-5.4, 2.2]) into Bay 3 100m Gallery
   addBoxStructure(24.75, H_RANGE * 0.5, -7.95, 0.5, H_RANGE, 5.1, materials.concreteWall, 'concrete');
   addBoxStructure(24.75, H_RANGE * 0.5, 19.35, 0.5, H_RANGE, 34.3, materials.concreteWall, 'concrete');
@@ -411,7 +417,7 @@ export function buildHideoutBunkerWorld(
 
   // --- ROOM 4: ZOMBIES PORTAL ROOM SHELL (X ∈ [-4.5, 4.5], Z ∈ [5.5, 13.5]) ---
   addBoxStructure(0, -0.1, 9.5, 9.6, 0.2, 8.6, materials.concreteFloor, 'concrete', false);
-  addBoxStructure(0, H_HUB + 0.1, 9.5, 9.6, 0.2, 8.6, materials.concreteCeiling, 'concrete', true, false);
+  addBoxStructure(0, H_HUB + 0.1, 9.5, 9.6, 0.2, 8.6, materials.concreteCeiling, 'concrete', true, false).userData.isRoof = true;
   addBoxStructure(-4.75, H_HUB * 0.5, 9.5, 0.5, H_HUB, 8.6, materials.concreteWall, 'concrete');
   addBoxStructure(4.75, H_HUB * 0.5, 9.5, 0.5, H_HUB, 8.6, materials.concreteWall, 'concrete');
   addBoxStructure(0, H_HUB * 0.5, 13.75, 9.6, H_HUB, 0.5, materials.concreteWall, 'concrete');
@@ -921,6 +927,7 @@ export function buildHideoutBunkerWorld(
     maxAniso,
     persistedState.gunRangeBestScore,
     gunRangeCallbacks,
+    penetrableSystem,
   );
 
   // ============================================================================
@@ -938,6 +945,7 @@ export function buildHideoutBunkerWorld(
     persistedState.longRangeBestMoa100m,
     persistedState.longRange100mHits,
     longRangeCallbacks,
+    penetrableSystem,
   );
 
   // ============================================================================
@@ -953,6 +961,88 @@ export function buildHideoutBunkerWorld(
     isSoftwareGl,
     maxAniso,
   );
+
+  // ============================================================================
+  // 5E. CQB DRYWALL, PLYWOOD BREACH PARTITIONS & VAULT OBSTACLE (RANGE STAGING)
+  // ============================================================================
+  const drywallMat = new THREE.MeshStandardMaterial({
+    color: 0xd4cfc4,
+    roughness: 0.92,
+    metalness: 0.02,
+  });
+  ownedMats.push(drywallMat);
+
+  const buildBreachPartition = (
+    id: string,
+    cx: number,
+    cz: number,
+    w: number,
+    h: number,
+    d: number,
+    kind: 'drywall' | 'plywood',
+    mat: THREE.Material,
+    title: string,
+    subtitle: string,
+    accentHex: string,
+  ): void => {
+    const panel = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(w, h, d)), mat);
+    panel.position.set(cx, h * 0.5, cz);
+    panel.castShadow = !isSoftwareGl;
+    panel.receiveShadow = true;
+    panel.userData.surfaceMaterial = kind === 'drywall' ? 'concrete' : 'wood';
+    panel.userData.ballisticMaterial = 'wood';
+    panel.userData.thicknessM = d;
+    root.add(panel);
+    raycastMeshes.push(panel);
+    penetrableSystem.registerSurface({
+      id,
+      mesh: panel,
+      kind,
+      width: w,
+      height: h,
+      thickness: d,
+      faceAxis: 'z',
+      floorY: 0,
+      maxHoles: 6,
+      hitsToBreach: 1,
+    });
+    // Steel side uprights & top header (colliders only on uprights so bullets/sightlines fly cleanly through carved holes)
+    for (const sx of [-1, 1]) {
+      addBoxStructure(cx + sx * (w * 0.5 + 0.045), h * 0.5, cz, 0.09, h, d + 0.05, materials.darkSteel, 'metal', true);
+    }
+    addBoxStructure(cx, h + 0.045, cz, w + 0.18, 0.09, d + 0.06, materials.darkSteel, 'metal', false);
+    makePlaque(cx, h + 0.34, cz + d * 0.5 + 0.03, 0, title, subtitle, accentHex);
+  };
+
+  buildBreachPartition(
+    'hideout_cqb_drywall',
+    10.4,
+    -7.8,
+    1.36,
+    2.16,
+    0.08,
+    'drywall',
+    drywallMat,
+    'DRYWALL BREACH',
+    'PUNCH / KICK SEE-THROUGH VOID',
+    '#e5e7eb',
+  );
+  buildBreachPartition(
+    'hideout_cqb_plywood',
+    13.1,
+    -7.8,
+    1.36,
+    2.16,
+    0.06,
+    'plywood',
+    materials.tableWood,
+    'PLYWOOD PANEL',
+    'SHOOT-THROUGH CARVED HOLE',
+    '#d97706',
+  );
+  // Dedicated 0.90m tactical vault barrier alongside breach panels (Space = Vault / 2x Space = 360 Spin)
+  addBoxStructure(16.0, 0.45, -7.8, 1.9, 0.9, 0.42, materials.ammoCrateBody, 'wood', true);
+  makePlaque(16.0, 1.28, -7.56, 0, 'VAULT BARRICADE 0.9M', 'SPACE VAULT · 2X SPACE SPIN', '#38bdf8');
 
   // Register static world, Gun Range & Ready Room raycast meshes BEFORE mounting dynamic doors
   physics.setRaycastMeshes(raycastMeshes);
@@ -1064,11 +1154,12 @@ export function buildHideoutBunkerWorld(
       crateLidPivot.rotation.x = 0;
     }
 
-    // Step Gun Range reactive targets, 30s CQB course, 100m Gallery, Ready Room displays & sparks
+    // Step Gun Range reactive targets, 30s CQB course, 100m Gallery, Ready Room displays, debris & sparks
     gunRange.update(clampedDt);
     longRangeGallery.update(clampedDt);
     readyRoom.update(clampedDt);
     electronics.update(clampedDt, listenerPos);
+    penetrableSystem.update(clampedDt, listenerPos);
   };
 
   const getSlotTransform = (
@@ -1121,6 +1212,7 @@ export function buildHideoutBunkerWorld(
     materials,
     electronics,
     doorSystem,
+    penetrableSystem,
     gunRange,
     longRangeGallery,
     readyRoom,
@@ -1143,6 +1235,7 @@ export function buildHideoutBunkerWorld(
       longRangeGallery.dispose();
       gunRange.dispose();
       electronics.dispose();
+      penetrableSystem.dispose();
       doorSystem.dispose();
       for (const slot of gunWallSlots) {
         if (slot.assembly) {
@@ -1152,6 +1245,7 @@ export function buildHideoutBunkerWorld(
         }
       }
       for (const g of ownedGeos) g.dispose();
+      for (const m of ownedMats) m.dispose();
       proxyMat.dispose();
       materials.dispose();
       envTex.dispose();

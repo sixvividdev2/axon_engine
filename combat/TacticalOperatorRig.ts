@@ -594,7 +594,7 @@ export class TacticalOperatorRigFactory {
     pelvisGroup.add(beltEquipmentMount);
     const beltBuiltItems: BuiltTacticalEquipmentMesh[] = [];
     const beltHitMeshes: THREE.Mesh[] = [];
-    const beltHitGeo = new THREE.SphereGeometry(0.056, 8, 8);
+    const beltHitGeo = new THREE.SphereGeometry(0.068, 8, 8);
     const beltHitMat = new THREE.MeshBasicMaterial({
       transparent: true,
       opacity: 0,

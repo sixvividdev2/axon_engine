@@ -42,6 +42,10 @@ export interface VaultStateSnapshot {
   headDuckWeight: number;
   /** World-space ceiling cap keeping camera & head strictly below window headers/lintels */
   maxCameraWorldY: number;
+  /** Dynamic 360° tactical spin yaw offset (radians, reaches ±2π smoothly at exit) */
+  spinYawOffset: number;
+  /** Dynamic banking roll offset during 360° tactical spin (radians) */
+  spinRollOffset: number;
 }
 
 function smoothstep(edge0: number, edge1: number, x: number): number {
@@ -67,6 +71,8 @@ export class VaultController {
   private overheadCeilingY = Infinity;
   private ledgeHeight = 0.9;
   private vaultHeadingYaw = 0;
+  private spinRequested = false;
+  private spinDir: -1 | 1 = 1;
 
   private handSlapPlayed = false;
   private secondHandSlapPlayed = false;
@@ -99,6 +105,8 @@ export class VaultController {
     legTuckWeight: 0,
     headDuckWeight: 0,
     maxCameraWorldY: Infinity,
+    spinYawOffset: 0,
+    spinRollOffset: 0,
   };
 
   private readonly completionOut: VaultCompletionResult = {
@@ -142,6 +150,7 @@ export class VaultController {
   public abort(): void {
     this.active = false;
     this.elapsed = 0;
+    this.spinRequested = false;
     this.breakableGlassObj = null;
     this.state.active = false;
     this.state.mode = 'NONE';
@@ -157,6 +166,8 @@ export class VaultController {
     this.state.legTuckWeight = 0;
     this.state.headDuckWeight = 0;
     this.state.maxCameraWorldY = Infinity;
+    this.state.spinYawOffset = 0;
+    this.state.spinRollOffset = 0;
   }
 
   public start(
@@ -164,6 +175,8 @@ export class VaultController {
     trauma?: Readonly<BodycamTraumaModifiers>,
     survivalMods?: Readonly<BodycamSurvivalModifiers>,
     wasCrouchedOnEntry = false,
+    spinVault = false,
+    spinDir: -1 | 1 = 1,
   ): void {
     this.active = true;
     this.kind = candidate.kind;
@@ -174,6 +187,8 @@ export class VaultController {
     this.wasCrouchedOnEntry = wasCrouchedOnEntry;
     this.overheadCeilingY = candidate.overheadCeilingY;
     this.ledgeHeight = candidate.ledgeHeight;
+    this.spinRequested = Boolean(spinVault) && candidate.kind !== 'HIGH_MANTLE';
+    this.spinDir = spinDir;
 
     this.entryPos.copy(candidate.entryPos);
     this.apexPos.copy(candidate.apexPos);
@@ -203,6 +218,9 @@ export class VaultController {
             ? 0.82
             : 0.68
           : 0.96 + Math.max(0, candidate.ledgeHeight - 1.25) * 0.24;
+    if (this.spinRequested) {
+      baseDur += 0.12;
+    }
 
     const avgLegImpair = trauma
       ? (trauma.leftLegImpairment + trauma.rightLegImpairment) * 0.5
@@ -217,7 +235,7 @@ export class VaultController {
 
     this.state.active = true;
     this.state.kind = candidate.kind;
-    this.state.mode = candidate.kind;
+    this.state.mode = this.spinRequested ? 'SPIN_VAULT' : candidate.kind;
     this.state.progress = 0;
     this.state.handLWorld.copy(candidate.handLWorld);
     this.state.handRWorld.copy(candidate.handRWorld);
@@ -238,6 +256,31 @@ export class VaultController {
     this.state.maxCameraWorldY = Number.isFinite(candidate.overheadCeilingY)
       ? candidate.overheadCeilingY - 0.30
       : Infinity;
+    this.state.spinYawOffset = 0;
+    this.state.spinRollOffset = 0;
+  }
+
+  /**
+   * Upgrades an early standard vault/climb (< 42% progress) into a 360-degree spinning vault
+   * when the player double-taps Space cleanly over a waist/chest obstacle.
+   */
+  public upgradeToSpinVault(spinDir: -1 | 1 = 1): boolean {
+    if (!this.active || this.spinRequested || this.kind === 'HIGH_MANTLE') {
+      return false;
+    }
+    if (this.state.progress >= 0.45) {
+      return false;
+    }
+    this.spinRequested = true;
+    this.spinDir = spinDir;
+    this.state.mode = 'SPIN_VAULT';
+    const progress = this.state.progress;
+    const minSpinDur = 0.68;
+    if (this.duration < minSpinDur) {
+      this.duration = minSpinDur;
+      this.elapsed = progress * this.duration;
+    }
+    return true;
   }
 
   /**
@@ -340,6 +383,13 @@ export class VaultController {
       this.state.handPinWeightR = w;
       // Weapon slings down immediately and smoothly re-readies over 0.74 -> 1.0
       this.state.weaponRetentionBlend = smoothstep(0.0, 0.14, p) * (1 - smoothstep(0.74, 1.0, crossP));
+    } else if (this.spinRequested) {
+      // Tactical spin vault: brief plant hand push-off, then release smoothly into full 360 rotation
+      const pinIn = smoothstep(0.02, 0.12, crossP);
+      const pinOut = 1 - smoothstep(0.18, 0.36, crossP);
+      this.state.handPinWeightL = pinIn * pinOut;
+      this.state.handPinWeightR = 0;
+      this.state.weaponRetentionBlend = smoothstep(0.0, 0.12, p) * (1 - smoothstep(0.76, 1.0, crossP));
     } else {
       const pinIn = smoothstep(0.02, 0.16, p);
       const pinOut = 1 - smoothstep(0.58, 0.78, crossP);
@@ -383,6 +433,20 @@ export class VaultController {
         ? -0.20 * windowDuckEnv
         : -0.05 * Math.sin(smoothstep(0.0, 0.25, crossP) * Math.PI);
       this.state.legTuckWeight = Math.sin(smoothstep(0.15, 0.86, crossP) * Math.PI);
+    }
+
+    if (this.spinRequested) {
+      const spinT = smoothstep(0.08, 0.90, crossP);
+      const spinArcEnv = Math.sin(spinT * Math.PI);
+      this.state.mode = 'SPIN_VAULT';
+      this.state.spinYawOffset = this.spinDir * Math.PI * 2 * spinT;
+      this.state.spinRollOffset = -this.spinDir * THREE.MathUtils.degToRad(14.5) * spinArcEnv;
+      this.state.legTuckWeight = Math.max(this.state.legTuckWeight, spinArcEnv * 0.96);
+      outPosition.y += spinArcEnv * 0.065;
+    } else {
+      this.state.mode = this.kind;
+      this.state.spinYawOffset = 0;
+      this.state.spinRollOffset = 0;
     }
 
     // Hold full crouch posture from frame 0 through window exit; smoothly begin rising right at touchdown

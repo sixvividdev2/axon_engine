@@ -150,6 +150,7 @@ export class CharacterAnimator {
   private hitstopTimer = 0;
   private unarmedGuardHeld = false;
   private unarmedGuardBlend = 0;
+  private unarmedSprintBlend = 0;
   private punchFromGuard = false;
 
   // Smooth additive camera twist / lean-back overlay (applied post-controller with zero drift)
@@ -270,10 +271,14 @@ export class CharacterAnimator {
   private readonly _camLocalOrigin = new THREE.Vector3();
   private readonly _readyPosL = new THREE.Vector3();
   private readonly _readyPosR = new THREE.Vector3();
+  private readonly _sprintPosL = new THREE.Vector3();
+  private readonly _sprintPosR = new THREE.Vector3();
   private readonly _guardPosL = new THREE.Vector3();
   private readonly _guardPosR = new THREE.Vector3();
   private readonly _readyPoleL = new THREE.Vector3();
   private readonly _readyPoleR = new THREE.Vector3();
+  private readonly _sprintPoleL = new THREE.Vector3();
+  private readonly _sprintPoleR = new THREE.Vector3();
   private readonly _guardPoleL = new THREE.Vector3();
   private readonly _guardPoleR = new THREE.Vector3();
   private readonly _unarmedPitchEuler = new THREE.Euler(0, 0, 0, 'YXZ');
@@ -308,6 +313,12 @@ export class CharacterAnimator {
   private readonly _leftHandPoseOpts: HandPoseDynamicOptions = {};
   private readonly _pdaPoleL = new THREE.Vector3();
   private readonly _pdaPoleR = new THREE.Vector3();
+  private readonly _pdaSolvedRWorld = new THREE.Vector3();
+  private readonly _pdaSolvedLWorld = new THREE.Vector3();
+  private readonly _pdaTargetRWorld = new THREE.Vector3();
+  private readonly _pdaTargetLWorld = new THREE.Vector3();
+  private readonly _pdaReachDeltaWorld = new THREE.Vector3();
+  private readonly _pdaTmpQuat = new THREE.Quaternion();
 
   private pdaDevice: TacticalPdaDevice | null = null;
   private grenadeSystem: TacticalGrenadeSystem | null = null;
@@ -448,7 +459,7 @@ export class CharacterAnimator {
     if (this.combatMove === 'PUSH_KICK' || this.combatMove === 'ARMED_BASH') return null;
 
     const fromGuard =
-      ((adsHeld ?? this.unarmedGuardHeld) && !controller?.isSprinting) ||
+      (adsHeld ?? this.unarmedGuardHeld) ||
       this.unarmedGuardBlend >= 0.45;
     const jabDuration = fromGuard ? 0.25 : 0.38;
     const crossDuration = fromGuard ? 0.34 : 0.50;
@@ -610,13 +621,23 @@ export class CharacterAnimator {
     const wantsUnarmedGuard =
       spec.holdClass === 'unarmed' &&
       (this.unarmedGuardHeld || controller.isAds) &&
-      !controller.isSprinting &&
       !controller.isVaulting();
-    // Smooth ~0.14s blend (lambda=21 reaches ~95% in 0.14s) between Relaxed Ready and ADS Fighting Guard
+    // Smooth ~0.14s blend (lambda=21 reaches ~95% in 0.14s) between Side-Rest and ADS Fighting Guard
     this.unarmedGuardBlend = THREE.MathUtils.damp(
       this.unarmedGuardBlend,
       wantsUnarmedGuard ? 1 : 0,
       21,
+      clampedDt,
+    );
+    const wantsUnarmedSprint =
+      spec.holdClass === 'unarmed' &&
+      controller.isSprinting &&
+      !wantsUnarmedGuard &&
+      !controller.isVaulting();
+    this.unarmedSprintBlend = THREE.MathUtils.damp(
+      this.unarmedSprintBlend,
+      wantsUnarmedSprint ? 1 : 0,
+      11,
       clampedDt,
     );
 
@@ -650,8 +671,9 @@ export class CharacterAnimator {
     }
     this.lastControllerY = controller.position.y;
 
+    const vaultStateTop = controller.getVaultState();
     this.skeleton.root.position.set(controller.position.x, smoothRootY, controller.position.z);
-    this.skeleton.root.rotation.set(0, controller.torsoYaw, 0);
+    this.skeleton.root.rotation.set(0, controller.torsoYaw + vaultStateTop.spinYawOffset, 0);
 
     if (rigState.isMoving && rigState.strideProgress < this.prevStridePhase - 0.5) {
       this.stepSign *= -1;
@@ -676,7 +698,6 @@ export class CharacterAnimator {
         : 0;
 
     const eyeHeight = controller.getEyeHeight();
-    const vaultStateTop = controller.getVaultState();
     const headDuck = vaultStateTop.active ? vaultStateTop.headDuckWeight : 0;
     const landingBend = controller.getLandingKneeBend();
     const landingDrop = THREE.MathUtils.clamp(controller.getLandingCompression(), -0.36, 0.04);
@@ -740,27 +761,44 @@ export class CharacterAnimator {
     }
 
     const spinePitch = controller.getSpinePitch();
+    const clampedChestPitch = THREE.MathUtils.clamp(spinePitch * 0.08, -0.10, 0.12);
     this.skeleton.spineLower.rotation.set(spineForwardPitch * 0.5, punchTorsoYaw * 0.45, leanAngle * 0.45);
-    this.skeleton.spineUpper.rotation.set(spineForwardPitch * 0.5 + spinePitch * 0.08, punchTorsoYaw * 0.55, leanAngle * 0.55);
-    this.skeleton.chest.rotation.set(spinePitch * 0.14, Math.sin(elapsed * 1.5) * 0.008, 0);
+    this.skeleton.spineUpper.rotation.set(
+      spineForwardPitch * 0.5 + clampedChestPitch * 0.45,
+      punchTorsoYaw * 0.55,
+      leanAngle * 0.55,
+    );
+    this.skeleton.chest.rotation.set(clampedChestPitch, Math.sin(elapsed * 1.5) * 0.008, 0);
 
-    const guardProtract = spec.holdClass === 'unarmed' ? this.unarmedGuardBlend * 0.09 : 0;
-    const protract =
-      (controller.isAds ? 0.10 : controller.isCanted ? 0.09 : controller.isPointAim ? 0.08 : 0.05) + guardProtract;
+    // Keep shoulders squared on the top-outer torso plane (zero involuntary chest-collapse protraction
+    // when looking down or standing unarmed; active protraction only for ADS, Guard, Leans & Punches).
+    const isUnarmedSpec = spec.holdClass === 'unarmed';
+    const guardProtract = isUnarmedSpec ? this.unarmedGuardBlend * 0.08 : 0;
+    const baseProtract = isUnarmedSpec
+      ? 0
+      : controller.isAds
+        ? 0.065
+        : controller.isCanted
+          ? 0.055
+          : controller.isPointAim
+            ? 0.045
+            : 0.022;
+    const protract = baseProtract + guardProtract;
+    const clavAimWeight = isUnarmedSpec ? this.unarmedGuardBlend : 1.0;
     // Symmetric cross-body shoulder follow when leaning Q/E so off-side arm stays ergonomic
-    const leanFollowL = Math.max(0, leanSign) * 0.16;
-    const leanFollowR = Math.max(0, -leanSign) * 0.16;
+    const leanFollowL = Math.max(0, leanSign) * 0.14;
+    const leanFollowR = Math.max(0, -leanSign) * 0.14;
     this.skeleton.leftArm.clavicle.rotation.order = 'YXZ';
     this.skeleton.rightArm.clavicle.rotation.order = 'YXZ';
     this.skeleton.leftArm.clavicle.rotation.set(
-      rigState.aimPitch * 0.22,
-      -protract - leftClavProtract - leanFollowL + rigState.aimYaw * 0.25,
-      -rigState.aimPitch * 0.16,
+      rigState.aimPitch * 0.14 * clavAimWeight,
+      -protract - leftClavProtract - leanFollowL + rigState.aimYaw * 0.20 * clavAimWeight,
+      -rigState.aimPitch * 0.12 * clavAimWeight,
     );
     this.skeleton.rightArm.clavicle.rotation.set(
-      rigState.aimPitch * 0.22,
-      protract + rightClavProtract + leanFollowR + rigState.aimYaw * 0.25,
-      rigState.aimPitch * 0.16,
+      rigState.aimPitch * 0.14 * clavAimWeight,
+      protract + rightClavProtract + leanFollowR + rigState.aimYaw * 0.20 * clavAimWeight,
+      rigState.aimPitch * 0.12 * clavAimWeight,
     );
 
     this.skeleton.root.updateMatrixWorld(true);
@@ -2027,34 +2065,45 @@ export class CharacterAnimator {
 
     if (isUnarmed) {
       const g = this.unarmedGuardBlend;
+      const sprintBlend = this.unarmedSprintBlend * this.moveWeight * (1 - g);
       const aimPitchOff = rigState.aimPitch * 0.18;
       const aimYawOff = rigState.aimYaw * 0.16;
 
-      // 1. NON-ADS UNARMED = RELAXED READY STANCE (lower-rib / waist level, clear viewport)
-      // Opposite-arm stride swing synced to cyclePhase (left leg steps forward when sin(cyclePhase) > 0)
+      // 1A. NON-GUARD UNARMED = NATURAL RELAXED SIDE-REST (anchored in torso/shoulder space so looking
+      //     downward keeps hands resting cleanly beside hips/thighs instead of floating out in front)
+      // Opposite-arm stride pendulum synced to cyclePhase (left leg steps forward when sin(cyclePhase) > 0)
       const armSwing = Math.sin(cyclePhase) * this.moveWeight * (1 - g);
-      const swingAmpZ = controller.isSprinting ? 0.13 : 0.062;
-      const swingAmpY = controller.isSprinting ? 0.052 : 0.020;
-      const swingAmpX = controller.isSprinting ? 0.030 : 0.014;
-      const swingL = Math.max(0, -armSwing);
-      const swingR = Math.max(0, armSwing);
+      const walkFwdL = Math.max(0, -armSwing);
+      const walkFwdR = Math.max(0, armSwing);
 
       this._readyPosL.set(
-        -0.22 + swingL * swingAmpX + kickBrace * 0.05,
-        -0.30 + swingL * swingAmpY - breathBob * 0.6 + kickBrace * 0.10,
-        -0.22 + armSwing * swingAmpZ + kickBrace * 0.04,
+        this._shoulderL.x - 0.046 + walkFwdL * 0.014 + kickBrace * 0.05,
+        this._shoulderL.y - 0.542 + Math.abs(armSwing) * 0.024 + walkFwdL * 0.024 - breathBob * 0.5 + kickBrace * 0.18,
+        this._shoulderL.z - 0.036 + armSwing * 0.115 - kickBrace * 0.06,
       );
       this._readyPosR.set(
-        0.22 - swingR * swingAmpX - kickBrace * 0.05,
-        -0.30 + swingR * swingAmpY + breathBob * 0.6 + kickBrace * 0.10,
-        -0.22 - armSwing * swingAmpZ + kickBrace * 0.04,
+        this._shoulderR.x + 0.046 - walkFwdR * 0.014 - kickBrace * 0.05,
+        this._shoulderR.y - 0.542 + Math.abs(armSwing) * 0.024 + walkFwdR * 0.024 + breathBob * 0.5 + kickBrace * 0.18,
+        this._shoulderR.z - 0.036 - armSwing * 0.115 - kickBrace * 0.06,
       );
-      const readyPitch = THREE.MathUtils.clamp(controller.torsoPitch * 0.18, -0.20, 0.20);
-      this._unarmedPitchEuler.set(readyPitch, 0, 0, 'YXZ');
-      this._readyPosL.applyEuler(this._unarmedPitchEuler).add(this._camLocalOrigin);
-      this._readyPosR.applyEuler(this._unarmedPitchEuler).add(this._camLocalOrigin);
 
-      // 2. ADS UNARMED (Right-Click HELD) = COMPACT CHEST-CAM-FRAMED FIGHTING GUARD
+      // 1B. UNARMED ATHLETIC SPRINT (when sprinting without Guard): bent-elbow rhythmic arm pump at sides
+      const runDriveL = -armSwing; // > 0 when left arm drives forward
+      const runDriveR = armSwing;  // > 0 when right arm drives forward
+      this._sprintPosL.set(
+        this._shoulderL.x - 0.032 + Math.max(0, runDriveL) * 0.058,
+        this._shoulderL.y - 0.345 + runDriveL * 0.105 + Math.max(0, -runDriveL) * 0.030,
+        this._shoulderL.z - 0.225 - runDriveL * 0.155,
+      );
+      this._sprintPosR.set(
+        this._shoulderR.x + 0.032 - Math.max(0, runDriveR) * 0.058,
+        this._shoulderR.y - 0.345 + runDriveR * 0.105 + Math.max(0, -runDriveR) * 0.030,
+        this._shoulderR.z - 0.225 - runDriveR * 0.155,
+      );
+      this._readyPosL.lerp(this._sprintPosL, sprintBlend);
+      this._readyPosR.lerp(this._sprintPosR, sprintBlend);
+
+      // 2. ADS UNARMED (Right-Click HELD) = COMPACT CHEST-CAM-FRAMED FIGHTING GUARD (also preserved during Guard-Sprint)
       // Lead handL: (-0.13, -0.05, -0.34) relative to chest cam (low enough to see clearly over knuckles)
       // Rear handR: (+0.15, -0.07, -0.24) relative to chest cam (tighter by right collarbone/jaw)
       this._guardPosL.set(
@@ -2074,12 +2123,14 @@ export class CharacterAnimator {
       this._lDesiredRoot.copy(this._readyPosL).lerp(this._guardPosL, g);
       this._rDesiredRoot.copy(this._readyPosR).lerp(this._guardPosR, g);
 
-      // Semi-curled relaxed hands in Non-ADS Ready -> tight clenched boxing fists in ADS Guard
-      leftGripCurl = THREE.MathUtils.lerp(0.42, 0.98, g);
-      rightGripCurl = THREE.MathUtils.lerp(0.42, 0.98, g);
-      // Natural vertical / ~36° inward boxing angle in guard (palms & thumbs inward toward chest)
-      leftPronation = THREE.MathUtils.lerp(0.24, 0.62, g);
-      rightPronation = THREE.MathUtils.lerp(0.24, 0.62, g);
+      // Relaxed open-curved hands at sides -> curled athletic sprint fists -> tight clenched boxing fists in Guard
+      const baseCurl = THREE.MathUtils.lerp(0.30, 0.78, sprintBlend);
+      const basePron = THREE.MathUtils.lerp(0.08, 0.28, sprintBlend);
+      leftGripCurl = THREE.MathUtils.lerp(baseCurl, 0.98, g);
+      rightGripCurl = THREE.MathUtils.lerp(baseCurl, 0.98, g);
+      // Natural inward-facing palms at sides -> ~36° inward boxing angle in guard
+      leftPronation = THREE.MathUtils.lerp(basePron, 0.62, g);
+      rightPronation = THREE.MathUtils.lerp(basePron, 0.62, g);
 
       // 3. Alternating LEFT_JAB / RIGHT_CROSS ballistic drive + forearm pronation + guard speed scaling
       if (this.combatMove === 'LEFT_JAB' || this.combatMove === 'RIGHT_CROSS') {
@@ -2217,13 +2268,6 @@ export class CharacterAnimator {
       this.pdaDevice!.getRightGripWorldTransform(this._pdaRPosRoot, this._pdaRQuatRoot);
       this.skeleton.root.worldToLocal(this._pdaRPosRoot);
       this._pdaRQuatRoot.premultiply(this._rootWorldQuatInv);
-
-      // Subtle wrist shift upward when pressing top-right power button
-      const pressW = this.pdaDevice!.getPowerPressWeight();
-      if (pressW > 0.005) {
-        this._pdaRPosRoot.y += pressW * 0.014;
-        this._pdaRPosRoot.z += pressW * 0.006;
-      }
 
       if (isUnarmed) {
         this._rDesiredQuatRoot.copy(this._pdaRQuatRoot);
@@ -2392,15 +2436,23 @@ export class CharacterAnimator {
     const usePdaRightQuat = pdaActiveHold && pdaIkW > 0.35;
     const useGrenadeRightQuat = grenadeActiveHold && grenadeIkW > 0.25;
     const useExtRightQuat = extRightW > 0.05;
+    const pdaLockedRight =
+      pdaActiveHold &&
+      pdaIkW >= 0.98 &&
+      this.equipBlendTimer <= 0 &&
+      vaultPinR < 0.001 &&
+      !useExtRightQuat &&
+      this.rightPdaReturnTimer <= 0;
     if (
-      this.equipBlendTimer > 0 ||
-      vaultPinR > 0.001 ||
-      boltHandW > 0.001 ||
-      pdaActiveHold ||
-      grenadeActiveHold ||
-      useExtRightQuat ||
-      this.rightPdaReturnTimer > 0 ||
-      this.rightGrenadeReturnTimer > 0
+      !pdaLockedRight &&
+      (this.equipBlendTimer > 0 ||
+        vaultPinR > 0.001 ||
+        boltHandW > 0.001 ||
+        pdaActiveHold ||
+        grenadeActiveHold ||
+        useExtRightQuat ||
+        this.rightPdaReturnTimer > 0 ||
+        this.rightGrenadeReturnTimer > 0)
     ) {
       this.rightHandBlender.blendTo(
         this._rDesiredRoot,
@@ -2414,7 +2466,7 @@ export class CharacterAnimator {
           : useExtRightQuat
             ? 42
             : grenadeActiveHold || pdaActiveHold || this.rightPdaReturnTimer > 0 || this.rightGrenadeReturnTimer > 0
-              ? 32
+              ? 36
               : boltHandW > 0.001
                 ? 34
                 : 32,
@@ -2423,7 +2475,7 @@ export class CharacterAnimator {
     } else {
       this.rightHandBlender.snap(
         this._rDesiredRoot,
-        isUnarmed ? this.rightHandBlender.quaternion : this._rDesiredQuatRoot,
+        isUnarmed && !usePdaRightQuat ? this.rightHandBlender.quaternion : this._rDesiredQuatRoot,
         rightGripCurl,
         1,
       );
@@ -2444,9 +2496,14 @@ export class CharacterAnimator {
     );
     if (isUnarmed) {
       const poleGuardW = Math.max(this.unarmedGuardBlend, activePunchPoleWeight);
+      const sprintPoleW = this.unarmedSprintBlend * this.moveWeight * (1 - poleGuardW);
 
-      this._readyPoleR.set(this._shoulderR.x + 0.12, this._shoulderR.y - 0.58, this._shoulderR.z + 0.34);
-      this._readyPoleL.set(this._shoulderL.x - 0.12, this._shoulderL.y - 0.58, this._shoulderL.z + 0.34);
+      this._readyPoleR.set(this._shoulderR.x + 0.14, this._shoulderR.y - 0.30, this._shoulderR.z + 0.28);
+      this._readyPoleL.set(this._shoulderL.x - 0.14, this._shoulderL.y - 0.30, this._shoulderL.z + 0.28);
+      this._sprintPoleR.set(this._shoulderR.x + 0.16, this._shoulderR.y - 0.34, this._shoulderR.z + 0.38);
+      this._sprintPoleL.set(this._shoulderL.x - 0.16, this._shoulderL.y - 0.34, this._shoulderL.z + 0.38);
+      this._readyPoleR.lerp(this._sprintPoleR, sprintPoleW);
+      this._readyPoleL.lerp(this._sprintPoleL, sprintPoleW);
 
       this._unarmedPitchEuler.set(guardPitch * 0.45, 0, 0, 'YXZ');
       this._guardPoleR
@@ -2567,13 +2624,7 @@ export class CharacterAnimator {
         rigState.recoilZ > 0.004 ||
         triggerPull01 > 0.02);
     if (pdaActiveHold && pdaIkW > 0.55) {
-      const joy = this.pdaDevice!.getJoystickTilt();
-      this.skeleton.applyPdaHandPose(
-        'right',
-        this.pdaDevice!.getPowerPressWeight(),
-        joy.x,
-        joy.y,
-      );
+      // Deferred until after both Right & Left 2-bone arm IK + post-IK PDA reach guard complete
     } else if (grenadeActiveHold && grenadeIkW > 0.45 && this.grenadeSystem) {
       this._rightHandPoseOpts.profile = null;
       this._rightHandPoseOpts.triggerPull01 = 0;
@@ -3123,7 +3174,17 @@ export class CharacterAnimator {
     const usePdaLeftQuat = pdaActiveHold && pdaIkW > 0.35;
     const useGrenadeLeftQuat = grenadeActiveHold && grenadeIkW > 0.25;
     const useExtLeftQuat = extLeftW > 0.05;
-    if (leftOverridden || this.equipBlendTimer > 0 || this.leftActionReturnTimer > 0) {
+    const pdaLockedLeft =
+      pdaActiveHold &&
+      pdaIkW >= 0.98 &&
+      this.equipBlendTimer <= 0 &&
+      vaultPinL < 0.001 &&
+      !useExtLeftQuat &&
+      this.leftActionReturnTimer <= 0;
+    if (
+      !pdaLockedLeft &&
+      (leftOverridden || this.equipBlendTimer > 0 || this.leftActionReturnTimer > 0)
+    ) {
       this.leftHandBlender.blendTo(
         this._lDesiredRoot,
         isUnarmed && !usePdaLeftQuat && !useGrenadeLeftQuat && !useExtLeftQuat
@@ -3136,7 +3197,7 @@ export class CharacterAnimator {
           : useExtLeftQuat
             ? 42
             : grenadeActiveHold || pdaActiveHold
-              ? 32
+              ? 36
               : leftOverridden
                 ? 30
                 : 34,
@@ -3145,7 +3206,7 @@ export class CharacterAnimator {
     } else {
       this.leftHandBlender.snap(
         this._lDesiredRoot,
-        isUnarmed ? this.leftHandBlender.quaternion : this._lDesiredQuatRoot,
+        isUnarmed && !usePdaLeftQuat ? this.leftHandBlender.quaternion : this._lDesiredQuatRoot,
         leftGripCurl,
         1,
       );
@@ -3199,7 +3260,37 @@ export class CharacterAnimator {
         ? 'none'
         : (weaponAsm?.foregripPose ?? 'none');
     if (pdaActiveHold && pdaIkW > 0.55) {
+      // Post-IK reach guard: if extreme torso pitch/lean clamps either arm's max reach, pull the
+      // PDA chassis by the averaged solved-hand residual so palms stay welded onto both bolsters.
+      if (pdaIkW >= 0.95) {
+        armR.hand.root.getWorldPosition(this._pdaSolvedRWorld);
+        armL.hand.root.getWorldPosition(this._pdaSolvedLWorld);
+        this.pdaDevice!.getRightGripWorldTransform(this._pdaTargetRWorld, this._pdaTmpQuat);
+        this.pdaDevice!.getLeftGripWorldTransform(this._pdaTargetLWorld, this._pdaTmpQuat);
+        this._pdaReachDeltaWorld
+          .subVectors(this._pdaSolvedRWorld, this._pdaTargetRWorld)
+          .add(this._pdaSolvedLWorld)
+          .sub(this._pdaTargetLWorld)
+          .multiplyScalar(0.5);
+        if (this._pdaReachDeltaWorld.lengthSq() > 2.5e-7) {
+          this.pdaDevice!.applyPostIkWorldOffset(this._pdaReachDeltaWorld);
+        }
+      }
+
+      // Pose both left and right hands & drive the 3D joystick gimbal from the final locked PDA matrix
       this.skeleton.applyPdaHandPose('left', 0, 0, 0);
+      const intent = this.pdaDevice!.getThumbIntent();
+      this.pdaDevice!.getRightThumbWorldTarget(this._tmpWorldB);
+      this.skeleton.applyPdaHandPose(
+        'right',
+        this.pdaDevice!.getPowerPressWeight(),
+        intent.x,
+        intent.y,
+        this._tmpWorldB,
+      );
+      this.skeleton.root.updateMatrixWorld(true);
+      this.skeleton.getRightThumbTipWorldPosition(this._tmpWorldA);
+      this.pdaDevice!.driveJoystickFromThumbWorldPos(this._tmpWorldA, dt, pdaIkW);
     } else {
       this._leftHandPoseOpts.profile = weaponAsm?.handPoseProfile ?? null;
       this._leftHandPoseOpts.triggerPull01 = 0;

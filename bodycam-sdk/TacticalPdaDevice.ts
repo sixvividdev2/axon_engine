@@ -50,6 +50,44 @@ export interface PdaOrthoCaptureOptions {
   excludeObjects?: readonly THREE.Object3D[];
 }
 
+/**
+ * Live zero-GC locomotion, breathing, suspension, turn-lag, strafe, and lean motion snapshot
+ * populated by BodycamController so the held 3D PDA moves as one grounded physical unit with the hands.
+ */
+export interface PdaMotionState {
+  bobPhase: number;
+  bobWeight: number;
+  moveRatio: number;
+  isMoving: boolean;
+  isSprinting: boolean;
+  isCrouched: boolean;
+  breathX: number;
+  breathY: number;
+  verticalOffset: number;
+  localStrafeVel: number;
+  leanMeters: number;
+  turnVelYaw: number;
+  turnVelPitch: number;
+}
+
+export function createPdaMotionState(): PdaMotionState {
+  return {
+    bobPhase: 0,
+    bobWeight: 0,
+    moveRatio: 0,
+    isMoving: false,
+    isSprinting: false,
+    isCrouched: false,
+    breathX: 0,
+    breathY: 0,
+    verticalOffset: 0,
+    localStrafeVel: 0,
+    leanMeters: 0,
+    turnVelYaw: 0,
+    turnVelPitch: 0,
+  };
+}
+
 const COMPASS_LABELS: ReadonlyArray<{ deg: number; label: string; major: boolean }> = [
   { deg: 0, label: 'N', major: true },
   { deg: 45, label: 'NE', major: false },
@@ -68,6 +106,17 @@ const STOWING_DUR = 0.18;
 
 const SCREEN_W = 1024;
 const SCREEN_H = 640;
+
+const JOY_PIVOT_X = 0.098;
+const JOY_PIVOT_Y = -0.001;
+const JOY_PIVOT_Z = 0.0082;
+const JOY_CAP_Z = 0.0184;
+const JOY_TRAVEL_M = 0.0052;
+const JOY_MAX_TILT_RAD = 0.52;
+
+const POWER_BTN_X = 0.092;
+const POWER_BTN_Y = 0.045;
+const POWER_BTN_Z = 0.0128;
 
 function smoothstep01(t: number): number {
   const x = THREE.MathUtils.clamp(t, 0, 1);
@@ -118,16 +167,30 @@ export class TacticalPdaDevice {
 
   // Motion & interactive joystick state
   private weaponStowBlend = 0;
-  private joyTiltX = 0; // left/right (-1..1)
-  private joyTiltY = 0; // up/down (-1..1)
-  private panOffsetU = 0; // normalized map pan (-0.4..0.4)
-  private panOffsetV = 0;
+  private raiseBlend = 0;
+  private bringCloserBlend = 0;
+  private dragging = false;
+  private thumbIntentX = 0; // desired thumb sweep intent from LMB+Drag (-1..1, circularly clamped)
+  private thumbIntentY = 0;
+  private joyTiltX = 0; // actual physical joystick tilt driven by post-IK thumbtip (-1..1)
+  private joyTiltY = 0; // actual physical joystick tilt driven by post-IK thumbtip (-1..1)
+  private panCenterU = 0.5; // normalized map center U (0.02..0.98)
+  private panCenterV = 0.5; // normalized map center V (0.02..0.98)
   private mapZoom = 1.15;
   private centerOnPlayer = true;
+  private wheelClickCooldown = 0;
 
   private tiltImpulseX = 0;
   private tiltImpulseZ = 0;
   private swayPhase = 0;
+  // Damped bodycam locomotion, sprint carry, vertical suspension, turn inertia, strafe & lean state
+  private sprintBlend = 0;
+  private moveBlend = 0;
+  private vertHeave = 0;
+  private lookLagYaw = 0;
+  private lookLagPitch = 0;
+  private strafeInertia = 0;
+  private leanTilt = 0;
   private redrawAccum = 0;
   private screenDirty = true;
 
@@ -147,6 +210,10 @@ export class TacticalPdaDevice {
 
   private readonly _tmpPos = new THREE.Vector3();
   private readonly _tmpQuat = new THREE.Quaternion();
+  private readonly _thumbLocal = new THREE.Vector3();
+  private readonly _invDeviceMat = new THREE.Matrix4();
+  private readonly _invRootMat = new THREE.Matrix4();
+  private readonly _postIkDeltaLocal = new THREE.Vector3();
 
   constructor(audio?: IBodycamAudioSource) {
     this.audio = audio;
@@ -316,18 +383,31 @@ export class TacticalPdaDevice {
     this.deviceGroup.add(this.joystickPivot);
 
     // === 2. HAND & THUMB IK SOCKETS (deviceGroup local space) ===
-    // Hand local convention: -Z points toward fingers, +Y is back of hand, +X is outward (right hand) / inward.
-    // Left palm wraps around left bezel gripping from underside/side:
-    this.leftGripSocket.position.set(-0.145, -0.036, -0.006);
-    this.leftGripSocket.rotation.set(0.32, -0.45, -1.28, 'YXZ');
+    // Hand local convention: -Z points toward fingers, +Y is dorsal (back of hand), -Y is palm,
+    // -side * X is radial/thumb side.
+    // Build exact side-cradle orthonormal bases so forearms enter naturally from lower-left / lower-right,
+    // palms wrap flush around the side bolsters, four fingers curl behind the casing, left thumb rests
+    // along the upper-left bezel, and right thumb arches gently (~25-35°) onto the 3D joystick cap.
+    const buildGripQuat = (side: -1 | 1): THREE.Quaternion => {
+      const zAxis = new THREE.Vector3(side * 0.16, -0.68, 0.71).normalize();
+      const dorsalHint = new THREE.Vector3(side * 0.84, 0.34, 0.42).normalize();
+      const yAxis = dorsalHint.clone().addScaledVector(zAxis, -dorsalHint.dot(zAxis)).normalize();
+      const xAxis = new THREE.Vector3().crossVectors(yAxis, zAxis).normalize();
+      yAxis.crossVectors(zAxis, xAxis).normalize();
+      return new THREE.Quaternion().setFromRotationMatrix(
+        new THREE.Matrix4().makeBasis(xAxis, yAxis, zAxis),
+      );
+    };
 
-    // Right palm grips right bezel so right thumb naturally rests over keypad/joystick:
-    this.rightGripSocket.position.set(0.145, -0.038, -0.006);
-    this.rightGripSocket.rotation.set(0.32, 0.45, 1.28, 'YXZ');
+    this.leftGripSocket.position.set(-0.156, -0.049, 0.014);
+    this.leftGripSocket.quaternion.copy(buildGripQuat(-1));
+
+    this.rightGripSocket.position.set(0.158, -0.059, 0.014);
+    this.rightGripSocket.quaternion.copy(buildGripQuat(1));
 
     // Right thumb targets inside deviceGroup space
-    this.rightThumbJoySocket.position.set(0.098, -0.001, 0.018);
-    this.rightThumbPowerSocket.position.set(0.092, 0.045, 0.015);
+    this.rightThumbJoySocket.position.set(JOY_PIVOT_X, JOY_PIVOT_Y, JOY_CAP_Z);
+    this.rightThumbPowerSocket.position.set(POWER_BTN_X, POWER_BTN_Y, POWER_BTN_Z);
     this.deviceGroup.add(
       this.leftGripSocket,
       this.rightGripSocket,
@@ -386,67 +466,215 @@ export class TacticalPdaDevice {
     return { x: this.joyTiltX, y: this.joyTiltY };
   }
 
+  public getThumbIntent(): { x: number; y: number } {
+    return { x: this.thumbIntentX, y: this.thumbIntentY };
+  }
+
+  public isDragging(): boolean {
+    return this.dragging && this.isOpen();
+  }
+
+  public setDragging(dragging: boolean): void {
+    const next = Boolean(dragging) && this.isOpen();
+    if (this.dragging === next) return;
+    this.dragging = next;
+  }
+
+  public getPanCenterUV(): { u: number; v: number } {
+    if (this.centerOnPlayer) {
+      const pUV = this.worldToMapUV(this.telemetry.playerX, this.telemetry.playerZ);
+      return {
+        u: THREE.MathUtils.clamp(pUV.u, 0.02, 0.98),
+        v: THREE.MathUtils.clamp(pUV.v, 0.02, 0.98),
+      };
+    }
+    return { u: this.panCenterU, v: this.panCenterV };
+  }
+
+  public isCenteredOnPlayer(): boolean {
+    return this.centerOnPlayer;
+  }
+
+  public getMapZoom(): number {
+    return this.mapZoom;
+  }
+
+  /**
+   * Drives the 3D joystick gimbal strictly from the player's solved post-IK right thumbtip
+   * position in world space relative to the physical joystick pivot, so the concave cap
+   * tracks directly beneath the operator's thumb pad without inducing map pan drift.
+   */
+  public driveJoystickFromThumbWorldPos(
+    thumbTipWorld: Readonly<THREE.Vector3>,
+    dt: number,
+    ikWeight = 1.0,
+  ): void {
+    if (!this.isOpen() || ikWeight < 0.55) {
+      this.joyTiltX = THREE.MathUtils.damp(this.joyTiltX, 0, 16, dt);
+      this.joyTiltY = THREE.MathUtils.damp(this.joyTiltY, 0, 16, dt);
+      this.joystickPivot.rotation.set(
+        -this.joyTiltY * JOY_MAX_TILT_RAD,
+        this.joyTiltX * JOY_MAX_TILT_RAD,
+        0,
+        'YXZ',
+      );
+      return;
+    }
+
+    this.deviceGroup.updateMatrixWorld(true);
+    this._invDeviceMat.copy(this.deviceGroup.matrixWorld).invert();
+    this._thumbLocal.copy(thumbTipWorld).applyMatrix4(this._invDeviceMat);
+
+    const pressW = this.getPowerPressWeight();
+    const dx = this._thumbLocal.x - JOY_PIVOT_X;
+    const dy = this._thumbLocal.y - JOY_PIVOT_Y;
+    const dz = this._thumbLocal.z - JOY_CAP_Z;
+    const radialDist = Math.hypot(dx, dy);
+
+    // Thumb only physically drives the joystick when resting on/near the cap and not pressing Power
+    const onStick = pressW < 0.08 && radialDist < 0.022 && Math.abs(dz) < 0.025;
+    if (!onStick) {
+      this.joyTiltX = THREE.MathUtils.damp(this.joyTiltX, 0, 18, dt);
+      this.joyTiltY = THREE.MathUtils.damp(this.joyTiltY, 0, 18, dt);
+    } else {
+      let targetX = dx / JOY_TRAVEL_M;
+      let targetY = dy / JOY_TRAVEL_M;
+      const mag = Math.hypot(targetX, targetY);
+      if (mag > 1) {
+        targetX /= mag;
+        targetY /= mag;
+      } else if (mag < 0.03) {
+        targetX = 0;
+        targetY = 0;
+      }
+      this.joyTiltX = THREE.MathUtils.damp(this.joyTiltX, targetX, 28, dt);
+      this.joyTiltY = THREE.MathUtils.damp(this.joyTiltY, targetY, 28, dt);
+    }
+
+    this.joystickPivot.rotation.set(
+      -this.joyTiltY * JOY_MAX_TILT_RAD,
+      this.joyTiltX * JOY_MAX_TILT_RAD,
+      0,
+      'YXZ',
+    );
+    this.joystickPivot.updateMatrixWorld(true);
+  }
+
   public toggle(): void {
     this.setOpen(!this.isOpen());
   }
 
   public setOpen(open: boolean): void {
     if (open) {
-      if (this.phase === 'STOWED' || this.phase === 'STOWING' || this.phase === 'POWER_OFF') {
+      if (this.phase === 'STOWED' || this.phase === 'STOWING') {
         this.phase = 'DRAWING';
-        this.phaseTimer = 0;
+        this.phaseTimer = THREE.MathUtils.clamp(this.raiseBlend, 0, 1) * DRAWING_DUR;
         this.powerButtonAudioPlayed = false;
         this.screenOn = false;
         this.bootTimer = 0;
+        this.dragging = false;
+        this.thumbIntentX = 0;
+        this.thumbIntentY = 0;
+        this.deviceGroup.visible = true;
+        this.screenDirty = true;
+      } else if (this.phase === 'POWER_OFF') {
+        if (this.screenOn) {
+          this.phase = 'ACTIVE';
+          this.phaseTimer = 0.2;
+        } else {
+          this.phase = 'POWER_PRESS';
+          this.phaseTimer = 0;
+          this.powerButtonAudioPlayed = false;
+        }
+        this.dragging = false;
+        this.thumbIntentX = 0;
+        this.thumbIntentY = 0;
         this.deviceGroup.visible = true;
         this.screenDirty = true;
       }
     } else {
+      this.dragging = false;
       if (this.phase === 'DRAWING') {
         this.phase = 'STOWING';
-        this.phaseTimer = 0;
+        this.phaseTimer = (1 - THREE.MathUtils.clamp(this.raiseBlend, 0, 1)) * STOWING_DUR;
+        this.thumbIntentX = 0;
+        this.thumbIntentY = 0;
       } else if (this.phase === 'POWER_PRESS' || this.phase === 'ACTIVE') {
         this.phase = 'POWER_OFF';
         this.phaseTimer = 0;
-        this.audio?.playPdaPowerSound(false);
+        this.thumbIntentX = 0;
+        this.thumbIntentY = 0;
+        if (this.screenOn) {
+          this.audio?.playPdaPowerSound(false);
+        }
         this.screenDirty = true;
       }
     }
   }
 
-  /** Called from mouse move while PDA is open to animate the 3D thumbstick & pan cursor. */
-  public applyMouseDelta(dx: number, dy: number): void {
-    if (!this.isOpen()) return;
-    const targetX = THREE.MathUtils.clamp(dx * 0.048, -1, 1);
-    const targetY = THREE.MathUtils.clamp(-dy * 0.048, -1, 1);
-    this.joyTiltX = THREE.MathUtils.clamp(this.joyTiltX + targetX * 0.45, -1, 1);
-    this.joyTiltY = THREE.MathUtils.clamp(this.joyTiltY + targetY * 0.45, -1, 1);
+  /**
+   * Called on mouse move while LMB is held (Click + Drag) on the PDA:
+   *  - Grab-sheet 1:1 map panning (drag down pulls north into view, drag right pulls west into view)
+   *  - Zero-snap transition out of GPS lock starting from player's live map UV
+   *  - Circularly clamped tactile right-thumb deflection driving the 3D gimbaled joystick
+   */
+  public applyDragDelta(dx: number, dy: number): void {
+    if (!this.isOpen() || !this.dragging) return;
+    if (this.phase !== 'ACTIVE') return;
+    if (Math.abs(dx) < 0.01 && Math.abs(dy) < 0.01) return;
 
-    if (this.phase === 'ACTIVE') {
-      const panSpeed = 0.00055 / Math.max(0.8, this.mapZoom);
-      this.panOffsetU = THREE.MathUtils.clamp(this.panOffsetU + dx * panSpeed, -0.45, 0.45);
-      this.panOffsetV = THREE.MathUtils.clamp(this.panOffsetV + dy * panSpeed, -0.45, 0.45);
-      if (Math.abs(dx) + Math.abs(dy) > 1.5) {
-        this.centerOnPlayer = false;
+    if (this.centerOnPlayer) {
+      const pUV = this.worldToMapUV(this.telemetry.playerX, this.telemetry.playerZ);
+      this.panCenterU = THREE.MathUtils.clamp(pUV.u, 0.02, 0.98);
+      this.panCenterV = THREE.MathUtils.clamp(pUV.v, 0.02, 0.98);
+      this.centerOnPlayer = false;
+    }
+
+    // Grab-sheet drag: pulling mouse down (dy > 0) shifts map sheet downward, revealing north (smaller V)
+    const panSens = 0.00145 / Math.max(0.8, this.mapZoom);
+    this.panCenterU = THREE.MathUtils.clamp(this.panCenterU - dx * panSens, 0.02, 0.98);
+    this.panCenterV = THREE.MathUtils.clamp(this.panCenterV - dy * panSens, 0.02, 0.98);
+
+    // Thumb glides in the physical drag direction on the 3D joystick cap (+X right, +Y up)
+    const stepX = THREE.MathUtils.clamp(dx * 0.032, -0.6, 0.6);
+    const stepY = THREE.MathUtils.clamp(-dy * 0.032, -0.6, 0.6);
+    this.thumbIntentX += stepX;
+    this.thumbIntentY += stepY;
+    const len = Math.hypot(this.thumbIntentX, this.thumbIntentY);
+    if (len > 1) {
+      this.thumbIntentX /= len;
+      this.thumbIntentY /= len;
+    }
+    this.screenDirty = true;
+  }
+
+  /** Legacy alias routed through drag-gated panning so free mouse look never drifts the PDA. */
+  public applyMouseDelta(dx: number, dy: number): void {
+    this.applyDragDelta(dx, dy);
+  }
+
+  /** Mouse wheel / trackpad zoom on tactical map. */
+  public applyWheel(deltaY: number): void {
+    if (!this.isOpen() || Math.abs(deltaY) < 0.01) return;
+    const step = THREE.MathUtils.clamp(deltaY / 100, -1.5, 1.5);
+    const factor = Math.pow(0.88, step);
+    const nextZoom = THREE.MathUtils.clamp(this.mapZoom * factor, 0.9, 3.6);
+    if (Math.abs(nextZoom - this.mapZoom) > 1e-4) {
+      this.mapZoom = nextZoom;
+      if (this.wheelClickCooldown <= 0) {
+        this.audio?.playPdaButtonClick();
+        this.wheelClickCooldown = 0.075;
       }
       this.screenDirty = true;
     }
   }
 
-  /** Mouse wheel zoom on tactical map. */
-  public applyWheel(deltaY: number): void {
-    if (!this.isOpen()) return;
-    const factor = deltaY > 0 ? 0.88 : 1.13;
-    this.mapZoom = THREE.MathUtils.clamp(this.mapZoom * factor, 0.9, 3.6);
-    this.audio?.playPdaButtonClick();
-    this.screenDirty = true;
-  }
-
   /** Snap view back onto operator position. */
   public recenterOnPlayer(): void {
+    const pUV = this.worldToMapUV(this.telemetry.playerX, this.telemetry.playerZ);
+    this.panCenterU = THREE.MathUtils.clamp(pUV.u, 0.02, 0.98);
+    this.panCenterV = THREE.MathUtils.clamp(pUV.v, 0.02, 0.98);
     this.centerOnPlayer = true;
-    this.panOffsetU = 0;
-    this.panOffsetV = 0;
     this.audio?.playPdaButtonClick();
     this.screenDirty = true;
   }
@@ -601,21 +829,27 @@ export class TacticalPdaDevice {
     }
   }
 
-  /** Advance state machine, 3D pose interpolation, joystick gimbal & OLED texture redraw. */
+  /** Advance state machine, coupled bodycam locomotion/inertia pose, joystick gimbal & OLED texture redraw. */
   public update(
     dt: number,
     elapsed: number,
     moveSpeedRatio = 0,
     isCrouched = false,
+    motion?: Readonly<PdaMotionState>,
   ): void {
     const clampedDt = Math.min(Math.max(dt, 0.0001), 0.05);
+    const effMoveRatio = motion ? motion.moveRatio : moveSpeedRatio;
+    const effCrouched = motion ? motion.isCrouched : isCrouched;
     this.phaseTimer += clampedDt;
-    this.swayPhase += clampedDt * (1.4 + moveSpeedRatio * 3.8);
+    this.swayPhase += clampedDt * (1.4 + effMoveRatio * 3.8);
+    if (this.wheelClickCooldown > 0) {
+      this.wheelClickCooldown = Math.max(0, this.wheelClickCooldown - clampedDt);
+    }
 
-    // Decay thumbstick back toward center when mouse stops moving
-    const joyDamp = Math.exp(-14 * clampedDt);
-    this.joyTiltX *= joyDamp;
-    this.joyTiltY *= joyDamp;
+    // Decay thumb motor intent smoothly back toward rest when mouse stops moving
+    const intentDamp = Math.exp(-12 * clampedDt);
+    this.thumbIntentX *= intentDamp;
+    this.thumbIntentY *= intentDamp;
 
     // Decay tactile tilt impulse from power-button press
     const impDamp = Math.exp(-11 * clampedDt);
@@ -665,10 +899,28 @@ export class TacticalPdaDevice {
         this.phase = 'STOWED';
         this.phaseTimer = 0;
         this.weaponStowBlend = 0;
+        this.raiseBlend = 0;
+        this.bringCloserBlend = 0;
+        this.sprintBlend = 0;
+        this.moveBlend = 0;
+        this.vertHeave = 0;
+        this.lookLagYaw = 0;
+        this.lookLagPitch = 0;
+        this.strafeInertia = 0;
+        this.leanTilt = 0;
         this.deviceGroup.visible = false;
       }
     } else {
       this.weaponStowBlend = 0;
+      this.raiseBlend = 0;
+      this.bringCloserBlend = 0;
+      this.sprintBlend = 0;
+      this.moveBlend = 0;
+      this.vertHeave = 0;
+      this.lookLagYaw = 0;
+      this.lookLagPitch = 0;
+      this.strafeInertia = 0;
+      this.leanTilt = 0;
       this.deviceGroup.visible = false;
       return;
     }
@@ -678,55 +930,178 @@ export class TacticalPdaDevice {
     // === POSITION & ERGONOMIC STALKER FRAMING IN CAMERA SPACE ===
     // Camera faces -Z. PDA sits around ~25cm in front of chest-cam lens tilted cleanly for readability,
     // leaving top strip clear so operator keeps situational awareness above top bezel.
-    let raiseT = 0;
-    let bringCloserT = 0;
+    let targetRaise = 0;
+    let targetBringCloser = 0;
     if (this.phase === 'DRAWING') {
-      raiseT = smoothstep01(this.phaseTimer / DRAWING_DUR);
-      bringCloserT = 0;
+      targetRaise = smoothstep01(this.phaseTimer / DRAWING_DUR);
+      targetBringCloser = 0;
     } else if (this.phase === 'POWER_PRESS') {
-      raiseT = 1;
-      bringCloserT = smoothstep01(Math.max(0, (this.phaseTimer - 0.14) / 0.13)) * 0.25;
+      targetRaise = 1;
+      targetBringCloser = smoothstep01(Math.max(0, (this.phaseTimer - 0.14) / 0.13)) * 0.25;
     } else if (this.phase === 'ACTIVE') {
-      raiseT = 1;
-      bringCloserT = smoothstep01(Math.min(1, this.phaseTimer / 0.18));
+      targetRaise = 1;
+      targetBringCloser = 1;
     } else if (this.phase === 'POWER_OFF') {
-      raiseT = 1;
-      bringCloserT = 1 - smoothstep01(this.phaseTimer / POWER_OFF_DUR) * 0.65;
+      targetRaise = 1;
+      targetBringCloser = 0.35;
     } else if (this.phase === 'STOWING') {
-      raiseT = 1 - smoothstep01(this.phaseTimer / STOWING_DUR);
-      bringCloserT = 0;
+      targetRaise = 1 - smoothstep01(this.phaseTimer / STOWING_DUR);
+      targetBringCloser = 0;
     }
 
-    const crouchY = isCrouched ? -0.008 : 0;
-    const walkSwayX = Math.sin(this.swayPhase) * (0.0018 + moveSpeedRatio * 0.0045);
-    const walkSwayY = Math.abs(Math.cos(this.swayPhase)) * (0.0014 + moveSpeedRatio * 0.0038);
+    this.raiseBlend = targetRaise;
+    this.bringCloserBlend = THREE.MathUtils.damp(
+      this.bringCloserBlend,
+      targetBringCloser,
+      16,
+      clampedDt,
+    );
+    const raiseT = this.raiseBlend;
+    const bringCloserT = this.bringCloserBlend;
+
+    // === COUPLED BODYCAM LOCOMOTION, LOWERED SPRINT PUMP, BREATHING, HEAVE & TURN/STRAFE/LEAN INERTIA ===
+    const wantsSprint = Boolean(motion?.isSprinting && this.phase === 'ACTIVE');
+    this.sprintBlend = THREE.MathUtils.damp(this.sprintBlend, wantsSprint ? 1 : 0, 9.5, clampedDt);
+    const sp = this.sprintBlend;
+
+    const targetMoveBlend = motion
+      ? THREE.MathUtils.clamp(Math.max(motion.bobWeight, motion.isMoving ? Math.min(1, motion.moveRatio) : 0), 0, 1)
+      : THREE.MathUtils.clamp(effMoveRatio, 0, 1);
+    this.moveBlend = THREE.MathUtils.damp(this.moveBlend, targetMoveBlend, 11.5, clampedDt);
+
+    const gaitPhase = motion ? motion.bobPhase : this.swayPhase;
+    const crouchScale = effCrouched ? 0.65 : 1.0;
+    const dragStab = this.dragging ? 0.55 : 1.0;
+    const bobEnv = this.moveBlend * crouchScale * dragStab * raiseT;
+
+    // Figure-8 footstep bob (grounded & readable while walking; stronger rhythmic pump when sprinting)
+    const bobAmpX = THREE.MathUtils.lerp(0.0085, 0.022, sp);
+    const bobAmpY = THREE.MathUtils.lerp(0.0075, 0.019, sp);
+    const bobAmpZ = THREE.MathUtils.lerp(0.0025, 0.0085, sp);
+    const bobRollAmp = THREE.MathUtils.lerp(0.022, 0.068, sp);
+    const bobPitchAmp = THREE.MathUtils.lerp(0.014, 0.036, sp);
+
+    const walkSwayX = Math.sin(gaitPhase) * bobAmpX * bobEnv;
+    const walkSwayY = (-Math.cos(gaitPhase * 2) * 0.5 - 0.5) * bobAmpY * bobEnv;
+    const walkSwayZ = Math.sin(gaitPhase * 2) * bobAmpZ * bobEnv;
+    const walkRoll = Math.sin(gaitPhase - 0.25) * bobRollAmp * bobEnv;
+    const walkPitch = -Math.cos(gaitPhase * 2 - 0.35) * bobPitchAmp * bobEnv;
+
+    // Breathing drift synced to BodycamController chest breath & exertion
+    const breathX = motion ? motion.breathX : Math.sin(elapsed * 1.45) * 0.0022;
+    const breathY = motion ? motion.breathY : Math.cos(elapsed * 2.15) * 0.0018;
+    const breathPosX = breathX * 0.48 * raiseT;
+    const breathPosY = breathY * 0.52 * raiseT;
+    const breathRotYaw = -breathX * 0.42 * raiseT;
+    const breathRotPitch = breathY * 0.48 * raiseT;
+
+    // Jump, step-up & landing vertical suspension heave
+    const targetVert = motion ? THREE.MathUtils.clamp(motion.verticalOffset, -0.14, 0.08) : 0;
+    this.vertHeave = THREE.MathUtils.damp(this.vertHeave, targetVert, 16, clampedDt);
+    const heavePosY = this.vertHeave * 0.24 * raiseT;
+    const heavePosZ = Math.min(0, this.vertHeave) * 0.05 * raiseT;
+    const heavePitch = this.vertHeave * 0.48 * raiseT;
+
+    // Camera-turn physical weight inertia (muted during LMB map drag when camera stays stationary)
+    // Right-handed Y-up camera: turning right => turnVelYaw < 0 => lookLagYaw > 0 => tablet trails LEFT (-X, +rotY, +rotZ)
+    // Pitching up => turnVelPitch > 0 => lookLagPitch < 0 => tablet trails DOWN (-Y, -rotX)
+    const targetLagYaw =
+      motion && !this.dragging
+        ? THREE.MathUtils.clamp(-motion.turnVelYaw * 0.026, -0.11, 0.11)
+        : 0;
+    const targetLagPitch =
+      motion && !this.dragging
+        ? THREE.MathUtils.clamp(-motion.turnVelPitch * 0.022, -0.09, 0.09)
+        : 0;
+    this.lookLagYaw = THREE.MathUtils.damp(this.lookLagYaw, targetLagYaw, 11.5, clampedDt);
+    this.lookLagPitch = THREE.MathUtils.damp(this.lookLagPitch, targetLagPitch, 11.5, clampedDt);
+    const lagPosX = -this.lookLagYaw * 0.15 * raiseT;
+    const lagPosY = this.lookLagPitch * 0.12 * raiseT;
+    const lagRotYaw = this.lookLagYaw * 0.85 * raiseT;
+    const lagRotPitch = this.lookLagPitch * 0.72 * raiseT;
+    const lagRotRoll = this.lookLagYaw * 0.52 * raiseT;
+
+    // Lateral strafe inertia & Q/E lean tilt
+    const targetStrafe = motion ? THREE.MathUtils.clamp(motion.localStrafeVel / 4.5, -1, 1) : 0;
+    this.strafeInertia = THREE.MathUtils.damp(this.strafeInertia, targetStrafe, 10.5, clampedDt);
+    const strafePosX = -this.strafeInertia * 0.010 * raiseT;
+    const strafeRotYaw = -this.strafeInertia * 0.010 * raiseT;
+    const strafeRotRoll = -this.strafeInertia * 0.044 * raiseT;
+
+    const targetLean = motion ? THREE.MathUtils.clamp(motion.leanMeters / 0.35, -1, 1) : 0;
+    this.leanTilt = THREE.MathUtils.damp(this.leanTilt, targetLean, 11, clampedDt);
+    const leanPosX = this.leanTilt * 0.008 * raiseT;
+    const leanRotRoll = -this.leanTilt * 0.068 * raiseT;
+
+    // Lowered athletic carry offset during sprint (opens top sightline while pumping with stride)
+    const sprintDropX = sp * 0.012 * raiseT;
+    const sprintDropY = -sp * 0.052 * raiseT;
+    const sprintDropZ = -sp * 0.018 * raiseT;
+    const sprintPitch = -sp * 0.14 * raiseT;
+    const sprintRoll = -sp * 0.06 * raiseT;
+
+    const crouchY = effCrouched ? -0.009 : 0;
 
     // Base draw -> inspection bring-closer curve
     const baseX = THREE.MathUtils.lerp(-0.14, 0.004, raiseT);
     const baseY = THREE.MathUtils.lerp(-0.34, THREE.MathUtils.lerp(-0.105, -0.044, bringCloserT), raiseT);
     const baseZ = THREE.MathUtils.lerp(-0.33, THREE.MathUtils.lerp(-0.305, -0.238, bringCloserT), raiseT);
 
-    // Gentle thumbstick mouse micro-tilt so device feels physically held by hands
-    const joyDevicePitch = this.joyTiltY * 0.032;
-    const joyDeviceYaw = -this.joyTiltX * 0.036;
+    // Subtle thumbstick micro-tilt so device feels physically held without inducing IK feedback lag
+    const joyDevicePitch = this.joyTiltY * 0.014;
+    const joyDeviceYaw = -this.joyTiltX * 0.016;
 
     this.deviceGroup.position.set(
-      baseX + walkSwayX + this.joyTiltX * 0.004,
-      baseY + walkSwayY + crouchY - this.joyTiltY * 0.003,
-      baseZ,
+      baseX +
+        walkSwayX +
+        breathPosX +
+        lagPosX +
+        strafePosX +
+        leanPosX +
+        sprintDropX +
+        this.joyTiltX * 0.002,
+      baseY +
+        walkSwayY +
+        breathPosY +
+        heavePosY +
+        lagPosY +
+        sprintDropY +
+        crouchY -
+        this.joyTiltY * 0.0015,
+      baseZ + walkSwayZ + heavePosZ + sprintDropZ,
     );
 
     this.deviceGroup.rotation.set(
       THREE.MathUtils.lerp(0.65, THREE.MathUtils.lerp(-0.24, -0.15, bringCloserT), raiseT) +
         this.tiltImpulseX +
-        joyDevicePitch,
-      THREE.MathUtils.lerp(0.45, -0.025, raiseT) + joyDeviceYaw,
-      THREE.MathUtils.lerp(-0.32, 0.015, raiseT) + this.tiltImpulseZ,
+        joyDevicePitch +
+        walkPitch +
+        breathRotPitch +
+        heavePitch +
+        lagRotPitch +
+        sprintPitch,
+      THREE.MathUtils.lerp(0.45, -0.025, raiseT) +
+        joyDeviceYaw +
+        breathRotYaw +
+        lagRotYaw +
+        strafeRotYaw,
+      THREE.MathUtils.lerp(-0.32, 0.015, raiseT) +
+        this.tiltImpulseZ +
+        walkRoll +
+        lagRotRoll +
+        strafeRotRoll +
+        leanRotRoll +
+        sprintRoll,
       'YXZ',
     );
 
-    // Animate 3D gimbaled thumbstick copying mouse movement + depress power switch
-    this.joystickPivot.rotation.set(-this.joyTiltY * 0.42, 0, -this.joyTiltX * 0.42, 'YXZ');
+    // Apply thumb-driven gimbal rotation + depress power switch
+    this.joystickPivot.rotation.set(
+      -this.joyTiltY * JOY_MAX_TILT_RAD,
+      this.joyTiltX * JOY_MAX_TILT_RAD,
+      0,
+      'YXZ',
+    );
     const pressDepth = this.getPowerPressWeight();
     this.powerBtnMesh.position.z = 0.0092 - pressDepth * 0.0024;
     this.powerBtnMat.emissiveIntensity = this.screenOn ? 0.95 : 0.28 + pressDepth * 0.5;
@@ -761,23 +1136,48 @@ export class TacticalPdaDevice {
     this.leftGripSocket.getWorldQuaternion(outQuat);
   }
 
-  /** World-space target for Right Hand holding the PDA side grip. */
+  /** World-space target for Right Hand holding the PDA side grip (shifts up in device-local space when pressing Power). */
   public getRightGripWorldTransform(outPos: THREE.Vector3, outQuat: THREE.Quaternion): void {
-    this.rightGripSocket.getWorldPosition(outPos);
+    const pressW = this.getPowerPressWeight();
+    outPos.copy(this.rightGripSocket.position);
+    if (pressW > 0.005) {
+      outPos.x -= pressW * 0.006;
+      outPos.y += pressW * 0.040;
+    }
+    this.deviceGroup.localToWorld(outPos);
     this.rightGripSocket.getWorldQuaternion(outQuat);
   }
 
-  /** World-space right thumb fingertip target (joystick vs power button). */
+  /**
+   * Post-IK reach guard: applies a single-frame world-space residual correction (converted into
+   * root-local space) if extreme pitch/lean ever clamps arm IK reach, ensuring the tablet never
+   * visually detaches from the solved palms. Zero drift accumulation because update() resets position.
+   */
+  public applyPostIkWorldOffset(deltaWorld: Readonly<THREE.Vector3>): void {
+    const lenSq = deltaWorld.lengthSq();
+    if (lenSq < 1e-10) return;
+    this.root.updateMatrixWorld(true);
+    this._invRootMat.copy(this.root.matrixWorld).invert();
+    this._postIkDeltaLocal.copy(deltaWorld).transformDirection(this._invRootMat);
+    const mag = Math.sqrt(lenSq);
+    this._postIkDeltaLocal.multiplyScalar(mag);
+    this.deviceGroup.position.add(this._postIkDeltaLocal);
+    this.deviceGroup.updateMatrixWorld(true);
+  }
+
+  /** World-space right thumb fingertip target (physical 3D joystick cap contact vs red power button). */
   public getRightThumbWorldTarget(outPos: THREE.Vector3): void {
     const pW = this.getPowerPressWeight();
-    this.rightThumbJoySocket.getWorldPosition(outPos);
-    if (pW > 0.01) {
-      this.rightThumbPowerSocket.getWorldPosition(this._tmpPos);
+    outPos.set(
+      JOY_PIVOT_X + this.thumbIntentX * JOY_TRAVEL_M,
+      JOY_PIVOT_Y + this.thumbIntentY * JOY_TRAVEL_M,
+      JOY_CAP_Z,
+    );
+    if (pW > 0.005) {
+      this._tmpPos.set(POWER_BTN_X, POWER_BTN_Y, POWER_BTN_Z - pW * 0.0022);
       outPos.lerp(this._tmpPos, pW);
-    } else {
-      outPos.x += this.joyTiltX * 0.004;
-      outPos.y += this.joyTiltY * 0.004;
     }
+    this.deviceGroup.localToWorld(outPos);
   }
 
   private worldToMapUV(x: number, z: number): { u: number; v: number } {
@@ -932,8 +1332,12 @@ export class TacticalPdaDevice {
     ctx.clip();
 
     const pUV = this.worldToMapUV(this.telemetry.playerX, this.telemetry.playerZ);
-    const centerU = this.centerOnPlayer ? pUV.u : THREE.MathUtils.clamp(0.5 + this.panOffsetU, 0.05, 0.95);
-    const centerV = this.centerOnPlayer ? pUV.v : THREE.MathUtils.clamp(0.5 + this.panOffsetV, 0.05, 0.95);
+    const centerU = this.centerOnPlayer
+      ? THREE.MathUtils.clamp(pUV.u, 0.02, 0.98)
+      : THREE.MathUtils.clamp(this.panCenterU, 0.02, 0.98);
+    const centerV = this.centerOnPlayer
+      ? THREE.MathUtils.clamp(pUV.v, 0.02, 0.98)
+      : THREE.MathUtils.clamp(this.panCenterV, 0.02, 0.98);
 
     const drawSize = Math.min(mapW, mapH) * 1.15 * this.mapZoom;
     const imgLeft = mapW * 0.5 - centerU * drawSize;
@@ -1087,13 +1491,13 @@ export class TacticalPdaDevice {
     ctx.font = '13px monospace';
     ctx.textAlign = 'left';
     ctx.fillText(
-      `GRID ${Math.round(this.telemetry.playerX)}E ${Math.round(-this.telemetry.playerZ)}N · MOUSE PAN · WHEEL ZOOM · R CENTER`,
+      `GRID ${Math.round(this.telemetry.playerX)}E ${Math.round(-this.telemetry.playerZ)}N · LMB+DRAG PAN · WHEEL ZOOM · R/RMB CENTER`,
       16,
       SCREEN_H - 13,
     );
     ctx.textAlign = 'right';
-    ctx.fillStyle = '#10b981';
-    ctx.fillText('LINK ACTIVE', SCREEN_W - 16, SCREEN_H - 13);
+    ctx.fillStyle = this.centerOnPlayer ? '#10b981' : '#38bdf8';
+    ctx.fillText(this.centerOnPlayer ? 'GPS LOCKED' : 'FREE PAN', SCREEN_W - 16, SCREEN_H - 13);
 
     // Boot scanline wipe effect
     if (bootProgress < 1) {

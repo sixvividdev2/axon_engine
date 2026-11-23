@@ -93,6 +93,9 @@ interface RemoteOperator {
   wallObstruction01: number;
   beltWallTuck01: number;
   beltGrenadeCount: number;
+  mountedBeltEquipId: TacticalEquipmentId;
+  mountedBeltCount: number;
+  mountedBeltVisible: boolean;
 
   // Unified Tactical 3D Rig
   rig: BuiltTacticalOperatorRig;
@@ -408,6 +411,9 @@ export class RemotePlayerManager {
       wallObstruction01: 0,
       beltWallTuck01: 0,
       beltGrenadeCount: 1,
+      mountedBeltEquipId: DEFAULT_TACTICAL_EQUIPMENT_ID,
+      mountedBeltCount: 1,
+      mountedBeltVisible: true,
 
       rig,
       nameSprite,
@@ -692,6 +698,9 @@ export class RemotePlayerManager {
     op.grenadeCharge01 = 0;
     op.grenadeThrowStyle = 'overhand';
     op.beltGrenadeCount = 1;
+    op.mountedBeltEquipId = op.grenadeEquipmentId;
+    op.mountedBeltCount = 1;
+    op.mountedBeltVisible = true;
     op.rig.setBeltEquipment(op.grenadeEquipmentId, 'front_left', 1, true);
     op.hasInitialState = true;
     if (
@@ -722,6 +731,9 @@ export class RemotePlayerManager {
     const op = this.players.get(userId);
     if (!op || !op.alive || op.beltGrenadeCount <= 0) return null;
     op.beltGrenadeCount = Math.max(0, op.beltGrenadeCount - 1);
+    op.mountedBeltEquipId = op.grenadeEquipmentId;
+    op.mountedBeltCount = op.beltGrenadeCount;
+    op.mountedBeltVisible = op.beltGrenadeCount > 0;
     op.rig.setBeltEquipment(op.grenadeEquipmentId, 'front_left', op.beltGrenadeCount, op.beltGrenadeCount > 0);
     return op.grenadeEquipmentId;
   }
@@ -959,8 +971,19 @@ export class RemotePlayerManager {
       pose.beltWallTuck01 = op.beltWallTuck01;
       rig.applyCombatPose(pose);
 
-      // Muzzle flash, laser & tactical light
+      // Muzzle flash, belt grenade visibility/type, laser & tactical light
       const grenadeBusy = op.handlingAction.startsWith('GRENADE_');
+      const wantBeltVisible = op.alive && op.beltGrenadeCount > 0 && !grenadeBusy;
+      if (
+        op.mountedBeltEquipId !== op.grenadeEquipmentId ||
+        op.mountedBeltCount !== op.beltGrenadeCount ||
+        op.mountedBeltVisible !== wantBeltVisible
+      ) {
+        op.mountedBeltEquipId = op.grenadeEquipmentId;
+        op.mountedBeltCount = op.beltGrenadeCount;
+        op.mountedBeltVisible = wantBeltVisible;
+        rig.setBeltEquipment(op.grenadeEquipmentId, 'front_left', op.beltGrenadeCount, wantBeltVisible);
+      }
       if (op.muzzleFlashTimer > 0) {
         op.muzzleFlashTimer = Math.max(0, op.muzzleFlashTimer - dt);
         if (op.muzzleFlashTimer <= 0) rig.muzzleFlash.visible = false;

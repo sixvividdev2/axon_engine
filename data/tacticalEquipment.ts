@@ -210,12 +210,15 @@ export function getTacticalEquipmentDef(id: unknown): TacticalEquipmentDef {
 export function computeBeltGrenadeDetonationChance(
   impactEnergyJ: number,
   ammoCategory?: string,
+  bulletMassGrams?: number,
 ): number {
   const energy = Math.max(0, Number.isFinite(impactEnergyJ) ? impactEnergyJ : 550);
-  // Smooth energy curve:
-  // ~140 J (.22LR) -> ~18%, ~480 J (9mm) -> ~30%, ~1750 J (5.56) -> ~58%,
-  // ~3300 J (7.62x51 / 12ga slug) -> ~79%, ~4800+ J (.338 / .50) -> ~92%+
-  let chance = 0.14 + (1 - Math.exp(-energy / 2450)) * 0.80;
+  const massG = Math.max(0, Number.isFinite(bulletMassGrams) ? (bulletMassGrams as number) : 0);
+  // Combine kinetic energy + bullet mass (impulse/bore diameter):
+  // ~140 J / 2.6g (.22LR) -> ~16%, ~480 J / 7.5g (9mm) -> ~30%,
+  // ~1750 J / 4g (5.56) -> ~57%, ~3300 J / 9.7g-28g (7.62x51 / 12ga slug) -> ~82%+, ~4800+ J (.338/.50) -> ~94%+
+  const massBoost = massG > 0 ? Math.min(0.18, (massG / 28) * 0.16) : 0;
+  let chance = 0.14 + (1 - Math.exp(-energy / 2450)) * 0.78 + massBoost;
 
   if (ammoCategory) {
     const cat = ammoCategory.toLowerCase();

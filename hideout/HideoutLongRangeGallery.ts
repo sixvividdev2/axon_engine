@@ -3,7 +3,9 @@ import {
   BallisticImpactEvent,
   BodycamPhysicsWorld,
   BodycamSurfaceMaterial,
+  computeTargetHingeAngularImpulse,
 } from '../bodycam-sdk';
+import { PenetrableSurfaceSystem } from '../doors/PenetrableSurfaceSystem';
 import { HideoutInteractableMeta } from './HideoutBunkerWorld';
 import { HideoutElectronicsSystem } from './HideoutElectronicsSystem';
 import { HideoutMaterialLibrary } from './HideoutMaterials';
@@ -480,6 +482,7 @@ export class HideoutLongRangeGallery {
 
   // Trolley state
   private trolleyGroup!: THREE.Group;
+  private trolleyPivot!: THREE.Group;
   private trolleyPresetIdx = 1; // Defaults to 50m so it's immediately visible & exciting downrange
   private trolleyDistM = 50;
   private trolleyTargetDistM = 50;
@@ -522,6 +525,7 @@ export class HideoutLongRangeGallery {
   // Zero-GC scratch
   private readonly _tmpLocalHit = new THREE.Vector3();
   private readonly electronics: HideoutElectronicsSystem;
+  private readonly penetrableSystem?: PenetrableSurfaceSystem;
   private consoleBroken = false;
   private monitorBroken = false;
   private chronoBroken = false;
@@ -538,10 +542,12 @@ export class HideoutLongRangeGallery {
     initialBestMoa100m: number | null,
     initialHits100m: number,
     callbacks: HideoutLongRangeCallbacks = {},
+    penetrableSystem?: PenetrableSurfaceSystem,
   ) {
     this.physics = physics;
     this.materials = materials;
     this.electronics = electronics;
+    this.penetrableSystem = penetrableSystem;
     this.isSoftwareGl = isSoftwareGl;
     this.maxAniso = maxAniso;
     this.bestMoa100m = initialBestMoa100m;
@@ -632,7 +638,7 @@ export class HideoutLongRangeGallery {
       raycastMeshes,
       false,
     );
-    this.addStructureBox(
+    const ceiling = this.addStructureBox(
       TUNNEL_CENTER_X,
       TUNNEL_HEIGHT + 0.1,
       tunnelMidZ,
@@ -644,6 +650,7 @@ export class HideoutLongRangeGallery {
       raycastMeshes,
       true,
     );
+    ceiling.userData.isRoof = true;
 
     // East outer concrete wall (X = 33.75, full length)
     this.addStructureBox(
@@ -760,6 +767,7 @@ export class HideoutLongRangeGallery {
     pilasterInst.computeBoundingSphere();
     beamInst.instanceMatrix.needsUpdate = true;
     beamInst.computeBoundingSphere();
+    beamInst.userData.isRoof = true;
     this.root.add(pilasterInst);
     this.root.add(beamInst);
 
@@ -787,9 +795,11 @@ export class HideoutLongRangeGallery {
       const lz = lightZs[i];
       const housing = new THREE.Mesh(housingGeo, this.materials.darkSteel);
       housing.position.set(TUNNEL_CENTER_X, TUNNEL_HEIGHT - 0.14, lz);
+      housing.userData.isRoof = true;
       this.root.add(housing);
       const tube = new THREE.Mesh(tubeGeo, this.materials.warmLampEmissive);
       tube.position.set(TUNNEL_CENTER_X, TUNNEL_HEIGHT - 0.19, lz);
+      tube.userData.isRoof = true;
       this.root.add(tube);
 
       const bayIdx = Math.min(bayLights.length - 1, Math.floor(i / 2));
@@ -1205,6 +1215,7 @@ export class HideoutLongRangeGallery {
       this.materials.darkSteel,
     );
     railBeam.position.set(TROLLEY_X, 4.3, railMidZ);
+    railBeam.userData.isRoof = true;
     this.root.add(railBeam);
 
     const railFlange = new THREE.Mesh(
@@ -1212,9 +1223,10 @@ export class HideoutLongRangeGallery {
       this.materials.brushedSteel,
     );
     railFlange.position.set(TROLLEY_X, 4.23, railMidZ);
+    railFlange.userData.isRoof = true;
     this.root.add(railFlange);
 
-    // Moving Trolley Carriage + Suspension + 1.0m × 1.0m Precision Bullseye Target
+    // Moving Trolley Carriage + Hanger Pivot + 1.0m × 1.0m Precision Bullseye Target
     this.trolleyGroup = new THREE.Group();
     this.trolleyGroup.position.set(TROLLEY_X, 0, FIRING_LINE_Z + this.trolleyDistM);
     this.root.add(this.trolleyGroup);
@@ -1242,22 +1254,27 @@ export class HideoutLongRangeGallery {
     motorBeacon.position.set(0, 4.02, -0.32);
     this.trolleyGroup.add(motorBeacon);
 
+    // Top-hinged hanger pivot under carriage so paper swings realistically on rail impacts & trolley starts
+    this.trolleyPivot = new THREE.Group();
+    this.trolleyPivot.position.set(0, 4.10, 0);
+    this.trolleyGroup.add(this.trolleyPivot);
+
     // Twin vertical hanger rods down to target clamp bar
     for (const sx of [-0.42, 0.42]) {
       const rod = new THREE.Mesh(
         this.trackGeo(new THREE.CylinderGeometry(0.014, 0.014, 2.08, 8)),
         this.materials.brushedSteel,
       );
-      rod.position.set(sx, 3.04, 0);
-      this.trolleyGroup.add(rod);
+      rod.position.set(sx, 3.04 - 4.10, 0);
+      this.trolleyPivot.add(rod);
     }
 
     const clampBar = new THREE.Mesh(
       this.trackGeo(new THREE.BoxGeometry(1.12, 0.08, 0.08)),
       this.materials.darkSteel,
     );
-    clampBar.position.set(0, 2.0, 0);
-    this.trolleyGroup.add(clampBar);
+    clampBar.position.set(0, 2.0 - 4.10, 0);
+    this.trolleyPivot.add(clampBar);
 
     // Precision Bullseye Paper Board (centered at Y = 1.46m — natural eye/benchrest line)
     const [pc, pctx] = buildPrecisionBullseyeCanvas();
@@ -1278,7 +1295,7 @@ export class HideoutLongRangeGallery {
       this.trackGeo(new THREE.BoxGeometry(PAPER_SIZE_M, PAPER_SIZE_M, 0.025)),
       paperMat,
     );
-    paperBoard.position.set(0, 1.46, 0);
+    paperBoard.position.set(0, 1.46 - 4.10, 0);
     paperBoard.userData.surfaceMaterial = 'wood';
     paperBoard.userData.ballisticMaterial = 'wood';
     paperBoard.userData.hideoutLongRangeTarget = {
@@ -1286,7 +1303,7 @@ export class HideoutLongRangeGallery {
       kind: 'trolley_paper',
       zone: 'paper',
     } satisfies LongRangeTargetTag;
-    this.trolleyGroup.add(paperBoard);
+    this.trolleyPivot.add(paperBoard);
     raycastMeshes.push(paperBoard);
   }
 
@@ -1625,6 +1642,21 @@ export class HideoutLongRangeGallery {
       pivot.add(mesh);
       raycastMeshes.push(mesh);
 
+      if (kind === 'pen_wood_panel' && this.penetrableSystem) {
+        this.penetrableSystem.registerSurface({
+          id: `lr_${id}`,
+          mesh,
+          kind: 'plywood',
+          width: w,
+          height: h,
+          thickness,
+          faceAxis: 'z',
+          floorY: 0,
+          maxHoles: 6,
+          hitsToBreach: 1,
+        });
+      }
+
       const entry: PenetrationPanel = {
         id,
         label,
@@ -1793,6 +1825,7 @@ export class HideoutLongRangeGallery {
       p.flashTimerSec = 0;
       p.mat.emissive.setHex(0x000000);
       p.mat.emissiveIntensity = 0;
+      this.penetrableSystem?.resetSurface(`lr_${p.id}`);
     }
     this.lrAudio.playTrolleyMotorPulse(0.28);
   }
@@ -1927,7 +1960,18 @@ export class HideoutLongRangeGallery {
       this.paperCtx.stroke();
       this.paperTex.needsUpdate = true;
 
-      this.trolleySwingVel -= 2.4;
+      this.trolleySwingVel += computeTargetHingeAngularImpulse({
+        pivot: this.trolleyPivot,
+        hitPointWorld: ev.point,
+        incomingDir: ev.incomingDir,
+        impactSpeedMs: ev.impactSpeedMs,
+        bulletMassGrams: ev.ammo.bulletMassGrams,
+        pellets: ev.ammo.pellets,
+        outcome: 'penetrate',
+        effectiveInertia: 0.72,
+        minDeltaRadSec: 0.8,
+        maxDeltaRadSec: 5.5,
+      });
 
       const grp = this.computeGroupMetrics();
       const is100m = this.trolleyTargetDistM >= 95;
@@ -1967,7 +2011,19 @@ export class HideoutLongRangeGallery {
     const steel = this.steelById.get(tag.id);
     if (steel) {
       const isHead = tag.zone === 'head';
-      steel.angVel -= steel.kind === 'lr_steel_gong' ? 8.8 : 4.2;
+      steel.angVel += computeTargetHingeAngularImpulse({
+        pivot: steel.pivot,
+        hitPointWorld: ev.point,
+        incomingDir: ev.incomingDir,
+        impactSpeedMs: ev.impactSpeedMs,
+        bulletMassGrams: ev.ammo.bulletMassGrams,
+        pellets: ev.ammo.pellets,
+        outcome: ev.outcome,
+        outgoingDir: ev.outgoingDir,
+        effectiveInertia: steel.kind === 'lr_steel_gong' ? 0.24 : 0.42,
+        minDeltaRadSec: steel.kind === 'lr_steel_gong' ? 3.2 : 2.2,
+        maxDeltaRadSec: 13.5,
+      });
       steel.flashTimerSec = 0.22;
       steel.plateMat.emissive.setHex(isHead ? 0xfef08a : 0xf59e0b);
       steel.plateMat.emissiveIntensity = 1.4;
@@ -2011,8 +2067,6 @@ export class HideoutLongRangeGallery {
     const panel = this.penById.get(tag.id);
     if (panel) {
       panel.hitCount++;
-      panel.angVel -= 3.8;
-      panel.flashTimerSec = 0.2;
       const outcome: LongRangeHitRecord['outcome'] =
         ev.outcome === 'penetrate'
           ? 'penetrate'
@@ -2021,6 +2075,20 @@ export class HideoutLongRangeGallery {
             : panel.kind === 'pen_witness_plate'
               ? 'penetrate'
               : 'stop';
+      panel.angVel += computeTargetHingeAngularImpulse({
+        pivot: panel.pivot,
+        hitPointWorld: ev.point,
+        incomingDir: ev.incomingDir,
+        impactSpeedMs: ev.impactSpeedMs,
+        bulletMassGrams: ev.ammo.bulletMassGrams,
+        pellets: ev.ammo.pellets,
+        outcome: outcome === 'penetrate' ? 'penetrate' : outcome === 'ricochet' ? 'ricochet' : 'stop',
+        outgoingDir: ev.outgoingDir,
+        effectiveInertia: panel.kind === 'pen_wood_panel' ? 0.34 : 0.44,
+        minDeltaRadSec: 1.8,
+        maxDeltaRadSec: 11.5,
+      });
+      panel.flashTimerSec = 0.2;
 
       const flashHex =
         outcome === 'penetrate'
@@ -2335,7 +2403,7 @@ export class HideoutLongRangeGallery {
       0.35,
     );
     this.trolleyGroup.position.z = FIRING_LINE_Z + this.trolleyDistM;
-    this.trolleyGroup.rotation.x = this.trolleySwingRad;
+    this.trolleyPivot.rotation.x = this.trolleySwingRad;
 
     // 2. Update 25m / 50m / 75m / 100m steel pendulum recoil, plate flashes & hit strobe beacons
     for (let i = 0; i < this.steelTargets.length; i++) {
@@ -2363,7 +2431,7 @@ export class HideoutLongRangeGallery {
       const damping = s.kind === 'lr_steel_gong' ? 2.8 : 7.5;
       const acc = -s.angleRad * stiffness - s.angVel * damping;
       s.angVel += acc * clampedDt;
-      s.angleRad = THREE.MathUtils.clamp(s.angleRad + s.angVel * clampedDt, -1.05, 0.75);
+      s.angleRad = THREE.MathUtils.clamp(s.angleRad + s.angVel * clampedDt, -1.05, 1.05);
       s.pivot.rotation.x = s.angleRad;
     }
 
@@ -2379,7 +2447,7 @@ export class HideoutLongRangeGallery {
       }
       const acc = -p.angleRad * 58 - p.angVel * 8.5;
       p.angVel += acc * clampedDt;
-      p.angleRad = THREE.MathUtils.clamp(p.angleRad + p.angVel * clampedDt, -0.4, 0.3);
+      p.angleRad = THREE.MathUtils.clamp(p.angleRad + p.angVel * clampedDt, -0.55, 0.78);
       p.pivot.rotation.x = p.angleRad;
     }
   }

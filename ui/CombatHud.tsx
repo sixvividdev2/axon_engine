@@ -848,7 +848,7 @@ export const CombatHud: React.FC<CombatHudProps> = ({
           {snapshot.isPdaOpen ? (
             <>
               <span className="text-emerald-300">TAC-PDA ACTIVE</span>
-              <span>Mouse Joystick Pan</span>
+              <span>LMB+Drag Pan</span>
               <span>Wheel Zoom</span>
               <span>R / RMB Center</span>
               <span className="text-amber-300">M Stow PDA</span>

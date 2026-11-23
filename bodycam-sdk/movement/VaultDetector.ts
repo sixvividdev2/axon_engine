@@ -62,7 +62,7 @@ export function createVaultCandidate(): VaultCandidate {
 }
 
 // Strict grounded tactical bounds (no wall-jumps, no superhuman leaps)
-const MIN_VAULT_HEIGHT_M = 0.45;
+const MIN_VAULT_HEIGHT_M = 0.40;
 const LOW_VAULT_MAX_HEIGHT_M = 1.15;
 const HIGH_MANTLE_MAX_HEIGHT_M = 2.15;
 const MAX_VAULT_OVER_DEPTH_M = 0.85;
@@ -74,8 +74,8 @@ const PLAYER_RADIUS_M = 0.34;
 const MAX_SAFE_FAR_DROP_M = 3.20;
 const MAX_DUAL_LEG_TRAUMA_HEIGHT_M = 1.50;
 
-// Dense waist/chest coverage ensures thin 0.06m-0.10m horizontal railing bars are reliably detected
-const FORWARD_PROBE_HEIGHTS = [0.42, 0.58, 0.74, 0.88, 0.96, 1.05, 1.18, 1.42, 1.75, 2.05] as const;
+// Dense waist/chest coverage ensures thin 0.06m-0.10m horizontal railing bars and 0.40m crates are reliably detected
+const FORWARD_PROBE_HEIGHTS = [0.36, 0.44, 0.58, 0.74, 0.88, 0.96, 1.05, 1.18, 1.42, 1.75, 2.05] as const;
 // Starts at 0.035m so thin railings/fences (0.06m-0.14m thick) hit their top bar before probing deeper
 const DOWN_PROBE_DEPTHS = [0.035, 0.15, 0.55, 0.95] as const;
 

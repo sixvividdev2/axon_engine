@@ -572,11 +572,11 @@ export class CharacterSkeleton {
 
   private buildArm(side: -1 | 1, upperLen: number, lowerLen: number): ArticulatedArm {
     const clavicle = new THREE.Group();
-    clavicle.position.set(side * 0.055, 0.072, 0.008);
+    clavicle.position.set(side * 0.058, 0.092, 0.014);
     this.chest.add(clavicle);
 
     const shoulderPivot = new THREE.Object3D();
-    shoulderPivot.position.set(side * 0.135, -0.012, -0.015);
+    shoulderPivot.position.set(side * 0.152, 0.002, 0.010);
     clavicle.add(shoulderPivot);
 
     // Upper Arm (extends along local +Y from 0 -> upperLen)

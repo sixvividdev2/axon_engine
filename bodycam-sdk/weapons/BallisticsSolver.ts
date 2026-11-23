@@ -1300,3 +1300,114 @@ export class BallisticsSolver {
     this.sparkInstanced.dispose();
   }
 }
+
+const _hingePivotPos = new THREE.Vector3();
+const _hingePivotQuat = new THREE.Quaternion();
+const _hingeAxisWorld = new THREE.Vector3();
+const _hingeArm = new THREE.Vector3();
+const _hingeImpulse = new THREE.Vector3();
+const _hingeCross = new THREE.Vector3();
+
+/**
+ * Pure 3D torque projection τ = ((hit - pivot) × impulse) · hingeAxis.
+ */
+export function computeHingeTorqueScalar(
+  armX: number,
+  armY: number,
+  armZ: number,
+  impX: number,
+  impY: number,
+  impZ: number,
+  axisX = 1,
+  axisY = 0,
+  axisZ = 0,
+): number {
+  const cx = armY * impZ - armZ * impY;
+  const cy = armZ * impX - armX * impZ;
+  const cz = armX * impY - armY * impX;
+  return cx * axisX + cy * axisY + cz * axisZ;
+}
+
+export interface TargetHingeImpulseParams {
+  pivot: THREE.Object3D;
+  hitPointWorld: Readonly<THREE.Vector3>;
+  incomingDir: Readonly<THREE.Vector3>;
+  impactSpeedMs: number;
+  bulletMassGrams: number;
+  pellets?: number;
+  outcome?: TerminalOutcome;
+  outgoingDir?: Readonly<THREE.Vector3>;
+  effectiveInertia?: number;
+  impulseScale?: number;
+  minDeltaRadSec?: number;
+  maxDeltaRadSec?: number;
+  localHingeAxis?: 'x' | 'y' | 'z';
+}
+
+/**
+ * Computes rigid-body angular velocity impulse Δω (rad/s) around a target's hinge
+ * from true 3D cross-product torque τ = (r × Δp) · axisWorld.
+ * - Bottom-hinged targets (+Y above pivot): downrange impulse (+Z) -> +Δω (tips away).
+ * - Top-hinged gongs (-Y below pivot): downrange impulse (+Z) -> -Δω (bottom kicks away).
+ * - Ricochets: Δp = m(v_in - e·v_out), reacting physically off slanted armor plates.
+ */
+export function computeTargetHingeAngularImpulse(params: TargetHingeImpulseParams): number {
+  params.pivot.updateMatrixWorld(true);
+  params.pivot.getWorldPosition(_hingePivotPos);
+  params.pivot.getWorldQuaternion(_hingePivotQuat);
+
+  const axisMode = params.localHingeAxis ?? 'x';
+  if (axisMode === 'y') {
+    _hingeAxisWorld.set(0, 1, 0);
+  } else if (axisMode === 'z') {
+    _hingeAxisWorld.set(0, 0, 1);
+  } else {
+    _hingeAxisWorld.set(1, 0, 0);
+  }
+  _hingeAxisWorld.applyQuaternion(_hingePivotQuat).normalize();
+
+  _hingeArm.copy(params.hitPointWorld).sub(_hingePivotPos);
+
+  const pellets = Math.max(1, params.pellets ?? 1);
+  const massKg = (Math.max(0.5, params.bulletMassGrams) / pellets) * 0.001;
+  const speedMs = Math.max(1, params.impactSpeedMs);
+
+  _hingeImpulse.copy(params.incomingDir);
+  if (_hingeImpulse.lengthSq() > 1e-6) {
+    _hingeImpulse.normalize();
+  } else {
+    _hingeImpulse.set(0, 0, 1);
+  }
+
+  if (params.outcome === 'ricochet' && params.outgoingDir) {
+    _hingeCross.copy(params.outgoingDir);
+    if (_hingeCross.lengthSq() > 1e-6) {
+      _hingeCross.normalize();
+      // Elastic restitution reflection delta: J = m * v_in * (d_in - 0.68 * d_out)
+      _hingeImpulse.addScaledVector(_hingeCross, -0.68);
+    }
+    _hingeImpulse.multiplyScalar(massKg * speedMs);
+  } else if (params.outcome === 'penetrate') {
+    // Pass-through imparts partial shear momentum
+    _hingeImpulse.multiplyScalar(massKg * speedMs * 0.42);
+  } else {
+    _hingeImpulse.multiplyScalar(massKg * speedMs * 1.15);
+  }
+
+  _hingeCross.crossVectors(_hingeArm, _hingeImpulse);
+  const torqueScalar = _hingeCross.dot(_hingeAxisWorld);
+  const inertia = Math.max(0.04, params.effectiveInertia ?? 0.24);
+  const scale = params.impulseScale ?? 1.0;
+  let deltaOmega = (torqueScalar * scale) / inertia;
+
+  const minMag = params.minDeltaRadSec ?? 0;
+  const maxMag = params.maxDeltaRadSec ?? 16;
+  if (Math.abs(deltaOmega) > 1e-4) {
+    const sign = deltaOmega >= 0 ? 1 : -1;
+    deltaOmega = sign * THREE.MathUtils.clamp(Math.abs(deltaOmega), minMag, maxMag);
+  } else {
+    deltaOmega = 0;
+  }
+  return deltaOmega;
+}
+

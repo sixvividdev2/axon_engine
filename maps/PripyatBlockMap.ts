@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import { BodycamPhysicsWorld, BodycamSurfaceMaterial } from '../bodycam-sdk';
 import { DestructibleDoorSystem } from '../doors/DestructibleDoorSystem';
+import { PenetrableSurfaceSystem } from '../doors/PenetrableSurfaceSystem';
 import { getGraphicsQualityProfile, GraphicsQualityId } from '../data/graphicsQuality';
 import { createStencilSignTexture } from '../gym/GymTextures';
 import {
@@ -244,6 +245,9 @@ function buildPripyatBlock(
 
   const dummy = new THREE.Object3D();
 
+  const penetrableSystem = new PenetrableSurfaceSystem(sceneGroup, { isSoftwareGl });
+  let nextPenSurfaceIdx = 0;
+
   // Solid structural helper (zero overlapping boxes when callers obey seam widths)
   const addSolidBox = (
     x: number,
@@ -273,6 +277,21 @@ function buildPripyatBlock(
       surface,
       blocksMovement: true,
     });
+    if (mat === matTealPlaster && h >= 1.1 && Math.min(w, d) <= 0.36 && Math.max(w, d) >= 0.45) {
+      const faceAxis = w < d ? 'x' : 'z';
+      penetrableSystem.registerSurface({
+        id: `pripyat_drywall_${nextPenSurfaceIdx++}`,
+        mesh,
+        kind: 'drywall',
+        width: faceAxis === 'x' ? d : w,
+        height: h,
+        thickness: faceAxis === 'x' ? w : d,
+        faceAxis,
+        floorY: Math.max(0.08, y - h * 0.5),
+        maxHoles: 6,
+        baseRadiusM: 0.135,
+      });
+    }
     return mesh;
   };
 
@@ -1020,7 +1039,9 @@ function buildPripyatBlock(
       nightLights,
     },
     doorSystem,
-    update: (_dt, elapsedSec) => {
+    penetrableSystem,
+    update: (dt, elapsedSec) => {
+      penetrableSystem.update(dt);
       for (const fl of flickerLights) {
         if (fl.broken) {
           const pulse = Math.sin(elapsedSec * 18.0 + fl.phase) * Math.sin(elapsedSec * 5.2 + fl.phase);
@@ -1031,6 +1052,7 @@ function buildPripyatBlock(
       }
     },
     dispose: () => {
+      penetrableSystem.dispose();
       doorSystem.dispose();
       scene.remove(sceneGroup);
       envTex.dispose();

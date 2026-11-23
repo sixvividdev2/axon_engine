@@ -3,7 +3,9 @@ import {
   BallisticImpactEvent,
   BodycamPhysicsWorld,
   BodycamSurfaceMaterial,
+  computeTargetHingeAngularImpulse,
 } from '../bodycam-sdk';
+import { PenetrableSurfaceSystem } from '../doors/PenetrableSurfaceSystem';
 import { HideoutInteractableMeta } from './HideoutBunkerWorld';
 import { HideoutElectronicsSystem } from './HideoutElectronicsSystem';
 import { HideoutMaterialLibrary } from './HideoutMaterials';
@@ -108,8 +110,8 @@ interface CqbPopupStation {
 
 const COURSE_DURATION_SEC = 30.0;
 const COUNTDOWN_DURATION_SEC = 3.0;
-const POPUP_FOLDED_RAD = -Math.PI * 0.48;
-const POPPER_KNOCKED_RAD = -Math.PI * 0.44;
+const POPUP_FOLDED_RAD = Math.PI * 0.48;
+const POPPER_KNOCKED_RAD = Math.PI * 0.44;
 
 /**
  * Procedural Web Audio range timer & steel-clang cue synthesizer.
@@ -420,6 +422,7 @@ export class HideoutGunRange {
   // Zero-GC scratch
   private readonly _tmpLocalHit = new THREE.Vector3();
   private readonly electronics: HideoutElectronicsSystem;
+  private readonly penetrableSystem?: PenetrableSurfaceSystem;
   private consoleBroken = false;
   private scoreboardBroken = false;
 
@@ -434,10 +437,12 @@ export class HideoutGunRange {
     maxAniso: number,
     initialBestScore = 0,
     callbacks: HideoutGunRangeCallbacks = {},
+    penetrableSystem?: PenetrableSurfaceSystem,
   ) {
     this.physics = physics;
     this.materials = materials;
     this.electronics = electronics;
+    this.penetrableSystem = penetrableSystem;
     this.isSoftwareGl = isSoftwareGl;
     this.maxAniso = maxAniso;
     this.bestScore = Math.max(0, Math.round(initialBestScore));
@@ -569,12 +574,14 @@ export class HideoutGunRange {
         this.materials.darkSteel,
       );
       housing.position.set(lx, 4.44, lz);
+      housing.userData.isRoof = true;
       this.root.add(housing);
       const tube = new THREE.Mesh(
         this.trackGeo(new THREE.BoxGeometry(1.25, 0.04, 0.14)),
         this.materials.warmLampEmissive,
       );
       tube.position.set(lx, 4.395, lz);
+      tube.userData.isRoof = true;
       this.root.add(tube);
 
       this.electronics.registerNode(
@@ -894,6 +901,7 @@ export class HideoutGunRange {
 
     const boardGroup = new THREE.Group();
     boardGroup.position.set(19.2, 3.68, 8.4);
+    boardGroup.userData.isRoof = true;
     this.root.add(boardGroup);
 
     // Suspended industrial steel casing + twin ceiling hanger rods
@@ -1326,9 +1334,24 @@ export class HideoutGunRange {
       [22.0, 0.88, 20.8, 2.1, 1.76, 0.18, 'wood'], // Mid-right barricade
       [19.2, 0.52, 24.4, 2.8, 1.04, 0.2, 'concrete'], // Rear center chest-high wall
     ];
-    for (const [cx, cy, cz, w, h, d, surf] of barricades) {
+    for (let idx = 0; idx < barricades.length; idx++) {
+      const [cx, cy, cz, w, h, d, surf] = barricades[idx];
       const mat = surf === 'wood' ? this.materials.tableWood : this.materials.concreteWall;
-      this.addSolidProp(cx, cy, cz, w, h, d, mat, surf, raycastMeshes, true);
+      const barricadeMesh = this.addSolidProp(cx, cy, cz, w, h, d, mat, surf, raycastMeshes, true);
+      if (surf === 'wood' && this.penetrableSystem) {
+        this.penetrableSystem.registerSurface({
+          id: `hideout_range_barricade_${idx}`,
+          mesh: barricadeMesh,
+          kind: 'range_panel',
+          width: w,
+          height: h,
+          thickness: d,
+          faceAxis: 'z',
+          floorY: 0,
+          maxHoles: 5,
+          hitsToBreach: 1,
+        });
+      }
       // Steel edge trim
       const cap = new THREE.Mesh(
         this.trackGeo(new THREE.BoxGeometry(w + 0.04, 0.05, d + 0.04)),
@@ -1650,7 +1673,20 @@ export class HideoutGunRange {
 
     // === 1. SHOOT-TO-START PADDLE ===
     if (tag.kind === 'course_start_paddle') {
-      this.startPaddleAngVel -= 14.0;
+      const paddleImp = computeTargetHingeAngularImpulse({
+        pivot: this.startPaddlePivot,
+        hitPointWorld: ev.point,
+        incomingDir: ev.incomingDir,
+        impactSpeedMs: ev.impactSpeedMs,
+        bulletMassGrams: ev.ammo.bulletMassGrams,
+        pellets: ev.ammo.pellets,
+        outcome: ev.outcome,
+        outgoingDir: ev.outgoingDir,
+        effectiveInertia: 0.075,
+        minDeltaRadSec: 6.0,
+        maxDeltaRadSec: 15.0,
+      });
+      this.startPaddleAngVel += paddleImp;
       this.rangeAudio.playSteelRing(true);
       if (this.isCourseRunning()) {
         this.abortCourse();
@@ -1693,15 +1729,40 @@ export class HideoutGunRange {
           zone = 'torso';
           pts = 60;
         }
-        // Subtle cardstock flutter kickback
-        free.angVel -= 3.2;
+        // True lever-arm flutter kickback away from bullet impulse
+        free.angVel += computeTargetHingeAngularImpulse({
+          pivot: free.pivot,
+          hitPointWorld: ev.point,
+          incomingDir: ev.incomingDir,
+          impactSpeedMs: ev.impactSpeedMs,
+          bulletMassGrams: ev.ammo.bulletMassGrams,
+          pellets: ev.ammo.pellets,
+          outcome: ev.outcome,
+          outgoingDir: ev.outgoingDir,
+          effectiveInertia: 0.38,
+          impulseScale: 0.52,
+          minDeltaRadSec: 1.4,
+          maxDeltaRadSec: 6.5,
+        });
       } else if (free.kind === 'steel_popper') {
         if (free.knockedDown) return null;
         zone = tag.zone === 'head' ? 'head' : 'a_zone';
         pts = zone === 'head' ? 150 : 100;
         free.knockedDown = true;
         free.resetTimerSec = 2.25;
-        free.angVel = -8.6;
+        free.angVel = computeTargetHingeAngularImpulse({
+          pivot: free.pivot,
+          hitPointWorld: ev.point,
+          incomingDir: ev.incomingDir,
+          impactSpeedMs: ev.impactSpeedMs,
+          bulletMassGrams: ev.ammo.bulletMassGrams,
+          pellets: ev.ammo.pellets,
+          outcome: ev.outcome,
+          outgoingDir: ev.outgoingDir,
+          effectiveInertia: 0.34,
+          minDeltaRadSec: 6.2,
+          maxDeltaRadSec: 14.0,
+        });
         free.flashTimerSec = 0.14;
         free.plateMat.emissive.setHex(0xf59e0b);
         free.plateMat.emissiveIntensity = 1.1;
@@ -1709,7 +1770,19 @@ export class HideoutGunRange {
       } else if (free.kind === 'steel_gong') {
         zone = 'gong';
         pts = 100;
-        free.angVel -= 9.5;
+        free.angVel += computeTargetHingeAngularImpulse({
+          pivot: free.pivot,
+          hitPointWorld: ev.point,
+          incomingDir: ev.incomingDir,
+          impactSpeedMs: ev.impactSpeedMs,
+          bulletMassGrams: ev.ammo.bulletMassGrams,
+          pellets: ev.ammo.pellets,
+          outcome: ev.outcome,
+          outgoingDir: ev.outgoingDir,
+          effectiveInertia: 0.22,
+          minDeltaRadSec: 4.5,
+          maxDeltaRadSec: 14.5,
+        });
         free.flashTimerSec = 0.14;
         free.plateMat.emissive.setHex(0xfef08a);
         free.plateMat.emissiveIntensity = 1.25;
@@ -1733,11 +1806,23 @@ export class HideoutGunRange {
     // === 3. BAY 2 MOTORIZED CQB POP-UP STATIONS ===
     const st = this.cqbById.get(tag.id);
     if (st) {
-      if (!st.raised || st.angleRad < -0.55) return null;
+      if (!st.raised || st.angleRad > 0.55) return null;
 
       if (st.isNoShoot) {
         st.raised = false;
-        st.angVel = -7.5;
+        st.angVel = computeTargetHingeAngularImpulse({
+          pivot: st.pivot,
+          hitPointWorld: ev.point,
+          incomingDir: ev.incomingDir,
+          impactSpeedMs: ev.impactSpeedMs,
+          bulletMassGrams: ev.ammo.bulletMassGrams,
+          pellets: ev.ammo.pellets,
+          outcome: ev.outcome,
+          outgoingDir: ev.outgoingDir,
+          effectiveInertia: 0.42,
+          minDeltaRadSec: 5.5,
+          maxDeltaRadSec: 12.0,
+        });
         st.cooldownSec = 1.8;
         st.statusLedMat.color.setHex(0x374151);
         st.statusLedMat.emissive.setHex(0x111827);
@@ -1771,7 +1856,19 @@ export class HideoutGunRange {
       const totalPts = basePts + streakBonus;
 
       st.raised = false;
-      st.angVel = -9.4;
+      st.angVel = computeTargetHingeAngularImpulse({
+        pivot: st.pivot,
+        hitPointWorld: ev.point,
+        incomingDir: ev.incomingDir,
+        impactSpeedMs: ev.impactSpeedMs,
+        bulletMassGrams: ev.ammo.bulletMassGrams,
+        pellets: ev.ammo.pellets,
+        outcome: ev.outcome,
+        outgoingDir: ev.outgoingDir,
+        effectiveInertia: 0.36,
+        minDeltaRadSec: 6.8,
+        maxDeltaRadSec: 14.0,
+      });
       st.cooldownSec = this.phase === 'active' ? 1.15 : 2.1;
       st.statusLedMat.color.setHex(0x22c55e);
       st.statusLedMat.emissive.setHex(0x15803d);
@@ -1843,13 +1940,13 @@ export class HideoutGunRange {
           t.angleRad = THREE.MathUtils.damp(t.angleRad, POPPER_KNOCKED_RAD, 11.5, clampedDt);
           if (t.resetTimerSec <= 0) {
             t.knockedDown = false;
-            t.angVel = 5.5;
+            t.angVel = -5.5;
             this.rangeAudio.playPopupPneumatic();
           }
         } else {
           const springAcc = -t.angleRad * 46 - t.angVel * 6.8;
           t.angVel += springAcc * clampedDt;
-          t.angleRad = THREE.MathUtils.clamp(t.angleRad + t.angVel * clampedDt, POPPER_KNOCKED_RAD, 0.25);
+          t.angleRad = THREE.MathUtils.clamp(t.angleRad + t.angVel * clampedDt, -0.25, POPPER_KNOCKED_RAD);
         }
         t.pivot.rotation.x = t.angleRad;
       } else {
@@ -1858,7 +1955,7 @@ export class HideoutGunRange {
         const damping = t.kind === 'steel_gong' ? 3.2 : 9.0;
         const acc = -t.angleRad * stiffness - t.angVel * damping;
         t.angVel += acc * clampedDt;
-        t.angleRad = THREE.MathUtils.clamp(t.angleRad + t.angVel * clampedDt, -1.1, 0.85);
+        t.angleRad = THREE.MathUtils.clamp(t.angleRad + t.angVel * clampedDt, -1.05, 1.05);
         t.pivot.rotation.x = t.angleRad;
       }
     }

@@ -952,7 +952,9 @@ export type GameGrenadeEventKind =
   | 'spoon_pop'
   | 'throw'
   | 'live_drop'
-  | 'in_hand_detonate';
+  | 'in_hand_detonate'
+  | 'belt_cookoff'
+  | 'belt_dud';
 
 export interface GameGrenadeEventPacket {
   type: 'game:grenade_event';
