@@ -6,7 +6,7 @@ import {
   normalizeWeaponAttachments,
   WeaponAttachments,
 } from '../data/attachments';
-import { VIEWMODEL_LAYER } from './BodycamPostProcess';
+import { IR_LAYER, VIEWMODEL_LAYER } from './BodycamPostProcess';
 import { IBodycamAudioSource } from './IBodycamAudioSource';
 import {
   BodycamRaycastResult,
@@ -80,6 +80,8 @@ export class WeaponRig {
   public readonly weaponAnimator: WeaponAnimator;
   public laserOn = false;
   public laserMode: 'visible_red' | 'ir_green' = 'visible_red';
+  private nvgOpticalActive = false;
+  private irLaserActive = false;
 
   private currentProfile: BodycamWeaponProfile = SDK_WEAPON_PROFILES.unarmed;
   private currentAttachments: WeaponAttachments = {};
@@ -707,12 +709,62 @@ export class WeaponRig {
 
   public setLaserMode(mode: 'visible_red' | 'ir_green'): void {
     this.laserMode = mode;
-    if (mode === 'ir_green') {
+    this.syncLaserAppearance();
+  }
+
+  public setNvgOpticalActive(active: boolean): void {
+    if (this.nvgOpticalActive === active) return;
+    this.nvgOpticalActive = active;
+    this.syncLaserAppearance();
+  }
+
+  public setIrLaserActive(active: boolean): void {
+    if (this.irLaserActive === active) return;
+    this.irLaserActive = active;
+    this.syncLaserAppearance();
+  }
+
+  /**
+   * Under active NVGs, magnified scopes and occluded iron sights cannot be cheek-welded
+   * behind helmet tubes, so ADS realistically transitions to canted IR point-aim unless
+   * an unmagnified NVG-compatible reflex optic is mounted.
+   */
+  public shouldForceNodsCantedAim(nvgActive: boolean): boolean {
+    if (!nvgActive) return false;
+    const isFirearm =
+      this.currentProfile.holdClass === 'pistol' ||
+      this.currentProfile.holdClass === 'rifle' ||
+      this.currentProfile.holdClass === 'shotgun';
+    if (!isFirearm) return false;
+    if (this.derivedStats.isMagnifiedOptic) return true;
+    const hasUnmagnifiedOptic = Boolean(this.currentAttachments.optic) && !this.derivedStats.isMagnifiedOptic;
+    return !hasUnmagnifiedOptic;
+  }
+
+  private syncLaserAppearance(): void {
+    const useIrSpectrum = this.nvgOpticalActive && (this.irLaserActive || this.laserOn);
+    if (useIrSpectrum) {
+      // Invisible to naked eye (IR_LAYER = 2), crisp bright emitter through NVG intensifier tubes
+      this.laserBeamMesh.layers.set(IR_LAYER);
+      this.laserDotMesh.layers.set(IR_LAYER);
+      this.laserBeamMat.color.setHex(0xd8ffe6);
+      this.laserBeamMat.opacity = 0.62;
+      this.laserDotMat.color.setHex(0xffffff);
+      this.laserDotMat.opacity = 1.0;
+      return;
+    }
+    this.laserBeamMesh.layers.set(0);
+    this.laserDotMesh.layers.set(0);
+    if (this.laserMode === 'ir_green') {
       this.laserBeamMat.color.setHex(0x45ff6b);
+      this.laserBeamMat.opacity = 0.42;
       this.laserDotMat.color.setHex(0x78ff96);
+      this.laserDotMat.opacity = 0.95;
     } else {
       this.laserBeamMat.color.setHex(0xff2222);
+      this.laserBeamMat.opacity = 0.42;
       this.laserDotMat.color.setHex(0xff4444);
+      this.laserDotMat.opacity = 0.95;
     }
   }
 
@@ -948,10 +1000,16 @@ export class WeaponRig {
    * originates cleanly from the final locked PEQ emitter and terminates on world surfaces.
    */
   public updateLaserBeam(adapter: IBodycamWorldAdapter): void {
+    const isFirearm =
+      this.currentProfile.holdClass === 'pistol' ||
+      this.currentProfile.holdClass === 'rifle' ||
+      this.currentProfile.holdClass === 'shotgun';
+    const visibleLaserAllowed =
+      this.laserOn && this.currentProfile.supportsLaser && this.derivedStats.hasLaser;
+    const irLaserAllowed =
+      this.nvgOpticalActive && this.irLaserActive && isFirearm;
     const active =
-      this.laserOn &&
-      this.currentProfile.supportsLaser &&
-      this.derivedStats.hasLaser &&
+      (visibleLaserAllowed || irLaserAllowed) &&
       this.modelGroup.visible &&
       !this.lastIsSprinting &&
       this.vaultRetentionBlend < 0.25 &&

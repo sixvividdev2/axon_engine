@@ -1,5 +1,15 @@
 import * as THREE from 'three';
 import { BodycamPhysicsWorld } from '../bodycam-sdk';
+import {
+  applyWindFoliageShader,
+  assignHeightSwayAttribute,
+  WindShaderUniforms,
+} from '../engine/world/WindFoliageShader';
+import {
+  createFernFrondTexture,
+  createGrassClumpTexture,
+  createShrubBranchTexture,
+} from './MapTextures';
 
 export type TrackGeoFn = <T extends THREE.BufferGeometry>(g: T) => T;
 export type TrackMatFn = <T extends THREE.Material>(m: T) => T;
@@ -11,6 +21,8 @@ export interface PropFactoryContext {
   isSoftwareGl: boolean;
   trackGeo: TrackGeoFn;
   trackMat: TrackMatFn;
+  windUniforms?: WindShaderUniforms | null;
+  maxAniso?: number;
 }
 
 export interface VehicleMaterials {
@@ -589,17 +601,24 @@ export function buildInstancedBirchTrees(
   addTrunkColliders = false,
 ): void {
   if (spots.length === 0) return;
-  const { sceneGroup, physics, raycastMeshes, isSoftwareGl, trackGeo, trackMat } = ctx;
+  const { sceneGroup, physics, raycastMeshes, isSoftwareGl, trackGeo, trackMat, windUniforms } = ctx;
 
   const matBirchBark = trackMat(new THREE.MeshStandardMaterial({ color: 0xc9c6bc, roughness: 0.9, metalness: 0.02 }));
   const matFoliage = trackMat(new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.86, metalness: 0.02 }));
+  if (windUniforms) {
+    applyWindFoliageShader(matBirchBark, windUniforms, { swayScale: 0.09, isTrunk: true });
+    applyWindFoliageShader(matFoliage, windUniforms, { swayScale: 0.22 });
+  }
 
-  const trunkGeo = trackGeo(new THREE.CylinderGeometry(0.09, 0.17, 4.6, 7));
+  const trunkGeo = trackGeo(new THREE.CylinderGeometry(0.09, 0.17, 4.6, 7, 3));
   trunkGeo.translate(0, 2.3, 0);
+  assignHeightSwayAttribute(trunkGeo, 0, 4.6, 2.0);
   const crown1Geo = trackGeo(new THREE.DodecahedronGeometry(1.55, 1));
   crown1Geo.translate(0, 5.1, 0);
+  assignHeightSwayAttribute(crown1Geo, 1.2, 6.8, 1.5);
   const crown2Geo = trackGeo(new THREE.DodecahedronGeometry(1.18, 1));
   crown2Geo.translate(0.55, 6.25, -0.35);
+  assignHeightSwayAttribute(crown2Geo, 1.2, 7.6, 1.5);
 
   const trunkInst = new THREE.InstancedMesh(trunkGeo, matBirchBark, spots.length);
   const crown1Inst = new THREE.InstancedMesh(crown1Geo, matFoliage, spots.length);
@@ -646,43 +665,211 @@ export function buildInstancedBirchTrees(
   raycastMeshes.push(trunkInst);
 }
 
-/** Instanced crossed grass / weed tufts for overgrown asphalt cracks and forest undergrowth */
+/** Builds a merged multi-card botanical geometry tilted & bowed naturally */
+function createRosetteCardGeometry(
+  trackGeo: TrackGeoFn,
+  cardCount: number,
+  width: number,
+  height: number,
+  tiltRad: number,
+  archPower: number,
+): THREE.BufferGeometry {
+  const planes: THREE.BufferGeometry[] = [];
+  for (let c = 0; c < cardCount; c++) {
+    const p = new THREE.PlaneGeometry(width, height, 1, 4);
+    p.translate(0, height * 0.5, 0);
+    const pos = p.getAttribute('position');
+    for (let v = 0; v < pos.count; v++) {
+      const y = pos.getY(v);
+      const t = Math.max(0, Math.min(1, y / height));
+      // Subtle outward arch along Z so blades drape gracefully
+      pos.setZ(v, Math.pow(t, archPower) * height * 0.28);
+      if (tiltRad !== 0) {
+        const yRot = y * Math.cos(tiltRad) - pos.getZ(v) * Math.sin(tiltRad);
+        const zRot = y * Math.sin(tiltRad) + pos.getZ(v) * Math.cos(tiltRad);
+        pos.setY(v, yRot);
+        pos.setZ(v, zRot);
+      }
+    }
+    p.rotateY((c / cardCount) * Math.PI);
+    p.computeVertexNormals();
+    planes.push(p);
+  }
+
+  // Merge cards cleanly into a single non-indexed BufferGeometry
+  let totalVerts = 0;
+  const nonIndexed = planes.map((p) => {
+    const g = p.toNonIndexed();
+    p.dispose();
+    totalVerts += g.getAttribute('position').count;
+    return g;
+  });
+
+  const mergedPos = new Float32Array(totalVerts * 3);
+  const mergedNorm = new Float32Array(totalVerts * 3);
+  const mergedUv = new Float32Array(totalVerts * 2);
+  const mergedSway = new Float32Array(totalVerts);
+
+  let offset3 = 0;
+  let offset2 = 0;
+  let offset1 = 0;
+  for (const g of nonIndexed) {
+    const pos = g.getAttribute('position');
+    const norm = g.getAttribute('normal');
+    const uv = g.getAttribute('uv');
+    for (let i = 0; i < pos.count; i++) {
+      const y = pos.getY(i);
+      const x = pos.getX(i);
+      const z = pos.getZ(i);
+      mergedPos[offset3] = x;
+      mergedPos[offset3 + 1] = y;
+      mergedPos[offset3 + 2] = z;
+      mergedNorm[offset3] = norm.getX(i);
+      mergedNorm[offset3 + 1] = norm.getY(i);
+      mergedNorm[offset3 + 2] = norm.getZ(i);
+      mergedUv[offset2] = uv.getX(i);
+      mergedUv[offset2 + 1] = uv.getY(i);
+      const t = Math.max(0, Math.min(1, y / Math.max(0.05, height)));
+      mergedSway[offset1] = Math.pow(t, 1.55);
+      offset3 += 3;
+      offset2 += 2;
+      offset1 += 1;
+    }
+    g.dispose();
+  }
+
+  const out = new THREE.BufferGeometry();
+  out.setAttribute('position', new THREE.BufferAttribute(mergedPos, 3));
+  out.setAttribute('normal', new THREE.BufferAttribute(mergedNorm, 3));
+  out.setAttribute('uv', new THREE.BufferAttribute(mergedUv, 2));
+  out.setAttribute('aSway', new THREE.BufferAttribute(mergedSway, 1));
+  out.computeBoundingSphere();
+  return trackGeo(out);
+}
+
+/** Instanced curved botanical meadow grass blade clusters with wind-coupled GPU sway */
 export function buildInstancedGrassTufts(
   ctx: PropFactoryContext,
   spots: Array<{ x: number; y: number; z: number; scale: number; yaw: number; tint: THREE.Color }>,
 ): void {
   if (spots.length === 0) return;
-  const { sceneGroup, trackGeo, trackMat } = ctx;
+  const { sceneGroup, trackGeo, trackMat, windUniforms, maxAniso } = ctx;
 
+  const tex = createGrassClumpTexture(maxAniso ?? 4);
   const matGrass = trackMat(
     new THREE.MeshStandardMaterial({
       color: 0xffffff,
-      roughness: 0.92,
+      map: tex,
+      alphaTest: 0.36,
+      roughness: 0.88,
       metalness: 0.01,
       side: THREE.DoubleSide,
     }),
   );
+  if (windUniforms) {
+    applyWindFoliageShader(matGrass, windUniforms, { swayScale: 0.38 });
+  }
 
-  // Two crossed vertical diamond blades merged cleanly into one InstancedMesh draw call
-  const bladeGeo = trackGeo(new THREE.ConeGeometry(0.18, 0.56, 3));
-  bladeGeo.translate(0, 0.28, 0);
-
-  const inst = new THREE.InstancedMesh(bladeGeo, matGrass, spots.length * 2);
+  const clumpGeo = createRosetteCardGeometry(trackGeo, 3, 0.72, 0.56, 0.08, 1.85);
+  const inst = new THREE.InstancedMesh(clumpGeo, matGrass, spots.length);
   const dummy = new THREE.Object3D();
-  let idx = 0;
-  for (const s of spots) {
-    for (let k = 0; k < 2; k++) {
-      dummy.position.set(s.x + (k === 0 ? -0.07 : 0.07), s.y, s.z + (k === 0 ? 0.05 : -0.05));
-      dummy.rotation.set(k === 0 ? 0.14 : -0.12, s.yaw + k * 1.1, k === 0 ? -0.1 : 0.12);
-      dummy.scale.set(s.scale, s.scale * (0.85 + k * 0.25), s.scale);
-      dummy.updateMatrix();
-      inst.setMatrixAt(idx, dummy.matrix);
-      inst.setColorAt(idx, k === 0 ? s.tint : s.tint.clone().offsetHSL(0.02, 0, -0.03));
-      idx++;
-    }
+  for (let i = 0; i < spots.length; i++) {
+    const s = spots[i];
+    dummy.position.set(s.x, s.y - 0.02, s.z);
+    dummy.rotation.set(0, s.yaw, 0);
+    dummy.scale.set(s.scale, s.scale * (0.85 + (i % 4) * 0.11), s.scale);
+    dummy.updateMatrix();
+    inst.setMatrixAt(i, dummy.matrix);
+    inst.setColorAt(i, s.tint);
   }
   inst.instanceMatrix.needsUpdate = true;
   if (inst.instanceColor) inst.instanceColor.needsUpdate = true;
   inst.computeBoundingSphere();
+  inst.userData.surfaceMaterial = 'grass';
   sceneGroup.add(inst);
 }
+
+/** Instanced forest fern rosettes with arched pinnate fronds & wind-coupled GPU sway */
+export function buildInstancedFerns(
+  ctx: PropFactoryContext,
+  spots: Array<{ x: number; y: number; z: number; scale: number; yaw: number; tint: THREE.Color }>,
+): void {
+  if (spots.length === 0) return;
+  const { sceneGroup, trackGeo, trackMat, windUniforms, maxAniso } = ctx;
+
+  const tex = createFernFrondTexture(maxAniso ?? 4);
+  const matFern = trackMat(
+    new THREE.MeshStandardMaterial({
+      color: 0xffffff,
+      map: tex,
+      alphaTest: 0.36,
+      roughness: 0.82,
+      metalness: 0.02,
+      side: THREE.DoubleSide,
+    }),
+  );
+  if (windUniforms) {
+    applyWindFoliageShader(matFern, windUniforms, { swayScale: 0.28 });
+  }
+
+  const fernGeo = createRosetteCardGeometry(trackGeo, 4, 0.92, 0.76, 0.56, 1.45);
+  const inst = new THREE.InstancedMesh(fernGeo, matFern, spots.length);
+  const dummy = new THREE.Object3D();
+  for (let i = 0; i < spots.length; i++) {
+    const s = spots[i];
+    dummy.position.set(s.x, s.y - 0.03, s.z);
+    dummy.rotation.set(0, s.yaw, 0);
+    dummy.scale.set(s.scale, s.scale * (0.9 + (i % 3) * 0.09), s.scale);
+    dummy.updateMatrix();
+    inst.setMatrixAt(i, dummy.matrix);
+    inst.setColorAt(i, s.tint);
+  }
+  inst.instanceMatrix.needsUpdate = true;
+  if (inst.instanceColor) inst.instanceColor.needsUpdate = true;
+  inst.computeBoundingSphere();
+  inst.userData.surfaceMaterial = 'grass';
+  sceneGroup.add(inst);
+}
+
+/** Instanced woody leafy undergrowth shrubs with wind-coupled GPU sway */
+export function buildInstancedUndergrowthShrubs(
+  ctx: PropFactoryContext,
+  spots: Array<{ x: number; y: number; z: number; scale: number; yaw: number; tint: THREE.Color }>,
+): void {
+  if (spots.length === 0) return;
+  const { sceneGroup, trackGeo, trackMat, windUniforms, maxAniso } = ctx;
+
+  const tex = createShrubBranchTexture(maxAniso ?? 4);
+  const matShrub = trackMat(
+    new THREE.MeshStandardMaterial({
+      color: 0xffffff,
+      map: tex,
+      alphaTest: 0.36,
+      roughness: 0.86,
+      metalness: 0.02,
+      side: THREE.DoubleSide,
+    }),
+  );
+  if (windUniforms) {
+    applyWindFoliageShader(matShrub, windUniforms, { swayScale: 0.24 });
+  }
+
+  const shrubGeo = createRosetteCardGeometry(trackGeo, 3, 1.28, 1.12, 0.16, 1.6);
+  const inst = new THREE.InstancedMesh(shrubGeo, matShrub, spots.length);
+  const dummy = new THREE.Object3D();
+  for (let i = 0; i < spots.length; i++) {
+    const s = spots[i];
+    dummy.position.set(s.x, s.y - 0.04, s.z);
+    dummy.rotation.set(0, s.yaw, 0);
+    dummy.scale.set(s.scale, s.scale * (0.88 + (i % 3) * 0.14), s.scale);
+    dummy.updateMatrix();
+    inst.setMatrixAt(i, dummy.matrix);
+    inst.setColorAt(i, s.tint);
+  }
+  inst.instanceMatrix.needsUpdate = true;
+  if (inst.instanceColor) inst.instanceColor.needsUpdate = true;
+  inst.computeBoundingSphere();
+  inst.userData.surfaceMaterial = 'grass';
+  sceneGroup.add(inst);
+}
+

@@ -46,8 +46,20 @@ export class BodycamAudio implements IBodycamAudioSource {
 
   private windGain: GainNode | null = null;
   private windSource: AudioBufferSourceNode | null = null;
+  private windBandpass: BiquadFilterNode | null = null;
+  private windLowpass: BiquadFilterNode | null = null;
+  private rainGain: GainNode | null = null;
+  private rainSource: AudioBufferSourceNode | null = null;
+  private rainHighpass: BiquadFilterNode | null = null;
+  private rainLowpass: BiquadFilterNode | null = null;
+  private currentWindTargetGain = 0.032;
+  private currentRainTargetGain = 0.0;
   private currentIndoor = false;
   private currentInteriorMaterial: 'concrete' | 'wood' | 'metal' | 'outdoor' = 'outdoor';
+  private windDuckUntilSec = 0;
+  private lastWindAudioPushSec = -1;
+  private nvgHumOsc: OscillatorNode | null = null;
+  private nvgHumGain: GainNode | null = null;
 
   private noiseBuffer: AudioBuffer | null = null;
   private clipDrive = 4.5;
@@ -203,23 +215,23 @@ export class BodycamAudio implements IBodycamAudioSource {
 
     const bp = ctx.createBiquadFilter();
     bp.type = 'bandpass';
-    bp.frequency.value = 320;
-    bp.Q.value = 1.65;
+    bp.frequency.value = 260;
+    bp.Q.value = 1.5;
 
     const lp = ctx.createBiquadFilter();
     lp.type = 'lowpass';
-    lp.frequency.value = 680;
+    lp.frequency.value = 540;
 
     const lfo = ctx.createOscillator();
-    lfo.frequency.value = 0.13;
+    lfo.frequency.value = 0.14;
     const lfoGain = ctx.createGain();
-    lfoGain.gain.value = 135;
+    lfoGain.gain.value = 115;
     lfo.connect(lfoGain);
     lfoGain.connect(bp.frequency);
     lfo.start();
 
     const windGain = ctx.createGain();
-    windGain.gain.value = 0.0836; // Reduced 12% from 0.095
+    windGain.gain.value = this.currentWindTargetGain;
 
     src.connect(bp);
     bp.connect(lp);
@@ -229,6 +241,35 @@ export class BodycamAudio implements IBodycamAudioSource {
 
     this.windGain = windGain;
     this.windSource = src;
+    this.windBandpass = bp;
+    this.windLowpass = lp;
+
+    // Rain sheet patter ambient loop (muted until rainIntensity > 0)
+    const rSrc = ctx.createBufferSource();
+    rSrc.buffer = this.noiseBuffer;
+    rSrc.loop = true;
+
+    const rHp = ctx.createBiquadFilter();
+    rHp.type = 'highpass';
+    rHp.frequency.value = 950;
+
+    const rLp = ctx.createBiquadFilter();
+    rLp.type = 'lowpass';
+    rLp.frequency.value = 4600;
+
+    const rGain = ctx.createGain();
+    rGain.gain.value = 0;
+
+    rSrc.connect(rHp);
+    rHp.connect(rLp);
+    rLp.connect(rGain);
+    rGain.connect(this.dryBus);
+    rSrc.start(0, 0.7);
+
+    this.rainSource = rSrc;
+    this.rainHighpass = rHp;
+    this.rainLowpass = rLp;
+    this.rainGain = rGain;
   }
 
   public setSettings(clipDrive: number, masterVolume: number, gearRattleGain = 0.75): void {
@@ -292,7 +333,8 @@ export class BodycamAudio implements IBodycamAudioSource {
     this.currentInteriorMaterial = material;
     if (!this.ctx) return;
     const t = this.ctx.currentTime;
-    const targetWind = isIndoor ? 0.01584 : 0.0836;
+    const targetWind = isIndoor ? this.currentWindTargetGain * 0.18 : this.currentWindTargetGain;
+    const targetRain = isIndoor ? this.currentRainTargetGain * 0.24 : this.currentRainTargetGain;
     const targetOutWet = isIndoor ? 0.05 : 0.34;
     const targetIntWet = isIndoor
       ? material === 'concrete'
@@ -302,19 +344,262 @@ export class BodycamAudio implements IBodycamAudioSource {
           : 0.34
       : 0.0;
 
-    this.windGain?.gain.setTargetAtTime(targetWind, t, 0.14);
+    if (t >= this.windDuckUntilSec) {
+      this.windGain?.gain.setTargetAtTime(targetWind, t, 0.14);
+    }
+    this.rainGain?.gain.setTargetAtTime(targetRain, t, 0.14);
+    if (this.rainLowpass) {
+      this.rainLowpass.frequency.setTargetAtTime(
+        isIndoor ? (material === 'metal' ? 2100 : 1250) : 4600,
+        t,
+        0.14,
+      );
+    }
     this.wetBus?.gain.setTargetAtTime(targetOutWet, t, 0.12);
     this.interiorWetBus?.gain.setTargetAtTime(targetIntWet, t, 0.12);
+  }
+
+  public setWindWeather(windSpeedMps: number, gust01: number, rainIntensity: number): void {
+    // Wind scales smoothly from near-silent calm (0.008) to rushing gale (0.145)
+    const speedNorm = THREE.MathUtils.clamp((windSpeedMps - 1.0) / 21.0, 0, 1);
+    const windGain = 0.008 + speedNorm * 0.088 + THREE.MathUtils.clamp(gust01, 0, 1) * 0.048 * (0.35 + speedNorm * 0.65);
+    const rainGain = THREE.MathUtils.clamp(rainIntensity, 0, 1) * 0.082;
+    this.currentWindTargetGain = windGain;
+    this.currentRainTargetGain = rainGain;
+    if (!this.ctx) return;
+
+    const t = this.ctx.currentTime;
+    // Throttle continuous weather audio automation to ~12 Hz to prevent Web Audio automation queue jitter
+    if (this.lastWindAudioPushSec >= 0 && t - this.lastWindAudioPushSec < 0.08) return;
+    this.lastWindAudioPushSec = t;
+
+    const effectiveWind = this.currentIndoor ? windGain * 0.18 : windGain;
+    const effectiveRain = this.currentIndoor ? rainGain * 0.24 : rainGain;
+    // Do not interrupt an active gunshot wind-duck envelope
+    if (t >= this.windDuckUntilSec) {
+      this.windGain?.gain.setTargetAtTime(effectiveWind, t, 0.18);
+    }
+    if (this.windBandpass) {
+      this.windBandpass.frequency.setTargetAtTime(210 + speedNorm * 240 + gust01 * 120, t, 0.22);
+    }
+    if (this.windLowpass) {
+      this.windLowpass.frequency.setTargetAtTime(420 + speedNorm * 580 + gust01 * 210, t, 0.22);
+    }
+    this.rainGain?.gain.setTargetAtTime(effectiveRain, t, 0.22);
+  }
+
+  public playThunder(intensity = 0.85): void {
+    if (!this.ctx || !this.noiseBuffer || !this.dryBus) return;
+    const ctx = this.ctx;
+    const t = ctx.currentTime;
+    const amp = THREE.MathUtils.clamp(intensity, 0.3, 1.2) * (this.currentIndoor ? 0.58 : 1.0);
+
+    const src = ctx.createBufferSource();
+    src.buffer = this.noiseBuffer;
+
+    const lp = ctx.createBiquadFilter();
+    lp.type = 'lowpass';
+    lp.frequency.setValueAtTime(520, t);
+    lp.frequency.exponentialRampToValueAtTime(68, t + 2.4);
+
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.001, t);
+    g.gain.linearRampToValueAtTime(0.48 * amp, t + 0.06);
+    g.gain.exponentialRampToValueAtTime(0.14 * amp, t + 0.75);
+    g.gain.exponentialRampToValueAtTime(0.001, t + 2.5);
+
+    src.connect(lp);
+    lp.connect(g);
+    this.connectToOutputBuses(g, true);
+    src.start(t, Math.random() * 0.4, 2.55);
+  }
+
+  public playPdaPowerSound(turningOn: boolean): void {
+    if (!this.ctx || !this.dryBus) return;
+    const ctx = this.ctx;
+    const t = ctx.currentTime;
+
+    // Tactile dome switch press click
+    const click = ctx.createOscillator();
+    click.type = 'triangle';
+    click.frequency.setValueAtTime(turningOn ? 1850 : 1420, t);
+    click.frequency.exponentialRampToValueAtTime(460, t + 0.018);
+    const cg = ctx.createGain();
+    cg.gain.setValueAtTime(0.14, t);
+    cg.gain.exponentialRampToValueAtTime(0.001, t + 0.022);
+    click.connect(cg);
+    cg.connect(this.dryBus);
+    click.start(t);
+    click.stop(t + 0.025);
+
+    // Subtle OLED boot/shutdown chirp
+    const chime = ctx.createOscillator();
+    chime.type = 'sine';
+    const startFreq = turningOn ? 640 : 880;
+    const endFreq = turningOn ? 980 : 420;
+    chime.frequency.setValueAtTime(startFreq, t + 0.04);
+    chime.frequency.exponentialRampToValueAtTime(endFreq, t + 0.14);
+    const gg = ctx.createGain();
+    gg.gain.setValueAtTime(0.001, t + 0.04);
+    gg.gain.linearRampToValueAtTime(0.045, t + 0.055);
+    gg.gain.exponentialRampToValueAtTime(0.001, t + 0.16);
+    chime.connect(gg);
+    gg.connect(this.dryBus);
+    chime.start(t + 0.04);
+    chime.stop(t + 0.17);
+  }
+
+  public playPdaButtonClick(): void {
+    if (!this.ctx || !this.dryBus) return;
+    const ctx = this.ctx;
+    const t = ctx.currentTime;
+    const osc = ctx.createOscillator();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(2200, t);
+    osc.frequency.exponentialRampToValueAtTime(780, t + 0.014);
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.045, t);
+    g.gain.exponentialRampToValueAtTime(0.001, t + 0.016);
+    osc.connect(g);
+    g.connect(this.dryBus);
+    osc.start(t);
+    osc.stop(t + 0.02);
+  }
+
+  public playRadioChirp(kind: 'open' | 'ack' = 'open'): void {
+    if (!this.ctx || !this.noiseBuffer || !this.dryBus) return;
+    const ctx = this.ctx;
+    const t = ctx.currentTime;
+
+    // VHF squelch burst
+    const nSrc = ctx.createBufferSource();
+    nSrc.buffer = this.noiseBuffer;
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.value = 1750;
+    bp.Q.value = 3.1;
+    const ng = ctx.createGain();
+    ng.gain.setValueAtTime(0.001, t);
+    ng.gain.linearRampToValueAtTime(0.075, t + 0.008);
+    ng.gain.exponentialRampToValueAtTime(0.001, t + 0.065);
+    nSrc.connect(bp);
+    bp.connect(ng);
+    ng.connect(this.dryBus);
+    nSrc.start(t, Math.random() * 0.8, 0.075);
+
+    // Dual telemetry beep
+    const osc = ctx.createOscillator();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(kind === 'ack' ? 1480 : 1240, t);
+    if (kind === 'ack') {
+      osc.frequency.setValueAtTime(1760, t + 0.045);
+    }
+    const og = ctx.createGain();
+    og.gain.setValueAtTime(0.045, t);
+    og.gain.exponentialRampToValueAtTime(0.001, t + 0.09);
+    osc.connect(og);
+    og.connect(this.dryBus);
+    osc.start(t);
+    osc.stop(t + 0.095);
+  }
+
+  public playNvgFlipSound(flipDown: boolean): void {
+    if (!this.ctx || !this.dryBus) return;
+    const ctx = this.ctx;
+    const t = ctx.currentTime;
+
+    // Wilcox shroud mechanical detent clack
+    const clack = ctx.createOscillator();
+    clack.type = 'triangle';
+    clack.frequency.setValueAtTime(flipDown ? 940 : 1180, t + 0.04);
+    clack.frequency.exponentialRampToValueAtTime(180, t + 0.09);
+    const cg = ctx.createGain();
+    cg.gain.setValueAtTime(0.16, t + 0.04);
+    cg.gain.exponentialRampToValueAtTime(0.001, t + 0.1);
+    clack.connect(cg);
+    cg.connect(this.dryBus);
+    clack.start(t + 0.04);
+    clack.stop(t + 0.11);
+
+    // High-voltage image intensifier tube startup whine when flipped down
+    if (flipDown) {
+      const whine = ctx.createOscillator();
+      whine.type = 'sine';
+      whine.frequency.setValueAtTime(4200, t + 0.12);
+      whine.frequency.exponentialRampToValueAtTime(7400, t + 0.42);
+      const wg = ctx.createGain();
+      wg.gain.setValueAtTime(0.0005, t + 0.12);
+      wg.gain.linearRampToValueAtTime(0.018, t + 0.22);
+      wg.gain.exponentialRampToValueAtTime(0.0008, t + 0.58);
+      whine.connect(wg);
+      wg.connect(this.dryBus);
+      whine.start(t + 0.12);
+      whine.stop(t + 0.6);
+    }
+  }
+
+  public playIrIlluminatorClick(turningOn: boolean): void {
+    this.ensureInitialized();
+    if (!this.ctx || !this.dryBus) return;
+    const ctx = this.ctx;
+    const t = ctx.currentTime;
+    const osc = ctx.createOscillator();
+    osc.type = 'triangle';
+    osc.frequency.setValueAtTime(turningOn ? 2350 : 1780, t);
+    osc.frequency.exponentialRampToValueAtTime(turningOn ? 880 : 620, t + 0.016);
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.085, t);
+    g.gain.exponentialRampToValueAtTime(0.001, t + 0.02);
+    osc.connect(g);
+    g.connect(this.dryBus);
+    osc.start(t);
+    osc.stop(t + 0.024);
+  }
+
+  public setNvgTubeHum(active: boolean): void {
+    if (!this.ctx || !this.dryBus) return;
+    const ctx = this.ctx;
+    const t = ctx.currentTime;
+    if (active) {
+      if (!this.nvgHumOsc || !this.nvgHumGain) {
+        const osc = ctx.createOscillator();
+        osc.type = 'sine';
+        osc.frequency.value = 5850;
+        const g = ctx.createGain();
+        g.gain.setValueAtTime(0.0001, t);
+        osc.connect(g);
+        g.connect(this.dryBus);
+        osc.start(t);
+        this.nvgHumOsc = osc;
+        this.nvgHumGain = g;
+      }
+      this.nvgHumGain.gain.setTargetAtTime(0.0032, t, 0.14);
+    } else if (this.nvgHumGain) {
+      this.nvgHumGain.gain.setTargetAtTime(0.00001, t, 0.08);
+    }
   }
 
   private duckAmbientWind(durationSec = 0.85, targetGain = 0.0105): void {
     if (!this.ctx || !this.windGain) return;
     const t = this.ctx.currentTime;
-    const restoreGain = this.currentIndoor ? 0.01584 : 0.0836;
-    this.windGain.gain.cancelScheduledValues(t);
-    this.windGain.gain.setValueAtTime(this.windGain.gain.value, t);
-    this.windGain.gain.linearRampToValueAtTime(Math.min(targetGain, restoreGain), t + 0.015);
-    this.windGain.gain.exponentialRampToValueAtTime(restoreGain, t + durationSec);
+    const restoreGain = Math.max(
+      0.0012,
+      this.currentIndoor ? this.currentWindTargetGain * 0.18 : this.currentWindTargetGain,
+    );
+    const duckTarget = Math.max(0.001, Math.min(targetGain, restoreGain * 0.65));
+    // Skip ducking when wind is already quieter than or equal to target (e.g. calm/indoor)
+    if (restoreGain <= 0.0025 || duckTarget >= restoreGain * 0.92) return;
+
+    const param = this.windGain.gain as AudioParam & { cancelAndHoldAtTime?: (time: number) => AudioParam };
+    if (typeof param.cancelAndHoldAtTime === 'function') {
+      param.cancelAndHoldAtTime(t);
+    } else {
+      param.cancelScheduledValues(t);
+      param.setValueAtTime(Math.max(0.001, param.value), t);
+    }
+    param.linearRampToValueAtTime(duckTarget, t + 0.015);
+    param.exponentialRampToValueAtTime(restoreGain, t + durationSec);
+    this.windDuckUntilSec = t + durationSec + 0.04;
   }
 
   private connectToOutputBuses(node: AudioNode, sendOutdoorWet = false): void {
@@ -2103,6 +2388,72 @@ export class BodycamAudio implements IBodycamAudioSource {
     osc.stop(t + 0.09);
   }
 
+  private lastSquadRadioChirpMs = 0;
+
+  /**
+   * Synthesizes an authentic VHF/UHF tactical squad radio squelch burst:
+   * PTT key-up click + brief band-limited static carrier + distinct category roger-beep release.
+   */
+  public playSquadRadioChirp(category: 'threat' | 'economy' | 'status' | 'ack'): void {
+    const nowMs = performance.now();
+    if (nowMs - this.lastSquadRadioChirpMs < 550) return;
+    this.lastSquadRadioChirpMs = nowMs;
+
+    this.ensureInitialized();
+    if (!this.ctx || !this.noiseBuffer || !this.dryBus) return;
+    const ctx = this.ctx;
+    const t = ctx.currentTime;
+
+    // 1. Key-up VHF squelch static burst (band-limited 950..2400 Hz)
+    const src = ctx.createBufferSource();
+    src.buffer = this.noiseBuffer;
+    src.loop = true;
+
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.setValueAtTime(category === 'threat' ? 1750 : 1420, t);
+    bp.Q.setValueAtTime(2.6, t);
+
+    const staticGain = ctx.createGain();
+    staticGain.gain.setValueAtTime(0.0005, t);
+    staticGain.gain.linearRampToValueAtTime(0.055, t + 0.012);
+    staticGain.gain.exponentialRampToValueAtTime(0.014, t + 0.042);
+    staticGain.gain.linearRampToValueAtTime(0.012, t + 0.14);
+    staticGain.gain.linearRampToValueAtTime(0.042, t + 0.155);
+    staticGain.gain.exponentialRampToValueAtTime(0.0005, t + 0.195);
+
+    src.connect(bp);
+    bp.connect(staticGain);
+    staticGain.connect(this.dryBus);
+    src.start(t, Math.random() * 0.4);
+    src.stop(t + 0.21);
+
+    // 2. Category-distinct tactical roger-beep / PTT tail
+    const tones =
+      category === 'threat'
+        ? [1340, 1620]
+        : category === 'economy'
+          ? [880, 1180]
+          : category === 'ack'
+            ? [1060, 1060]
+            : [980];
+
+    for (let i = 0; i < tones.length; i++) {
+      const start = t + 0.145 + i * 0.048;
+      const osc = ctx.createOscillator();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(tones[i], start);
+      const og = ctx.createGain();
+      og.gain.setValueAtTime(0.0008, start);
+      og.gain.linearRampToValueAtTime(0.052, start + 0.005);
+      og.gain.exponentialRampToValueAtTime(0.0006, start + 0.042);
+      osc.connect(og);
+      og.connect(this.dryBus);
+      osc.start(start);
+      osc.stop(start + 0.046);
+    }
+  }
+
   /**
    * Horror-mix 3D HRTF spatialized zombie vocalization with proximity-escalated intensity:
    *  - Distant (> 16m): hollow reverberant corridor moans with air-absorption rolloff
@@ -2525,6 +2876,18 @@ export class BodycamAudio implements IBodycamAudioSource {
     } catch {
       // already stopped
     }
+    try {
+      this.rainSource?.stop();
+    } catch {
+      // already stopped
+    }
+    try {
+      this.nvgHumOsc?.stop();
+    } catch {
+      // already stopped
+    }
+    this.nvgHumOsc = null;
+    this.nvgHumGain = null;
     if (this.ctx) {
       void this.ctx.close();
       this.ctx = null;

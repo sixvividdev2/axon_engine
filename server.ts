@@ -19,6 +19,8 @@ import {
   LobbyTeamId,
   LobbyVisibility,
   sanitizeSpecialEventConfig,
+  sanitizeTimeOfDayStart,
+  sanitizeWeatherPreset,
   SpecialEventRecord,
 } from './data/multiplayer';
 import {
@@ -1414,6 +1416,12 @@ async function startServer() {
       : req.body?.killfeedPolicy === 'force_on' || req.body?.killfeedPolicy === 'force_off'
         ? req.body.killfeedPolicy
         : 'player_choice';
+    const weatherPreset = sanitizeWeatherPreset(
+      specialEvent ? specialEvent.config.weatherPreset : req.body?.weatherPreset,
+    );
+    const timeOfDayStart = sanitizeTimeOfDayStart(
+      specialEvent ? specialEvent.config.timeOfDayStart : req.body?.timeOfDayStart,
+    );
 
     let code = generateLobbyCode();
     while (activeLobbyRooms.has(code)) {
@@ -1436,6 +1444,8 @@ async function startServer() {
         killLimit,
         botDifficulty,
         killfeedPolicy,
+        weatherPreset,
+        timeOfDayStart,
         status: 'lobby',
         matchSequence: 0,
         specialEvent,
@@ -1867,6 +1877,12 @@ async function startServer() {
               ) {
                 st.killfeedPolicy = patch.killfeedPolicy;
               }
+              if (patch.weatherPreset !== undefined) {
+                st.weatherPreset = sanitizeWeatherPreset(patch.weatherPreset);
+              }
+              if (patch.timeOfDayStart !== undefined) {
+                st.timeOfDayStart = sanitizeTimeOfDayStart(patch.timeOfDayStart);
+              }
               if (st.specialEvent) {
                 st.specialEvent = {
                   ...st.specialEvent,
@@ -1881,6 +1897,8 @@ async function startServer() {
                     killLimit: st.killLimit,
                     botDifficulty: st.botDifficulty,
                     killfeedPolicy: st.killfeedPolicy,
+                    weatherPreset: st.weatherPreset,
+                    timeOfDayStart: st.timeOfDayStart,
                   }),
                 };
               }
@@ -2081,7 +2099,7 @@ async function startServer() {
   if (IS_PROD) {
     const distDir = path.resolve(process.cwd(), 'dist');
     app.use(express.static(distDir));
-    app.get('*', (_req, res) => {
+    app.use((_req, res) => {
       res.sendFile(path.join(distDir, 'index.html'));
     });
   } else {

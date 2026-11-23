@@ -9,6 +9,8 @@ import {
 
 /** Dedicated Three.js render layer for first-person weapon & arm meshes (depth-cleared pass) */
 export const VIEWMODEL_LAYER = 1;
+/** Dedicated Three.js render layer for infrared-only illuminators & IR aiming lasers (visible ONLY through active NVGs) */
+export const IR_LAYER = 2;
 
 const LuminanceDownsampleShader = {
   uniforms: {
@@ -51,6 +53,7 @@ const GlareExtractShader = {
     tHdr: { value: null as THREE.Texture | null },
     uExposure: { value: 1.0 },
     uTexel: { value: new THREE.Vector2(1 / 256, 1 / 144) },
+    uNvgGlareBoost: { value: 0.0 },
   },
   vertexShader: /* glsl */ `
     varying vec2 vUv;
@@ -63,14 +66,17 @@ const GlareExtractShader = {
     uniform sampler2D tHdr;
     uniform float uExposure;
     uniform vec2 uTexel;
+    uniform float uNvgGlareBoost;
     varying vec2 vUv;
 
     vec3 extractBright(vec2 uv) {
       vec3 c = texture2D(tHdr, clamp(uv, 0.002, 0.998)).rgb * uExposure;
       float luma = dot(c, vec3(0.2126, 0.7152, 0.0722));
-      // Soft knee above HDR 1.15 so normal midtones contribute zero glare
-      float knee = smoothstep(1.05, 2.85, luma);
-      return c * knee;
+      // Lower bright-pass knee under active NVGs so streetlights, muzzle flashes & flashlights create optical halos
+      float kneeLow = mix(1.05, 0.24, uNvgGlareBoost);
+      float kneeHigh = mix(2.85, 1.25, uNvgGlareBoost);
+      float knee = smoothstep(kneeLow, kneeHigh, luma);
+      return c * knee * (1.0 + uNvgGlareBoost * 1.35);
     }
 
     void main() {
@@ -143,6 +149,11 @@ const BodycamOpticalShader = {
     tFlashBurnIn: { value: null as THREE.Texture | null },
     uFlashOverload: { value: 0.0 },
     uFlashBurnIn: { value: 0.0 },
+    uNvgBlend: { value: 0.0 },
+    uNvgMode: { value: 0.0 },
+    uNvgGate: { value: 1.0 },
+    uNvgIrActive: { value: 0.0 },
+    uAspect: { value: 1.7778 },
   },
   vertexShader: /* glsl */ `
     varying vec2 vUv;
@@ -174,6 +185,11 @@ const BodycamOpticalShader = {
     uniform sampler2D tFlashBurnIn;
     uniform float uFlashOverload;
     uniform float uFlashBurnIn;
+    uniform float uNvgBlend;
+    uniform float uNvgMode;
+    uniform float uNvgGate;
+    uniform float uNvgIrActive;
+    uniform float uAspect;
     varying vec2 vUv;
 
     float rand(vec2 co) {
@@ -313,6 +329,110 @@ const BodycamOpticalShader = {
         col = mix(col, cmosTint, smoothstep(0.0, 0.85, overload));
       }
 
+      // Physically Authentic Image-Intensifier Night Vision Optics Pass
+      // Simulates ambient light amplification, true-darkness scintillation noise,
+      // optical halos/bloom, ABC auto-gating, phosphor grading (P43 green vs P45 white),
+      // peripheral near-focus softness, and physical tube FOV masks (PVS-7 vs ARNVG).
+      if (uNvgBlend > 0.005) {
+        bool isArnvg = uNvgMode >= 1.5;
+
+        // Aspect-corrected screen coordinate with subtle vertical drop-in animation as tubes hinge down
+        float hingeDrop = (1.0 - uNvgBlend) * 0.24;
+        vec2 p = vec2((vUv.x - 0.5) * uAspect, (vUv.y - 0.5) - hingeDrop);
+
+        float tubeDist;
+        float tubeRadius;
+        if (isArnvg) {
+          // AB Nightvision RNVG-A (ARNVG): Dual articulating MIL40 binocular figure-8 FOV mask
+          float dL = length(p - vec2(-0.175, 0.0));
+          float dR = length(p - vec2( 0.175, 0.0));
+          tubeDist = min(dL, dR);
+          tubeRadius = 0.405;
+        } else {
+          // AGM PVS-7 NL2 / NL1: Single bi-ocular ~40 deg circular tube mask
+          tubeDist = length(p);
+          tubeRadius = 0.435;
+        }
+
+        float normR = tubeDist / max(0.001, tubeRadius);
+        // Hard matte rubber eyecup bezel + slight dark peripheral silhouette outside tube
+        float apertureMask = 1.0 - smoothstep(0.92, 1.02, normR);
+        float bezelRing = smoothstep(0.84, 0.96, normR) * (1.0 - smoothstep(0.96, 1.04, normR));
+
+        // Subtle fixed-focus peripheral lens softness near the outer edge of the objective tube
+        vec3 nvgHdr = hdrColor;
+        float edgeSoft = smoothstep(0.55, 0.98, normR);
+        if (edgeSoft > 0.02) {
+          vec2 softOff = vec2(0.0022, 0.0018) * edgeSoft;
+          vec3 s0 = texture2D(tHdr, clamp(uv + softOff, 0.001, 0.999)).rgb;
+          vec3 s1 = texture2D(tHdr, clamp(uv - softOff, 0.001, 0.999)).rgb;
+          nvgHdr = mix(nvgHdr, (nvgHdr + s0 + s1) / 3.0, edgeSoft * 0.55);
+        }
+
+        // True linear ambient photon luminance (before normal bodycam exposure)
+        float rawLuma = dot(nvgHdr, vec3(0.24, 0.66, 0.10));
+
+        // Optical halo & bright-source blooming from quarter-res glare buffer
+        vec3 nvgGlare = texture2D(tGlare, uv).rgb;
+        float glareLuma = dot(nvgGlare, vec3(0.28, 0.62, 0.10));
+
+        // Image-intensifier tube gain & Auto-Brightness Control (ABC) gating
+        float tubeGain = isArnvg ? 19.0 : 14.0;
+        float gatedSignal = rawLuma * tubeGain * uNvgGate;
+        // Soft analog tube highlight compression (prevents flat solid clipping while allowing bright bloom)
+        float ampLuma = gatedSignal / (1.0 + gatedSignal * (isArnvg ? 0.68 : 0.78));
+
+        // Add optical halo bloom around streetlights, muzzle flashes, flashlights & IR beams
+        float haloGain = isArnvg ? 0.92 : 1.18;
+        ampLuma = clamp(ampLuma + glareLuma * haloGain * (0.45 + 0.55 * uNvgGate), 0.0, 1.45);
+
+        // True darkness vs ambient light: in pitch black without IR, signal stays near-zero
+        // and image-intensifier scintillation (electronic shot noise) dominates
+        float darknessWeight = 1.0 - smoothstep(0.002, 0.055, rawLuma);
+        float fineSeed = fract(uTime * 57.3);
+        float n1 = rand(floor(uv * vec2(740.0, 420.0)) + fineSeed) - 0.5;
+        float n2 = rand(uv * vec2(1480.0, 840.0) + fract(uTime * 91.7)) - 0.5;
+        float scintNoise = n1 * 0.65 + n2 * 0.35;
+        float baseScintAmp = isArnvg ? 0.065 : 0.115;
+        float scintAmp = baseScintAmp * (0.42 + darknessWeight * 1.85);
+
+        // Subtle bright micro-sparkle scintillation specks in extreme darkness
+        float speckRoll = rand(floor(uv * vec2(520.0, 295.0)) + fract(uTime * 31.1));
+        float speck = step(isArnvg ? 0.9965 : 0.9935, speckRoll) * darknessWeight * (isArnvg ? 0.18 : 0.28);
+
+        // Slight contrast curve: MIL40 P45 white phosphor has crisper midtone separation
+        float finalSignal = clamp(ampLuma + scintNoise * scintAmp + speck, 0.0, 1.35);
+        finalSignal = isArnvg
+          ? pow(max(finalSignal, 0.0), 0.86) * 1.06
+          : pow(max(finalSignal, 0.0), 0.92) * 1.02;
+
+        // Objective edge falloff inside tube aperture
+        float tubeVignette = 1.0 - smoothstep(0.32, 0.96, normR) * (isArnvg ? 0.32 : 0.42);
+        finalSignal *= tubeVignette;
+
+        // Phosphor color grading:
+        //  - PVS-7 Gen 2+ P43 Green Phosphor (muted tactical green -> mint-white hot blooms)
+        //  - ARNVG MIL40 P45 White Phosphor (cool desaturated cyan-white -> crisp white highlights)
+        vec3 phosphorLow = isArnvg ? vec3(0.014, 0.036, 0.048) : vec3(0.010, 0.045, 0.015);
+        vec3 phosphorMid = isArnvg ? vec3(0.62, 0.88, 0.98) : vec3(0.16, 0.92, 0.34);
+        vec3 phosphorHot = isArnvg ? vec3(0.94, 0.99, 1.0) : vec3(0.76, 1.0, 0.82);
+
+        vec3 nvgCol = mix(phosphorLow, phosphorMid, smoothstep(0.0, 0.72, finalSignal));
+        nvgCol = mix(nvgCol, phosphorHot, smoothstep(0.72, 1.25, finalSignal));
+
+        // Faint IR illuminator status glint on outer bottom edge of housing if active
+        vec3 outsideCol = col * 0.045;
+        vec3 tubeFramed = mix(outsideCol, nvgCol, apertureMask);
+        tubeFramed *= 1.0 - bezelRing * 0.88;
+
+        // Retain flashbang whiteout overload through NVG tubes (overwhelms intensifier!)
+        if (uFlashOverload > 0.01) {
+          tubeFramed = mix(tubeFramed, phosphorHot * 1.2, smoothstep(0.0, 0.7, uFlashOverload) * apertureMask);
+        }
+
+        col = mix(col, tubeFramed, clamp(uNvgBlend, 0.0, 1.0));
+      }
+
       gl_FragColor = vec4(clamp(col, 0.0, 1.0), 1.0);
     }
   `,
@@ -443,6 +563,15 @@ export class BodycamPostProcess {
   private flashOverloadPeak = 0;
   private flashHoldTimer = 0;
 
+  // Physically authentic Night Vision Goggle (NVG) optics state
+  private nvgMode: 0 | 1 | 2 = 0; // 0 = off, 1 = AGM PVS-7 (P43), 2 = RNVG-A ARNVG (P45)
+  private nvgTargetBlend = 0;
+  private nvgBlend = 0;
+  private nvgGate = 1.0; // Auto-Brightness Control (ABC) gating multiplier
+  private nvgFlashSpike = 0;
+  private nvgIrActive = false;
+  private nvgAspect = 16 / 9;
+
   private readonly _sizeVec = new THREE.Vector2();
 
   constructor(
@@ -462,6 +591,7 @@ export class BodycamPostProcess {
     renderer.getDrawingBufferSize(this._sizeVec);
     const w = Math.max(1, this._sizeVec.x);
     const h = Math.max(1, this._sizeVec.y);
+    this.nvgAspect = w / Math.max(1, h);
 
     this.hdrTarget = new THREE.WebGLRenderTarget(w, h, {
       type: THREE.HalfFloatType,
@@ -581,6 +711,37 @@ export class BodycamPostProcess {
       Math.max(72, Math.floor(ph / 2)),
     );
     this.glareExtractMaterial.uniforms.uTexel.value.set(1 / gw, 1 / gh);
+    this.nvgAspect = pw / Math.max(1, ph);
+  }
+
+  public setNvgState(
+    mode: 'none' | 'pvs7' | 'arnvg',
+    flippedDown: boolean,
+    irActive = false,
+  ): void {
+    const resolvedMode: 0 | 1 | 2 = mode === 'arnvg' ? 2 : mode === 'pvs7' ? 1 : 0;
+    if (resolvedMode === 0) {
+      this.nvgTargetBlend = 0;
+      this.nvgIrActive = false;
+      return;
+    }
+    this.nvgMode = resolvedMode;
+    this.nvgTargetBlend = flippedDown ? 1 : 0;
+    this.nvgIrActive = flippedDown && irActive;
+  }
+
+  /** Triggers an instantaneous ABC auto-gating dip on muzzle flash, explosion, or bright glare. */
+  public triggerNvgFlashSpike(amount: number): void {
+    if (this.nvgBlend < 0.05 && this.nvgTargetBlend < 0.5) return;
+    this.nvgFlashSpike = Math.min(1.0, Math.max(this.nvgFlashSpike, THREE.MathUtils.clamp(amount, 0, 1)));
+  }
+
+  public getNvgBlend(): number {
+    return this.nvgBlend;
+  }
+
+  public isNvgActive(): boolean {
+    return this.nvgBlend > 0.08 || this.nvgTargetBlend > 0.5;
   }
 
   public getAverageLuminance(): number {
@@ -672,6 +833,28 @@ export class BodycamPostProcess {
     u.uFlashOverload.value = this.flashOverloadIntensity;
     u.uFlashBurnIn.value = this.flashBurnInStrength;
 
+    // Step NVG flip-down blend & Auto-Brightness Control (ABC) auto-gating
+    const nvgSpeed = this.nvgTargetBlend > this.nvgBlend ? 12.0 : 15.0;
+    this.nvgBlend = THREE.MathUtils.damp(this.nvgBlend, this.nvgTargetBlend, nvgSpeed, clampedDelta);
+    if (this.nvgBlend < 0.002 && this.nvgTargetBlend === 0) {
+      this.nvgBlend = 0;
+    }
+    if (this.nvgFlashSpike > 0) {
+      this.nvgFlashSpike = Math.max(0, this.nvgFlashSpike - clampedDelta * 3.8);
+    }
+
+    // Real ABC rapidly dims bright scenes (daylight / flashlights / muzzle flash) to protect the tube
+    const effectiveSceneBright = Math.max(0.001, this.avgLuminance + this.nvgFlashSpike * 0.65);
+    const targetGate = THREE.MathUtils.clamp(0.11 / Math.max(0.055, effectiveSceneBright), 0.14, 1.0);
+    const gateRate = targetGate < this.nvgGate ? 18.0 : 3.2; // fast clamp-down, slower recovery
+    this.nvgGate = THREE.MathUtils.damp(this.nvgGate, targetGate, gateRate, clampedDelta);
+
+    u.uNvgBlend.value = this.nvgBlend;
+    u.uNvgMode.value = this.nvgMode;
+    u.uNvgGate.value = this.nvgGate;
+    u.uNvgIrActive.value = this.nvgIrActive ? 1.0 : 0.0;
+    u.uAspect.value = this.nvgAspect;
+
     if (trauma) {
       u.uInjury.value = THREE.MathUtils.clamp(trauma.arterialVignette, 0, 0.72);
       u.uBleeding.value = trauma.anyHeavyBleed ? 1.0 : trauma.anyLightBleed ? 0.55 : 0.0;
@@ -715,6 +898,10 @@ export class BodycamPostProcess {
     this.renderer.clear(true, true, true);
 
     this.camera.layers.set(0);
+    if (this.nvgBlend > 0.02) {
+      // Enable IR_LAYER ONLY while NVGs are active so IR floodlights & IR lasers are invisible to naked eye
+      this.camera.layers.enable(IR_LAYER);
+    }
     this.renderer.render(this.scene, this.camera);
 
     this.renderer.clearDepth();
@@ -747,11 +934,13 @@ export class BodycamPostProcess {
       }
     }
 
-    // 3. Quarter-res bright-pass glare + separable blur for Lens Dirt / Smudge Flare
+    // 3. Quarter-res bright-pass glare + separable blur for Lens Dirt / Smudge Flare & NVG Optical Halos
     const dirtActive = (this.opticalMaterial.uniforms.uLensDirtStrength.value as number) > 0.005;
-    if (dirtActive) {
+    const nvgGlareActive = this.nvgBlend > 0.02;
+    if (dirtActive || nvgGlareActive) {
       this.glareExtractMaterial.uniforms.tHdr.value = this.hdrTarget.texture;
       this.glareExtractMaterial.uniforms.uExposure.value = this.currentExposure;
+      this.glareExtractMaterial.uniforms.uNvgGlareBoost.value = this.nvgBlend;
       this.quadMesh.material = this.glareExtractMaterial;
       this.renderer.setRenderTarget(this.glareTargetA);
       this.renderer.render(this.quadScene, this.quadCamera);

@@ -11,6 +11,7 @@ import {
   TwoBoneIKResult,
 } from './IKSolver';
 import { SecondaryPhysicsRigApplier } from './physics/SecondaryPhysicsRigApplier';
+import { TacticalPdaDevice } from './TacticalPdaDevice';
 import {
   BodycamMeleeAttackType,
   BodycamMeleeHitEvent,
@@ -99,7 +100,9 @@ export class CharacterAnimator {
   private lastWeaponId = '';
   private equipBlendTimer = 0;
   private leftActionReturnTimer = 0;
+  private rightPdaReturnTimer = 0;
   private wasLeftOverridden = false;
+  private wasPdaActive = false;
 
   private prevStridePhase = 0;
   private stepSign = 1;
@@ -246,6 +249,14 @@ export class CharacterAnimator {
   private readonly _zoomRingQuatWorld = new THREE.Quaternion();
   private readonly _zoomRingPosRoot = new THREE.Vector3();
   private readonly _zoomRingQuatRoot = new THREE.Quaternion();
+  private readonly _pdaLPosRoot = new THREE.Vector3();
+  private readonly _pdaRPosRoot = new THREE.Vector3();
+  private readonly _pdaLQuatRoot = new THREE.Quaternion();
+  private readonly _pdaRQuatRoot = new THREE.Quaternion();
+  private readonly _pdaPoleL = new THREE.Vector3();
+  private readonly _pdaPoleR = new THREE.Vector3();
+
+  private pdaDevice: TacticalPdaDevice | null = null;
 
   // Post-animation soft-tissue & gear secondary physics
   private readonly secondaryApplier: SecondaryPhysicsRigApplier;
@@ -266,6 +277,10 @@ export class CharacterAnimator {
     this.weaponRig = weaponRig;
     this.audio = audio;
     this.secondaryApplier = new SecondaryPhysicsRigApplier(skeleton);
+  }
+
+  public setPdaDevice(pda: TacticalPdaDevice | null): void {
+    this.pdaDevice = pda;
   }
 
   public setSecondaryRagdollDecay(active: boolean): void {
@@ -686,7 +701,8 @@ export class CharacterAnimator {
       vaultState.handPinWeightL < 0.05
         ? Math.max(rigState.adsBlend, rigState.cantBlend, rigState.pointAimBlend)
         : 0;
-    const reachClampWeight = 1 - aimLockWeight;
+    const pdaStowW = this.pdaDevice ? this.pdaDevice.getWeaponStowBlend() : 0;
+    const reachClampWeight = (1 - aimLockWeight) * (1 - pdaStowW);
 
     if (reachClampWeight > 0.001) {
       for (let iter = 0; iter < 2; iter++) {
@@ -1456,12 +1472,19 @@ export class CharacterAnimator {
       this._actionRotOffset.z += Math.sin(elapsed * 23.1) * rotScale * 0.8;
     }
 
+    const pdaStowW = this.pdaDevice ? this.pdaDevice.getWeaponStowBlend() : 0;
+    if (pdaStowW > 0.001) {
+      this._actionPosOffset.y -= 0.28 * pdaStowW;
+      this._actionPosOffset.z += 0.14 * pdaStowW;
+      this._actionRotOffset.x -= 0.45 * pdaStowW;
+    }
+
     this.weaponRig.applyCharacterActionPose(
       this._actionPosOffset,
       this._actionRotOffset,
       0,
       0,
-      false,
+      this.pdaDevice?.isWeaponHidden() ?? false,
     );
   }
 
@@ -1697,13 +1720,54 @@ export class CharacterAnimator {
       rightGripCurl = THREE.MathUtils.lerp(rightGripCurl, 0.16, vaultPinR);
     }
 
-    if (this.equipBlendTimer > 0 || vaultPinR > 0.001 || boltHandW > 0.001) {
+    const pdaStowW = this.pdaDevice ? this.pdaDevice.getWeaponStowBlend() : 0;
+    const pdaIkW = smoothstep(0.08, 0.85, pdaStowW);
+    const pdaActiveHold =
+      this.pdaDevice !== null && pdaIkW > 0.02 && vaultPinR < 0.15 && vaultPinL < 0.15;
+
+    if (pdaActiveHold) {
+      this.pdaDevice!.getRightGripWorldTransform(this._pdaRPosRoot, this._pdaRQuatRoot);
+      this.skeleton.root.worldToLocal(this._pdaRPosRoot);
+      this._pdaRQuatRoot.premultiply(this._rootWorldQuatInv);
+
+      // Subtle wrist shift upward when pressing top-right power button
+      const pressW = this.pdaDevice!.getPowerPressWeight();
+      if (pressW > 0.005) {
+        this._pdaRPosRoot.y += pressW * 0.014;
+        this._pdaRPosRoot.z += pressW * 0.006;
+      }
+
+      if (isUnarmed) {
+        this._rDesiredQuatRoot.copy(this._pdaRQuatRoot);
+      } else {
+        this._rDesiredQuatRoot.slerp(this._pdaRQuatRoot, pdaIkW);
+      }
+      this._rDesiredRoot.lerp(this._pdaRPosRoot, pdaIkW);
+      rightGripCurl = THREE.MathUtils.lerp(rightGripCurl, 0.45, pdaIkW);
+    }
+
+    if (this.wasPdaActive && !pdaActiveHold) {
+      this.rightPdaReturnTimer = 0.14;
+    }
+    this.wasPdaActive = pdaActiveHold;
+    if (this.rightPdaReturnTimer > 0) {
+      this.rightPdaReturnTimer = Math.max(0, this.rightPdaReturnTimer - dt);
+    }
+
+    const usePdaRightQuat = pdaActiveHold && pdaIkW > 0.35;
+    if (
+      this.equipBlendTimer > 0 ||
+      vaultPinR > 0.001 ||
+      boltHandW > 0.001 ||
+      pdaActiveHold ||
+      this.rightPdaReturnTimer > 0
+    ) {
       this.rightHandBlender.blendTo(
         this._rDesiredRoot,
-        isUnarmed ? this.rightHandBlender.quaternion : this._rDesiredQuatRoot,
+        isUnarmed && !usePdaRightQuat ? this.rightHandBlender.quaternion : this._rDesiredQuatRoot,
         rightGripCurl,
         1,
-        vaultPinR > 0.001 ? 36 : boltHandW > 0.001 ? 34 : 32,
+        vaultPinR > 0.001 ? 36 : pdaActiveHold || this.rightPdaReturnTimer > 0 ? 32 : boltHandW > 0.001 ? 34 : 32,
         dt,
       );
     } else {
@@ -1754,6 +1818,12 @@ export class CharacterAnimator {
         .add(this._shoulderR);
       this._poleL.set(-0.35, -0.55, 0.28).applyEuler(this._aimPoleEuler).add(this._shoulderL);
     }
+    if (pdaActiveHold) {
+      this._pdaPoleR.set(this._shoulderR.x + 0.30, this._shoulderR.y - 0.50, this._shoulderR.z + 0.16);
+      this._pdaPoleL.set(this._shoulderL.x - 0.30, this._shoulderL.y - 0.50, this._shoulderL.z + 0.16);
+      this._poleR.lerp(this._pdaPoleR, pdaIkW);
+      this._poleL.lerp(this._pdaPoleL, pdaIkW);
+    }
     if (vaultPinR > 0.05) {
       this._poleR.set(this._shoulderR.x + 0.42, this._shoulderR.y - 0.36, this._shoulderR.z + 0.22);
     }
@@ -1768,7 +1838,7 @@ export class CharacterAnimator {
     this.skeleton.root.updateMatrixWorld(true);
     solveTwoBoneIK(this._shoulderR, this._rTargetRoot, this._poleR, armR.upperLen, armR.lowerLen, this.rightArmIK);
     orientLimbAlongYInRootSpace(armR.upperArm, this.skeleton.root, this._shoulderR, this.rightArmIK.midPos, this._poleR);
-    if (isUnarmed) {
+    if (isUnarmed && !usePdaRightQuat) {
       this.computeUnarmedForearmAlignedHandQuat(1, this.rightArmIK.dir2, rightPronation, this._handAlignedQuat);
       if (vaultPinR > 0.001) {
         this._handAlignedQuat.slerp(this._vaultHandQuatRoot, vaultPinR);
@@ -1795,16 +1865,27 @@ export class CharacterAnimator {
     // Strict trigger discipline: right index finger straight off the trigger during Inspect, Reload, Mag-Check, and Bolt Cycling
     const triggerEngaged =
       !isUnarmed &&
+      !pdaActiveHold &&
       vaultPinR < 0.05 &&
       boltHandW < 0.05 &&
       weaponAction === 'NONE' &&
       (controller.isAds || controller.isCanted || controller.isPointAim || rigState.recoilZ > 0.004);
-    this.skeleton.applyHandPose(
-      'right',
-      vaultPinR > 0.2 || isUnarmed ? 'unarmed' : spec.holdClass,
-      triggerEngaged,
-      this.rightHandBlender.gripCurl,
-    );
+    if (pdaActiveHold && pdaIkW > 0.55) {
+      const joy = this.pdaDevice!.getJoystickTilt();
+      this.skeleton.applyPdaHandPose(
+        'right',
+        this.pdaDevice!.getPowerPressWeight(),
+        joy.x,
+        joy.y,
+      );
+    } else {
+      this.skeleton.applyHandPose(
+        'right',
+        vaultPinR > 0.2 || isUnarmed ? 'unarmed' : spec.holdClass,
+        triggerEngaged,
+        this.rightHandBlender.gripCurl,
+      );
+    }
 
     // 2. Post-IK Rigid Hard-Lock: align weaponRig.root to solved right hand in hip-fire/action,
     //    while preserving rigid camera-to-sightAnchor alignment during ADS / Canted / Point Aim on both Q and E leans.
@@ -1816,7 +1897,7 @@ export class CharacterAnimator {
       vaultPinL < 0.05
         ? Math.max(rigState.adsBlend, rigState.cantBlend, rigState.pointAimBlend)
         : 0;
-    const hardLockW = 1 - aimLockWeightPost;
+    const hardLockW = (1 - aimLockWeightPost) * (1 - smoothstep(0.02, 0.25, pdaIkW));
 
     if (!isUnarmed && vaultPinR < 0.12 && boltHandW < 0.02 && hardLockW > 0.001) {
       armR.hand.root.getWorldPosition(this._solvedHandRWorldPos);
@@ -2067,6 +2148,20 @@ export class CharacterAnimator {
       }
     }
 
+    if (pdaActiveHold) {
+      leftOverridden = true;
+      this.pdaDevice!.getLeftGripWorldTransform(this._pdaLPosRoot, this._pdaLQuatRoot);
+      this.skeleton.root.worldToLocal(this._pdaLPosRoot);
+      this._pdaLQuatRoot.premultiply(this._rootWorldQuatInv);
+      this._lDesiredRoot.lerp(this._pdaLPosRoot, pdaIkW);
+      if (isUnarmed) {
+        this._lDesiredQuatRoot.copy(this._pdaLQuatRoot);
+      } else {
+        this._lDesiredQuatRoot.slerp(this._pdaLQuatRoot, pdaIkW);
+      }
+      leftGripCurl = THREE.MathUtils.lerp(leftGripCurl, 0.45, pdaIkW);
+    }
+
     if (this.wasLeftOverridden && !leftOverridden) {
       this.leftActionReturnTimer = 0.14;
     }
@@ -2075,13 +2170,14 @@ export class CharacterAnimator {
       this.leftActionReturnTimer = Math.max(0, this.leftActionReturnTimer - dt);
     }
 
+    const usePdaLeftQuat = pdaActiveHold && pdaIkW > 0.35;
     if (leftOverridden || this.equipBlendTimer > 0 || this.leftActionReturnTimer > 0) {
       this.leftHandBlender.blendTo(
         this._lDesiredRoot,
-        isUnarmed ? this.leftHandBlender.quaternion : this._lDesiredQuatRoot,
+        isUnarmed && !usePdaLeftQuat ? this.leftHandBlender.quaternion : this._lDesiredQuatRoot,
         leftGripCurl,
         1,
-        vaultPinL > 0.001 ? 38 : leftOverridden ? 28 : 34,
+        vaultPinL > 0.001 ? 38 : pdaActiveHold ? 32 : leftOverridden ? 28 : 34,
         dt,
       );
     } else {
@@ -2099,7 +2195,7 @@ export class CharacterAnimator {
     // 4. Solve Left Arm 2-Bone IK + Forearm-Aligned Zero-Hyperextension Wrist Orientation
     solveTwoBoneIK(this._shoulderL, this._lTargetRoot, this._poleL, armL.upperLen, armL.lowerLen, this.leftArmIK);
     orientLimbAlongYInRootSpace(armL.upperArm, this.skeleton.root, this._shoulderL, this.leftArmIK.midPos, this._poleL);
-    if (isUnarmed) {
+    if (isUnarmed && !usePdaLeftQuat) {
       this.computeUnarmedForearmAlignedHandQuat(-1, this.leftArmIK.dir2, leftPronation, this._handAlignedQuat);
       if (vaultPinL > 0.001) {
         this._handAlignedQuat.slerp(this._vaultHandQuatRoot, vaultPinL);
@@ -2132,13 +2228,17 @@ export class CharacterAnimator {
       leftOverridden || vaultPinL > 0.2 || isUnarmed
         ? 'none'
         : (this.weaponRig.getModelAssembly()?.foregripPose ?? 'none');
-    this.skeleton.applyHandPose(
-      'left',
-      leftHoldClass,
-      false,
-      this.leftHandBlender.gripCurl,
-      foregripPose,
-    );
+    if (pdaActiveHold && pdaIkW > 0.55) {
+      this.skeleton.applyPdaHandPose('left', 0, 0, 0);
+    } else {
+      this.skeleton.applyHandPose(
+        'left',
+        leftHoldClass,
+        false,
+        this.leftHandBlender.gripCurl,
+        foregripPose,
+      );
+    }
   }
 
   /**

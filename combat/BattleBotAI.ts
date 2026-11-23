@@ -3,7 +3,10 @@ import {
   ActiveSmokeCloudInfo,
   ArticulatedRagdoll,
   BodycamAudio,
+  BodycamWeaponWeightClass,
+  GYM_ARMORY_WEAPONS,
   IBodycamWorldAdapter,
+  resolveWeaponProfile,
 } from '../bodycam-sdk';
 import {
   createVaultCandidate,
@@ -21,14 +24,18 @@ import {
   BuiltMapInstance,
   findNavPath,
   findNearestNavNode,
+  InfectionPerkId,
   NavNode,
   SpawnPoint,
 } from '../maps/types';
 import {
+  BotWeaponVisualClass,
   GameBotsSyncPacket,
   OperatorUniformId,
   resolveOperatorUniformId,
+  SquadCommsCategory,
   SyncedBotState,
+  TacticalPingKind,
 } from '../data/multiplayer';
 import {
   BuiltTacticalOperatorRig,
@@ -99,6 +106,50 @@ export interface BotZombieHitEvent {
   impactDir: THREE.Vector3;
   shooterId: string;
   shooterName: string;
+  weaponId: string;
+  weaponLabel: string;
+  melee?: boolean;
+}
+
+export interface BotCommsEvent {
+  botId: string;
+  callsign: string;
+  team: BattleTeamId;
+  category: SquadCommsCategory;
+  text: string;
+  pingKind?: TacticalPingKind | null;
+  pingLabel?: string | null;
+  pingPos?: THREE.Vector3 | null;
+}
+
+export interface BotEconomyActionEvent {
+  botId: string;
+  botName: string;
+  kind: 'buyable_door' | 'power_switch' | 'wall_buy' | 'mystery_crate' | 'perk_machine' | 'window_barrier';
+  interactableId: string;
+  barrierId?: string;
+  cost: number;
+  weaponId?: string;
+  perkId?: InfectionPerkId;
+}
+
+export interface InfectionBotEconomyContext {
+  round: number;
+  intermissionActive: boolean;
+  powerOn: boolean;
+  getBarrierPlanks: (barrierId: string) => { remaining: number; max: number } | null;
+  onBotEconomyAction: (ev: BotEconomyActionEvent) => boolean;
+}
+
+export interface InfectionBotStatusSummary {
+  id: string;
+  name: string;
+  alive: boolean;
+  hp: number;
+  maxHp: number;
+  points: number;
+  weaponLabel: string;
+  kills: number;
 }
 
 export interface BattleBotTuningOptions {
@@ -112,6 +163,8 @@ export interface BattleBotTuningOptions {
   coopInfectionMode?: boolean;
   /** World physics adapter enabling AI operators to vault, climb, and mantle real geometry */
   worldAdapter?: IBodycamWorldAdapter;
+  /** Allied team ID for Battle TDM comms filtering (defaults to 'A') */
+  localAllyTeam?: BattleTeamId;
 }
 
 interface DifficultyParams {
@@ -176,13 +229,152 @@ const INFECTION_DOOR_GATED_EDGES: ReadonlyArray<[string, string, string]> = [
   ['aud_back_w', 'proj_ramp', 'door_projector'],
 ];
 
+interface BotWeaponCombatSpec {
+  id: string;
+  label: string;
+  visualClass: BotWeaponVisualClass;
+  weightClass: 'pistol' | 'carbine' | 'heavy_rifle';
+  caliberId: string;
+  magCapacity: number;
+  reserveMax: number;
+  damagePerShot: number;
+  fireIntervalSec: number;
+  burstMin: number;
+  burstMax: number;
+  burstPauseSec: number;
+  reloadSec: number;
+  spreadMult: number;
+  tier: number; // 0 = starter pistol, 1 = shotgun/smg, 2 = compact rifle, 3 = carbine/mystery
+}
+
+function buildBotWeaponSpec(weaponId: string): BotWeaponCombatSpec {
+  const prof = resolveWeaponProfile(weaponId);
+  const cat = prof.category;
+  const isPistol = cat === 'pistols' || cat === 'revolvers';
+  const isShotgun = cat === 'shotguns';
+  const isSmg = cat === 'pdws';
+  const visualClass: BotWeaponVisualClass = isPistol
+    ? 'pistol'
+    : isShotgun
+      ? 'shotgun'
+      : isSmg
+        ? 'smg'
+        : 'rifle';
+
+  const magCapacity = Math.max(4, prof.magCapacity || 17);
+  const reserveMax = isPistol ? magCapacity * 6 : magCapacity * 5;
+  const rpm = Math.max(70, prof.rpm || 380);
+  const baseInterval = 60 / rpm;
+
+  if (isPistol) {
+    return {
+      id: prof.id,
+      label: prof.name.length > 18 ? 'Glock 17' : prof.name,
+      visualClass: 'pistol',
+      weightClass: 'pistol',
+      caliberId: prof.defaultCaliberId || '9x19',
+      magCapacity,
+      reserveMax,
+      damagePerShot: 24,
+      fireIntervalSec: Math.max(0.24, baseInterval),
+      burstMin: 2,
+      burstMax: 3,
+      burstPauseSec: 0.42,
+      reloadSec: prof.reloadDurationSec || 1.85,
+      spreadMult: 0.92,
+      tier: 0,
+    };
+  }
+  if (isShotgun) {
+    return {
+      id: prof.id,
+      label: prof.name.length > 20 ? 'Remington 870' : prof.name,
+      visualClass: 'shotgun',
+      weightClass: 'heavy_rifle',
+      caliberId: prof.defaultCaliberId || '12ga',
+      magCapacity,
+      reserveMax,
+      damagePerShot: 82,
+      fireIntervalSec: Math.max(0.68, baseInterval),
+      burstMin: 1,
+      burstMax: 2,
+      burstPauseSec: 0.55,
+      reloadSec: prof.reloadDurationSec || 2.6,
+      spreadMult: 1.35,
+      tier: 1,
+    };
+  }
+  if (isSmg) {
+    return {
+      id: prof.id,
+      label: prof.name.length > 20 ? 'HK MP5 9mm' : prof.name,
+      visualClass: 'smg',
+      weightClass: 'pistol',
+      caliberId: prof.defaultCaliberId || '9x19',
+      magCapacity,
+      reserveMax,
+      damagePerShot: 28,
+      fireIntervalSec: Math.max(0.095, baseInterval),
+      burstMin: 4,
+      burstMax: 7,
+      burstPauseSec: 0.44,
+      reloadSec: prof.reloadDurationSec || 2.1,
+      spreadMult: 1.05,
+      tier: 2,
+    };
+  }
+  const rifleAudioWeight: 'pistol' | 'carbine' | 'heavy_rifle' =
+    prof.weightClass === 'heavy_rifle'
+      ? 'heavy_rifle'
+      : prof.weightClass === 'pistol'
+        ? 'pistol'
+        : 'carbine';
+  return {
+    id: prof.id,
+    label: prof.name.length > 20 ? prof.name.slice(0, 18) : prof.name,
+    visualClass: 'rifle',
+    weightClass: rifleAudioWeight,
+    caliberId: prof.defaultCaliberId || '556x45',
+    magCapacity,
+    reserveMax,
+    damagePerShot: 38,
+    fireIntervalSec: Math.max(0.105, baseInterval),
+    burstMin: 3,
+    burstMax: 6,
+    burstPauseSec: 0.48,
+    reloadSec: prof.reloadDurationSec || 2.35,
+    spreadMult: 0.88,
+    tier: 3,
+  };
+}
+
+interface BotEconomyGoal {
+  kind: BotEconomyActionEvent['kind'];
+  interactableId: string;
+  barrierId?: string;
+  label: string;
+  pos: THREE.Vector3;
+  cost: number;
+  weaponId?: string;
+  perkId?: InfectionPerkId;
+}
+
+interface PendingSquadAck {
+  dueTimer: number;
+  sourceBotId: string;
+  team: BattleTeamId;
+  text: string;
+}
+
 interface BotActor {
   id: string;
   name: string;
   team: BattleTeamId;
   uniformId: OperatorUniformId;
   operatorId: OperatorId;
+  weaponId: string;
   weaponLabel: string;
+  weaponClass: BotWeaponVisualClass;
   alive: boolean;
   hp: number;
   maxHp: number;
@@ -190,6 +382,27 @@ interface BotActor {
   deaths: number;
   respawnTimer: number;
   deathTimer: number;
+
+  // Shared Infection Economy, Weapon Slots, Finite Ammo & Perks
+  points: number;
+  weaponSlots: string[];
+  activeSlotIndex: number;
+  magAmmoByWeapon: Record<string, number>;
+  reserveAmmoByWeapon: Record<string, number>;
+  perks: Set<InfectionPerkId>;
+  reloadTimer: number;
+  reloadDuration: number;
+  netReloading: boolean;
+  meleeCooldown: number;
+  economyGoal: BotEconomyGoal | null;
+  economyEvalTimer: number;
+  barrierRepairAccum: number;
+
+  // Per-bot comms cooldowns
+  commsCooldown: number;
+  lowHpCalledOut: boolean;
+  lastContactCalloutSec: number;
+  prevHasLos: boolean;
 
   pos: THREE.Vector3;
   netPos: THREE.Vector3;
@@ -294,6 +507,7 @@ export class BattleBotAI {
   private readonly aiMaxHp: number;
   private readonly aiRespawnEnabled: boolean;
   private readonly coopInfectionMode: boolean;
+  private readonly localAllyTeam: BattleTeamId;
   private readonly worldAdapter: IBodycamWorldAdapter | null;
   private readonly vaultDetector = new VaultDetector();
   private readonly _vaultCandidate: VaultCandidate = createVaultCandidate();
@@ -302,6 +516,13 @@ export class BattleBotAI {
   // Zone/door gating for friendly Infection bots
   private readonly unlockedZones = new Set<string>(['lobby', 'default']);
   private readonly openedDoors = new Set<string>();
+
+  // Universal Allied Bot Comms throttling & call-and-response queue
+  private readonly weaponSpecCache = new Map<string, BotWeaponCombatSpec>();
+  private globalCommsCooldown = 0;
+  private elapsedClockSec = 0;
+  private readonly pendingAcks: PendingSquadAck[] = [];
+  private onBotCommsCb: ((ev: BotCommsEvent) => void) | null = null;
 
   public scoreA = 0;
   public scoreB = 0;
@@ -354,6 +575,7 @@ export class BattleBotAI {
     this.audio = audio;
     this.rule = rule;
     this.coopInfectionMode = Boolean(tuning?.coopInfectionMode);
+    this.localAllyTeam = tuning?.localAllyTeam ?? 'A';
     this.worldAdapter = tuning?.worldAdapter ?? map.physics.createAdapter();
     const baseDiff = DIFFICULTY_TABLE[difficulty];
     const accMult = Math.max(0.25, Math.min(2.5, tuning?.aiAccuracyMult ?? 1.0));
@@ -402,18 +624,19 @@ export class BattleBotAI {
     for (let i = 0; i < clampedCount; i++) {
       let team: BattleTeamId = 'FFA';
       let name = '';
-      let weaponLabel = i % 2 === 0 ? 'AKM 7.62' : 'M4A1 5.56';
+      let weaponId = i % 2 === 0 ? 'akm_762' : 'm4a1';
       let operatorId: OperatorId;
 
       if (this.coopInfectionMode) {
         // Always friendly Team A squadmates in Infection mode; alternating Female/Male mix
+        // TRUE PISTOL START: every Infection bot starts with Glock 17 + 500 PTS matching player!
         team = 'A';
         const isFemale = startFemalePolarity ? i % 2 === 0 : i % 2 === 1;
         operatorId = isFemale ? 'FEMALE' : 'MALE';
         name = isFemale
           ? FEMALE_CALLSIGNS_A[femaleCountA++ % FEMALE_CALLSIGNS_A.length]
           : MALE_CALLSIGNS_A[maleCountA++ % MALE_CALLSIGNS_A.length];
-        weaponLabel = i % 2 === 0 ? 'M4A1 5.56' : 'HK416 5.56';
+        weaponId = 'glock_17';
         countA++;
       } else if (rule === 'tdm') {
         // Player occupies 1 slot on Team A -> put slightly more bots on Team B so totals stay even
@@ -425,7 +648,7 @@ export class BattleBotAI {
           name = isFemale
             ? FEMALE_CALLSIGNS_A[femaleCountA++ % FEMALE_CALLSIGNS_A.length]
             : MALE_CALLSIGNS_A[maleCountA++ % MALE_CALLSIGNS_A.length];
-          weaponLabel = countA % 2 === 0 ? 'M4A1 5.56' : 'HK416 5.56';
+          weaponId = countA % 2 === 0 ? 'm4a1' : 'hk416';
           countA++;
         } else {
           team = 'B';
@@ -434,7 +657,7 @@ export class BattleBotAI {
           name = isFemale
             ? FEMALE_CALLSIGNS_B[femaleCountB++ % FEMALE_CALLSIGNS_B.length]
             : MALE_CALLSIGNS_B[maleCountB++ % MALE_CALLSIGNS_B.length];
-          weaponLabel = countB % 2 === 0 ? 'AKM 7.62' : 'AKS-74U';
+          weaponId = countB % 2 === 0 ? 'akm_762' : 'aks74u';
           countB++;
         }
       } else {
@@ -451,6 +674,8 @@ export class BattleBotAI {
         ? 'infection'
         : resolveOperatorUniformId('battle', team);
       const rig = this.rigFactory.buildOperator('bot', id, uniformId, operatorId);
+      const initSpec = this.getWeaponSpec(weaponId);
+      rig.setWeaponClass(initSpec.visualClass);
       this.group.add(rig.root);
 
       const bot: BotActor = {
@@ -459,7 +684,9 @@ export class BattleBotAI {
         team,
         uniformId,
         operatorId,
-        weaponLabel,
+        weaponId: initSpec.id,
+        weaponLabel: initSpec.label,
+        weaponClass: initSpec.visualClass,
         alive: true,
         hp: this.aiMaxHp,
         maxHp: this.aiMaxHp,
@@ -467,6 +694,23 @@ export class BattleBotAI {
         deaths: 0,
         respawnTimer: 0,
         deathTimer: 0,
+        points: this.coopInfectionMode ? 500 : 0,
+        weaponSlots: [initSpec.id],
+        activeSlotIndex: 0,
+        magAmmoByWeapon: { [initSpec.id]: initSpec.magCapacity },
+        reserveAmmoByWeapon: { [initSpec.id]: this.coopInfectionMode ? initSpec.reserveMax : -1 },
+        perks: new Set<InfectionPerkId>(),
+        reloadTimer: 0,
+        reloadDuration: initSpec.reloadSec,
+        netReloading: false,
+        meleeCooldown: 0,
+        economyGoal: null,
+        economyEvalTimer: 1.5 + i * 0.65,
+        barrierRepairAccum: 0,
+        commsCooldown: 2.0 + i * 1.1,
+        lowHpCalledOut: false,
+        lastContactCalloutSec: -20,
+        prevHasLos: false,
         pos: new THREE.Vector3(),
         netPos: new THREE.Vector3(),
         vel: new THREE.Vector3(),
@@ -646,9 +890,19 @@ export class BattleBotAI {
     bot.burstShotsLeft = 0;
     bot.reactionTimer = this.diff.reactionSec;
     bot.flinchTimer = 0;
+    bot.reloadTimer = 0;
+    bot.lowHpCalledOut = false;
+    bot.economyGoal = null;
+    bot.prevHasLos = false;
+
+    if (!this.coopInfectionMode) {
+      const spec = this.getWeaponSpec(bot.weaponId);
+      bot.magAmmoByWeapon[bot.weaponId] = spec.magCapacity;
+    }
 
     bot.ragdoll.deactivate();
     bot.rig.resetRagdollPose();
+    bot.rig.setWeaponClass(bot.weaponClass);
     bot.root.visible = true;
     bot.root.position.copy(bot.pos);
     bot.root.quaternion.identity();
@@ -661,12 +915,216 @@ export class BattleBotAI {
     this.scoreA = 0;
     this.scoreB = 0;
     this.killfeed.length = 0;
+    this.pendingAcks.length = 0;
     for (let i = 0; i < this.bots.length; i++) {
       const b = this.bots[i];
       b.kills = 0;
       b.deaths = 0;
+      if (this.coopInfectionMode) {
+        const pistolSpec = this.getWeaponSpec('glock_17');
+        b.points = 500;
+        b.maxHp = this.aiMaxHp;
+        b.hp = this.aiMaxHp;
+        b.perks.clear();
+        b.weaponSlots = ['glock_17'];
+        b.activeSlotIndex = 0;
+        b.magAmmoByWeapon = { glock_17: pistolSpec.magCapacity };
+        b.reserveAmmoByWeapon = { glock_17: pistolSpec.reserveMax };
+        this.applyBotActiveWeapon(b, 'glock_17');
+      }
       this.spawnBot(b, playerPos, i);
     }
+  }
+
+  private getWeaponSpec(weaponId: string): BotWeaponCombatSpec {
+    let spec = this.weaponSpecCache.get(weaponId);
+    if (!spec) {
+      spec = buildBotWeaponSpec(weaponId);
+      this.weaponSpecCache.set(weaponId, spec);
+    }
+    return spec;
+  }
+
+  private applyBotActiveWeapon(bot: BotActor, weaponId: string): void {
+    const spec = this.getWeaponSpec(weaponId);
+    bot.weaponId = spec.id;
+    bot.weaponLabel = spec.label;
+    bot.weaponClass = spec.visualClass;
+    bot.reloadDuration = spec.reloadSec / (bot.perks.has('rapid_handling') ? 1.6 : 1.0);
+    bot.rig.setWeaponClass(spec.visualClass);
+  }
+
+  private grantBotInfectionWeapon(bot: BotActor, weaponId: string): BotWeaponCombatSpec {
+    const spec = this.getWeaponSpec(weaponId);
+    bot.magAmmoByWeapon[spec.id] = spec.magCapacity;
+    bot.reserveAmmoByWeapon[spec.id] = spec.reserveMax;
+
+    const existingIdx = bot.weaponSlots.indexOf(spec.id);
+    if (existingIdx >= 0) {
+      bot.activeSlotIndex = existingIdx;
+      this.applyBotActiveWeapon(bot, spec.id);
+      return spec;
+    }
+
+    if (bot.weaponSlots.length < 2) {
+      bot.weaponSlots.push(spec.id);
+      bot.activeSlotIndex = bot.weaponSlots.length - 1;
+    } else {
+      // Replace the lower-tier slot (typically Glock 17 once bot upgrades)
+      const tier0 = this.getWeaponSpec(bot.weaponSlots[0]).tier;
+      const tier1 = this.getWeaponSpec(bot.weaponSlots[1]).tier;
+      const replaceIdx = tier0 <= tier1 ? 0 : 1;
+      bot.weaponSlots[replaceIdx] = spec.id;
+      bot.activeSlotIndex = replaceIdx;
+    }
+    this.applyBotActiveWeapon(bot, spec.id);
+    return spec;
+  }
+
+  public setBotCommsListener(listener: ((ev: BotCommsEvent) => void) | null): void {
+    this.onBotCommsCb = listener;
+  }
+
+  private isAlliedBot(bot: BotActor): boolean {
+    if (this.coopInfectionMode) return true;
+    if (this.rule === 'tdm') return bot.team === this.localAllyTeam;
+    return false;
+  }
+
+  private emitAlliedComms(
+    bot: BotActor,
+    category: SquadCommsCategory,
+    text: string,
+    opts?: {
+      force?: boolean;
+      pingKind?: TacticalPingKind;
+      pingLabel?: string;
+      pingPos?: THREE.Vector3;
+      triggerAck?: boolean;
+      ackPool?: readonly string[];
+    },
+  ): boolean {
+    if (this.isClientReplica || !this.onBotCommsCb || !this.isAlliedBot(bot)) return false;
+    if (!opts?.force && (this.globalCommsCooldown > 0 || bot.commsCooldown > 0)) return false;
+
+    this.globalCommsCooldown = opts?.force ? 1.15 : 2.35;
+    bot.commsCooldown = opts?.force ? 2.5 : 5.8 + Math.random() * 2.5;
+
+    this.onBotCommsCb({
+      botId: bot.id,
+      callsign: bot.name,
+      team: bot.team,
+      category,
+      text,
+      pingKind: opts?.pingKind ?? null,
+      pingLabel: opts?.pingLabel ?? null,
+      pingPos: opts?.pingPos ? opts.pingPos.clone() : null,
+    });
+
+    if (opts?.triggerAck && this.pendingAcks.length < 2) {
+      const pool = opts.ackPool ?? [
+        'Copy that, moving to support.',
+        'Roger, watching your six.',
+        'Solid copy — pushing up.',
+        'Acknowledged, staying with you.',
+      ];
+      this.pendingAcks.push({
+        dueTimer: 0.85 + Math.random() * 0.7,
+        sourceBotId: bot.id,
+        team: bot.team,
+        text: pool[Math.floor(Math.random() * pool.length)],
+      });
+    }
+    return true;
+  }
+
+  /**
+   * Notifies allied bots when the human player places a [Z] tactical ping so a nearby
+   * squadmate responds on VHF radio and adjusts awareness toward the mark.
+   */
+  public notifyPlayerPing(kind: TacticalPingKind, pos: Readonly<THREE.Vector3>, label: string): void {
+    if (this.isClientReplica || !this.onBotCommsCb) return;
+    if (!this.coopInfectionMode && this.rule !== 'tdm') return;
+
+    const candidates = this.bots.filter((b) => b.alive && this.isAlliedBot(b));
+    if (candidates.length === 0) return;
+
+    // Pick closest alive allied bot
+    let best = candidates[0];
+    let bestDistSq = best.pos.distanceToSquared(pos);
+    for (let i = 1; i < candidates.length; i++) {
+      const dSq = candidates[i].pos.distanceToSquared(pos);
+      if (dSq < bestDistSq) {
+        bestDistSq = dSq;
+        best = candidates[i];
+      }
+    }
+
+    const cleanLabel = label.trim().slice(0, 22) || 'MARK';
+    const ackLine =
+      kind === 'enemy'
+        ? `Copy contact on ${cleanLabel} — eyes on sector.`
+        : kind === 'item'
+          ? `Roger, noted ${cleanLabel} on tac-net.`
+          : `Solid copy — shifting toward your mark.`;
+
+    this.pendingAcks.push({
+      dueTimer: 0.75 + Math.random() * 0.55,
+      sourceBotId: 'player',
+      team: best.team,
+      text: ackLine,
+    });
+  }
+
+  public awardInfectionHitPoints(botId: string, amount = 10): void {
+    if (!this.coopInfectionMode) return;
+    const b = this.bots.find((item) => item.id === botId);
+    if (b) b.points += amount;
+  }
+
+  public awardInfectionKillPoints(botId: string, headshot: boolean, melee = false): void {
+    if (!this.coopInfectionMode) return;
+    const b = this.bots.find((item) => item.id === botId);
+    if (!b) return;
+    b.kills += 1;
+    b.points += melee ? 130 : headshot ? 100 : 60;
+  }
+
+  public awardInfectionRoundBonus(bonus: number, completedRound: number): void {
+    if (!this.coopInfectionMode) return;
+    for (let i = 0; i < this.bots.length; i++) {
+      this.bots[i].points += bonus;
+    }
+    const speaker = this.bots.find((b) => b.alive);
+    if (speaker) {
+      this.emitAlliedComms(
+        speaker,
+        'status',
+        `Wave ${completedRound} clear — check mags, doors, and perks before next push.`,
+        {
+          force: true,
+          triggerAck: true,
+          ackPool: [
+            'Copy — topping off ammo now.',
+            'Roger, checking points for the next door.',
+            'Solid copy, holding lobby sector.',
+          ],
+        },
+      );
+    }
+  }
+
+  public getInfectionSquadSummary(): InfectionBotStatusSummary[] {
+    return this.bots.map((b) => ({
+      id: b.id,
+      name: b.name,
+      alive: b.alive,
+      hp: Math.round(b.hp),
+      maxHp: b.maxHp,
+      points: b.points,
+      weaponLabel: b.weaponLabel,
+      kills: b.kills,
+    }));
   }
 
   public setClientReplica(replica: boolean): void {
@@ -717,6 +1175,7 @@ export class BattleBotAI {
 
     bot.operatorId = nextOperatorId;
     bot.rig = rig;
+    bot.rig.setWeaponClass(bot.weaponClass);
     bot.root = rig.root;
     bot.bodyPivot = rig.bodyPivot;
     bot.leftLeg = rig.leftLeg;
@@ -763,7 +1222,16 @@ export class BattleBotAI {
     if (!bot || !bot.alive) return false;
     bot.hp -= damage;
     bot.flinchTimer = 0.22;
+    if (bot.hp > 0 && bot.hp <= bot.maxHp * 0.36 && !bot.lowHpCalledOut) {
+      bot.lowHpCalledOut = true;
+      this.emitAlliedComms(bot, 'status', 'Taking heavy hits — need cover!', {
+        pingKind: 'location',
+        pingLabel: `${bot.name} LOW HP`,
+        pingPos: new THREE.Vector3(bot.pos.x, bot.pos.y + 1.5, bot.pos.z),
+      });
+    }
     if (bot.hp <= 0) {
+      this.emitAlliedComms(bot, 'status', 'Going down! Hold the line!', { force: true });
       this.killBot(bot, 'INFECTED', 'B', false, 'CLAWS');
       bot.respawnTimer = this.coopInfectionMode ? 14.0 : 4.0;
       return true;
@@ -789,6 +1257,11 @@ export class BattleBotAI {
       team: b.team,
       uniformId: b.uniformId,
       operatorId: b.operatorId,
+      weaponId: b.weaponId,
+      weaponLabel: b.weaponLabel,
+      weaponClass: b.weaponClass,
+      points: this.coopInfectionMode ? b.points : undefined,
+      reloading: b.reloadTimer > 0,
       x: Number(b.pos.x.toFixed(3)),
       y: Number(b.pos.y.toFixed(3)),
       z: Number(b.pos.z.toFixed(3)),
@@ -837,6 +1310,15 @@ export class BattleBotAI {
           hitMeshesDirty = true;
         }
       }
+
+      if (sb.weaponClass && bot.weaponClass !== sb.weaponClass) {
+        bot.weaponClass = sb.weaponClass;
+        bot.rig.setWeaponClass(sb.weaponClass);
+      }
+      if (sb.weaponId) bot.weaponId = sb.weaponId;
+      if (sb.weaponLabel) bot.weaponLabel = sb.weaponLabel;
+      if (typeof sb.points === 'number') bot.points = sb.points;
+      bot.netReloading = Boolean(sb.reloading);
 
       const wasAlive = bot.alive;
       bot.alive = sb.alive;
@@ -890,6 +1372,7 @@ export class BattleBotAI {
 
   public playRemoteBotFire(botId: string, ox: number, oy: number, oz: number, ex: number, ey: number, ez: number): void {
     const bot = this.bots.find((b) => b.id === botId);
+    const spec = bot ? this.getWeaponSpec(bot.weaponId) : null;
     if (bot && bot.alive) {
       bot.muzzleFlash.visible = true;
       bot.muzzleFlashTimer = 0.055;
@@ -901,10 +1384,10 @@ export class BattleBotAI {
     this.spawnTracer(this._tmpMuzzle, this._tmpOrigin);
     this.audio.playWeaponCue('fire', {
       position: this._tmpMuzzle,
-      weightClass: 'carbine',
-      caliberId: '556x45',
+      weightClass: spec?.weightClass ?? 'carbine',
+      caliberId: spec?.caliberId ?? '556x45',
       suppressed: false,
-      intensity: 0.72,
+      intensity: spec?.visualClass === 'pistol' ? 0.56 : 0.72,
     });
   }
 
@@ -1437,6 +1920,382 @@ export class BattleBotAI {
     }
   }
 
+  private isPointReachableInInfection(pos: Readonly<THREE.Vector3>): boolean {
+    if (!this.coopInfectionMode) return true;
+    const node = findNearestNavNode(this.map.navGraph, pos, this.unlockedZones, this.openedDoors);
+    if (!node) return false;
+    const d = Math.hypot(node.position[0] - pos.x, node.position[2] - pos.z);
+    return d <= 7.8;
+  }
+
+  private pickInfectionEconomyGoal(
+    bot: BotActor,
+    econ: InfectionBotEconomyContext,
+  ): BotEconomyGoal | null {
+    const interactables = this.map.interactables;
+    if (!interactables || interactables.length === 0) return null;
+
+    const activeSpec = this.getWeaponSpec(bot.weaponId);
+    const activeReserve = bot.reserveAmmoByWeapon[bot.weaponId] ?? 0;
+    const activeMag = bot.magAmmoByWeapon[bot.weaponId] ?? 0;
+    const lowAmmo = activeMag + activeReserve <= activeSpec.magCapacity * 1.4;
+    const currentBestTier = bot.weaponSlots.reduce(
+      (best, wid) => Math.max(best, this.getWeaponSpec(wid).tier),
+      0,
+    );
+
+    // Priority 1: Refill ammo at owned wall-buy if running critically low
+    if (lowAmmo) {
+      let bestRefill: BotEconomyGoal | null = null;
+      let bestDist = Infinity;
+      for (let i = 0; i < interactables.length; i++) {
+        const it = interactables[i];
+        if (it.kind !== 'wall_buy' || !it.weaponId || !bot.weaponSlots.includes(it.weaponId)) continue;
+        const refillCost = Math.round(it.cost * 0.5);
+        if (bot.points < refillCost) continue;
+        const p = new THREE.Vector3(it.position[0], it.position[1], it.position[2]);
+        if (!this.isPointReachableInInfection(p)) continue;
+        const d = bot.pos.distanceTo(p);
+        if (d < bestDist) {
+          bestDist = d;
+          bestRefill = {
+            kind: 'wall_buy',
+            interactableId: it.id,
+            label: it.label,
+            pos: p,
+            cost: refillCost,
+            weaponId: it.weaponId,
+          };
+        }
+      }
+      if (bestRefill) return bestRefill;
+    }
+
+    // Priority 2: Flip Main Power Switch if reachable and power is still OFF (free!)
+    if (!econ.powerOn) {
+      for (let i = 0; i < interactables.length; i++) {
+        const it = interactables[i];
+        if (it.kind !== 'power_switch' || it.activated) continue;
+        const p = new THREE.Vector3(it.position[0], it.position[1], it.position[2]);
+        if (!this.isPointReachableInInfection(p)) continue;
+        return {
+          kind: 'power_switch',
+          interactableId: it.id,
+          label: it.label,
+          pos: p,
+          cost: 0,
+        };
+      }
+    }
+
+    // Priority 3: Upgrade off starting Glock 17 to an affordable wall weapon!
+    if (currentBestTier === 0 && bot.points >= 750) {
+      let bestWall: BotEconomyGoal | null = null;
+      let bestScore = -Infinity;
+      for (let i = 0; i < interactables.length; i++) {
+        const it = interactables[i];
+        if (it.kind !== 'wall_buy' || !it.weaponId || bot.weaponSlots.includes(it.weaponId)) continue;
+        if (bot.points < it.cost) continue;
+        const p = new THREE.Vector3(it.position[0], it.position[1], it.position[2]);
+        if (!this.isPointReachableInInfection(p)) continue;
+        const spec = this.getWeaponSpec(it.weaponId);
+        const dist = bot.pos.distanceTo(p);
+        const score = spec.tier * 25 + it.cost * 0.01 - dist * 0.8;
+        if (score > bestScore) {
+          bestScore = score;
+          bestWall = {
+            kind: 'wall_buy',
+            interactableId: it.id,
+            label: it.label,
+            pos: p,
+            cost: it.cost,
+            weaponId: it.weaponId,
+          };
+        }
+      }
+      if (bestWall) return bestWall;
+    }
+
+    // Priority 4: Buy perks once power is ON
+    if (econ.powerOn) {
+      for (let i = 0; i < interactables.length; i++) {
+        const it = interactables[i];
+        if (it.kind !== 'perk_machine' || !it.perkId) continue;
+        if (bot.perks.has(it.perkId)) continue;
+        if (bot.points < it.cost) continue;
+        const p = new THREE.Vector3(it.position[0], it.position[1], it.position[2]);
+        if (!this.isPointReachableInInfection(p)) continue;
+        return {
+          kind: 'perk_machine',
+          interactableId: it.id,
+          label: it.label,
+          pos: p,
+          cost: it.cost,
+          perkId: it.perkId,
+        };
+      }
+    }
+
+    // Priority 5: Open buyable doors to expand map (once bot has upgraded OR round >= 2 & has points)
+    if (currentBestTier >= 1 || econ.round >= 2) {
+      let bestDoor: BotEconomyGoal | null = null;
+      let bestCost = Infinity;
+      for (let i = 0; i < interactables.length; i++) {
+        const it = interactables[i];
+        if (it.kind !== 'buyable_door' || it.activated || this.openedDoors.has(it.id)) continue;
+        if (bot.points < it.cost) continue;
+        const p = new THREE.Vector3(it.position[0], it.position[1], it.position[2]);
+        if (!this.isPointReachableInInfection(p)) continue;
+        if (it.cost < bestCost) {
+          bestCost = it.cost;
+          bestDoor = {
+            kind: 'buyable_door',
+            interactableId: it.id,
+            label: it.label,
+            pos: p,
+            cost: it.cost,
+          };
+        }
+      }
+      if (bestDoor) return bestDoor;
+    }
+
+    // Priority 6: Roll Mystery Weapon Crate if reachable and affordable
+    if (bot.points >= 950 && (currentBestTier < 3 || lowAmmo)) {
+      for (let i = 0; i < interactables.length; i++) {
+        const it = interactables[i];
+        if (it.kind !== 'mystery_crate') continue;
+        if (bot.points < it.cost) continue;
+        const p = new THREE.Vector3(it.position[0], it.position[1], it.position[2]);
+        if (!this.isPointReachableInInfection(p)) continue;
+        return {
+          kind: 'mystery_crate',
+          interactableId: it.id,
+          label: it.label,
+          pos: p,
+          cost: it.cost,
+        };
+      }
+    }
+
+    // Priority 7: Repair nearby breached window barriers for +5 PTS/plank (especially during intermission or early rounds)
+    let bestBarrier: BotEconomyGoal | null = null;
+    let bestBarrierDist = econ.intermissionActive ? 22 : 12;
+    for (let i = 0; i < interactables.length; i++) {
+      const it = interactables[i];
+      if (it.kind !== 'window_barrier') continue;
+      const bid = it.barrierId ?? it.id;
+      const bState = econ.getBarrierPlanks(bid);
+      if (!bState || bState.remaining >= bState.max) continue;
+      const p = new THREE.Vector3(it.position[0], it.position[1], it.position[2]);
+      if (!this.isPointReachableInInfection(p)) continue;
+      const d = bot.pos.distanceTo(p);
+      if (d < bestBarrierDist) {
+        bestBarrierDist = d;
+        bestBarrier = {
+          kind: 'window_barrier',
+          interactableId: it.id,
+          barrierId: bid,
+          label: it.label,
+          pos: p,
+          cost: 0,
+        };
+      }
+    }
+    return bestBarrier;
+  }
+
+  private executeInfectionEconomyGoal(
+    bot: BotActor,
+    goal: BotEconomyGoal,
+    econ: InfectionBotEconomyContext,
+    dt: number,
+  ): boolean {
+    if (goal.kind === 'window_barrier' && goal.barrierId) {
+      const st = econ.getBarrierPlanks(goal.barrierId);
+      if (!st || st.remaining >= st.max) {
+        bot.barrierRepairAccum = 0;
+        return true; // finished
+      }
+      bot.barrierRepairAccum += dt;
+      if (bot.barrierRepairAccum >= 0.72) {
+        bot.barrierRepairAccum = 0;
+        const ok = econ.onBotEconomyAction({
+          botId: bot.id,
+          botName: bot.name,
+          kind: 'window_barrier',
+          interactableId: goal.interactableId,
+          barrierId: goal.barrierId,
+          cost: 0,
+        });
+        if (ok) {
+          bot.points += 5;
+          if (st.remaining + 1 >= st.max) {
+            this.emitAlliedComms(bot, 'economy', `Boarded up ${goal.label} — holding tight.`);
+            return true;
+          }
+        } else {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    if (goal.kind === 'buyable_door') {
+      if (bot.points < goal.cost || this.openedDoors.has(goal.interactableId)) return true;
+      const ok = econ.onBotEconomyAction({
+        botId: bot.id,
+        botName: bot.name,
+        kind: 'buyable_door',
+        interactableId: goal.interactableId,
+        cost: goal.cost,
+      });
+      if (ok) {
+        bot.points -= goal.cost;
+        this.emitAlliedComms(
+          bot,
+          'economy',
+          `Cleared ${goal.label} (-${goal.cost} PTS) — path is open!`,
+          {
+            force: true,
+            pingKind: 'location',
+            pingLabel: `${goal.label.toUpperCase()} OPEN`,
+            pingPos: goal.pos,
+            triggerAck: true,
+            ackPool: [
+              'Copy that, pushing through!',
+              'Good call — covering the new sector.',
+              'Roger, moving up with you.',
+            ],
+          },
+        );
+      }
+      return true;
+    }
+
+    if (goal.kind === 'power_switch') {
+      if (econ.powerOn) return true;
+      const ok = econ.onBotEconomyAction({
+        botId: bot.id,
+        botName: bot.name,
+        kind: 'power_switch',
+        interactableId: goal.interactableId,
+        cost: 0,
+      });
+      if (ok) {
+        this.emitAlliedComms(
+          bot,
+          'economy',
+          'Main Theater Power is ONLINE! Perk machines are live!',
+          {
+            force: true,
+            pingKind: 'item',
+            pingLabel: 'POWER ONLINE',
+            pingPos: goal.pos,
+            triggerAck: true,
+            ackPool: [
+              'Solid copy — heading for perks when clear!',
+              'Lights are back! Nice work!',
+            ],
+          },
+        );
+      }
+      return true;
+    }
+
+    if (goal.kind === 'wall_buy' && goal.weaponId) {
+      const owned = bot.weaponSlots.includes(goal.weaponId);
+      const actualCost = owned ? Math.round(goal.cost) : goal.cost;
+      if (bot.points < actualCost) return true;
+      bot.points -= actualCost;
+      const spec = this.grantBotInfectionWeapon(bot, goal.weaponId);
+      econ.onBotEconomyAction({
+        botId: bot.id,
+        botName: bot.name,
+        kind: 'wall_buy',
+        interactableId: goal.interactableId,
+        cost: actualCost,
+        weaponId: spec.id,
+      });
+      this.emitAlliedComms(
+        bot,
+        'economy',
+        owned
+          ? `Refilled ${spec.label} ammo off the wall.`
+          : `Picked up ${spec.label} (-${actualCost} PTS) — ready to engage.`,
+        {
+          pingKind: 'item',
+          pingLabel: spec.label.toUpperCase(),
+          pingPos: goal.pos,
+        },
+      );
+      return true;
+    }
+
+    if (goal.kind === 'mystery_crate') {
+      if (bot.points < goal.cost) return true;
+      bot.points -= goal.cost;
+      const candidates = GYM_ARMORY_WEAPONS.filter(
+        (w) => !bot.weaponSlots.includes(w.id) && w.magCapacity > 0 && w.category !== 'pistols',
+      );
+      const pool = candidates.length > 0 ? candidates : GYM_ARMORY_WEAPONS;
+      const picked = pool[Math.floor(Math.random() * pool.length)];
+      const spec = this.grantBotInfectionWeapon(bot, picked.id);
+      econ.onBotEconomyAction({
+        botId: bot.id,
+        botName: bot.name,
+        kind: 'mystery_crate',
+        interactableId: goal.interactableId,
+        cost: goal.cost,
+        weaponId: spec.id,
+      });
+      this.emitAlliedComms(
+        bot,
+        'economy',
+        `Rolled Mystery Crate — pulled ${spec.label}!`,
+        {
+          force: true,
+          pingKind: 'item',
+          pingLabel: 'MYSTERY CRATE',
+          pingPos: goal.pos,
+        },
+      );
+      return true;
+    }
+
+    if (goal.kind === 'perk_machine' && goal.perkId) {
+      if (!econ.powerOn || bot.perks.has(goal.perkId) || bot.points < goal.cost) return true;
+      bot.points -= goal.cost;
+      bot.perks.add(goal.perkId);
+      if (goal.perkId === 'vitality') {
+        bot.maxHp += 60;
+        bot.hp = bot.maxHp;
+      } else if (goal.perkId === 'rapid_handling') {
+        const spec = this.getWeaponSpec(bot.weaponId);
+        bot.reloadDuration = spec.reloadSec / 1.6;
+      }
+      econ.onBotEconomyAction({
+        botId: bot.id,
+        botName: bot.name,
+        kind: 'perk_machine',
+        interactableId: goal.interactableId,
+        cost: goal.cost,
+        perkId: goal.perkId,
+      });
+      this.emitAlliedComms(
+        bot,
+        'economy',
+        goal.perkId === 'vitality'
+          ? 'Grabbed Vitality Reserve — armor & health boosted.'
+          : 'Grabbed Rapid Handling — faster reloads online.',
+        { force: true },
+      );
+      return true;
+    }
+
+    return true;
+  }
+
   public update(
     dt: number,
     playerPos: Readonly<THREE.Vector3>,
@@ -1449,7 +2308,30 @@ export class BattleBotAI {
     getActiveSmokeClouds?: () => readonly ActiveSmokeCloudInfo[],
     zombieTargets?: ReadonlyArray<BattleZombieTarget>,
     onHitZombie?: (ev: BotZombieHitEvent) => void,
+    infectionEconomy?: InfectionBotEconomyContext,
   ): void {
+    this.elapsedClockSec += dt;
+    if (this.globalCommsCooldown > 0) {
+      this.globalCommsCooldown = Math.max(0, this.globalCommsCooldown - dt);
+    }
+
+    // Process delayed call-and-response squad radio acknowledgments
+    if (!this.isClientReplica && this.pendingAcks.length > 0 && this.onBotCommsCb) {
+      for (let a = this.pendingAcks.length - 1; a >= 0; a--) {
+        const ack = this.pendingAcks[a];
+        ack.dueTimer -= dt;
+        if (ack.dueTimer <= 0) {
+          this.pendingAcks.splice(a, 1);
+          const responder = this.bots.find(
+            (b) => b.alive && b.id !== ack.sourceBotId && b.team === ack.team && this.isAlliedBot(b),
+          );
+          if (responder) {
+            this.emitAlliedComms(responder, 'ack', ack.text, { force: true });
+          }
+        }
+      }
+    }
+
     // Update pooled tracers
     for (let i = 0; i < this.tracers.length; i++) {
       const t = this.tracers[i];
@@ -1519,7 +2401,7 @@ export class BattleBotAI {
         pose.adsBlend = isAimingFire ? 0.72 : 0.12;
         pose.pointAimBlend = 0;
         pose.cantBlend = 0;
-        pose.reloadBlend = 0;
+        pose.reloadBlend = bot.netReloading ? 0.85 : 0;
         pose.speedMps = speedHoriz;
         pose.walkCycle = bot.walkCycle;
         pose.sprint = speedHoriz > 3.5;
@@ -1590,7 +2472,29 @@ export class BattleBotAI {
       if (bot.vaultCooldown > 0) bot.vaultCooldown = Math.max(0, bot.vaultCooldown - dt);
       if (bot.vaultProbeTimer > 0) bot.vaultProbeTimer = Math.max(0, bot.vaultProbeTimer - dt);
       if (bot.unstuckBoostTimer > 0) bot.unstuckBoostTimer = Math.max(0, bot.unstuckBoostTimer - dt);
+      if (bot.commsCooldown > 0) bot.commsCooldown = Math.max(0, bot.commsCooldown - dt);
+      if (bot.meleeCooldown > 0) bot.meleeCooldown = Math.max(0, bot.meleeCooldown - dt);
+      if (bot.hp > bot.maxHp * 0.65) bot.lowHpCalledOut = false;
       bot.recoilKick = Math.max(0, bot.recoilKick - dt * 7.2);
+
+      // Timed tactical reload step
+      if (bot.reloadTimer > 0) {
+        bot.reloadTimer -= dt;
+        if (bot.reloadTimer <= 0) {
+          bot.reloadTimer = 0;
+          const spec = this.getWeaponSpec(bot.weaponId);
+          const curMag = bot.magAmmoByWeapon[bot.weaponId] ?? 0;
+          const res = bot.reserveAmmoByWeapon[bot.weaponId] ?? -1;
+          const needed = Math.max(0, spec.magCapacity - curMag);
+          if (res < 0) {
+            bot.magAmmoByWeapon[bot.weaponId] = spec.magCapacity;
+          } else {
+            const loaded = Math.min(needed, res);
+            bot.magAmmoByWeapon[bot.weaponId] = curMag + loaded;
+            bot.reserveAmmoByWeapon[bot.weaponId] = res - loaded;
+          }
+        }
+      }
 
       // === ACTIVE VAULT / CLIMB / HIGH-MANTLE EXECUTION ===
       if (bot.vaultActive) {
@@ -1743,6 +2647,33 @@ export class BattleBotAI {
           }
           bot.targetId = bestId;
           bot.hasLos = true;
+
+          // Universal Allied Bot Comms: Contact / Horde Sighting + World Ping
+          if (!bot.prevHasLos && this.elapsedClockSec - bot.lastContactCalloutSec > 10.5 && this.isAlliedBot(bot)) {
+            bot.lastContactCalloutSec = this.elapsedClockSec;
+            if (this.coopInfectionMode) {
+              const closeZombies = zombies.filter((z) => z.pos.distanceToSquared(bot.pos) < 12 * 12).length;
+              const callText =
+                closeZombies >= 4
+                  ? 'Heavy infected swarm pushing our sector — light them up!'
+                  : 'Infected spotted ahead — engaging!';
+              this.emitAlliedComms(bot, 'threat', callText, {
+                pingKind: 'enemy',
+                pingLabel: closeZombies >= 4 ? 'INFECTED SWARM' : 'INFECTED',
+                pingPos: this._tmpTarget.clone(),
+                triggerAck: closeZombies >= 4,
+                ackPool: ['Copy that, laying down fire!', 'Roger, covering your flank!'],
+              });
+            } else {
+              this.emitAlliedComms(bot, 'threat', 'Contact! Hostile operator in sight — engaging!', {
+                pingKind: 'enemy',
+                pingLabel: 'HOSTILE',
+                pingPos: this._tmpTarget.clone(),
+                triggerAck: Math.random() < 0.55,
+                ackPool: ['Copy contact — flanking!', 'Roger, moving to assist!'],
+              });
+            }
+          }
         } else {
           bot.hasLos = false;
           if (blockedBySmoke || this.coopInfectionMode || Math.random() < 0.25) {
@@ -1750,6 +2681,7 @@ export class BattleBotAI {
             bot.burstShotsLeft = 0;
           }
         }
+        bot.prevHasLos = bot.hasLos;
       }
 
       // Resolve live target position
@@ -1834,43 +2766,92 @@ export class BattleBotAI {
         moveX = (strafeX * 0.72 + nx * radial) * moveSpeed * 0.68;
         moveZ = (strafeZ * 0.72 + nz * radial) * moveSpeed * 0.68;
 
-        // 3. Burst-Fire Engagement
+        // 3. Burst-Fire Engagement (Weapon-spec accurate, finite ammo + reloads + melee fallback in Infection)
+        const activeSpec = this.getWeaponSpec(bot.weaponId);
         if (bot.stunTimer > 0) {
           bot.stunTimer = Math.max(0, bot.stunTimer - dt);
           bot.burstShotsLeft = 0;
           moveX *= 0.25;
           moveZ *= 0.25;
+        } else if (bot.reloadTimer > 0) {
+          bot.burstShotsLeft = 0;
         } else if (bot.reactionTimer > 0) {
           bot.reactionTimer -= dt;
         } else {
-          if (bot.burstShotsLeft <= 0) {
-            bot.burstCooldown -= dt;
-            if (bot.burstCooldown <= 0) {
-              bot.burstShotsLeft =
-                this.diff.burstMin +
-                Math.floor(Math.random() * (this.diff.burstMax - this.diff.burstMin + 1));
-              bot.fireTimer = 0;
-            }
-          }
+          const curMag = bot.magAmmoByWeapon[bot.weaponId] ?? activeSpec.magCapacity;
+          const curRes = bot.reserveAmmoByWeapon[bot.weaponId] ?? -1;
 
-          if (bot.burstShotsLeft > 0) {
-            bot.fireTimer -= dt;
-            if (bot.fireTimer <= 0) {
-              bot.fireTimer = this.diff.fireIntervalSec;
-              bot.burstShotsLeft -= 1;
-              if (bot.burstShotsLeft <= 0) {
-                bot.burstCooldown = this.diff.burstPauseSec * (0.75 + Math.random() * 0.45);
+          if (curMag <= 0) {
+            if (curRes !== 0) {
+              // Start timed tactical reload
+              bot.reloadDuration = activeSpec.reloadSec / (bot.perks.has('rapid_handling') ? 1.6 : 1.0);
+              bot.reloadTimer = bot.reloadDuration;
+              bot.burstShotsLeft = 0;
+              if (this.isAlliedBot(bot) && Math.random() < 0.45) {
+                this.emitAlliedComms(bot, 'status', `Reloading ${activeSpec.label} — cover me!`);
               }
-              this.fireBotRound(
-                bot,
-                targetPos,
-                targetBot,
-                targetHuman,
-                targetZombie,
-                onDamagePlayer,
-                onBotFire,
-                onHitZombie,
-              );
+            } else {
+              // Active weapon completely dry -> try switching to other slot with ammo
+              const altIdx = bot.weaponSlots.findIndex((wid, idx) => {
+                if (idx === bot.activeSlotIndex) return false;
+                return (bot.magAmmoByWeapon[wid] ?? 0) + Math.max(0, bot.reserveAmmoByWeapon[wid] ?? 0) > 0;
+              });
+              if (altIdx >= 0) {
+                bot.activeSlotIndex = altIdx;
+                this.applyBotActiveWeapon(bot, bot.weaponSlots[altIdx]);
+                if (this.isAlliedBot(bot)) {
+                  this.emitAlliedComms(bot, 'status', `Primary dry — switching to ${bot.weaponLabel}!`);
+                }
+              } else if (this.coopInfectionMode && targetZombie && onHitZombie && horizDist < 2.25 && bot.meleeCooldown <= 0) {
+                // Defensive knife/bash melee when completely out of ammo!
+                bot.meleeCooldown = 0.88;
+                bot.recoilKick = 0.9;
+                onHitZombie({
+                  zombieId: targetZombie.id,
+                  damage: 58,
+                  hitZone: 'thorax',
+                  impactPoint: targetPos.clone(),
+                  impactDir: this._tmpDir.set(nx, 0.1, nz).clone(),
+                  shooterId: bot.id,
+                  shooterName: bot.name,
+                  weaponId: 'melee',
+                  weaponLabel: 'MELEE',
+                  melee: true,
+                });
+              }
+            }
+          } else {
+            if (bot.burstShotsLeft <= 0) {
+              bot.burstCooldown -= dt;
+              if (bot.burstCooldown <= 0) {
+                const bMin = this.coopInfectionMode ? activeSpec.burstMin : this.diff.burstMin;
+                const bMax = this.coopInfectionMode ? activeSpec.burstMax : this.diff.burstMax;
+                bot.burstShotsLeft = bMin + Math.floor(Math.random() * (bMax - bMin + 1));
+                bot.fireTimer = 0;
+              }
+            }
+
+            if (bot.burstShotsLeft > 0) {
+              bot.fireTimer -= dt;
+              if (bot.fireTimer <= 0) {
+                bot.fireTimer = this.coopInfectionMode ? activeSpec.fireIntervalSec : this.diff.fireIntervalSec;
+                bot.burstShotsLeft -= 1;
+                bot.magAmmoByWeapon[bot.weaponId] = Math.max(0, curMag - 1);
+                if (bot.burstShotsLeft <= 0) {
+                  const basePause = this.coopInfectionMode ? activeSpec.burstPauseSec : this.diff.burstPauseSec;
+                  bot.burstCooldown = basePause * (0.75 + Math.random() * 0.45);
+                }
+                this.fireBotRound(
+                  bot,
+                  targetPos,
+                  targetBot,
+                  targetHuman,
+                  targetZombie,
+                  onDamagePlayer,
+                  onBotFire,
+                  onHitZombie,
+                );
+              }
             }
           }
         }
@@ -1904,32 +2885,65 @@ export class BattleBotAI {
               let goalNode: NavNode | null = null;
 
               if (this.coopInfectionMode) {
-                // Friendly Infection bots support living human players & patrol unlocked sectors
-                const aliveHumans = humans.filter((hm) => hm.alive);
-                const anchor = aliveHumans.length > 0 ? aliveHumans[i % aliveHumans.length] : null;
-                const distToAnchor = anchor
-                  ? Math.hypot(anchor.pos.x - bot.pos.x, anchor.pos.z - bot.pos.z)
-                  : 0;
-
-                if (anchor && distToAnchor > 7.5) {
-                  // Follow human squadmate through unlocked rooms
-                  goalNode = findNearestNavNode(this.map.navGraph, anchor.pos, zones, doors);
-                } else if (zombies.length > 0 && Math.random() < 0.6) {
-                  // Move toward nearest active interior zombie's sector
-                  const nearestZ = zombies.find((z) => !z.enteringWindow) ?? zombies[0];
-                  if (nearestZ) {
-                    goalNode = findNearestNavNode(this.map.navGraph, nearestZ.pos, zones, doors);
+                // Autonomous Infection Economy Brain: evaluate buying guns, doors, power, perks, ammo & repairs
+                if (infectionEconomy) {
+                  bot.economyEvalTimer -= dt;
+                  if (bot.economyEvalTimer <= 0 && !bot.economyGoal) {
+                    bot.economyEvalTimer = infectionEconomy.intermissionActive ? 0.65 : 2.2 + Math.random() * 1.4;
+                    const nearestZDistSq = zombies.reduce(
+                      (minSq, z) => Math.min(minSq, z.pos.distanceToSquared(bot.pos)),
+                      Infinity,
+                    );
+                    if (infectionEconomy.intermissionActive || nearestZDistSq > 7.5 * 7.5) {
+                      bot.economyGoal = this.pickInfectionEconomyGoal(bot, infectionEconomy);
+                    }
                   }
                 }
-                if (!goalNode || goalNode.id === startNode.id) {
-                  const unlockedNodes = this.map.navGraph.nodes.filter(
-                    (n) =>
-                      this.unlockedZones.has(n.zoneId) &&
-                      (!n.requiredDoorId || this.openedDoors.has(n.requiredDoorId)) &&
-                      n.id !== startNode.id,
+
+                if (bot.economyGoal && infectionEconomy) {
+                  const distToGoal = Math.hypot(
+                    bot.economyGoal.pos.x - bot.pos.x,
+                    bot.economyGoal.pos.z - bot.pos.z,
                   );
-                  if (unlockedNodes.length > 0) {
-                    goalNode = unlockedNodes[Math.floor(Math.random() * unlockedNodes.length)];
+                  if (distToGoal <= 2.65) {
+                    const done = this.executeInfectionEconomyGoal(bot, bot.economyGoal, infectionEconomy, dt);
+                    if (done) {
+                      bot.economyGoal = null;
+                      bot.economyEvalTimer = 1.6;
+                    }
+                  } else {
+                    goalNode = findNearestNavNode(this.map.navGraph, bot.economyGoal.pos, zones, doors);
+                  }
+                }
+
+                if (!goalNode) {
+                  // Friendly Infection bots support living human players & patrol unlocked sectors
+                  const aliveHumans = humans.filter((hm) => hm.alive);
+                  const anchor = aliveHumans.length > 0 ? aliveHumans[i % aliveHumans.length] : null;
+                  const distToAnchor = anchor
+                    ? Math.hypot(anchor.pos.x - bot.pos.x, anchor.pos.z - bot.pos.z)
+                    : 0;
+
+                  if (anchor && distToAnchor > 7.5) {
+                    // Follow human squadmate through unlocked rooms
+                    goalNode = findNearestNavNode(this.map.navGraph, anchor.pos, zones, doors);
+                  } else if (zombies.length > 0 && Math.random() < 0.6) {
+                    // Move toward nearest active interior zombie's sector
+                    const nearestZ = zombies.find((z) => !z.enteringWindow) ?? zombies[0];
+                    if (nearestZ) {
+                      goalNode = findNearestNavNode(this.map.navGraph, nearestZ.pos, zones, doors);
+                    }
+                  }
+                  if (!goalNode || goalNode.id === startNode.id) {
+                    const unlockedNodes = this.map.navGraph.nodes.filter(
+                      (n) =>
+                        this.unlockedZones.has(n.zoneId) &&
+                        (!n.requiredDoorId || this.openedDoors.has(n.requiredDoorId)) &&
+                        n.id !== startNode.id,
+                    );
+                    if (unlockedNodes.length > 0) {
+                      goalNode = unlockedNodes[Math.floor(Math.random() * unlockedNodes.length)];
+                    }
                   }
                 }
               } else {
@@ -2061,6 +3075,26 @@ export class BattleBotAI {
               moveZ = dirZ * moveSpeed;
               bot.targetYaw = Math.atan2(-dirX, -dirZ);
             }
+          } else if (this.coopInfectionMode && bot.economyGoal && infectionEconomy) {
+            // Final short-range walk directly up to the interactable (door / wall-buy / barrier / power)
+            const dx = bot.economyGoal.pos.x - bot.pos.x;
+            const dz = bot.economyGoal.pos.z - bot.pos.z;
+            const d = Math.hypot(dx, dz);
+            if (d <= 2.65) {
+              const done = this.executeInfectionEconomyGoal(bot, bot.economyGoal, infectionEconomy, dt);
+              if (done) {
+                bot.economyGoal = null;
+                bot.economyEvalTimer = 1.6;
+              }
+            } else if (d < 9.0) {
+              const dirX = dx / d;
+              const dirZ = dz / d;
+              moveX = dirX * moveSpeed * 0.85;
+              moveZ = dirZ * moveSpeed * 0.85;
+              bot.targetYaw = Math.atan2(-dirX, -dirZ);
+            } else {
+              bot.economyGoal = null;
+            }
           }
         }
       }
@@ -2178,7 +3212,8 @@ export class BattleBotAI {
       pose.adsBlend = isAimingFire ? 0.76 : 0.12;
       pose.pointAimBlend = 0;
       pose.cantBlend = 0;
-      pose.reloadBlend = 0;
+      pose.reloadBlend =
+        bot.reloadTimer > 0 ? Math.sin(Math.min(1, bot.reloadTimer / Math.max(0.2, bot.reloadDuration)) * Math.PI) : 0;
       pose.speedMps = speedHoriz;
       pose.walkCycle = bot.walkCycle;
       pose.sprint = !bot.hasLos && bot.crouchBlend < 0.25 && speedHoriz > 3.1;
@@ -2260,7 +3295,8 @@ export class BattleBotAI {
     const dist = Math.max(0.5, this._tmpDir.length());
     this._tmpDir.divideScalar(dist);
 
-    const spread = this.diff.spreadRad * (1 - shooter.crouchBlend * 0.18);
+    const spec = this.getWeaponSpec(shooter.weaponId);
+    const spread = this.diff.spreadRad * spec.spreadMult * (1 - shooter.crouchBlend * 0.18);
     this._tmpDir.x += (Math.random() - 0.5) * spread * 2;
     this._tmpDir.y += (Math.random() - 0.5) * spread * 1.5;
     this._tmpDir.z += (Math.random() - 0.5) * spread * 2;
@@ -2272,28 +3308,33 @@ export class BattleBotAI {
 
     this.audio.playWeaponCue('fire', {
       position: this._tmpMuzzle,
-      weightClass: 'carbine',
-      caliberId: '556x45',
+      weightClass: spec.weightClass,
+      caliberId: spec.caliberId,
       suppressed: false,
-      intensity: 0.72,
+      intensity: spec.visualClass === 'pistol' ? 0.56 : 0.72,
     });
 
     this._tmpToTarget.subVectors(targetPos, this._tmpMuzzle).normalize();
     const cosErr = THREE.MathUtils.clamp(this._tmpToTarget.dot(this._tmpDir), -1, 1);
     const angErr = Math.acos(cosErr);
-    const hitAngleLimit = Math.atan2(targetZombie ? 0.56 : 0.46, Math.max(2.5, dist));
+    const hitAngleLimit = Math.atan2(
+      targetZombie ? (spec.visualClass === 'shotgun' ? 0.74 : 0.56) : 0.46,
+      Math.max(2.5, dist),
+    );
 
     if (angErr <= hitAngleLimit) {
       if (targetZombie && onHitZombie) {
-        const hs = Math.random() < 0.24;
+        const hs = Math.random() < (spec.visualClass === 'pistol' ? 0.28 : 0.24);
         onHitZombie({
           zombieId: targetZombie.id,
-          damage: this.diff.damagePerShot * 1.9,
+          damage: spec.damagePerShot,
           hitZone: hs ? 'head' : 'thorax',
           impactPoint: targetPos.clone(),
           impactDir: this._tmpDir.clone(),
           shooterId: shooter.id,
           shooterName: shooter.name,
+          weaponId: shooter.weaponId,
+          weaponLabel: shooter.weaponLabel,
         });
       } else if (targetBot) {
         const hs = Math.random() < 0.16;
@@ -2301,6 +3342,9 @@ export class BattleBotAI {
         targetBot.flinchTimer = 0.14;
         if (targetBot.hp <= 0) {
           this.killBot(targetBot, shooter.name, shooter.team, hs, shooter.weaponLabel, shooter);
+          if (this.isAlliedBot(shooter) && Math.random() < 0.42) {
+            this.emitAlliedComms(shooter, 'status', `Tango down! ${targetBot.name} neutralized.`);
+          }
         }
       } else if (targetHuman && !this.coopInfectionMode) {
         onDamagePlayer({

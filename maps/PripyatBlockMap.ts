@@ -4,8 +4,15 @@ import { BodycamPhysicsWorld, BodycamSurfaceMaterial } from '../bodycam-sdk';
 import { getGraphicsQualityProfile, GraphicsQualityId } from '../data/graphicsQuality';
 import { createStencilSignTexture } from '../gym/GymTextures';
 import {
+  NightLightEntry,
+  WettableSurfaceEntry,
+} from '../engine/world/WeatherTimeSystem';
+import { createWindShaderUniforms } from '../engine/world/WindFoliageShader';
+import {
   buildInstancedBirchTrees,
+  buildInstancedFerns,
   buildInstancedGrassTufts,
+  buildInstancedUndergrowthShrubs,
   buildOfficeDesk,
   buildRustedVehicle,
   PropFactoryContext,
@@ -126,6 +133,7 @@ function buildPripyatBlock(
   sceneGroup.add(sun);
 
   const maxAniso = Math.min(qProfile.anisotropyCap, renderer.capabilities.getMaxAnisotropy() || 4);
+  const windUniforms = createWindShaderUniforms();
 
   // Textures (Option 1: Soviet Teal-Amber Decay)
   const panelConcTex = trackTex(createPripyatPanelConcreteTexture(maxAniso, 4, 2, 1986));
@@ -220,7 +228,18 @@ function buildPripyatBlock(
     isSoftwareGl,
     trackGeo,
     trackMat,
+    windUniforms,
+    maxAniso,
   };
+
+  const wettableSurfaces: WettableSurfaceEntry[] = [
+    { material: matAsphalt, baseRoughness: 0.94, baseEnvMapIntensity: 0.45 },
+    { material: matSidewalk, baseRoughness: 0.92, baseEnvMapIntensity: 0.4 },
+    { material: matPanelConc, baseRoughness: 0.9, baseEnvMapIntensity: 0.35 },
+  ];
+  const nightLights: NightLightEntry[] = [
+    { emissiveMat: matAmberBulb, baseEmissiveIntensity: 2.8 },
+  ];
 
   const dummy = new THREE.Object3D();
 
@@ -387,6 +406,11 @@ function buildPripyatBlock(
       maxZ: lz + ld * 0.5,
       surface: 'grass',
     });
+    // Concrete curb frames enclosing each lawn island flush against asphalt
+    addSolidBox(lx, 0.045, lz - ld * 0.5 - 0.1, lw + 0.4, 0.09, 0.2, matSidewalk, 'concrete', false);
+    addSolidBox(lx, 0.045, lz + ld * 0.5 + 0.1, lw + 0.4, 0.09, 0.2, matSidewalk, 'concrete', false);
+    addSolidBox(lx - lw * 0.5 - 0.1, 0.045, lz, 0.2, 0.09, ld, matSidewalk, 'concrete', false);
+    addSolidBox(lx + lw * 0.5 + 0.1, 0.045, lz, 0.2, 0.09, ld, matSidewalk, 'concrete', false);
   }
 
   // === 2. NORTH 2-STORY PRIPYAT BREZHNEVKA APARTMENT BLOCK (X in [-36, 36], Z in [-36, -18]) ===
@@ -691,13 +715,12 @@ function buildPripyatBlock(
   }
   buildInstancedBirchTrees(propCtx, birchSpots, false);
 
-  // Overgrown grass & weed tufts bursting through cracked asphalt & courtyard lawns
-  const grassCount = Math.max(45, Math.round(160 * qProfile.foliageDensity));
+  // Overgrown grass, courtyard ferns & woody shrubs bursting through cracked asphalt & lawns
+  const grassCount = Math.max(95, Math.round(290 * qProfile.foliageDensity));
   const grassSpots: Array<{ x: number; y: number; z: number; scale: number; yaw: number; tint: THREE.Color }> = [];
-  for (let i = 0; i < grassCount; i++) {
-    const gx = (rand() - 0.5) * 78;
+  for (let i = 0; i < grassCount * 2 && grassSpots.length < grassCount; i++) {
+    const gx = (rand() - 0.5) * 80;
     const gz = -16 + rand() * 54;
-    // Skip inside building footprints
     if (gz < -17.5) continue;
     if (Math.abs(gx) > 23.0 && gz < 18.8) continue;
     if (Math.abs(gx) < 3.8 && Math.abs(gz - 3.0) < 3.8) continue;
@@ -705,12 +728,41 @@ function buildPripyatBlock(
       x: gx,
       y: 0.05,
       z: gz,
-      scale: 0.65 + rand() * 0.85,
+      scale: 0.72 + rand() * 0.78,
       yaw: rand() * Math.PI * 2,
-      tint: new THREE.Color().setHSL(0.22 + (rand() - 0.5) * 0.08, 0.3 + rand() * 0.12, 0.24 + rand() * 0.1),
+      tint: new THREE.Color().setHSL(0.22 + (rand() - 0.5) * 0.08, 0.34, 0.42 + rand() * 0.14),
     });
   }
   buildInstancedGrassTufts(propCtx, grassSpots);
+
+  const fernSpots: Array<{ x: number; y: number; z: number; scale: number; yaw: number; tint: THREE.Color }> = [];
+  for (const [cx, cz] of [[-10.5, 4.5], [10.5, 4.5]]) {
+    for (let k = 0; k < 22; k++) {
+      fernSpots.push({
+        x: cx + (rand() - 0.5) * 10.0,
+        y: 0.06,
+        z: cz + (rand() - 0.5) * 12.2,
+        scale: 0.75 + rand() * 0.55,
+        yaw: rand() * Math.PI * 2,
+        tint: new THREE.Color().setHSL(0.26 + (rand() - 0.5) * 0.05, 0.38, 0.36 + rand() * 0.14),
+      });
+    }
+  }
+  buildInstancedFerns(propCtx, fernSpots);
+
+  const shrubSpots: Array<{ x: number; y: number; z: number; scale: number; yaw: number; tint: THREE.Color }> = [];
+  for (let k = 0; k < 26; k++) {
+    const side = k % 2 === 0 ? -1 : 1;
+    shrubSpots.push({
+      x: side * (5.5 + rand() * 11.5),
+      y: 0.05,
+      z: -11 + rand() * 44,
+      scale: 0.8 + rand() * 0.65,
+      yaw: rand() * Math.PI * 2,
+      tint: new THREE.Color().setHSL(0.24 + (rand() - 0.5) * 0.07, 0.32, 0.36 + rand() * 0.14),
+    });
+  }
+  buildInstancedUndergrowthShrubs(propCtx, shrubSpots);
 
   // Distant Pripyat 9-story Brezhnevka skyline silhouette blocks outside map bounds
   const skylineGeo = trackGeo(new THREE.BoxGeometry(28, 28, 14));
@@ -882,6 +934,12 @@ function buildPripyatBlock(
     },
     interactables: [],
     lightingPreset: LIGHTING_PRESET,
+    supportsDynamicWeatherTime: true,
+    envBindings: {
+      windUniforms,
+      wettableSurfaces,
+      nightLights,
+    },
     update: (_dt, elapsedSec) => {
       for (const fl of flickerLights) {
         if (fl.broken) {

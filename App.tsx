@@ -40,12 +40,16 @@ const DEFAULT_BATTLE_CONFIG: BattleMatchConfig = {
   difficulty: 'tactical',
   primaryWeaponId: 'm4a1',
   secondaryWeaponId: 'makarov_pm',
+  weatherPreset: 'auto',
+  timeOfDayStart: 'auto',
 };
 
 const DEFAULT_INFECTION_CONFIG: InfectionMatchConfig = {
   mapId: 'kino_theater',
   botCount: 0,
   botDifficulty: 'tactical',
+  weatherPreset: 'auto',
+  timeOfDayStart: 'auto',
 };
 
 function PlaygroundView({ onReturnToMenu }: { onReturnToMenu: () => void }) {
@@ -335,6 +339,9 @@ function AppShell() {
     const selectedTacticalId =
       tacticalEquipmentStore.getSelection().equipmentId || activeLoadout.tacticalEquipmentId;
     const maxInfectionBots = Math.max(0, st.maxPlayers - st.members.length);
+    const weatherPreset = st.weatherPreset ?? st.specialEvent?.config.weatherPreset ?? 'auto';
+    const timeOfDayStart =
+      st.timeOfDayStart ?? st.specialEvent?.config.timeOfDayStart ?? 'auto';
     const params: CombatSessionParams =
       st.mode === 'infection'
         ? {
@@ -344,6 +351,8 @@ function AppShell() {
               botCount: st.botsEnabled ? Math.min(st.botCount, maxInfectionBots) : 0,
               botDifficulty: st.botDifficulty,
               tacticalEquipmentId: selectedTacticalId,
+              weatherPreset,
+              timeOfDayStart,
             },
             multiplayer: mpBridge,
           }
@@ -358,6 +367,8 @@ function AppShell() {
               primaryWeaponId: activeLoadout.primaryWeaponId || battleConfig.primaryWeaponId,
               secondaryWeaponId: activeLoadout.secondaryWeaponId || battleConfig.secondaryWeaponId,
               tacticalEquipmentId: selectedTacticalId,
+              weatherPreset,
+              timeOfDayStart,
             },
             multiplayer: mpBridge,
           };

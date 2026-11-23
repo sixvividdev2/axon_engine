@@ -21,8 +21,11 @@ import {
   GrenadeDetonationEvent,
   GrenadeHoldStage,
   IBodycamWorldAdapter,
+  IR_LAYER,
   LENS_PRESETS,
+  NvgMountId,
   operatorAssetLoader,
+  OperatorGearConfig,
   operatorSelectionStore,
   resolveWeaponProfile,
   ScopePassParams,
@@ -32,6 +35,7 @@ import {
   solveZeroPitchRad,
   TacticalGrenadeSystem,
   tacticalEquipmentStore,
+  TacticalPdaDevice,
   WeaponRig,
 } from '../bodycam-sdk';
 import {
@@ -118,6 +122,10 @@ export interface GymSnapshot {
   zeroDistanceM: number;
   zeroElevationMrad: number;
   heightOverBoreM: number;
+  isPdaOpen: boolean;
+  nvgMount: NvgMountId;
+  nvgActive: boolean;
+  irIlluminatorOn: boolean;
 }
 
 type Listener = (snap: GymSnapshot) => void;
@@ -152,7 +160,14 @@ export class GymEngine {
   private readonly scopeRenderer: ScopeRenderer;
   private readonly ballistics: GymBallistics;
   private readonly grenadeSystem: TacticalGrenadeSystem;
+  private readonly pdaDevice: TacticalPdaDevice;
+  private readonly irIlluminatorLight: THREE.SpotLight;
+  private readonly irIlluminatorTarget = new THREE.Object3D();
   private readonly unsubTacticalEquipment: () => void;
+  private readonly unsubOperatorGear: () => void;
+  private localGear: OperatorGearConfig;
+  private nvgFlipped = false;
+  private irIlluminatorOn = false;
 
   private config: BodycamSDKConfig = { ...DEFAULT_BODYCAM_SDK_CONFIG };
   private readonly telemetry: BodycamTelemetry = createBodycamTelemetry();
@@ -320,11 +335,13 @@ export class GymEngine {
     this.scene.add(this.weaponRig.root);
 
     const maxAnisotropy = Math.min(8, this.renderer.capabilities.getMaxAnisotropy());
+    this.localGear = operatorSelectionStore.getGearConfig();
     const loadedOp = operatorAssetLoader.loadProceduralOperator(
       operatorSelectionStore.getSelectedOperator(),
       {
         maxAnisotropy,
-        uniformId: 'infection',
+        uniformId: this.localGear.uniformId,
+        gear: this.localGear,
         previewMode: false,
         validationMode: 'SAFE_FALLBACK',
       },
@@ -334,8 +351,28 @@ export class GymEngine {
     this.skeleton.enableArmViewmodelLayer();
     this.scene.add(this.skeleton.root);
 
+    // Helmet-mounted IR illuminator floodlight strictly on IR_LAYER = 2 (invisible to naked eye)
+    this.irIlluminatorLight = new THREE.SpotLight(
+      0xdceeff,
+      7.5,
+      44,
+      THREE.MathUtils.degToRad(36),
+      0.56,
+      1.35,
+    );
+    this.irIlluminatorLight.position.set(0.03, 0.06, -0.08);
+    this.irIlluminatorLight.visible = false;
+    this.irIlluminatorLight.layers.set(IR_LAYER);
+    this.irIlluminatorTarget.position.set(0, 0.0, -12);
+    this.camera.add(this.irIlluminatorLight);
+    this.camera.add(this.irIlluminatorTarget);
+    this.irIlluminatorLight.target = this.irIlluminatorTarget;
+
     this.animator = new CharacterAnimator(this.skeleton, this.weaponRig, this.audio);
     this.controller = new BodycamController(this.camera, this.weaponRig, this.audio);
+    this.pdaDevice = new TacticalPdaDevice(this.audio);
+    this.camera.add(this.pdaDevice.root);
+    this.animator.setPdaDevice(this.pdaDevice);
     this.postProcess = new BodycamPostProcess(
       this.renderer,
       this.scene,
@@ -422,6 +459,19 @@ export class GymEngine {
       this.syncBeltEquipmentMesh();
       this.emitSnapshot();
     });
+    this.unsubOperatorGear = operatorSelectionStore.subscribeGear((nextGear) => {
+      this.localGear = nextGear;
+      this.skeleton.applyUniform(nextGear.uniformId);
+      this.skeleton.applyGearConfig(nextGear);
+      this.skeleton.setFirstPersonHeadShadowOnly(true);
+      this.skeleton.enableArmViewmodelLayer();
+      if (nextGear.nvgMount === 'none' && this.nvgFlipped) {
+        this.nvgFlipped = false;
+        this.irIlluminatorOn = false;
+      }
+      this.syncNvgRuntime();
+      this.emitSnapshot();
+    });
 
     // Initialize bare weapon attachments (or restore saved Gunsmith loadout) & magazine counts
     const savedLoadout = this.saveManager.loadGymLoadout();
@@ -442,6 +492,17 @@ export class GymEngine {
     this.weaponRig.laserOn = false;
     this.weaponRig.setLaserMode('visible_red');
     this.teleportToZone('spawn', true);
+    this.pdaDevice.captureOrthographicMap({
+      renderer: this.renderer,
+      scene: this.scene,
+      bounds: {
+        minX: this.world.physics.boundsMinX,
+        maxX: this.world.physics.boundsMaxX,
+        minZ: this.world.physics.boundsMinZ,
+        maxZ: this.world.physics.boundsMaxZ,
+      },
+      excludeObjects: [this.skeleton.root, this.weaponRig.root, this.pdaDevice.root],
+    });
 
     // Pre-compile scene shaders once at boot (hardware GL) to avoid mid-session GLSL compile hitches
     if (!this.isSoftwareGl) {
@@ -890,6 +951,7 @@ export class GymEngine {
     if (
       this.world.gunsmithBench.isActiveOrTransitioning() ||
       this.controller.isVaulting() ||
+      this.pdaDevice.isBlockingWeaponActions() ||
       this.reloadTimer > 0
     ) {
       return;
@@ -929,6 +991,9 @@ export class GymEngine {
 
   public openGunsmith(): void {
     if (this.world.gunsmithBench.isOpen()) return;
+    if (this.pdaDevice.isOpen()) {
+      this.pdaDevice.setOpen(false);
+    }
     if (this.grenadeSystem.isDrawn()) {
       this.handleGrenadeHolsterOrToss();
     }
@@ -1138,6 +1203,9 @@ export class GymEngine {
   public switchWeapon(weaponId: string, silent = false): void {
     const prof = SDK_WEAPON_PROFILES[weaponId] ?? resolveWeaponProfile(weaponId);
     if (!prof) return;
+    if (this.pdaDevice.isOpen()) {
+      this.pdaDevice.setOpen(false);
+    }
     if (this.grenadeSystem.isDrawn()) {
       this.handleGrenadeHolsterOrToss();
     }
@@ -1251,6 +1319,7 @@ export class GymEngine {
       prof.magCapacity <= 0 ||
       this.reloadTimer > 0 ||
       this.controller.isVaulting() ||
+      this.pdaDevice.isBlockingWeaponActions() ||
       this.weaponRig.isSuppressorActionActive()
     ) {
       return;
@@ -1271,6 +1340,7 @@ export class GymEngine {
       prof.magCapacity <= 0 ||
       this.reloadTimer > 0 ||
       this.controller.isVaulting() ||
+      this.pdaDevice.isBlockingWeaponActions() ||
       this.weaponRig.isSuppressorActionActive()
     ) {
       return;
@@ -1293,6 +1363,7 @@ export class GymEngine {
       prof.holdClass === 'unarmed' ||
       this.reloadTimer > 0 ||
       this.controller.isVaulting() ||
+      this.pdaDevice.isBlockingWeaponActions() ||
       this.weaponRig.isSuppressorActionActive()
     ) {
       return;
@@ -1309,7 +1380,13 @@ export class GymEngine {
 
   private triggerQuickBash(): void {
     const prof = this.getWeaponProfile();
-    if (this.controller.isVaulting() || this.weaponRig.isSuppressorActionActive()) return;
+    if (
+      this.controller.isVaulting() ||
+      this.pdaDevice.isBlockingWeaponActions() ||
+      this.weaponRig.isSuppressorActionActive()
+    ) {
+      return;
+    }
     if (prof.holdClass === 'unarmed') {
       const punch = this.animator.triggerUnarmedPunch(
         this.controller,
@@ -1331,7 +1408,9 @@ export class GymEngine {
   }
 
   private triggerPushKick(): void {
-    if (this.weaponRig.isSuppressorActionActive()) return;
+    if (this.pdaDevice.isBlockingWeaponActions() || this.weaponRig.isSuppressorActionActive()) {
+      return;
+    }
     const res = this.animator.triggerPushKick(this.controller, this.getActiveTraumaModifiers());
     if (res === 'dual_leg_trauma') {
       this.showToast('Both legs fractured — cannot push-kick');
@@ -1390,6 +1469,7 @@ export class GymEngine {
   }
 
   private attemptFire(): void {
+    if (this.pdaDevice.isBlockingWeaponActions()) return;
     const prof = this.getWeaponProfile();
     if (prof.holdClass === 'unarmed') {
       if (this.semiTriggerConsumed || this.controller.isVaulting()) return;
@@ -1458,6 +1538,9 @@ export class GymEngine {
     // Visual muzzle flash + articulated blowback / bolt-action cycle / revolver cylinder indexing + brass
     const cyclePump = prof.toggleablePumpSemi ? this.spas12Mode === 'pump' : undefined;
     this.weaponRig.triggerFire(suppressed, remainingAmmo, cyclePump);
+    if (!suppressed) {
+      this.postProcess.triggerNvgFlashSpike(0.55);
+    }
     this.controller.applyRecoil(
       prof.recoilPitchRad,
       prof.recoilYawRad,
@@ -1521,11 +1604,72 @@ export class GymEngine {
     this.emitSnapshot();
   };
 
+  private togglePda(): void {
+    if (this.world.gunsmithBench.isOpen() || this.tunerOpen) return;
+    const next = !this.pdaDevice.isOpen();
+    if (next) {
+      if (this.grenadeSystem.isDrawn() && !this.grenadeSystem.isPinPulled()) {
+        this.handleGrenadeHolsterOrToss();
+      }
+      this.isFiring = false;
+      this.input.ads = false;
+      this.reloadTimer = 0;
+    }
+    this.pdaDevice.setOpen(next);
+    this.emitSnapshot();
+  }
+
+  private syncNvgRuntime(): void {
+    const mount = this.localGear.nvgMount;
+    const active = mount !== 'none' && this.nvgFlipped;
+    const irActive = active && this.irIlluminatorOn;
+    this.skeleton.setNvgFlipped(active);
+    this.postProcess.setNvgState(mount, active, irActive);
+    this.irIlluminatorLight.visible = irActive;
+    this.weaponRig.setNvgOpticalActive(active);
+    this.weaponRig.setIrLaserActive(irActive);
+    this.audio.setNvgTubeHum(active);
+  }
+
+  private toggleNvg(): void {
+    if (this.world.gunsmithBench.isOpen() || this.tunerOpen) return;
+    if (this.localGear.nvgMount === 'none') {
+      this.showToast('No NVG Mounted — Equip Mil-Tec + NVG in Operator Screen');
+      return;
+    }
+    this.nvgFlipped = !this.nvgFlipped;
+    if (!this.nvgFlipped) {
+      this.irIlluminatorOn = false;
+    }
+    this.audio.playNvgFlipSound(this.nvgFlipped);
+    this.syncNvgRuntime();
+    const label = this.localGear.nvgMount === 'arnvg' ? 'RNVG-A (P45)' : 'PVS-7 NL2 (P43)';
+    this.showToast(this.nvgFlipped ? `${label} Deployed · [N] IR Flood` : `${label} Stowed`);
+    this.emitSnapshot();
+  }
+
+  private toggleIrIlluminator(): void {
+    if (!this.nvgFlipped || this.localGear.nvgMount === 'none') {
+      this.showToast('Deploy NVG [J] to use IR Illuminator');
+      return;
+    }
+    this.irIlluminatorOn = !this.irIlluminatorOn;
+    this.audio.playIrIlluminatorClick(this.irIlluminatorOn);
+    this.syncNvgRuntime();
+    this.showToast(this.irIlluminatorOn ? 'IR Illuminator + IR Laser: ON' : 'IR Illuminator: OFF');
+    this.emitSnapshot();
+  }
+
   private readonly onMouseMove = (e: MouseEvent): void => {
     if (!this.pointerLocked) return;
     // Clamp abnormal single-frame pointer jump spikes
     const dx = THREE.MathUtils.clamp(e.movementX, -140, 140);
     const dy = THREE.MathUtils.clamp(e.movementY, -140, 140);
+    if (this.pdaDevice.isOpen()) {
+      this.pdaDevice.applyMouseDelta(dx, dy);
+      this.controller.handleMouseMove(dx * 0.25, dy * 0.25, this.config);
+      return;
+    }
     this.controller.handleMouseMove(dx, dy, this.config);
   };
 
@@ -1535,6 +1679,13 @@ export class GymEngine {
     }
     if (!this.pointerLocked) return;
     this.audio.ensureInitialized();
+
+    if (this.pdaDevice.isBlockingWeaponActions()) {
+      if (e.button === 2 && this.pdaDevice.isOpen()) {
+        this.pdaDevice.recenterOnPlayer();
+      }
+      return;
+    }
 
     // Authentic 4-stage tactical grenade Manual of Arms when grenade is drawn
     if (this.grenadeSystem.isDrawn()) {
@@ -1610,6 +1761,11 @@ export class GymEngine {
   };
 
   private readonly onWheel = (e: WheelEvent): void => {
+    if (this.pointerLocked && !this.world.gunsmithBench.isOpen() && this.pdaDevice.isOpen()) {
+      e.preventDefault();
+      this.pdaDevice.applyWheel(e.deltaY);
+      return;
+    }
     if (
       this.pointerLocked &&
       this.controller.isAds &&
@@ -1684,8 +1840,11 @@ export class GymEngine {
           this.toggleFlashlight();
         }
         break;
+      case 'KeyM':
+        if (!e.repeat) this.togglePda();
+        break;
       case 'KeyB':
-        if (!e.repeat) {
+        if (!e.repeat && !this.pdaDevice.isBlockingWeaponActions()) {
           if (!this.weaponRig.hasCantedOptic()) break;
           const prof = this.getWeaponProfile();
           const cur = this.getArmedAdsMode(prof.id);
@@ -1711,25 +1870,40 @@ export class GymEngine {
         }
         break;
       case 'KeyR':
-        if (!e.repeat) this.startReload();
+        if (!e.repeat) {
+          if (this.pdaDevice.isOpen()) {
+            this.pdaDevice.recenterOnPlayer();
+          } else {
+            this.startReload();
+          }
+        }
         break;
       case 'KeyI':
-        if (!e.repeat) this.triggerWeaponInspect();
+        if (!e.repeat && !this.pdaDevice.isBlockingWeaponActions()) this.triggerWeaponInspect();
         break;
       case 'KeyG':
-        if (!e.repeat) this.toggleSuppressor();
+        if (!e.repeat && !this.pdaDevice.isBlockingWeaponActions()) this.toggleSuppressor();
         break;
       case 'KeyV':
-        if (!e.repeat) this.triggerQuickBash();
+        if (!e.repeat && !this.pdaDevice.isBlockingWeaponActions()) this.triggerQuickBash();
         break;
       case 'KeyX':
-        if (!e.repeat) this.triggerPushKick();
+        if (!e.repeat && !this.pdaDevice.isBlockingWeaponActions()) this.triggerPushKick();
         break;
       case 'KeyZ':
-        if (!e.repeat) this.toggleFireMode();
+        if (!e.repeat && !this.pdaDevice.isBlockingWeaponActions()) this.toggleFireMode();
+        break;
+      case 'KeyJ':
+        if (!e.repeat) this.toggleNvg();
         break;
       case 'KeyN':
-        if (!e.repeat) this.toggleReticleIllumination();
+        if (!e.repeat) {
+          if (this.nvgFlipped && !e.altKey) {
+            this.toggleIrIlluminator();
+          } else {
+            this.toggleReticleIllumination();
+          }
+        }
         break;
       case 'BracketRight':
         if (!e.repeat && this.controller.isAds && this.weaponRig.hasVariableZoom()) {
@@ -1743,7 +1917,7 @@ export class GymEngine {
         break;
       case 'KeyH':
       case 'Digit5':
-        if (!e.repeat) {
+        if (!e.repeat && !this.pdaDevice.isBlockingWeaponActions()) {
           if (this.grenadeSystem.isDrawn()) {
             this.handleGrenadeHolsterOrToss();
             this.emitSnapshot();
@@ -1932,15 +2106,22 @@ export class GymEngine {
       this.stamina = Math.min(1.0, this.stamina + dt * 0.22);
     }
 
-    this.input.adsMode = this.getArmedAdsMode(prof.id);
+    const baseAdsMode = this.getArmedAdsMode(prof.id);
+    const nodsForceCant =
+      this.nvgFlipped &&
+      this.input.ads &&
+      baseAdsMode === 'PRIMARY' &&
+      this.weaponRig.shouldForceNodsCantedAim(true);
+    this.input.adsMode = nodsForceCant ? 'POINT_AIM' : baseAdsMode;
     this.input.cant = false;
     const suppBusy = this.weaponRig.isSuppressorActionActive();
-    if (suppBusy) {
+    const pdaBusy = this.pdaDevice.isBlockingWeaponActions();
+    if (suppBusy || pdaBusy) {
       this.input.ads = false;
     }
     // Shift sprints ONLY when not aiming; while aiming, Shift (or Alt) exclusively engages Hold Breath
     this.input.sprint = !suppBusy && this.shiftHeld && !this.input.ads;
-    this.input.holdBreath = !suppBusy && this.input.ads && (this.shiftHeld || this.altHeld);
+    this.input.holdBreath = !suppBusy && !pdaBusy && this.input.ads && (this.shiftHeld || this.altHeld);
 
     let isVaultingNow = false;
     if (!benchBusy) {
@@ -1971,13 +2152,34 @@ export class GymEngine {
       }
       this.wasVaulting = isVaultingNow;
 
+      // Update 3D Physical PDA Device before IK animator consumes wrist sockets
+      this.pdaDevice.setTelemetry({
+        playerX: this.controller.position.x,
+        playerZ: this.controller.position.z,
+        playerYawRad: this.controller.aimYaw,
+        gameClockText: '12:00',
+        weatherLabel: 'FACILITY',
+        windSpeedMps: 0.4,
+        windAngleRad: 0.6,
+        modeLabel: 'PLAYGROUND',
+        zoneLabel: 'TESTING PLAYGROUND',
+      });
+      this.controller.getVelocity(this._playerVelScratch);
+      const moveRatioPda = THREE.MathUtils.clamp(
+        Math.hypot(this._playerVelScratch.x, this._playerVelScratch.z) / 4.8,
+        0,
+        1.3,
+      );
+      this.pdaDevice.update(dt, this.elapsedSec, moveRatioPda, this.controller.crouched);
+
       // 2. Step Full-Body Procedural IK Character Animator
       this.animator.update(dt, this.elapsedSec, this.controller, this.adapter, prof, this.input.ads);
       this.animator.applyCameraAdditiveOverlay(this.camera);
 
       this._fpsCamPos.copy(this.camera.position);
       this._fpsCamQuat.copy(this.camera.quaternion);
-      this.weaponRig.root.visible = !this.grenadeSystem.isDrawn();
+      this.weaponRig.root.visible =
+        !this.grenadeSystem.isDrawn() && !this.pdaDevice.isWeaponHidden();
       this.skeleton.root.visible = true;
 
       // Bench interaction look-at raycast
@@ -1992,6 +2194,10 @@ export class GymEngine {
         this.lookingAtBench = false;
       }
     } else {
+      if (this.pdaDevice.isOpen()) {
+        this.pdaDevice.setOpen(false);
+      }
+      this.pdaDevice.update(dt, this.elapsedSec, 0, false);
       this.lookingAtBench = false;
       this.weaponRig.root.visible = false;
       this.skeleton.root.visible = false;
@@ -2180,6 +2386,10 @@ export class GymEngine {
       zeroDistanceM: att.zeroDistanceM ?? getDefaultZeroDistanceM(prof.category),
       zeroElevationMrad: att.zeroElevationMrad ?? 0,
       heightOverBoreM: this.weaponRig.getHeightOverBoreM(),
+      isPdaOpen: this.pdaDevice.isOpen(),
+      nvgMount: this.localGear.nvgMount,
+      nvgActive: this.nvgFlipped && this.localGear.nvgMount !== 'none',
+      irIlluminatorOn: this.irIlluminatorOn && this.nvgFlipped,
     };
   }
 
@@ -2197,6 +2407,9 @@ export class GymEngine {
       document.exitPointerLock();
     }
     this.unsubTacticalEquipment();
+    this.unsubOperatorGear();
+    this.camera.remove(this.irIlluminatorLight, this.irIlluminatorTarget);
+    this.pdaDevice.dispose();
     this.grenadeSystem.dispose();
     this.ballistics.dispose();
     this.scopeRenderer.dispose();

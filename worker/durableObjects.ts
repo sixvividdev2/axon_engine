@@ -7,7 +7,11 @@ import {
   LobbyTeamId,
   LobbyVisibility,
   sanitizeSpecialEventConfig,
+  sanitizeTimeOfDayStart,
+  sanitizeWeatherPreset,
   SpecialEventRecord,
+  TimeOfDayStartSetting,
+  WeatherPresetId,
 } from '../data/multiplayer';
 import { generateId } from './crypto';
 import {
@@ -584,6 +588,8 @@ export class LobbyRoomDO {
         killLimit: number;
         botDifficulty: 'recruit' | 'tactical' | 'veteran';
         killfeedPolicy?: 'player_choice' | 'force_on' | 'force_off';
+        weatherPreset?: WeatherPresetId;
+        timeOfDayStart?: TimeOfDayStartSetting;
         specialEvent: SpecialEventRecord | null;
       };
 
@@ -608,6 +614,12 @@ export class LobbyRoomDO {
         : body.killfeedPolicy === 'force_on' || body.killfeedPolicy === 'force_off'
           ? body.killfeedPolicy
           : 'player_choice';
+      const weatherPreset = sanitizeWeatherPreset(
+        ev ? ev.config.weatherPreset : body.weatherPreset,
+      );
+      const timeOfDayStart = sanitizeTimeOfDayStart(
+        ev ? ev.config.timeOfDayStart : body.timeOfDayStart,
+      );
 
       this.room = {
         state: {
@@ -624,6 +636,8 @@ export class LobbyRoomDO {
           killLimit: ev ? ev.config.killLimit : Math.max(10, Math.min(100, body.killLimit || 30)),
           botDifficulty: ev ? ev.config.botDifficulty : body.botDifficulty,
           killfeedPolicy,
+          weatherPreset,
+          timeOfDayStart,
           status: 'lobby',
           matchSequence: 0,
           specialEvent: ev,
@@ -963,6 +977,12 @@ export class LobbyRoomDO {
       ) {
         st.killfeedPolicy = patch.killfeedPolicy;
       }
+      if (patch.weatherPreset !== undefined) {
+        st.weatherPreset = sanitizeWeatherPreset(patch.weatherPreset);
+      }
+      if (patch.timeOfDayStart !== undefined) {
+        st.timeOfDayStart = sanitizeTimeOfDayStart(patch.timeOfDayStart);
+      }
       if (st.specialEvent) {
         st.specialEvent = {
           ...st.specialEvent,
@@ -977,6 +997,8 @@ export class LobbyRoomDO {
             killLimit: st.killLimit,
             botDifficulty: st.botDifficulty,
             killfeedPolicy: st.killfeedPolicy,
+            weatherPreset: st.weatherPreset,
+            timeOfDayStart: st.timeOfDayStart,
           }),
         };
       }

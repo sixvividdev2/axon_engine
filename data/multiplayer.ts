@@ -10,6 +10,9 @@ export type LobbyVisibility = 'public' | 'friends_only' | 'private';
 export type LobbyModeId = 'battle' | 'infection';
 export type EventCycleModeId = 'battle_tdm' | 'battle_ffa' | 'infection';
 export type LobbyTeamId = 'A' | 'B';
+export type ActiveWeatherConditionId = 'clear' | 'sunny' | 'overcast' | 'rainy' | 'stormy';
+export type WeatherPresetId = 'auto' | ActiveWeatherConditionId;
+export type TimeOfDayStartSetting = 'auto' | number;
 
 export interface SpecialEventConfig {
   mode: LobbyModeId;
@@ -44,6 +47,8 @@ export interface SpecialEventConfig {
   zombieSpawnAmountMult: number; // 0.25..3.0
   waveBreakIntervalSec: number; // 2..30
   killfeedPolicy?: LobbyKillfeedPolicy;
+  weatherPreset?: WeatherPresetId;
+  timeOfDayStart?: TimeOfDayStartSetting;
 }
 
 export interface SpecialEventRecord {
@@ -90,6 +95,8 @@ export interface LobbySettingsPatch {
   killLimit?: number;
   botDifficulty?: BotDifficultyId;
   killfeedPolicy?: LobbyKillfeedPolicy;
+  weatherPreset?: WeatherPresetId;
+  timeOfDayStart?: TimeOfDayStartSetting;
 }
 
 export interface LobbyRoomState {
@@ -106,6 +113,8 @@ export interface LobbyRoomState {
   killLimit: number;
   botDifficulty: BotDifficultyId;
   killfeedPolicy?: LobbyKillfeedPolicy;
+  weatherPreset?: WeatherPresetId;
+  timeOfDayStart?: TimeOfDayStartSetting;
   status: 'lobby' | 'in_match';
   matchSequence: number;
   specialEvent: SpecialEventRecord | null;
@@ -163,6 +172,8 @@ export const DEFAULT_SPECIAL_EVENT_CONFIG: SpecialEventConfig = {
   zombieSpawnAmountMult: 1.0,
   waveBreakIntervalSec: 6,
   killfeedPolicy: 'player_choice',
+  weatherPreset: 'auto',
+  timeOfDayStart: 'auto',
 };
 
 function clampNum(val: unknown, min: number, max: number, fallback: number): number {
@@ -236,7 +247,32 @@ export function sanitizeSpecialEventConfig(raw: unknown): SpecialEventConfig {
     killfeedPolicy: isValidLobbyKillfeedPolicy(obj.killfeedPolicy)
       ? obj.killfeedPolicy
       : 'player_choice',
+    weatherPreset: sanitizeWeatherPreset(obj.weatherPreset),
+    timeOfDayStart: sanitizeTimeOfDayStart(obj.timeOfDayStart),
   };
+}
+
+const VALID_WEATHER_PRESETS = new Set<WeatherPresetId>([
+  'auto',
+  'clear',
+  'sunny',
+  'overcast',
+  'rainy',
+  'stormy',
+]);
+
+export function sanitizeWeatherPreset(val: unknown): WeatherPresetId {
+  return typeof val === 'string' && VALID_WEATHER_PRESETS.has(val as WeatherPresetId)
+    ? (val as WeatherPresetId)
+    : 'auto';
+}
+
+export function sanitizeTimeOfDayStart(val: unknown): TimeOfDayStartSetting {
+  if (val === 'auto' || val === undefined || val === null || val === '') return 'auto';
+  const n = typeof val === 'number' ? val : Number(val);
+  if (!Number.isFinite(n)) return 'auto';
+  const wrapped = ((n % 24) + 24) % 24;
+  return Number(wrapped.toFixed(2));
 }
 
 export function generateLobbyCode(): string {
@@ -322,6 +358,12 @@ export interface GamePlayerStatePacket {
   fireSeq: number;
   uniformId: OperatorUniformId;
   operatorId?: OperatorId;
+  glovesEnabled?: boolean;
+  gloveColor?: string;
+  helmetType?: 'mich' | 'mil_tec';
+  helmetColor?: string;
+  nvgMount?: 'none' | 'pvs7' | 'arnvg';
+  nvgFlipped?: boolean;
   lean: number; // -1..1
   weaponId: string;
   hp: number;
@@ -400,10 +442,19 @@ export interface GamePlayerRespawnPacket {
   maxHp: number;
   uniformId?: OperatorUniformId;
   operatorId?: OperatorId;
+  glovesEnabled?: boolean;
+  gloveColor?: string;
+  helmetType?: 'mich' | 'mil_tec';
+  helmetColor?: string;
+  nvgMount?: 'none' | 'pvs7' | 'arnvg';
+  nvgFlipped?: boolean;
   ts: number;
 }
 
 // === PHASE 5: HOST-AUTHORITATIVE AI BOT, ZOMBIE & KINO MAP SYNC PACKETS (20 HZ) ===
+
+export type BotWeaponVisualClass = 'pistol' | 'smg' | 'shotgun' | 'rifle';
+export type SquadCommsCategory = 'threat' | 'economy' | 'status' | 'ack';
 
 export interface SyncedBotState {
   id: string;
@@ -411,6 +462,11 @@ export interface SyncedBotState {
   team: 'A' | 'B' | 'FFA';
   uniformId: OperatorUniformId;
   operatorId?: OperatorId;
+  weaponId?: string;
+  weaponLabel?: string;
+  weaponClass?: BotWeaponVisualClass;
+  points?: number;
+  reloading?: boolean;
   x: number;
   y: number;
   z: number;
@@ -669,6 +725,50 @@ export interface GameTacticalPingPacket {
   ts: number;
 }
 
+export interface GameEnvSyncPacket {
+  type: 'game:env_sync';
+  senderUserId?: string;
+  senderIsHost?: boolean;
+  timeOfDayHours: number;
+  currentWeather: ActiveWeatherConditionId;
+  targetWeather: ActiveWeatherConditionId;
+  transitionProgress: number; // 0..1
+  weatherHoldRemainingSec: number;
+  windDirRad: number;
+  windSpeedMps: number;
+  rainIntensity: number;
+  wetness: number;
+  lightningFlash: number;
+  ts: number;
+}
+
+export interface GameGlassShatterPacket {
+  type: 'game:glass_shatter';
+  senderUserId?: string;
+  breakableId: string;
+  px: number;
+  py: number;
+  pz: number;
+  ts: number;
+}
+
+export interface GameBotCommsPacket {
+  type: 'game:bot_comms';
+  senderUserId?: string;
+  senderIsHost?: boolean;
+  botId: string;
+  callsign: string;
+  team: 'A' | 'B' | 'FFA';
+  category: SquadCommsCategory;
+  text: string;
+  pingKind?: TacticalPingKind | null;
+  pingLabel?: string | null;
+  px?: number;
+  py?: number;
+  pz?: number;
+  ts: number;
+}
+
 export type GameSyncPacket =
   | GamePlayerStatePacket
   | GamePlayerFirePacket
@@ -679,6 +779,7 @@ export type GameSyncPacket =
   | GameBotFirePacket
   | GameBotDamagePacket
   | GameBotHitPlayerPacket
+  | GameBotCommsPacket
   | GameZombieSpawnPacket
   | GameZombiesSyncPacket
   | GameBarrierRepairRequestPacket
@@ -691,6 +792,8 @@ export type GameSyncPacket =
   | GameMapInteractPacket
   | GameMapInteractRejectedPacket
   | GameMatchSyncPacket
-  | GameTacticalPingPacket;
+  | GameTacticalPingPacket
+  | GameEnvSyncPacket
+  | GameGlassShatterPacket;
 
 

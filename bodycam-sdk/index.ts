@@ -28,3 +28,4 @@ export * from './physics/ArticulatedRagdoll';
 export * from './equipment/TacticalEquipmentStore';
 export * from './equipment/TacticalEquipmentMesh';
 export * from './equipment/TacticalGrenadeSystem';
+export * from './TacticalPdaDevice';

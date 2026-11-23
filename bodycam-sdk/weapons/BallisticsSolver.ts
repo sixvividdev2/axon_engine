@@ -1027,9 +1027,11 @@ export class BallisticsSolver {
 
     // 0. Breakable Glass: shatter + immediate pass-through
     if (matId === 'glass') {
-      world.shatterBreakable?.(hit.object!, ev.point, this._stepDir);
+      if (hit.object && !hit.object.userData?.shattered) {
+        world.shatterBreakable?.(hit.object, ev.point, this._stepDir);
+      }
       p.vel.multiplyScalar(0.88);
-      p.pos.addScaledVector(this._stepDir, 0.03);
+      p.pos.addScaledVector(this._stepDir, 0.10);
       ev.outcome = 'penetrate';
       onImpact?.(ev);
       return;

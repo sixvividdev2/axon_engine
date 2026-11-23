@@ -124,6 +124,195 @@ export function normalizeOperatorId(val: unknown): OperatorId {
 }
 
 // ============================================================================
+// OPERATOR TACTICAL GEAR CUSTOMIZATION (Gloves, Helmets, NVG Mounts, Uniform)
+// ============================================================================
+
+export type OperatorGearUniformId = 'team_a' | 'team_b' | 'ffa' | 'infection';
+
+export type GloveColorId =
+  | 'charcoal'
+  | 'coyote'
+  | 'olive'
+  | 'slate'
+  | 'sand'
+  | 'crimson'
+  | 'uniform';
+
+export type HelmetTypeId = 'mich' | 'mil_tec';
+
+export type HelmetColorId =
+  | 'black'
+  | 'olive_drab'
+  | 'desert_tan'
+  | 'ranger_green'
+  | 'coyote_brown'
+  | 'uniform';
+
+export type NvgMountId = 'none' | 'pvs7' | 'arnvg';
+
+export interface OperatorGearConfig {
+  uniformId: OperatorGearUniformId;
+  glovesEnabled: boolean;
+  gloveColor: GloveColorId;
+  helmetType: HelmetTypeId;
+  helmetColor: HelmetColorId;
+  nvgMount: NvgMountId;
+}
+
+export const OPERATOR_GEAR_STORAGE_KEY = 'bfps.operator.gear.v1';
+
+export const DEFAULT_OPERATOR_GEAR: Readonly<OperatorGearConfig> = {
+  uniformId: 'team_a',
+  glovesEnabled: true,
+  gloveColor: 'charcoal',
+  helmetType: 'mil_tec',
+  helmetColor: 'black',
+  nvgMount: 'none',
+};
+
+export interface GloveColorSpec {
+  readonly id: GloveColorId;
+  readonly label: string;
+  readonly swatchHex: string;
+  readonly rgb: readonly [number, number, number];
+  readonly palmRgb: readonly [number, number, number];
+}
+
+export const GLOVE_COLOR_LIST: readonly GloveColorSpec[] = [
+  { id: 'charcoal', label: 'Charcoal', swatchHex: '#24272c', rgb: [32, 36, 42], palmRgb: [48, 52, 58] },
+  { id: 'coyote', label: 'Coyote', swatchHex: '#735c43', rgb: [98, 78, 56], palmRgb: [118, 96, 70] },
+  { id: 'olive', label: 'Olive Drab', swatchHex: '#4b553d', rgb: [62, 70, 50], palmRgb: [78, 82, 62] },
+  { id: 'slate', label: 'Navy Slate', swatchHex: '#334459', rgb: [44, 58, 76], palmRgb: [58, 72, 90] },
+  { id: 'sand', label: 'Desert Sand', swatchHex: '#a89474', rgb: [148, 130, 102], palmRgb: [164, 146, 118] },
+  { id: 'crimson', label: 'Oxblood', swatchHex: '#6b2828', rgb: [92, 34, 34], palmRgb: [74, 30, 30] },
+  { id: 'uniform', label: 'Match Kit', swatchHex: '#59636e', rgb: [44, 48, 52], palmRgb: [60, 62, 66] },
+] as const;
+
+export const GLOVE_COLOR_MAP: Readonly<Record<GloveColorId, GloveColorSpec>> = Object.fromEntries(
+  GLOVE_COLOR_LIST.map((s) => [s.id, s]),
+) as Record<GloveColorId, GloveColorSpec>;
+
+export interface HelmetTypeSpec {
+  readonly id: HelmetTypeId;
+  readonly label: string;
+  readonly shortLabel: string;
+  readonly hasMount: boolean;
+  readonly summary: string;
+}
+
+export const HELMET_TYPE_LIST: readonly HelmetTypeSpec[] = [
+  {
+    id: 'mich',
+    label: 'MICH-2000',
+    shortLabel: 'MICH',
+    hasMount: false,
+    summary: 'Full-cut ballistic shell with clean brow and no NVG shroud mount.',
+  },
+  {
+    id: 'mil_tec',
+    label: 'Mil-Tec High-Cut',
+    shortLabel: 'MIL-TEC',
+    hasMount: true,
+    summary: 'High-cut tactical helmet with side ARC rails, ear-pro, and Wilcox NVG shroud.',
+  },
+] as const;
+
+export interface HelmetColorSpec {
+  readonly id: HelmetColorId;
+  readonly label: string;
+  readonly swatchHex: string;
+  readonly hex: number;
+}
+
+export const HELMET_COLOR_LIST: readonly HelmetColorSpec[] = [
+  { id: 'black', label: 'Matte Black', swatchHex: '#1f2328', hex: 0x20242a },
+  { id: 'olive_drab', label: 'Olive Drab', swatchHex: '#434d36', hex: 0x3b4430 },
+  { id: 'desert_tan', label: 'Desert Tan', swatchHex: '#9c8868', hex: 0x8f7c5e },
+  { id: 'ranger_green', label: 'Ranger Green', swatchHex: '#4a5448', hex: 0x434d42 },
+  { id: 'coyote_brown', label: 'Coyote Brown', swatchHex: '#6b563f', hex: 0x614d38 },
+  { id: 'uniform', label: 'Match Kit', swatchHex: '#59636e', hex: 0x2c333c },
+] as const;
+
+export const HELMET_COLOR_MAP: Readonly<Record<HelmetColorId, HelmetColorSpec>> = Object.fromEntries(
+  HELMET_COLOR_LIST.map((s) => [s.id, s]),
+) as Record<HelmetColorId, HelmetColorSpec>;
+
+export interface NvgMountSpec {
+  readonly id: NvgMountId;
+  readonly label: string;
+  readonly shortLabel: string;
+  readonly phosphorLabel: string;
+  readonly summary: string;
+}
+
+export const NVG_MOUNT_LIST: readonly NvgMountSpec[] = [
+  {
+    id: 'none',
+    label: 'No Mount',
+    shortLabel: 'NONE',
+    phosphorLabel: 'Unaided',
+    summary: 'Empty Wilcox shroud with zero optical weight.',
+  },
+  {
+    id: 'pvs7',
+    label: 'AGM PVS-7 NL2 / NL1',
+    shortLabel: 'PVS-7',
+    phosphorLabel: 'Gen 2+ P43 Green',
+    summary: 'Classic bi-ocular housing with Gen 2+ tube, ABC auto-gating, and built-in IR illuminator.',
+  },
+  {
+    id: 'arnvg',
+    label: 'AB Nightvision RNVG-A (ARNVG)',
+    shortLabel: 'ARNVG',
+    phosphorLabel: 'MIL40 P45 White',
+    summary: '7075 aluminum articulating dual-tube kit with MIL-STD-810H durability and MIL40 white-phosphor optics.',
+  },
+] as const;
+
+const VALID_UNIFORMS = new Set<string>(['team_a', 'team_b', 'ffa', 'infection']);
+const VALID_GLOVE_COLORS = new Set<string>(GLOVE_COLOR_LIST.map((g) => g.id));
+const VALID_HELMET_TYPES = new Set<string>(['mich', 'mil_tec']);
+const VALID_HELMET_COLORS = new Set<string>(HELMET_COLOR_LIST.map((h) => h.id));
+const VALID_NVG_MOUNTS = new Set<string>(['none', 'pvs7', 'arnvg']);
+
+export function normalizeOperatorGearConfig(raw: unknown): OperatorGearConfig {
+  const obj = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {};
+  const uniformId: OperatorGearUniformId =
+    typeof obj.uniformId === 'string' && VALID_UNIFORMS.has(obj.uniformId)
+      ? (obj.uniformId as OperatorGearUniformId)
+      : DEFAULT_OPERATOR_GEAR.uniformId;
+  const glovesEnabled =
+    typeof obj.glovesEnabled === 'boolean' ? obj.glovesEnabled : DEFAULT_OPERATOR_GEAR.glovesEnabled;
+  const gloveColor: GloveColorId =
+    typeof obj.gloveColor === 'string' && VALID_GLOVE_COLORS.has(obj.gloveColor)
+      ? (obj.gloveColor as GloveColorId)
+      : DEFAULT_OPERATOR_GEAR.gloveColor;
+  const helmetType: HelmetTypeId =
+    typeof obj.helmetType === 'string' && VALID_HELMET_TYPES.has(obj.helmetType)
+      ? (obj.helmetType as HelmetTypeId)
+      : DEFAULT_OPERATOR_GEAR.helmetType;
+  const helmetColor: HelmetColorId =
+    typeof obj.helmetColor === 'string' && VALID_HELMET_COLORS.has(obj.helmetColor)
+      ? (obj.helmetColor as HelmetColorId)
+      : DEFAULT_OPERATOR_GEAR.helmetColor;
+  const rawNvg: NvgMountId =
+    typeof obj.nvgMount === 'string' && VALID_NVG_MOUNTS.has(obj.nvgMount)
+      ? (obj.nvgMount as NvgMountId)
+      : DEFAULT_OPERATOR_GEAR.nvgMount;
+  // MICH helmet has NO shroud mount — always enforce 'none'
+  const nvgMount: NvgMountId = helmetType === 'mil_tec' ? rawNvg : 'none';
+
+  return {
+    uniformId,
+    glovesEnabled,
+    gloveColor,
+    helmetType,
+    helmetColor,
+    nvgMount,
+  };
+}
+
+// ============================================================================
 // CANONICAL SHARED RIG CONTRACT (OperatorRigContract)
 // ============================================================================
 

@@ -2,7 +2,7 @@ import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { CharacterSkeleton } from '../CharacterSkeleton';
 import { OperatorUniformId } from '../TacticalUniforms';
-import { DEFAULT_OPERATOR_ID, OperatorId } from './OperatorTypes';
+import { DEFAULT_OPERATOR_ID, OperatorGearConfig, OperatorId } from './OperatorTypes';
 import {
   RigValidationMode,
   RigValidationReport,
@@ -24,6 +24,7 @@ export interface OperatorLoadOptions {
   readonly uniformId?: OperatorUniformId;
   readonly previewMode?: boolean;
   readonly validationMode?: RigValidationMode;
+  readonly gear?: Partial<OperatorGearConfig>;
   /** Optional drop-in `.glb` URL for DCC SkinnedMesh assets conforming to OperatorRigContract */
   readonly glbUrl?: string | null;
 }
@@ -64,7 +65,13 @@ export class OperatorAssetLoader {
     const previewMode = options?.previewMode ?? false;
     const validationMode = options?.validationMode ?? 'SAFE_FALLBACK';
 
-    const skeleton = new CharacterSkeleton(maxAniso, uniformId, requestedOperatorId, previewMode);
+    const skeleton = new CharacterSkeleton(
+      maxAniso,
+      uniformId,
+      requestedOperatorId,
+      previewMode,
+      options?.gear,
+    );
     const report = validateOperatorRig(skeleton.root, requestedOperatorId, validationMode);
 
     if (report.valid) {
@@ -82,7 +89,13 @@ export class OperatorAssetLoader {
     console.error('[OperatorAssetLoader] Rig contract validation failed — falling back to MALE', report);
     skeleton.dispose();
 
-    const fallbackSkeleton = new CharacterSkeleton(maxAniso, uniformId, DEFAULT_OPERATOR_ID, previewMode);
+    const fallbackSkeleton = new CharacterSkeleton(
+      maxAniso,
+      uniformId,
+      DEFAULT_OPERATOR_ID,
+      previewMode,
+      options?.gear,
+    );
     const fallbackReport = validateOperatorRig(fallbackSkeleton.root, DEFAULT_OPERATOR_ID, 'SAFE_FALLBACK');
     return {
       operatorId: DEFAULT_OPERATOR_ID,

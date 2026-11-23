@@ -753,8 +753,10 @@ function buildKinoTheater(
   addSolidBox(13.0, 5.4, -11.5, 0.45, 4.4, 3.4, matTheaterWall);
 
   // Ceilings + Architectural Coffered Beams
-  addSolidBox(0, H + 0.15, -1.0, 26.45, 0.3, 46.9, matCeiling);
-  addSolidBox(-17.5875, 4.4, -5.0, 8.725, 0.3, 37.9, matCeiling);
+  const mainCeiling = addSolidBox(0, H + 0.15, -1.0, 26.45, 0.3, 46.9, matCeiling);
+  mainCeiling.userData.isRoof = true;
+  const alleyCeiling = addSolidBox(-17.5875, 4.4, -5.0, 8.725, 0.3, 37.9, matCeiling);
+  alleyCeiling.userData.isRoof = true;
   for (const bz of [18, 12, 2, -6, -14, -20]) {
     const beam = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(25.0, 0.36, 0.42)), matCastIron);
     beam.position.set(0, H - 0.18, bz);

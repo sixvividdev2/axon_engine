@@ -24,16 +24,22 @@ import {
   GrenadeHoldStage,
   GYM_ARMORY_WEAPONS,
   IBodycamWorldAdapter,
+  IR_LAYER,
   LENS_PRESETS,
+  NvgMountId,
   operatorAssetLoader,
+  OperatorGearConfig,
   OperatorId,
   operatorSelectionStore,
+  PdaAllyMarker,
+  PdaPingMarker,
   resolveWeaponProfile,
   ScopePassParams,
   ScopeRenderer,
   solveZeroPitchRad,
   tacticalEquipmentStore,
   TacticalGrenadeSystem,
+  TacticalPdaDevice,
   WeaponRig,
 } from '../bodycam-sdk';
 import {
@@ -59,6 +65,7 @@ import { getGraphicsQualityProfile, graphicsQualityStore } from '../data/graphic
 import { killfeedPreferenceStore } from '../data/killfeedSettings';
 import { loadoutStore } from '../data/loadoutStore';
 import { SaveManager } from '../engine/persistence/SaveManager';
+import { WeatherTimeSystem } from '../engine/world/WeatherTimeSystem';
 import { getMapDefinitionById } from '../maps/MapRegistry';
 import {
   BattleMatchConfig,
@@ -70,10 +77,13 @@ import {
 import {
   GameBarrierRepairRequestPacket,
   GameBarrierUpdatePacket,
+  GameBotCommsPacket,
   GameBotDamagePacket,
   GameBotFirePacket,
   GameBotHitPlayerPacket,
   GameBotsSyncPacket,
+  GameEnvSyncPacket,
+  GameGlassShatterPacket,
   GameMapInteractPacket,
   GameMapInteractRejectedPacket,
   GameMapInteractRequestPacket,
@@ -94,6 +104,7 @@ import {
   OperatorUniformId,
   resolveOperatorUniformId,
   SpecialEventConfig,
+  SquadCommsCategory,
   SyncedAimStance,
   TacticalPingKind,
   TacticalPingTargetType,
@@ -104,6 +115,8 @@ import {
   BattleKillfeedEntry,
   BattleScoreEntry,
   BattleTeamId,
+  BotCommsEvent,
+  InfectionBotStatusSummary,
 } from './BattleBotAI';
 import { InfectionHumanTarget, InfectionZombieAI, ZombieRoundState } from './InfectionZombieAI';
 import { RemotePlayerManager } from './RemotePlayerManager';
@@ -126,6 +139,14 @@ export interface PointsPopup {
   id: number;
   amount: number;
   label: string;
+  timestampMs: number;
+}
+
+export interface SquadCommsMessage {
+  id: number;
+  callsign: string;
+  category: SquadCommsCategory;
+  text: string;
   timestampMs: number;
 }
 
@@ -268,6 +289,22 @@ export interface CombatSessionSnapshot {
   spectatingTargetName: string | null;
   livesRemaining: number;
   tacticalPings: ProjectedTacticalPing[];
+
+  // Weather, 5x Time-of-Day & 3D PDA
+  supportsDynamicWeatherTime: boolean;
+  gameClockText: string;
+  weatherLabel: string;
+  windSpeedMps: number;
+  isPdaOpen: boolean;
+
+  // Squad Radio Comms & Infection Bot Economy Telemetry
+  squadComms: SquadCommsMessage[];
+  infectionSquadBots: InfectionBotStatusSummary[];
+
+  // Helmet-Mounted Night Vision & IR Illuminator
+  nvgMount: NvgMountId;
+  nvgActive: boolean;
+  irIlluminatorOn: boolean;
 }
 
 type SnapshotListener = (snap: CombatSessionSnapshot) => void;
@@ -304,6 +341,11 @@ export class CombatSessionEngine {
   private readonly scopeRenderer: ScopeRenderer;
   private readonly ballistics: BallisticsSolver;
   private readonly grenadeSystem: TacticalGrenadeSystem;
+  private readonly pdaDevice: TacticalPdaDevice;
+  private readonly weatherTime: WeatherTimeSystem | null = null;
+  private envSyncAccum = 0;
+  private readonly _pdaAllyBuf: PdaAllyMarker[] = [];
+  private readonly _pdaPingBuf: PdaPingMarker[] = [];
   private unsubTacticalEquipment: (() => void) | null = null;
   private tacticalEquipmentId: TacticalEquipmentId;
   private tacticalBeltSlot: TacticalBeltSlot;
@@ -313,6 +355,8 @@ export class CombatSessionEngine {
 
   private readonly botAI: BattleBotAI | null = null;
   private readonly zombieAI: InfectionZombieAI | null = null;
+  private squadComms: SquadCommsMessage[] = [];
+  private nextSquadCommsId = 1;
   private readonly mp: MultiplayerSessionBridge | null = null;
   private readonly remotePlayers: RemotePlayerManager | null = null;
   private unsubMpMessages: (() => void) | null = null;
@@ -375,6 +419,12 @@ export class CombatSessionEngine {
   private activeSlotIndex = 0;
   private equippedWeaponId = 'm4a1';
   private flashlightOn = false;
+  private localGear: OperatorGearConfig;
+  private readonly irIlluminatorLight: THREE.SpotLight;
+  private readonly irIlluminatorTarget = new THREE.Object3D();
+  private nvgFlipped = false;
+  private irIlluminatorOn = false;
+  private unsubOperatorGear: (() => void) | null = null;
 
   // Player health & combat state
   private hp = 100;
@@ -590,8 +640,10 @@ export class CombatSessionEngine {
           isClientReplica,
           maxAnisotropy,
           worldAdapter: this.adapter,
+          localAllyTeam: this.localBattleTeam,
         },
       );
+      this.botAI.setBotCommsListener((ev) => this.handleLocalBotComms(ev));
     } else {
       this.zombieAI = new InfectionZombieAI(this.scene, this.map, this.audio, {
         zombieHealthMult: evCfg?.zombieHealthMult,
@@ -621,8 +673,10 @@ export class CombatSessionEngine {
             maxAnisotropy,
             coopInfectionMode: true,
             worldAdapter: this.adapter,
+            localAllyTeam: 'A',
           },
         );
+        this.botAI.setBotCommsListener((ev) => this.handleLocalBotComms(ev));
         this.botAI.setInfectionZones(
           this.zombieAI.getUnlockedZoneIds(),
           this.zombieAI.getOpenedDoorIds(),
@@ -636,11 +690,13 @@ export class CombatSessionEngine {
     this.scene.add(this.weaponRig.root);
 
     this.localOperatorId = operatorSelectionStore.getSelectedOperator();
+    this.localGear = operatorSelectionStore.getGearConfig();
     const loadedOp = operatorAssetLoader.loadProceduralOperator(
       this.localOperatorId,
       {
         maxAnisotropy,
         uniformId: this.localUniformId,
+        gear: this.localGear,
         previewMode: false,
         validationMode: 'SAFE_FALLBACK',
       },
@@ -650,8 +706,78 @@ export class CombatSessionEngine {
     this.skeleton.enableArmViewmodelLayer();
     this.scene.add(this.skeleton.root);
 
+    // Helmet-mounted IR illuminator (strictly on IR_LAYER — invisible to naked eye, illuminates under NVGs)
+    this.irIlluminatorLight = new THREE.SpotLight(
+      0xdceeff,
+      7.5,
+      44,
+      THREE.MathUtils.degToRad(36),
+      0.56,
+      1.35,
+    );
+    this.irIlluminatorLight.position.set(0.05, 0.08, -0.05);
+    this.irIlluminatorTarget.position.set(0, -0.04, -12);
+    this.irIlluminatorLight.target = this.irIlluminatorTarget;
+    this.irIlluminatorLight.visible = false;
+    this.irIlluminatorLight.layers.set(IR_LAYER);
+    this.camera.add(this.irIlluminatorLight);
+    this.camera.add(this.irIlluminatorTarget);
+
+    this.unsubOperatorGear = operatorSelectionStore.subscribeGear((nextGear) => {
+      this.localGear = nextGear;
+      this.skeleton.applyGearConfig(nextGear);
+      if (nextGear.nvgMount === 'none') {
+        this.nvgFlipped = false;
+        this.irIlluminatorOn = false;
+      }
+      this.syncNvgRuntime();
+      this.emitSnapshot();
+    });
+
     this.animator = new CharacterAnimator(this.skeleton, this.weaponRig, this.audio);
     this.controller = new BodycamController(this.camera, this.weaponRig, this.audio);
+    this.pdaDevice = new TacticalPdaDevice(this.audio);
+    this.camera.add(this.pdaDevice.root);
+    this.animator.setPdaDevice(this.pdaDevice);
+
+    let hemiLight: THREE.HemisphereLight | null = null;
+    let keyLight: THREE.DirectionalLight | null = null;
+    this.map.sceneGroup.traverse((obj) => {
+      if (!hemiLight && obj instanceof THREE.HemisphereLight) hemiLight = obj;
+      else if (!keyLight && obj instanceof THREE.DirectionalLight) keyLight = obj;
+    });
+    if (this.map.supportsDynamicWeatherTime && hemiLight && keyLight) {
+      const reqWeather =
+        evCfg?.weatherPreset ??
+        (params.mode === 'battle'
+          ? params.battleConfig.weatherPreset
+          : params.infectionConfig.weatherPreset);
+      const reqTime =
+        evCfg?.timeOfDayStart ??
+        (params.mode === 'battle'
+          ? params.battleConfig.timeOfDayStart
+          : params.infectionConfig.timeOfDayStart);
+      this.weatherTime = new WeatherTimeSystem({
+        scene: this.scene,
+        renderer: this.renderer,
+        hemiLight,
+        keyLight,
+        baseFogDensity: this.map.lightingPreset.fogDensity,
+        baseEnvIntensity: this.map.lightingPreset.envIntensity,
+        supportsDynamicWeatherTime: true,
+        weatherPreset: reqWeather,
+        timeOfDayStart: reqTime,
+        graphicsQuality: activeQuality,
+        isSoftwareGl: this.isSoftwareGl,
+        interiorZones: this.map.physics.getInteriorZones(),
+        windUniforms: this.map.envBindings?.windUniforms ?? null,
+        waterUniforms: this.map.envBindings?.waterUniforms ?? null,
+        wettableSurfaces: this.map.envBindings?.wettableSurfaces,
+        nightLights: this.map.envBindings?.nightLights,
+        audio: this.audio,
+      });
+      this.weatherTime.update(0.016, this.camera.position, this.isMpHost || !this.mp);
+    }
     this.postProcess = new BodycamPostProcess(
       this.renderer,
       this.scene,
@@ -800,8 +926,19 @@ export class CombatSessionEngine {
       this.equipSlot(0, true);
     }
 
-    // Place player at map starting spawn
+    // Place player at map starting spawn & capture clean orthographic Tac-Map for 3D PDA
     this.spawnPlayerAtStart();
+    this.pdaDevice.captureOrthographicMap({
+      renderer: this.renderer,
+      scene: this.scene,
+      bounds: {
+        minX: this.map.physics.boundsMinX,
+        maxX: this.map.physics.boundsMaxX,
+        minZ: this.map.physics.boundsMinZ,
+        maxZ: this.map.physics.boundsMaxZ,
+      },
+      excludeObjects: [this.skeleton.root, this.weaponRig.root, this.pdaDevice.root],
+    });
 
     // Pre-warm WebGL shaders once at boot on hardware GPUs to eliminate mid-combat GLSL compile hitches
     if (!this.isSoftwareGl) {
@@ -937,6 +1074,7 @@ export class CombatSessionEngine {
       meleeSpherecast: (origin, direction, _radius, maxDistance, outResult) =>
         raycastWithActors(origin, direction, 0.05, maxDistance, outResult),
       onMeleeHit: (ev) => this.handleMeleeHit(ev),
+      shatterBreakable: (obj, pt, dir) => this.handleWorldGlassShatter(obj, pt, dir),
     };
   }
 
@@ -1033,6 +1171,9 @@ export class CombatSessionEngine {
   }
 
   private equipSlot(slotIdx: number, silent = false): void {
+    if (this.pdaDevice.isOpen()) {
+      this.pdaDevice.setOpen(false);
+    }
     if (this.grenadeSystem.isDrawn()) {
       this.handleGrenadeHolsterOrToss();
     }
@@ -1160,6 +1301,12 @@ export class CombatSessionEngine {
       fireSeq: this.localFireSeq,
       uniformId: this.localUniformId,
       operatorId: this.localOperatorId,
+      glovesEnabled: this.localGear.glovesEnabled,
+      gloveColor: this.localGear.gloveColor,
+      helmetType: this.localGear.helmetType,
+      helmetColor: this.localGear.helmetColor,
+      nvgMount: this.localGear.nvgMount,
+      nvgFlipped: this.nvgFlipped && this.localGear.nvgMount !== 'none',
       lean,
       weaponId: this.equippedWeaponId,
       hp: Math.round(this.hp),
@@ -1270,6 +1417,40 @@ export class CombatSessionEngine {
     if (type === 'game:bot_fire' && this.botAI && !this.isMpHost) {
       const pkt = raw as unknown as GameBotFirePacket;
       this.botAI.playRemoteBotFire(pkt.botId, pkt.ox, pkt.oy, pkt.oz, pkt.ex, pkt.ey, pkt.ez);
+      return;
+    }
+
+    if (type === 'game:bot_comms' && !this.isMpHost) {
+      const pkt = raw as unknown as GameBotCommsPacket;
+      if (!pkt.senderIsHost) return;
+      if (this.params.mode === 'battle') {
+        if (this.params.battleConfig.rule === 'ffa') return;
+        if (pkt.team !== this.localBattleTeam) return;
+      }
+      this.pushSquadComms(pkt.callsign, pkt.category, pkt.text);
+      this.audio.playSquadRadioChirp(pkt.category);
+      if (
+        pkt.pingKind &&
+        typeof pkt.px === 'number' &&
+        typeof pkt.py === 'number' &&
+        typeof pkt.pz === 'number'
+      ) {
+        this.upsertTacticalPing({
+          id: `bot:${pkt.botId}:${this.nextSquadCommsId}`,
+          senderId: `bot:${pkt.botId}`,
+          senderName: pkt.callsign,
+          isLocal: false,
+          kind: pkt.pingKind,
+          label: (pkt.pingLabel || 'CONTACT').toUpperCase().slice(0, 26),
+          worldPos: new THREE.Vector3(pkt.px, pkt.py, pkt.pz),
+          targetEntityType: null,
+          targetEntityId: null,
+          ageSec: 0,
+          durationSec: 8.5,
+          lostTargetTimer: 0,
+        });
+      }
+      this.emitSnapshot();
       return;
     }
 
@@ -1676,6 +1857,29 @@ export class CombatSessionEngine {
         }
       }
       this.emitSnapshot();
+      return;
+    }
+
+    if (type === 'game:env_sync' && this.weatherTime) {
+      const pkt = raw as unknown as GameEnvSyncPacket;
+      if (!pkt.senderIsHost) return;
+      this.weatherTime.applyHostSyncState({
+        activeWeather: pkt.currentWeather,
+        targetWeather: pkt.targetWeather,
+        transitionAlpha: pkt.transitionProgress,
+        gameTimeHours: pkt.timeOfDayHours,
+        windAngleRad: pkt.windDirRad,
+        windSpeedMps: pkt.windSpeedMps,
+        wetness: pkt.wetness,
+      });
+      return;
+    }
+
+    if (type === 'game:glass_shatter') {
+      const pkt = raw as unknown as GameGlassShatterPacket;
+      if (pkt.senderUserId === this.mp.localUserId) return;
+      this._tmpImpactPoint.set(pkt.px, pkt.py, pkt.pz);
+      this.handleWorldGlassShatter(pkt.breakableId, this._tmpImpactPoint, undefined, true);
     }
   }
 
@@ -1957,7 +2161,49 @@ export class CombatSessionEngine {
     this.emitSnapshot();
   }
 
+  private handleWorldGlassShatter(
+    objOrId: THREE.Object3D | string,
+    point?: Readonly<THREE.Vector3>,
+    _dir?: Readonly<THREE.Vector3>,
+    fromRemote = false,
+  ): boolean {
+    if (!this.map.shatterBreakable) return false;
+    const res = this.map.shatterBreakable(objOrId, point);
+    if (!res) return false;
+    this.audio.playGlassShatter(res.impactPoint, 0.95);
+    if (!fromRemote && this.mp) {
+      const pkt: GameGlassShatterPacket = {
+        type: 'game:glass_shatter',
+        breakableId: res.breakableId,
+        px: Number(res.impactPoint.x.toFixed(3)),
+        py: Number(res.impactPoint.y.toFixed(3)),
+        pz: Number(res.impactPoint.z.toFixed(3)),
+        ts: Date.now(),
+      };
+      this.mp.sendMessage(pkt as unknown as Record<string, unknown>);
+    }
+    return true;
+  }
+
   private handleGrenadeDetonation(ev: GrenadeDetonationEvent): void {
+    // 0. Shatter breakable glass panes inside frag/thermite/flash blast radius
+    if (
+      this.map.shatterBreakable &&
+      !ev.isTick &&
+      (ev.kind === 'frag' || ev.kind === 'thermite' || ev.kind === 'flash')
+    ) {
+      const blastGlassR = Math.max(ev.radiusM, 6.5);
+      const meshesCopy = this.map.raycastMeshes.slice();
+      for (let i = 0; i < meshesCopy.length; i++) {
+        const m = meshesCopy[i];
+        if (!m.userData?.breakableGlass || m.userData.shattered) continue;
+        m.getWorldPosition(this._tmpImpactPoint);
+        if (this._tmpImpactPoint.distanceTo(ev.position) <= blastGlassR) {
+          this.handleWorldGlassShatter(m, this._tmpImpactPoint);
+        }
+      }
+    }
+
     // 1. Battle AI Bots AoE blast (with 44-ray cover-occluded M67 fragmentation evaluator)
     if (this.params.mode === 'battle' && this.botAI) {
       const attackerName = this.mp?.localUsername ?? 'YOU';
@@ -2109,6 +2355,7 @@ export class CombatSessionEngine {
           );
           if (exposure.intensity > 0.05) {
             this.postProcess.triggerFlashbangOverload(exposure.intensity);
+            this.postProcess.triggerNvgFlashSpike(1.0);
             this.audio.playFlashbangTinnitus(exposure.intensity);
             this.flashBlindAlpha = Math.max(
               this.flashBlindAlpha,
@@ -2360,7 +2607,13 @@ export class CombatSessionEngine {
       return;
     }
 
-    // Static environment surface audio
+    // Static environment breakable glass + surface audio (already shattered in BallisticsSolver when hit)
+    if (ev.material === 'glass' || ud?.breakableGlass || ud?.breakableId) {
+      if (obj && !ud?.shattered) {
+        this.handleWorldGlassShatter(obj, ev.point, ev.incomingDir);
+      }
+      return;
+    }
     if (ev.material === 'steel') this.audio.playImpact(ev.point, 'metal');
     else if (ev.material === 'wood') this.audio.playImpact(ev.point, 'wood');
     else this.audio.playImpact(ev.point, 'concrete');
@@ -3146,7 +3399,7 @@ export class CombatSessionEngine {
   }
 
   private startReload(): void {
-    if (!this.playerAlive || this.weaponRig.isSuppressorActionActive()) return;
+    if (!this.playerAlive || this.pdaDevice.isBlockingWeaponActions() || this.weaponRig.isSuppressorActionActive()) return;
     const prof = this._runtimeProfile;
     if (prof.magCapacity <= 0 || this.reloadTimer > 0 || this.controller.isVaulting()) return;
     const curMag = this.magAmmoByWeapon[prof.id] ?? 0;
@@ -3165,7 +3418,7 @@ export class CombatSessionEngine {
 
   private attemptFire(): void {
     if (!this.playerAlive || this.gameOver || this.matchOutcome !== 'active') return;
-    if (this.weaponRig.isSuppressorActionActive()) return;
+    if (this.pdaDevice.isBlockingWeaponActions() || this.weaponRig.isSuppressorActionActive()) return;
     const prof = this._runtimeProfile;
 
     if (prof.holdClass === 'unarmed') {
@@ -3230,6 +3483,9 @@ export class CombatSessionEngine {
     });
 
     this.weaponRig.triggerFire(suppressed, remaining);
+    if (!suppressed) {
+      this.postProcess.triggerNvgFlashSpike(0.55);
+    }
     this.controller.applyRecoil(
       prof.recoilPitchRad,
       prof.recoilYawRad,
@@ -3303,6 +3559,7 @@ export class CombatSessionEngine {
       !this.playerAlive ||
       this.gameOver ||
       this.matchOutcome !== 'active' ||
+      this.pdaDevice.isBlockingWeaponActions() ||
       this.controller.isVaulting() ||
       this.reloadTimer > 0
     ) {
@@ -3377,10 +3634,76 @@ export class CombatSessionEngine {
     this.emitSnapshot();
   };
 
+  private togglePda(): void {
+    if (!this.playerAlive || this.gameOver || this.matchOutcome !== 'active') return;
+    const next = !this.pdaDevice.isOpen();
+    if (next) {
+      if (this.grenadeSystem.isDrawn() && !this.grenadeSystem.isPinPulled()) {
+        this.handleGrenadeHolsterOrToss();
+      }
+      this.isFiring = false;
+      this.input.ads = false;
+      this.reloadTimer = 0;
+    }
+    this.pdaDevice.setOpen(next);
+    this.emitSnapshot();
+  }
+
+  private syncNvgRuntime(): void {
+    const mount = this.localGear.nvgMount;
+    const active = this.playerAlive && mount !== 'none' && this.nvgFlipped;
+    const irActive = active && this.irIlluminatorOn;
+    this.skeleton.setNvgFlipped(active);
+    this.postProcess.setNvgState(mount, active, irActive);
+    this.irIlluminatorLight.visible = irActive;
+    this.weaponRig.setNvgOpticalActive(active);
+    this.weaponRig.setIrLaserActive(irActive);
+    this.audio.setNvgTubeHum(active);
+  }
+
+  private toggleNvg(): void {
+    if (!this.playerAlive || this.gameOver || this.matchOutcome !== 'active' || this.tunerOpen) {
+      return;
+    }
+    if (this.localGear.nvgMount === 'none') {
+      this.showToast('No NVG Mounted — Equip Mil-Tec + NVG in Operator Screen');
+      return;
+    }
+    this.nvgFlipped = !this.nvgFlipped;
+    if (!this.nvgFlipped) {
+      this.irIlluminatorOn = false;
+    }
+    this.audio.playNvgFlipSound(this.nvgFlipped);
+    this.syncNvgRuntime();
+    if (this.mp) {
+      this.broadcastLocalState20Hz();
+    }
+    const label = this.localGear.nvgMount === 'arnvg' ? 'RNVG-A (P45)' : 'PVS-7 NL2 (P43)';
+    this.showToast(this.nvgFlipped ? `${label} Deployed · [N] IR Flood` : `${label} Stowed`);
+    this.emitSnapshot();
+  }
+
+  private toggleIrIlluminator(): void {
+    if (!this.nvgFlipped || this.localGear.nvgMount === 'none') {
+      this.showToast('Deploy NVG [J] to use IR Illuminator');
+      return;
+    }
+    this.irIlluminatorOn = !this.irIlluminatorOn;
+    this.audio.playIrIlluminatorClick(this.irIlluminatorOn);
+    this.syncNvgRuntime();
+    this.showToast(this.irIlluminatorOn ? 'IR Illuminator + IR Laser: ON' : 'IR Illuminator: OFF');
+    this.emitSnapshot();
+  }
+
   private readonly onMouseMove = (e: MouseEvent): void => {
     if (!this.pointerLocked || !this.playerAlive) return;
     const dx = THREE.MathUtils.clamp(e.movementX, -140, 140);
     const dy = THREE.MathUtils.clamp(e.movementY, -140, 140);
+    if (this.pdaDevice.isOpen()) {
+      this.pdaDevice.applyMouseDelta(dx, dy);
+      this.controller.handleMouseMove(dx * 0.25, dy * 0.25, this.config);
+      return;
+    }
     this.controller.handleMouseMove(dx, dy, this.config);
   };
 
@@ -3395,6 +3718,13 @@ export class CombatSessionEngine {
     }
     if (!this.pointerLocked || !this.playerAlive) return;
     this.audio.ensureInitialized();
+
+    if (this.pdaDevice.isBlockingWeaponActions()) {
+      if (e.button === 2 && this.pdaDevice.isOpen()) {
+        this.pdaDevice.recenterOnPlayer();
+      }
+      return;
+    }
 
     // Authentic 4-stage grenade Manual of Arms when grenade is drawn
     if (this.grenadeSystem.isDrawn()) {
@@ -3449,6 +3779,11 @@ export class CombatSessionEngine {
   };
 
   private readonly onWheel = (e: WheelEvent): void => {
+    if (this.pointerLocked && this.pdaDevice.isOpen()) {
+      e.preventDefault();
+      this.pdaDevice.applyWheel(e.deltaY);
+      return;
+    }
     if (this.pointerLocked && this.controller.isAds && this.weaponRig.hasVariableZoom()) {
       e.preventDefault();
       this.weaponRig.cycleOpticZoom(e.deltaY < 0 ? 1 : -1, true);
@@ -3546,13 +3881,22 @@ export class CombatSessionEngine {
         if (!e.repeat) this.toggleLaser();
         break;
       case 'KeyR':
-        if (!e.repeat) this.startReload();
+        if (!e.repeat) {
+          if (this.pdaDevice.isOpen()) {
+            this.pdaDevice.recenterOnPlayer();
+          } else {
+            this.startReload();
+          }
+        }
+        break;
+      case 'KeyM':
+        if (!e.repeat) this.togglePda();
         break;
       case 'KeyG':
-        if (!e.repeat) this.toggleSuppressor();
+        if (!e.repeat && !this.pdaDevice.isBlockingWeaponActions()) this.toggleSuppressor();
         break;
       case 'KeyB':
-        if (!e.repeat && this.weaponRig.hasCantedOptic()) {
+        if (!e.repeat && !this.pdaDevice.isBlockingWeaponActions() && this.weaponRig.hasCantedOptic()) {
           const id = this._runtimeProfile.id;
           const next: AdsMode = (this.adsModeByWeapon[id] ?? 'PRIMARY') === 'CANTED' ? 'PRIMARY' : 'CANTED';
           this.adsModeByWeapon[id] = next;
@@ -3561,15 +3905,27 @@ export class CombatSessionEngine {
           this.emitSnapshot();
         }
         break;
+      case 'KeyJ':
+        if (!e.repeat) this.toggleNvg();
+        break;
       case 'KeyN':
         if (!e.repeat) {
-          this.weaponRig.toggleReticleIllumination();
-          this.audio.playTacticalSwitchClick(true);
-          this.emitSnapshot();
+          if (this.nvgFlipped && !e.altKey) {
+            this.toggleIrIlluminator();
+          } else if (!this.pdaDevice.isBlockingWeaponActions()) {
+            this.weaponRig.toggleReticleIllumination();
+            this.audio.playTacticalSwitchClick(true);
+            this.emitSnapshot();
+          }
         }
         break;
       case 'KeyV':
-        if (!e.repeat && !this.controller.isVaulting() && !this.weaponRig.isSuppressorActionActive()) {
+        if (
+          !e.repeat &&
+          !this.pdaDevice.isBlockingWeaponActions() &&
+          !this.controller.isVaulting() &&
+          !this.weaponRig.isSuppressorActionActive()
+        ) {
           if (this._runtimeProfile.holdClass === 'unarmed') {
             this.animator.triggerUnarmedPunch(this.controller, false);
           } else if (this.animator.triggerArmedBash(this.controller, this._runtimeProfile.holdClass)) {
@@ -3783,6 +4139,10 @@ export class CombatSessionEngine {
     });
 
     this.audio.playTacticalPing(kind);
+    // Allied AI bots acknowledge and respond to the player's tactical ping
+    if (this.params.mode === 'infection' || (this.params.mode === 'battle' && this.params.battleConfig.rule === 'tdm')) {
+      this.botAI?.notifyPlayerPing(kind, pingPos, label);
+    }
 
     if (this.mp) {
       const pkt: GameTacticalPingPacket = {
@@ -3801,6 +4161,68 @@ export class CombatSessionEngine {
     }
 
     this.updateAndProjectPings(0);
+    this.emitSnapshot();
+  }
+
+  private pushSquadComms(callsign: string, category: SquadCommsCategory, text: string): void {
+    const now = performance.now();
+    this.squadComms = this.squadComms.filter((m) => now - m.timestampMs < 7500);
+    this.squadComms.push({
+      id: this.nextSquadCommsId++,
+      callsign: callsign.toUpperCase().slice(0, 16),
+      category,
+      text: text.slice(0, 84),
+      timestampMs: now,
+    });
+    if (this.squadComms.length > 4) {
+      this.squadComms.shift();
+    }
+  }
+
+  private handleLocalBotComms(ev: BotCommsEvent): void {
+    if (this.params.mode === 'battle' && this.params.battleConfig.rule === 'ffa') return;
+
+    // Broadcast to multiplayer clients first if host (clients filter by their own team)
+    if (this.mp && this.isMpHost) {
+      const pkt: GameBotCommsPacket = {
+        type: 'game:bot_comms',
+        botId: ev.botId,
+        callsign: ev.callsign,
+        team: ev.team,
+        category: ev.category,
+        text: ev.text,
+        pingKind: ev.pingKind ?? null,
+        pingLabel: ev.pingLabel ?? null,
+        px: ev.pingPos ? Number(ev.pingPos.x.toFixed(2)) : undefined,
+        py: ev.pingPos ? Number(ev.pingPos.y.toFixed(2)) : undefined,
+        pz: ev.pingPos ? Number(ev.pingPos.z.toFixed(2)) : undefined,
+        ts: Date.now(),
+      };
+      this.mp.sendMessage(pkt as unknown as Record<string, unknown>);
+    }
+
+    // Filter local HUD/audio/ping display to allied team only
+    if (this.params.mode === 'battle' && ev.team !== this.localBattleTeam) return;
+
+    this.pushSquadComms(ev.callsign, ev.category, ev.text);
+    this.audio.playSquadRadioChirp(ev.category);
+
+    if (ev.pingKind && ev.pingPos) {
+      this.upsertTacticalPing({
+        id: `bot:${ev.botId}:${this.nextSquadCommsId}`,
+        senderId: `bot:${ev.botId}`,
+        senderName: ev.callsign,
+        isLocal: false,
+        kind: ev.pingKind,
+        label: (ev.pingLabel || 'CONTACT').toUpperCase().slice(0, 26),
+        worldPos: ev.pingPos.clone(),
+        targetEntityType: null,
+        targetEntityId: null,
+        ageSec: 0,
+        durationSec: 8.5,
+        lostTargetTimer: 0,
+      });
+    }
     this.emitSnapshot();
   }
 
@@ -4108,6 +4530,7 @@ export class CombatSessionEngine {
         }
         this.equipSlot(Math.max(0, this.activeSlotIndex), true);
         this.spawnPlayerAtStart();
+        this.syncNvgRuntime();
         this.showToast('Respawned');
         if (this.mp) {
           const rspPkt: GamePlayerRespawnPacket = {
@@ -4120,6 +4543,12 @@ export class CombatSessionEngine {
             maxHp: this.maxHp,
             uniformId: this.localUniformId,
             operatorId: this.localOperatorId,
+            glovesEnabled: this.localGear.glovesEnabled,
+            gloveColor: this.localGear.gloveColor,
+            helmetType: this.localGear.helmetType,
+            helmetColor: this.localGear.helmetColor,
+            nvgMount: this.localGear.nvgMount,
+            nvgFlipped: this.nvgFlipped && this.localGear.nvgMount !== 'none',
             ts: Date.now(),
           };
           this.mp.sendMessage(rspPkt as unknown as Record<string, unknown>);
@@ -4171,12 +4600,20 @@ export class CombatSessionEngine {
     }
 
     const suppBusy = this.weaponRig.isSuppressorActionActive();
-    if (suppBusy) {
+    const pdaBusy = this.pdaDevice.isBlockingWeaponActions();
+    if (suppBusy || pdaBusy) {
       this.input.ads = false;
     }
-    this.input.adsMode = this.adsModeByWeapon[prof.id] ?? 'PRIMARY';
+    const baseAdsMode = this.adsModeByWeapon[prof.id] ?? 'PRIMARY';
+    const nodsForceCant =
+      this.nvgFlipped &&
+      this.localGear.nvgMount !== 'none' &&
+      this.input.ads &&
+      baseAdsMode === 'PRIMARY' &&
+      this.weaponRig.shouldForceNodsCantedAim(true);
+    this.input.adsMode = nodsForceCant ? 'POINT_AIM' : baseAdsMode;
     this.input.sprint = !suppBusy && this.shiftHeld && !this.input.ads;
-    this.input.holdBreath = !suppBusy && this.input.ads && (this.shiftHeld || this.altHeld);
+    this.input.holdBreath = !suppBusy && !pdaBusy && this.input.ads && (this.shiftHeld || this.altHeld);
 
     // In multiplayer, world stays live continuously even when Esc pause overlay is open
     const simActive =
@@ -4184,7 +4621,7 @@ export class CombatSessionEngine {
       !this.gameOver &&
       this.matchOutcome === 'active';
 
-    // Step player controller & IK animator
+    // Step player controller, 3D PDA telemetry + choreography, & IK animator
     if (this.playerAlive) {
       this.controller.update(
         dt,
@@ -4199,9 +4636,17 @@ export class CombatSessionEngine {
           this.stamina = Math.max(0, this.stamina - drain);
         },
       );
+
+      this.updatePdaTelemetry(dt);
       this.animator.update(dt, this.elapsedSec, this.controller, this.adapter, prof, this.input.ads);
       this.animator.applyCameraAdditiveOverlay(this.camera);
     } else {
+      if (this.pdaDevice.isOpen()) {
+        this.pdaDevice.setOpen(false);
+      }
+      if (this.postProcess.isNvgActive() || this.irIlluminatorLight.visible) {
+        this.syncNvgRuntime();
+      }
       if (this.playerRagdoll.isActive()) {
         this.playerRagdoll.step(dt, this.map.physics, this.map.terrainHeightAt);
         this.playerRagdoll.syncToSkeleton(this.skeleton);
@@ -4233,7 +4678,8 @@ export class CombatSessionEngine {
       }
     }
 
-    this.weaponRig.root.visible = this.playerAlive && !this.grenadeSystem.isDrawn();
+    this.weaponRig.root.visible =
+      this.playerAlive && !this.grenadeSystem.isDrawn() && !this.pdaDevice.isWeaponHidden();
     this.skeleton.root.visible = this.playerAlive || this.playerRagdoll.isActive();
 
     // Step drift-free 20 Hz multiplayer broadcast (+ immediate flush on stance/fire/reload transitions)
@@ -4278,8 +4724,34 @@ export class CombatSessionEngine {
       this.remotePlayers.update(dt, this.camera.position);
     }
 
-    // Step map animated fixtures (flickering Pripyat fluorescents, theater beams)
+    // Step map animated fixtures & dynamic 5x weather/day-night system (+ 1 Hz MP Host broadcast)
     this.map.update?.(dt, this.elapsedSec);
+    if (this.weatherTime) {
+      this.weatherTime.update(dt, this.camera.position, this.isMpHost || !this.mp);
+      if (this.mp && this.isMpHost) {
+        this.envSyncAccum += dt;
+        if (this.envSyncAccum >= 1.0) {
+          this.envSyncAccum = 0;
+          const st = this.weatherTime.getSyncState();
+          const envPkt: GameEnvSyncPacket = {
+            type: 'game:env_sync',
+            timeOfDayHours: st.gameTimeHours,
+            currentWeather: st.activeWeather,
+            targetWeather: st.targetWeather,
+            transitionProgress: st.transitionAlpha,
+            weatherHoldRemainingSec: 0,
+            windDirRad: st.windAngleRad,
+            windSpeedMps: st.windSpeedMps,
+            rainIntensity:
+              st.activeWeather === 'stormy' ? 1 : st.activeWeather === 'rainy' ? 0.65 : 0,
+            wetness: st.wetness,
+            lightningFlash: 0,
+            ts: Date.now(),
+          };
+          this.mp.sendMessage(envPkt as unknown as Record<string, unknown>);
+        }
+      }
+    }
 
     // Step BallisticsSolver & Tactical Grenade Physics
     this.ballistics.update(dt, this.adapter, (ev) => this.handleBallisticImpact(ev));
@@ -4396,6 +4868,7 @@ export class CombatSessionEngine {
             this.addPoints(bonus, `ROUND ${completedRound} BONUS`);
             this.replenishInfectionRoundGrenade();
             this.botAI?.reviveAllDownedBots(this.controller.position);
+            this.botAI?.awardInfectionRoundBonus(bonus, completedRound);
             this.showToast(`Round ${completedRound} Cleared · +${bonus} PTS · +1 Grenade`, 3.4);
             if (this.spectating && !this.playerAlive && !this.gameOver) {
               this.reviveCoopInfectionPlayer(completedRound + 1);
@@ -4432,6 +4905,7 @@ export class CombatSessionEngine {
         // Step friendly co-op AI squadmates fighting alongside humans against the zombie horde
         if (this.botAI) {
           const zombieTargets = this.zombieAI.getAliveZombieTargets();
+          const roundState = this.zombieAI.getRoundState();
           this.botAI.update(
             dt,
             this.controller.position,
@@ -4455,13 +4929,18 @@ export class CombatSessionEngine {
                 hitEv.impactDir,
               );
               if (res.killed) {
+                this.botAI?.awardInfectionKillPoints(
+                  hitEv.shooterId,
+                  res.headshot,
+                  Boolean(hitEv.melee),
+                );
                 this.pushMpKillfeed({
                   killerName: hitEv.shooterName,
                   killerTeam: 'A',
                   victimName: 'INFECTED',
                   victimTeam: 'B',
                   headshot: res.headshot,
-                  weaponLabel: 'CARBINE',
+                  weaponLabel: hitEv.weaponLabel,
                 });
                 if (this.mp && this.isMpHost) {
                   const killedPkt: GameZombieKilledPacket = {
@@ -4469,9 +4948,9 @@ export class CombatSessionEngine {
                     zombieId: hitEv.zombieId,
                     killerUserId: hitEv.shooterId,
                     headshot: res.headshot,
-                    melee: false,
+                    melee: Boolean(hitEv.melee),
                     pointsAwarded: 0,
-                    weaponId: 'm4a1',
+                    weaponId: hitEv.weaponId,
                     px: Number(hitEv.impactPoint.x.toFixed(3)),
                     py: Number(hitEv.impactPoint.y.toFixed(3)),
                     pz: Number(hitEv.impactPoint.z.toFixed(3)),
@@ -4479,7 +4958,70 @@ export class CombatSessionEngine {
                   };
                   this.mp.sendMessage(killedPkt as unknown as Record<string, unknown>);
                 }
+              } else if (res.hit) {
+                this.botAI?.awardInfectionHitPoints(hitEv.shooterId, 10);
               }
+            },
+            {
+              round: roundState.round,
+              intermissionActive: roundState.intermissionSec > 0,
+              powerOn: this.powerOn,
+              getBarrierPlanks: (barrierId) => {
+                const b = this.zombieAI?.getBarrierById(barrierId);
+                if (!b) return null;
+                return { remaining: b.getPlanksRemaining(), max: b.maxPlanks };
+              },
+              onBotEconomyAction: (ev) => {
+                if (ev.kind === 'buyable_door' || ev.kind === 'power_switch') {
+                  const ok = this.applyMapInteractableEffect(ev.interactableId, ev.botName, false);
+                  if (ok && this.mp && this.isMpHost) {
+                    const it = this.map.interactables.find(
+                      (item) =>
+                        item.id === ev.interactableId ||
+                        (ev.interactableId === 'power_switch' && item.kind === 'power_switch'),
+                    );
+                    const pkt: GameMapInteractPacket = {
+                      type: 'game:map_interact',
+                      interactableId: it?.id ?? ev.interactableId,
+                      kind: ev.kind,
+                      activatedByUserId: ev.botId,
+                      activatedByUsername: ev.botName,
+                      unlockedZoneId: it?.unlocksZoneId,
+                      ts: Date.now(),
+                    };
+                    this.mp.sendMessage(pkt as unknown as Record<string, unknown>);
+                    if (this.zombieAI) {
+                      this.mp.sendMessage(
+                        this.zombieAI.exportSyncSnapshot(this.powerOn) as unknown as Record<string, unknown>,
+                      );
+                    }
+                  }
+                  return ok;
+                }
+                if (ev.kind === 'window_barrier' && ev.barrierId && this.zombieAI) {
+                  const barrier = this.zombieAI.getBarrierById(ev.barrierId);
+                  if (!barrier || !barrier.repairPlank()) return false;
+                  this._tmpBarrierPos.set(barrier.sillPos[0], barrier.sillPos[1], barrier.sillPos[2]);
+                  this.audio.playImpact(this._tmpBarrierPos, 'wood');
+                  if (this.mp && this.isMpHost) {
+                    const updPkt: GameBarrierUpdatePacket = {
+                      type: 'game:barrier_update',
+                      barrierId: barrier.id,
+                      planksRemaining: barrier.getPlanksRemaining(),
+                      repairedByUserId: ev.botId,
+                      pointsAwarded: 0,
+                      ts: Date.now(),
+                    };
+                    this.mp.sendMessage(updPkt as unknown as Record<string, unknown>);
+                  }
+                  return true;
+                }
+                if (ev.kind === 'wall_buy' || ev.kind === 'mystery_crate' || ev.kind === 'perk_machine') {
+                  this.audio.playGearRattle('weapon_swap', 0.45);
+                  return true;
+                }
+                return false;
+              },
             },
           );
         }
@@ -4702,7 +5244,84 @@ export class CombatSessionEngine {
       spectatingTargetName: this.spectatingTargetName,
       livesRemaining: this.livesRemaining,
       tacticalPings: this.projectedPings,
+
+      supportsDynamicWeatherTime: Boolean(this.map.supportsDynamicWeatherTime),
+      gameClockText: this.weatherTime ? this.weatherTime.getFormattedClock() : '23:15',
+      weatherLabel: this.weatherTime ? this.weatherTime.getActiveWeather().toUpperCase() : 'NIGHT',
+      windSpeedMps: this.weatherTime ? Number(this.weatherTime.getWindSpeedMps().toFixed(1)) : 0,
+      isPdaOpen: this.pdaDevice.isOpen(),
+
+      squadComms: this.squadComms.filter((m) => now - m.timestampMs < 7500),
+      infectionSquadBots:
+        this.params.mode === 'infection' ? (this.botAI?.getInfectionSquadSummary() ?? []) : [],
+
+      nvgMount: this.localGear.nvgMount,
+      nvgActive: this.playerAlive && this.nvgFlipped && this.localGear.nvgMount !== 'none',
+      irIlluminatorOn:
+        this.playerAlive &&
+        this.nvgFlipped &&
+        this.localGear.nvgMount !== 'none' &&
+        this.irIlluminatorOn,
     };
+  }
+
+  private updatePdaTelemetry(dt: number): void {
+    this._pdaAllyBuf.length = 0;
+    if (this.botAI) {
+      const allyBots = this.botAI.getAliveAllyTargets();
+      for (let i = 0; i < allyBots.length; i++) {
+        const b = allyBots[i];
+        const info = this.botAI.getBotInfo(b.id);
+        this._pdaAllyBuf.push({
+          id: b.id,
+          name: info?.name ?? b.id,
+          x: b.pos.x,
+          z: b.pos.z,
+          alive: b.alive,
+        });
+      }
+    }
+    if (this.remotePlayers) {
+      const humans = this.remotePlayers.getAliveHumanTargets();
+      for (let i = 0; i < humans.length; i++) {
+        const h = humans[i];
+        if (this.remotePlayers.isFriendly(h.id)) {
+          this._pdaAllyBuf.push({
+            id: h.id,
+            name: h.name,
+            x: h.pos.x,
+            z: h.pos.z,
+            alive: h.alive,
+          });
+        }
+      }
+    }
+
+    this._pdaPingBuf.length = 0;
+    for (let i = 0; i < this.activePings.length; i++) {
+      const p = this.activePings[i];
+      this._pdaPingBuf.push({
+        x: p.worldPos.x,
+        z: p.worldPos.z,
+        label: p.label,
+        kind: p.kind === 'enemy' ? 'contact' : p.kind === 'item' ? 'poi' : 'order',
+      });
+    }
+
+    const moveRatio = THREE.MathUtils.clamp(this.telemetry.speedMps / 4.8, 0, 1);
+    this.pdaDevice.setTelemetry({
+      playerX: this.controller.position.x,
+      playerZ: this.controller.position.z,
+      playerYawRad: this.controller.aimYaw,
+      gameClockText: this.weatherTime ? this.weatherTime.getFormattedClock() : '23:15',
+      weatherLabel: this.weatherTime ? this.weatherTime.getActiveWeather().toUpperCase() : 'INDOOR',
+      windSpeedMps: this.weatherTime ? this.weatherTime.getWindSpeedMps() : 0,
+      windAngleRad: this.weatherTime ? this.weatherTime.getWindAngleRad() : 0,
+      zoneLabel: this.map.name.toUpperCase(),
+      allies: this._pdaAllyBuf,
+      pings: this._pdaPingBuf,
+    });
+    this.pdaDevice.update(dt, this.elapsedSec, moveRatio, this.controller.crouched);
   }
 
   private emitSnapshot(): void {
@@ -4719,6 +5338,10 @@ export class CombatSessionEngine {
     this.unsubMpMessages = null;
     this.unsubTacticalEquipment?.();
     this.unsubTacticalEquipment = null;
+    this.unsubOperatorGear?.();
+    this.unsubOperatorGear = null;
+    this.camera.remove(this.irIlluminatorLight);
+    this.camera.remove(this.irIlluminatorTarget);
     if (document.pointerLockElement === this.renderer.domElement) {
       document.exitPointerLock();
     }
@@ -4726,6 +5349,8 @@ export class CombatSessionEngine {
     this.botAI?.dispose();
     this.zombieAI?.dispose();
     this.grenadeSystem.dispose();
+    this.pdaDevice.dispose();
+    this.weatherTime?.dispose();
     this.ballistics.dispose();
     this.scopeRenderer.dispose();
     this.weaponRig.dispose();

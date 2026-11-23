@@ -3,7 +3,10 @@ import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment
 import { BodycamPhysicsWorld, BodycamSurfaceMaterial } from '../bodycam-sdk';
 import { getGraphicsQualityProfile, GraphicsQualityId } from '../data/graphicsQuality';
 import { createStencilSignTexture } from '../gym/GymTextures';
+import { WettableSurfaceEntry } from '../engine/world/WeatherTimeSystem';
+import { createWindShaderUniforms } from '../engine/world/WindFoliageShader';
 import {
+  buildInstancedGrassTufts,
   buildOfficeDesk,
   buildRustedVehicle,
   PropFactoryContext,
@@ -176,6 +179,8 @@ function buildKorsakovSubstation(
     }),
   );
 
+  const windUniforms = createWindShaderUniforms();
+
   const propCtx: PropFactoryContext = {
     sceneGroup,
     physics,
@@ -183,7 +188,13 @@ function buildKorsakovSubstation(
     isSoftwareGl,
     trackGeo,
     trackMat,
+    windUniforms,
+    maxAniso,
   };
+
+  const wettableSurfaces: WettableSurfaceEntry[] = [
+    { material: matYardTarmac, baseRoughness: 0.56, baseEnvMapIntensity: 0.65 },
+  ];
 
   const dummy = new THREE.Object3D();
 
@@ -263,6 +274,23 @@ function buildKorsakovSubstation(
     addSolidBox(fx, 0.08 + HALL_H * 0.5, 12.25, 0.5, HALL_H, 18.5, matSlateWall);
     addSolidBox(fx, 0.08 + 3.4 + (HALL_H - 3.4) * 0.5, 0, 0.5, HALL_H - 3.4, 6.0, matSlateWall);
   }
+
+  // Sloped concrete threshold aprons seating exterior tarmac seamlessly to Turbine Hall floor slab (0.08m)
+  const addDoorApron = (x: number, z: number, w: number, d: number): void => {
+    const apron = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(w, 0.08, d)), matSlateFloor);
+    apron.position.set(x, 0.04, z);
+    apron.receiveShadow = !isSoftwareGl && qProfile.castShadows;
+    apron.userData.surfaceMaterial = 'concrete';
+    sceneGroup.add(apron);
+    raycastMeshes.push(apron);
+  };
+  for (const dz of [-22.4, 22.4]) {
+    addDoorApron(-24.0, dz, 4.4, 1.1);
+    addDoorApron(0, dz, 6.8, 1.1);
+    addDoorApron(24.0, dz, 4.4, 1.1);
+  }
+  addDoorApron(-33.4, 0, 1.1, 6.4);
+  addDoorApron(33.4, 0, 1.1, 6.4);
 
   // Interior Switchgear Corridor Divider Walls (X = -21.0 and X = 21.0) with triple arch openings
   for (const ix of [-21.0, 21.0]) {
@@ -358,14 +386,43 @@ function buildKorsakovSubstation(
   addSolidBox(20.9, CAT_Y + 0.52, 0, 0.16, 1.02, 28.2, matDarkSteel, 'metal');
   addSolidBox(0, CAT_Y + 0.52, 14.3, 41.5, 1.02, 0.16, matDarkSteel, 'metal');
 
-  // North Switchgear Control Room Enclosure (glass observation window facing South into Turbine Hall)
+  // North Switchgear Control Room Enclosure (4 segmented non-vaultable bullet-breakable observation windows)
   addSolidBox(-14.5, CAT_Y + 1.5, -14.3, 12.6, 3.0, 0.24, matSlateWall);
   addSolidBox(14.5, CAT_Y + 1.5, -14.3, 12.6, 3.0, 0.24, matSlateWall);
   addSolidBox(0, CAT_Y + 0.54, -14.3, 16.4, 1.08, 0.24, matSlateWall);
   addSolidBox(0, CAT_Y + 2.98, -14.3, 16.4, 0.24, 0.24, matSlateWall);
-  const ctrlGlass = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(16.2, 1.85, 0.08)), matControlGlass);
-  ctrlGlass.position.set(0, CAT_Y + 2.02, -14.3);
-  sceneGroup.add(ctrlGlass);
+
+  const ctrlBreakables = new Map<string, { id: string; mesh: THREE.Mesh; shattered: boolean; center: THREE.Vector3 }>();
+  const ctrlPaneW = 3.95;
+  for (let p = 0; p < 4; p++) {
+    const px = -6.075 + p * 4.05;
+    const bid = `korsakov_ctrl_glass_${p + 1}`;
+    const pane = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(ctrlPaneW, 1.85, 0.08)), matControlGlass);
+    pane.position.set(px, CAT_Y + 2.02, -14.3);
+    pane.userData.surfaceMaterial = 'glass';
+    pane.userData.ballisticMaterial = 'glass';
+    pane.userData.breakableGlass = true;
+    pane.userData.noVault = true;
+    pane.userData.shattered = false;
+    pane.userData.breakableId = bid;
+    sceneGroup.add(pane);
+    raycastMeshes.push(pane);
+    physics.addBox({
+      id: bid,
+      minX: px - ctrlPaneW * 0.5,
+      maxX: px + ctrlPaneW * 0.5,
+      minY: CAT_Y + 1.08,
+      maxY: CAT_Y + 2.95,
+      minZ: -14.38,
+      maxZ: -14.22,
+      surface: 'glass',
+      blocksMovement: true,
+    });
+    ctrlBreakables.set(bid, { id: bid, mesh: pane, shattered: false, center: pane.position.clone() });
+    if (p < 3) {
+      addSolidBox(-4.05 + p * 4.05, CAT_Y + 2.02, -14.3, 0.1, 1.85, 0.18, matDarkSteel, 'metal');
+    }
+  }
   buildOfficeDesk(propCtx, -4.0, CAT_Y, -16.8, 0, matDarkSteel, matTurbineBody);
   buildOfficeDesk(propCtx, 4.0, CAT_Y, -16.8, 0, matDarkSteel, matTurbineBody);
 
@@ -668,7 +725,47 @@ function buildKorsakovSubstation(
     { position: [42, 0, 0], yaw: Math.PI * 0.5 },
   ];
 
+  // Yard crack weeds hugging outer concrete perimeter walls
+  const weedSpots: Array<{ x: number; y: number; z: number; scale: number; yaw: number; tint: THREE.Color }> = [];
+  for (let i = 0; i < 42; i++) {
+    const alongN = i % 2 === 0;
+    const wx = alongN ? -46 + i * 2.2 : (i % 4 === 1 ? -49.2 : 49.2);
+    const wz = alongN ? (i % 4 === 0 ? -41.2 : 41.2) : -38 + i * 1.8;
+    weedSpots.push({
+      x: wx,
+      y: 0.01,
+      z: wz,
+      scale: 0.65 + (i % 3) * 0.22,
+      yaw: i * 1.1,
+      tint: new THREE.Color(0x526142),
+    });
+  }
+  buildInstancedGrassTufts(propCtx, weedSpots);
+
   physics.setRaycastMeshes(raycastMeshes);
+
+  const shatterBreakable = (
+    objOrId: THREE.Object3D | string,
+    impactPoint?: Readonly<THREE.Vector3>,
+  ): { breakableId: string; impactPoint: THREE.Vector3 } | null => {
+    const id =
+      typeof objOrId === 'string'
+        ? objOrId
+        : (objOrId.userData?.breakableId as string | undefined);
+    if (!id) return null;
+    const rec = ctrlBreakables.get(id);
+    if (!rec || rec.shattered) return null;
+    rec.shattered = true;
+    rec.mesh.userData.shattered = true;
+    rec.mesh.visible = false;
+    physics.disableBoxById(id);
+    const idx = raycastMeshes.indexOf(rec.mesh);
+    if (idx >= 0) raycastMeshes.splice(idx, 1);
+    return {
+      breakableId: id,
+      impactPoint: impactPoint ? impactPoint.clone() : rec.center.clone(),
+    };
+  };
 
   return {
     id: 'korsakov_substation',
@@ -686,6 +783,12 @@ function buildKorsakovSubstation(
     },
     interactables: [],
     lightingPreset: LIGHTING_PRESET,
+    supportsDynamicWeatherTime: true,
+    envBindings: {
+      windUniforms,
+      wettableSurfaces,
+    },
+    shatterBreakable,
     update: (_dt, elapsedSec) => {
       for (const bl of blueLights) {
         bl.light.intensity = 7.8 + Math.sin(elapsedSec * 2.8 + bl.phase) * 0.8;

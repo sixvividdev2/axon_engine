@@ -3,6 +3,11 @@ import { BodycamPhysicsWorld } from '../bodycam-sdk';
 import { GraphicsQualityId } from '../data/graphicsQuality';
 import { TacticalEquipmentId } from '../data/tacticalEquipment';
 
+import type { TimeOfDayStartSetting, WeatherPresetId } from '../data/multiplayer';
+import type { WaterShaderUniforms } from '../engine/world/WaterShader';
+import type { NightLightEntry, WettableSurfaceEntry } from '../engine/world/WeatherTimeSystem';
+import type { WindShaderUniforms } from '../engine/world/WindFoliageShader';
+
 export type TopLevelModeId = 'playground' | 'battle' | 'infection';
 export type BattleRuleId = 'tdm' | 'ffa';
 export type BotDifficultyId = 'recruit' | 'tactical' | 'veteran';
@@ -16,6 +21,8 @@ export interface BattleMatchConfig {
   primaryWeaponId: string;
   secondaryWeaponId: string;
   tacticalEquipmentId?: TacticalEquipmentId;
+  weatherPreset?: WeatherPresetId;
+  timeOfDayStart?: TimeOfDayStartSetting;
 }
 
 export interface InfectionMatchConfig {
@@ -23,6 +30,8 @@ export interface InfectionMatchConfig {
   botCount?: number;
   botDifficulty?: BotDifficultyId;
   tacticalEquipmentId?: TacticalEquipmentId;
+  weatherPreset?: WeatherPresetId;
+  timeOfDayStart?: TimeOfDayStartSetting;
 }
 
 export interface NavNode {
@@ -133,6 +142,13 @@ export interface MapLightingPreset {
   keyLightPos: [number, number, number];
 }
 
+export interface MapEnvBindings {
+  windUniforms?: WindShaderUniforms;
+  waterUniforms?: WaterShaderUniforms;
+  wettableSurfaces?: WettableSurfaceEntry[];
+  nightLights?: NightLightEntry[];
+}
+
 export interface BuiltMapInstance {
   id: string;
   name: string;
@@ -153,6 +169,15 @@ export interface BuiltMapInstance {
   windowBarriers?: MapWindowBarrier[];
   interactables: MapInteractable[];
   lightingPreset: MapLightingPreset;
+  /** True for outdoor daytime/twilight maps that receive dynamic 24h sun/moon & weather */
+  supportsDynamicWeatherTime?: boolean;
+  /** Optional shared wind/water/wetness/night-light hooks bound by WeatherTimeSystem */
+  envBindings?: MapEnvBindings;
+  /** Shatters a breakable glass pane/window and disables its paired physics collider */
+  shatterBreakable?: (
+    objOrId: THREE.Object3D | string,
+    impactPoint?: Readonly<THREE.Vector3>,
+  ) => { breakableId: string; impactPoint: THREE.Vector3 } | null;
   setPowerState?: (powered: boolean) => void;
   update?: (dt: number, elapsedSec: number) => void;
   dispose: () => void;

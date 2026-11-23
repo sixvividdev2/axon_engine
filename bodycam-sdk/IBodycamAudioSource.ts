@@ -109,5 +109,23 @@ export interface IBodycamAudioSource {
 
   /** Tactile 0.1 MRAD scope elevation/windage turret click */
   playTurretClick?(up?: boolean): void;
+
+  /** Dynamic weather-coupled wind speed, gust intensity, and rain patter */
+  setWindWeather?(windSpeedMps: number, gust01: number, rainIntensity: number): void;
+
+  /** Delayed spatial thunder rumble during stormy weather */
+  playThunder?(intensity?: number): void;
+
+  /** 3D PDA tactile power toggle + subtle OLED boot chime */
+  playPdaPowerSound?(turningOn: boolean): void;
+
+  /** 3D PDA cursor / joystick tactile micro-switch click */
+  playPdaButtonClick?(): void;
+
+  /** VHF tactical radio squelch chirp for allied bot/player comms */
+  playRadioChirp?(kind?: 'open' | 'ack'): void;
+
+  /** NVG mount mechanical flip-down / stow detent click & tube high-voltage whine */
+  playNvgFlipSound?(flipDown: boolean): void;
 }
 

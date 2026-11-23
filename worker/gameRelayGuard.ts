@@ -1,4 +1,5 @@
 import {
+  ActiveWeatherConditionId,
   LobbyRoomState,
   OperatorUniformId,
   SyncedAimStance,
@@ -28,6 +29,7 @@ const HOST_ONLY_GAME_TYPES = new Set<string>([
   'game:bots_sync',
   'game:bot_fire',
   'game:bot_hit_player',
+  'game:bot_comms',
   'game:zombies_sync',
   'game:zombie_spawn',
   'game:zombie_killed',
@@ -37,6 +39,7 @@ const HOST_ONLY_GAME_TYPES = new Set<string>([
   'game:map_interact',
   'game:map_interact_rejected',
   'game:match_sync',
+  'game:env_sync',
 ]);
 
 const ALLOWED_GAME_TYPES = new Set<string>([
@@ -51,11 +54,19 @@ const ALLOWED_GAME_TYPES = new Set<string>([
   'game:barrier_repair_request',
   'game:map_interact_request',
   'game:ping',
+  'game:glass_shatter',
 ]);
 
 const VALID_AIM_STANCES = new Set<SyncedAimStance>(['HIP', 'ADS', 'POINT_AIM', 'CANTED_ADS']);
 const VALID_ADS_MODES = new Set<string>(['PRIMARY', 'CANTED', 'POINT_AIM']);
 const VALID_UNIFORM_IDS = new Set<OperatorUniformId>(['team_a', 'team_b', 'ffa', 'infection']);
+const VALID_WEATHERS = new Set<ActiveWeatherConditionId>([
+  'clear',
+  'sunny',
+  'overcast',
+  'rainy',
+  'stormy',
+]);
 
 function clampFinite(val: unknown, min: number, max: number, fallback: number): number {
   const n = Number(val);
@@ -173,6 +184,24 @@ export function validateAndSanitizeGameMessage(
       safePayload.uniformId = parsed.uniformId;
     } else {
       delete safePayload.uniformId;
+    }
+    if (typeof parsed.glovesEnabled === 'boolean') {
+      safePayload.glovesEnabled = parsed.glovesEnabled;
+    }
+    if (typeof parsed.gloveColor === 'string') {
+      safePayload.gloveColor = parsed.gloveColor.slice(0, 24);
+    }
+    if (parsed.helmetType === 'mich' || parsed.helmetType === 'mil_tec') {
+      safePayload.helmetType = parsed.helmetType;
+    }
+    if (typeof parsed.helmetColor === 'string') {
+      safePayload.helmetColor = parsed.helmetColor.slice(0, 24);
+    }
+    if (parsed.nvgMount === 'none' || parsed.nvgMount === 'pvs7' || parsed.nvgMount === 'arnvg') {
+      safePayload.nvgMount = parsed.helmetType === 'mich' ? 'none' : parsed.nvgMount;
+    }
+    if (typeof parsed.nvgFlipped === 'boolean') {
+      safePayload.nvgFlipped = parsed.nvgFlipped;
     }
     safePayload.lean = Number(clampFinite(parsed.lean, -1, 1, 0).toFixed(2));
     safePayload.weaponId = String(parsed.weaponId ?? 'm4a1').slice(0, 40);
@@ -423,6 +452,60 @@ export function validateAndSanitizeGameMessage(
     } else {
       safePayload.targetEntityType = null;
       safePayload.targetEntityId = null;
+    }
+  } else if (type === 'game:env_sync') {
+    const cw = parsed.currentWeather as ActiveWeatherConditionId;
+    const tw = parsed.targetWeather as ActiveWeatherConditionId;
+    safePayload.timeOfDayHours = Number(clampFinite(parsed.timeOfDayHours, 0, 24, 12).toFixed(3));
+    safePayload.currentWeather = VALID_WEATHERS.has(cw) ? cw : 'clear';
+    safePayload.targetWeather = VALID_WEATHERS.has(tw) ? tw : safePayload.currentWeather;
+    safePayload.transitionProgress = Number(clampFinite(parsed.transitionProgress, 0, 1, 1).toFixed(3));
+    safePayload.weatherHoldRemainingSec = Number(clampFinite(parsed.weatherHoldRemainingSec, 0, 3600, 0).toFixed(1));
+    safePayload.windDirRad = Number(clampFinite(parsed.windDirRad, -100, 100, 0).toFixed(3));
+    safePayload.windSpeedMps = Number(clampFinite(parsed.windSpeedMps, 0, 45, 3).toFixed(2));
+    safePayload.rainIntensity = Number(clampFinite(parsed.rainIntensity, 0, 1, 0).toFixed(3));
+    safePayload.wetness = Number(clampFinite(parsed.wetness, 0, 1, 0).toFixed(3));
+    safePayload.lightningFlash = Number(clampFinite(parsed.lightningFlash, 0, 2, 0).toFixed(3));
+  } else if (type === 'game:glass_shatter') {
+    const breakableId = String(parsed.breakableId ?? '').trim().slice(0, 80);
+    if (!breakableId || !isFiniteCoord(parsed.px) || !isFiniteCoord(parsed.py) || !isFiniteCoord(parsed.pz)) {
+      return null;
+    }
+    safePayload.breakableId = breakableId;
+    safePayload.px = Number(parsed.px.toFixed(3));
+    safePayload.py = Number(parsed.py.toFixed(3));
+    safePayload.pz = Number(parsed.pz.toFixed(3));
+  } else if (type === 'game:bot_comms') {
+    const botId = String(parsed.botId ?? '').trim().slice(0, 32);
+    const callsign = String(parsed.callsign ?? 'ALLY').trim().slice(0, 24);
+    const text = String(parsed.text ?? '').trim().slice(0, 120);
+    const cat = parsed.category;
+    if (
+      !botId ||
+      !text ||
+      (cat !== 'threat' && cat !== 'economy' && cat !== 'status' && cat !== 'ack')
+    ) {
+      return null;
+    }
+    safePayload.botId = botId;
+    safePayload.callsign = callsign || 'ALLY';
+    safePayload.team = parsed.team === 'A' || parsed.team === 'B' ? parsed.team : 'FFA';
+    safePayload.category = cat;
+    safePayload.text = text;
+    if (
+      (parsed.pingKind === 'location' || parsed.pingKind === 'enemy' || parsed.pingKind === 'item') &&
+      isFiniteCoord(parsed.px) &&
+      isFiniteCoord(parsed.py) &&
+      isFiniteCoord(parsed.pz)
+    ) {
+      safePayload.pingKind = parsed.pingKind;
+      safePayload.pingLabel = String(parsed.pingLabel ?? 'MARK').trim().slice(0, 32) || 'MARK';
+      safePayload.px = Number(parsed.px.toFixed(3));
+      safePayload.py = Number(parsed.py.toFixed(3));
+      safePayload.pz = Number(parsed.pz.toFixed(3));
+    } else {
+      safePayload.pingKind = null;
+      safePayload.pingLabel = null;
     }
   }
 

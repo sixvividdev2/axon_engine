@@ -105,9 +105,19 @@ export class VaultDetector {
     );
   }
 
+  private isNoVaultGlass(obj: THREE.Object3D | null): boolean {
+    return Boolean(
+      obj &&
+        obj.userData &&
+        obj.userData.noVault === true &&
+        obj.userData.shattered !== true,
+    );
+  }
+
   /**
-   * Casts a ray skipping breakable glass panes (recording the first glass hit if found)
+   * Casts a ray skipping vaultable breakable glass panes (recording the first glass hit if found)
    * so window sills and openings behind breakable glass are probed accurately.
+   * Intact glass flagged `noVault: true` is treated as an impassable solid barrier instead.
    */
   private raycastThroughGlass(
     adapter: IBodycamWorldAdapter,
@@ -121,7 +131,7 @@ export class VaultDetector {
     if (!adapter.raycast(origin, dir, near, far, outHit)) {
       return false;
     }
-    if (!this.isBreakableGlass(outHit.object)) {
+    if (!this.isBreakableGlass(outHit.object) || this.isNoVaultGlass(outHit.object)) {
       return true;
     }
 
@@ -142,7 +152,7 @@ export class VaultDetector {
 
   /**
    * Measures minimum vertical clearance above a world point (x, baseY, z) using a 5-ray bundle
-   * via `adapter.raycast()` (ignoring breakable glass panes).
+   * via `adapter.raycast()` (ignoring vaultable breakable glass panes).
    */
   private measureVerticalClearance(
     adapter: IBodycamWorldAdapter,
@@ -225,6 +235,7 @@ export class VaultDetector {
 
     // 1. Multi-height forward wall probes (0.42m to 2.08m) to locate a vertical climbable face
     let foundWall = false;
+    let hitNoVaultBarrier = false;
     let closestWallDist = Infinity;
     let wallNX = 0;
     let wallNZ = 0;
@@ -235,6 +246,10 @@ export class VaultDetector {
 
       if (!this.raycastThroughGlass(adapter, this._rayOrigin, this._fwd, 0.08, probeRange, this._rayOut, out)) {
         continue;
+      }
+
+      if (this.isNoVaultGlass(this._rayOut.object)) {
+        hitNoVaultBarrier = true;
       }
 
       // Reject steep non-vaultable sloped faces (only crisp obstacle faces)
@@ -261,6 +276,11 @@ export class VaultDetector {
         wallNZ = uNZ;
         foundWall = true;
       }
+    }
+
+    if (hitNoVaultBarrier) {
+      out.blockReason = 'no_clearance';
+      return false;
     }
 
     if (!foundWall) {

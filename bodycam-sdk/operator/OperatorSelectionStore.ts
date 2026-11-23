@@ -1,13 +1,18 @@
 import { useEffect, useState } from 'react';
 import {
+  DEFAULT_OPERATOR_GEAR,
   DEFAULT_OPERATOR_ID,
   isOperatorId,
+  normalizeOperatorGearConfig,
   normalizeOperatorId,
+  OPERATOR_GEAR_STORAGE_KEY,
   OPERATOR_STORAGE_KEY,
+  OperatorGearConfig,
   OperatorId,
 } from './OperatorTypes';
 
 type OperatorListener = (operatorId: OperatorId) => void;
+type OperatorGearListener = (gear: OperatorGearConfig) => void;
 
 export interface OperatorStorageLike {
   getItem(key: string): string | null;
@@ -49,16 +54,20 @@ function resolveDefaultStorage(): OperatorStorageLike | null {
 }
 
 /**
- * Persistent Operator Selection Store.
- * - Persists under versioned key `bfps.operator.v1`
+ * Persistent Operator Selection & Tactical Gear Store.
+ * - Persists operator gender under versioned key `bfps.operator.v1`
+ * - Persists uniform, gloves, helmet & NVG mount under `bfps.operator.gear.v1`
  * - Falls back cleanly to in-memory storage if browser storage is blocked
- * - Sanitizes corrupted/unknown values back to `'MALE'`
+ * - Sanitizes corrupted/unknown values back to safe defaults
  * - Supports deterministic top-precedence URL query override `?operator=male|female`
  */
 export class OperatorSelectionStore {
   private selectedId: OperatorId = DEFAULT_OPERATOR_ID;
+  private gearConfig: OperatorGearConfig = { ...DEFAULT_OPERATOR_GEAR };
   private memoryValue: string | null = null;
+  private memoryGearValue: string | null = null;
   private readonly listeners = new Set<OperatorListener>();
+  private readonly gearListeners = new Set<OperatorGearListener>();
   private readonly customStorage?: OperatorStorageLike | null;
   private readonly customSearch?: string | null;
 
@@ -66,6 +75,7 @@ export class OperatorSelectionStore {
     this.customStorage = options?.storage;
     this.customSearch = options?.search;
     this.selectedId = this.hydrate();
+    this.gearConfig = this.hydrateGear();
   }
 
   private getStorage(): OperatorStorageLike | null {
@@ -93,6 +103,31 @@ export class OperatorSelectionStore {
         storage.setItem(OPERATOR_STORAGE_KEY, value);
       } catch {
         // Storage unavailable/quota exceeded — in-memory fallback stays active
+      }
+    }
+  }
+
+  private readGearRaw(): string | null {
+    const storage = this.getStorage();
+    if (storage) {
+      try {
+        return storage.getItem(OPERATOR_GEAR_STORAGE_KEY);
+      } catch {
+        return this.memoryGearValue;
+      }
+    }
+    return this.memoryGearValue;
+  }
+
+  private writeGearRaw(cfg: OperatorGearConfig): void {
+    const encoded = JSON.stringify(cfg);
+    this.memoryGearValue = encoded;
+    const storage = this.getStorage();
+    if (storage) {
+      try {
+        storage.setItem(OPERATOR_GEAR_STORAGE_KEY, encoded);
+      } catch {
+        // Storage unavailable/quota exceeded
       }
     }
   }
@@ -125,6 +160,17 @@ export class OperatorSelectionStore {
     return DEFAULT_OPERATOR_ID;
   }
 
+  public hydrateGear(): OperatorGearConfig {
+    const raw = this.readGearRaw();
+    if (!raw) return { ...DEFAULT_OPERATOR_GEAR };
+    try {
+      const parsed = JSON.parse(raw);
+      return normalizeOperatorGearConfig(parsed);
+    } catch {
+      return { ...DEFAULT_OPERATOR_GEAR };
+    }
+  }
+
   public getSelectedOperator(): OperatorId {
     const override = this.getUrlOverride();
     if (override) {
@@ -142,10 +188,33 @@ export class OperatorSelectionStore {
     return effective;
   }
 
+  public getGearConfig(): OperatorGearConfig {
+    return { ...this.gearConfig };
+  }
+
+  public setGearConfig(patch: Partial<OperatorGearConfig>): OperatorGearConfig {
+    const merged = normalizeOperatorGearConfig({
+      ...this.gearConfig,
+      ...patch,
+    });
+    this.gearConfig = merged;
+    this.writeGearRaw(merged);
+    const snap = { ...merged };
+    this.gearListeners.forEach((fn) => fn(snap));
+    return snap;
+  }
+
   public subscribe(listener: OperatorListener): () => void {
     this.listeners.add(listener);
     return () => {
       this.listeners.delete(listener);
+    };
+  }
+
+  public subscribeGear(listener: OperatorGearListener): () => void {
+    this.gearListeners.add(listener);
+    return () => {
+      this.gearListeners.delete(listener);
     };
   }
 }
@@ -168,4 +237,21 @@ export function useOperatorSelection(
   };
 
   return [operatorId, setSelected, urlOverride] as const;
+}
+
+export function useOperatorGearConfig(
+  store: OperatorSelectionStore = operatorSelectionStore,
+): readonly [OperatorGearConfig, (patch: Partial<OperatorGearConfig>) => void] {
+  const [gear, setGear] = useState<OperatorGearConfig>(() => store.getGearConfig());
+
+  useEffect(() => {
+    setGear(store.getGearConfig());
+    return store.subscribeGear((next) => setGear(next));
+  }, [store]);
+
+  const updateGear = (patch: Partial<OperatorGearConfig>): void => {
+    store.setGearConfig(patch);
+  };
+
+  return [gear, updateGear] as const;
 }

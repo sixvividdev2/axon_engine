@@ -6,7 +6,11 @@ import {
 } from '../bodycam-sdk/IKSolver';
 import {
   DEFAULT_OPERATOR_ID,
+  GLOVE_COLOR_LIST,
+  HELMET_COLOR_LIST,
+  HelmetTypeId,
   normalizeOperatorId,
+  NvgMountId,
   OPERATOR_PROFILES,
   OperatorId,
 } from '../bodycam-sdk/operator/OperatorTypes';
@@ -90,6 +94,15 @@ export interface BuiltTacticalOperatorRig {
     count?: number,
     visible?: boolean,
   ) => void;
+  setWeaponClass: (weaponClass: 'pistol' | 'smg' | 'shotgun' | 'rifle') => void;
+  setGearAppearance: (gear: {
+    glovesEnabled?: boolean;
+    gloveColor?: string;
+    helmetType?: HelmetTypeId;
+    helmetColor?: string;
+    nvgMount?: NvgMountId;
+    nvgFlipped?: boolean;
+  }) => void;
 }
 
 type MaterialSlot =
@@ -229,6 +242,9 @@ export class TacticalOperatorRigFactory {
   private readonly geoHelmetRim: THREE.CylinderGeometry;
   private readonly geoHelmetBand: THREE.CylinderGeometry;
   private readonly geoNvgShroud: THREE.BoxGeometry;
+  private readonly geoNvgArm: THREE.BoxGeometry;
+  private readonly geoNvgPvs7Body: THREE.BoxGeometry;
+  private readonly geoNvgTube: THREE.CylinderGeometry;
   private readonly geoVisor: THREE.BoxGeometry;
   private readonly geoEarPro: THREE.CylinderGeometry;
   private readonly geoHairBun: THREE.SphereGeometry;
@@ -305,6 +321,10 @@ export class TacticalOperatorRigFactory {
     this.geoHelmetRim = this.track(new THREE.CylinderGeometry(0.133, 0.136, 0.03, 12));
     this.geoHelmetBand = this.track(new THREE.CylinderGeometry(0.138, 0.138, 0.032, 12));
     this.geoNvgShroud = this.track(new THREE.BoxGeometry(0.05, 0.054, 0.028));
+    this.geoNvgArm = this.track(new THREE.BoxGeometry(0.022, 0.022, 0.044));
+    this.geoNvgPvs7Body = this.track(new THREE.BoxGeometry(0.088, 0.044, 0.082));
+    this.geoNvgTube = this.track(new THREE.CylinderGeometry(0.017, 0.018, 0.092, 8));
+    this.geoNvgTube.rotateX(Math.PI * 0.5);
     this.geoVisor = this.track(new THREE.BoxGeometry(0.18, 0.062, 0.054));
     this.geoEarPro = this.track(new THREE.CylinderGeometry(0.042, 0.042, 0.03, 8));
     this.geoEarPro.rotateZ(Math.PI * 0.5);
@@ -442,7 +462,8 @@ export class TacticalOperatorRigFactory {
     const profile = OPERATOR_PROFILES[operatorId];
     const isFemale = operatorId === 'FEMALE';
 
-    const bundle = this.materialLib.getBundle(uniformId);
+    let activeBundle = this.materialLib.getBundle(uniformId);
+    const bundle = activeBundle;
     const slotBindings: Array<{ mesh: THREE.Mesh; slot: MaterialSlot }> = [];
     const hitMeshes: THREE.Mesh[] = [];
 
@@ -782,6 +803,38 @@ export class TacticalOperatorRigFactory {
     const nvgShroud = makeMesh(this.geoNvgShroud, 'hardware');
     nvgShroud.position.set(0, 0.216, -0.128 * headScaleXZ);
 
+    // Lightweight 3rd-person articulating NVG pivot (PVS-7 bi-ocular & RNVG-A dual-tube pods)
+    const nvgPivot = new THREE.Group();
+    nvgPivot.position.set(0, 0.216, -0.132 * headScaleXZ);
+    nvgPivot.rotation.x = -1.28;
+    nvgPivot.visible = false;
+
+    const nvgArm = makeMesh(this.geoNvgArm, 'hardware');
+    nvgArm.position.set(0, -0.012, -0.024);
+    nvgPivot.add(nvgArm);
+
+    const pvs7Group = new THREE.Group();
+    const pvs7Body = makeMesh(this.geoNvgPvs7Body, 'hardware');
+    pvs7Body.position.set(0, -0.042, -0.058);
+    const pvs7Obj = makeMesh(this.geoNvgTube, 'gun');
+    pvs7Obj.scale.set(1.22, 1.22, 0.72);
+    pvs7Obj.position.set(0, -0.042, -0.102);
+    pvs7Group.add(pvs7Body, pvs7Obj);
+    pvs7Group.visible = false;
+    nvgPivot.add(pvs7Group);
+
+    const arnvgGroup = new THREE.Group();
+    const arnvgBridge = makeMesh(this.geoNvgArm, 'hardware');
+    arnvgBridge.scale.set(3.2, 0.75, 0.52);
+    arnvgBridge.position.set(0, -0.036, -0.05);
+    const arnvgTubeL = makeMesh(this.geoNvgTube, 'gun');
+    arnvgTubeL.position.set(-0.033, -0.046, -0.068);
+    const arnvgTubeR = makeMesh(this.geoNvgTube, 'gun');
+    arnvgTubeR.position.set(0.033, -0.046, -0.068);
+    arnvgGroup.add(arnvgBridge, arnvgTubeL, arnvgTubeR);
+    arnvgGroup.visible = false;
+    nvgPivot.add(arnvgGroup);
+
     const visor = makeMesh(this.geoVisor, 'visor');
     visor.scale.set(headScaleXZ, 1.0, 1.0);
     visor.position.set(0, 0.142, -0.102 * headScaleXZ);
@@ -799,6 +852,7 @@ export class TacticalOperatorRigFactory {
       helmetRim,
       helmetBand,
       nvgShroud,
+      nvgPivot,
       visor,
       earL,
       earR,
@@ -848,7 +902,7 @@ export class TacticalOperatorRigFactory {
 
       forearmPivot.add(elbow, forearmMesh, cuff, glove);
       armPivot.add(shoulder, upperArmMesh, patch, forearmPivot);
-      return { armPivot, forearmPivot };
+      return { armPivot, forearmPivot, glove };
     };
 
     const leftArmParts = buildArticulatedArm(-1);
@@ -913,15 +967,232 @@ export class TacticalOperatorRigFactory {
       flashlightGlow,
     );
 
-    // Local grip anchors in weaponSocket space for 2-bone arm IK
+    // Local grip anchors in weaponSocket space for 2-bone arm IK (updated dynamically per weapon class)
     const rightGripLocal = new THREE.Vector3(0.0, -0.078, -0.012);
     const leftHandguardLocal = new THREE.Vector3(-0.018, -0.022, -0.295);
 
+    const setWeaponClass = (weaponClass: 'pistol' | 'smg' | 'shotgun' | 'rifle'): void => {
+      if (weaponClass === 'pistol') {
+        // Compact semi-auto service pistol (Glock 17) held in two-handed tactical isosceles grip
+        receiver.visible = true;
+        receiver.scale.set(0.58, 0.72, 0.76);
+        receiver.position.set(0, 0.015, -0.17);
+
+        handguard.visible = false;
+        stock.visible = false;
+        buttpad.visible = false;
+        optic.visible = false;
+        mag.visible = false;
+
+        pistolGrip.visible = true;
+        pistolGrip.scale.set(0.86, 0.92, 0.92);
+        pistolGrip.position.set(0, -0.052, -0.105);
+        pistolGrip.rotation.x = -0.34;
+
+        barrel.visible = true;
+        barrel.scale.set(0.95, 0.34, 0.95);
+        barrel.position.set(0, 0.018, -0.285);
+
+        muzzleFlash.position.set(0, 0.018, -0.34);
+        rightGripLocal.set(0.008, -0.055, -0.105);
+        leftHandguardLocal.set(-0.016, -0.058, -0.125);
+        return;
+      }
+
+      if (weaponClass === 'smg') {
+        // Compact PDW / Submachine gun (MP5 / AKS-74U)
+        receiver.visible = true;
+        receiver.scale.set(0.9, 0.92, 0.82);
+        receiver.position.set(0, 0.0, -0.08);
+
+        handguard.visible = true;
+        handguard.scale.set(0.92, 0.9, 0.62);
+        handguard.position.set(0, 0.006, -0.27);
+
+        stock.visible = true;
+        stock.scale.set(0.82, 0.72, 0.86);
+        stock.position.set(0, -0.006, 0.12);
+
+        buttpad.visible = true;
+        buttpad.position.set(0, -0.01, 0.215);
+
+        pistolGrip.visible = true;
+        pistolGrip.scale.set(1, 1, 1);
+        pistolGrip.position.set(0, -0.072, -0.006);
+        pistolGrip.rotation.x = -0.32;
+
+        mag.visible = true;
+        mag.scale.set(0.75, 1.1, 0.72);
+        mag.position.set(0, -0.105, -0.145);
+        mag.rotation.x = 0.22;
+
+        optic.visible = true;
+        optic.position.set(0, 0.058, -0.065);
+
+        barrel.visible = true;
+        barrel.scale.set(0.95, 0.62, 0.95);
+        barrel.position.set(0, 0.008, -0.42);
+
+        muzzleFlash.position.set(0, 0.008, -0.52);
+        rightGripLocal.set(0.0, -0.078, -0.012);
+        leftHandguardLocal.set(-0.018, -0.022, -0.245);
+        return;
+      }
+
+      if (weaponClass === 'shotgun') {
+        // Pump / Tactical Shotgun (Remington 870 / SPAS-12)
+        receiver.visible = true;
+        receiver.scale.set(1.04, 0.92, 1.05);
+        receiver.position.set(0, 0.0, -0.08);
+
+        handguard.visible = true;
+        handguard.scale.set(1.18, 0.98, 0.92);
+        handguard.position.set(0, -0.012, -0.35);
+
+        stock.visible = true;
+        stock.scale.set(1.02, 1.0, 1.04);
+        stock.position.set(0, -0.016, 0.145);
+
+        buttpad.visible = true;
+        buttpad.position.set(0, -0.02, 0.25);
+
+        pistolGrip.visible = true;
+        pistolGrip.scale.set(1, 0.92, 1);
+        pistolGrip.position.set(0, -0.068, 0.012);
+        pistolGrip.rotation.x = -0.42;
+
+        mag.visible = false;
+        optic.visible = false;
+
+        barrel.visible = true;
+        barrel.scale.set(1.38, 1.18, 1.38);
+        barrel.position.set(0, 0.014, -0.62);
+
+        muzzleFlash.position.set(0, 0.014, -0.80);
+        rightGripLocal.set(0.0, -0.074, 0.01);
+        leftHandguardLocal.set(-0.018, -0.028, -0.335);
+        return;
+      }
+
+      // Default: Carbine / Assault Rifle (M4A1 / AKM / HK416)
+      receiver.visible = true;
+      receiver.scale.set(1, 1, 1);
+      receiver.position.set(0, 0.0, -0.08);
+
+      handguard.visible = true;
+      handguard.scale.set(1, 1, 1);
+      handguard.position.set(0, 0.008, -0.355);
+
+      stock.visible = true;
+      stock.scale.set(1, 1, 1);
+      stock.position.set(0, -0.01, 0.14);
+
+      buttpad.visible = true;
+      buttpad.position.set(0, -0.014, 0.242);
+
+      pistolGrip.visible = true;
+      pistolGrip.scale.set(1, 1, 1);
+      pistolGrip.position.set(0, -0.072, -0.006);
+      pistolGrip.rotation.x = -0.32;
+
+      mag.visible = true;
+      mag.scale.set(1, 1, 1);
+      mag.position.set(0, -0.095, -0.145);
+      mag.rotation.x = 0.16;
+
+      optic.visible = true;
+      optic.position.set(0, 0.062, -0.065);
+
+      barrel.visible = true;
+      barrel.scale.set(1, 1, 1);
+      barrel.position.set(0, 0.01, -0.585);
+
+      muzzleFlash.position.set(0, 0.01, -0.74);
+      rightGripLocal.set(0.0, -0.078, -0.012);
+      leftHandguardLocal.set(-0.018, -0.022, -0.295);
+    };
+
+    let customHelmetMat: THREE.MeshStandardMaterial | null = null;
+    let customGloveMat: THREE.MeshStandardMaterial | null = null;
+    let currentGear: {
+      glovesEnabled?: boolean;
+      gloveColor?: string;
+      helmetType?: HelmetTypeId;
+      helmetColor?: string;
+      nvgMount?: NvgMountId;
+      nvgFlipped?: boolean;
+    } | null = null;
+
+    const setGearAppearance = (gear: {
+      glovesEnabled?: boolean;
+      gloveColor?: string;
+      helmetType?: HelmetTypeId;
+      helmetColor?: string;
+      nvgMount?: NvgMountId;
+      nvgFlipped?: boolean;
+    }): void => {
+      currentGear = { ...gear };
+
+      // 1. Gloves ON/OFF + Color
+      if (gear.glovesEnabled === false) {
+        leftArmParts.glove.material = activeBundle.skinMat;
+        rightArmParts.glove.material = activeBundle.skinMat;
+      } else if (gear.gloveColor && gear.gloveColor !== 'uniform') {
+        const gSpec = GLOVE_COLOR_LIST.find((c) => c.id === gear.gloveColor);
+        if (gSpec) {
+          if (!customGloveMat) {
+            customGloveMat = activeBundle.gloveMat.clone();
+            this.track(customGloveMat);
+          }
+          customGloveMat.color.setRGB(gSpec.rgb[0] / 255, gSpec.rgb[1] / 255, gSpec.rgb[2] / 255);
+          leftArmParts.glove.material = customGloveMat;
+          rightArmParts.glove.material = customGloveMat;
+        }
+      } else {
+        leftArmParts.glove.material = activeBundle.gloveMat;
+        rightArmParts.glove.material = activeBundle.gloveMat;
+      }
+
+      // 2. Helmet Shell (MICH-2000 low-cut no mount vs Mil-Tec high-cut + mount) + Color
+      const isMich = gear.helmetType === 'mich';
+      helmetShell.scale.set(headScaleXZ, isMich ? 1.07 : 0.96, 1.06 * headScaleXZ);
+      helmetRim.position.y = isMich ? 0.156 : 0.172;
+      earL.visible = !isMich;
+      earR.visible = !isMich;
+      nvgShroud.visible = !isMich;
+
+      if (gear.helmetColor && gear.helmetColor !== 'uniform') {
+        const hSpec = HELMET_COLOR_LIST.find((c) => c.id === gear.helmetColor);
+        if (hSpec) {
+          if (!customHelmetMat) {
+            customHelmetMat = activeBundle.helmetMat.clone();
+            this.track(customHelmetMat);
+          }
+          customHelmetMat.color.setHex(hSpec.hex);
+          helmetShell.material = customHelmetMat;
+          helmetRim.material = customHelmetMat;
+        }
+      } else {
+        helmetShell.material = activeBundle.helmetMat;
+        helmetRim.material = activeBundle.helmetMat;
+      }
+
+      // 3. Mounted NVG (locked off on MICH) & flip-down hinge pose
+      const effectiveMount: NvgMountId = isMich ? 'none' : (gear.nvgMount ?? 'none');
+      nvgPivot.visible = effectiveMount !== 'none';
+      pvs7Group.visible = effectiveMount === 'pvs7';
+      arnvgGroup.visible = effectiveMount === 'arnvg';
+      nvgPivot.rotation.x = gear.nvgFlipped && effectiveMount !== 'none' ? 0.14 : -1.28;
+    };
+
     const applyUniform = (nextUniformId: OperatorUniformId): void => {
-      const nextBundle = this.materialLib.getBundle(nextUniformId);
+      activeBundle = this.materialLib.getBundle(nextUniformId);
       for (let i = 0; i < slotBindings.length; i++) {
         const b = slotBindings[i];
-        b.mesh.material = this.pickMat(nextBundle, b.slot);
+        b.mesh.material = this.pickMat(activeBundle, b.slot);
+      }
+      if (currentGear) {
+        setGearAppearance(currentGear);
       }
     };
 
@@ -1169,6 +1440,8 @@ export class TacticalOperatorRigFactory {
       applyCombatPose,
       resetRagdollPose,
       setBeltEquipment,
+      setWeaponClass,
+      setGearAppearance,
     };
   }
 

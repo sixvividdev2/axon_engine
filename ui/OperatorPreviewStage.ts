@@ -2,7 +2,12 @@ import * as THREE from 'three';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import { CharacterSkeleton } from '../bodycam-sdk/CharacterSkeleton';
 import { operatorAssetLoader } from '../bodycam-sdk/operator/OperatorAssetLoader';
-import { OperatorId } from '../bodycam-sdk/operator/OperatorTypes';
+import {
+  DEFAULT_OPERATOR_GEAR,
+  normalizeOperatorGearConfig,
+  OperatorGearConfig,
+  OperatorId,
+} from '../bodycam-sdk/operator/OperatorTypes';
 import { SecondaryPhysicsRigApplier } from '../bodycam-sdk/physics/SecondaryPhysicsRigApplier';
 import { OperatorUniformId } from '../bodycam-sdk/TacticalUniforms';
 import { tacticalEquipmentStore } from '../bodycam-sdk/equipment/TacticalEquipmentStore';
@@ -16,6 +21,7 @@ export interface OperatorPreviewStageOptions {
   container: HTMLElement;
   initialOperator: OperatorId;
   initialUniform?: OperatorUniformId;
+  initialGear?: Partial<OperatorGearConfig>;
   onContextStatusChange?: (lost: boolean) => void;
 }
 
@@ -40,6 +46,8 @@ export class OperatorPreviewStage {
   private secondaryApplier: SecondaryPhysicsRigApplier | null = null;
   private currentOperatorId: OperatorId;
   private currentUniformId: OperatorUniformId;
+  private currentGear: OperatorGearConfig;
+  private currentNvgFlipped = false;
 
   // Orbit camera state (exponentially damped, zero-GC)
   private targetYaw = HERO_YAW;
@@ -71,7 +79,12 @@ export class OperatorPreviewStage {
   constructor(opts: OperatorPreviewStageOptions) {
     this.container = opts.container;
     this.currentOperatorId = opts.initialOperator;
-    this.currentUniformId = opts.initialUniform ?? 'team_a';
+    this.currentGear = normalizeOperatorGearConfig({
+      ...DEFAULT_OPERATOR_GEAR,
+      ...opts.initialGear,
+      ...(opts.initialUniform ? { uniformId: opts.initialUniform } : {}),
+    });
+    this.currentUniformId = this.currentGear.uniformId;
     this.onContextStatusChange = opts.onContextStatusChange;
 
     const renderer = new THREE.WebGLRenderer({
@@ -286,6 +299,7 @@ export class OperatorPreviewStage {
     const loaded = operatorAssetLoader.loadProceduralOperator(operatorId, {
       maxAnisotropy: this.maxAnisotropy,
       uniformId: this.currentUniformId,
+      gear: this.currentGear,
       previewMode: true,
       validationMode: 'SAFE_FALLBACK',
     });
@@ -293,6 +307,7 @@ export class OperatorPreviewStage {
     const skel = loaded.skeleton;
     const sel = tacticalEquipmentStore.getSelection();
     skel.setBeltEquipment(sel.equipmentId, sel.beltSlot, 2, sel.mountOnBelt);
+    skel.setNvgFlipped(this.currentNvgFlipped);
     skel.setFirstPersonHeadShadowOnly(false);
     skel.setAllMeshesWorldLayer();
     // Face +Z toward the front studio camera so operator looks naturally toward the viewer
@@ -314,8 +329,32 @@ export class OperatorPreviewStage {
   public setUniform(uniformId: OperatorUniformId): void {
     if (this.disposed) return;
     this.currentUniformId = uniformId;
+    this.currentGear = normalizeOperatorGearConfig({ ...this.currentGear, uniformId });
     if (this.skeleton) {
       this.skeleton.applyUniform(uniformId);
+    }
+  }
+
+  public setGear(gear: Partial<OperatorGearConfig>): void {
+    if (this.disposed) return;
+    this.currentGear = normalizeOperatorGearConfig({ ...this.currentGear, ...gear });
+    this.currentUniformId = this.currentGear.uniformId;
+    if (this.currentGear.nvgMount === 'none') {
+      this.currentNvgFlipped = false;
+    }
+    if (this.skeleton) {
+      this.skeleton.applyUniform(this.currentGear.uniformId);
+      this.skeleton.applyGearConfig(this.currentGear);
+      this.skeleton.setNvgFlipped(this.currentNvgFlipped);
+      this.skeleton.setAllMeshesWorldLayer();
+    }
+  }
+
+  public setNvgFlipped(flippedDown: boolean): void {
+    if (this.disposed) return;
+    this.currentNvgFlipped = this.currentGear.nvgMount !== 'none' && flippedDown;
+    if (this.skeleton) {
+      this.skeleton.setNvgFlipped(this.currentNvgFlipped);
     }
   }
 

@@ -249,27 +249,57 @@ export const GymHud: React.FC<GymHudProps> = ({
           <span className={snapshot.grenadeCount > 0 ? 'text-amber-300' : 'text-red-400'}>
             {snapshot.tacticalEquipmentShortName} {snapshot.grenadeCount}/{snapshot.grenadeMax} [H]
           </span>
-          <span className="text-neutral-600">|</span>
-          <span>1-4 Weapons</span>
-          <span>E Bench</span>
-          {snapshot.toggleablePumpSemi && (
-            <span className="text-amber-300">
-              Z {snapshot.spas12Mode === 'semi' ? 'Semi' : 'Pump'}
-            </span>
+          {snapshot.nvgMount !== 'none' && (
+            <>
+              <span className="text-neutral-600">|</span>
+              <span
+                className={
+                  snapshot.nvgActive
+                    ? snapshot.nvgMount === 'arnvg'
+                      ? 'font-semibold text-sky-300'
+                      : 'font-semibold text-emerald-300'
+                    : 'text-neutral-400'
+                }
+              >
+                {snapshot.nvgMount === 'arnvg' ? 'RNVG-A P45' : 'PVS-7 P43'} [J]
+                {snapshot.nvgActive ? (snapshot.irIlluminatorOn ? ' · IR ON' : ' · ON') : ''}
+              </span>
+            </>
           )}
-          {snapshot.hasVariableZoom && <span>Wheel/[ ] Zoom</span>}
-          {snapshot.isMagnifiedOptic && <span>N Illum</span>}
-          <span>MMB Pt-Aim</span>
-          {snapshot.hasCantedOptic && <span>B Canted</span>}
-          <span>L / Alt+L Laser</span>
-          <span>F / T Light</span>
-          <span>Q/E Lean</span>
-          <span>C Crouch</span>
-          <span>Space Vault</span>
-          <span>V Bash</span>
-          <span>X Kick</span>
-          <span>R Reload</span>
-          <span className="text-amber-300/90">F1 Armory &amp; SDK</span>
+          <span className="text-neutral-600">|</span>
+          {snapshot.isPdaOpen ? (
+            <>
+              <span className="text-emerald-300">TAC-PDA ACTIVE</span>
+              <span>Mouse Pan</span>
+              <span>Wheel Zoom</span>
+              <span>R / RMB Center</span>
+              <span className="text-amber-300">M Stow PDA</span>
+            </>
+          ) : (
+            <>
+              <span>1-4 Weapons</span>
+              <span>E Bench</span>
+              <span className="text-emerald-300">M Tac Map</span>
+              {snapshot.toggleablePumpSemi && (
+                <span className="text-amber-300">
+                  Z {snapshot.spas12Mode === 'semi' ? 'Semi' : 'Pump'}
+                </span>
+              )}
+              {snapshot.hasVariableZoom && <span>Wheel/[ ] Zoom</span>}
+              {snapshot.isMagnifiedOptic && <span>N Illum</span>}
+              <span>MMB Pt-Aim</span>
+              {snapshot.hasCantedOptic && <span>B Canted</span>}
+              <span>L / Alt+L Laser</span>
+              <span>F / T Light</span>
+              <span>Q/E Lean</span>
+              <span>C Crouch</span>
+              <span>Space Vault</span>
+              <span>V Bash</span>
+              <span>X Kick</span>
+              <span>R Reload</span>
+              <span className="text-amber-300/90">F1 Armory &amp; SDK</span>
+            </>
+          )}
         </div>
       )}
 
@@ -379,6 +409,12 @@ export const GymHud: React.FC<GymHudProps> = ({
               </div>
               <div>
                 <span className="text-neutral-200">Wheel / N</span> Scope Zoom &amp; Illum
+              </div>
+              <div>
+                <span className="text-neutral-200">M / Wheel / R</span> 3D Tac Map PDA
+              </div>
+              <div>
+                <span className="text-neutral-200">J / N</span> Flip NVG &amp; IR Flood
               </div>
             </div>
           </div>

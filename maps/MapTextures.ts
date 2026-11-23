@@ -1004,3 +1004,231 @@ export function createRiverWaterTexture(
   return makeCanvasTex(c, repeatX, repeatY, maxAniso, true);
 }
 
+/** Alpha-cutout meadow grass clump texture with 11 curved tapered blades and seed stems */
+export function createGrassClumpTexture(maxAniso: number, seed = 4110): THREE.CanvasTexture {
+  const c = document.createElement('canvas');
+  c.width = 256;
+  c.height = 256;
+  const ctx = c.getContext('2d')!;
+  const rand = seededRand(seed);
+  ctx.clearRect(0, 0, 256, 256);
+
+  const bladeCount = 13;
+  for (let i = 0; i < bladeCount; i++) {
+    const baseX = 36 + (i / (bladeCount - 1)) * 184 + (rand() - 0.5) * 14;
+    const h = 115 + rand() * 115;
+    const lean = (baseX - 128) * (0.45 + rand() * 0.45) + (rand() - 0.5) * 34;
+    const width = 7 + rand() * 6;
+    const tipY = Math.max(8, 254 - h);
+
+    const grad = ctx.createLinearGradient(baseX, 256, baseX + lean, tipY);
+    const shade = 0.72 + rand() * 0.28;
+    const r0 = Math.round(62 * shade);
+    const g0 = Math.round(92 * shade);
+    const b0 = Math.round(48 * shade);
+    const r1 = Math.round(138 * shade);
+    const g1 = Math.round(168 * shade);
+    const b1 = Math.round(92 * shade);
+    grad.addColorStop(0, `rgb(${r0},${g0},${b0})`);
+    grad.addColorStop(0.55, `rgb(${Math.round(r0 * 1.4)},${Math.round(g0 * 1.45)},${Math.round(b0 * 1.3)})`);
+    grad.addColorStop(1, `rgb(${r1},${g1},${b1})`);
+
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.moveTo(baseX - width * 0.5, 256);
+    ctx.quadraticCurveTo(baseX + lean * 0.35 - width * 0.28, 256 - h * 0.55, baseX + lean, tipY);
+    ctx.quadraticCurveTo(baseX + lean * 0.35 + width * 0.32, 256 - h * 0.55, baseX + width * 0.5, 256);
+    ctx.closePath();
+    ctx.fill();
+
+    // Subtle central midrib vein highlight
+    ctx.strokeStyle = 'rgba(206, 224, 152, 0.22)';
+    ctx.lineWidth = 1.1;
+    ctx.beginPath();
+    ctx.moveTo(baseX, 254);
+    ctx.quadraticCurveTo(baseX + lean * 0.36, 256 - h * 0.55, baseX + lean * 0.92, tipY + 6);
+    ctx.stroke();
+  }
+
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.anisotropy = Math.min(8, Math.max(1, maxAniso));
+  tex.wrapS = THREE.ClampToEdgeWrapping;
+  tex.wrapT = THREE.ClampToEdgeWrapping;
+  tex.needsUpdate = true;
+  return tex;
+}
+
+/** Alpha-cutout forest fern frond texture with pinnate leaflets */
+export function createFernFrondTexture(maxAniso: number, seed = 4220): THREE.CanvasTexture {
+  const c = document.createElement('canvas');
+  c.width = 256;
+  c.height = 256;
+  const ctx = c.getContext('2d')!;
+  const rand = seededRand(seed);
+  ctx.clearRect(0, 0, 256, 256);
+
+  // Central stem (rachis)
+  ctx.strokeStyle = '#4e6b35';
+  ctx.lineWidth = 4.5;
+  ctx.beginPath();
+  ctx.moveTo(128, 254);
+  ctx.quadraticCurveTo(124, 130, 128, 12);
+  ctx.stroke();
+
+  // Pairs of tapering pinnae leaflets
+  const pairs = 15;
+  for (let i = 0; i < pairs; i++) {
+    const t = i / (pairs - 1);
+    const y = 228 - t * 206;
+    const span = Math.sin(Math.pow(1 - t * 0.88, 0.78) * Math.PI * 0.85) * 88 + 10;
+    const g = Math.round(115 + t * 44 + (rand() - 0.5) * 14);
+    const r = Math.round(70 + t * 34);
+    const b = Math.round(42 + t * 18);
+
+    for (const side of [-1, 1]) {
+      ctx.fillStyle = `rgb(${r},${g},${b})`;
+      ctx.beginPath();
+      ctx.moveTo(128, y + 4);
+      ctx.quadraticCurveTo(
+        128 + side * span * 0.55,
+        y - 11,
+        128 + side * span,
+        y - 16 - t * 6,
+      );
+      ctx.quadraticCurveTo(128 + side * span * 0.45, y + 6, 128, y - 3);
+      ctx.closePath();
+      ctx.fill();
+    }
+  }
+
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.anisotropy = Math.min(8, Math.max(1, maxAniso));
+  tex.wrapS = THREE.ClampToEdgeWrapping;
+  tex.wrapT = THREE.ClampToEdgeWrapping;
+  tex.needsUpdate = true;
+  return tex;
+}
+
+/** Alpha-cutout deciduous/undergrowth woody shrub branch texture */
+export function createShrubBranchTexture(maxAniso: number, seed = 4330): THREE.CanvasTexture {
+  const c = document.createElement('canvas');
+  c.width = 256;
+  c.height = 256;
+  const ctx = c.getContext('2d')!;
+  const rand = seededRand(seed);
+  ctx.clearRect(0, 0, 256, 256);
+
+  // Forked woody twigs
+  const twigs = [
+    [128, 254, 128, 42],
+    [128, 210, 62, 74],
+    [128, 196, 196, 80],
+    [104, 146, 52, 54],
+    [152, 138, 204, 52],
+  ];
+  ctx.strokeStyle = '#4f3f2d';
+  ctx.lineWidth = 4;
+  ctx.lineCap = 'round';
+  for (const [x0, y0, x1, y1] of twigs) {
+    ctx.beginPath();
+    ctx.moveTo(x0, y0);
+    ctx.quadraticCurveTo((x0 + x1) * 0.5 + (rand() - 0.5) * 14, (y0 + y1) * 0.5, x1, y1);
+    ctx.stroke();
+  }
+
+  // Clustered ovate leaves along branches
+  for (let i = 0; i < 64; i++) {
+    const seg = twigs[i % twigs.length];
+    const u = 0.18 + rand() * 0.84;
+    const lx = seg[0] + (seg[2] - seg[0]) * u + (rand() - 0.5) * 32;
+    const ly = seg[1] + (seg[3] - seg[1]) * u + (rand() - 0.5) * 28;
+    const rx = 10 + rand() * 11;
+    const ry = 5 + rand() * 6;
+    const angle = (rand() - 0.5) * Math.PI;
+    const shade = 0.72 + rand() * 0.32;
+    ctx.save();
+    ctx.translate(lx, ly);
+    ctx.rotate(angle);
+    ctx.fillStyle = `rgb(${Math.round(74 * shade)},${Math.round(112 * shade)},${Math.round(52 * shade)})`;
+    ctx.beginPath();
+    ctx.ellipse(0, 0, rx, ry, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.anisotropy = Math.min(8, Math.max(1, maxAniso));
+  tex.wrapS = THREE.ClampToEdgeWrapping;
+  tex.wrapT = THREE.ClampToEdgeWrapping;
+  tex.needsUpdate = true;
+  return tex;
+}
+
+/** Seamless tileable tangent-space water surface ripple normal map */
+export function createWaterNormalTexture(
+  maxAniso: number,
+  variant: 'a' | 'b' = 'a',
+): THREE.CanvasTexture {
+  const size = 256;
+  const c = document.createElement('canvas');
+  c.width = size;
+  c.height = size;
+  const ctx = c.getContext('2d')!;
+  const img = ctx.createImageData(size, size);
+  const data = img.data;
+
+  const waves =
+    variant === 'a'
+      ? [
+          { fx: 2, fy: 3, amp: 0.42, ph: 0.4 },
+          { fx: -4, fy: 2, amp: 0.31, ph: 1.7 },
+          { fx: 3, fy: -5, amp: 0.24, ph: 2.9 },
+          { fx: 6, fy: 5, amp: 0.16, ph: 4.1 },
+          { fx: -7, fy: 6, amp: 0.11, ph: 0.9 },
+        ]
+      : [
+          { fx: -3, fy: 2, amp: 0.4, ph: 1.1 },
+          { fx: 5, fy: 3, amp: 0.29, ph: 2.3 },
+          { fx: -2, fy: -6, amp: 0.22, ph: 3.7 },
+          { fx: 7, fy: -4, amp: 0.15, ph: 5.0 },
+          { fx: -6, fy: -7, amp: 0.12, ph: 1.8 },
+        ];
+
+  const twoPi = Math.PI * 2;
+  for (let y = 0; y < size; y++) {
+    const v = y / size;
+    for (let x = 0; x < size; x++) {
+      const u = x / size;
+      let dhdu = 0;
+      let dhdv = 0;
+      for (let w = 0; w < waves.length; w++) {
+        const wave = waves[w];
+        const arg = twoPi * (wave.fx * u + wave.fy * v) + wave.ph;
+        const cVal = Math.cos(arg) * wave.amp;
+        dhdu += cVal * wave.fx;
+        dhdv += cVal * wave.fy;
+      }
+      const nx = -dhdu * 0.22;
+      const ny = -dhdv * 0.22;
+      const nz = 1.0;
+      const invLen = 1 / Math.hypot(nx, ny, nz);
+      const idx = (y * size + x) * 4;
+      data[idx] = Math.round((nx * invLen * 0.5 + 0.5) * 255);
+      data[idx + 1] = Math.round((ny * invLen * 0.5 + 0.5) * 255);
+      data[idx + 2] = Math.round((nz * invLen * 0.5 + 0.5) * 255);
+      data[idx + 3] = 255;
+    }
+  }
+
+  ctx.putImageData(img, 0, 0);
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.NoColorSpace;
+  tex.wrapS = THREE.RepeatWrapping;
+  tex.wrapT = THREE.RepeatWrapping;
+  tex.anisotropy = Math.min(8, Math.max(1, maxAniso));
+  tex.needsUpdate = true;
+  return tex;
+}

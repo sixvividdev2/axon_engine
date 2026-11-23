@@ -8,8 +8,13 @@ import {
   TwoBoneIKResult,
 } from './IKSolver';
 import {
+  DEFAULT_OPERATOR_GEAR,
+  GLOVE_COLOR_MAP,
+  HELMET_COLOR_MAP,
   HitZoneNodeName,
+  normalizeOperatorGearConfig,
   OPERATOR_PROFILES,
+  OperatorGearConfig,
   OperatorId,
   OperatorProfileSpec,
   SecondaryBoneName,
@@ -146,8 +151,23 @@ export class CharacterSkeleton {
   private texSets: ProceduralFabricSet[] = [];
   private readonly anisotropy: number;
   private currentUniformId: OperatorUniformId;
+  private currentGear: OperatorGearConfig = { ...DEFAULT_OPERATOR_GEAR };
   private headShadowOnly = false;
   private readonly headMeshes: Array<{ mesh: THREE.Mesh; visibleMat: THREE.Material }> = [];
+
+  // Helmet & NVG mount groups (MICH-2000 vs Mil-Tec + articulating Wilcox shroud pivot)
+  private michHelmetGroup: THREE.Group | null = null;
+  private milTecHelmetGroup: THREE.Group | null = null;
+  private nvgPivotGroup: THREE.Group | null = null;
+  private pvs7MountGroup: THREE.Group | null = null;
+  private arnvgMountGroup: THREE.Group | null = null;
+  private nvgFlippedDown = false;
+
+  // Hand meshes supporting Gloves ON/OFF + live glove color changes
+  private readonly gloveOnlyMeshes: THREE.Mesh[] = [];
+  private readonly handGlovePrimaryMeshes: THREE.Mesh[] = [];
+  private readonly handGlovePalmMeshes: THREE.Mesh[] = [];
+  private customGloveTexSets: ProceduralFabricSet[] = [];
 
   private sleeveMat: THREE.MeshStandardMaterial;
   private pantsMat: THREE.MeshStandardMaterial;
@@ -165,6 +185,10 @@ export class CharacterSkeleton {
   private helmetMat: THREE.MeshStandardMaterial;
   private visorMat: THREE.MeshStandardMaterial;
   private iffTrimMat: THREE.MeshStandardMaterial;
+  private nvgBodyMat: THREE.MeshStandardMaterial;
+  private nvgAluminumMat: THREE.MeshStandardMaterial;
+  private nvgLensPvs7Mat: THREE.MeshStandardMaterial;
+  private nvgLensArnvgMat: THREE.MeshStandardMaterial;
   private headShadowOnlyMat: THREE.MeshBasicMaterial;
 
   // Pre-allocated scratch objects for zero-GC preview pose solving
@@ -185,6 +209,7 @@ export class CharacterSkeleton {
     uniformId: OperatorUniformId = 'infection',
     operatorId: OperatorId = 'MALE',
     previewMode = false,
+    initialGear?: Partial<OperatorGearConfig>,
   ) {
     this.operatorId = operatorId;
     this.profile = OPERATOR_PROFILES[operatorId] ?? OPERATOR_PROFILES.MALE;
@@ -193,6 +218,11 @@ export class CharacterSkeleton {
     const aniso = Math.min(8, Math.max(1, maxAnisotropy));
     this.anisotropy = aniso;
     this.currentUniformId = uniformId;
+    this.currentGear = normalizeOperatorGearConfig({
+      ...DEFAULT_OPERATOR_GEAR,
+      uniformId,
+      ...initialGear,
+    });
     const preset = TACTICAL_UNIFORM_PRESETS[uniformId] ?? TACTICAL_UNIFORM_PRESETS.infection;
     const s = preset.seedOffset;
 
@@ -332,6 +362,38 @@ export class CharacterSkeleton {
         emissiveIntensity: preset.iffEmissiveIntensity,
         roughness: 0.42,
         metalness: 0.15,
+      }),
+    );
+    this.nvgBodyMat = this.mat(
+      new THREE.MeshStandardMaterial({
+        color: 0x181a1e,
+        roughness: 0.52,
+        metalness: 0.34,
+      }),
+    );
+    this.nvgAluminumMat = this.mat(
+      new THREE.MeshStandardMaterial({
+        color: 0x22262c,
+        roughness: 0.34,
+        metalness: 0.78,
+      }),
+    );
+    this.nvgLensPvs7Mat = this.mat(
+      new THREE.MeshStandardMaterial({
+        color: 0x102822,
+        emissive: 0x0b3a22,
+        emissiveIntensity: 0.45,
+        roughness: 0.08,
+        metalness: 0.85,
+      }),
+    );
+    this.nvgLensArnvgMat = this.mat(
+      new THREE.MeshStandardMaterial({
+        color: 0x12233b,
+        emissive: 0x184c7a,
+        emissiveIntensity: 0.55,
+        roughness: 0.06,
+        metalness: 0.88,
       }),
     );
     // Shadow-only material: WebGLShadowMap overrides with depthMaterial so FAST helmet casts
@@ -705,6 +767,9 @@ export class CharacterSkeleton {
       }
     });
 
+    // Apply initial helmet/glove/NVG gear configuration cleanly before setting layers
+    this.applyGearConfig(this.currentGear);
+
     if (previewMode) {
       // In 3D turntable preview, everything renders on Layer 0 with fully visible head/helmet
       this.setFirstPersonHeadShadowOnly(false);
@@ -717,72 +782,360 @@ export class CharacterSkeleton {
 
   private buildTacticalHead(operatorId: OperatorId): void {
     const scaleX = operatorId === 'FEMALE' ? 0.94 : 1.0;
-    const addHeadMesh = (mesh: THREE.Mesh): void => {
-      this.headGroup.add(mesh);
+    const registerHeadMesh = (parent: THREE.Object3D, mesh: THREE.Mesh): THREE.Mesh => {
+      parent.add(mesh);
       this.headMeshes.push({ mesh, visibleMat: mesh.material as THREE.Material });
+      return mesh;
     };
 
     // Balaclava cranium & jaw silhouette
     const cranium = new THREE.Mesh(this.geo(new THREE.SphereGeometry(0.104, 16, 12)), this.hoodMat);
     cranium.scale.set(0.86 * scaleX, 1.05, 0.96);
     cranium.position.set(0, 0.095, -0.008);
-    addHeadMesh(cranium);
+    registerHeadMesh(this.headGroup, cranium);
 
     // Subtle skin bridge around ballistic eyewear
     const eyeBridge = new THREE.Mesh(this.geo(new THREE.BoxGeometry(0.115 * scaleX, 0.036, 0.035)), this.wristSkinMat);
     eyeBridge.position.set(0, 0.102, -0.082);
-    addHeadMesh(eyeBridge);
-
-    // High-cut FAST ballistic helmet shell
-    const helmetShell = new THREE.Mesh(
-      this.geo(new THREE.SphereGeometry(0.117, 18, 12, 0, Math.PI * 2, 0, Math.PI * 0.62)),
-      this.helmetMat,
-    );
-    helmetShell.scale.set(0.95 * scaleX, 1.02, 1.06);
-    helmetShell.position.set(0, 0.114, 0.002);
-    helmetShell.rotation.x = -0.10;
-    addHeadMesh(helmetShell);
-
-    // Front NVG Wilcox mount shroud
-    const nvgShroud = new THREE.Mesh(this.geo(new THREE.BoxGeometry(0.044, 0.052, 0.022)), this.hardwareMat);
-    nvgShroud.position.set(0, 0.168, -0.112);
-    nvgShroud.rotation.x = -0.22;
-    addHeadMesh(nvgShroud);
-
-    // Side ARC accessory rails & Peltor ComTac ear-pro cups
-    for (const side of [-1, 1]) {
-      const arcRail = new THREE.Mesh(this.geo(new THREE.BoxGeometry(0.014, 0.028, 0.105)), this.knuckleMat);
-      arcRail.position.set(side * 0.104 * scaleX, 0.132, -0.006);
-      arcRail.rotation.z = -side * 0.12;
-      addHeadMesh(arcRail);
-
-      const earCup = new THREE.Mesh(this.geo(new THREE.CylinderGeometry(0.032, 0.035, 0.028, 12)), this.knuckleMat);
-      earCup.rotation.z = Math.PI * 0.5;
-      earCup.position.set(side * 0.102 * scaleX, 0.084, 0.004);
-      addHeadMesh(earCup);
-    }
+    registerHeadMesh(this.headGroup, eyeBridge);
 
     // Ballistic tactical visor / wraparound eye-pro
     const visor = new THREE.Mesh(this.geo(new THREE.BoxGeometry(0.142 * scaleX, 0.044, 0.048)), this.visorMat);
     visor.position.set(0, 0.106, -0.095);
-    addHeadMesh(visor);
-
-    // Rear helmet battery pack / counterweight + IFF strobe patch
-    const counterWeight = new THREE.Mesh(this.geo(new THREE.BoxGeometry(0.072, 0.044, 0.030)), this.pouchMat);
-    counterWeight.position.set(0, 0.124, 0.112);
-    addHeadMesh(counterWeight);
-
-    const rearIff = new THREE.Mesh(this.geo(new THREE.BoxGeometry(0.056, 0.022, 0.008)), this.iffTrimMat);
-    rearIff.position.set(0, 0.168, 0.106);
-    addHeadMesh(rearIff);
+    registerHeadMesh(this.headGroup, visor);
 
     // Tactical tied-back low bun silhouette under rear helmet rim for Female operator
     if (operatorId === 'FEMALE') {
       const hairBun = new THREE.Mesh(this.geo(new THREE.SphereGeometry(0.042, 12, 10)), this.knuckleMat);
       hairBun.scale.set(0.92, 0.84, 1.12);
       hairBun.position.set(0, 0.062, 0.108);
-      addHeadMesh(hairBun);
+      registerHeadMesh(this.headGroup, hairBun);
     }
+
+    // === 1. MICH-2000 HELMET (Full-cut ballistic shell, clean brow, NO shroud/mount) ===
+    const michGroup = new THREE.Group();
+    michGroup.name = 'helmet_mich';
+    this.headGroup.add(michGroup);
+    this.michHelmetGroup = michGroup;
+
+    const michShell = new THREE.Mesh(
+      this.geo(new THREE.SphereGeometry(0.120, 18, 12, 0, Math.PI * 2, 0, Math.PI * 0.67)),
+      this.helmetMat,
+    );
+    michShell.scale.set(0.97 * scaleX, 1.04, 1.08);
+    michShell.position.set(0, 0.112, 0.004);
+    michShell.rotation.x = -0.07;
+    registerHeadMesh(michGroup, michShell);
+
+    // Full-cut side ear-flares characteristic of MICH-2000
+    for (const side of [-1, 1]) {
+      const earFlare = new THREE.Mesh(
+        this.geo(new THREE.CylinderGeometry(0.046, 0.052, 0.062, 10, 1, false, 0, Math.PI)),
+        this.helmetMat,
+      );
+      earFlare.rotation.y = side > 0 ? 0 : Math.PI;
+      earFlare.rotation.z = -side * 0.14;
+      earFlare.scale.set(0.52, 1.0, 1.25);
+      earFlare.position.set(side * 0.096 * scaleX, 0.088, 0.006);
+      registerHeadMesh(michGroup, earFlare);
+
+      const chinStrap = new THREE.Mesh(this.geo(new THREE.BoxGeometry(0.009, 0.064, 0.012)), this.knuckleMat);
+      chinStrap.position.set(side * 0.088 * scaleX, 0.056, -0.022);
+      chinStrap.rotation.z = side * 0.18;
+      registerHeadMesh(michGroup, chinStrap);
+    }
+
+    // Subtle matte brim trim band
+    const michBrim = new THREE.Mesh(this.geo(new THREE.TorusGeometry(0.115, 0.006, 6, 20)), this.knuckleMat);
+    michBrim.rotation.x = Math.PI * 0.5 - 0.07;
+    michBrim.scale.set(0.96 * scaleX, 1.07, 1.0);
+    michBrim.position.set(0, 0.124, 0.002);
+    registerHeadMesh(michGroup, michBrim);
+
+    // === 2. MIL-TEC HIGH-CUT HELMET (ARC rails, ear-pro, counterweight, Wilcox NVG shroud) ===
+    const milTecGroup = new THREE.Group();
+    milTecGroup.name = 'helmet_mil_tec';
+    this.headGroup.add(milTecGroup);
+    this.milTecHelmetGroup = milTecGroup;
+
+    const fastShell = new THREE.Mesh(
+      this.geo(new THREE.SphereGeometry(0.117, 18, 12, 0, Math.PI * 2, 0, Math.PI * 0.60)),
+      this.helmetMat,
+    );
+    fastShell.scale.set(0.95 * scaleX, 1.02, 1.06);
+    fastShell.position.set(0, 0.115, 0.002);
+    fastShell.rotation.x = -0.10;
+    registerHeadMesh(milTecGroup, fastShell);
+
+    // Front Wilcox L4G24 NVG shroud baseplate + dove-tail socket
+    const nvgShroud = new THREE.Mesh(this.geo(new THREE.BoxGeometry(0.044, 0.052, 0.022)), this.hardwareMat);
+    nvgShroud.position.set(0, 0.168, -0.112);
+    nvgShroud.rotation.x = -0.22;
+    registerHeadMesh(milTecGroup, nvgShroud);
+
+    const shroudPlate = new THREE.Mesh(this.geo(new THREE.BoxGeometry(0.032, 0.036, 0.012)), this.nvgAluminumMat);
+    shroudPlate.position.set(0, 0.169, -0.121);
+    shroudPlate.rotation.x = -0.22;
+    registerHeadMesh(milTecGroup, shroudPlate);
+
+    // Side ARC accessory rails & Peltor ComTac ear-pro cups
+    for (const side of [-1, 1]) {
+      const arcRail = new THREE.Mesh(this.geo(new THREE.BoxGeometry(0.014, 0.028, 0.105)), this.knuckleMat);
+      arcRail.position.set(side * 0.104 * scaleX, 0.132, -0.006);
+      arcRail.rotation.z = -side * 0.12;
+      registerHeadMesh(milTecGroup, arcRail);
+
+      const earCup = new THREE.Mesh(this.geo(new THREE.CylinderGeometry(0.032, 0.035, 0.028, 12)), this.knuckleMat);
+      earCup.rotation.z = Math.PI * 0.5;
+      earCup.position.set(side * 0.102 * scaleX, 0.084, 0.004);
+      registerHeadMesh(milTecGroup, earCup);
+    }
+
+    // Rear helmet battery pack / counterweight + IFF strobe patch
+    const counterWeight = new THREE.Mesh(this.geo(new THREE.BoxGeometry(0.072, 0.044, 0.030)), this.pouchMat);
+    counterWeight.position.set(0, 0.124, 0.112);
+    registerHeadMesh(milTecGroup, counterWeight);
+
+    const rearIff = new THREE.Mesh(this.geo(new THREE.BoxGeometry(0.056, 0.022, 0.008)), this.iffTrimMat);
+    rearIff.position.set(0, 0.168, 0.106);
+    registerHeadMesh(milTecGroup, rearIff);
+
+    // === ARTICULATING NVG PIVOT ARM (child of Mil-Tec helmet shroud) ===
+    const nvgPivot = new THREE.Group();
+    nvgPivot.name = 'nvg_mount_pivot';
+    nvgPivot.position.set(0, 0.165, -0.126);
+    milTecGroup.add(nvgPivot);
+    this.nvgPivotGroup = nvgPivot;
+
+    // Articulating Wilcox G24 arm extending down in front of eyes (when rotation.x = 0)
+    const mountArm = new THREE.Mesh(this.geo(new THREE.BoxGeometry(0.022, 0.054, 0.018)), this.nvgAluminumMat);
+    mountArm.position.set(0, -0.024, -0.014);
+    mountArm.rotation.x = 0.25;
+    registerHeadMesh(nvgPivot, mountArm);
+
+    // --- 2A. AGM PVS-7 NL2 / NL1 (Classic Bi-Ocular single objective -> dual angled eyepieces) ---
+    const pvs7Group = new THREE.Group();
+    pvs7Group.name = 'nvg_pvs7';
+    pvs7Group.position.set(0, -0.056, -0.028);
+    nvgPivot.add(pvs7Group);
+    this.pvs7MountGroup = pvs7Group;
+
+    // Main polymer bi-ocular chassis body
+    const pvs7Body = new THREE.Mesh(this.geo(new THREE.BoxGeometry(0.068, 0.038, 0.064)), this.nvgBodyMat);
+    pvs7Body.position.set(0, 0, -0.010);
+    registerHeadMesh(pvs7Group, pvs7Body);
+
+    // Single central intensifier objective barrel + knurled focus ring + front multi-coated lens
+    const pvs7ObjBarrel = new THREE.Mesh(
+      this.geo(new THREE.CylinderGeometry(0.021, 0.023, 0.052, 14)),
+      this.nvgBodyMat,
+    );
+    pvs7ObjBarrel.rotation.x = Math.PI * 0.5;
+    pvs7ObjBarrel.position.set(0, 0.002, -0.056);
+    registerHeadMesh(pvs7Group, pvs7ObjBarrel);
+
+    const pvs7FocusRing = new THREE.Mesh(
+      this.geo(new THREE.CylinderGeometry(0.0245, 0.0245, 0.014, 14)),
+      this.nvgAluminumMat,
+    );
+    pvs7FocusRing.rotation.x = Math.PI * 0.5;
+    pvs7FocusRing.position.set(0, 0.002, -0.064);
+    registerHeadMesh(pvs7Group, pvs7FocusRing);
+
+    const pvs7FrontLens = new THREE.Mesh(
+      this.geo(new THREE.CylinderGeometry(0.018, 0.018, 0.004, 14)),
+      this.nvgLensPvs7Mat,
+    );
+    pvs7FrontLens.rotation.x = Math.PI * 0.5;
+    pvs7FrontLens.position.set(0, 0.002, -0.082);
+    registerHeadMesh(pvs7Group, pvs7FrontLens);
+
+    // Built-in IR illuminator diode dome & rotary gain/ABC switch on top-right
+    const pvs7IrDome = new THREE.Mesh(this.geo(new THREE.CylinderGeometry(0.0065, 0.0075, 0.016, 10)), this.hardwareMat);
+    pvs7IrDome.rotation.x = Math.PI * 0.5;
+    pvs7IrDome.position.set(0.024, 0.012, -0.044);
+    registerHeadMesh(pvs7Group, pvs7IrDome);
+
+    const pvs7Knob = new THREE.Mesh(this.geo(new THREE.CylinderGeometry(0.008, 0.009, 0.012, 10)), this.nvgAluminumMat);
+    pvs7Knob.position.set(-0.022, 0.022, -0.012);
+    registerHeadMesh(pvs7Group, pvs7Knob);
+
+    // Dual split angled rear eyepieces + rubber eyecups
+    for (const side of [-1, 1]) {
+      const eyepiece = new THREE.Mesh(
+        this.geo(new THREE.CylinderGeometry(0.0155, 0.017, 0.036, 12)),
+        this.nvgBodyMat,
+      );
+      eyepiece.rotation.x = Math.PI * 0.5;
+      eyepiece.rotation.z = -side * 0.14;
+      eyepiece.position.set(side * 0.031, -0.003, 0.024);
+      registerHeadMesh(pvs7Group, eyepiece);
+
+      const eyecup = new THREE.Mesh(
+        this.geo(new THREE.CylinderGeometry(0.0185, 0.0155, 0.014, 12)),
+        this.knuckleMat,
+      );
+      eyecup.rotation.x = Math.PI * 0.5;
+      eyecup.position.set(side * 0.032, -0.003, 0.044);
+      registerHeadMesh(pvs7Group, eyecup);
+    }
+
+    // --- 2B. AB NIGHTVISION RNVG-A (ARNVG) BUILD KIT (7075 Aluminum Articulating Dual-Tube + MIL40 Lenses) ---
+    const arnvgGroup = new THREE.Group();
+    arnvgGroup.name = 'nvg_arnvg';
+    arnvgGroup.position.set(0, -0.056, -0.026);
+    nvgPivot.add(arnvgGroup);
+    this.arnvgMountGroup = arnvgGroup;
+
+    // Central machined 7075-T6 aluminum articulating bridge + battery compartment + LEMO port
+    const arnvgBridge = new THREE.Mesh(this.geo(new THREE.BoxGeometry(0.072, 0.022, 0.036)), this.nvgAluminumMat);
+    arnvgBridge.position.set(0, 0.012, -0.008);
+    registerHeadMesh(arnvgGroup, arnvgBridge);
+
+    const arnvgBatt = new THREE.Mesh(
+      this.geo(new THREE.CylinderGeometry(0.010, 0.010, 0.042, 10)),
+      this.hardwareMat,
+    );
+    arnvgBatt.rotation.x = Math.PI * 0.5;
+    arnvgBatt.position.set(0, 0.014, -0.030);
+    registerHeadMesh(arnvgGroup, arnvgBatt);
+
+    // Dual articulating pods with ruggedized rings & MIL40 white-phosphor sapphire-coated lenses
+    for (const side of [-1, 1]) {
+      const podPivot = new THREE.Group();
+      podPivot.position.set(side * 0.034, -0.004, -0.008);
+      podPivot.rotation.z = side * 0.04;
+      arnvgGroup.add(podPivot);
+
+      const tube = new THREE.Mesh(
+        this.geo(new THREE.CylinderGeometry(0.0195, 0.0205, 0.088, 14)),
+        this.nvgAluminumMat,
+      );
+      tube.rotation.x = Math.PI * 0.5;
+      tube.position.set(0, 0, -0.014);
+      registerHeadMesh(podPivot, tube);
+
+      // MIL40 objective knurled bezel collar
+      const mil40Collar = new THREE.Mesh(
+        this.geo(new THREE.CylinderGeometry(0.0225, 0.0215, 0.016, 14)),
+        this.nvgBodyMat,
+      );
+      mil40Collar.rotation.x = Math.PI * 0.5;
+      mil40Collar.position.set(0, 0, -0.052);
+      registerHeadMesh(podPivot, mil40Collar);
+
+      // Multi-coated sapphire MIL40 objective glass
+      const mil40Lens = new THREE.Mesh(
+        this.geo(new THREE.CylinderGeometry(0.0175, 0.0175, 0.004, 14)),
+        this.nvgLensArnvgMat,
+      );
+      mil40Lens.rotation.x = Math.PI * 0.5;
+      mil40Lens.position.set(0, 0, -0.060);
+      registerHeadMesh(podPivot, mil40Lens);
+
+      // Rear ocular housing & diopter ring
+      const ocular = new THREE.Mesh(
+        this.geo(new THREE.CylinderGeometry(0.017, 0.019, 0.022, 12)),
+        this.nvgBodyMat,
+      );
+      ocular.rotation.x = Math.PI * 0.5;
+      ocular.position.set(0, 0, 0.036);
+      registerHeadMesh(podPivot, ocular);
+    }
+
+    // Default stowed upward position
+    this.setNvgFlipped(false);
+  }
+
+  public setNvgFlipped(flippedDown: boolean): void {
+    this.nvgFlippedDown = flippedDown;
+    if (this.nvgPivotGroup) {
+      // Stowed cleanly upward over helmet brow (+1.38 rad) vs deployed directly in front of eyes (0.0 rad)
+      this.nvgPivotGroup.rotation.x = flippedDown ? 0.0 : 1.38;
+    }
+  }
+
+  public applyGearConfig(patch: Partial<OperatorGearConfig>): void {
+    this.currentGear = normalizeOperatorGearConfig({
+      ...this.currentGear,
+      ...patch,
+    });
+    const g = this.currentGear;
+    const preset = TACTICAL_UNIFORM_PRESETS[this.currentUniformId] ?? TACTICAL_UNIFORM_PRESETS.infection;
+
+    // 1. Helmet model & color
+    if (this.michHelmetGroup) {
+      this.michHelmetGroup.visible = g.helmetType === 'mich';
+    }
+    if (this.milTecHelmetGroup) {
+      this.milTecHelmetGroup.visible = g.helmetType === 'mil_tec';
+    }
+    const hSpec = HELMET_COLOR_MAP[g.helmetColor];
+    this.helmetMat.color.setHex(
+      g.helmetColor === 'uniform' || !hSpec ? preset.helmetHex : hSpec.hex,
+    );
+
+    // 2. NVG Mount visibility (strictly on Mil-Tec)
+    const hasNvg = g.helmetType === 'mil_tec' && g.nvgMount !== 'none';
+    if (this.nvgPivotGroup) {
+      this.nvgPivotGroup.visible = hasNvg;
+    }
+    if (this.pvs7MountGroup) {
+      this.pvs7MountGroup.visible = hasNvg && g.nvgMount === 'pvs7';
+    }
+    if (this.arnvgMountGroup) {
+      this.arnvgMountGroup.visible = hasNvg && g.nvgMount === 'arnvg';
+    }
+    this.setNvgFlipped(hasNvg && this.nvgFlippedDown);
+
+    // 3. Gloves ON/OFF + Glove Color
+    for (let i = 0; i < this.gloveOnlyMeshes.length; i++) {
+      this.gloveOnlyMeshes[i].visible = g.glovesEnabled;
+    }
+
+    if (g.glovesEnabled) {
+      const gSpec = GLOVE_COLOR_MAP[g.gloveColor];
+      const gloveRgb: [number, number, number] =
+        g.gloveColor === 'uniform' || !gSpec
+          ? [preset.gloveRgb[0], preset.gloveRgb[1], preset.gloveRgb[2]]
+          : [gSpec.rgb[0], gSpec.rgb[1], gSpec.rgb[2]];
+      const palmRgb: [number, number, number] =
+        g.gloveColor === 'uniform' || !gSpec
+          ? [preset.palmRgb[0], preset.palmRgb[1], preset.palmRgb[2]]
+          : [gSpec.palmRgb[0], gSpec.palmRgb[1], gSpec.palmRgb[2]];
+
+      const oldCustom = this.customGloveTexSets;
+      const gTex = buildFabricTextureSet(gloveRgb, 0.14, 0.18, 0.78, 137 + gloveRgb[0], this.anisotropy, 'olive_bdu');
+      const pTex = buildFabricTextureSet(palmRgb, 0.10, 0.22, 0.88, 173 + palmRgb[0], this.anisotropy, 'olive_bdu');
+      this.customGloveTexSets = [gTex, pTex];
+
+      this.gloveMat.map = gTex.map;
+      this.gloveMat.normalMap = gTex.normalMap;
+      this.gloveMat.roughnessMap = gTex.roughnessMap;
+      this.gloveMat.needsUpdate = true;
+
+      this.palmLeatherMat.map = pTex.map;
+      this.palmLeatherMat.normalMap = pTex.normalMap;
+      this.palmLeatherMat.roughnessMap = pTex.roughnessMap;
+      this.palmLeatherMat.needsUpdate = true;
+
+      for (const old of oldCustom) {
+        old.map.dispose();
+        old.normalMap.dispose();
+        old.roughnessMap.dispose();
+      }
+    }
+
+    for (let i = 0; i < this.handGlovePrimaryMeshes.length; i++) {
+      this.handGlovePrimaryMeshes[i].material = g.glovesEnabled ? this.gloveMat : this.wristSkinMat;
+    }
+    for (let i = 0; i < this.handGlovePalmMeshes.length; i++) {
+      this.handGlovePalmMeshes[i].material = g.glovesEnabled ? this.palmLeatherMat : this.wristSkinMat;
+    }
+  }
+
+  public getGearConfig(): Readonly<OperatorGearConfig> {
+    return this.currentGear;
   }
 
   /**
@@ -1091,6 +1444,9 @@ export class CharacterSkeleton {
     this.iffTrimMat.emissive.setHex(preset.iffEmissiveHex);
     this.iffTrimMat.emissiveIntensity = preset.iffEmissiveIntensity;
 
+    // Re-apply operator custom helmet color & glove color/visibility on top of new uniform
+    this.applyGearConfig(this.currentGear);
+
     for (const t of oldSets) {
       t.map.dispose();
       t.normalMap.dispose();
@@ -1286,6 +1642,7 @@ export class CharacterSkeleton {
     strapBand.rotation.x = Math.PI * 0.5;
     strapBand.scale.set(1.14, 1.0, 0.74);
     strapBand.position.set(0, 0, 0.003);
+    this.gloveOnlyMeshes.push(wristCuff, strapBand);
     root.add(wristCuff, strapBand);
 
     const palmShape = new THREE.Shape();
@@ -1308,6 +1665,7 @@ export class CharacterSkeleton {
     palmGeo.rotateX(-Math.PI * 0.5);
     palmGeo.translate(0, -0.0075 * hs, -0.002);
     const palm = new THREE.Mesh(palmGeo, this.gloveMat);
+    this.handGlovePrimaryMeshes.push(palm);
     root.add(palm);
 
     const suedePalm = new THREE.Mesh(
@@ -1315,6 +1673,7 @@ export class CharacterSkeleton {
       this.palmLeatherMat,
     );
     suedePalm.position.set(0, -0.011 * hs, -0.038 * hs);
+    this.gloveOnlyMeshes.push(suedePalm);
     root.add(suedePalm);
 
     const mcpSpecs = [
@@ -1331,6 +1690,7 @@ export class CharacterSkeleton {
     knuckleBridge.rotation.z = Math.PI * 0.5;
     knuckleBridge.scale.set(0.75, 1.0, 1.35);
     knuckleBridge.position.set(0, 0.0105 * hs, -0.058 * hs);
+    this.gloveOnlyMeshes.push(knuckleBridge);
     root.add(knuckleBridge);
 
     for (let i = 0; i < mcpSpecs.length; i++) {
@@ -1338,6 +1698,7 @@ export class CharacterSkeleton {
       const dome = new THREE.Mesh(this.geo(new THREE.SphereGeometry(m.r * 1.16, 10, 8)), this.knuckleMat);
       dome.scale.set(1.05, 0.72, 1.15);
       dome.position.set(m.x, m.y + 0.008 * hs, m.z + 0.006 * hs);
+      this.gloveOnlyMeshes.push(dome);
       root.add(dome);
     }
 
@@ -1350,6 +1711,7 @@ export class CharacterSkeleton {
     );
     thumbProxMesh.rotation.x = Math.PI * 0.5;
     thumbProxMesh.position.set(0, 0, -0.0145 * hs);
+    this.handGlovePrimaryMeshes.push(thumbProxMesh);
     thumbProx.add(thumbProxMesh);
 
     const thumbDist = new THREE.Group();
@@ -1360,6 +1722,7 @@ export class CharacterSkeleton {
     );
     thumbDistMesh.rotation.x = Math.PI * 0.5;
     thumbDistMesh.position.set(0, 0, -0.012 * hs);
+    this.handGlovePalmMeshes.push(thumbDistMesh);
     thumbDist.add(thumbDistMesh);
     thumbProx.add(thumbDist);
     root.add(thumbProx);
@@ -1373,6 +1736,7 @@ export class CharacterSkeleton {
       const seg1 = new THREE.Mesh(this.geo(new THREE.CylinderGeometry(m.r * 0.88, m.r, m.l1, 10)), this.gloveMat);
       seg1.rotation.x = Math.PI * 0.5;
       seg1.position.set(0, 0, -m.l1 * 0.5);
+      this.handGlovePrimaryMeshes.push(seg1);
       proximal.add(seg1);
 
       const middle = new THREE.Group();
@@ -1380,6 +1744,7 @@ export class CharacterSkeleton {
       const seg2 = new THREE.Mesh(this.geo(new THREE.CylinderGeometry(m.r * 0.78, m.r * 0.87, m.l2, 10)), this.gloveMat);
       seg2.rotation.x = Math.PI * 0.5;
       seg2.position.set(0, 0, -m.l2 * 0.5);
+      this.handGlovePrimaryMeshes.push(seg2);
       middle.add(seg2);
 
       const distal = new THREE.Group();
@@ -1390,6 +1755,7 @@ export class CharacterSkeleton {
       );
       seg3.rotation.x = Math.PI * 0.5;
       seg3.position.set(0, 0, -m.l3 * 0.5);
+      this.handGlovePalmMeshes.push(seg3);
       distal.add(seg3);
 
       middle.add(distal);
@@ -1745,6 +2111,54 @@ export class CharacterSkeleton {
   }
 
   /**
+   * Articulated tablet grip pose: fingers wrap cleanly around rear rubberized bezel while
+   * the right thumb physically reaches up to press the power switch or moves across the gimbaled joystick.
+   */
+  public applyPdaHandPose(
+    side: 'left' | 'right',
+    powerPressWeight: number,
+    joyX: number,
+    joyY: number,
+  ): void {
+    const hand = side === 'left' ? this.leftArm.hand : this.rightArm.hand;
+    const s = hand.side;
+    const setFinger = (f: ArticulatedFinger, proxDeg: number, midDeg: number, distDeg: number): void => {
+      f.proximal.rotation.x = -THREE.MathUtils.degToRad(proxDeg);
+      f.middle.rotation.x = -THREE.MathUtils.degToRad(midDeg);
+      f.distal.rotation.x = -THREE.MathUtils.degToRad(distDeg);
+    };
+
+    // Fingers curved ergonomically behind the ruggedized tablet housing
+    setFinger(hand.index, 38, 52, 34);
+    setFinger(hand.middle, 44, 58, 38);
+    setFinger(hand.ring, 46, 60, 40);
+    setFinger(hand.pinky, 48, 62, 42);
+
+    if (side === 'left') {
+      // Left thumb braces comfortably along left upper bezel edge
+      hand.thumbProx.rotation.set(0.06, s * 0.16, s * 0.12);
+      hand.thumbDist.rotation.set(-0.18, 0, 0);
+    } else {
+      // Right thumb glides dynamically over the 3D gimbaled joystick, or reaches up & depresses power switch
+      const press = THREE.MathUtils.clamp(powerPressWeight, 0, 1);
+      const basePitch = 0.04 + joyY * 0.24;
+      const baseYaw = s * (0.28 + joyX * 0.22);
+      const baseRoll = -s * (0.06 - joyY * 0.12);
+
+      hand.thumbProx.rotation.set(
+        THREE.MathUtils.lerp(basePitch, 0.34, press),
+        THREE.MathUtils.lerp(baseYaw, s * 0.12, press),
+        THREE.MathUtils.lerp(baseRoll, s * 0.18, press),
+      );
+      hand.thumbDist.rotation.set(
+        THREE.MathUtils.lerp(-0.26 - joyY * 0.16, -0.44, press),
+        0,
+        0,
+      );
+    }
+  }
+
+  /**
    * Assigns & rebuilds the 3D tactical equipment meshes mounted on the player's belt.
    * Updates live in Playground/Gym, Battle, Infection, and the 3D Operator Preview.
    */
@@ -1821,8 +2235,14 @@ export class CharacterSkeleton {
       t.normalMap.dispose();
       t.roughnessMap.dispose();
     });
+    this.customGloveTexSets.forEach((t) => {
+      t.map.dispose();
+      t.normalMap.dispose();
+      t.roughnessMap.dispose();
+    });
     this.geos.length = 0;
     this.mats.length = 0;
     this.texSets.length = 0;
+    this.customGloveTexSets.length = 0;
   }
 }

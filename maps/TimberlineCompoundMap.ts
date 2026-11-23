@@ -4,8 +4,22 @@ import { BodycamPhysicsWorld, BodycamSurfaceMaterial } from '../bodycam-sdk';
 import { getGraphicsQualityProfile, GraphicsQualityId } from '../data/graphicsQuality';
 import { createStencilSignTexture } from '../gym/GymTextures';
 import {
+  createRiverWaterMaterial,
+} from '../engine/world/WaterShader';
+import {
+  NightLightEntry,
+  WettableSurfaceEntry,
+} from '../engine/world/WeatherTimeSystem';
+import {
+  applyWindFoliageShader,
+  assignHeightSwayAttribute,
+  createWindShaderUniforms,
+} from '../engine/world/WindFoliageShader';
+import {
   buildArmoryWeaponRack,
+  buildInstancedFerns,
   buildInstancedGrassTufts,
+  buildInstancedUndergrowthShrubs,
   buildOfficeDesk,
   buildRadarTower,
   buildRealisticHelicopterProp,
@@ -19,10 +33,10 @@ import {
   createCorrugatedMetalTexture,
   createForestFloorTexture,
   createIndustrialSlateConcreteTexture,
-  createRiverWaterTexture,
   createRunwayAsphaltTexture,
   createRustedMetalTexture,
   createSovietConcreteTexture,
+  createWaterNormalTexture,
 } from './MapTextures';
 import {
   buildNavGraph,
@@ -198,6 +212,8 @@ function buildTimberlineCompound(
 
   const maxAniso = Math.min(qProfile.anisotropyCap, renderer.capabilities.getMaxAnisotropy() || 4);
 
+  const windUniforms = createWindShaderUniforms();
+
   // Textures
   const forestTex = trackTex(createForestFloorTexture(maxAniso, 36, 36));
   const cabinWoodTex = trackTex(createCabinWoodTexture(maxAniso, 2, 1, '#614833', 707));
@@ -206,7 +222,8 @@ function buildTimberlineCompound(
   const bunkerConcTex = trackTex(createIndustrialSlateConcreteTexture(maxAniso, 3, 2, '#4c5256', 739));
   const roadAsphaltTex = trackTex(createAsphaltRoadTexture(maxAniso, 2, 24, false, 741));
   const runwayTex = trackTex(createRunwayAsphaltTexture(maxAniso, 2, 14));
-  const riverTex = trackTex(createRiverWaterTexture(maxAniso, 2, 24));
+  const riverNormalA = trackTex(createWaterNormalTexture(maxAniso, 'a'));
+  const riverNormalB = trackTex(createWaterNormalTexture(maxAniso, 'b'));
   const garageMetalTex = trackTex(createCorrugatedMetalTexture(maxAniso, '#455148', 751));
   const rustOliveTex = trackTex(createRustedMetalTexture(maxAniso, '#485442', 761));
   const rustBlueTex = trackTex(createRustedMetalTexture(maxAniso, '#3c5261', 762));
@@ -255,27 +272,34 @@ function buildTimberlineCompound(
   const matGunMetal = trackMat(
     new THREE.MeshStandardMaterial({ color: 0x24272a, roughness: 0.44, metalness: 0.82 }),
   );
-  const matFenceMesh = trackMat(
+  const matBarrierGlass = trackMat(
     new THREE.MeshStandardMaterial({
-      color: 0x5d676b,
-      roughness: 0.6,
-      metalness: 0.65,
+      color: 0x8db2bd,
+      roughness: 0.12,
+      metalness: 0.18,
       transparent: true,
-      opacity: 0.42,
+      opacity: 0.38,
       side: THREE.DoubleSide,
     }),
   );
-  const matRiver = trackMat(
+  const matGlassShard = trackMat(
     new THREE.MeshStandardMaterial({
-      map: riverTex,
-      roughness: 0.24,
-      metalness: 0.32,
+      color: 0xb7dbe6,
+      roughness: 0.15,
+      metalness: 0.25,
       transparent: true,
-      opacity: 0.84,
+      opacity: 0.72,
+      side: THREE.DoubleSide,
     }),
   );
+  const waterHandle = createRiverWaterMaterial(riverNormalA, riverNormalB);
+  const matRiver = trackMat(waterHandle.material);
+
   const matBark = trackMat(new THREE.MeshStandardMaterial({ color: 0x463426, roughness: 0.95 }));
   const matPineNeedles = trackMat(new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.88 }));
+  applyWindFoliageShader(matBark, windUniforms, { swayScale: 0.06, isTrunk: true });
+  applyWindFoliageShader(matPineNeedles, windUniforms, { swayScale: 0.21 });
+
   const matRock = trackMat(new THREE.MeshStandardMaterial({ color: 0x5c6160, roughness: 0.94 }));
   const matRunwayBulb = trackMat(
     new THREE.MeshStandardMaterial({ color: 0xffefc2, emissive: 0xf7c96b, emissiveIntensity: 2.8, roughness: 0.15 }),
@@ -289,6 +313,17 @@ function buildTimberlineCompound(
   const matWindsock = trackMat(
     new THREE.MeshStandardMaterial({ color: 0xe66524, roughness: 0.75, side: THREE.DoubleSide }),
   );
+
+  const wettableSurfaces: WettableSurfaceEntry[] = [
+    { material: matRoad, baseRoughness: 0.9, baseEnvMapIntensity: 0.55 },
+    { material: matRunway, baseRoughness: 0.86, baseEnvMapIntensity: 0.55 },
+    { material: matBaseConcrete, baseRoughness: 0.91, baseEnvMapIntensity: 0.45 },
+    { material: matTerrain, baseRoughness: 0.96, baseEnvMapIntensity: 0.35 },
+  ];
+  const nightLights: NightLightEntry[] = [
+    { emissiveMat: matRunwayBulb, baseEmissiveIntensity: 3.4 },
+    { emissiveMat: matThresholdGreen, baseEmissiveIntensity: 3.0 },
+  ];
 
   const baseVehMats = {
     rust: trackMat(new THREE.MeshStandardMaterial({ map: pureRustTex, roughness: 0.82, metalness: 0.38 })),
@@ -322,6 +357,8 @@ function buildTimberlineCompound(
     isSoftwareGl,
     trackGeo,
     trackMat,
+    windUniforms,
+    maxAniso,
   };
 
   const dummy = new THREE.Object3D();
@@ -357,9 +394,9 @@ function buildTimberlineCompound(
     return mesh;
   };
 
-  // === 1. MASSIVE 340m x 340m TERRAIN WITH CLEAN BUNKER ENTRANCE CUTOUT (ZERO Z-FIGHTING!) ===
+  // === 1. MASSIVE 340m x 340m HIGH-RESOLUTION TERRAIN WITH CLEAN BUNKER ENTRANCE CUTOUT ===
   const terrainSize = 340;
-  const segs = 104;
+  const segs = graphicsQuality === 'performance' ? 144 : 192;
   const terrainGeo = trackGeo(new THREE.PlaneGeometry(terrainSize, terrainSize, segs, segs));
   terrainGeo.rotateX(-Math.PI * 0.5);
   const posAttr = terrainGeo.attributes.position;
@@ -377,7 +414,6 @@ function buildTimberlineCompound(
     const c = oldIndex.getX(i + 2);
     const cx = (posAttr.getX(a) + posAttr.getX(b) + posAttr.getX(c)) / 3;
     const cz = (posAttr.getZ(a) + posAttr.getZ(b) + posAttr.getZ(c)) / 3;
-    // Cutout strictly over the bunker stairwell & subterranean chamber roof (bunker roof slab covers it cleanly!)
     if (cx >= 42.5 && cx <= 62.5 && cz >= -16.5 && cz <= 4.5) {
       continue;
     }
@@ -392,70 +428,208 @@ function buildTimberlineCompound(
   sceneGroup.add(terrainMesh);
   raycastMeshes.push(terrainMesh);
 
-  // === 2. WINDING ALPINE RIVER & TWO BRIDGES ===
-  // Ribbon water mesh following getRiverCenterX(z) at y = -0.35m (well above -1.65m riverbed)
-  const riverSegsZ = 64;
-  const riverHalfW = 7.4;
+  // === 2. OPTICAL ALPINE RIVER WATER (ZERO SHORELINE GAPS) & ANCHORED BRIDGES ===
+  const waterSurfaceY = -0.35;
+  const riverSegsZ = 148;
+  const riverColsX = 12;
+  const riverHalfW = 10.6; // extends cleanly under bank slopes; depth <= 0 feathers smoothly to zero
   const rPositions: number[] = [];
   const rUvs: number[] = [];
+  const rDepths: number[] = [];
+  const rPierMask: number[] = [];
   const rIndices: number[] = [];
-  for (let i = 0; i <= riverSegsZ; i++) {
-    const tz = i / riverSegsZ;
-    const z = -155 + tz * 310;
-    const rx = getRiverCenterX(z);
-    rPositions.push(rx - riverHalfW, -0.35, z);
-    rPositions.push(rx + riverHalfW, -0.35, z);
-    rUvs.push(0, tz * 14);
-    rUvs.push(1, tz * 14);
-    if (i < riverSegsZ) {
-      const base = i * 2;
-      rIndices.push(base, base + 2, base + 1);
-      rIndices.push(base + 1, base + 2, base + 3);
+
+  const pierPositions: Array<[number, number]> = [];
+  for (const bz of [-48, 34]) {
+    const brx = getRiverCenterX(bz);
+    for (const px of [-6.0, 0, 6.0]) {
+      for (const side of [-1, 1]) {
+        pierPositions.push([brx + px, bz + side * (5.4 * 0.42)]);
+      }
     }
   }
+
+  for (let iz = 0; iz <= riverSegsZ; iz++) {
+    const tz = iz / riverSegsZ;
+    const z = -155 + tz * 310;
+    const rx = getRiverCenterX(z);
+    for (let ix = 0; ix <= riverColsX; ix++) {
+      const tx = ix / riverColsX;
+      const wx = rx + (tx * 2 - 1) * riverHalfW;
+      const groundY = sampleVisualTerrainY(wx, z);
+      const depth = Math.max(0, waterSurfaceY - groundY);
+
+      let pierMask = 0;
+      for (let p = 0; p < pierPositions.length; p++) {
+        const pd = Math.hypot(wx - pierPositions[p][0], z - pierPositions[p][1]);
+        if (pd < 1.9) {
+          pierMask = Math.max(pierMask, 1.0 - pd / 1.9);
+        }
+      }
+
+      rPositions.push(wx, waterSurfaceY, z);
+      rUvs.push(tx, tz * 14);
+      rDepths.push(depth);
+      rPierMask.push(pierMask);
+    }
+  }
+
+  const rowStride = riverColsX + 1;
+  for (let iz = 0; iz < riverSegsZ; iz++) {
+    for (let ix = 0; ix < riverColsX; ix++) {
+      const a = iz * rowStride + ix;
+      const b = a + 1;
+      const c = a + rowStride;
+      const d = c + 1;
+      rIndices.push(a, c, b);
+      rIndices.push(b, c, d);
+    }
+  }
+
   const riverGeo = trackGeo(new THREE.BufferGeometry());
   riverGeo.setAttribute('position', new THREE.Float32BufferAttribute(rPositions, 3));
   riverGeo.setAttribute('uv', new THREE.Float32BufferAttribute(rUvs, 2));
+  riverGeo.setAttribute('aDepth', new THREE.Float32BufferAttribute(rDepths, 1));
+  riverGeo.setAttribute('aPierMask', new THREE.Float32BufferAttribute(rPierMask, 1));
   riverGeo.setIndex(rIndices);
   riverGeo.computeVertexNormals();
   const riverMesh = new THREE.Mesh(riverGeo, matRiver);
-  riverMesh.receiveShadow = !isSoftwareGl && qProfile.castShadows;
   sceneGroup.add(riverMesh);
 
-  // Two sturdy timber-and-steel Road Bridges spanning the river at Z = -48 and Z = 34
+  // Natural shoreline river cobbles tucked cleanly where water meets the bank slopes
+  const cobbleGeo = trackGeo(new THREE.DodecahedronGeometry(0.42, 1));
+  const cobbleRand = seededRand(8831);
+  const cobblePositions: Array<{ x: number; y: number; z: number; sx: number; sy: number; sz: number; ry: number }> = [];
+  for (let i = 0; i < 160; i++) {
+    const z = -112 + cobbleRand() * 224;
+    if (Math.abs(z - -48) < 5.2 || Math.abs(z - 34) < 5.2) continue;
+    const rx = getRiverCenterX(z);
+    const side = cobbleRand() > 0.5 ? 1 : -1;
+    const x = rx + side * (5.6 + cobbleRand() * 2.2);
+    const groundY = sampleVisualTerrainY(x, z);
+    if (groundY > -0.65 && groundY < 0.05) {
+      cobblePositions.push({
+        x,
+        y: groundY - 0.04,
+        z,
+        sx: 0.7 + cobbleRand() * 1.15,
+        sy: 0.35 + cobbleRand() * 0.4,
+        sz: 0.65 + cobbleRand() * 0.95,
+        ry: cobbleRand() * Math.PI * 2,
+      });
+    }
+  }
+  if (cobblePositions.length > 0) {
+    const cobbleInst = new THREE.InstancedMesh(cobbleGeo, matRock, cobblePositions.length);
+    for (let i = 0; i < cobblePositions.length; i++) {
+      const c = cobblePositions[i];
+      dummy.position.set(c.x, c.y, c.z);
+      dummy.rotation.set(0, c.ry, 0);
+      dummy.scale.set(c.sx, c.sy, c.sz);
+      dummy.updateMatrix();
+      cobbleInst.setMatrixAt(i, dummy.matrix);
+    }
+    cobbleInst.instanceMatrix.needsUpdate = true;
+    cobbleInst.computeBoundingSphere();
+    cobbleInst.userData.surfaceMaterial = 'gravel';
+    sceneGroup.add(cobbleInst);
+  }
+
+  // Two anchored timber-and-steel Road Bridges with full concrete abutments, 45° wing-walls & flush approach ramps
   const buildBridge = (bz: number): void => {
     const rx = getRiverCenterX(bz);
     const bridgeLen = 19.5;
     const bridgeW = 5.4;
+    const halfSpan = bridgeLen * 0.5;
+
     // Main bridge deck (top at y = 0.24m)
     addSolidBox(rx, 0.12, bz, bridgeLen, 0.24, bridgeW, matWoodFloor, 'wood');
-    // Approach ramps on West & East ends
+
+    // Physics + solid visual approach ramps bridging deck (y = 0.24) down to bank ground (y = 0.04)
+    const rampLen = 3.2;
+    const slopeAngle = Math.atan2(0.2, rampLen);
+    const slopeHyp = Math.hypot(rampLen, 0.2);
+
+    const addVisualRamp = (cx: number, tiltZ: number): void => {
+      const rampMesh = new THREE.Mesh(
+        trackGeo(new THREE.BoxGeometry(slopeHyp, 0.2, bridgeW)),
+        matBaseConcrete,
+      );
+      rampMesh.position.set(cx, 0.04, bz);
+      rampMesh.rotation.z = tiltZ;
+      rampMesh.receiveShadow = !isSoftwareGl && qProfile.castShadows;
+      rampMesh.castShadow = !isSoftwareGl && qProfile.castShadows;
+      rampMesh.userData.surfaceMaterial = 'concrete';
+      sceneGroup.add(rampMesh);
+      raycastMeshes.push(rampMesh);
+    };
+
     physics.addRamp({
-      minX: rx - bridgeLen * 0.5 - 3.2,
-      maxX: rx - bridgeLen * 0.5,
+      minX: rx - halfSpan - rampLen,
+      maxX: rx - halfSpan,
       minZ: bz - bridgeW * 0.5,
       maxZ: bz + bridgeW * 0.5,
-      baseY: 0,
+      baseY: 0.04,
       topY: 0.24,
       riseAxis: '+x',
-      surface: 'wood',
+      surface: 'concrete',
     });
+    addVisualRamp(rx - halfSpan - rampLen * 0.5, slopeAngle);
+
     physics.addRamp({
-      minX: rx + bridgeLen * 0.5,
-      maxX: rx + bridgeLen * 0.5 + 3.2,
+      minX: rx + halfSpan,
+      maxX: rx + halfSpan + rampLen,
       minZ: bz - bridgeW * 0.5,
       maxZ: bz + bridgeW * 0.5,
-      baseY: 0,
+      baseY: 0.04,
       topY: 0.24,
       riseAxis: '-x',
-      surface: 'wood',
+      surface: 'concrete',
     });
-    // Side concrete curbs & steel guardrails
+    addVisualRamp(rx + halfSpan + rampLen * 0.5, -slopeAngle);
+
+    // Concrete end abutments & flared 45-deg corner wing-walls anchoring bridge ends firmly into riverbanks
+    for (const endSide of [-1, 1]) {
+      const endX = rx + endSide * (halfSpan - 0.55);
+      // Heavy concrete headwall abutment descending cleanly to y = -2.2m (top = 0.24m)
+      addSolidBox(endX, -0.98, bz, 2.2, 2.44, bridgeW + 1.3, matBaseConcrete, 'concrete', false);
+
+      // Pair of corner wing-walls flaring out at 45° to connect bridge corners into sloping banks
+      for (const zSide of [-1, 1]) {
+        const wing = new THREE.Mesh(
+          trackGeo(new THREE.BoxGeometry(3.2, 2.3, 0.58)),
+          matBaseConcrete,
+        );
+        wing.position.set(
+          endX + endSide * 1.35,
+          -0.88,
+          bz + zSide * (bridgeW * 0.5 + 0.95),
+        );
+        wing.rotation.y = endSide * zSide * -Math.PI * 0.22;
+        wing.castShadow = !isSoftwareGl && qProfile.castShadows;
+        wing.receiveShadow = !isSoftwareGl && qProfile.castShadows;
+        wing.userData.surfaceMaterial = 'concrete';
+        sceneGroup.add(wing);
+        raycastMeshes.push(wing);
+        // Corner pilaster cap rising to deck guardrail height
+        addSolidBox(
+          endX + endSide * 0.3,
+          0.62,
+          bz + zSide * (bridgeW * 0.5 + 0.12),
+          0.64,
+          1.2,
+          0.64,
+          matBaseConcrete,
+          'concrete',
+        );
+      }
+    }
+
+    // Side steel guardrails + deep submerged riverbed support piers (descending to y = -2.25m)
     for (const side of [-1, 1]) {
       addSolidBox(rx, 0.72, bz + side * (bridgeW * 0.5 - 0.14), bridgeLen, 0.96, 0.2, matSteel, 'metal');
-      // Support piers descending into riverbed
       for (const px of [-6.0, 0, 6.0]) {
-        addSolidBox(rx + px, -0.8, bz + side * (bridgeW * 0.42), 0.55, 1.7, 0.55, matBaseConcrete, 'concrete', false);
+        addSolidBox(rx + px, -1.0, bz + side * (bridgeW * 0.42), 0.72, 2.5, 0.72, matBaseConcrete, 'concrete', false);
       }
     }
   };
@@ -615,8 +789,25 @@ function buildTimberlineCompound(
   // South-East apron below bunker: X in [42.5, 65], Z in [4.5, 58]
   addFlatRoadStrip(53.75, 31.25, 22.5, 53.5, matBaseConcrete, 'concrete', 0.04);
 
-  // Military Base Perimeter Concrete Curb + Chain-Link Fence with Wide Gates
+  // Military Base Perimeter Concrete Curb + Non-Vaultable Bullet-Breakable Security Glass Barriers
   const fencePosts: Array<[number, number]> = [];
+  interface BreakableGlassRecord {
+    id: string;
+    mesh: THREE.Mesh;
+    shattered: boolean;
+    center: THREE.Vector3;
+  }
+  interface GlassShard {
+    mesh: THREE.Mesh;
+    vel: THREE.Vector3;
+    rotVel: THREE.Vector3;
+    life: number;
+  }
+  const breakablesById = new Map<string, BreakableGlassRecord>();
+  const activeGlassShards: GlassShard[] = [];
+  const shardGeo = trackGeo(new THREE.TetrahedronGeometry(0.11, 0));
+  let breakableCounter = 0;
+
   const addFence = (x1: number, z1: number, x2: number, z2: number): void => {
     const dx = x2 - x1;
     const dz = z2 - z1;
@@ -624,26 +815,50 @@ function buildTimberlineCompound(
     const cx = (x1 + x2) * 0.5;
     const cz = (z1 + z2) * 0.5;
     const alongX = Math.abs(dx) >= Math.abs(dz);
+    // Solid 0.9m reinforced concrete base curb (becomes vaultable once the upper thick glass bay is shot out)
     addSolidBox(cx, 0.45, cz, alongX ? len : 0.36, 0.9, alongX ? 0.36 : len, matBaseConcrete, 'concrete');
-    const panel = new THREE.Mesh(
-      trackGeo(new THREE.BoxGeometry(alongX ? len : 0.06, 2.0, alongX ? 0.06 : len)),
-      matFenceMesh,
-    );
-    panel.position.set(cx, 1.9, cz);
-    sceneGroup.add(panel);
-    physics.addBox({
-      minX: cx - (alongX ? len * 0.5 : 0.14),
-      maxX: cx + (alongX ? len * 0.5 : 0.14),
-      minY: 0.9,
-      maxY: 2.95,
-      minZ: cz - (alongX ? 0.14 : len * 0.5),
-      maxZ: cz + (alongX ? 0.14 : len * 0.5),
-      surface: 'metal',
-      blocksMovement: true,
-    });
+
     const n = Math.max(2, Math.round(len / 4.2));
     for (let i = 0; i <= n; i++) {
       fencePosts.push([x1 + (dx * i) / n, z1 + (dz * i) / n]);
+    }
+    for (let i = 0; i < n; i++) {
+      const bx = x1 + (dx * (i + 0.5)) / n;
+      const bz = z1 + (dz * (i + 0.5)) / n;
+      const bayLen = Math.max(0.4, len / n - 0.14);
+      const breakableId = `tl_glass_${++breakableCounter}`;
+      const panel = new THREE.Mesh(
+        trackGeo(new THREE.BoxGeometry(alongX ? bayLen : 0.08, 2.0, alongX ? 0.08 : bayLen)),
+        matBarrierGlass,
+      );
+      panel.position.set(bx, 1.9, bz);
+      panel.userData.surfaceMaterial = 'glass';
+      panel.userData.ballisticMaterial = 'glass';
+      panel.userData.breakableGlass = true;
+      panel.userData.noVault = true;
+      panel.userData.shattered = false;
+      panel.userData.breakableId = breakableId;
+      sceneGroup.add(panel);
+      raycastMeshes.push(panel);
+
+      physics.addBox({
+        id: breakableId,
+        minX: bx - (alongX ? bayLen * 0.5 : 0.12),
+        maxX: bx + (alongX ? bayLen * 0.5 : 0.12),
+        minY: 0.9,
+        maxY: 2.95,
+        minZ: bz - (alongX ? 0.12 : bayLen * 0.5),
+        maxZ: bz + (alongX ? 0.12 : bayLen * 0.5),
+        surface: 'glass',
+        blocksMovement: true,
+      });
+
+      breakablesById.set(breakableId, {
+        id: breakableId,
+        mesh: panel,
+        shattered: false,
+        center: new THREE.Vector3(bx, 1.9, bz),
+      });
     }
   };
 
@@ -774,15 +989,21 @@ function buildTimberlineCompound(
     const rl = new THREE.PointLight(0xffd27d, 5.5, 22, 1.7);
     rl.position.set(runwayX, 1.4, rz);
     sceneGroup.add(rl);
+    nightLights.push({ light: rl, baseLightIntensity: 6.2 });
   }
 
-  // Windsock Mast next to Airstrip
+  // Windsock Mast next to Airstrip (rotates and lifts dynamically to match live wind vector)
   const sockPole = new THREE.Mesh(trackGeo(new THREE.CylinderGeometry(0.06, 0.09, 6.2, 8)), matSteel);
   sockPole.position.set(65.5, 3.1, -32.0);
+  const windsockPivot = new THREE.Group();
+  windsockPivot.position.set(65.5, 6.08, -32.0);
+  const windsockArm = new THREE.Group();
   const windsockCone = new THREE.Mesh(trackGeo(new THREE.CylinderGeometry(0.18, 0.42, 2.2, 10, 1, true)), matWindsock);
-  windsockCone.rotation.z = Math.PI * 0.45;
-  windsockCone.position.set(66.6, 5.75, -32.0);
-  sceneGroup.add(sockPole, windsockCone);
+  windsockCone.rotation.z = Math.PI * 0.5;
+  windsockCone.position.set(1.15, 0, 0);
+  windsockArm.add(windsockCone);
+  windsockPivot.add(windsockArm);
+  sceneGroup.add(sockPole, windsockPivot);
 
   // --- 5D. ELEVATED HELIPAD WITH ACCESS STAIRS & REALISTIC HELICOPTER PROP (X = 48, Z = 36) ---
   const heliX = 48.0;
@@ -1021,14 +1242,18 @@ function buildTimberlineCompound(
     treeSpots.push({ x: tx, y: ty, z: tz, scale, yaw: rand() * Math.PI * 2, tint });
   }
 
-  const trunkGeo = trackGeo(new THREE.CylinderGeometry(0.18, 0.32, 3.6, 7));
+  const trunkGeo = trackGeo(new THREE.CylinderGeometry(0.18, 0.32, 3.6, 7, 3));
   trunkGeo.translate(0, 1.8, 0);
-  const tier1Geo = trackGeo(new THREE.ConeGeometry(2.5, 4.6, 8));
+  assignHeightSwayAttribute(trunkGeo, 0, 3.6, 2.0);
+  const tier1Geo = trackGeo(new THREE.ConeGeometry(2.5, 4.6, 9, 3));
   tier1Geo.translate(0, 4.5, 0);
-  const tier2Geo = trackGeo(new THREE.ConeGeometry(1.9, 3.8, 8));
+  assignHeightSwayAttribute(tier1Geo, 0.8, 10.6, 1.5);
+  const tier2Geo = trackGeo(new THREE.ConeGeometry(1.9, 3.8, 9, 2));
   tier2Geo.translate(0, 7.0, 0);
-  const tier3Geo = trackGeo(new THREE.ConeGeometry(1.25, 3.0, 8));
+  assignHeightSwayAttribute(tier2Geo, 0.8, 10.6, 1.5);
+  const tier3Geo = trackGeo(new THREE.ConeGeometry(1.25, 3.0, 8, 2));
   tier3Geo.translate(0, 9.2, 0);
+  assignHeightSwayAttribute(tier3Geo, 0.8, 10.6, 1.5);
 
   const tCount = treeSpots.length;
   const trunkInst = new THREE.InstancedMesh(trunkGeo, matBark, tCount);
@@ -1077,26 +1302,74 @@ function buildTimberlineCompound(
   }
   raycastMeshes.push(trunkInst);
 
-  // Undergrowth grass tufts along forest clearings & riverbanks
-  const grassCount = Math.max(60, Math.round(220 * qProfile.foliageDensity));
+  // Botanical undergrowth: dense wind-reactive grass clumps, forest ferns, and leafy shrubs
+  const isClearFoliage = (gx: number, gz: number): boolean => {
+    if (gx >= 11 && gx <= 97 && gz >= -63 && gz <= 59) return false;
+    if (Math.abs(gx - getRiverCenterX(gz)) < 7.6) return false;
+    if (Math.abs(gx - -2) < 5.0) return false;
+    if (Math.abs(gz - -48) < 4.5 && gx > -74 && gx < 14) return false;
+    if (Math.abs(gz - 34) < 4.5 && gx > -74 && gx < 14) return false;
+    if (gx >= -82 && gx <= -40 && gz >= -74 && gz <= -42) return false;
+    if (gx >= -84 && gx <= -44 && gz >= 42 && gz <= 78) return false;
+    return true;
+  };
+
+  const grassCount = Math.max(180, Math.round(620 * qProfile.foliageDensity));
   const grassSpots: Array<{ x: number; y: number; z: number; scale: number; yaw: number; tint: THREE.Color }> = [];
-  for (let i = 0; i < grassCount; i++) {
-    const gx = (rand() - 0.5) * 210;
-    const gz = (rand() - 0.5) * 210;
-    if (gx >= 11 && gx <= 97 && gz >= -63 && gz <= 59) continue;
-    if (Math.abs(gx - getRiverCenterX(gz)) < 7.8) continue;
-    if (Math.abs(gx - -2) < 5.0) continue;
+  for (let i = 0; i < grassCount * 2 && grassSpots.length < grassCount; i++) {
+    const gx = (rand() - 0.5) * 214;
+    const gz = (rand() - 0.5) * 214;
+    if (!isClearFoliage(gx, gz)) continue;
     const gy = sampleVisualTerrainY(gx, gz);
+    if (gy < -0.22) continue;
     grassSpots.push({
       x: gx,
       y: gy,
       z: gz,
-      scale: 0.75 + rand() * 0.9,
+      scale: 0.8 + rand() * 0.75,
       yaw: rand() * Math.PI * 2,
-      tint: new THREE.Color().setHSL(0.24 + (rand() - 0.5) * 0.07, 0.32, 0.23 + rand() * 0.09),
+      tint: new THREE.Color().setHSL(0.24 + (rand() - 0.5) * 0.07, 0.36, 0.42 + rand() * 0.18),
     });
   }
   buildInstancedGrassTufts(propCtx, grassSpots);
+
+  const fernCount = Math.max(70, Math.round(220 * qProfile.foliageDensity));
+  const fernSpots: Array<{ x: number; y: number; z: number; scale: number; yaw: number; tint: THREE.Color }> = [];
+  for (let i = 0; i < fernCount * 2 && fernSpots.length < fernCount; i++) {
+    const fx = (rand() - 0.5) * 210;
+    const fz = (rand() - 0.5) * 210;
+    if (!isClearFoliage(fx, fz)) continue;
+    const fy = sampleVisualTerrainY(fx, fz);
+    if (fy < -0.15) continue;
+    fernSpots.push({
+      x: fx,
+      y: fy,
+      z: fz,
+      scale: 0.78 + rand() * 0.65,
+      yaw: rand() * Math.PI * 2,
+      tint: new THREE.Color().setHSL(0.27 + (rand() - 0.5) * 0.05, 0.4, 0.38 + rand() * 0.16),
+    });
+  }
+  buildInstancedFerns(propCtx, fernSpots);
+
+  const shrubCount = Math.max(55, Math.round(170 * qProfile.foliageDensity));
+  const shrubSpots: Array<{ x: number; y: number; z: number; scale: number; yaw: number; tint: THREE.Color }> = [];
+  for (let i = 0; i < shrubCount * 2 && shrubSpots.length < shrubCount; i++) {
+    const sx = (rand() - 0.5) * 216;
+    const sz = (rand() - 0.5) * 216;
+    if (!isClearFoliage(sx, sz)) continue;
+    const sy = sampleVisualTerrainY(sx, sz);
+    if (sy < -0.12) continue;
+    shrubSpots.push({
+      x: sx,
+      y: sy,
+      z: sz,
+      scale: 0.85 + rand() * 0.75,
+      yaw: rand() * Math.PI * 2,
+      tint: new THREE.Color().setHSL(0.25 + (rand() - 0.5) * 0.08, 0.34, 0.35 + rand() * 0.16),
+    });
+  }
+  buildInstancedUndergrowthShrubs(propCtx, shrubSpots);
 
   // Natural mossy valley boulders along riverbanks & forest flanks
   const rockGeo = trackGeo(new THREE.DodecahedronGeometry(1.3, 0));
@@ -1206,6 +1479,58 @@ function buildTimberlineCompound(
 
   physics.setRaycastMeshes(raycastMeshes);
 
+  const shatterBreakable = (
+    objOrId: THREE.Object3D | string,
+    impactPoint?: Readonly<THREE.Vector3>,
+  ): { breakableId: string; impactPoint: THREE.Vector3 } | null => {
+    const id =
+      typeof objOrId === 'string'
+        ? objOrId
+        : (objOrId.userData?.breakableId as string | undefined);
+    if (!id) return null;
+    const rec = breakablesById.get(id);
+    if (!rec || rec.shattered) return null;
+    rec.shattered = true;
+    rec.mesh.userData.shattered = true;
+    rec.mesh.visible = false;
+    physics.disableBoxById(id);
+
+    const rayIdx = raycastMeshes.indexOf(rec.mesh);
+    if (rayIdx >= 0) {
+      raycastMeshes.splice(rayIdx, 1);
+    }
+
+    const origin = impactPoint ? impactPoint.clone() : rec.center.clone();
+    if (!isSoftwareGl) {
+      const shardCount = 18;
+      for (let s = 0; s < shardCount; s++) {
+        const sm = new THREE.Mesh(shardGeo, matGlassShard);
+        sm.position.set(
+          origin.x + (Math.random() - 0.5) * 1.1,
+          Math.max(0.95, origin.y + (Math.random() - 0.5) * 1.2),
+          origin.z + (Math.random() - 0.5) * 1.1,
+        );
+        sm.scale.set(0.6 + Math.random() * 1.2, 0.8 + Math.random() * 1.4, 0.35);
+        sceneGroup.add(sm);
+        activeGlassShards.push({
+          mesh: sm,
+          vel: new THREE.Vector3(
+            (Math.random() - 0.5) * 5.2,
+            1.0 + Math.random() * 2.8,
+            (Math.random() - 0.5) * 5.2,
+          ),
+          rotVel: new THREE.Vector3(
+            (Math.random() - 0.5) * 14,
+            (Math.random() - 0.5) * 14,
+            (Math.random() - 0.5) * 14,
+          ),
+          life: 4.5,
+        });
+      }
+    }
+    return { breakableId: id, impactPoint: origin };
+  };
+
   return {
     id: 'timberline_compound',
     name: 'Timberline Valley & Base',
@@ -1223,13 +1548,51 @@ function buildTimberlineCompound(
     terrainHeightAt: samplePhysicsTerrainY,
     interactables: [],
     lightingPreset: LIGHTING_PRESET,
+    supportsDynamicWeatherTime: true,
+    envBindings: {
+      windUniforms,
+      waterUniforms: waterHandle.uniforms,
+      wettableSurfaces,
+      nightLights,
+    },
+    shatterBreakable,
     update: (dt, elapsedSec) => {
       // Smooth rotating radar dish + blinking aviation obstruction beacon
       radar.dishPivot.rotation.y += dt * 0.55;
       const blink = Math.sin(elapsedSec * 4.2) > 0.25;
       radar.beaconMat.emissiveIntensity = blink ? 3.2 : 0.35;
-      // Subtle flowing alpine river scroll
-      riverTex.offset.y = -(elapsedSec * 0.14) % 1;
+
+      // Animate windsock heading & lift directly from live weather wind uniforms
+      const wx = windUniforms.uWindDir.value.x;
+      const wz = windUniforms.uWindDir.value.y;
+      const wStr = windUniforms.uWindStrength.value;
+      const windYaw = Math.atan2(-wz, wx);
+      windsockPivot.rotation.y = windYaw + Math.sin(elapsedSec * 4.6) * 0.14 * wStr;
+      // Droops when calm, extends nearly horizontal in strong storm gusts
+      const lift = THREE.MathUtils.clamp(wStr * 0.85, 0.15, 0.92);
+      windsockArm.rotation.z = -(1 - lift) * 0.85 + Math.sin(elapsedSec * 7.2) * 0.08 * wStr;
+
+      // Update tumbling broken glass shards
+      for (let i = activeGlassShards.length - 1; i >= 0; i--) {
+        const sh = activeGlassShards[i];
+        sh.life -= dt;
+        sh.vel.y -= 9.81 * dt;
+        sh.mesh.position.addScaledVector(sh.vel, dt);
+        sh.mesh.rotation.x += sh.rotVel.x * dt;
+        sh.mesh.rotation.y += sh.rotVel.y * dt;
+        sh.mesh.rotation.z += sh.rotVel.z * dt;
+        if (sh.mesh.position.y < 0.06) {
+          sh.mesh.position.y = 0.06;
+          sh.vel.y = Math.abs(sh.vel.y) * 0.28;
+          sh.vel.x *= 0.6;
+          sh.vel.z *= 0.6;
+          sh.rotVel.multiplyScalar(0.5);
+        }
+        if (sh.life <= 0) {
+          sceneGroup.remove(sh.mesh);
+          activeGlassShards.splice(i, 1);
+        }
+      }
     },
     dispose: () => {
       scene.remove(sceneGroup);

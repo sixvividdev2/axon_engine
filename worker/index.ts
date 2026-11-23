@@ -8,7 +8,11 @@ import {
   LobbyRoomState,
   LobbyVisibility,
   sanitizeSpecialEventConfig,
+  sanitizeTimeOfDayStart,
+  sanitizeWeatherPreset,
   SpecialEventRecord,
+  TimeOfDayStartSetting,
+  WeatherPresetId,
 } from '../data/multiplayer';
 import {
   applyMatchProgression,
@@ -1372,6 +1376,8 @@ export default {
           killLimit?: number;
           botDifficulty?: 'recruit' | 'tactical' | 'veteran';
           killfeedPolicy?: 'player_choice' | 'force_on' | 'force_off';
+          weatherPreset?: WeatherPresetId;
+          timeOfDayStart?: TimeOfDayStartSetting;
           specialEventId?: string | null;
         }>(request);
 
@@ -1447,6 +1453,12 @@ export default {
           : body?.killfeedPolicy === 'force_on' || body?.killfeedPolicy === 'force_off'
             ? body.killfeedPolicy
             : 'player_choice';
+        const weatherPreset = sanitizeWeatherPreset(
+          specialEvent ? specialEvent.config.weatherPreset : body?.weatherPreset,
+        );
+        const timeOfDayStart = sanitizeTimeOfDayStart(
+          specialEvent ? specialEvent.config.timeOfDayStart : body?.timeOfDayStart,
+        );
 
         let code = generateLobbyCode();
         for (let attempt = 0; attempt < 5; attempt++) {
@@ -1479,6 +1491,8 @@ export default {
             killLimit,
             botDifficulty,
             killfeedPolicy,
+            weatherPreset,
+            timeOfDayStart,
             specialEvent,
           }),
         });

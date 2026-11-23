@@ -35,6 +35,11 @@ import {
 import { useLoadoutStore } from '../data/loadoutStore';
 import { useTacticalEquipmentSelection } from '../bodycam-sdk/equipment/TacticalEquipmentStore';
 import { TACTICAL_EQUIPMENT_LIST } from '../data/tacticalEquipment';
+import {
+  formatTimeOfDayLabel,
+  formatWeatherPresetLabel,
+  WeatherTimeControls,
+} from './WeatherTimeControls';
 
 interface LobbyRoomViewProps {
   onOpenLoadoutWorkbench?: () => void;
@@ -196,6 +201,11 @@ export const LobbyRoomView: React.FC<LobbyRoomViewProps> = ({ onOpenLoadoutWorkb
                 <span className="text-sky-300">Mode Cycle ON</span>
               </>
             )}
+            <span className="text-neutral-600">·</span>
+            <span>
+              {formatWeatherPresetLabel(lobby.weatherPreset ?? ev.config.weatherPreset)} ·{' '}
+              {formatTimeOfDayLabel(lobby.timeOfDayStart ?? ev.config.timeOfDayStart)}
+            </span>
           </div>
         </div>
       ) : (
@@ -568,6 +578,18 @@ export const LobbyRoomView: React.FC<LobbyRoomViewProps> = ({ onOpenLoadoutWorkb
               </div>
             )
           )}
+
+          {/* Weather & Time of Day (Host Editable / Client Read-Only) */}
+          <WeatherTimeControls
+            compact
+            editable={isHost}
+            mapId={lobby.mapId}
+            weatherPreset={lobby.weatherPreset ?? ev?.config.weatherPreset ?? 'auto'}
+            timeOfDayStart={lobby.timeOfDayStart ?? ev?.config.timeOfDayStart ?? 'auto'}
+            accent={isInfection ? 'red' : 'sky'}
+            onChangeWeather={(weatherPreset) => updateSettings({ weatherPreset })}
+            onChangeTimeOfDay={(timeOfDayStart) => updateSettings({ timeOfDayStart })}
+          />
 
           {/* Host Killfeed Policy Override & Personal Toggle */}
           <div className="border border-neutral-800 bg-neutral-900/50 p-3">

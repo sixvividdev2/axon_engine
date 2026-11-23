@@ -200,6 +200,10 @@ export class BodycamPhysicsWorld {
     this.interiorZones.push(zone);
   }
 
+  public getInteriorZones(): readonly PhysicsInteriorZone[] {
+    return this.interiorZones;
+  }
+
   public clear(): void {
     this.boxes.length = 0;
     this.ramps.length = 0;

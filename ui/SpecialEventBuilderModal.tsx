@@ -8,6 +8,7 @@ import {
 } from '../data/multiplayer';
 import { BATTLE_MAPS, ZOMBIE_MAPS } from '../maps/MapRegistry';
 import { BotDifficultyId } from '../maps/types';
+import { WeatherTimeControls } from './WeatherTimeControls';
 
 interface SpecialEventBuilderModalProps {
   initialEvent?: SpecialEventRecord | null;
@@ -291,6 +292,16 @@ export const SpecialEventBuilderModal: React.FC<SpecialEventBuilderModalProps> =
                   </div>
                 )}
               </div>
+
+              {/* Weather & 5x Dynamic Time of Day */}
+              <WeatherTimeControls
+                mapId={cfg.mapId}
+                weatherPreset={cfg.weatherPreset ?? 'auto'}
+                timeOfDayStart={cfg.timeOfDayStart ?? 'auto'}
+                accent="amber"
+                onChangeWeather={(weatherPreset) => patchCfg({ weatherPreset })}
+                onChangeTimeOfDay={(timeOfDayStart) => patchCfg({ timeOfDayStart })}
+              />
             </section>
 
             {/* Section 3: Player Health, Movement & Elimination Rules */}

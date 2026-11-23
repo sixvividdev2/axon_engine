@@ -107,6 +107,36 @@ export const CombatHud: React.FC<CombatHudProps> = ({
         localPlayerName={multiplayerSession?.localPlayerName ?? 'YOU'}
       />
 
+      {/* Mid-Left Tactical Squad Radio Feed (Allied Bot Comms in Infection & Battle TDM) */}
+      {snapshot.squadComms.length > 0 && (
+        <div className="pointer-events-none fixed left-5 bottom-40 z-10 flex w-72 flex-col gap-1 font-mono-tabular">
+          <div className="text-[9px] font-semibold uppercase tracking-[0.18em] text-neutral-400">
+            SQUAD RADIO · VHF CH-04
+          </div>
+          {snapshot.squadComms.map((msg) => {
+            const accent =
+              msg.category === 'threat'
+                ? 'border-l-red-500 text-red-300'
+                : msg.category === 'economy'
+                  ? 'border-l-amber-400 text-amber-200'
+                  : msg.category === 'ack'
+                    ? 'border-l-emerald-400 text-emerald-200'
+                    : 'border-l-sky-400 text-sky-200';
+            return (
+              <div
+                key={msg.id}
+                className={`border border-neutral-800/80 border-l-2 bg-neutral-950/84 px-2 py-1 text-[10px] leading-snug ${accent}`}
+              >
+                <span className="mr-1.5 font-semibold uppercase tracking-wider">
+                  [{msg.callsign}]
+                </span>
+                <span className="text-neutral-100">{msg.text}</span>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
       {/* World-Projected Tactical Pings (Z Key · Auto-Detect Location / Enemy / Item · Distance Fade) */}
       {snapshot.tacticalPings.length > 0 && (
         <div className="pointer-events-none fixed inset-0 z-10 overflow-hidden">
@@ -232,6 +262,12 @@ export const CombatHud: React.FC<CombatHudProps> = ({
           <div className="mt-0.5 text-[10px] text-neutral-200/80">
             {formatRecTimestamp(snapshot.recordingElapsedSec)}
           </div>
+          {snapshot.supportsDynamicWeatherTime && (
+            <div className="mt-0.5 text-[10px] uppercase tracking-wider text-amber-300/90">
+              {snapshot.gameClockText} · {snapshot.weatherLabel} ·{' '}
+              {snapshot.windSpeedMps.toFixed(1)} m/s
+            </div>
+          )}
           <div className="mt-1.5">
             <HeartRateIndicator
               bpm={snapshot.heartRateBpm}
@@ -437,6 +473,27 @@ export const CombatHud: React.FC<CombatHudProps> = ({
               </div>
             </div>
 
+            {snapshot.infectionSquadBots.length > 0 && (
+              <div className="flex flex-wrap gap-1.5 font-mono-tabular text-[10px]">
+                {snapshot.infectionSquadBots.map((bot) => (
+                  <div
+                    key={bot.id}
+                    className={`flex items-center gap-1.5 border px-2 py-0.5 ${
+                      bot.alive
+                        ? 'border-neutral-700/90 bg-neutral-950/85 text-neutral-200'
+                        : 'border-red-900/80 bg-red-950/70 text-red-300'
+                    }`}
+                  >
+                    <span className="font-semibold uppercase text-sky-300">{bot.name}</span>
+                    <span className="text-neutral-400">
+                      {bot.alive ? bot.weaponLabel : 'DOWN'}
+                    </span>
+                    <span className="font-semibold text-amber-300">{bot.points}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+
             {snapshot.perks.length > 0 && (
               <div className="flex items-center gap-2 font-mono-tabular text-[10px] font-semibold uppercase tracking-wider">
                 {snapshot.perks.includes('vitality') && (
@@ -624,6 +681,42 @@ export const CombatHud: React.FC<CombatHudProps> = ({
         </div>
 
         <div className="flex items-stretch gap-1.5">
+          {/* Helmet-Mounted Night Vision & IR Illuminator Indicator */}
+          {snapshot.nvgMount !== 'none' && (
+            <div
+              className={`flex flex-col justify-center border px-3 py-1.5 font-mono-tabular text-right ${
+                snapshot.nvgActive
+                  ? snapshot.nvgMount === 'arnvg'
+                    ? 'border-sky-500/80 bg-neutral-950/90 text-sky-200'
+                    : 'border-emerald-500/80 bg-neutral-950/90 text-emerald-200'
+                  : 'border-neutral-800/90 bg-neutral-950/88 text-neutral-400'
+              }`}
+            >
+              <div className="text-[10px] font-semibold uppercase tracking-wider">
+                {snapshot.nvgMount === 'arnvg' ? 'RNVG-A P45' : 'PVS-7 P43'}
+              </div>
+              <div className="mt-0.5 flex items-center justify-end gap-1.5 text-[10px] uppercase">
+                <span className={snapshot.nvgActive ? 'font-bold' : 'text-neutral-500'}>
+                  {snapshot.nvgActive ? 'ON' : 'STOW'}
+                </span>
+                <span className="border border-neutral-700 bg-neutral-900 px-1 text-[9px] text-neutral-300">
+                  J
+                </span>
+                {snapshot.nvgActive && (
+                  <span
+                    className={`border px-1 text-[9px] font-semibold ${
+                      snapshot.irIlluminatorOn
+                        ? 'border-amber-400 bg-amber-950/80 text-amber-200'
+                        : 'border-neutral-700 bg-neutral-900 text-neutral-400'
+                    }`}
+                  >
+                    IR {snapshot.irIlluminatorOn ? 'ON' : 'N'}
+                  </span>
+                )}
+              </div>
+            </div>
+          )}
+
           {/* Belt Tactical Grenade Slot */}
           <div
             className={`flex flex-col justify-center border px-3 py-1.5 font-mono-tabular text-right ${
@@ -684,16 +777,32 @@ export const CombatHud: React.FC<CombatHudProps> = ({
           className="fixed bottom-3 left-1/2 hidden -translate-x-1/2 items-center gap-2.5 whitespace-nowrap font-mono-tabular text-[10px] uppercase tracking-wider text-neutral-300/75 lg:flex"
           style={{ textShadow: '0 1px 2px rgba(0,0,0,0.95)' }}
         >
-          <span>1-2 Weapons</span>
-          <span className="text-amber-300">4 / H Grenade</span>
-          <span>R Reload</span>
-          <span>MMB Pt-Aim</span>
-          <span>V Bash</span>
-          <span>X Kick</span>
-          <span className="text-sky-300">Z Ping</span>
-          {isBattle && <span>Tab Scoreboard</span>}
-          {isInfection && <span className="text-amber-300">F Interact · Hold F Repair</span>}
-          <span>F1 Optics</span>
+          {snapshot.isPdaOpen ? (
+            <>
+              <span className="text-emerald-300">TAC-PDA ACTIVE</span>
+              <span>Mouse Joystick Pan</span>
+              <span>Wheel Zoom</span>
+              <span>R / RMB Center</span>
+              <span className="text-amber-300">M Stow PDA</span>
+            </>
+          ) : (
+            <>
+              <span>1-2 Weapons</span>
+              <span className="text-amber-300">4 / H Grenade</span>
+              <span className="text-emerald-300">M Tac Map</span>
+              {snapshot.nvgMount !== 'none' && (
+                <span className="text-sky-300">J NVG · N IR</span>
+              )}
+              <span>R Reload</span>
+              <span>MMB Pt-Aim</span>
+              <span>V Bash</span>
+              <span>X Kick</span>
+              <span className="text-sky-300">Z Ping</span>
+              {isBattle && <span>Tab Scoreboard</span>}
+              {isInfection && <span className="text-amber-300">F Interact · Hold F Repair</span>}
+              <span>F1 Optics</span>
+            </>
+          )}
         </div>
       )}
 

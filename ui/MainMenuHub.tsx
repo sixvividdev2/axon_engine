@@ -37,6 +37,7 @@ import {
   TACTICAL_EQUIPMENT_LIST,
   TacticalEquipmentId,
 } from '../data/tacticalEquipment';
+import { WeatherTimeControls } from './WeatherTimeControls';
 
 export type HubTabId = TopLevelModeId | 'loadout' | 'operator' | 'multiplayer';
 
@@ -608,6 +609,16 @@ export const MainMenuHub: React.FC<MainMenuHubProps> = ({
                 />
               </div>
 
+              {/* Weather & 5x Dynamic Time of Day */}
+              <WeatherTimeControls
+                mapId={battleConfig.mapId}
+                weatherPreset={battleConfig.weatherPreset ?? 'auto'}
+                timeOfDayStart={battleConfig.timeOfDayStart ?? 'auto'}
+                accent="amber"
+                onChangeWeather={(weatherPreset) => updateBattle({ weatherPreset })}
+                onChangeTimeOfDay={(timeOfDayStart) => updateBattle({ timeOfDayStart })}
+              />
+
               <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
                 <div className="font-mono-tabular text-xs text-neutral-400">
                   {battleConfig.rule === 'tdm'
@@ -621,6 +632,8 @@ export const MainMenuHub: React.FC<MainMenuHubProps> = ({
                     onLaunchBattle({
                       ...battleConfig,
                       tacticalEquipmentId: tacticalSelection.equipmentId,
+                      weatherPreset: battleConfig.weatherPreset ?? 'auto',
+                      timeOfDayStart: battleConfig.timeOfDayStart ?? 'auto',
                     })
                   }
                   className="cursor-pointer whitespace-nowrap shrink-0 bg-amber-500 px-8 py-3 font-display text-base font-bold uppercase tracking-wider text-neutral-950 transition-colors hover:bg-amber-400"
@@ -766,6 +779,20 @@ export const MainMenuHub: React.FC<MainMenuHubProps> = ({
                 </div>
               </div>
 
+              {/* Weather & 5x Dynamic Time of Day (Outdoor Containment Sites) */}
+              <WeatherTimeControls
+                mapId={infectionConfig.mapId}
+                weatherPreset={infectionConfig.weatherPreset ?? 'auto'}
+                timeOfDayStart={infectionConfig.timeOfDayStart ?? 'auto'}
+                accent="red"
+                onChangeWeather={(weatherPreset) =>
+                  setInfectionConfig((prev) => ({ ...prev, weatherPreset }))
+                }
+                onChangeTimeOfDay={(timeOfDayStart) =>
+                  setInfectionConfig((prev) => ({ ...prev, timeOfDayStart }))
+                }
+              />
+
               <div className="flex flex-wrap items-center justify-between gap-3 border-t border-red-950/80 pt-3">
                 <div className="font-mono-tabular text-[11px] text-neutral-300">
                   Hold [F] Repair Window Barriers (+5 PTS) · Buyable Doors · Backstage Power ·
@@ -779,6 +806,8 @@ export const MainMenuHub: React.FC<MainMenuHubProps> = ({
                       botCount: infectionConfig.botCount ?? 0,
                       botDifficulty: infectionConfig.botDifficulty ?? 'tactical',
                       tacticalEquipmentId: tacticalSelection.equipmentId,
+                      weatherPreset: infectionConfig.weatherPreset ?? 'auto',
+                      timeOfDayStart: infectionConfig.timeOfDayStart ?? 'auto',
                     })
                   }
                   className="cursor-pointer whitespace-nowrap shrink-0 bg-red-600 px-8 py-3 font-display text-base font-bold uppercase tracking-wider text-neutral-50 transition-colors hover:bg-red-500"
@@ -806,8 +835,8 @@ export const MainMenuHub: React.FC<MainMenuHubProps> = ({
         {/* Bottom Controls, 4-Mode Graphics Quality & Killfeed Toggle Footer */}
         <footer className="flex flex-wrap items-center justify-between gap-3 border-t border-neutral-800/70 pt-3 font-mono-tabular text-[11px] text-neutral-400">
           <div>
-            WASD Move · Shift Sprint · RMB ADS · MMB Point Aim · R Reload · 4 / H Grenade · Z Ping ·
-            F Interact · F1 Settings
+            WASD Move · Shift Sprint · RMB ADS · MMB Point Aim · R Reload · 4 / H Grenade · M Tac
+            Map · Z Ping · F Interact · F1 Settings
           </div>
           <div className="flex flex-wrap items-center gap-3">
             <div className="flex items-center gap-1">

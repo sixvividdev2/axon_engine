@@ -67,6 +67,7 @@ interface RemoteOperator {
   flashlightOn: boolean;
   laserOn: boolean;
   hasInitialState: boolean;
+  gearSig: string;
 
   // Unified Tactical 3D Rig
   rig: BuiltTacticalOperatorRig;
@@ -281,6 +282,7 @@ export class RemotePlayerManager {
           this.group.add(newRig.root);
           existing.rig = newRig;
           existing.operatorId = targetOperatorId;
+          existing.gearSig = '';
         }
       }
       return existing;
@@ -352,6 +354,7 @@ export class RemotePlayerManager {
       flashlightOn: false,
       laserOn: false,
       hasInitialState: false,
+      gearSig: '',
 
       rig,
       nameSprite,
@@ -465,6 +468,28 @@ export class RemotePlayerManager {
       op.hasInitialState = true;
     }
 
+    if (
+      pkt.glovesEnabled !== undefined ||
+      pkt.gloveColor !== undefined ||
+      pkt.helmetType !== undefined ||
+      pkt.helmetColor !== undefined ||
+      pkt.nvgMount !== undefined ||
+      pkt.nvgFlipped !== undefined
+    ) {
+      const nextSig = `${pkt.glovesEnabled ?? ''}|${pkt.gloveColor ?? ''}|${pkt.helmetType ?? ''}|${pkt.helmetColor ?? ''}|${pkt.nvgMount ?? ''}|${pkt.nvgFlipped ? 1 : 0}`;
+      if (op.gearSig !== nextSig) {
+        op.gearSig = nextSig;
+        op.rig.setGearAppearance({
+          glovesEnabled: pkt.glovesEnabled,
+          gloveColor: pkt.gloveColor,
+          helmetType: pkt.helmetType,
+          helmetColor: pkt.helmetColor,
+          nvgMount: pkt.nvgMount,
+          nvgFlipped: pkt.nvgFlipped,
+        });
+      }
+    }
+
     op.rig.root.visible = op.alive;
   }
 
@@ -552,6 +577,27 @@ export class RemotePlayerManager {
     op.targetReload = 0;
     op.reloadBlend = 0;
     op.hasInitialState = true;
+    if (
+      pkt.glovesEnabled !== undefined ||
+      pkt.gloveColor !== undefined ||
+      pkt.helmetType !== undefined ||
+      pkt.helmetColor !== undefined ||
+      pkt.nvgMount !== undefined ||
+      pkt.nvgFlipped !== undefined
+    ) {
+      const nextSig = `${pkt.glovesEnabled ?? ''}|${pkt.gloveColor ?? ''}|${pkt.helmetType ?? ''}|${pkt.helmetColor ?? ''}|${pkt.nvgMount ?? ''}|${pkt.nvgFlipped ? 1 : 0}`;
+      if (op.gearSig !== nextSig) {
+        op.gearSig = nextSig;
+        op.rig.setGearAppearance({
+          glovesEnabled: pkt.glovesEnabled,
+          gloveColor: pkt.gloveColor,
+          helmetType: pkt.helmetType,
+          helmetColor: pkt.helmetColor,
+          nvgMount: pkt.nvgMount,
+          nvgFlipped: pkt.nvgFlipped,
+        });
+      }
+    }
     op.rig.root.visible = true;
   }
 
