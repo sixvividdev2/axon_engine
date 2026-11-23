@@ -890,6 +890,7 @@ export class BodycamPostProcess {
     const prevAutoClear = this.renderer.autoClear;
     const prevShadowAutoUpdate = this.renderer.shadowMap.autoUpdate;
     const prevBackground = this.scene.background;
+    const prevFog = this.scene.fog;
     const prevNear = this.camera.near;
     const prevFar = this.camera.far;
 
@@ -907,6 +908,7 @@ export class BodycamPostProcess {
     this.renderer.clearDepth();
     this.renderer.shadowMap.autoUpdate = false;
     this.scene.background = null;
+    this.scene.fog = null;
     this.camera.near = 0.015;
     this.camera.far = 4.0;
     this.camera.updateProjectionMatrix();
@@ -918,6 +920,7 @@ export class BodycamPostProcess {
     this.camera.far = prevFar;
     this.camera.updateProjectionMatrix();
     this.scene.background = prevBackground;
+    this.scene.fog = prevFog;
     this.renderer.shadowMap.autoUpdate = prevShadowAutoUpdate;
     this.renderer.autoClear = prevAutoClear;
 

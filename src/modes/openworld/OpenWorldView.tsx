@@ -53,7 +53,12 @@ export const OpenWorldView: React.FC<OpenWorldViewProps> = ({
           snapshot={snapshot}
           onRequestLock={() => engineRef.current?.requestPointerLock()}
           onSetNavMode={(mode) => engineRef.current?.setNavMode(mode)}
+          onSetRenderPipeline={(mode) => engineRef.current?.setRenderPipeline(mode)}
+          onSetLensPreset={(preset) => engineRef.current?.setLensPreset(preset)}
+          onSetNvgMode={(mode) => engineRef.current?.setNvgMode(mode)}
           onToggleFlashlight={() => engineRef.current?.toggleFlashlight()}
+          onTogglePda={() => engineRef.current?.togglePda()}
+          onExecuteInteract={() => engineRef.current?.executeFieldInteraction()}
           onTeleportLandmark={(id) => engineRef.current?.teleportToLandmark(id)}
           onSetTimeOfDay={(h) => engineRef.current?.setTimeOfDay(h)}
           onSetTimeScale={(s) => engineRef.current?.setTimeScale(s)}

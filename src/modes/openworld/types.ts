@@ -607,6 +607,15 @@ export interface ShardTransitionLogEntry {
   summary: string;
 }
 
+export type SectorControlOwner = PmcFactionId | 'neutral';
+
+export interface SectorControlRecord {
+  sectorId: string;
+  owner: SectorControlOwner;
+  captureProgress: number; // 0..100 for current owner stability
+  lastFlippedAtIso?: string;
+}
+
 export interface ShardWorldState {
   mode: ShardMode;
   revision: number;
@@ -616,6 +625,7 @@ export interface ShardWorldState {
     pmc_bravo: number;
     neutral: number;
   };
+  sectors: Record<string, SectorControlRecord>;
   corpses: DroppedCorpseEntity[];
   recentTransitions: ShardTransitionLogEntry[];
 }

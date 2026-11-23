@@ -6,6 +6,8 @@ import {
   OpenWorldStorageLike,
   PmcFactionId,
   resolveDefaultStorage,
+  SectorControlOwner,
+  SectorControlRecord,
   SHARD_RULES,
   ShardMode,
   ShardWorldState,
@@ -35,7 +37,59 @@ function createInitialSupplyPool(mode: ShardMode, faction: PmcFactionId): Factio
     : { ammo: 76, medical: 78, fuelParts: 75, intel: 68 };
 }
 
+function createInitialSectors(mode: ShardMode): Record<string, SectorControlRecord> {
+  return {
+    landmark_fob_alpha: {
+      sectorId: 'landmark_fob_alpha',
+      owner: 'pmc_alpha',
+      captureProgress: 100,
+    },
+    landmark_fob_bravo: {
+      sectorId: 'landmark_fob_bravo',
+      owner: 'pmc_bravo',
+      captureProgress: 100,
+    },
+    landmark_port_terminal: {
+      sectorId: 'landmark_port_terminal',
+      owner: mode === 'PvE' ? 'pmc_alpha' : 'neutral',
+      captureProgress: mode === 'PvE' ? 100 : 0,
+    },
+    landmark_timberline_railyard: {
+      sectorId: 'landmark_timberline_railyard',
+      owner: 'neutral',
+      captureProgress: 0,
+    },
+    landmark_steppe_quarry: {
+      sectorId: 'landmark_steppe_quarry',
+      owner: mode === 'PvE' ? 'pmc_bravo' : 'neutral',
+      captureProgress: mode === 'PvE' ? 100 : 0,
+    },
+    landmark_alpine_dam: {
+      sectorId: 'landmark_alpine_dam',
+      owner: 'neutral',
+      captureProgress: 0,
+    },
+  };
+}
+
+function countTerritories(sectors: Record<string, SectorControlRecord>): {
+  pmc_alpha: number;
+  pmc_bravo: number;
+  neutral: number;
+} {
+  let pmc_alpha = 0;
+  let pmc_bravo = 0;
+  let neutral = 0;
+  for (const rec of Object.values(sectors)) {
+    if (rec.owner === 'pmc_alpha') pmc_alpha++;
+    else if (rec.owner === 'pmc_bravo') pmc_bravo++;
+    else neutral++;
+  }
+  return { pmc_alpha, pmc_bravo, neutral };
+}
+
 function createInitialShard(mode: ShardMode): ShardWorldState {
+  const sectors = createInitialSectors(mode);
   return {
     mode,
     revision: 0,
@@ -43,16 +97,18 @@ function createInitialShard(mode: ShardMode): ShardWorldState {
       pmc_alpha: createInitialSupplyPool(mode, 'pmc_alpha'),
       pmc_bravo: createInitialSupplyPool(mode, 'pmc_bravo'),
     },
-    territoryCounts:
-      mode === 'PvPvE'
-        ? { pmc_alpha: 3, pmc_bravo: 3, neutral: 4 }
-        : { pmc_alpha: 4, pmc_bravo: 4, neutral: 2 },
+    territoryCounts: countTerritories(sectors),
+    sectors,
     corpses: [],
     recentTransitions: [],
   };
 }
 
 function cloneShard(s: ShardWorldState): ShardWorldState {
+  const clonedSectors: Record<string, SectorControlRecord> = {};
+  for (const [k, v] of Object.entries(s.sectors)) {
+    clonedSectors[k] = { ...v };
+  }
   return {
     mode: s.mode,
     revision: s.revision,
@@ -61,6 +117,7 @@ function cloneShard(s: ShardWorldState): ShardWorldState {
       pmc_bravo: { ...s.pmcSupplyPools.pmc_bravo },
     },
     territoryCounts: { ...s.territoryCounts },
+    sectors: clonedSectors,
     corpses: s.corpses.map((c) => ({
       ...c,
       droppedWeaponIds: [...c.droppedWeaponIds],
@@ -139,20 +196,27 @@ export class ShardStore {
               intel: clampPct(src.pmcSupplyPools?.pmc_bravo?.intel, def.pmcSupplyPools.pmc_bravo.intel),
             },
           },
-          territoryCounts: {
-            pmc_alpha:
-              typeof src.territoryCounts?.pmc_alpha === 'number'
-                ? Math.max(0, Math.floor(src.territoryCounts.pmc_alpha))
-                : def.territoryCounts.pmc_alpha,
-            pmc_bravo:
-              typeof src.territoryCounts?.pmc_bravo === 'number'
-                ? Math.max(0, Math.floor(src.territoryCounts.pmc_bravo))
-                : def.territoryCounts.pmc_bravo,
-            neutral:
-              typeof src.territoryCounts?.neutral === 'number'
-                ? Math.max(0, Math.floor(src.territoryCounts.neutral))
-                : def.territoryCounts.neutral,
-          },
+          ...(() => {
+            const mergedSectors: Record<string, SectorControlRecord> = { ...def.sectors };
+            if (src.sectors && typeof src.sectors === 'object') {
+              for (const [secId, rec] of Object.entries(src.sectors)) {
+                if (rec && typeof rec === 'object') {
+                  const owner: SectorControlOwner =
+                    rec.owner === 'pmc_alpha' || rec.owner === 'pmc_bravo' ? rec.owner : 'neutral';
+                  mergedSectors[secId] = {
+                    sectorId: secId,
+                    owner,
+                    captureProgress: clampPct(rec.captureProgress, owner === 'neutral' ? 0 : 100),
+                    lastFlippedAtIso: typeof rec.lastFlippedAtIso === 'string' ? rec.lastFlippedAtIso : undefined,
+                  };
+                }
+              }
+            }
+            return {
+              sectors: mergedSectors,
+              territoryCounts: countTerritories(mergedSectors),
+            };
+          })(),
           corpses: Array.isArray(src.corpses)
             ? src.corpses.slice(0, MAX_CORPSES_PER_SHARD).map((c) => ({
                 ...c,
@@ -272,6 +336,138 @@ export class ShardStore {
     if (!corpse) return false;
     if (corpse.ownerCharacterId === looterCharacterId) return true;
     return SHARD_RULES[mode].corpseLootingPlayers;
+  }
+
+  /**
+   * Discrete state transition write: claims/loots a persistent corpse if permitted by shard rules.
+   */
+  public lootAndRemoveCorpse(
+    mode: ShardMode,
+    corpseId: string,
+    looterCharacterId: string,
+    looterCallsign: string,
+  ): { ok: boolean; error?: string; corpse?: DroppedCorpseEntity } {
+    const shard = this.state.shards[mode];
+    const target = shard.corpses.find((c) => c.corpseId === corpseId);
+    if (!target) return { ok: false, error: 'Corpse no longer exists in this shard.' };
+    if (!this.canCharacterLootCorpse(mode, corpseId, looterCharacterId)) {
+      return {
+        ok: false,
+        error: 'PvE Cooperative Shard rules prevent looting another player\'s corpse.',
+      };
+    }
+    const nextRev = shard.revision + 1;
+    const nextCorpses = shard.corpses.filter((c) => c.corpseId !== corpseId);
+    this.state = {
+      shards: {
+        ...this.state.shards,
+        [mode]: {
+          ...shard,
+          revision: nextRev,
+          corpses: nextCorpses,
+          recentTransitions: [
+            {
+              revision: nextRev,
+              type: 'stash_update',
+              timestampIso: new Date().toISOString(),
+              summary: `${looterCallsign} recovered gear from ${target.ownerCallsign}'s corpse at ${target.sectorLabel}`,
+            },
+            ...shard.recentTransitions,
+          ].slice(0, MAX_TRANSITION_LOG),
+        },
+      },
+    };
+    this.persistAndEmit();
+    return {
+      ok: true,
+      corpse: {
+        ...target,
+        droppedWeaponIds: [...target.droppedWeaponIds],
+        droppedItems: target.droppedItems.map((it) => ({ ...it })),
+      },
+    };
+  }
+
+  /**
+   * Discrete state transition write: flips ownership of a strategic sector in ONE shard,
+   * recalculates territory counts, and awards supply pool deltas to the capturing PMC.
+   */
+  public flipSector(
+    mode: ShardMode,
+    sectorId: string,
+    newOwner: SectorControlOwner,
+    actorCallsign: string,
+    sectorLabel: string,
+    supplyBonus?: Partial<FactionSupplyPool>,
+  ): { changed: boolean; previousOwner: SectorControlOwner; sector: SectorControlRecord } {
+    const shard = this.state.shards[mode];
+    const prev = shard.sectors[sectorId] ?? {
+      sectorId,
+      owner: 'neutral' as SectorControlOwner,
+      captureProgress: 0,
+    };
+    const previousOwner = prev.owner;
+    const nowIso = new Date().toISOString();
+    const updatedRecord: SectorControlRecord = {
+      sectorId,
+      owner: newOwner,
+      captureProgress: newOwner === 'neutral' ? 0 : 100,
+      lastFlippedAtIso: nowIso,
+    };
+    const nextSectors: Record<string, SectorControlRecord> = {
+      ...shard.sectors,
+      [sectorId]: updatedRecord,
+    };
+    const nextCounts = countTerritories(nextSectors);
+    const nextPools = {
+      pmc_alpha: { ...shard.pmcSupplyPools.pmc_alpha },
+      pmc_bravo: { ...shard.pmcSupplyPools.pmc_bravo },
+    };
+    if (newOwner !== 'neutral' && supplyBonus) {
+      const p = nextPools[newOwner];
+      nextPools[newOwner] = {
+        ammo: clampPct(p.ammo + (supplyBonus.ammo ?? 0), p.ammo),
+        medical: clampPct(p.medical + (supplyBonus.medical ?? 0), p.medical),
+        fuelParts: clampPct(p.fuelParts + (supplyBonus.fuelParts ?? 0), p.fuelParts),
+        intel: clampPct(p.intel + (supplyBonus.intel ?? 0), p.intel),
+      };
+    }
+
+    const nextRev = shard.revision + 1;
+    const ownerLabel =
+      newOwner === 'pmc_alpha'
+        ? 'PMC Alpha'
+        : newOwner === 'pmc_bravo'
+          ? 'PMC Bravo'
+          : 'Neutral';
+
+    this.state = {
+      shards: {
+        ...this.state.shards,
+        [mode]: {
+          ...shard,
+          revision: nextRev,
+          sectors: nextSectors,
+          territoryCounts: nextCounts,
+          pmcSupplyPools: nextPools,
+          recentTransitions: [
+            {
+              revision: nextRev,
+              type: 'sector_flip',
+              timestampIso: nowIso,
+              summary: `${actorCallsign} flipped ${sectorLabel} to ${ownerLabel}`,
+            },
+            ...shard.recentTransitions,
+          ].slice(0, MAX_TRANSITION_LOG),
+        },
+      },
+    };
+    this.persistAndEmit();
+    return {
+      changed: previousOwner !== newOwner,
+      previousOwner,
+      sector: { ...updatedRecord },
+    };
   }
 
   /**

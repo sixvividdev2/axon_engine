@@ -9,4 +9,7 @@ export * from './OpenWorldView';
 export * from './world/OpenWorldTerrain';
 export * from './world/OpenWorldAtmosphere';
 export * from './world/OpenWorldChunkStreamer';
+export * from './world/OpenWorldSectorManager';
+export * from './world/OpenWorldAiDirector';
+export * from './world/OpenWorldBodycamAdapter';
 export * from './world/OpenWorldSessionEngine';

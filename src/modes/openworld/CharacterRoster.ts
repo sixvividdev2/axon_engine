@@ -1357,6 +1357,37 @@ export class CharacterRoster {
     return { ok: true };
   }
 
+  /**
+   * Discrete state transition write: deposits recovered weapons and items from a looted shard corpse
+   * into the looter character's Arsenal & Stash (strictly bound to this characterId).
+   */
+  public addRecoveredCorpseLoot(
+    slotId: CharacterSlotId,
+    weaponIds: readonly string[],
+    items: readonly InventoryItemRecord[],
+  ): OpenWorldCharacter | null {
+    return this.mutateCharacter(slotId, (c) => {
+      for (const rawId of weaponIds) {
+        const canonical = normalizeLoadoutWeaponId(rawId, '');
+        if (!canonical) continue;
+        if (!c.arsenal.ownedWeaponIds.includes(canonical)) {
+          c.arsenal.ownedWeaponIds = [...c.arsenal.ownedWeaponIds, canonical];
+          c.arsenal.wallRackSlots = reconcileRackSlots(
+            c.arsenal.ownedWeaponIds,
+            c.arsenal.wallRackSlots,
+            c.arsenal.equippedWeaponId,
+          );
+          if (c.arsenal.equippedWeaponId === 'unarmed') {
+            c.arsenal.equippedWeaponId = canonical;
+          }
+        }
+      }
+      for (const item of items) {
+        c.stashItems.push({ ...item, instanceId: makeItemId('loot') });
+      }
+    });
+  }
+
   public updateCharacterGear(
     slotId: CharacterSlotId,
     patch: Partial<OperatorGearConfig>,

@@ -836,6 +836,14 @@ export class TacticalPdaDevice {
     }
   }
 
+  /** Supplies a pre-rendered procedural topographic canvas (e.g. 4km open-world theater) directly to the PDA OLED. */
+  public setCustomMapCanvas(canvas: HTMLCanvasElement, bounds: PdaMapBounds): void {
+    this.mapBounds = { ...bounds };
+    this.mapAspectBounds = { ...bounds };
+    this.mapCacheCanvas = canvas;
+    this.screenDirty = true;
+  }
+
   /** Advance state machine, coupled bodycam locomotion/inertia pose, joystick gimbal & OLED texture redraw. */
   public update(
     dt: number,

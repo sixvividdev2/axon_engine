@@ -1,0 +1,575 @@
+import * as THREE from 'three';
+import { CharacterRoster } from '../CharacterRoster';
+import { ShardStore } from '../ShardStore';
+import {
+  FactionSupplyPool,
+  OPENWORLD_CONTRACT_CATALOG,
+  OPENWORLD_CONTRACT_MAP,
+  OpenWorldCharacter,
+  OpenWorldContractSpec,
+  PmcFactionId,
+  SectorControlOwner,
+  ShardMode,
+  SUB_FACTION_MAP,
+  SubFactionId,
+} from '../types';
+import {
+  OPENWORLD_LANDMARKS,
+  OpenWorldLandmarkSpec,
+  SEA_LEVEL_M,
+} from './OpenWorldTerrain';
+
+export interface SectorRuntimeState {
+  readonly sectorId: string;
+  readonly name: string;
+  readonly shortLabel: string;
+  readonly biomeId: OpenWorldLandmarkSpec['biomeId'];
+  readonly worldX: number;
+  readonly worldZ: number;
+  readonly groundY: number;
+  readonly isFob: boolean;
+  readonly homeFaction?: PmcFactionId;
+  readonly subFactionId?: SubFactionId;
+  readonly contractId: string | null;
+  readonly supplyYield: Readonly<Partial<FactionSupplyPool>>;
+  owner: SectorControlOwner;
+  /** 0..100 live capture progress toward the player's PMC faction while inside capture zone */
+  liveCapturePct: number;
+  contested: boolean;
+  hostileGarrisonCount: number;
+  terminalX: number;
+  terminalZ: number;
+}
+
+export interface SectorCaptureCompleteEvent {
+  sectorId: string;
+  sectorName: string;
+  newOwner: PmcFactionId;
+  cashBonusUsd: number;
+  supplyBonus: Partial<FactionSupplyPool>;
+}
+
+export interface OpenWorldInteractableContext {
+  kind: 'contract' | 'sector_terminal' | 'fob_resupply' | 'corpse';
+  id: string;
+  label: string;
+  sublabel: string;
+  distanceM: number;
+  canExecute: boolean;
+  blockedReason?: string;
+}
+
+const SECTOR_CAPTURE_RADIUS_M = 48;
+const SECTOR_CAPTURE_RATE_PER_SEC = 18; // ~5.5s uncontested capture
+const SECTOR_CAPTURE_CASH_BONUS = 1500;
+
+const SECTOR_SUPPLY_YIELDS: Readonly<Record<string, Partial<FactionSupplyPool>>> = {
+  landmark_port_terminal: { fuelParts: 14, ammo: 8, intel: 6 },
+  landmark_timberline_railyard: { ammo: 14, fuelParts: 10, medical: 6 },
+  landmark_steppe_quarry: { intel: 14, ammo: 10, fuelParts: 6 },
+  landmark_alpine_dam: { medical: 14, intel: 14, ammo: 8 },
+};
+
+const CONTRACT_BY_LANDMARK: Readonly<Record<string, string>> = {
+  landmark_port_terminal: 'contract_port_manifest',
+  landmark_timberline_railyard: 'contract_valley_convoy',
+  landmark_steppe_quarry: 'contract_quarry_relay',
+  landmark_alpine_dam: 'contract_dam_vault',
+};
+
+const OWNER_COLORS: Readonly<Record<SectorControlOwner, number>> = {
+  pmc_alpha: 0x38bdf8,
+  pmc_bravo: 0xf59e0b,
+  neutral: 0x94a3b8,
+};
+
+interface SectorVisualHandle {
+  sectorId: string;
+  flagMesh: THREE.Mesh;
+  beaconMesh: THREE.Mesh;
+  ringMesh: THREE.Mesh;
+  flagMat: THREE.MeshStandardMaterial;
+  beaconMat: THREE.MeshStandardMaterial;
+  ringMat: THREE.MeshBasicMaterial;
+  contractScreenMat: THREE.MeshStandardMaterial | null;
+}
+
+/**
+ * Phase 3 Dynamic Territory Control, Sector Command Terminals & In-World Biome Contracts.
+ * - Renders grounded multi-part 3D Sector Command Beacons & Contract Intel Terminals at all 6 landmarks.
+ * - Commits discrete `sector_flip` and `contract_completed` writes to ShardStore & CharacterRoster.
+ * - Zero per-frame allocations; explicit `.dispose()` teardown.
+ */
+export class OpenWorldSectorManager {
+  public readonly rootGroup = new THREE.Group();
+  private readonly sectors = new Map<string, SectorRuntimeState>();
+  private readonly visuals = new Map<string, SectorVisualHandle>();
+  private readonly sharedGeometries: THREE.BufferGeometry[] = [];
+  private readonly sharedMaterials: THREE.Material[] = [];
+
+  private readonly roster: CharacterRoster;
+  private readonly shards: ShardStore;
+  private activeShardMode: ShardMode = 'PvPvE';
+  private waveTime = 0;
+
+  constructor(
+    scene: THREE.Scene,
+    sampleGroundHeight: (x: number, z: number) => number,
+    roster: CharacterRoster,
+    shards: ShardStore,
+    initialShardMode: ShardMode = 'PvPvE',
+  ) {
+    this.roster = roster;
+    this.shards = shards;
+    this.activeShardMode = initialShardMode;
+    this.rootGroup.name = 'openworld_sector_beacons';
+    scene.add(this.rootGroup);
+
+    this.initSectorsAndVisuals(sampleGroundHeight);
+    this.syncFromShard(initialShardMode);
+  }
+
+  private initSectorsAndVisuals(sampleGroundHeight: (x: number, z: number) => number): void {
+    // Shared composite geometries (reused across all 6 sector command beacons -> minimal draw calls)
+    const padGeo = new THREE.BoxGeometry(4.6, 0.28, 4.6);
+    const mastGeo = new THREE.CylinderGeometry(0.08, 0.14, 11.5, 8);
+    const crossBarGeo = new THREE.BoxGeometry(1.9, 0.08, 0.08);
+    const flagGeo = new THREE.PlaneGeometry(2.6, 1.45, 4, 1);
+    flagGeo.translate(1.3, 0, 0);
+    const beaconGeo = new THREE.OctahedronGeometry(0.42, 0);
+    const crateGeo = new THREE.BoxGeometry(1.15, 0.85, 0.72);
+    const antennaGeo = new THREE.CylinderGeometry(0.02, 0.03, 1.45, 5);
+    const ringGeo = new THREE.RingGeometry(SECTOR_CAPTURE_RADIUS_M - 0.65, SECTOR_CAPTURE_RADIUS_M, 48);
+    ringGeo.rotateX(-Math.PI * 0.5);
+
+    // Contract intel terminal geometries
+    const laptopBaseGeo = new THREE.BoxGeometry(0.54, 0.06, 0.38);
+    const laptopLidGeo = new THREE.BoxGeometry(0.54, 0.34, 0.04);
+    const caseGeo = new THREE.BoxGeometry(0.88, 0.52, 0.62);
+
+    this.sharedGeometries.push(
+      padGeo,
+      mastGeo,
+      crossBarGeo,
+      flagGeo,
+      beaconGeo,
+      crateGeo,
+      antennaGeo,
+      ringGeo,
+      laptopBaseGeo,
+      laptopLidGeo,
+      caseGeo,
+    );
+
+    const concreteMat = new THREE.MeshStandardMaterial({ color: 0x4b5158, roughness: 0.92, metalness: 0.06 });
+    const steelMat = new THREE.MeshStandardMaterial({ color: 0x353a40, roughness: 0.45, metalness: 0.72 });
+    const crateMat = new THREE.MeshStandardMaterial({ color: 0x3b4434, roughness: 0.78, metalness: 0.18 });
+    const caseMat = new THREE.MeshStandardMaterial({ color: 0x26292f, roughness: 0.55, metalness: 0.35 });
+    this.sharedMaterials.push(concreteMat, steelMat, crateMat, caseMat);
+
+    for (const lm of OPENWORLD_LANDMARKS) {
+      const groundY = Math.max(SEA_LEVEL_M + 0.3, sampleGroundHeight(lm.worldX, lm.worldZ));
+      const isFob = lm.kind === 'fob_alpha' || lm.kind === 'fob_bravo';
+      const contractId = CONTRACT_BY_LANDMARK[lm.id] ?? null;
+
+      // Place command terminal slightly offset from center so player can walk right up to it
+      const terminalX = lm.worldX + 6.5;
+      const terminalZ = lm.worldZ + 6.5;
+      const termY = Math.max(SEA_LEVEL_M + 0.3, sampleGroundHeight(terminalX, terminalZ));
+
+      const state: SectorRuntimeState = {
+        sectorId: lm.id,
+        name: lm.name,
+        shortLabel: lm.shortLabel,
+        biomeId: lm.biomeId,
+        worldX: lm.worldX,
+        worldZ: lm.worldZ,
+        groundY,
+        isFob,
+        homeFaction: lm.pmcFactionId,
+        subFactionId: lm.subFactionId,
+        contractId,
+        supplyYield: SECTOR_SUPPLY_YIELDS[lm.id] ?? { ammo: 8, medical: 8 },
+        owner: lm.pmcFactionId ?? 'neutral',
+        liveCapturePct: lm.pmcFactionId ? 100 : 0,
+        contested: false,
+        hostileGarrisonCount: 0,
+        terminalX,
+        terminalZ,
+      };
+      this.sectors.set(lm.id, state);
+
+      // Composite 6-part Sector Command Beacon (bottom-center grounded at groundY)
+      const g = new THREE.Group();
+      g.name = `sector_beacon_${lm.id}`;
+      g.position.set(lm.worldX, groundY, lm.worldZ);
+
+      const pad = new THREE.Mesh(padGeo, concreteMat);
+      pad.position.y = 0.14;
+      pad.receiveShadow = true;
+
+      const mast = new THREE.Mesh(mastGeo, steelMat);
+      mast.position.y = 5.75;
+
+      const crossBar = new THREE.Mesh(crossBarGeo, steelMat);
+      crossBar.position.set(0, 10.6, 0);
+
+      const flagMat = new THREE.MeshStandardMaterial({
+        color: OWNER_COLORS[state.owner],
+        roughness: 0.72,
+        metalness: 0.08,
+        side: THREE.DoubleSide,
+      });
+      const beaconMat = new THREE.MeshStandardMaterial({
+        color: OWNER_COLORS[state.owner],
+        emissive: OWNER_COLORS[state.owner],
+        emissiveIntensity: 1.15,
+        roughness: 0.25,
+        metalness: 0.4,
+      });
+      const ringMat = new THREE.MeshBasicMaterial({
+        color: OWNER_COLORS[state.owner],
+        transparent: true,
+        opacity: isFob ? 0.16 : 0.28,
+        depthWrite: false,
+        side: THREE.DoubleSide,
+      });
+      this.sharedMaterials.push(flagMat, beaconMat, ringMat);
+
+      const flagMesh = new THREE.Mesh(flagGeo, flagMat);
+      flagMesh.position.set(0.1, 9.85, 0);
+
+      const beaconMesh = new THREE.Mesh(beaconGeo, beaconMat);
+      beaconMesh.position.y = 11.95;
+
+      const radioCrate = new THREE.Mesh(crateGeo, crateMat);
+      radioCrate.position.set(1.4, 0.56, 0.8);
+
+      const radioAnt = new THREE.Mesh(antennaGeo, steelMat);
+      radioAnt.position.set(1.85, 1.5, 0.8);
+
+      const ringMesh = new THREE.Mesh(ringGeo, ringMat);
+      ringMesh.position.y = 0.25;
+
+      g.add(pad, mast, crossBar, flagMesh, beaconMesh, radioCrate, radioAnt, ringMesh);
+      this.rootGroup.add(g);
+
+      // Composite 4-part Contract Intel Terminal (for the 4 biome contract sectors)
+      let contractScreenMat: THREE.MeshStandardMaterial | null = null;
+      if (contractId) {
+        const termGroup = new THREE.Group();
+        termGroup.name = `contract_terminal_${contractId}`;
+        termGroup.position.set(terminalX, termY, terminalZ);
+
+        const pelican = new THREE.Mesh(caseGeo, caseMat);
+        pelican.position.y = 0.26;
+        const base = new THREE.Mesh(laptopBaseGeo, steelMat);
+        base.position.set(0, 0.55, 0);
+        contractScreenMat = new THREE.MeshStandardMaterial({
+          color: 0x38bdf8,
+          emissive: 0x0284c7,
+          emissiveIntensity: 0.9,
+          roughness: 0.2,
+          metalness: 0.2,
+        });
+        this.sharedMaterials.push(contractScreenMat);
+        const lid = new THREE.Mesh(laptopLidGeo, contractScreenMat);
+        lid.position.set(0, 0.72, -0.18);
+        lid.rotation.x = -0.22;
+        const ant = new THREE.Mesh(antennaGeo, steelMat);
+        ant.position.set(0.36, 0.9, -0.22);
+
+        termGroup.add(pelican, base, lid, ant);
+        this.rootGroup.add(termGroup);
+      }
+
+      this.visuals.set(lm.id, {
+        sectorId: lm.id,
+        flagMesh,
+        beaconMesh,
+        ringMesh,
+        flagMat,
+        beaconMat,
+        ringMat,
+        contractScreenMat,
+      });
+    }
+  }
+
+  public syncFromShard(mode: ShardMode, activeCharacter?: OpenWorldCharacter | null): void {
+    this.activeShardMode = mode;
+    const shard = this.shards.getShard(mode);
+    const completedSet = new Set(activeCharacter?.unlocks.completedContractIds ?? []);
+
+    for (const sector of this.sectors.values()) {
+      const persisted = shard.sectors[sector.sectorId];
+      if (persisted) {
+        sector.owner = persisted.owner;
+        if (activeCharacter && persisted.owner === activeCharacter.pmcFaction) {
+          sector.liveCapturePct = 100;
+        } else if (persisted.owner === 'neutral') {
+          sector.liveCapturePct = Math.min(sector.liveCapturePct, 99);
+        }
+      }
+      const vis = this.visuals.get(sector.sectorId);
+      if (vis) {
+        const hex = OWNER_COLORS[sector.owner];
+        vis.flagMat.color.setHex(hex);
+        vis.beaconMat.color.setHex(hex);
+        vis.beaconMat.emissive.setHex(hex);
+        vis.ringMat.color.setHex(hex);
+        if (vis.contractScreenMat && sector.contractId) {
+          const done = completedSet.has(sector.contractId);
+          vis.contractScreenMat.color.setHex(done ? 0x22c55e : 0xf59e0b);
+          vis.contractScreenMat.emissive.setHex(done ? 0x15803d : 0xd97706);
+        }
+      }
+    }
+  }
+
+  /**
+   * Advances sector capture timers and subtle flag wind motion (zero heap allocations).
+   * Returns a capture event ONLY on the discrete frame a sector flips ownership.
+   */
+  public update(
+    dt: number,
+    playerX: number,
+    playerZ: number,
+    character: OpenWorldCharacter | null,
+    getHostileGarrisonCount: (sectorId: string) => number,
+  ): SectorCaptureCompleteEvent | null {
+    this.waveTime += dt;
+    let captureEvent: SectorCaptureCompleteEvent | null = null;
+
+    for (const sector of this.sectors.values()) {
+      const vis = this.visuals.get(sector.sectorId);
+      if (vis) {
+        // Gentle wind flutter on command flag + beacon slow spin
+        vis.flagMesh.rotation.y = Math.sin(this.waveTime * 2.4 + sector.worldX * 0.01) * 0.16;
+        vis.beaconMesh.rotation.y += dt * 0.85;
+      }
+
+      const hostiles = getHostileGarrisonCount(sector.sectorId);
+      sector.hostileGarrisonCount = hostiles;
+
+      if (sector.isFob || !character) {
+        sector.contested = false;
+        continue;
+      }
+
+      const dist = Math.hypot(playerX - sector.worldX, playerZ - sector.worldZ);
+      const inZone = dist <= SECTOR_CAPTURE_RADIUS_M;
+
+      if (sector.owner === character.pmcFaction) {
+        sector.liveCapturePct = 100;
+        sector.contested = inZone && hostiles > 0;
+        continue;
+      }
+
+      if (inZone) {
+        if (hostiles > 0) {
+          sector.contested = true;
+        } else {
+          sector.contested = false;
+          sector.liveCapturePct = Math.min(100, sector.liveCapturePct + SECTOR_CAPTURE_RATE_PER_SEC * dt);
+          if (sector.liveCapturePct >= 100) {
+            // Discrete shard write: flip sector ownership + boost winning PMC supply pool
+            const flip = this.shards.flipSector(
+              character.shardMode,
+              sector.sectorId,
+              character.pmcFaction,
+              character.callsign,
+              sector.name,
+              sector.supplyYield,
+            );
+            sector.owner = flip.sector.owner;
+            this.roster.adjustCash(character.slotId, SECTOR_CAPTURE_CASH_BONUS);
+            this.syncFromShard(character.shardMode, this.roster.getCharacter(character.slotId));
+            captureEvent = {
+              sectorId: sector.sectorId,
+              sectorName: sector.name,
+              newOwner: character.pmcFaction,
+              cashBonusUsd: SECTOR_CAPTURE_CASH_BONUS,
+              supplyBonus: { ...sector.supplyYield },
+            };
+          }
+        }
+      } else {
+        sector.contested = false;
+        if (sector.liveCapturePct > 0) {
+          sector.liveCapturePct = Math.max(0, sector.liveCapturePct - 6 * dt);
+        }
+      }
+    }
+
+    return captureEvent;
+  }
+
+  /**
+   * Scans for the nearest actionable 3D field interactable (Contract Terminal, FOB Resupply, Sector Beacon, or Shard Corpse).
+   */
+  public findNearestInteractable(
+    playerX: number,
+    playerZ: number,
+    character: OpenWorldCharacter | null,
+  ): OpenWorldInteractableContext | null {
+    let best: OpenWorldInteractableContext | null = null;
+    let bestDist = 8.5;
+
+    // 1. Check Biome Contract Terminals
+    if (character) {
+      const completed = new Set(character.unlocks.completedContractIds);
+      for (const sector of this.sectors.values()) {
+        if (!sector.contractId) continue;
+        const d = Math.hypot(playerX - sector.terminalX, playerZ - sector.terminalZ);
+        if (d < bestDist) {
+          const spec: OpenWorldContractSpec | undefined = OPENWORLD_CONTRACT_MAP[sector.contractId];
+          if (!spec) continue;
+          const alreadyDone = completed.has(spec.id);
+          const blockedByHostiles = !alreadyDone && sector.hostileGarrisonCount > 0;
+          bestDist = d;
+          best = {
+            kind: 'contract',
+            id: spec.id,
+            label: alreadyDone ? `${spec.title} (Completed)` : `Complete Contract: ${spec.title}`,
+            sublabel: alreadyDone
+              ? 'Intel already uploaded for this character'
+              : blockedByHostiles
+                ? `Clear ${sector.hostileGarrisonCount} hostile garrison contact(s) first`
+                : `+$${spec.cashRewardUsd.toLocaleString()} · Unlocks ${spec.unlocksWeaponIds.length} weapons / ${spec.unlocksAttachmentIds.length} optics`,
+            distanceM: d,
+            canExecute: !alreadyDone && !blockedByHostiles,
+            blockedReason: alreadyDone
+              ? 'Contract already completed.'
+              : blockedByHostiles
+                ? `Clear ${sector.hostileGarrisonCount} hostile contact(s) in ${sector.shortLabel} first.`
+                : undefined,
+          };
+        }
+      }
+
+      // 2. Check Home FOB Resupply & Surgical Heal Station
+      for (const sector of this.sectors.values()) {
+        if (!sector.isFob || sector.homeFaction !== character.pmcFaction) continue;
+        const d = Math.hypot(playerX - sector.worldX, playerZ - sector.worldZ);
+        if (d < bestDist) {
+          bestDist = d;
+          best = {
+            kind: 'fob_resupply',
+            id: sector.sectorId,
+            label: `FOB Resupply & Medbay (${sector.shortLabel})`,
+            sublabel: 'Restore 100% HP, fresh Armor Plate & full weapon ammunition',
+            distanceM: d,
+            canExecute: true,
+          };
+        }
+      }
+
+      // 3. Check Dropped Shard Corpses (enforces PvPvE vs PvE corpse looting rules)
+      const shard = this.shards.getShard(character.shardMode);
+      for (const corpse of shard.corpses) {
+        const d = Math.hypot(playerX - corpse.worldX, playerZ - corpse.worldZ);
+        if (d < bestDist) {
+          const allowed = this.shards.canCharacterLootCorpse(
+            character.shardMode,
+            corpse.corpseId,
+            character.characterId,
+          );
+          bestDist = d;
+          best = {
+            kind: 'corpse',
+            id: corpse.corpseId,
+            label: `Corpse: ${corpse.ownerCallsign}`,
+            sublabel: allowed
+              ? `${corpse.droppedWeaponIds.length} weapon(s) · ${corpse.droppedItems.length} item(s) · ${corpse.sectorLabel}`
+              : 'Protected by PvE Cooperative Shard rules (owner-only recovery)',
+            distanceM: d,
+            canExecute: allowed,
+            blockedReason: allowed
+              ? undefined
+              : 'PvE Cooperative Shard rules prevent looting another player\'s corpse.',
+          };
+        }
+      }
+    }
+
+    return best;
+  }
+
+  /**
+   * Executes a Biome Contract completion in-world (per-character unlocks + discrete shard log).
+   */
+  public executeContractTerminal(
+    contractId: string,
+    character: OpenWorldCharacter,
+  ): { ok: boolean; message: string } {
+    const spec = OPENWORLD_CONTRACT_MAP[contractId];
+    if (!spec) return { ok: false, message: 'Unknown contract terminal.' };
+
+    // Ensure sector garrison is clear
+    const sector = Array.from(this.sectors.values()).find((s) => s.contractId === contractId);
+    if (sector && sector.hostileGarrisonCount > 0) {
+      return {
+        ok: false,
+        message: `Eliminate ${sector.hostileGarrisonCount} hostile(s) guarding ${sector.shortLabel} before uploading intel.`,
+      };
+    }
+
+    const res = this.roster.completeContract(character.slotId, contractId);
+    if (!res.ok) {
+      return { ok: false, message: res.error ?? 'Contract completion failed.' };
+    }
+
+    this.shards.recordDiscreteTransition(
+      character.shardMode,
+      'contract_completed',
+      `${character.callsign} completed "${spec.title}" (+$${spec.cashRewardUsd.toLocaleString()})`,
+    );
+
+    if (spec.subFactionId) {
+      const sf = SUB_FACTION_MAP[spec.subFactionId];
+      this.shards.adjustPmcSupply(
+        character.shardMode,
+        character.pmcFaction,
+        { intel: 8, ammo: 5 },
+        'reputation_update',
+        `${character.callsign} gained +${spec.standingDelta} standing with ${sf.shortName}`,
+      );
+    }
+
+    this.syncFromShard(character.shardMode, this.roster.getCharacter(character.slotId));
+    return {
+      ok: true,
+      message: `Contract Complete: ${spec.title} (+$${spec.cashRewardUsd.toLocaleString()}, unlocked ${spec.unlocksWeaponIds.length} weapon(s) & ${spec.unlocksAttachmentIds.length} optic(s))`,
+    };
+  }
+
+  public getSectorsSnapshot(): SectorRuntimeState[] {
+    return Array.from(this.sectors.values()).map((s) => ({ ...s }));
+  }
+
+  public getActiveSectorAt(x: number, z: number): SectorRuntimeState | null {
+    for (const s of this.sectors.values()) {
+      if (Math.hypot(x - s.worldX, z - s.worldZ) <= SECTOR_CAPTURE_RADIUS_M) {
+        return { ...s };
+      }
+    }
+    return null;
+  }
+
+  public getAllContracts(): readonly OpenWorldContractSpec[] {
+    return OPENWORLD_CONTRACT_CATALOG;
+  }
+
+  public dispose(): void {
+    if (this.rootGroup.parent) {
+      this.rootGroup.parent.remove(this.rootGroup);
+    }
+    for (const g of this.sharedGeometries) g.dispose();
+    for (const m of this.sharedMaterials) m.dispose();
+    this.sharedGeometries.length = 0;
+    this.sharedMaterials.length = 0;
+    this.visuals.clear();
+    this.sectors.clear();
+  }
+}
