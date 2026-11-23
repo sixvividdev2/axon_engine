@@ -25,14 +25,23 @@ import {
   ScopePassParams,
   ScopeRenderer,
   SDK_WEAPON_PROFILES,
+  solveZeroPitchRad,
   WeaponRig,
 } from '../bodycam-sdk';
 import {
   computeDerivedWeaponStats,
+  getDefaultZeroDistanceM,
   normalizeWeaponAttachments,
   WeaponAttachments,
 } from '../data/attachments';
-import { getDefaultAmmoVariant } from '../data/calibers';
+import {
+  AMMO_VARIANTS,
+  AmmoVariantDef,
+  AmmoVariantId,
+  getAmmoVariantsForCaliber,
+  getDefaultAmmoVariant,
+  resolveBaseCaliberId,
+} from '../data/calibers';
 import { graphicsQualityStore } from '../data/graphicsQuality';
 import { loadoutStore } from '../data/loadoutStore';
 import { DoorInteractOptionId } from '../doors/DestructibleDoorSystem';
@@ -46,6 +55,7 @@ import {
   resolveHideoutRoom,
 } from './HideoutBunkerWorld';
 import { GunRangeSnapshot } from './HideoutGunRange';
+import { LongRangeSnapshot } from './HideoutLongRangeGallery';
 import { hideoutStateStore } from './HideoutStateStore';
 
 export type InteractReticleState = 'hidden' | 'near' | 'ready';
@@ -75,6 +85,10 @@ export interface HideoutSnapshot {
   equippedWeaponId: string;
   equippedWeaponName: string;
   equippedCaliber: string;
+  activeAmmoLabel: string;
+  zeroDistanceM: number;
+  hasVariableZoom: boolean;
+  activeOpticZoom: number;
   fireModeLabel: string;
   ammoInMag: number;
   magCapacity: number;
@@ -86,6 +100,7 @@ export interface HideoutSnapshot {
   fps: number;
   masterVolume: number;
   gunRange: GunRangeSnapshot;
+  longRange: LongRangeSnapshot;
 }
 
 export interface HideoutControllerCallbacks {
@@ -233,28 +248,43 @@ export class HideoutSessionController {
     container.appendChild(this.renderer.domElement);
 
     this.scene = new THREE.Scene();
-    this.camera = new THREE.PerspectiveCamera(72, width / height, 0.05, 140);
+    this.camera = new THREE.PerspectiveCamera(72, width / height, 0.05, 185);
     this.scene.add(this.camera);
 
-    // Build 4-room Cold-War bunker shell, Arsenal Room props, Gun Range Phase 2 & destructible doors
-    this.world = buildHideoutBunkerWorld(this.scene, this.renderer, this.isSoftwareGl, {
-      onCourseComplete: (res) => {
-        const storedNewBest = hideoutStateStore.recordGunRangeRun(
-          res.score,
-          res.hits,
-          res.accuracyPct,
-        );
-        this.world.gunRange.setBestScore(hideoutStateStore.getState().gunRangeBestScore);
-        const headline =
-          storedNewBest || res.isNewBest ? 'New Record' : 'Course Complete';
-        this.showToast(
-          `${headline}: ${res.score} pts · ${res.hits} hits (${res.accuracyPct}%)`,
-        );
-        this.emitSnapshot(true);
+    // Build 4-room Cold-War bunker shell, Arsenal Room, Gun Range Phase 2, 100m Gallery Phase 3 & doors
+    this.world = buildHideoutBunkerWorld(
+      this.scene,
+      this.renderer,
+      this.isSoftwareGl,
+      {
+        onCourseComplete: (res) => {
+          const storedNewBest = hideoutStateStore.recordGunRangeRun(
+            res.score,
+            res.hits,
+            res.accuracyPct,
+          );
+          this.world.gunRange.setBestScore(hideoutStateStore.getState().gunRangeBestScore);
+          const headline =
+            storedNewBest || res.isNewBest ? 'New Record' : 'Course Complete';
+          this.showToast(
+            `${headline}: ${res.score} pts · ${res.hits} hits (${res.accuracyPct}%)`,
+          );
+          this.emitSnapshot(true);
+        },
       },
-    });
+      {
+        on100mRecord: (info) => {
+          const isNewBest = hideoutStateStore.recordLongRangeHit(info.groupMoa);
+          if (isNewBest && info.groupMoa !== null) {
+            this.showToast(`New 100m Group Record: ${info.groupMoa.toFixed(2)} MOA`);
+          }
+          this.emitSnapshot(true);
+        },
+      },
+    );
     this.world.doorSystem.setAudioVolume(this.config.masterVolume);
     this.world.gunRange.setAudioVolume(this.config.masterVolume);
+    this.world.longRangeGallery.setAudioVolume(this.config.masterVolume);
     this.ballistics = new BallisticsSolver(this.scene);
 
     this.adapter = this.world.physics.createAdapter({
@@ -499,6 +529,7 @@ export class HideoutSessionController {
     );
     this.world.doorSystem.setAudioVolume(clamped);
     this.world.gunRange.setAudioVolume(clamped);
+    this.world.longRangeGallery.setAudioVolume(clamped);
     this.emitSnapshot(true);
   }
 
@@ -554,8 +585,123 @@ export class HideoutSessionController {
     }
     const curMag = weaponId === 'unarmed' ? 0 : (this.magAmmoByWeapon[profile.id] ?? profile.magCapacity);
     this.weaponRig.setAmmoState(curMag, weaponId !== 'unarmed');
+    this.syncWeaponBallistics();
     if (playCue) {
       this.audio.playGearRattle('weapon_swap', 0.5);
+    }
+  }
+
+  private getActiveBaseCaliberId(weaponId = this.equippedWeaponId): string {
+    const base = resolveWeaponProfile(weaponId);
+    const derived = this.weaponRig.getDerivedStats();
+    if (weaponId === this.equippedWeaponId && derived.caliberOverride) {
+      return resolveBaseCaliberId(derived.caliberOverride);
+    }
+    return resolveBaseCaliberId(base.defaultCaliberId);
+  }
+
+  private getActiveAmmoVariant(weaponId = this.equippedWeaponId): AmmoVariantDef {
+    const calId = this.getActiveBaseCaliberId(weaponId);
+    const stored = hideoutStateStore.getState().ammoVariantByWeapon[weaponId] as
+      | AmmoVariantId
+      | undefined;
+    if (stored && AMMO_VARIANTS[stored]?.caliberId === calId) {
+      return AMMO_VARIANTS[stored];
+    }
+    return getDefaultAmmoVariant(calId);
+  }
+
+  private getZeroDistanceForWeapon(weaponId = this.equippedWeaponId): number {
+    if (weaponId === 'unarmed') return 100;
+    const base = resolveWeaponProfile(weaponId);
+    const stored = hideoutStateStore.getState().zeroDistanceByWeapon[base.id];
+    if (typeof stored === 'number' && Number.isFinite(stored)) return stored;
+    const att = loadoutStore.getActiveWeaponBuild(base.id).attachments;
+    return att.zeroDistanceM ?? getDefaultZeroDistanceM(base.category);
+  }
+
+  private syncWeaponBallistics(): void {
+    if (this.equippedWeaponId === 'unarmed') {
+      this.weaponRig.setZeroConfig(100, 0, 0);
+      this.world.longRangeGallery.setWeaponBallisticsContext('Unarmed', '--', 100, 0, 0);
+      return;
+    }
+    const base = resolveWeaponProfile(this.equippedWeaponId);
+    const derived = this.weaponRig.getDerivedStats();
+    const ammo = this.getActiveAmmoVariant(base.id);
+    const zeroDist = this.getZeroDistanceForWeapon(base.id);
+    const muzzleVelMs =
+      ammo.baseVelocityMs * (base.barrelVelocityMult ?? 1.0) * derived.velocityMult;
+    const hob = this.weaponRig.getHeightOverBoreM();
+    const zeroPitchRad = solveZeroPitchRad({
+      muzzleVelocityMs: muzzleVelMs,
+      bc: ammo.ballisticCoefficient,
+      heightOverBoreM: hob,
+      zeroDistanceM: zeroDist,
+      extraElevationMrad: 0,
+    });
+    this.weaponRig.setZeroConfig(zeroDist, 0, zeroPitchRad);
+    this.world.longRangeGallery.setWeaponBallisticsContext(
+      base.name,
+      ammo.shortName,
+      zeroDist,
+      muzzleVelMs,
+      ammo.ballisticCoefficient,
+    );
+  }
+
+  private cycleZeroDistance(dir: 1 | -1): void {
+    if (this.equippedWeaponId === 'unarmed' || this.swapChoreography.isActive()) return;
+    const presets = [25, 50, 100, 200];
+    const cur = this.getZeroDistanceForWeapon(this.equippedWeaponId);
+    let idx = presets.indexOf(cur);
+    if (idx < 0) {
+      idx = presets.findIndex((p) => p >= cur);
+      if (idx < 0) idx = presets.length - 1;
+    }
+    const nextIdx = (idx + dir + presets.length) % presets.length;
+    const nextDist = presets[nextIdx];
+    const prof = resolveWeaponProfile(this.equippedWeaponId);
+    hideoutStateStore.setWeaponZeroDistance(prof.id, nextDist);
+    this.syncWeaponBallistics();
+    this.weaponRig.triggerTurretClick();
+    this.audio.playTurretClick(dir > 0);
+    this.showToast(`Optic Zeroed: ${nextDist}m`);
+    this.emitSnapshot(true);
+  }
+
+  private cycleAmmoVariant(): void {
+    if (this.equippedWeaponId === 'unarmed' || this.swapChoreography.isActive()) return;
+    const prof = resolveWeaponProfile(this.equippedWeaponId);
+    const calId = this.getActiveBaseCaliberId(prof.id);
+    const variants = getAmmoVariantsForCaliber(calId);
+    if (variants.length <= 1) {
+      this.showToast(`Only 1 Load Available for ${prof.caliberLabel}`);
+      return;
+    }
+    const cur = this.getActiveAmmoVariant(prof.id);
+    const curIdx = variants.findIndex((v) => v.id === cur.id);
+    const next = variants[(curIdx + 1) % variants.length];
+    hideoutStateStore.setWeaponAmmoVariant(prof.id, next.id);
+    this.syncWeaponBallistics();
+    this.audio.playWeaponCue('mag_in', { intensity: 0.7 });
+    this.showToast(`Ammo Loaded: ${next.label} (${Math.round(next.baseVelocityMs)} m/s)`);
+    this.emitSnapshot(true);
+  }
+
+  private cycleOpticZoom(dir: 1 | -1): void {
+    if (
+      this.equippedWeaponId === 'unarmed' ||
+      this.swapChoreography.isActive() ||
+      !this.weaponRig.hasVariableZoom()
+    ) {
+      return;
+    }
+    const prev = this.weaponRig.getTargetOpticZoomMult();
+    const next = this.weaponRig.cycleOpticZoom(dir, true);
+    if (Math.abs(next - prev) > 0.01) {
+      this.audio.playTurretClick(dir > 0);
+      this.emitSnapshot(true);
     }
   }
 
@@ -649,7 +795,7 @@ export class HideoutSessionController {
     this.world.gunRange.registerShotFired();
 
     const derived = this.weaponRig.getDerivedStats();
-    const activeAmmo = getDefaultAmmoVariant(prof.defaultCaliberId);
+    const activeAmmo = this.getActiveAmmoVariant(prof.id);
     const suppressed = derived.isSuppressed;
 
     this.animator.interruptInspect();
@@ -657,6 +803,10 @@ export class HideoutSessionController {
 
     // Sample world muzzle transform BEFORE recoil kick, applying true HOB zeroing pitch
     this.weaponRig.getMuzzleWorldTransform(this._muzzlePos, this._muzzleDir, true);
+    const muzzleVelocityMs =
+      activeAmmo.baseVelocityMs * (prof.barrelVelocityMult ?? 1.0) * derived.velocityMult;
+    const effectiveSpreadMOA = Math.hypot(prof.spreadMOA, activeAmmo.spreadMOA);
+
     this.ballistics.spawnShot({
       origin: this._muzzlePos,
       direction: this._muzzleDir,
@@ -664,9 +814,26 @@ export class HideoutSessionController {
       weaponId: prof.id,
       barrelVelocityMult: prof.barrelVelocityMult ?? 1.0,
       attachmentVelocityMult: derived.velocityMult,
-      weaponSpreadMOA: prof.spreadMOA,
+      weaponSpreadMOA: effectiveSpreadMOA,
       audio: this.audio,
     });
+
+    // Capture live velocity & ballistic energy on Bay 3's Optical Chronograph
+    if (
+      this.world.longRangeGallery.isPointInGalleryBay(
+        this.controller.position.x,
+        this.controller.position.z,
+      )
+    ) {
+      this.world.longRangeGallery.recordMuzzleShot({
+        weaponName: prof.name,
+        ammoLabel: activeAmmo.shortName,
+        muzzleVelocityMs,
+        bulletMassGrams: activeAmmo.bulletMassGrams,
+        bc: activeAmmo.ballisticCoefficient,
+        zeroDistanceM: this.getZeroDistanceForWeapon(prof.id),
+      });
+    }
 
     this.weaponRig.triggerFire(suppressed, remainingAmmo);
     this.weaponRig.setAmmoState(remainingAmmo, true);
@@ -718,6 +885,17 @@ export class HideoutSessionController {
     const rangeHit = this.world.gunRange.handleBallisticImpact(ev, this._camPos);
     if (rangeHit) {
       this.audio.playImpact(ev.point, rangeHit.isSteel ? 'steel_plate' : 'paper');
+      this.emitSnapshot(true);
+      return;
+    }
+
+    const longRangeHit = this.world.longRangeGallery.handleBallisticImpact(ev, this._camPos);
+    if (longRangeHit) {
+      if (!longRangeHit.isSteel) {
+        this.audio.playImpact(ev.point, 'paper');
+      } else if (longRangeHit.distanceM < 20) {
+        this.audio.playImpact(ev.point, 'steel_plate');
+      }
       this.emitSnapshot(true);
       return;
     }
@@ -926,6 +1104,30 @@ export class HideoutSessionController {
         } else if (chosen.id === 'range_resupply') {
           this.resupplyAllWeapons(false);
           break;
+        }
+        this.emitSnapshot(true);
+        break;
+      }
+      case 'ballistics_console': {
+        if (this.world.getPropInteractPos('ballistics_console', this._ikTargetPos)) {
+          this.interactAnimator.trigger('PROP_INTERACT', this._ikTargetPos);
+        }
+        if (chosen.id === 'trolley_move') {
+          const nextDist = this.world.longRangeGallery.cycleTrolleyDistance();
+          this.showToast(`Target Trolley Moving to ${nextDist}m`);
+        } else if (chosen.id === 'clear_paper') {
+          this.world.longRangeGallery.clearPaperTarget();
+          this.audio.playWeaponCue('mode_toggle', { intensity: 0.45 });
+          this.showToast('Target Paper & Group Cleared');
+        } else if (chosen.id === 'cycle_zero') {
+          this.cycleZeroDistance(1);
+          break;
+        } else if (chosen.id === 'cycle_ammo') {
+          this.cycleAmmoVariant();
+          break;
+        } else if (chosen.id === 'reset_pen_rig') {
+          this.world.longRangeGallery.resetPenetrationRig();
+          this.showToast('Armor Penetration Rig Reset');
         }
         this.emitSnapshot(true);
         break;
@@ -1187,6 +1389,31 @@ export class HideoutSessionController {
         options: opts,
         selectedIndex: this.selectedOptionIndex,
       };
+      return;
+    }
+
+    if (meta.kind === 'ballistics_console') {
+      const curDist = this.world.longRangeGallery.getTrolleyDistanceM();
+      const nextDist = this.world.longRangeGallery.getNextTrolleyDistanceM();
+      const zeroM = this.getZeroDistanceForWeapon(this.equippedWeaponId);
+      const ammoName =
+        this.equippedWeaponId === 'unarmed'
+          ? 'None'
+          : this.getActiveAmmoVariant(this.equippedWeaponId).shortName;
+      const opts: HideoutPromptOption[] = [
+        { id: 'trolley_move', label: 'Move Trolley Target', hint: `${curDist}m → ${nextDist}m` },
+        { id: 'clear_paper', label: 'Clear Target Paper & Group' },
+        { id: 'cycle_zero', label: 'Cycle Optic Zero', hint: `${zeroM}m` },
+        { id: 'cycle_ammo', label: 'Cycle Ammo Load', hint: ammoName },
+        { id: 'reset_pen_rig', label: 'Reset Armor Test Rig' },
+      ];
+      this.selectedOptionIndex = THREE.MathUtils.clamp(this.selectedOptionIndex, 0, opts.length - 1);
+      this.activePrompt = {
+        key: 'F',
+        targetLabel: 'Ballistics Control Console',
+        options: opts,
+        selectedIndex: this.selectedOptionIndex,
+      };
     }
   }
 
@@ -1276,6 +1503,11 @@ export class HideoutSessionController {
       };
       this.audio.playWeaponCue('mode_toggle', { intensity: 0.2 });
       this.emitSnapshot(true);
+      return;
+    }
+    if (this.input.ads && this.weaponRig.hasVariableZoom()) {
+      e.preventDefault();
+      this.cycleOpticZoom(e.deltaY < 0 ? 1 : -1);
     }
   };
 
@@ -1423,6 +1655,26 @@ export class HideoutSessionController {
           this.audio.playWeaponCue('mode_toggle', { intensity: 0.45 });
         }
         break;
+      case 'BracketRight':
+        if (!e.repeat && !this.controller.isSprinting) {
+          this.cycleOpticZoom(1);
+        }
+        break;
+      case 'BracketLeft':
+        if (!e.repeat && !this.controller.isSprinting) {
+          this.cycleOpticZoom(-1);
+        }
+        break;
+      case 'PageUp':
+        if (!e.repeat) {
+          this.cycleZeroDistance(1);
+        }
+        break;
+      case 'PageDown':
+        if (!e.repeat) {
+          this.cycleZeroDistance(-1);
+        }
+        break;
       case 'Digit0':
         if (!e.repeat && !this.swapChoreography.isActive() && this.equippedWeaponId !== 'unarmed') {
           hideoutStateStore.setEquippedWeaponDirect('unarmed');
@@ -1551,6 +1803,7 @@ export class HideoutSessionController {
     if (!this.contextLost) {
       const swapping = this.swapChoreography.isActive();
       this.input.sprint = this.shiftHeld && this.input.forward && !this.input.ads && !swapping;
+      this.input.holdBreath = this.shiftHeld && this.input.ads && !swapping;
       this.input.adsMode = 'PRIMARY' as AdsMode;
 
       const profile = this.getWeaponProfile(this.equippedWeaponId);
@@ -1695,6 +1948,8 @@ export class HideoutSessionController {
       this.equippedWeaponId === 'unarmed'
         ? 0
         : (this.magAmmoByWeapon[prof.id] ?? prof.magCapacity);
+    const activeAmmo =
+      this.equippedWeaponId === 'unarmed' ? null : this.getActiveAmmoVariant(prof.id);
     return {
       pointerLocked: this.pointerLocked,
       pauseOpen: this.pauseOpen,
@@ -1703,6 +1958,10 @@ export class HideoutSessionController {
       equippedWeaponId: this.equippedWeaponId,
       equippedWeaponName: this.equippedWeaponId === 'unarmed' ? 'Unarmed' : prof.name,
       equippedCaliber: this.equippedWeaponId === 'unarmed' ? '' : prof.caliberLabel,
+      activeAmmoLabel: activeAmmo ? activeAmmo.shortName : '',
+      zeroDistanceM: this.getZeroDistanceForWeapon(this.equippedWeaponId),
+      hasVariableZoom: this.weaponRig.hasVariableZoom(),
+      activeOpticZoom: this.weaponRig.getActiveOpticZoomMult(),
       fireModeLabel: this.getFireModeLabel(prof),
       ammoInMag,
       magCapacity: this.equippedWeaponId === 'unarmed' ? 0 : prof.magCapacity,
@@ -1719,6 +1978,10 @@ export class HideoutSessionController {
       fps: this.currentFps,
       masterVolume: this.config.masterVolume,
       gunRange: this.world.gunRange.getState(),
+      longRange: this.world.longRangeGallery.getState(
+        this.controller.position.x,
+        this.controller.position.z,
+      ),
     };
   }
 

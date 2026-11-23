@@ -12,6 +12,10 @@ import { loadoutStore } from '../data/loadoutStore';
 import { DestructibleDoorSystem } from '../doors/DestructibleDoorSystem';
 import { createHideoutMaterials, HideoutMaterialLibrary } from './HideoutMaterials';
 import { HideoutGunRange, HideoutGunRangeCallbacks } from './HideoutGunRange';
+import {
+  HideoutLongRangeCallbacks,
+  HideoutLongRangeGallery,
+} from './HideoutLongRangeGallery';
 import { hideoutStateStore } from './HideoutStateStore';
 
 export type HideoutRoomId = 'arsenal' | 'gun_range' | 'ready_room' | 'zombies_portal';
@@ -22,7 +26,8 @@ export type HideoutInteractableKind =
   | 'locker_door'
   | 'ammo_crate'
   | 'range_console'
-  | 'range_ammo_box';
+  | 'range_ammo_box'
+  | 'ballistics_console';
 
 export interface HideoutInteractableMeta {
   kind: HideoutInteractableKind;
@@ -52,7 +57,7 @@ export interface HideoutRoomBounds {
 
 export const HIDEOUT_ROOMS: readonly HideoutRoomBounds[] = [
   { id: 'arsenal', label: 'Arsenal Room', minX: -5.5, maxX: 5.5, minZ: -4.5, maxZ: 4.5 },
-  { id: 'gun_range', label: 'Gun Range', minX: 5.5, maxX: 25.0, minZ: -12.0, maxZ: 112.0 },
+  { id: 'gun_range', label: 'Gun Range', minX: 5.5, maxX: 34.0, minZ: -12.0, maxZ: 112.0 },
   { id: 'ready_room', label: 'Ready Room', minX: -16.5, maxX: -5.5, minZ: -5.0, maxZ: 5.0 },
   { id: 'zombies_portal', label: 'Sector 4 · Containment', minX: -4.5, maxX: 4.5, minZ: 4.5, maxZ: 13.5 },
 ];
@@ -71,6 +76,7 @@ export interface HideoutBunkerWorldHandle {
   materials: HideoutMaterialLibrary;
   doorSystem: DestructibleDoorSystem;
   gunRange: HideoutGunRange;
+  longRangeGallery: HideoutLongRangeGallery;
   root: THREE.Group;
   raycastMeshes: THREE.Object3D[];
   interactableMeshes: THREE.Mesh[];
@@ -108,13 +114,14 @@ export function buildHideoutBunkerWorld(
   renderer: THREE.WebGLRenderer,
   isSoftwareGl: boolean,
   gunRangeCallbacks?: HideoutGunRangeCallbacks,
+  longRangeCallbacks?: HideoutLongRangeCallbacks,
 ): HideoutBunkerWorldHandle {
   const physics = new BodycamPhysicsWorld();
   physics.baseFloorY = 0;
   physics.boundsMinX = -16.2;
-  physics.boundsMaxX = 24.4;
+  physics.boundsMaxX = 33.3;
   physics.boundsMinZ = -11.6;
-  physics.boundsMaxZ = 110.0;
+  physics.boundsMaxZ = 107.6;
 
   const maxAniso = Math.min(8, renderer.capabilities.getMaxAnisotropy());
   const materials = createHideoutMaterials(maxAniso);
@@ -133,7 +140,7 @@ export function buildHideoutBunkerWorld(
 
   // === Atmosphere, PMREM Studio Reflections & Balanced Cold-War Lighting (≤ 2 Shadow Casters) ===
   scene.background = new THREE.Color(0x0b0c0e);
-  scene.fog = new THREE.FogExp2(0x0d0f11, 0.014);
+  scene.fog = new THREE.FogExp2(0x0d0f11, 0.0085);
 
   const pmrem = new THREE.PMREMGenerator(renderer);
   const envTex = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
@@ -264,8 +271,8 @@ export function buildHideoutBunkerWorld(
   const DOOR_W = 2.8;
   const DOOR_H = 2.75;
 
-  // Interior acoustic reverb zones across the bunker
-  physics.addInteriorZone({ minX: -16.5, maxX: 25.0, minY: 0, maxY: H_RANGE, minZ: -12.0, maxZ: 112.0, material: 'concrete' });
+  // Interior acoustic reverb zones across the bunker (including Bay 3 100m Gallery)
+  physics.addInteriorZone({ minX: -16.5, maxX: 34.0, minY: 0, maxY: H_RANGE, minZ: -12.0, maxZ: 112.0, material: 'concrete' });
 
   // --- ROOM 1: ARSENAL ROOM (X ∈ [-5.5, 5.5], Z ∈ [-4.5, 4.5]) ---
   addBoxStructure(0, -0.1, 0, 12.2, 0.2, 10.2, materials.concreteFloor, 'concrete', false);
@@ -332,10 +339,15 @@ export function buildHideoutBunkerWorld(
   addOverheadLamp(-11.5, H_HUB - 0.12, -1.8, materials.warmLampEmissive);
   addOverheadLamp(-11.5, H_HUB - 0.12, 1.8, materials.warmLampEmissive);
 
-  // --- ROOM 3: GUN RANGE SHELL (X ∈ [6.5, 24.5], Z ∈ [-10.0, 36.0] in Phase 1; expands cleanly to 100m in Phase 3) ---
+  // --- ROOM 3: GUN RANGE SHELL (Bays 1 & 2: X ∈ [6.5, 24.5], Z ∈ [-10.0, 36.0]; opens East into Bay 3 100m Gallery) ---
   addBoxStructure(15.5, -0.1, 13.0, 18.6, 0.2, 47.0, materials.concreteFloor, 'concrete', false);
   addBoxStructure(15.5, H_RANGE + 0.1, 13.0, 18.6, 0.2, 47.0, materials.concreteCeiling, 'concrete', true, false);
-  addBoxStructure(24.75, H_RANGE * 0.5, 13.0, 0.5, H_RANGE, 47.0, materials.concreteWall, 'concrete');
+  // East bulkhead at X = 24.75 split to create a wide 7.6m foyer archway (Z ∈ [-5.4, 2.2]) into Bay 3 100m Gallery
+  addBoxStructure(24.75, H_RANGE * 0.5, -7.95, 0.5, H_RANGE, 5.1, materials.concreteWall, 'concrete');
+  addBoxStructure(24.75, H_RANGE * 0.5, 19.35, 0.5, H_RANGE, 34.3, materials.concreteWall, 'concrete');
+  addBoxStructure(24.75, 3.975, -1.6, 0.5, 1.25, 7.6, materials.concreteWall, 'concrete');
+  addDoorwayFrame(24.75, -1.6, 7.6, 3.35, 0.58, true);
+  makePlaque(24.46, 3.72, -1.6, -Math.PI * 0.5, 'BAY 3 · 100M GALLERY', 'LONG-RANGE & BALLISTICS BENCH', '#38bdf8');
   addBoxStructure(15.5, H_RANGE * 0.5, -10.25, 18.6, H_RANGE, 0.5, materials.concreteWall, 'concrete');
   addBoxStructure(15.5, H_RANGE * 0.5, 36.25, 18.6, H_RANGE, 0.5, materials.concreteWall, 'concrete');
   // West side wall segments of Gun Range flanking the Arsenal bulkhead
@@ -839,6 +851,7 @@ export function buildHideoutBunkerWorld(
   // ============================================================================
   // Mounted BEFORE physics.setRaycastMeshes so every target plate, gong, paper
   // board, CQB pop-up, and shoot-house barricade is registered for live bullets.
+  const persistedState = hideoutStateStore.getState();
   const gunRange = new HideoutGunRange(
     root,
     physics,
@@ -847,8 +860,24 @@ export function buildHideoutBunkerWorld(
     interactableMeshes,
     isSoftwareGl,
     maxAniso,
-    hideoutStateStore.getState().gunRangeBestScore,
+    persistedState.gunRangeBestScore,
     gunRangeCallbacks,
+  );
+
+  // ============================================================================
+  // 5C. PHASE 3 BAY 3 — 100M LONG-RANGE GALLERY & BALLISTICS BENCH
+  // ============================================================================
+  const longRangeGallery = new HideoutLongRangeGallery(
+    root,
+    physics,
+    materials,
+    raycastMeshes,
+    interactableMeshes,
+    isSoftwareGl,
+    maxAniso,
+    persistedState.longRangeBestMoa100m,
+    persistedState.longRange100mHits,
+    longRangeCallbacks,
   );
 
   // Register static world & Gun Range raycast meshes BEFORE mounting dynamic destructible doors
@@ -961,8 +990,9 @@ export function buildHideoutBunkerWorld(
       crateLidPivot.rotation.x = 0;
     }
 
-    // Step Gun Range reactive targets, swinging gongs, and 30s CQB pop-up course
+    // Step Gun Range reactive targets, 30s CQB course & 100m Long-Range Gallery
     gunRange.update(clampedDt);
+    longRangeGallery.update(clampedDt);
   };
 
   const getSlotTransform = (
@@ -998,6 +1028,9 @@ export function buildHideoutBunkerWorld(
     if (kind === 'range_ammo_box') {
       return gunRange.getRangeAmmoWorldPos(outPos);
     }
+    if (kind === 'ballistics_console') {
+      return longRangeGallery.getConsoleWorldPos(outPos);
+    }
     return false;
   };
 
@@ -1006,6 +1039,7 @@ export function buildHideoutBunkerWorld(
     materials,
     doorSystem,
     gunRange,
+    longRangeGallery,
     root,
     raycastMeshes,
     interactableMeshes,
@@ -1021,6 +1055,7 @@ export function buildHideoutBunkerWorld(
     getSlotTransform,
     updateProps,
     dispose: () => {
+      longRangeGallery.dispose();
       gunRange.dispose();
       doorSystem.dispose();
       for (const slot of gunWallSlots) {

@@ -152,53 +152,119 @@ export const HideoutHud: React.FC<HideoutHudProps> = ({
             </div>
           )}
 
-          {snapshot.gunRange.phase === 'idle' && snapshot.currentRoomId === 'gun_range' && (
-            <div className="flex items-baseline gap-2.5 text-xs text-neutral-300/85">
-              <span className="font-medium text-amber-300/90">Live Fire Active</span>
-              {snapshot.gunRange.bestScore > 0 && (
-                <>
-                  <span className="text-neutral-600" aria-hidden="true">
-                    ·
-                  </span>
-                  <span className="font-mono-tabular text-neutral-300">
-                    CQB Best {snapshot.gunRange.bestScore}
-                  </span>
-                </>
-              )}
-              <span className="text-neutral-600" aria-hidden="true">
-                ·
-              </span>
-              <span className="text-neutral-400">
-                Shoot Amber Paddle or Use Console [F] for 30s Course
-              </span>
-            </div>
-          )}
+          {snapshot.gunRange.phase === 'idle' &&
+            snapshot.currentRoomId === 'gun_range' &&
+            snapshot.longRange.inGalleryBay && (
+              <div className="flex items-baseline gap-2.5 text-xs text-neutral-300/90">
+                <span className="font-medium text-sky-300">100m Gallery</span>
+                <span className="text-neutral-600" aria-hidden="true">
+                  ·
+                </span>
+                <span className="font-mono-tabular text-neutral-200">
+                  Trolley {snapshot.longRange.trolleyDistanceM}m
+                  {snapshot.longRange.trolleyMoving
+                    ? ` → ${snapshot.longRange.trolleyTargetDistanceM}m`
+                    : ''}
+                </span>
+                <span className="text-neutral-600" aria-hidden="true">
+                  ·
+                </span>
+                <span className="font-mono-tabular text-neutral-300">
+                  Zero {snapshot.zeroDistanceM}m
+                </span>
+                {snapshot.longRange.lastChrono && (
+                  <>
+                    <span className="text-neutral-600" aria-hidden="true">
+                      ·
+                    </span>
+                    <span className="font-mono-tabular text-amber-300">
+                      {snapshot.longRange.lastChrono.muzzleVelocityMs} m/s
+                    </span>
+                  </>
+                )}
+                {snapshot.longRange.groupSizeMoa !== null && (
+                  <>
+                    <span className="text-neutral-600" aria-hidden="true">
+                      ·
+                    </span>
+                    <span className="font-mono-tabular text-sky-300">
+                      Group {snapshot.longRange.groupSizeMoa.toFixed(2)} MOA
+                    </span>
+                  </>
+                )}
+              </div>
+            )}
+
+          {snapshot.gunRange.phase === 'idle' &&
+            snapshot.currentRoomId === 'gun_range' &&
+            !snapshot.longRange.inGalleryBay && (
+              <div className="flex items-baseline gap-2.5 text-xs text-neutral-300/85">
+                <span className="font-medium text-amber-300/90">Live Fire Active</span>
+                {snapshot.gunRange.bestScore > 0 && (
+                  <>
+                    <span className="text-neutral-600" aria-hidden="true">
+                      ·
+                    </span>
+                    <span className="font-mono-tabular text-neutral-300">
+                      CQB Best {snapshot.gunRange.bestScore}
+                    </span>
+                  </>
+                )}
+                <span className="text-neutral-600" aria-hidden="true">
+                  ·
+                </span>
+                <span className="text-neutral-400">
+                  Shoot Amber Paddle or Use Console [F] for 30s Course
+                </span>
+              </div>
+            )}
 
           {/* Transient target impact confirmation tick (positioned cleanly above reticle/prompt) */}
-          {snapshot.gunRange.lastHit && (
+          {snapshot.longRange.lastHit &&
+          (!snapshot.gunRange.lastHit ||
+            snapshot.longRange.lastHit.timestampMs >= snapshot.gunRange.lastHit.timestampMs) ? (
             <div
               className={`font-mono-tabular text-xs font-medium tracking-wide ${
-                snapshot.gunRange.lastHit.isNoShoot
-                  ? 'text-red-400'
-                  : snapshot.gunRange.lastHit.zone === 'head' ||
-                      snapshot.gunRange.lastHit.zone === 'gong' ||
-                      snapshot.gunRange.lastHit.zone === 'paddle'
-                    ? 'text-amber-300'
-                    : 'text-neutral-100'
+                snapshot.longRange.lastHit.outcome === 'penetrate'
+                  ? 'text-emerald-400'
+                  : snapshot.longRange.lastHit.outcome === 'stop'
+                    ? 'text-red-400'
+                    : 'text-amber-300'
               }`}
             >
-              {snapshot.gunRange.lastHit.zone === 'no_shoot'
-                ? `NO-SHOOT ${snapshot.gunRange.lastHit.scoreDelta}`
-                : snapshot.gunRange.lastHit.zone === 'paddle'
-                  ? snapshot.gunRange.lastHit.label
-                  : snapshot.gunRange.lastHit.zone === 'head'
-                    ? `HEADSHOT +${snapshot.gunRange.lastHit.scoreDelta} · ${snapshot.gunRange.lastHit.distanceM}m`
-                    : snapshot.gunRange.lastHit.zone === 'gong'
-                      ? `STEEL GONG · ${snapshot.gunRange.lastHit.distanceM}m`
-                      : snapshot.gunRange.lastHit.zone === 'a_zone'
-                        ? `A-ZONE +${snapshot.gunRange.lastHit.scoreDelta} · ${snapshot.gunRange.lastHit.distanceM}m`
-                        : `TORSO +${snapshot.gunRange.lastHit.scoreDelta} · ${snapshot.gunRange.lastHit.distanceM}m`}
+              {snapshot.longRange.lastHit.zoneLabel} · {snapshot.longRange.lastHit.distanceM}m ·{' '}
+              {snapshot.longRange.lastHit.impactSpeedMs} m/s ·{' '}
+              {snapshot.longRange.lastHit.impactEnergyJ} J
+              {snapshot.longRange.lastHit.groupMoa !== null
+                ? ` · ${snapshot.longRange.lastHit.groupMoa.toFixed(2)} MOA`
+                : ''}
             </div>
+          ) : (
+            snapshot.gunRange.lastHit && (
+              <div
+                className={`font-mono-tabular text-xs font-medium tracking-wide ${
+                  snapshot.gunRange.lastHit.isNoShoot
+                    ? 'text-red-400'
+                    : snapshot.gunRange.lastHit.zone === 'head' ||
+                        snapshot.gunRange.lastHit.zone === 'gong' ||
+                        snapshot.gunRange.lastHit.zone === 'paddle'
+                      ? 'text-amber-300'
+                      : 'text-neutral-100'
+                }`}
+              >
+                {snapshot.gunRange.lastHit.zone === 'no_shoot'
+                  ? `NO-SHOOT ${snapshot.gunRange.lastHit.scoreDelta}`
+                  : snapshot.gunRange.lastHit.zone === 'paddle'
+                    ? snapshot.gunRange.lastHit.label
+                    : snapshot.gunRange.lastHit.zone === 'head'
+                      ? `HEADSHOT +${snapshot.gunRange.lastHit.scoreDelta} · ${snapshot.gunRange.lastHit.distanceM}m`
+                      : snapshot.gunRange.lastHit.zone === 'gong'
+                        ? `STEEL GONG · ${snapshot.gunRange.lastHit.distanceM}m`
+                        : snapshot.gunRange.lastHit.zone === 'a_zone'
+                          ? `A-ZONE +${snapshot.gunRange.lastHit.scoreDelta} · ${snapshot.gunRange.lastHit.distanceM}m`
+                          : `TORSO +${snapshot.gunRange.lastHit.scoreDelta} · ${snapshot.gunRange.lastHit.distanceM}m`}
+              </div>
+            )
           )}
         </div>
       )}
@@ -211,7 +277,15 @@ export const HideoutHud: React.FC<HideoutHudProps> = ({
           </div>
           {snapshot.equippedWeaponId !== 'unarmed' && (
             <div className="mt-0.5 flex items-center justify-end gap-2 font-mono-tabular text-xs text-neutral-400">
-              <span>{snapshot.equippedCaliber}</span>
+              <span>{snapshot.activeAmmoLabel || snapshot.equippedCaliber}</span>
+              <span aria-hidden="true">·</span>
+              <span>Zero {snapshot.zeroDistanceM}m</span>
+              {snapshot.hasVariableZoom && (
+                <>
+                  <span aria-hidden="true">·</span>
+                  <span className="text-sky-300">{snapshot.activeOpticZoom.toFixed(1)}x</span>
+                </>
+              )}
               {snapshot.fireModeLabel && (
                 <>
                   <span aria-hidden="true">·</span>

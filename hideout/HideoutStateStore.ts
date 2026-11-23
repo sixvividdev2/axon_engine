@@ -20,6 +20,11 @@ export interface HideoutPersistedState {
   gunRangeBestHits: number;
   gunRangeBestAccuracy: number;
   gunRangeCoursesCompleted: number;
+  /** Phase 3 100m Long-Range Gallery & Ballistics Bench persistence */
+  longRangeBestMoa100m: number | null;
+  longRange100mHits: number;
+  ammoVariantByWeapon: Record<string, string>;
+  zeroDistanceByWeapon: Record<string, number>;
 }
 
 const STORAGE_KEY = 'axon_hideout_state_v1';
@@ -89,6 +94,10 @@ class HideoutStateStore {
       gunRangeBestHits: 0,
       gunRangeBestAccuracy: 0,
       gunRangeCoursesCompleted: 0,
+      longRangeBestMoa100m: null,
+      longRange100mHits: 0,
+      ammoVariantByWeapon: {},
+      zeroDistanceByWeapon: {},
     };
 
     try {
@@ -133,6 +142,25 @@ class HideoutStateStore {
           Number.isFinite(parsed.gunRangeCoursesCompleted)
             ? Math.max(0, Math.round(parsed.gunRangeCoursesCompleted))
             : 0,
+        longRangeBestMoa100m:
+          typeof parsed.longRangeBestMoa100m === 'number' &&
+          Number.isFinite(parsed.longRangeBestMoa100m) &&
+          parsed.longRangeBestMoa100m > 0
+            ? Math.round(parsed.longRangeBestMoa100m * 100) / 100
+            : null,
+        longRange100mHits:
+          typeof parsed.longRange100mHits === 'number' &&
+          Number.isFinite(parsed.longRange100mHits)
+            ? Math.max(0, Math.round(parsed.longRange100mHits))
+            : 0,
+        ammoVariantByWeapon:
+          parsed.ammoVariantByWeapon && typeof parsed.ammoVariantByWeapon === 'object'
+            ? { ...parsed.ammoVariantByWeapon }
+            : {},
+        zeroDistanceByWeapon:
+          parsed.zeroDistanceByWeapon && typeof parsed.zeroDistanceByWeapon === 'object'
+            ? { ...parsed.zeroDistanceByWeapon }
+            : {},
       };
     } catch {
       return fallback;
@@ -159,6 +187,10 @@ class HideoutStateStore {
       gunRangeBestHits: this.state.gunRangeBestHits,
       gunRangeBestAccuracy: this.state.gunRangeBestAccuracy,
       gunRangeCoursesCompleted: this.state.gunRangeCoursesCompleted,
+      longRangeBestMoa100m: this.state.longRangeBestMoa100m,
+      longRange100mHits: this.state.longRange100mHits,
+      ammoVariantByWeapon: { ...this.state.ammoVariantByWeapon },
+      zeroDistanceByWeapon: { ...this.state.zeroDistanceByWeapon },
     };
   }
 
@@ -355,6 +387,50 @@ class HideoutStateStore {
       gunRangeBestHits: Math.max(this.state.gunRangeBestHits, cleanHits),
       gunRangeBestAccuracy: Math.max(this.state.gunRangeBestAccuracy, cleanAcc),
       gunRangeCoursesCompleted: this.state.gunRangeCoursesCompleted + 1,
+    };
+    this.saveAndEmit();
+    return isNewBest;
+  }
+
+  public setWeaponAmmoVariant(weaponId: string, variantId: string): void {
+    if (!weaponId || weaponId === 'unarmed') return;
+    this.state = {
+      ...this.state,
+      ammoVariantByWeapon: {
+        ...this.state.ammoVariantByWeapon,
+        [weaponId]: variantId,
+      },
+    };
+    this.saveAndEmit();
+  }
+
+  public setWeaponZeroDistance(weaponId: string, zeroDistanceM: number): void {
+    if (!weaponId || weaponId === 'unarmed') return;
+    const clamped = Math.max(25, Math.min(300, Math.round(zeroDistanceM)));
+    this.state = {
+      ...this.state,
+      zeroDistanceByWeapon: {
+        ...this.state.zeroDistanceByWeapon,
+        [weaponId]: clamped,
+      },
+    };
+    this.saveAndEmit();
+  }
+
+  public recordLongRangeHit(groupMoa100m: number | null): boolean {
+    let isNewBest = false;
+    let nextBest = this.state.longRangeBestMoa100m;
+    if (groupMoa100m !== null && Number.isFinite(groupMoa100m) && groupMoa100m > 0) {
+      const cleanMoa = Math.round(groupMoa100m * 100) / 100;
+      if (nextBest === null || cleanMoa < nextBest) {
+        nextBest = cleanMoa;
+        isNewBest = true;
+      }
+    }
+    this.state = {
+      ...this.state,
+      longRange100mHits: this.state.longRange100mHits + 1,
+      longRangeBestMoa100m: nextBest,
     };
     this.saveAndEmit();
     return isNewBest;
