@@ -22,6 +22,7 @@ import {
   DEFAULT_TRAUMA_MODIFIERS,
   GrenadeDetonationEvent,
   GrenadeHoldStage,
+  GrenadeThrowStyle,
   GYM_ARMORY_WEAPONS,
   IBodycamWorldAdapter,
   IR_LAYER,
@@ -84,6 +85,8 @@ import {
   GameBotsSyncPacket,
   GameEnvSyncPacket,
   GameGlassShatterPacket,
+  GameGrenadeEventKind,
+  GameGrenadeEventPacket,
   GameMapInteractPacket,
   GameMapInteractRejectedPacket,
   GameMapInteractRequestPacket,
@@ -118,6 +121,7 @@ import {
   BattleScoreEntry,
   BattleTeamId,
   BotCommsEvent,
+  BotGrenadeEvent,
   InfectionBotStatusSummary,
 } from './BattleBotAI';
 import { InfectionHumanTarget, InfectionZombieAI, ZombieRoundState } from './InfectionZombieAI';
@@ -277,7 +281,9 @@ export interface CombatSessionSnapshot {
   grenadeMax: number;
   grenadeHoldStage: GrenadeHoldStage;
   grenadeCooking: boolean;
-  grenadeCookRatio: number;
+  grenadeStatusLabel: string;
+  grenadeThrowStyle: GrenadeThrowStyle;
+  grenadeThrowHeld: boolean;
   flashBlindAlpha: number;
   zeroDistanceM: number;
   zeroElevationMrad: number;
@@ -373,6 +379,8 @@ export class CombatSessionEngine {
   private lastSentFiring = false;
   private lastSentReloading = false;
   private lastSentHandlingAction: SyncedHandlingAction = 'NONE';
+  private lastSentGrenadeStage: GrenadeHoldStage = 'HOLSTERED';
+  private lastSentGrenadeThrowHeld = false;
   private lastImmediateStateFlushMs = 0;
   private nextMapInteractReqSeq = 1;
   private readonly pendingMapInteractRequests = new Map<
@@ -647,6 +655,7 @@ export class CombatSessionEngine {
         },
       );
       this.botAI.setBotCommsListener((ev) => this.handleLocalBotComms(ev));
+      this.botAI.setBotGrenadeListener((ev) => this.handleHostBotGrenadeEvent(ev));
     } else {
       this.zombieAI = new InfectionZombieAI(this.scene, this.map, this.audio, {
         zombieHealthMult: evCfg?.zombieHealthMult,
@@ -680,6 +689,7 @@ export class CombatSessionEngine {
           },
         );
         this.botAI.setBotCommsListener((ev) => this.handleLocalBotComms(ev));
+        this.botAI.setBotGrenadeListener((ev) => this.handleHostBotGrenadeEvent(ev));
         this.botAI.setInfectionZones(
           this.zombieAI.getUnlockedZoneIds(),
           this.zombieAI.getOpenedDoorIds(),
@@ -853,8 +863,9 @@ export class CombatSessionEngine {
       },
       audio: this.audio,
       onDetonate: (ev) => this.handleGrenadeDetonation(ev),
+      onInHandDetonate: (ev) => this.handleGrenadeDetonation(ev, true),
     });
-    this.grenadeSystem.attachViewmodelCamera(this.camera);
+    this.animator.setGrenadeSystem(this.grenadeSystem);
 
     this.syncBeltEquipmentMesh();
     this.unsubTacticalEquipment = tacticalEquipmentStore.subscribe((sel) => {
@@ -1281,11 +1292,49 @@ export class CombatSessionEngine {
     const isFiringNow = this.isLocallyActivelyFiring();
     const isReloadingNow = this.reloadTimer > 0 || this.weaponRig.isTubularReloading();
     const handlingSnap = this.weaponRig.getSyncedHandlingSnapshot();
+    const grenadeStage = this.grenadeSystem.getHoldStage();
+    const grenadeThrowHeld = this.grenadeSystem.isThrowInputHeld();
+    const grenadeWhipProg = this.grenadeSystem.getThrowWhipProgress();
+    const grenadeThrowStyle = this.grenadeSystem.getThrowStyle();
+    const grenadeCharge01 = this.grenadeSystem.getCharge01();
+    const grenadeEquipId = this.grenadeSystem.getCookingEquipmentId();
+
+    let syncedAction: SyncedHandlingAction = handlingSnap.action;
+    let syncedProg = handlingSnap.progress;
+    if (grenadeStage !== 'HOLSTERED' || this.grenadeSystem.isThrowing()) {
+      if (grenadeWhipProg > 0) {
+        syncedAction =
+          grenadeThrowStyle === 'underhand'
+            ? 'GRENADE_THROW_UNDERHAND'
+            : 'GRENADE_THROW_OVERHAND';
+        syncedProg = grenadeWhipProg;
+      } else if (grenadeThrowHeld) {
+        syncedAction = 'GRENADE_CHARGE';
+        syncedProg = grenadeCharge01;
+      } else if (grenadeStage === 'PIN_PULLED') {
+        const pinPhase = this.grenadeSystem.getPinPullPhase();
+        if (pinPhase !== 'NONE' && pinPhase !== 'EYE_AIM') {
+          syncedAction = 'GRENADE_PIN_PULL';
+          syncedProg = THREE.MathUtils.clamp(this.grenadeSystem.getPinPullElapsed() / 0.56, 0, 1);
+        } else {
+          syncedAction = 'GRENADE_COOK';
+          syncedProg = 0.0;
+        }
+      } else if (grenadeStage === 'LEVER_RELEASED') {
+        syncedAction = 'GRENADE_COOK';
+        syncedProg = 1.0;
+      } else {
+        syncedAction = 'GRENADE_DRAW';
+        syncedProg = this.grenadeSystem.getWeaponStowBlend();
+      }
+    }
 
     this.lastSentStance = aimStance;
     this.lastSentFiring = isFiringNow;
     this.lastSentReloading = isReloadingNow;
-    this.lastSentHandlingAction = handlingSnap.action;
+    this.lastSentHandlingAction = syncedAction;
+    this.lastSentGrenadeStage = grenadeStage;
+    this.lastSentGrenadeThrowHeld = grenadeThrowHeld;
 
     const pkt: GamePlayerStatePacket = {
       type: 'game:state',
@@ -1317,8 +1366,11 @@ export class CombatSessionEngine {
       lean,
       weaponId: this.equippedWeaponId,
       att: packSyncedWeaponAttachments(this.weaponRig.getAttachments()),
-      ha: handlingSnap.action,
-      hprog: Number(handlingSnap.progress.toFixed(3)),
+      ha: syncedAction,
+      hprog: Number(syncedProg.toFixed(3)),
+      geq: grenadeEquipId ?? undefined,
+      gc: Number(grenadeCharge01.toFixed(3)),
+      gts: grenadeThrowStyle,
       sup: derived.isSuppressed,
       hp: Math.round(this.hp),
       maxHp: this.maxHp,
@@ -1330,6 +1382,81 @@ export class CombatSessionEngine {
       ts: Date.now(),
     };
     this.mp.sendMessage(pkt as unknown as Record<string, unknown>);
+  }
+
+  private sendLocalGrenadeEvent(
+    kind: GameGrenadeEventKind,
+    equipmentId: TacticalEquipmentId,
+    origin: Readonly<THREE.Vector3>,
+    velocity?: Readonly<THREE.Vector3>,
+    fuseRemainingSec?: number,
+  ): void {
+    if (!this.mp) return;
+    const pkt: GameGrenadeEventPacket = {
+      type: 'game:grenade_event',
+      actorId: this.mp.localUserId,
+      isBot: false,
+      team: this.localBattleTeam,
+      kind,
+      equipmentId,
+      px: Number(origin.x.toFixed(3)),
+      py: Number(origin.y.toFixed(3)),
+      pz: Number(origin.z.toFixed(3)),
+      vx: velocity ? Number(velocity.x.toFixed(3)) : undefined,
+      vy: velocity ? Number(velocity.y.toFixed(3)) : undefined,
+      vz: velocity ? Number(velocity.z.toFixed(3)) : undefined,
+      fuseRemainingSec:
+        typeof fuseRemainingSec === 'number' ? Number(fuseRemainingSec.toFixed(3)) : undefined,
+      ts: Date.now(),
+    };
+    this.mp.sendMessage(pkt as unknown as Record<string, unknown>);
+  }
+
+  private handleHostBotGrenadeEvent(ev: BotGrenadeEvent): void {
+    const meta = {
+      isRemote: true,
+      sourceId: ev.botId,
+      sourceName: ev.botName,
+      sourceTeam: ev.team,
+      sourceIsBot: true,
+    } as const;
+
+    if (ev.kind === 'pin_pull') {
+      this.audio.playGearRattle('weapon_swap', 0.4);
+    } else if (ev.kind === 'spoon_pop') {
+      this.audio.playGrenadeLeverSnap?.();
+      this.grenadeSystem.spawnRemoteFlyingSpoon(ev.origin, ev.velocity);
+    } else if (ev.kind === 'throw' || ev.kind === 'live_drop') {
+      this.grenadeSystem.spawnRemoteGrenade(
+        ev.equipmentId,
+        ev.origin,
+        ev.velocity,
+        ev.fuseRemainingSec,
+        meta,
+      );
+    } else if (ev.kind === 'in_hand_detonate') {
+      this.grenadeSystem.triggerRemoteDetonation(ev.equipmentId, ev.origin, meta);
+    }
+
+    if (this.mp && this.isMpHost) {
+      const pkt: GameGrenadeEventPacket = {
+        type: 'game:grenade_event',
+        actorId: ev.botId,
+        isBot: true,
+        team: ev.team,
+        kind: ev.kind,
+        equipmentId: ev.equipmentId,
+        px: Number(ev.origin.x.toFixed(3)),
+        py: Number(ev.origin.y.toFixed(3)),
+        pz: Number(ev.origin.z.toFixed(3)),
+        vx: Number(ev.velocity.x.toFixed(3)),
+        vy: Number(ev.velocity.y.toFixed(3)),
+        vz: Number(ev.velocity.z.toFixed(3)),
+        fuseRemainingSec: Number(ev.fuseRemainingSec.toFixed(3)),
+        ts: Date.now(),
+      };
+      this.mp.sendMessage(pkt as unknown as Record<string, unknown>);
+    }
   }
 
   private handleRemoteGameMessage(raw: Record<string, unknown>): void {
@@ -1353,6 +1480,38 @@ export class CombatSessionEngine {
 
     if (type === 'game:ping') {
       this.handleRemoteTacticalPing(raw as unknown as GameTacticalPingPacket);
+      return;
+    }
+
+    if (type === 'game:grenade_event') {
+      const pkt = raw as unknown as GameGrenadeEventPacket;
+      if (!pkt.isBot && pkt.senderUserId === this.mp.localUserId) return;
+      if (pkt.isBot && this.isMpHost) return;
+      this._tmpImpactPoint.set(pkt.px, pkt.py, pkt.pz);
+      this._tmpImpactDir.set(pkt.vx ?? 0, pkt.vy ?? 0, pkt.vz ?? 0);
+      const meta = {
+        isRemote: true,
+        sourceId: pkt.actorId,
+        sourceName: pkt.isBot ? pkt.actorId : (pkt.senderUsername ?? 'OPERATOR'),
+        sourceTeam: (pkt.team ?? (pkt.senderTeam === 'B' ? 'B' : 'A')) as BattleTeamId,
+        sourceIsBot: Boolean(pkt.isBot),
+      };
+      if (pkt.kind === 'pin_pull') {
+        this.audio.playGearRattle('weapon_swap', 0.4);
+      } else if (pkt.kind === 'spoon_pop') {
+        this.audio.playGrenadeLeverSnap?.();
+        this.grenadeSystem.spawnRemoteFlyingSpoon(this._tmpImpactPoint, this._tmpImpactDir);
+      } else if (pkt.kind === 'throw' || pkt.kind === 'live_drop') {
+        this.grenadeSystem.spawnRemoteGrenade(
+          pkt.equipmentId,
+          this._tmpImpactPoint,
+          this._tmpImpactDir,
+          pkt.fuseRemainingSec ?? 3.8,
+          meta,
+        );
+      } else if (pkt.kind === 'in_hand_detonate') {
+        this.grenadeSystem.triggerRemoteDetonation(pkt.equipmentId, this._tmpImpactPoint, meta);
+      }
       return;
     }
 
@@ -2113,7 +2272,7 @@ export class CombatSessionEngine {
     }
   }
 
-  private handleGrenadeHolsterOrToss(): 'holstered' | 'tossed' | 'none' {
+  private handleGrenadeHolsterOrToss(reason: 'switch' | 'death' = 'switch'): 'holstered' | 'tossed' | 'none' {
     this.camera.getWorldPosition(this._grenadeThrowOrigin);
     this.camera.getWorldDirection(this._grenadeThrowDir);
     this._grenadeThrowOrigin.y -= 0.08;
@@ -2124,11 +2283,23 @@ export class CombatSessionEngine {
       this._grenadePlayerVel,
     );
     if (res === 'tossed') {
+      const launched = this.grenadeSystem.consumeLastLaunchedThrow();
       this.grenadeCount = Math.max(0, this.grenadeCount - 1);
       this.syncBeltEquipmentMesh();
       this.audio.playGearRattle('weapon_swap', 0.65);
-      this.showToast('Live Grenade Tossed Clear!');
-    } else if (res === 'holstered') {
+      if (launched) {
+        this.sendLocalGrenadeEvent(
+          reason === 'death' ? 'live_drop' : 'throw',
+          launched.equipmentId,
+          launched.origin,
+          launched.velocity,
+          launched.fuseRemainingSec,
+        );
+      }
+      if (reason === 'switch') {
+        this.showToast('Live Grenade Tossed Clear!');
+      }
+    } else if (res === 'holstered' && reason === 'switch') {
       this.showToast('Grenade Re-Pinned & Holstered');
     }
     return res;
@@ -2137,7 +2308,7 @@ export class CombatSessionEngine {
   private drawOrHolsterGrenade(): void {
     if (!this.playerAlive || this.gameOver || this.matchOutcome !== 'active') return;
     if (this.grenadeSystem.isDrawn()) {
-      this.handleGrenadeHolsterOrToss();
+      this.handleGrenadeHolsterOrToss('switch');
       this.emitSnapshot();
       return;
     }
@@ -2152,32 +2323,7 @@ export class CombatSessionEngine {
     this.reloadTimer = 0;
     this.weaponRig.cancelZoomTwist();
     this.grenadeSystem.drawGrenade(def.id);
-    this.showToast(`${def.shortName} Drawn — LMB Pin · RMB Lever · Rel LMB Throw`);
-    this.emitSnapshot();
-  }
-
-  private throwHeldGrenadeNow(): void {
-    if (!this.grenadeSystem.isPinPulled()) return;
-    if (!this.playerAlive || this.gameOver || this.matchOutcome !== 'active') {
-      this.grenadeSystem.cancelCook();
-      this.emitSnapshot();
-      return;
-    }
-    this.camera.getWorldPosition(this._grenadeThrowOrigin);
-    this.camera.getWorldDirection(this._grenadeThrowDir);
-    this._grenadeThrowOrigin.y -= 0.08;
-    this.controller.getVelocity(this._grenadePlayerVel);
-    if (
-      this.grenadeSystem.throwHeldGrenade(
-        this._grenadeThrowOrigin,
-        this._grenadeThrowDir,
-        this._grenadePlayerVel,
-      )
-    ) {
-      this.grenadeCount = Math.max(0, this.grenadeCount - 1);
-      this.syncBeltEquipmentMesh();
-      this.audio.playGearRattle('weapon_swap', 0.65);
-    }
+    this.showToast(`${def.shortName} Drawn — [RMB] Pin · [RMB] Spoon · [LMB] Click Lob / Hold Throw`);
     this.emitSnapshot();
   }
 
@@ -2205,7 +2351,10 @@ export class CombatSessionEngine {
     return true;
   }
 
-  private handleGrenadeDetonation(ev: GrenadeDetonationEvent): void {
+  private handleGrenadeDetonation(ev: GrenadeDetonationEvent, isInHand = false): void {
+    const canApplyAuthorityDamage = !ev.isRemote || (Boolean(ev.sourceIsBot) && (this.isMpHost || !this.mp));
+    const canAttributeLocalKills = !ev.isRemote;
+
     // 0. Shatter breakable glass panes inside frag/thermite/flash blast radius
     if (
       this.map.shatterBreakable &&
@@ -2219,14 +2368,17 @@ export class CombatSessionEngine {
         if (!m.userData?.breakableGlass || m.userData.shattered) continue;
         m.getWorldPosition(this._tmpImpactPoint);
         if (this._tmpImpactPoint.distanceTo(ev.position) <= blastGlassR) {
-          this.handleWorldGlassShatter(m, this._tmpImpactPoint);
+          this.handleWorldGlassShatter(m, this._tmpImpactPoint, undefined, Boolean(ev.isRemote));
         }
       }
     }
 
     // 1. Battle AI Bots AoE blast (with 44-ray cover-occluded M67 fragmentation evaluator)
-    if (this.params.mode === 'battle' && this.botAI) {
-      const attackerName = this.mp?.localUsername ?? 'YOU';
+    if (this.params.mode === 'battle' && this.botAI && canApplyAuthorityDamage) {
+      const attackerName = ev.sourceIsBot ? (ev.sourceName ?? 'BOT') : (this.mp?.localUsername ?? 'YOU');
+      const attackerTeam: BattleTeamId = ev.sourceIsBot
+        ? (ev.sourceTeam ?? 'B')
+        : this.localBattleTeam;
       const fragEvaluator =
         ev.kind === 'frag'
           ? (targetPos: Readonly<THREE.Vector3>) =>
@@ -2238,11 +2390,11 @@ export class CombatSessionEngine {
         ev.maxDamage,
         ev.kind,
         attackerName,
-        this.localBattleTeam,
+        attackerTeam,
         ev.def.killfeedLabel,
         fragEvaluator,
       );
-      if (res.hits > 0) {
+      if (res.hits > 0 && canAttributeLocalKills) {
         this.hitmarkerTimer = res.kills > 0 ? 0.34 : 0.2;
         this.hitmarkerHeadshot = false;
         this.hitmarkerKill = res.kills > 0;
@@ -2271,11 +2423,20 @@ export class CombatSessionEngine {
           this.checkBattleVictory();
         }
         this.emitSnapshot();
+      } else if (res.kills > 0) {
+        this.checkBattleVictory();
+        this.emitSnapshot();
       }
     }
 
-    // 2. Multiplayer Remote Human Opponents PvP blast
-    if (this.params.mode === 'battle' && this.mp && this.remotePlayers && ev.kind !== 'smoke') {
+    // 2. Multiplayer Remote Human Opponents PvP blast (sent once by authoritative thrower or Host for bot throws)
+    if (
+      this.params.mode === 'battle' &&
+      this.mp &&
+      this.remotePlayers &&
+      ev.kind !== 'smoke' &&
+      canApplyAuthorityDamage
+    ) {
       const searchR = ev.kind === 'frag' ? Math.max(ev.radiusM, 24.0) : ev.radiusM;
       const hostiles = this.remotePlayers.getAliveHostilesInRadius(ev.position, searchR);
       for (const target of hostiles) {
@@ -2297,28 +2458,43 @@ export class CombatSessionEngine {
               ? Math.max(4, Math.round(ev.maxDamage * falloff))
               : Math.max(8, Math.round(ev.maxDamage * Math.pow(falloff, 1.1)));
         }
-        this.hitmarkerTimer = 0.22;
-        this.hitmarkerHeadshot = false;
-        this.hitmarkerKill = false;
-        this.remotePlayers.triggerHitFlinch(target.userId);
-        const hitPkt: GamePlayerHitPacket = {
-          type: 'game:hit',
-          targetUserId: target.userId,
-          damage: dmg,
-          hitZone: 'thorax',
-          headshot: false,
-          weaponId: ev.equipmentId,
-          weaponName: ev.def.killfeedLabel,
-          ts: Date.now(),
-        };
-        this.mp.sendMessage(hitPkt as unknown as Record<string, unknown>);
+        if (ev.sourceIsBot) {
+          if (this.isMpHost) {
+            const hitPkt: GameBotHitPlayerPacket = {
+              type: 'game:bot_hit_player',
+              targetUserId: target.userId,
+              damage: dmg,
+              botId: ev.sourceId ?? 'bot_0',
+              botName: ev.sourceName ?? 'BOT',
+              botTeam: ev.sourceTeam ?? 'B',
+              ts: Date.now(),
+            };
+            this.mp.sendMessage(hitPkt as unknown as Record<string, unknown>);
+          }
+        } else {
+          this.hitmarkerTimer = 0.22;
+          this.hitmarkerHeadshot = false;
+          this.hitmarkerKill = false;
+          this.remotePlayers.triggerHitFlinch(target.userId);
+          const hitPkt: GamePlayerHitPacket = {
+            type: 'game:hit',
+            targetUserId: target.userId,
+            damage: dmg,
+            hitZone: 'thorax',
+            headshot: false,
+            weaponId: ev.equipmentId,
+            weaponName: ev.def.killfeedLabel,
+            ts: Date.now(),
+          };
+          this.mp.sendMessage(hitPkt as unknown as Record<string, unknown>);
+        }
       }
     }
 
     // 3. Infection Zombies AoE blast
-    if (this.params.mode === 'infection' && this.zombieAI) {
+    if (this.params.mode === 'infection' && this.zombieAI && canApplyAuthorityDamage) {
       const res = this.zombieAI.applyAreaBlast(ev.position, ev.radiusM, ev.maxDamage, ev.kind);
-      if (res.hits > 0) {
+      if (res.hits > 0 && canAttributeLocalKills) {
         this.hitmarkerTimer = res.kills > 0 ? 0.34 : 0.2;
         this.hitmarkerHeadshot = false;
         this.hitmarkerKill = res.kills > 0;
@@ -2340,6 +2516,16 @@ export class CombatSessionEngine {
           );
         }
         this.emitSnapshot();
+      } else if (res.kills > 0 && ev.sourceIsBot) {
+        this.botAI?.awardInfectionKillPoints(ev.sourceId ?? '', false, false);
+        this.pushMpKillfeed({
+          killerName: ev.sourceName ?? 'SQUAD BOT',
+          killerTeam: 'A',
+          victimName: res.kills > 1 ? `INFECTED ×${res.kills}` : 'INFECTED',
+          victimTeam: 'B',
+          headshot: false,
+          weaponLabel: ev.def.killfeedLabel,
+        });
       }
     }
 
@@ -2352,27 +2538,33 @@ export class CombatSessionEngine {
       );
       const dist = playerChest.distanceTo(ev.position);
       const maxEffectDist = ev.kind === 'frag' ? Math.max(ev.radiusM * 1.4, 24.0) : ev.radiusM * 1.25;
-      if (dist <= maxEffectDist) {
-        const proximity = Math.max(0, 1 - dist / Math.max(0.6, maxEffectDist));
+      if (dist <= maxEffectDist || isInHand) {
+        const proximity = isInHand ? 1.0 : Math.max(0, 1 - dist / Math.max(0.6, maxEffectDist));
         if (!ev.isTick) {
           this.controller.applyRecoil(
-            0.028 * proximity,
-            (Math.random() - 0.5) * 0.045 * proximity,
-            0.014 * proximity,
+            (isInHand ? 0.14 : 0.028) * proximity,
+            (Math.random() - 0.5) * (isInHand ? 0.12 : 0.045) * proximity,
+            (isInHand ? 0.045 : 0.014) * proximity,
             0.6,
             { stanceCoupled: false },
           );
-          this.adrenalineStress = Math.min(1, this.adrenalineStress + 0.35 * proximity);
+          this.adrenalineStress = Math.min(1, this.adrenalineStress + (isInHand ? 1.0 : 0.35 * proximity));
         }
+
+        const attackerLabel = ev.sourceIsBot ? (ev.sourceName ?? ev.def.killfeedLabel) : ev.def.killfeedLabel;
+        const attackerTeam: BattleTeamId = ev.sourceIsBot ? (ev.sourceTeam ?? 'B') : this.localBattleTeam;
+        const attackerId = ev.sourceIsBot ? ev.sourceId : undefined;
 
         if (ev.kind === 'flash') {
           this.camera.getWorldDirection(this._grenadeThrowDir);
-          const exposure = this.grenadeSystem.computeFlashbangExposure(
-            ev.position,
-            this.camera.position,
-            this._grenadeThrowDir,
-            ev.radiusM * 1.25,
-          );
+          const exposure = isInHand
+            ? { intensity: 1.0 }
+            : this.grenadeSystem.computeFlashbangExposure(
+                ev.position,
+                this.camera.position,
+                this._grenadeThrowDir,
+                ev.radiusM * 1.25,
+              );
           if (exposure.intensity > 0.05) {
             this.postProcess.triggerFlashbangOverload(exposure.intensity);
             this.postProcess.triggerNvgFlashSpike(1.0);
@@ -2382,17 +2574,24 @@ export class CombatSessionEngine {
               THREE.MathUtils.clamp(exposure.intensity * 0.34, 0, 0.36),
             );
           }
-        } else if (ev.kind === 'frag') {
-          const fragEval = this.grenadeSystem.evaluateFragDamageAt(ev.position, playerChest, ev.def);
-          const selfDmg = Math.round(fragEval.damage * 0.62);
-          if (selfDmg > 0) {
-            this.applyPlayerDamage(selfDmg, ev.def.killfeedLabel, this.localBattleTeam);
+          if (isInHand) {
+            this.applyPlayerDamage(Math.max(45, ev.maxDamage), attackerLabel, attackerTeam, attackerId);
           }
-        } else if (ev.kind === 'thermite' && dist <= ev.radiusM) {
-          const falloff = Math.max(0.15, 1 - dist / Math.max(0.5, ev.radiusM));
-          const selfDmg = Math.round(ev.maxDamage * 0.48 * falloff);
+        } else if (ev.kind === 'frag') {
+          if (isInHand) {
+            this.applyPlayerDamage(Math.max(this.maxHp + 50, ev.maxDamage), attackerLabel, attackerTeam, attackerId);
+          } else {
+            const fragEval = this.grenadeSystem.evaluateFragDamageAt(ev.position, playerChest, ev.def);
+            const selfDmg = Math.round(fragEval.damage * (ev.isRemote ? 1.0 : 0.62));
+            if (selfDmg > 0) {
+              this.applyPlayerDamage(selfDmg, attackerLabel, attackerTeam, attackerId);
+            }
+          }
+        } else if (ev.kind === 'thermite' && (dist <= ev.radiusM || isInHand)) {
+          const falloff = isInHand ? 1.0 : Math.max(0.15, 1 - dist / Math.max(0.5, ev.radiusM));
+          const selfDmg = Math.round(ev.maxDamage * (ev.isRemote ? 0.85 : 0.48) * falloff);
           if (selfDmg > 0) {
-            this.applyPlayerDamage(selfDmg, ev.def.killfeedLabel, this.localBattleTeam);
+            this.applyPlayerDamage(selfDmg, attackerLabel, attackerTeam, attackerId);
           }
         }
       }
@@ -2847,7 +3046,11 @@ export class CombatSessionEngine {
       this.playerDeaths += 1;
       this.isFiring = false;
       this.input.ads = false;
-      this.grenadeSystem.cancelCook();
+      if (this.grenadeSystem.isLeverReleased()) {
+        this.handleGrenadeHolsterOrToss('death');
+      } else {
+        this.grenadeSystem.cancelCook();
+      }
       this.weaponRig.cancelAction();
       this.skeleton.setFirstPersonHeadShadowOnly(false);
       this.skeleton.setAllMeshesWorldLayer();
@@ -3473,7 +3676,13 @@ export class CombatSessionEngine {
 
   private attemptFire(): void {
     if (!this.playerAlive || this.gameOver || this.matchOutcome !== 'active') return;
-    if (this.pdaDevice.isBlockingWeaponActions() || this.weaponRig.isSuppressorActionActive()) return;
+    if (
+      this.pdaDevice.isBlockingWeaponActions() ||
+      this.weaponRig.isSuppressorActionActive() ||
+      this.grenadeSystem.isDrawn()
+    ) {
+      return;
+    }
     const prof = this._runtimeProfile;
 
     if (prof.holdClass === 'unarmed') {
@@ -3672,30 +3881,38 @@ export class CombatSessionEngine {
     this.postProcess.setSize(w, h);
   };
 
+  private clearHeldControlInputs(): void {
+    this.isFiring = false;
+    this.semiTriggerConsumed = false;
+    this.shiftHeld = false;
+    this.altHeld = false;
+    this.scoreboardOpen = false;
+    this.input.ads = false;
+    this.input.forward = false;
+    this.input.backward = false;
+    this.input.left = false;
+    this.input.right = false;
+    this.input.sprint = false;
+    this.input.leanLeft = false;
+    this.input.leanRight = false;
+    this.input.holdBreath = false;
+    this.input.vault = false;
+    this.interactKeyHeld = false;
+    this.repairingBarrierId = null;
+    this.barrierRepairProgress = 0;
+    this.barrierRepairPendingRequest = false;
+    this.grenadeSystem.resetHeldInputOnFocusLoss();
+  }
+
+  private readonly onWindowBlur = (): void => {
+    this.clearHeldControlInputs();
+    this.emitSnapshot();
+  };
+
   private readonly onPointerLockChange = (): void => {
     this.pointerLocked = document.pointerLockElement === this.renderer.domElement;
     if (!this.pointerLocked) {
-      this.isFiring = false;
-      this.shiftHeld = false;
-      this.altHeld = false;
-      this.scoreboardOpen = false;
-      this.input.ads = false;
-      this.input.forward = false;
-      this.input.backward = false;
-      this.input.left = false;
-      this.input.right = false;
-      this.input.sprint = false;
-      this.input.leanLeft = false;
-      this.input.leanRight = false;
-      this.input.holdBreath = false;
-      this.input.vault = false;
-      this.interactKeyHeld = false;
-      this.repairingBarrierId = null;
-      this.barrierRepairProgress = 0;
-      this.barrierRepairPendingRequest = false;
-      if (this.grenadeSystem.isDrawn() && !this.grenadeSystem.isLeverReleased()) {
-        this.grenadeSystem.cancelCook();
-      }
+      this.clearHeldControlInputs();
     }
     this.emitSnapshot();
   };
@@ -3794,11 +4011,31 @@ export class CombatSessionEngine {
 
     // Authentic 4-stage grenade Manual of Arms when grenade is drawn
     if (this.grenadeSystem.isDrawn()) {
-      if (e.button === 0 && this.grenadeSystem.getHoldStage() === 'DRAWN') {
-        this.grenadeSystem.pullPin();
-        this.emitSnapshot();
-      } else if (e.button === 2 && this.grenadeSystem.getHoldStage() === 'PIN_PULLED') {
-        this.grenadeSystem.releaseLever();
+      this.input.ads = false;
+      const stage = this.grenadeSystem.getHoldStage();
+      const equipId = this.grenadeSystem.getCookingEquipmentId() ?? this.tacticalEquipmentId;
+      if (e.button === 2) {
+        if (stage === 'DRAWN') {
+          if (this.grenadeSystem.pullPin()) {
+            this.camera.getWorldPosition(this._grenadeThrowOrigin);
+            this.sendLocalGrenadeEvent('pin_pull', equipId, this._grenadeThrowOrigin);
+            this.emitSnapshot();
+          }
+        } else if (stage === 'PIN_PULLED') {
+          if (this.grenadeSystem.releaseLever()) {
+            this.camera.getWorldPosition(this._grenadeThrowOrigin);
+            this.camera.getWorldDirection(this._grenadeThrowDir);
+            this.sendLocalGrenadeEvent(
+              'spoon_pop',
+              equipId,
+              this._grenadeThrowOrigin,
+              this._grenadeThrowDir,
+            );
+            this.emitSnapshot();
+          }
+        }
+      } else if (e.button === 0 && (stage === 'PIN_PULLED' || stage === 'LEVER_RELEASED')) {
+        this.grenadeSystem.beginThrowInput();
         this.emitSnapshot();
       }
       return;
@@ -3829,12 +4066,15 @@ export class CombatSessionEngine {
 
   private readonly onMouseUp = (e: MouseEvent): void => {
     if (e.button === 0) {
-      if (this.grenadeSystem.isPinPulled()) {
-        this.throwHeldGrenadeNow();
-        return;
+      if (this.grenadeSystem.isThrowInputHeld()) {
+        this.grenadeSystem.releaseThrowInput();
+        this.emitSnapshot();
       }
       this.isFiring = false;
       this.semiTriggerConsumed = false;
+      if (this.grenadeSystem.isDrawn()) {
+        return;
+      }
     } else if (e.button === 2) {
       this.input.ads = false;
     }
@@ -4494,6 +4734,7 @@ export class CombatSessionEngine {
 
   private bindEvents(): void {
     window.addEventListener('resize', this.onResize);
+    window.addEventListener('blur', this.onWindowBlur);
     document.addEventListener('pointerlockchange', this.onPointerLockChange);
     window.addEventListener('mousemove', this.onMouseMove);
     window.addEventListener('mousedown', this.onMouseDown);
@@ -4509,6 +4750,7 @@ export class CombatSessionEngine {
 
   private unbindEvents(): void {
     window.removeEventListener('resize', this.onResize);
+    window.removeEventListener('blur', this.onWindowBlur);
     document.removeEventListener('pointerlockchange', this.onPointerLockChange);
     window.removeEventListener('mousemove', this.onMouseMove);
     window.removeEventListener('mousedown', this.onMouseDown);
@@ -4667,7 +4909,8 @@ export class CombatSessionEngine {
 
     const suppBusy = this.weaponRig.isSuppressorActionActive();
     const pdaBusy = this.pdaDevice.isBlockingWeaponActions();
-    if (suppBusy || pdaBusy) {
+    const grenadeDrawn = this.grenadeSystem.isDrawn();
+    if (suppBusy || pdaBusy || grenadeDrawn) {
       this.input.ads = false;
     }
     const baseAdsMode = this.adsModeByWeapon[prof.id] ?? 'PRIMARY';
@@ -4689,6 +4932,11 @@ export class CombatSessionEngine {
 
     // Step player controller, 3D PDA telemetry + choreography, & IK animator
     if (this.playerAlive) {
+      this.controller.setGrenadeTension(
+        this.grenadeSystem.getCharge01(),
+        this.grenadeSystem.isLeverReleased(),
+        this.grenadeSystem.getThrowStyle(),
+      );
       this.controller.update(
         dt,
         this.elapsedSec,
@@ -4745,10 +4993,12 @@ export class CombatSessionEngine {
     }
 
     this.weaponRig.root.visible =
-      this.playerAlive && !this.grenadeSystem.isDrawn() && !this.pdaDevice.isWeaponHidden();
+      this.playerAlive &&
+      !this.grenadeSystem.isWeaponHidden() &&
+      !this.pdaDevice.isWeaponHidden();
     this.skeleton.root.visible = this.playerAlive || this.playerRagdoll.isActive();
 
-    // Step drift-free 20 Hz multiplayer broadcast (+ immediate flush on stance/fire/reload transitions)
+    // Step drift-free 20 Hz multiplayer broadcast (+ immediate flush on stance/fire/reload/grenade transitions)
     if (this.mp && this.remotePlayers) {
       this.netSendAccum += dt;
       const nowPerf = performance.now();
@@ -4758,8 +5008,15 @@ export class CombatSessionEngine {
         (this.reloadTimer > 0 || this.weaponRig.isTubularReloading()) !== this.lastSentReloading;
       const handlingActionChanged =
         this.weaponRig.getSyncedHandlingSnapshot().action !== this.lastSentHandlingAction;
+      const grenadeStageChanged =
+        this.grenadeSystem.getHoldStage() !== this.lastSentGrenadeStage ||
+        this.grenadeSystem.isThrowInputHeld() !== this.lastSentGrenadeThrowHeld;
       const urgentTransition =
-        (stanceChanged || firingChanged || reloadChanged || handlingActionChanged) &&
+        (stanceChanged ||
+          firingChanged ||
+          reloadChanged ||
+          handlingActionChanged ||
+          grenadeStageChanged) &&
         nowPerf - this.lastImmediateStateFlushMs >= 16;
 
       if (this.netSendAccum >= 0.05 || urgentTransition) {
@@ -4830,10 +5087,26 @@ export class CombatSessionEngine {
       this.controller.position.z,
     );
     const wasLiveBefore = this.grenadeSystem.isLeverReleased();
+    const liveEquipBefore = this.grenadeSystem.getCookingEquipmentId() ?? this.tacticalEquipmentId;
     this.grenadeSystem.update(dt, this._grenadeThrowOrigin);
-    if (wasLiveBefore && !this.grenadeSystem.isLeverReleased()) {
+    const launched = this.grenadeSystem.consumeLastLaunchedThrow();
+    if (launched) {
       this.grenadeCount = Math.max(0, this.grenadeCount - 1);
       this.syncBeltEquipmentMesh();
+      this.audio.playGearRattle('weapon_swap', 0.65);
+      this.sendLocalGrenadeEvent(
+        'throw',
+        launched.equipmentId,
+        launched.origin,
+        launched.velocity,
+        launched.fuseRemainingSec,
+      );
+      this.emitSnapshot();
+    } else if (wasLiveBefore && !this.grenadeSystem.isLeverReleased()) {
+      this.grenadeCount = Math.max(0, this.grenadeCount - 1);
+      this.syncBeltEquipmentMesh();
+      this.sendLocalGrenadeEvent('in_hand_detonate', liveEquipBefore, this._grenadeThrowOrigin);
+      this.emitSnapshot();
     }
 
     // Step active AI system (Host-authoritative in multiplayer; Infection supports friendly AI squadmates)
@@ -4945,6 +5218,7 @@ export class CombatSessionEngine {
             this.addPoints(bonus, `ROUND ${completedRound} BONUS`);
             this.replenishInfectionRoundGrenade();
             this.botAI?.reviveAllDownedBots(this.controller.position);
+            this.botAI?.replenishBotGrenades();
             this.botAI?.awardInfectionRoundBonus(bonus, completedRound);
             this.showToast(`Round ${completedRound} Cleared · +${bonus} PTS · +1 Grenade`, 3.4);
             if (this.spectating && !this.playerAlive && !this.gameOver) {
@@ -5308,7 +5582,9 @@ export class CombatSessionEngine {
       grenadeMax: getTacticalEquipmentDef(this.tacticalEquipmentId).maxCarry,
       grenadeHoldStage: this.grenadeSystem.getHoldStage(),
       grenadeCooking: this.grenadeSystem.isCooking(),
-      grenadeCookRatio: this.grenadeSystem.getCookRatio(),
+      grenadeStatusLabel: this.grenadeSystem.getActionStatusLabel(),
+      grenadeThrowStyle: this.grenadeSystem.getThrowStyle(),
+      grenadeThrowHeld: this.grenadeSystem.isThrowInputHeld(),
       flashBlindAlpha: this.flashBlindAlpha,
       zeroDistanceM: this.weaponRig.getZeroDistanceM(),
       zeroElevationMrad: this.weaponRig.getZeroElevationMrad(),

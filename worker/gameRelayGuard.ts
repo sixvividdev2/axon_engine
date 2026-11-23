@@ -1,5 +1,6 @@
 import {
   ActiveWeatherConditionId,
+  GameGrenadeEventKind,
   LobbyRoomState,
   OperatorUniformId,
   SyncedAimStance,
@@ -7,6 +8,7 @@ import {
   SyncedWeaponAttachments,
   VALID_SYNCED_HANDLING_ACTIONS,
 } from '../data/multiplayer';
+import { isTacticalEquipmentId } from '../data/tacticalEquipment';
 
 export interface CachedMatchState {
   powerOn: boolean;
@@ -58,6 +60,15 @@ const ALLOWED_GAME_TYPES = new Set<string>([
   'game:map_interact_request',
   'game:ping',
   'game:glass_shatter',
+  'game:grenade_event',
+]);
+
+const VALID_GRENADE_EVENT_KINDS = new Set<GameGrenadeEventKind>([
+  'pin_pull',
+  'spoon_pop',
+  'throw',
+  'live_drop',
+  'in_hand_detonate',
 ]);
 
 const VALID_AIM_STANCES = new Set<SyncedAimStance>(['HIP', 'ADS', 'POINT_AIM', 'CANTED_ADS']);
@@ -258,6 +269,21 @@ export function validateAndSanitizeGameMessage(
     }
     safePayload.ha = sanitizeSyncedHandlingAction(parsed.ha);
     safePayload.hprog = Number(clampFinite(parsed.hprog, 0, 1, 0).toFixed(3));
+    if (isTacticalEquipmentId(parsed.geq)) {
+      safePayload.geq = parsed.geq;
+    } else {
+      delete safePayload.geq;
+    }
+    if (parsed.gc !== undefined) {
+      safePayload.gc = Number(clampFinite(parsed.gc, 0, 1, 0).toFixed(3));
+    } else {
+      delete safePayload.gc;
+    }
+    if (parsed.gts === 'overhand' || parsed.gts === 'underhand') {
+      safePayload.gts = parsed.gts;
+    } else {
+      delete safePayload.gts;
+    }
     if (typeof parsed.sup === 'boolean') {
       safePayload.sup = parsed.sup;
     } else {
@@ -287,6 +313,23 @@ export function validateAndSanitizeGameMessage(
         }
         if (b.hprog !== undefined) {
           cleanBot.hprog = Number(clampFinite(b.hprog, 0, 1, 0).toFixed(3));
+        }
+        if (b.geq !== undefined) {
+          if (isTacticalEquipmentId(b.geq)) {
+            cleanBot.geq = b.geq;
+          } else {
+            delete cleanBot.geq;
+          }
+        }
+        if (b.gc !== undefined) {
+          cleanBot.gc = Number(clampFinite(b.gc, 0, 1, 0).toFixed(3));
+        }
+        if (b.gts !== undefined) {
+          if (b.gts === 'overhand' || b.gts === 'underhand') {
+            cleanBot.gts = b.gts;
+          } else {
+            delete cleanBot.gts;
+          }
         }
         if (typeof b.sup === 'boolean') {
           cleanBot.sup = b.sup;
@@ -609,6 +652,61 @@ export function validateAndSanitizeGameMessage(
     } else {
       safePayload.pingKind = null;
       safePayload.pingLabel = null;
+    }
+  } else if (type === 'game:grenade_event') {
+    const isBot = Boolean(parsed.isBot);
+    if (isBot && !isHost) {
+      return null;
+    }
+    const kind = parsed.kind;
+    if (
+      typeof kind !== 'string' ||
+      !VALID_GRENADE_EVENT_KINDS.has(kind as GameGrenadeEventKind) ||
+      !isTacticalEquipmentId(parsed.equipmentId) ||
+      !isFiniteCoord(parsed.px) ||
+      !isFiniteCoord(parsed.py) ||
+      !isFiniteCoord(parsed.pz)
+    ) {
+      return null;
+    }
+    if (isBot) {
+      const cleanBotId = String(parsed.actorId ?? '').trim().slice(0, 40);
+      if (!cleanBotId) return null;
+      safePayload.actorId = cleanBotId;
+      safePayload.isBot = true;
+      safePayload.team =
+        parsed.team === 'A' || parsed.team === 'B' || parsed.team === 'FFA'
+          ? parsed.team
+          : 'FFA';
+    } else {
+      safePayload.actorId = sender.userId;
+      safePayload.isBot = false;
+      safePayload.team = senderMember.team;
+    }
+    safePayload.kind = kind;
+    safePayload.equipmentId = parsed.equipmentId;
+    safePayload.px = Number(parsed.px.toFixed(3));
+    safePayload.py = Number(parsed.py.toFixed(3));
+    safePayload.pz = Number(parsed.pz.toFixed(3));
+    if (
+      isFiniteCoord(parsed.vx, 80) &&
+      isFiniteCoord(parsed.vy, 80) &&
+      isFiniteCoord(parsed.vz, 80)
+    ) {
+      safePayload.vx = Number(parsed.vx.toFixed(3));
+      safePayload.vy = Number(parsed.vy.toFixed(3));
+      safePayload.vz = Number(parsed.vz.toFixed(3));
+    } else {
+      delete safePayload.vx;
+      delete safePayload.vy;
+      delete safePayload.vz;
+    }
+    if (parsed.fuseRemainingSec !== undefined) {
+      safePayload.fuseRemainingSec = Number(
+        clampFinite(parsed.fuseRemainingSec, 0, 30, 3.8).toFixed(3),
+      );
+    } else {
+      delete safePayload.fuseRemainingSec;
     }
   }
 

@@ -37,6 +37,14 @@ export interface FlashbangExposureResult {
   occluded: boolean;
 }
 
+export interface GrenadeRemoteAttribution {
+  isRemote?: boolean;
+  sourceId?: string;
+  sourceName?: string;
+  sourceTeam?: 'A' | 'B' | 'FFA';
+  sourceIsBot?: boolean;
+}
+
 export interface GrenadeDetonationEvent {
   equipmentId: TacticalEquipmentId;
   def: TacticalEquipmentDef;
@@ -47,6 +55,36 @@ export interface GrenadeDetonationEvent {
   maxDamage: number;
   isTick: boolean;
   tickDtSec?: number;
+  isRemote?: boolean;
+  sourceId?: string;
+  sourceName?: string;
+  sourceTeam?: 'A' | 'B' | 'FFA';
+  sourceIsBot?: boolean;
+}
+
+export type GrenadePinPullPhase =
+  | 'NONE'
+  | 'REACH_PIN'
+  | 'PULL_PIN'
+  | 'TUCK_POCKET'
+  | 'EYE_AIM';
+
+export type GrenadeThrowStyle = 'overhand' | 'underhand';
+
+export interface PendingGrenadeRelease {
+  equipmentId: TacticalEquipmentId;
+  style: GrenadeThrowStyle;
+  speedMps: number;
+  charge01: number;
+}
+
+export interface LaunchedGrenadeInfo {
+  equipmentId: TacticalEquipmentId;
+  style: GrenadeThrowStyle;
+  speedMps: number;
+  origin: THREE.Vector3;
+  velocity: THREE.Vector3;
+  fuseRemainingSec: number;
 }
 
 export interface TacticalGrenadeSystemOptions {
@@ -61,6 +99,7 @@ export interface TacticalGrenadeSystemOptions {
   };
   audio?: IBodycamAudioSource | null;
   onDetonate?: (ev: GrenadeDetonationEvent) => void;
+  onInHandDetonate?: (ev: GrenadeDetonationEvent) => void;
   onShatterGlass?: (
     object: THREE.Object3D,
     impactPoint: Readonly<THREE.Vector3>,
@@ -79,6 +118,7 @@ interface ActiveGrenade {
   age: number;
   bounces: number;
   resting: boolean;
+  meta?: GrenadeRemoteAttribution;
 }
 
 interface FlyingSpoon {
@@ -150,6 +190,7 @@ interface ThermiteZone {
   age: number;
   duration: number;
   tickAccum: number;
+  meta?: GrenadeRemoteAttribution;
 }
 
 const GRAVITY_MPS2 = 14.2;
@@ -195,6 +236,7 @@ export class TacticalGrenadeSystem {
   private readonly worldBounds: { minX: number; maxX: number; minZ: number; maxZ: number };
   private readonly audio?: IBodycamAudioSource | null;
   private readonly onDetonate?: (ev: GrenadeDetonationEvent) => void;
+  private readonly onInHandDetonate?: (ev: GrenadeDetonationEvent) => void;
   private readonly onShatterGlass?: TacticalGrenadeSystemOptions['onShatterGlass'];
 
   private readonly activeGrenades: ActiveGrenade[] = [];
@@ -215,19 +257,33 @@ export class TacticalGrenadeSystem {
   private readonly geoSpoonProp: THREE.BoxGeometry;
   private readonly matSpoonProp: THREE.MeshStandardMaterial;
 
-  // 4-stage held grenade Manual of Arms FSM
+  // 4-stage held grenade Manual of Arms FSM (bone-attached, zero floating camera viewmodel)
   private holdStage: GrenadeHoldStage = 'HOLSTERED';
   private heldEquipmentId: TacticalEquipmentId | null = null;
   private fuseElapsed = 0;
   private actualFuseSec = 4.5;
   private nominalFuseSec = 4.5;
-  private heldViewmodelGroup: THREE.Group | null = null;
-  private heldViewmodelBuilt: BuiltTacticalEquipmentMesh | null = null;
-  private heldViewmodelEquipmentId: TacticalEquipmentId | null = null;
-  private viewmodelParentCamera: THREE.Camera | null = null;
-  private viewmodelBobTime = 0;
-  private pinPullAnim = 0;
-  private leverSnapAnim = 0;
+  private heldBoneBuilt: BuiltTacticalEquipmentMesh | null = null;
+  private heldBoneEquipmentId: TacticalEquipmentId | null = null;
+  private heldBoneLayer = VIEWMODEL_LAYER;
+  private heldBoneRingAttachedTo: THREE.Object3D | null = null;
+  private lastThrowHandSocket: THREE.Object3D | null = null;
+  private weaponStowBlend = 0;
+  private pinPullPhase: GrenadePinPullPhase = 'NONE';
+  private pinPullElapsed = 0;
+
+  // Seamless LMB click-lob (<0.18s) vs hold-charge (>=0.18s) + release whip state
+  private lmbHeld = false;
+  private lmbHoldSec = 0;
+  private charge01 = 0;
+  private throwStyle: GrenadeThrowStyle = 'underhand';
+  private pendingThrowRelease: PendingGrenadeRelease | null = null;
+  private throwWhipTimer = 0;
+  private throwWhipDuration = 0.16;
+  private throwWhipStyle: GrenadeThrowStyle = 'overhand';
+  private spoonPopAnim = 0;
+  private animTime = 0;
+  private lastLaunchedThrow: LaunchedGrenadeInfo | null = null;
 
   // Pre-allocated scratch buffers (zero-GC)
   private readonly _raycaster = new THREE.Raycaster();
@@ -239,11 +295,11 @@ export class TacticalGrenadeSystem {
   private readonly _segVec = new THREE.Vector3();
   private readonly _toCenter = new THREE.Vector3();
   private readonly _closestPt = new THREE.Vector3();
-  private readonly _camPos = new THREE.Vector3();
-  private readonly _camQuat = new THREE.Quaternion();
-  private readonly _camRight = new THREE.Vector3();
-  private readonly _camUp = new THREE.Vector3();
-  private readonly _camFwd = new THREE.Vector3();
+  private readonly _spoonPos = new THREE.Vector3();
+  private readonly _spoonQuat = new THREE.Quaternion();
+  private readonly _spoonRight = new THREE.Vector3();
+  private readonly _spoonUp = new THREE.Vector3();
+  private readonly _spoonFwd = new THREE.Vector3();
   private readonly _smokeInfoBuf: ActiveSmokeCloudInfo[] = [];
   private readonly _sparkDummy = new THREE.Object3D();
   private readonly _sparkLookTarget = new THREE.Vector3();
@@ -256,6 +312,7 @@ export class TacticalGrenadeSystem {
     this.worldBounds = opts.worldBounds ?? { minX: -96, maxX: 96, minZ: -96, maxZ: 96 };
     this.audio = opts.audio;
     this.onDetonate = opts.onDetonate;
+    this.onInHandDetonate = opts.onInHandDetonate;
     this.onShatterGlass = opts.onShatterGlass;
 
     this.root.name = 'tactical_grenade_system';
@@ -480,57 +537,122 @@ export class TacticalGrenadeSystem {
     return m;
   }
 
-  /**
-   * Attaches a VIEWMODEL_LAYER foreground mount to the active FPS camera so the held grenade,
-   * safety pin removal, and flying spoon are clearly visible during the 4-stage sequence.
-   */
-  public attachViewmodelCamera(camera: THREE.Camera): void {
-    if (this.viewmodelParentCamera === camera && this.heldViewmodelGroup) return;
-    this.detachViewmodelCamera();
-    this.viewmodelParentCamera = camera;
-    this.heldViewmodelGroup = new THREE.Group();
-    this.heldViewmodelGroup.name = 'held_grenade_viewmodel';
-    this.heldViewmodelGroup.visible = false;
-    this.heldViewmodelGroup.layers.set(VIEWMODEL_LAYER);
-    camera.add(this.heldViewmodelGroup);
-    if (this.heldEquipmentId && this.holdStage !== 'HOLSTERED') {
-      this.syncHeldViewmodelMesh(this.heldEquipmentId);
-    }
-  }
-
-  private detachViewmodelCamera(): void {
-    if (this.heldViewmodelBuilt && this.heldViewmodelGroup) {
-      this.heldViewmodelGroup.remove(this.heldViewmodelBuilt.group);
-      this.heldViewmodelBuilt.dispose();
-      this.heldViewmodelBuilt = null;
-      this.heldViewmodelEquipmentId = null;
-    }
-    if (this.heldViewmodelGroup && this.viewmodelParentCamera) {
-      this.viewmodelParentCamera.remove(this.heldViewmodelGroup);
-    }
-    this.heldViewmodelGroup = null;
-    this.viewmodelParentCamera = null;
-  }
-
-  private syncHeldViewmodelMesh(equipmentId: TacticalEquipmentId): void {
-    if (!this.heldViewmodelGroup) return;
-    if (this.heldViewmodelEquipmentId !== equipmentId || !this.heldViewmodelBuilt) {
-      if (this.heldViewmodelBuilt) {
-        this.heldViewmodelGroup.remove(this.heldViewmodelBuilt.group);
-        this.heldViewmodelBuilt.dispose();
+  private disposeHeldBoneMesh(): void {
+    if (this.heldBoneBuilt) {
+      if (this.heldBoneBuilt.pullRingMesh.parent) {
+        this.heldBoneBuilt.pullRingMesh.parent.remove(this.heldBoneBuilt.pullRingMesh);
       }
-      this.heldViewmodelBuilt = buildTacticalEquipmentMesh(equipmentId, {
-        withBeltClip: false,
-        scale: 1.45,
-        renderLayer: VIEWMODEL_LAYER,
-      });
-      this.heldViewmodelEquipmentId = equipmentId;
-      this.heldViewmodelGroup.add(this.heldViewmodelBuilt.group);
+      if (this.heldBoneBuilt.group.parent) {
+        this.heldBoneBuilt.group.parent.remove(this.heldBoneBuilt.group);
+      }
+      this.heldBoneBuilt.dispose();
+      this.heldBoneBuilt = null;
+      this.heldBoneEquipmentId = null;
+      this.heldBoneRingAttachedTo = null;
     }
-    const built = this.heldViewmodelBuilt;
-    built.pullRingMesh.visible = this.holdStage === 'DRAWN';
+  }
+
+  private ensureHeldBoneMesh(
+    equipmentId: TacticalEquipmentId,
+    throwHandSocket: THREE.Object3D,
+    renderLayer = VIEWMODEL_LAYER,
+  ): BuiltTacticalEquipmentMesh {
+    this.lastThrowHandSocket = throwHandSocket;
+    if (
+      !this.heldBoneBuilt ||
+      this.heldBoneEquipmentId !== equipmentId ||
+      this.heldBoneLayer !== renderLayer
+    ) {
+      this.disposeHeldBoneMesh();
+      this.heldBoneLayer = renderLayer;
+      this.heldBoneBuilt = buildTacticalEquipmentMesh(equipmentId, {
+        withBeltClip: false,
+        scale: 1.0,
+        renderLayer,
+      });
+      this.heldBoneEquipmentId = equipmentId;
+      this.heldBoneBuilt.group.position.copy(this.heldBoneBuilt.gripOffset.position);
+      this.heldBoneBuilt.group.rotation.copy(this.heldBoneBuilt.gripOffset.rotation);
+      throwHandSocket.add(this.heldBoneBuilt.group);
+      this.heldBoneRingAttachedTo = this.heldBoneBuilt.group;
+    } else if (this.heldBoneBuilt.group.parent !== throwHandSocket) {
+      throwHandSocket.add(this.heldBoneBuilt.group);
+    }
+    return this.heldBoneBuilt;
+  }
+
+  /**
+   * Synchronizes the physically attached ordnance inside the right palm socket (`throwHandSocket`),
+   * plus dynamic `.attach()` transfer of `pullRingMesh` onto `leftPinPinchSocket` during PULL_PIN
+   * and stowing inside `leftPocketAnchor` during TUCK_POCKET.
+   */
+  public syncHeldBoneAttachment(
+    throwHandSocket: THREE.Object3D,
+    leftPinPinchSocket: THREE.Object3D,
+    leftPocketAnchor: THREE.Object3D,
+    renderLayer = VIEWMODEL_LAYER,
+  ): void {
+    this.lastThrowHandSocket = throwHandSocket;
+    if (this.holdStage === 'HOLSTERED' || !this.heldEquipmentId) {
+      if (this.heldBoneBuilt) {
+        this.heldBoneBuilt.group.visible = false;
+        this.heldBoneBuilt.pullRingMesh.visible = false;
+      }
+      return;
+    }
+
+    const built = this.ensureHeldBoneMesh(this.heldEquipmentId, throwHandSocket, renderLayer);
+    const grenadeReadyInPalm = this.weaponStowBlend >= 0.45 && !this.pendingThrowRelease;
+    built.group.visible = grenadeReadyInPalm;
     built.spoonGroup.visible = this.holdStage !== 'LEVER_RELEASED';
-    this.heldViewmodelGroup.visible = this.holdStage !== 'HOLSTERED';
+
+    if (this.holdStage === 'DRAWN' || this.pinPullPhase === 'REACH_PIN') {
+      if (this.heldBoneRingAttachedTo !== built.group) {
+        built.group.add(built.pullRingMesh);
+        // Reset back to grenade collar resting coordinates
+        const fuzeY =
+          this.heldEquipmentId === 'm67_frag'
+            ? 0.052
+            : this.heldEquipmentId === 'm84_flash'
+              ? 0.068
+              : this.heldEquipmentId === 'm18_smoke'
+                ? 0.07
+                : 0.072;
+        built.pullRingMesh.position.set(-0.017, fuzeY - 0.002, 0.008);
+        built.pullRingMesh.rotation.set(0, 0.42, 0);
+        built.pullRingMesh.scale.setScalar(1);
+        this.heldBoneRingAttachedTo = built.group;
+      }
+      built.pullRingMesh.visible = grenadeReadyInPalm;
+    } else if (this.pinPullPhase === 'PULL_PIN') {
+      if (this.heldBoneRingAttachedTo !== leftPinPinchSocket) {
+        leftPinPinchSocket.attach(built.pullRingMesh);
+        this.heldBoneRingAttachedTo = leftPinPinchSocket;
+      }
+      built.pullRingMesh.visible = grenadeReadyInPalm;
+    } else if (this.pinPullPhase === 'TUCK_POCKET') {
+      if (this.heldBoneRingAttachedTo !== leftPocketAnchor && this.pinPullElapsed >= 0.48) {
+        leftPocketAnchor.attach(built.pullRingMesh);
+        this.heldBoneRingAttachedTo = leftPocketAnchor;
+      }
+      built.pullRingMesh.visible = grenadeReadyInPalm && this.pinPullElapsed < 0.50;
+    } else {
+      if (this.heldBoneRingAttachedTo && this.heldBoneRingAttachedTo !== leftPocketAnchor) {
+        leftPocketAnchor.attach(built.pullRingMesh);
+        this.heldBoneRingAttachedTo = leftPocketAnchor;
+      }
+      built.pullRingMesh.visible = false;
+    }
+  }
+
+  public consumeLastLaunchedThrow(): LaunchedGrenadeInfo | null {
+    const out = this.lastLaunchedThrow;
+    this.lastLaunchedThrow = null;
+    return out;
+  }
+
+  public getHeldGrenadeMesh(): BuiltTacticalEquipmentMesh | null {
+    return this.heldBoneBuilt;
   }
 
   public setWorldRaycastMeshes(meshes: THREE.Object3D[]): void {
@@ -558,10 +680,59 @@ export class TacticalGrenadeSystem {
     return this.holdStage === 'PIN_PULLED' || this.holdStage === 'LEVER_RELEASED';
   }
 
+  public getWeaponStowBlend(): number {
+    return this.weaponStowBlend;
+  }
+
+  public isWeaponHidden(): boolean {
+    return this.weaponStowBlend > 0.92;
+  }
+
+  public getPinPullPhase(): GrenadePinPullPhase {
+    return this.pinPullPhase;
+  }
+
+  public getPinPullElapsed(): number {
+    return this.pinPullElapsed;
+  }
+
+  public getCharge01(): number {
+    return this.charge01;
+  }
+
+  public isThrowInputHeld(): boolean {
+    return this.lmbHeld;
+  }
+
+  public getThrowStyle(): GrenadeThrowStyle {
+    return this.pendingThrowRelease?.style ?? (this.throwWhipTimer > 0 ? this.throwWhipStyle : this.throwStyle);
+  }
+
+  public getThrowWhipProgress(): number {
+    if (this.throwWhipTimer <= 0 || this.throwWhipDuration <= 0) return 0;
+    return THREE.MathUtils.clamp(1 - this.throwWhipTimer / this.throwWhipDuration, 0, 1);
+  }
+
+  public isThrowing(): boolean {
+    return this.lmbHeld || this.throwWhipTimer > 0 || this.pendingThrowRelease !== null;
+  }
+
+  public getActionStatusLabel(): string {
+    if (this.holdStage === 'HOLSTERED') return '';
+    if (this.holdStage === 'DRAWN') return '[RMB] Pull Pin';
+    if (this.holdStage === 'PIN_PULLED') {
+      return this.lmbHeld && this.throwStyle === 'overhand'
+        ? 'Release [LMB] Overhand Throw'
+        : '[RMB] Release Spoon · [LMB] Click Lob / Hold Throw';
+    }
+    return this.lmbHeld && this.throwStyle === 'overhand'
+      ? 'LIVE FUSE — Release [LMB] Throw'
+      : 'LIVE FUSE — [LMB] Click Lob / Hold Throw';
+  }
+
   /**
    * Returns 0..1 progress of the *nominal* fuse only while the safety lever has been released.
-   * Because the real delay has hidden chemical variance, the HUD bar intentionally reflects
-   * nominal burn time rather than guaranteeing an exact millisecond detonation!
+   * Exposed strictly for telemetry/audio/vfx/tests — NOT rendered as any HUD throw power bar.
    */
   public getCookRatio(): number {
     if (this.holdStage !== 'LEVER_RELEASED' || this.nominalFuseSec <= 0.01) return 0;
@@ -581,16 +752,22 @@ export class TacticalGrenadeSystem {
     this.fuseElapsed = 0;
     this.nominalFuseSec = def.fuseSec;
     this.actualFuseSec = samplePyrotechnicFuseSec(def);
-    this.pinPullAnim = 0;
-    this.leverSnapAnim = 0;
-    this.syncHeldViewmodelMesh(def.id);
+    this.pinPullPhase = 'NONE';
+    this.pinPullElapsed = 0;
+    this.lmbHeld = false;
+    this.lmbHoldSec = 0;
+    this.charge01 = 0;
+    this.pendingThrowRelease = null;
+    this.throwWhipTimer = 0;
+    this.spoonPopAnim = 0;
     this.audio?.playGearRattle('weapon_swap', 0.58);
     return true;
   }
 
   /**
-   * Stage 2: Pull safety pin (LMB hold).
-   * Physically yanks the cotter pin ring — DOES NOT ignite the chemical delay fuse while spoon is gripped!
+   * Stage 2 (1st RMB): Pull safety pin.
+   * Left hand reaches to live pinAnchor, pinches & pulls along pinPullAxis, and tucks into left pocket
+   * (pin never drops), while right palm keeps spoon compressed so the fuse remains STOPPED.
    */
   public pullPin(equipmentId?: TacticalEquipmentId): boolean {
     const targetId = equipmentId ?? this.heldEquipmentId;
@@ -602,16 +779,16 @@ export class TacticalGrenadeSystem {
     this.fuseElapsed = 0;
     this.nominalFuseSec = def.fuseSec;
     this.actualFuseSec = samplePyrotechnicFuseSec(def);
-    this.pinPullAnim = 1.0;
-    this.syncHeldViewmodelMesh(def.id);
+    this.pinPullPhase = 'REACH_PIN';
+    this.pinPullElapsed = 0;
     this.audio?.playGrenadePinPull?.();
     return true;
   }
 
   /**
-   * Stage 3: Release safety lever / spoon (RMB while holding LMB after pulling pin).
-   * Spring-loaded spoon flies off physically, striker snaps the primer, and the hidden
-   * 4.0-5.0s chemical delay fuse begins burning!
+   * Stage 3 (2nd RMB): Release safety lever / spoon while keeping hold of body.
+   * Spring-loaded spoon flies off physically from live spoonAnchor, striker snaps primer,
+   * and hidden-variance chemical delay fuse begins burning live!
    */
   public releaseLever(
     spoonOrigin?: Readonly<THREE.Vector3>,
@@ -625,22 +802,100 @@ export class TacticalGrenadeSystem {
     this.fuseElapsed = 0;
     this.nominalFuseSec = def.fuseSec;
     this.actualFuseSec = samplePyrotechnicFuseSec(def);
-    this.leverSnapAnim = 1.0;
-    this.syncHeldViewmodelMesh(def.id);
+    this.spoonPopAnim = 1.0;
+    if (this.pinPullPhase === 'REACH_PIN' || this.pinPullPhase === 'PULL_PIN') {
+      this.pinPullPhase = 'EYE_AIM';
+    }
     this.audio?.playGrenadeLeverSnap?.();
-    this.spawnFlyingSpoon(spoonOrigin, spoonRight, spoonUp, spoonFwd);
+    this.spawnSpoonFromAnchorOrPose(spoonOrigin, spoonRight, spoonUp, spoonFwd);
     return true;
   }
 
   /**
-   * Stage 4: Throw held grenade (LMB release).
-   * If still in `PIN_PULLED`, throwing automatically releases the safety lever in mid-air
-   * with spoon fly-off + primer snap and full pyrotechnic delay.
+   * Stage 4a (LMB down): Begins unified quick-lob vs hold-charge input when pin has been pulled.
    */
-  public throwHeldGrenade(
+  public beginThrowInput(): boolean {
+    if (this.holdStage !== 'PIN_PULLED' && this.holdStage !== 'LEVER_RELEASED') return false;
+    if (this.lmbHeld || this.pendingThrowRelease || this.throwWhipTimer > 0) return false;
+    this.lmbHeld = true;
+    this.lmbHoldSec = 0;
+    this.charge01 = 0;
+    this.throwStyle = 'underhand';
+    return true;
+  }
+
+  /**
+   * Stage 4b (LMB up): Commits either seamless Underhand Lob (<0.18s) or Overhand Power Charge (>=0.18s).
+   * Returns the resolved throw style so callers/UI/sync can mirror immediately, while actual projectile
+   * release occurs right after right-arm whip + updateWorldMatrix(true, false).
+   */
+  public releaseThrowInput(): GrenadeThrowStyle | null {
+    if (!this.lmbHeld || !this.heldEquipmentId) {
+      this.lmbHeld = false;
+      this.lmbHoldSec = 0;
+      this.charge01 = 0;
+      return null;
+    }
+    const style: GrenadeThrowStyle = this.lmbHoldSec < 0.18 ? 'underhand' : 'overhand';
+    const speedMps =
+      style === 'underhand'
+        ? 10.0
+        : THREE.MathUtils.lerp(13.5, 22.5, THREE.MathUtils.clamp(this.charge01, 0, 1));
+
+    this.pendingThrowRelease = {
+      equipmentId: this.heldEquipmentId,
+      style,
+      speedMps,
+      charge01: this.charge01,
+    };
+    this.throwStyle = style;
+    this.throwWhipStyle = style;
+    this.throwWhipDuration = style === 'overhand' ? 0.14 : 0.16;
+    this.throwWhipTimer = this.throwWhipDuration;
+    this.lmbHeld = false;
+    this.lmbHoldSec = 0;
+    return style;
+  }
+
+  /** Resets held LMB charge safely on pointer-unlock or window blur without accidental release. */
+  public resetHeldInputOnFocusLoss(): void {
+    this.lmbHeld = false;
+    this.lmbHoldSec = 0;
+    this.charge01 = 0;
+    this.throwStyle = 'underhand';
+  }
+
+  /**
+   * Called by CharacterAnimator immediately after right-arm IK solve + `updateWorldMatrix(true, false)`
+   * so projectile spawn position/velocity matches exact live bone world transform!
+   */
+  public consumePendingThrowRelease(
+    boneWorldPos: Readonly<THREE.Vector3>,
+    aimForward: Readonly<THREE.Vector3>,
+    inheritedVel?: Readonly<THREE.Vector3>,
+  ): { thrown: boolean; style: GrenadeThrowStyle; speedMps: number } | null {
+    if (!this.pendingThrowRelease) return null;
+    if (this.getThrowWhipProgress() < 0.24) return null;
+
+    const pending = this.pendingThrowRelease;
+    this.pendingThrowRelease = null;
+    const thrown = this.throwHeldGrenadeWithSpeed(
+      boneWorldPos,
+      aimForward,
+      inheritedVel,
+      pending.speedMps,
+      pending.style,
+      pending.equipmentId,
+    );
+    return { thrown, style: pending.style, speedMps: pending.speedMps };
+  }
+
+  public throwHeldGrenadeWithSpeed(
     origin: Readonly<THREE.Vector3>,
     forward: Readonly<THREE.Vector3>,
-    inheritedVel?: Readonly<THREE.Vector3>,
+    inheritedVel: Readonly<THREE.Vector3> | undefined,
+    speedMps: number,
+    style: GrenadeThrowStyle = 'overhand',
     forceEquipmentId?: TacticalEquipmentId,
   ): boolean {
     const id = forceEquipmentId ?? this.heldEquipmentId;
@@ -654,18 +909,40 @@ export class TacticalGrenadeSystem {
       // Safety lever releases automatically upon throw -> spoon pings off & ignites full delay
       remainingFuse = samplePyrotechnicFuseSec(def);
       this.audio?.playGrenadeLeverSnap?.();
-      this.spawnFlyingSpoon(origin, undefined, undefined, forward);
+      this.spawnSpoonFromAnchorOrPose(origin, undefined, undefined, forward);
     }
 
     this.holdStage = 'HOLSTERED';
     this.heldEquipmentId = null;
     this.fuseElapsed = 0;
-    if (this.heldViewmodelGroup) {
-      this.heldViewmodelGroup.visible = false;
+    this.pinPullPhase = 'NONE';
+    this.pinPullElapsed = 0;
+    this.lmbHeld = false;
+    this.lmbHoldSec = 0;
+    this.charge01 = 0;
+    this.pendingThrowRelease = null;
+    if (this.heldBoneBuilt) {
+      this.heldBoneBuilt.group.visible = false;
+      this.heldBoneBuilt.pullRingMesh.visible = false;
     }
 
-    this.spawnProjectile(def, origin, forward, inheritedVel, remainingFuse);
+    this.spawnProjectile(def, origin, forward, inheritedVel, remainingFuse, speedMps, style);
     return true;
+  }
+
+  /**
+   * Stage 4: Throw held grenade using catalog default throw speed (used by backward-compatible callers/tests).
+   */
+  public throwHeldGrenade(
+    origin: Readonly<THREE.Vector3>,
+    forward: Readonly<THREE.Vector3>,
+    inheritedVel?: Readonly<THREE.Vector3>,
+    forceEquipmentId?: TacticalEquipmentId,
+  ): boolean {
+    const id = forceEquipmentId ?? this.heldEquipmentId;
+    if (!id) return false;
+    const def = getTacticalEquipmentDef(id);
+    return this.throwHeldGrenadeWithSpeed(origin, forward, inheritedVel, def.throwSpeedMps, 'overhand', id);
   }
 
   /**
@@ -680,7 +957,7 @@ export class TacticalGrenadeSystem {
   ): 'holstered' | 'tossed' | 'none' {
     if (this.holdStage === 'HOLSTERED') return 'none';
     if (this.holdStage === 'LEVER_RELEASED') {
-      this.throwHeldGrenade(origin, forward, inheritedVel);
+      this.throwHeldGrenadeWithSpeed(origin, forward, inheritedVel, 10.5, 'underhand');
       return 'tossed';
     }
     this.cancelCook();
@@ -696,8 +973,16 @@ export class TacticalGrenadeSystem {
     this.holdStage = 'HOLSTERED';
     this.heldEquipmentId = null;
     this.fuseElapsed = 0;
-    if (this.heldViewmodelGroup) {
-      this.heldViewmodelGroup.visible = false;
+    this.pinPullPhase = 'NONE';
+    this.pinPullElapsed = 0;
+    this.lmbHeld = false;
+    this.lmbHoldSec = 0;
+    this.charge01 = 0;
+    this.pendingThrowRelease = null;
+    this.throwWhipTimer = 0;
+    if (this.heldBoneBuilt) {
+      this.heldBoneBuilt.group.visible = false;
+      this.heldBoneBuilt.pullRingMesh.visible = false;
     }
   }
 
@@ -711,39 +996,117 @@ export class TacticalGrenadeSystem {
     return this.throwHeldGrenade(origin, forward, inheritedVel, forceEquipmentId);
   }
 
+  /**
+   * Spawns a live projectile for a remote MP player or host-authoritative AI bot.
+   */
+  public spawnRemoteGrenade(
+    equipmentId: TacticalEquipmentId,
+    position: Readonly<THREE.Vector3>,
+    velocity: Readonly<THREE.Vector3>,
+    fuseRemainingSec: number,
+    meta?: GrenadeRemoteAttribution,
+  ): void {
+    const def = getTacticalEquipmentDef(equipmentId);
+    const built = buildTacticalEquipmentMesh(def.id, { withBeltClip: false, scale: 1.05 });
+    built.pullRingMesh.visible = false;
+    built.spoonGroup.visible = false;
+    built.group.position.copy(position);
+    built.group.rotation.set(Math.random() * 2, Math.random() * 2, Math.random() * 2);
+    this.root.add(built.group);
+
+    this.activeGrenades.push({
+      equipmentId: def.id,
+      def,
+      built,
+      pos: position.clone(),
+      vel: velocity.clone(),
+      rotVel: new THREE.Vector3(
+        (Math.random() - 0.5) * 14 + 6,
+        (Math.random() - 0.5) * 11,
+        (Math.random() - 0.5) * 13,
+      ),
+      fuseLeft: Math.max(0.06, fuseRemainingSec),
+      age: 0,
+      bounces: 0,
+      resting: false,
+      meta: meta ? { isRemote: true, ...meta } : { isRemote: true },
+    });
+  }
+
+  public spawnRemoteFlyingSpoon(
+    origin: Readonly<THREE.Vector3>,
+    forward?: Readonly<THREE.Vector3>,
+  ): void {
+    this._spoonFwd.copy(forward ?? new THREE.Vector3(0, 0, -1)).normalize();
+    this._spoonUp.set(0, 1, 0);
+    this._spoonRight.crossVectors(this._spoonFwd, this._spoonUp).normalize();
+    this.spawnFlyingSpoon(origin, this._spoonRight, this._spoonUp, this._spoonFwd);
+  }
+
+  public triggerRemoteDetonation(
+    equipmentId: TacticalEquipmentId,
+    position: Readonly<THREE.Vector3>,
+    meta?: GrenadeRemoteAttribution,
+  ): void {
+    const def = getTacticalEquipmentDef(equipmentId);
+    this.detonateAt(def, position.clone(), meta ? { isRemote: true, ...meta } : { isRemote: true });
+  }
+
+  private spawnSpoonFromAnchorOrPose(
+    fallbackOrigin?: Readonly<THREE.Vector3>,
+    fallbackRight?: Readonly<THREE.Vector3>,
+    fallbackUp?: Readonly<THREE.Vector3>,
+    fallbackFwd?: Readonly<THREE.Vector3>,
+  ): void {
+    if (this.heldBoneBuilt && this.heldBoneBuilt.spoonAnchor) {
+      this.heldBoneBuilt.spoonAnchor.updateWorldMatrix(true, false);
+      this.heldBoneBuilt.spoonAnchor.getWorldPosition(this._spoonPos);
+      this.heldBoneBuilt.spoonAnchor.getWorldQuaternion(this._spoonQuat);
+      this._spoonRight.set(1, 0, 0).applyQuaternion(this._spoonQuat).normalize();
+      this._spoonUp.set(0, 1, 0).applyQuaternion(this._spoonQuat).normalize();
+      this._spoonFwd.set(0, 0, -1).applyQuaternion(this._spoonQuat).normalize();
+      this.spawnFlyingSpoon(this._spoonPos, this._spoonRight, this._spoonUp, this._spoonFwd, true);
+      return;
+    }
+    if (fallbackOrigin) {
+      this._spoonPos.copy(fallbackOrigin);
+      this._spoonFwd.copy(fallbackFwd ?? new THREE.Vector3(0, 0, -1)).normalize();
+      this._spoonUp.copy(fallbackUp ?? new THREE.Vector3(0, 1, 0)).normalize();
+      this._spoonRight.copy(
+        fallbackRight ?? new THREE.Vector3().crossVectors(this._spoonFwd, this._spoonUp).normalize(),
+      );
+      this.spawnFlyingSpoon(this._spoonPos, this._spoonRight, this._spoonUp, this._spoonFwd, false);
+    }
+  }
+
   private spawnFlyingSpoon(
-    origin?: Readonly<THREE.Vector3>,
+    origin: Readonly<THREE.Vector3>,
     right?: Readonly<THREE.Vector3>,
     up?: Readonly<THREE.Vector3>,
     fwd?: Readonly<THREE.Vector3>,
+    exactOrigin = false,
   ): void {
-    if (!origin && this.viewmodelParentCamera) {
-      this.viewmodelParentCamera.getWorldPosition(this._camPos);
-      this.viewmodelParentCamera.getWorldQuaternion(this._camQuat);
-      this._camRight.set(1, 0, 0).applyQuaternion(this._camQuat).normalize();
-      this._camUp.set(0, 1, 0).applyQuaternion(this._camQuat).normalize();
-      this._camFwd.set(0, 0, -1).applyQuaternion(this._camQuat).normalize();
-    } else if (origin) {
-      this._camPos.copy(origin);
-      this._camFwd.copy(fwd ?? new THREE.Vector3(0, 0, -1)).normalize();
-      this._camUp.copy(up ?? new THREE.Vector3(0, 1, 0)).normalize();
-      this._camRight.copy(right ?? new THREE.Vector3().crossVectors(this._camFwd, this._camUp).normalize());
-    } else {
-      return;
-    }
+    this._spoonPos.copy(origin);
+    this._spoonFwd.copy(fwd ?? new THREE.Vector3(0, 0, -1)).normalize();
+    this._spoonUp.copy(up ?? new THREE.Vector3(0, 1, 0)).normalize();
+    this._spoonRight.copy(right ?? new THREE.Vector3().crossVectors(this._spoonFwd, this._spoonUp).normalize());
 
     const mesh = new THREE.Mesh(this.geoSpoonProp, this.matSpoonProp);
-    mesh.position
-      .copy(this._camPos)
-      .addScaledVector(this._camFwd, 0.34)
-      .addScaledVector(this._camRight, 0.14)
-      .addScaledVector(this._camUp, -0.08);
+    if (exactOrigin) {
+      mesh.position.copy(this._spoonPos);
+    } else {
+      mesh.position
+        .copy(this._spoonPos)
+        .addScaledVector(this._spoonFwd, 0.24)
+        .addScaledVector(this._spoonRight, 0.12)
+        .addScaledVector(this._spoonUp, 0.04);
+    }
     this.root.add(mesh);
 
     const vel = new THREE.Vector3()
-      .addScaledVector(this._camRight, 2.2 + Math.random() * 1.1)
-      .addScaledVector(this._camUp, 2.4 + Math.random() * 0.9)
-      .addScaledVector(this._camFwd, 1.3 + Math.random() * 0.8);
+      .addScaledVector(this._spoonRight, 2.2 + Math.random() * 1.1)
+      .addScaledVector(this._spoonUp, 2.5 + Math.random() * 0.9)
+      .addScaledVector(this._spoonFwd, 1.2 + Math.random() * 0.8);
 
     this.flyingSpoons.push({
       mesh,
@@ -760,24 +1123,26 @@ export class TacticalGrenadeSystem {
     forward: Readonly<THREE.Vector3>,
     inheritedVel: Readonly<THREE.Vector3> | undefined,
     fuseSec: number,
+    speedMps: number = def.throwSpeedMps,
+    style: GrenadeThrowStyle = 'overhand',
   ): void {
     const built = buildTacticalEquipmentMesh(def.id, { withBeltClip: false, scale: 1.05 });
     // Thrown grenade has pin & safety lever already detached
     built.pullRingMesh.visible = false;
     built.spoonGroup.visible = false;
 
-    const startPos = origin.clone().addScaledVector(forward, 0.42);
+    const dir = forward.clone().normalize();
+    const startPos = origin.clone().addScaledVector(dir, 0.08);
     built.group.position.copy(startPos);
     built.group.rotation.set(Math.random() * 2, Math.random() * 2, Math.random() * 2);
     this.root.add(built.group);
 
-    // Slight upward tactical lob arc
-    const vel = forward.clone().normalize().multiplyScalar(def.throwSpeedMps);
-    vel.y += 2.65;
+    const vel = dir.multiplyScalar(speedMps);
+    vel.y += style === 'underhand' ? 2.1 : 2.35;
     if (inheritedVel) {
-      vel.x += inheritedVel.x * 0.42;
-      vel.y += Math.max(0, inheritedVel.y) * 0.25;
-      vel.z += inheritedVel.z * 0.42;
+      vel.x += inheritedVel.x * 0.48;
+      vel.y += Math.max(0, inheritedVel.y) * 0.30;
+      vel.z += inheritedVel.z * 0.48;
     }
 
     this.activeGrenades.push({
@@ -796,6 +1161,15 @@ export class TacticalGrenadeSystem {
       bounces: 0,
       resting: false,
     });
+
+    this.lastLaunchedThrow = {
+      equipmentId: def.id,
+      style,
+      speedMps,
+      origin: startPos.clone(),
+      velocity: vel.clone(),
+      fuseRemainingSec: fuseSec,
+    };
   }
 
   /**
@@ -966,38 +1340,56 @@ export class TacticalGrenadeSystem {
   }
 
   /**
-   * Advances burning fuse (ONLY in LEVER_RELEASED stage), held viewmodel animation,
-   * flying spoons, projectile trajectories, explosions, smoke plumes, and thermite zones.
+   * Advances burning fuse (ONLY in LEVER_RELEASED stage), smooth weapon stow blend (0 <-> 1),
+   * pin-pull choreography phase, unified LMB hold charge, flying spoons, projectiles, and VFX pools.
    */
   public update(dt: number, cookOvercookOrigin?: Readonly<THREE.Vector3>): void {
     const clampedDt = Math.min(Math.max(dt, 0.0001), 0.05);
-    this.viewmodelBobTime += clampedDt;
+    this.animTime += clampedDt;
 
-    // 0. Animate held first-person grenade viewmodel on VIEWMODEL_LAYER
-    if (this.heldViewmodelGroup && this.heldViewmodelGroup.visible) {
-      this.pinPullAnim = Math.max(0, this.pinPullAnim - clampedDt * 5.2);
-      this.leverSnapAnim = Math.max(0, this.leverSnapAnim - clampedDt * 6.4);
-      const bobX = Math.sin(this.viewmodelBobTime * 2.1) * 0.004;
-      const bobY = Math.cos(this.viewmodelBobTime * 4.2) * 0.003;
-      const windupZ = this.holdStage === 'PIN_PULLED' ? 0.045 : this.holdStage === 'LEVER_RELEASED' ? 0.068 : 0;
-      const windupY = this.holdStage === 'LEVER_RELEASED' ? 0.025 : this.holdStage === 'PIN_PULLED' ? 0.012 : 0;
-      // Subtle tension tremor when live fuse is actively burning in hand!
-      const liveTremor =
-        this.holdStage === 'LEVER_RELEASED'
-          ? (Math.sin(this.viewmodelBobTime * 38) * 0.0018 + Math.cos(this.viewmodelBobTime * 53) * 0.0014) *
-            (0.4 + this.getCookRatio() * 0.9)
-          : 0;
+    // 0. Smooth weapon stow & return blend (0 -> 1 -> 0) + whip release progress
+    if (this.throwWhipTimer > 0) {
+      this.throwWhipTimer = Math.max(0, this.throwWhipTimer - clampedDt);
+    }
+    this.spoonPopAnim = Math.max(0, this.spoonPopAnim - clampedDt * 5.8);
 
-      this.heldViewmodelGroup.position.set(
-        0.165 + bobX + liveTremor - this.pinPullAnim * 0.02,
-        -0.145 + bobY + windupY + this.leverSnapAnim * 0.018,
-        -0.34 + windupZ,
-      );
-      this.heldViewmodelGroup.rotation.set(
-        0.18 + windupY * 2.4 + this.leverSnapAnim * 0.28,
-        -0.38 - this.pinPullAnim * 0.32,
-        0.16 + liveTremor * 14,
-      );
+    const wantsWeaponStowed =
+      this.holdStage !== 'HOLSTERED' || this.throwWhipTimer > 0 || this.pendingThrowRelease !== null;
+    if (wantsWeaponStowed) {
+      this.weaponStowBlend = Math.min(1, this.weaponStowBlend + clampedDt * 16.0);
+    } else {
+      this.weaponStowBlend = Math.max(0, this.weaponStowBlend - clampedDt * 11.0);
+    }
+
+    // 0b. Pin-pull choreography phase progression (REACH_PIN -> PULL_PIN -> TUCK_POCKET -> EYE_AIM)
+    if (this.holdStage === 'PIN_PULLED' || this.holdStage === 'LEVER_RELEASED') {
+      if (this.pinPullPhase !== 'EYE_AIM' && this.pinPullPhase !== 'NONE') {
+        this.pinPullElapsed += clampedDt;
+        if (this.pinPullElapsed < 0.16) {
+          this.pinPullPhase = 'REACH_PIN';
+        } else if (this.pinPullElapsed < 0.34) {
+          this.pinPullPhase = 'PULL_PIN';
+        } else if (this.pinPullElapsed < 0.56) {
+          this.pinPullPhase = 'TUCK_POCKET';
+        } else {
+          this.pinPullPhase = 'EYE_AIM';
+        }
+      }
+    } else {
+      this.pinPullPhase = 'NONE';
+      this.pinPullElapsed = 0;
+    }
+
+    // 0c. Seamless LMB click-lob (<0.18s) vs hold-charge (>=0.18s) accumulation
+    if (this.lmbHeld) {
+      this.lmbHoldSec += clampedDt;
+      if (this.lmbHoldSec < 0.18) {
+        this.throwStyle = 'underhand';
+        this.charge01 = 0;
+      } else {
+        this.throwStyle = 'overhand';
+        this.charge01 = THREE.MathUtils.clamp((this.lmbHoldSec - 0.18) / 0.82, 0, 1);
+      }
     }
 
     // 1. Step live chemical delay fuse ONLY when safety lever/spoon has been released
@@ -1005,16 +1397,31 @@ export class TacticalGrenadeSystem {
       const def = getTacticalEquipmentDef(this.heldEquipmentId);
       this.fuseElapsed += clampedDt;
       if (this.fuseElapsed >= this.actualFuseSec) {
-        const detPos = cookOvercookOrigin
-          ? this._tmpDetPos.copy(cookOvercookOrigin)
-          : this._tmpDetPos.set(0, 1.4, 0);
+        if (this.lastThrowHandSocket) {
+          this.lastThrowHandSocket.updateWorldMatrix(true, false);
+          this.lastThrowHandSocket.getWorldPosition(this._tmpDetPos);
+        } else if (cookOvercookOrigin) {
+          this._tmpDetPos.copy(cookOvercookOrigin);
+        } else {
+          this._tmpDetPos.set(0, 1.4, 0);
+        }
+        const detPos = this._tmpDetPos.clone();
         this.holdStage = 'HOLSTERED';
         this.heldEquipmentId = null;
         this.fuseElapsed = 0;
-        if (this.heldViewmodelGroup) {
-          this.heldViewmodelGroup.visible = false;
+        this.pinPullPhase = 'NONE';
+        this.pinPullElapsed = 0;
+        this.lmbHeld = false;
+        this.lmbHoldSec = 0;
+        this.charge01 = 0;
+        this.pendingThrowRelease = null;
+        this.throwWhipTimer = 0;
+        if (this.heldBoneBuilt) {
+          this.heldBoneBuilt.group.visible = false;
+          this.heldBoneBuilt.pullRingMesh.visible = false;
         }
-        this.detonateAt(def, detPos.clone());
+        const ev = this.detonateAt(def, detPos);
+        this.onInHandDetonate?.(ev);
       }
     }
 
@@ -1133,10 +1540,11 @@ export class TacticalGrenadeSystem {
       if (g.fuseLeft <= 0) {
         this._detPosScratch.copy(g.pos);
         const def = g.def;
+        const meta = g.meta;
         this.root.remove(g.built.group);
         g.built.dispose();
         this.activeGrenades.splice(i, 1);
-        this.detonateAt(def, this._detPosScratch);
+        this.detonateAt(def, this._detPosScratch, meta);
       }
     }
 
@@ -1274,6 +1682,11 @@ export class TacticalGrenadeSystem {
           maxDamage: tz.def.maxDamage * tickDt,
           isTick: true,
           tickDtSec: tickDt,
+          isRemote: tz.meta?.isRemote,
+          sourceId: tz.meta?.sourceId,
+          sourceName: tz.meta?.sourceName,
+          sourceTeam: tz.meta?.sourceTeam,
+          sourceIsBot: tz.meta?.sourceIsBot,
         });
       }
 
@@ -1318,7 +1731,11 @@ export class TacticalGrenadeSystem {
     }
   }
 
-  private detonateAt(def: TacticalEquipmentDef, pos: THREE.Vector3): void {
+  private detonateAt(
+    def: TacticalEquipmentDef,
+    pos: THREE.Vector3,
+    meta?: GrenadeRemoteAttribution,
+  ): GrenadeDetonationEvent {
     const kind = resolveEffectKind(def.id);
     this.audio?.playExplosion?.(pos, kind);
 
@@ -1332,10 +1749,10 @@ export class TacticalGrenadeSystem {
       this.spawnSmokeCloud(pos, def.effectDurationSec, def.blastRadiusM);
     } else {
       this.spawnExplosionVfx(pos, 0xff6b1a, 0xffb347, 16, 1.9, 3.8, 0.42, 14);
-      this.spawnThermiteZone(def, pos);
+      this.spawnThermiteZone(def, pos, meta);
     }
 
-    this.onDetonate?.({
+    const ev: GrenadeDetonationEvent = {
       equipmentId: def.id,
       def,
       kind,
@@ -1344,7 +1761,14 @@ export class TacticalGrenadeSystem {
       lethalRadiusM: def.lethalRadiusM,
       maxDamage: kind === 'thermite' ? def.maxDamage * 0.45 : def.maxDamage,
       isTick: false,
-    });
+      isRemote: meta?.isRemote,
+      sourceId: meta?.sourceId,
+      sourceName: meta?.sourceName,
+      sourceTeam: meta?.sourceTeam,
+      sourceIsBot: meta?.sourceIsBot,
+    };
+    this.onDetonate?.(ev);
+    return ev;
   }
 
   private spawnExplosionVfx(
@@ -1481,7 +1905,11 @@ export class TacticalGrenadeSystem {
     }
   }
 
-  private spawnThermiteZone(def: TacticalEquipmentDef, pos: THREE.Vector3): void {
+  private spawnThermiteZone(
+    def: TacticalEquipmentDef,
+    pos: THREE.Vector3,
+    meta?: GrenadeRemoteAttribution,
+  ): void {
     let slot = this.thermiteZones[0];
     for (let i = 0; i < this.thermiteZones.length; i++) {
       if (!this.thermiteZones[i].active) {
@@ -1497,6 +1925,7 @@ export class TacticalGrenadeSystem {
     slot.active = true;
     slot.equipmentId = def.id;
     slot.def = def;
+    slot.meta = meta;
     slot.pos.set(pos.x, floorY + 0.03, pos.z);
     slot.group.position.copy(slot.pos);
     slot.group.visible = true;
@@ -1516,7 +1945,7 @@ export class TacticalGrenadeSystem {
   }
 
   public dispose(): void {
-    this.detachViewmodelCamera();
+    this.disposeHeldBoneMesh();
 
     for (const g of this.activeGrenades) {
       this.root.remove(g.built.group);

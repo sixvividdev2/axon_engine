@@ -30,9 +30,11 @@ export type CharacterActionType =
   | 'NONE'
   | 'RELOAD'
   | 'MAG_CHECK'
-  | 'MELEE_SWING'
-  | 'THROW_PREP'
-  | 'THROW_RELEASE';
+  | 'MELEE_SWING';
+
+export type SurvivalThrowStage = 'READY' | 'PIN_PULLED' | 'LEVER_RELEASED';
+export type SurvivalPinPullPhase = 'NONE' | 'REACH_PIN' | 'PULL_PIN' | 'TUCK_POCKET' | 'EYE_AIM';
+export type SurvivalThrowStyle = 'overhand' | 'underhand';
 
 export type SurvivalCombatMove = 'NONE' | 'LEFT_JAB' | 'RIGHT_CROSS' | 'ARMED_BASH' | 'PUSH_KICK';
 export type SurvivalKickTriggerResult = 'ok' | 'busy' | 'airborne' | 'dual_leg_trauma';
@@ -40,7 +42,20 @@ export type SurvivalKickTriggerResult = 'ok' | 'busy' | 'airborne' | 'dual_leg_t
 export interface CharacterActionCallbacks {
   onMeleeImpact?: (spec: WeaponSpec) => void;
   onPinPulled?: (spec: WeaponSpec) => void;
-  onThrowRelease?: (spec: WeaponSpec, handWorldPos: THREE.Vector3, remainingFuseSec: number) => void;
+  onLeverReleased?: (
+    spec: WeaponSpec,
+    spoonOrigin: THREE.Vector3,
+    spoonRight: THREE.Vector3,
+    spoonUp: THREE.Vector3,
+    spoonFwd: THREE.Vector3,
+  ) => void;
+  onThrowRelease?: (
+    spec: WeaponSpec,
+    handWorldPos: THREE.Vector3,
+    remainingFuseSec: number,
+    speedMps: number,
+    style: SurvivalThrowStyle,
+  ) => void;
   onOvercookedDetonate?: (spec: WeaponSpec, handWorldPos: THREE.Vector3) => void;
   onCombatShock?: (pitchRad: number, yawRad: number, kickBackM: number) => void;
   onCombatExertion?: (amount: number) => void;
@@ -131,16 +146,36 @@ export class CharacterAnimator {
   private footPitchL = 0;
   private footPitchR = 0;
 
-  // Active additive action state (reload / mag check / knife-crowbar swing / throwable)
+  // Active additive action state (reload / mag check / knife-crowbar swing)
   private actionType: CharacterActionType = 'NONE';
   private actionTime = 0;
   private actionDuration = 0;
   private actionSpec: WeaponSpec | null = null;
   private meleeImpactFired = false;
-  private pinPullFired = false;
-  private throwReleaseFired = false;
-  private cookElapsed = 0;
   private callbacks: CharacterActionCallbacks = {};
+
+  // 4-stage RGD-5 Manual of Arms + shared Underhand Lob / Overhand Power Throw state
+  private throwStage: SurvivalThrowStage = 'READY';
+  private pinPullPhase: SurvivalPinPullPhase = 'NONE';
+  private pinPullElapsed = 0;
+  private fuseElapsed = 0;
+  private actualFuseSec = 3.5;
+  private throwLmbHeld = false;
+  private throwLmbHoldSec = 0;
+  private throwCharge01 = 0;
+  private throwStyle: SurvivalThrowStyle = 'underhand';
+  private pendingThrowRelease: {
+    spec: WeaponSpec;
+    style: SurvivalThrowStyle;
+    speedMps: number;
+    charge01: number;
+  } | null = null;
+  private throwWhipTimer = 0;
+  private throwWhipDuration = 0.16;
+  private throwWhipStyle: SurvivalThrowStyle = 'overhand';
+  private throwCooldownHideTimer = 0;
+  private pullRingAttachedTo: THREE.Object3D | null = null;
+  private throwableTorsoCoilYaw = 0;
 
   // Unarmed Jab -> Cross, Armed V Quick-Bash, and Tactical Push-Kick (X) state (zero-GC)
   private combatMove: SurvivalCombatMove = 'NONE';
@@ -284,6 +319,22 @@ export class CharacterAnimator {
     strokeIndex: 0,
   };
   private readonly _microTargetRoot = new THREE.Vector3();
+  private readonly _throwRPos = new THREE.Vector3();
+  private readonly _throwLPos = new THREE.Vector3();
+  private readonly _throwEyeAimPos = new THREE.Vector3();
+  private readonly _throwPinPos = new THREE.Vector3();
+  private readonly _throwPullAxis = new THREE.Vector3();
+  private readonly _throwHandEuler = new THREE.Euler(0, 0, 0, 'YXZ');
+  private readonly _throwHandQuat = new THREE.Quaternion();
+  private readonly _throwLQuat = new THREE.Quaternion();
+  private readonly _throwBodyQuat = new THREE.Quaternion();
+  private readonly _throwPoleR = new THREE.Vector3();
+  private readonly _throwPoleL = new THREE.Vector3();
+  private readonly _spoonOrigin = new THREE.Vector3();
+  private readonly _spoonQuat = new THREE.Quaternion();
+  private readonly _spoonRight = new THREE.Vector3();
+  private readonly _spoonUp = new THREE.Vector3();
+  private readonly _spoonFwd = new THREE.Vector3();
 
   constructor(skeleton: CharacterSkeleton, weaponRig: WeaponRig, audio?: IBodycamAudioSource) {
     this.skeleton = skeleton;
@@ -318,18 +369,29 @@ export class CharacterAnimator {
     return this.combatMove === 'PUSH_KICK';
   }
 
+  public isThrowableBusy(): boolean {
+    return (
+      this.throwStage !== 'READY' ||
+      this.throwLmbHeld ||
+      this.throwWhipTimer > 0 ||
+      this.pendingThrowRelease !== null ||
+      this.throwCooldownHideTimer > 0
+    );
+  }
+
   public isBusy(): boolean {
     const wa = this.weaponRig.weaponAnimator.getActiveAction();
     return (
       this.actionType !== 'NONE' ||
       this.combatMove !== 'NONE' ||
+      this.isThrowableBusy() ||
       wa === 'RELOAD' ||
       wa === 'MAG_CHECK'
     );
   }
 
   public triggerInspect(): boolean {
-    if (this.combatMove !== 'NONE' || this.actionType !== 'NONE') return false;
+    if (this.combatMove !== 'NONE' || this.actionType !== 'NONE' || this.isThrowableBusy()) return false;
     return this.weaponRig.triggerInspect();
   }
 
@@ -342,10 +404,9 @@ export class CharacterAnimator {
     this.actionType = 'NONE';
     this.actionTime = 0;
     this.actionDuration = 0;
-    this.cookElapsed = 0;
     this.meleeImpactFired = false;
-    this.pinPullFired = false;
-    this.throwReleaseFired = false;
+    this.restorePullRingToGrenade();
+    this.resetThrowableState();
   }
 
   public cancelCombat(): void {
@@ -428,7 +489,7 @@ export class CharacterAnimator {
    */
   public triggerArmedBash(isVaulting = false, holdClass?: HoldClass): boolean {
     if (isVaulting) return false;
-    if (this.combatMove !== 'NONE' || this.actionType === 'THROW_PREP' || this.actionType === 'THROW_RELEASE') {
+    if (this.combatMove !== 'NONE' || this.isThrowableBusy()) {
       return false;
     }
     if (this.actionType === 'RELOAD' || this.actionType === 'MAG_CHECK') {
@@ -458,7 +519,7 @@ export class CharacterAnimator {
     isVaulting: boolean,
     trauma?: Readonly<TraumaModifiers>,
   ): SurvivalKickTriggerResult {
-    if (this.combatMove !== 'NONE' || isVaulting || this.actionType === 'THROW_PREP' || this.actionType === 'THROW_RELEASE') {
+    if (this.combatMove !== 'NONE' || isVaulting || this.isThrowableBusy()) {
       return 'busy';
     }
     if (!grounded) return 'airborne';
@@ -509,28 +570,209 @@ export class CharacterAnimator {
     return attackType;
   }
 
-  public triggerThrowPrep(spec: WeaponSpec): boolean {
-    if (this.actionType === 'THROW_PREP' || this.actionType === 'THROW_RELEASE' || this.combatMove !== 'NONE') {
+  private resetThrowableState(): void {
+    this.throwStage = 'READY';
+    this.pinPullPhase = 'NONE';
+    this.pinPullElapsed = 0;
+    this.fuseElapsed = 0;
+    this.throwLmbHeld = false;
+    this.throwLmbHoldSec = 0;
+    this.throwCharge01 = 0;
+    this.throwStyle = 'underhand';
+    this.pendingThrowRelease = null;
+    this.throwWhipTimer = 0;
+  }
+
+  private restorePullRingToGrenade(): void {
+    const parts = this.weaponRig.getThrowableParts();
+    if (!parts) {
+      this.pullRingAttachedTo = null;
+      return;
+    }
+    const homeParent = parts.bodyGroup.parent;
+    if (homeParent && parts.pullRingMesh.parent !== homeParent) {
+      homeParent.add(parts.pullRingMesh);
+    }
+    parts.pullRingMesh.position.set(-0.017, 0.052, 0.008);
+    parts.pullRingMesh.rotation.set(0, 0.42, 0);
+    parts.pullRingMesh.scale.setScalar(1);
+    parts.pullRingMesh.visible = this.throwCooldownHideTimer <= 0;
+    this.pullRingAttachedTo = homeParent;
+  }
+
+  private emitLeverReleasedSpoon(spec: WeaponSpec): void {
+    const parts = this.weaponRig.getThrowableParts();
+    if (parts?.spoonAnchor) {
+      parts.spoonAnchor.updateWorldMatrix(true, false);
+      parts.spoonAnchor.getWorldPosition(this._spoonOrigin);
+      parts.spoonAnchor.getWorldQuaternion(this._spoonQuat);
+    } else {
+      this.skeleton.throwHandSocket.updateWorldMatrix(true, false);
+      this.skeleton.throwHandSocket.getWorldPosition(this._spoonOrigin);
+      this.skeleton.throwHandSocket.getWorldQuaternion(this._spoonQuat);
+    }
+    this._spoonRight.set(1, 0, 0).applyQuaternion(this._spoonQuat).normalize();
+    this._spoonUp.set(0, 1, 0).applyQuaternion(this._spoonQuat).normalize();
+    this._spoonFwd.set(0, 0, -1).applyQuaternion(this._spoonQuat).normalize();
+    this.callbacks.onLeverReleased?.(
+      spec,
+      this._spoonOrigin,
+      this._spoonRight,
+      this._spoonUp,
+      this._spoonFwd,
+    );
+  }
+
+  /** Stage 2 (1st RMB on rgd5_frag): pull safety pin into pocket; fuse stays STOPPED. */
+  public pullThrowablePin(spec: WeaponSpec): boolean {
+    if (spec.holdClass !== 'throwable' || spec.id !== 'rgd5_frag') return false;
+    if (this.throwStage !== 'READY' || this.combatMove !== 'NONE' || this.throwCooldownHideTimer > 0) {
       return false;
     }
     this.weaponRig.interruptInspect();
-    this.actionType = 'THROW_PREP';
-    this.actionTime = 0;
-    this.actionDuration = spec.fuseDurationSec ?? 3.5;
-    this.actionSpec = spec;
-    this.pinPullFired = false;
-    this.cookElapsed = 0;
+    this.throwStage = 'PIN_PULLED';
+    this.pinPullPhase = 'REACH_PIN';
+    this.pinPullElapsed = 0;
+    this.fuseElapsed = 0;
+    const nominal = spec.fuseDurationSec ?? 3.5;
+    this.actualFuseSec = Math.max(0.65, nominal + (Math.random() * 2 - 1) * 0.25);
+    this.audio?.playGrenadePinPull?.();
+    this.callbacks.onPinPulled?.(spec);
     return true;
   }
 
-  public triggerThrowRelease(spec: WeaponSpec): boolean {
-    if (this.actionType !== 'THROW_PREP') return false;
-    this.actionType = 'THROW_RELEASE';
-    this.actionTime = 0;
-    this.actionDuration = 0.40;
-    this.actionSpec = spec;
-    this.throwReleaseFired = false;
+  /** Stage 3 (2nd RMB on rgd5_frag): lift fingers off spoon; spring spoon flies & live fuse ignites. */
+  public releaseThrowableLever(spec: WeaponSpec): boolean {
+    if (spec.holdClass !== 'throwable' || spec.id !== 'rgd5_frag') return false;
+    if (this.throwStage !== 'PIN_PULLED') return false;
+    this.throwStage = 'LEVER_RELEASED';
+    this.fuseElapsed = 0;
+    const nominal = spec.fuseDurationSec ?? 3.5;
+    this.actualFuseSec = Math.max(0.65, nominal + (Math.random() * 2 - 1) * 0.25);
+    if (this.pinPullPhase === 'REACH_PIN' || this.pinPullPhase === 'PULL_PIN') {
+      this.pinPullPhase = 'EYE_AIM';
+    }
+    this.emitLeverReleasedSpoon(spec);
+    this.audio?.playGrenadeLeverSnap?.();
     return true;
+  }
+
+  /** LMB down on throwable: seamless click (<0.18s underhand lob) vs hold (>=0.18s overhand power throw). */
+  public beginThrowInput(spec: WeaponSpec): boolean {
+    if (spec.holdClass !== 'throwable' || this.combatMove !== 'NONE') return false;
+    if (spec.id === 'rgd5_frag' && this.throwStage === 'READY') return false;
+    if (this.throwLmbHeld || this.pendingThrowRelease || this.throwWhipTimer > 0 || this.throwCooldownHideTimer > 0) {
+      return false;
+    }
+    this.weaponRig.interruptInspect();
+    this.throwLmbHeld = true;
+    this.throwLmbHoldSec = 0;
+    this.throwCharge01 = 0;
+    this.throwStyle = 'underhand';
+    return true;
+  }
+
+  /** LMB up on throwable: commits underhand lob or charged overhand throw, releasing at whip apex. */
+  public releaseThrowInput(spec: WeaponSpec): SurvivalThrowStyle | null {
+    if (!this.throwLmbHeld) {
+      this.throwLmbHoldSec = 0;
+      this.throwCharge01 = 0;
+      return null;
+    }
+    const style: SurvivalThrowStyle = this.throwLmbHoldSec < 0.18 ? 'underhand' : 'overhand';
+    const speedMps =
+      style === 'underhand'
+        ? 10.0
+        : THREE.MathUtils.lerp(13.5, 22.5, THREE.MathUtils.clamp(this.throwCharge01, 0, 1));
+
+    this.pendingThrowRelease = {
+      spec,
+      style,
+      speedMps,
+      charge01: this.throwCharge01,
+    };
+    this.throwStyle = style;
+    this.throwWhipStyle = style;
+    this.throwWhipDuration = style === 'overhand' ? 0.14 : 0.16;
+    this.throwWhipTimer = this.throwWhipDuration;
+    this.throwLmbHeld = false;
+    this.throwLmbHoldSec = 0;
+    return style;
+  }
+
+  public resetThrowableInputOnFocusLoss(): void {
+    this.throwLmbHeld = false;
+    this.throwLmbHoldSec = 0;
+    this.throwCharge01 = 0;
+    this.throwStyle = 'underhand';
+  }
+
+  public holsterOrTossThrowable(spec: WeaponSpec): 'holstered' | 'tossed' | 'none' {
+    this.restorePullRingToGrenade();
+    if (spec.holdClass !== 'throwable') {
+      this.resetThrowableState();
+      return 'none';
+    }
+    if (spec.id === 'rgd5_frag' && this.throwStage === 'LEVER_RELEASED') {
+      this.skeleton.throwHandSocket.updateWorldMatrix(true, false);
+      this.skeleton.throwHandSocket.getWorldPosition(this._tmpWorldA);
+      const rem = Math.max(0.08, this.actualFuseSec - this.fuseElapsed);
+      this.resetThrowableState();
+      this.callbacks.onThrowRelease?.(spec, this._tmpWorldA, rem, 10.5, 'underhand');
+      return 'tossed';
+    }
+    const hadActive =
+      this.throwStage !== 'READY' ||
+      this.throwLmbHeld ||
+      this.pendingThrowRelease !== null ||
+      this.throwWhipTimer > 0;
+    this.resetThrowableState();
+    return hadActive ? 'holstered' : 'none';
+  }
+
+  public getThrowableStage(): SurvivalThrowStage {
+    return this.throwStage;
+  }
+
+  public isThrowableLiveFuse(): boolean {
+    return this.throwStage === 'LEVER_RELEASED';
+  }
+
+  public getThrowableWhipProgress(): number {
+    if (this.throwWhipTimer <= 0 || this.throwWhipDuration <= 0) return 0;
+    return THREE.MathUtils.clamp(1 - this.throwWhipTimer / this.throwWhipDuration, 0, 1);
+  }
+
+  public getThrowableTension(): {
+    charge01: number;
+    liveCook: boolean;
+    throwStyle: SurvivalThrowStyle;
+  } {
+    const activeStyle: SurvivalThrowStyle =
+      this.pendingThrowRelease?.style ?? (this.throwWhipTimer > 0 ? this.throwWhipStyle : this.throwStyle);
+    return {
+      charge01: this.throwLmbHeld && this.throwStyle === 'overhand' ? this.throwCharge01 : 0,
+      liveCook: this.throwStage === 'LEVER_RELEASED',
+      throwStyle: activeStyle,
+    };
+  }
+
+  public getThrowableStatusLabel(spec: WeaponSpec): string {
+    if (spec.holdClass !== 'throwable') return '';
+    if (spec.id === 'rgd5_frag') {
+      if (this.throwStage === 'READY') return '[RMB] Pull Pin';
+      if (this.throwStage === 'PIN_PULLED') {
+        return this.throwLmbHeld && this.throwStyle === 'overhand'
+          ? 'Release [LMB] Overhand Throw'
+          : '[RMB] Release Spoon · [LMB] Click Lob / Hold Throw';
+      }
+      return this.throwLmbHeld && this.throwStyle === 'overhand'
+        ? 'LIVE FUSE — Release [LMB] Throw'
+        : 'LIVE FUSE — [LMB] Click Lob / Hold Throw';
+    }
+    return this.throwLmbHeld && this.throwStyle === 'overhand'
+      ? 'Release [LMB] Overhand Throw'
+      : '[LMB] Click Lob / Hold Throw';
   }
 
   /**
@@ -582,6 +824,9 @@ export class CharacterAnimator {
 
     if (this.prevWeaponId !== null && this.prevWeaponId !== spec.id) {
       this.equipBlendTimer = 0.11;
+      this.throwCooldownHideTimer = 0;
+      this.restorePullRingToGrenade();
+      this.resetThrowableState();
       if (this.combatMove !== 'NONE' && this.combatMove !== 'PUSH_KICK') {
         this.cancelCombat();
       }
@@ -593,6 +838,52 @@ export class CharacterAnimator {
 
     if (state.vaultState.active && this.combatMove !== 'NONE') {
       this.cancelCombat();
+    }
+
+    // Advance throwable pin-pull choreography, unified LMB charge, & live overcook fuse
+    this.throwCooldownHideTimer = Math.max(0, this.throwCooldownHideTimer - dt);
+    this.throwWhipTimer = Math.max(0, this.throwWhipTimer - dt);
+    if (spec.holdClass === 'throwable') {
+      if (this.throwStage === 'PIN_PULLED' || this.throwStage === 'LEVER_RELEASED') {
+        if (this.pinPullPhase !== 'EYE_AIM' && this.pinPullPhase !== 'NONE') {
+          this.pinPullElapsed += dt;
+          if (this.pinPullElapsed < 0.16) {
+            this.pinPullPhase = 'REACH_PIN';
+          } else if (this.pinPullElapsed < 0.34) {
+            this.pinPullPhase = 'PULL_PIN';
+          } else if (this.pinPullElapsed < 0.56) {
+            this.pinPullPhase = 'TUCK_POCKET';
+          } else {
+            this.pinPullPhase = 'EYE_AIM';
+          }
+        }
+      } else {
+        this.pinPullPhase = 'NONE';
+        this.pinPullElapsed = 0;
+      }
+
+      if (this.throwLmbHeld) {
+        this.throwLmbHoldSec += dt;
+        if (this.throwLmbHoldSec < 0.18) {
+          this.throwStyle = 'underhand';
+          this.throwCharge01 = 0;
+        } else {
+          this.throwStyle = 'overhand';
+          this.throwCharge01 = THREE.MathUtils.clamp((this.throwLmbHoldSec - 0.18) / 0.82, 0, 1);
+        }
+      }
+
+      if (spec.id === 'rgd5_frag' && this.throwStage === 'LEVER_RELEASED') {
+        this.fuseElapsed += dt;
+        if (this.fuseElapsed >= this.actualFuseSec) {
+          this.skeleton.throwHandSocket.updateWorldMatrix(true, false);
+          this.skeleton.throwHandSocket.getWorldPosition(this._tmpWorldA);
+          this.restorePullRingToGrenade();
+          this.resetThrowableState();
+          this.throwCooldownHideTimer = 0.24;
+          this.callbacks.onOvercookedDetonate?.(spec, this._tmpWorldA);
+        }
+      }
     }
 
     // Advance unarmed Jab -> Cross, armed V bash, and X Push-Kick state machine + spherecasts
@@ -673,9 +964,20 @@ export class CharacterAnimator {
       kickShiftWeight * 0.16;
     const leanAngle = -leanSign * 1.22 + kickShiftWeight * 0.10;
 
-    let punchTorsoYaw = 0;
+    let targetCoilYaw = 0;
+    if (spec.holdClass === 'throwable') {
+      if (this.throwLmbHeld && this.throwStyle === 'overhand') {
+        targetCoilYaw = -0.22 * this.throwCharge01;
+      } else if (this.throwWhipTimer > 0 && this.throwWhipStyle === 'overhand') {
+        const wp = this.getThrowableWhipProgress();
+        targetCoilYaw = 0.18 * smoothstep(0.0, 0.45, wp) * (1 - smoothstep(0.45, 1.0, wp));
+      }
+    }
+    this.throwableTorsoCoilYaw = THREE.MathUtils.damp(this.throwableTorsoCoilYaw, targetCoilYaw, 16, dt);
+
+    let punchTorsoYaw = this.throwableTorsoCoilYaw;
     let leftClavProtract = 0;
-    let rightClavProtract = 0;
+    let rightClavProtract = -Math.max(0, -this.throwableTorsoCoilYaw) * 0.45;
     if (this.combatMove === 'LEFT_JAB' || this.combatMove === 'RIGHT_CROSS') {
       const p = THREE.MathUtils.clamp(this.combatTime / Math.max(0.01, this.combatDuration), 0, 1);
       const drive = this.evalPunchDriveCurve(p, this.punchFromGuard);
@@ -776,6 +1078,7 @@ export class CharacterAnimator {
     const activeWepAct = this.weaponRig.weaponAnimator.getActiveAction();
     const aimLockWeight =
       spec.holdClass !== 'unarmed' &&
+      spec.holdClass !== 'throwable' &&
       this.actionType === 'NONE' &&
       activeWepAct === 'NONE' &&
       this.combatMove === 'NONE' &&
@@ -783,7 +1086,7 @@ export class CharacterAnimator {
       vaultState.handPinWeightL < 0.05
         ? Math.max(rigState.adsBlend, rigState.cantBlend, rigState.pointAimBlend)
         : 0;
-    const reachClampWeight = 1 - aimLockWeight;
+    const reachClampWeight = spec.holdClass === 'throwable' ? 0 : 1 - aimLockWeight;
 
     if (reachClampWeight > 0.001) {
       for (let iter = 0; iter < 2; iter++) {
@@ -1213,7 +1516,7 @@ export class CharacterAnimator {
     if (this.combatMove === 'ARMED_BASH' && spec.holdClass === 'pistol') return true;
     const wa = this.weaponRig.weaponAnimator.getActiveAction();
     if (isFirearm && (wa === 'RELOAD' || wa === 'MAG_CHECK')) return true;
-    if (this.actionType === 'THROW_PREP') return true;
+    if (spec.holdClass === 'throwable') return true;
     if (this.actionType === 'MELEE_SWING' && !isFirearm) return true;
     return false;
   }
@@ -1428,8 +1731,15 @@ export class CharacterAnimator {
 
     let magDropY = 0;
     let boltBackZ = 0;
-    let hideModel = false;
-    let hidePin = false;
+    const hideModel = currentSpec.holdClass === 'throwable' && this.throwCooldownHideTimer > 0;
+    const hidePin =
+      currentSpec.id === 'rgd5_frag' &&
+      (this.throwStage === 'LEVER_RELEASED' ||
+        this.pinPullPhase === 'EYE_AIM' ||
+        this.throwCooldownHideTimer > 0);
+    const hideSpoon =
+      currentSpec.id === 'rgd5_frag' &&
+      (this.throwStage === 'LEVER_RELEASED' || this.throwCooldownHideTimer > 0);
 
     if (this.actionType !== 'NONE') {
       if (this.actionSpec && this.actionSpec.id !== currentSpec.id && this.actionType !== 'MELEE_SWING') {
@@ -1466,62 +1776,6 @@ export class CharacterAnimator {
             this._actionPosOffset.set(-0.24 * (1 - r), -0.10 * (1 - r), -0.22 * (1 - r));
             this._actionRotOffset.set(-1.18 * (1 - r), 0.72 * (1 - r), 0.68 * (1 - r));
           }
-
-          if (p >= 1) {
-            this.actionType = 'NONE';
-          }
-        } else if (this.actionType === 'THROW_PREP') {
-          this.cookElapsed += dt;
-          const wind = smoothstep(0, 0.30, this.cookElapsed);
-          this._actionPosOffset.set(0.14 * wind, 0.12 * wind, 0.18 * wind);
-          this._actionRotOffset.set(0.52 * wind, -0.32 * wind, -0.22 * wind);
-
-          if (currentSpec.id === 'rgd5_frag') {
-            if (!this.pinPullFired && this.cookElapsed >= 0.24) {
-              this.pinPullFired = true;
-              this.callbacks.onPinPulled?.(currentSpec);
-            }
-            hidePin = this.pinPullFired;
-            const fuse = currentSpec.fuseDurationSec ?? 3.5;
-            if (this.cookElapsed >= fuse) {
-              this.weaponRig.rightHandSocketAnchor.getWorldPosition(this._tmpWorldA);
-              this.actionType = 'NONE';
-              this.callbacks.onOvercookedDetonate?.(currentSpec, this._tmpWorldA);
-            }
-          }
-        } else if (this.actionType === 'THROW_RELEASE') {
-          const fuseTotal = currentSpec.fuseDurationSec ?? 3.5;
-          if (p < 0.24) {
-            const whip = smoothstep(0, 0.22, p);
-            this._actionPosOffset.set(
-              THREE.MathUtils.lerp(0.14, -0.04, whip),
-              THREE.MathUtils.lerp(0.12, 0.02, whip),
-              THREE.MathUtils.lerp(0.18, -0.20, whip),
-            );
-            this._actionRotOffset.set(
-              THREE.MathUtils.lerp(0.52, -0.95, whip),
-              THREE.MathUtils.lerp(-0.32, 0.15, whip),
-              THREE.MathUtils.lerp(-0.22, 0.10, whip),
-            );
-          } else {
-            const rec = smoothstep(0.24, 1.0, p);
-            this._actionPosOffset.set(
-              -0.04 * (1 - rec),
-              0.02 * (1 - rec) - Math.sin(rec * Math.PI) * 0.08,
-              -0.20 * (1 - rec),
-            );
-            this._actionRotOffset.set(-0.95 * (1 - rec), 0.15 * (1 - rec), 0.10 * (1 - rec));
-          }
-
-          if (!this.throwReleaseFired && p >= 0.16) {
-            this.throwReleaseFired = true;
-            this.weaponRig.applyCharacterActionPose(this._actionPosOffset, this._actionRotOffset, 0, 0, false, true);
-            this.weaponRig.rightHandSocketAnchor.getWorldPosition(this._tmpWorldA);
-            const remainingFuse = Math.max(0.2, fuseTotal - this.cookElapsed);
-            this.callbacks.onThrowRelease?.(currentSpec, this._tmpWorldA, remainingFuse);
-          }
-          hideModel = this.throwReleaseFired;
-          hidePin = true;
 
           if (p >= 1) {
             this.actionType = 'NONE';
@@ -1641,6 +1895,7 @@ export class CharacterAnimator {
       boltBackZ,
       hideModel,
       hidePin,
+      hideSpoon,
     );
   }
 
@@ -1842,7 +2097,103 @@ export class CharacterAnimator {
       rightGripCurl = THREE.MathUtils.lerp(rightGripCurl, 0.16, vaultPinR);
     }
 
-    if (this.equipBlendTimer > 0 || vaultPinR > 0.001) {
+    const isThrowable = spec.holdClass === 'throwable' && vaultPinR < 0.15 && vaultPinL < 0.15;
+    if (isThrowable) {
+      const idleBobY = Math.sin(elapsed * 2.2) * 0.003;
+      const gWhip = this.getThrowableWhipProgress();
+      const gActiveStyle: SurvivalThrowStyle =
+        this.pendingThrowRelease?.style ?? (this.throwWhipTimer > 0 ? this.throwWhipStyle : this.throwStyle);
+
+      this._throwRPos.set(0.185, -0.105 + idleBobY, -0.335);
+      let pitchTilt = guardPitch * 0.65;
+      let yawTwist = 0.24;
+      let rollTwist = -0.45;
+
+      if (spec.id === 'rgd5_frag' && (this.pinPullPhase === 'REACH_PIN' || this.pinPullPhase === 'PULL_PIN')) {
+        this._throwRPos.set(0.145, -0.095 + idleBobY, -0.315);
+        yawTwist = 0.34;
+      }
+
+      if (this.throwLmbHeld) {
+        if (this.throwStyle === 'underhand') {
+          this._throwRPos.set(0.205, -0.255, -0.14);
+          pitchTilt = -0.45;
+          yawTwist = 0.12;
+        } else {
+          const wind = smoothstep(0.0, 1.0, this.throwCharge01);
+          const peakTremor =
+            this.throwCharge01 > 0.85
+              ? Math.sin(elapsed * 44) * 0.0032 * ((this.throwCharge01 - 0.85) / 0.15)
+              : 0;
+          this._throwRPos.set(
+            THREE.MathUtils.lerp(0.18, 0.295, wind) + peakTremor,
+            THREE.MathUtils.lerp(-0.09, 0.065, wind) + peakTremor * 0.6,
+            THREE.MathUtils.lerp(-0.31, 0.075, wind),
+          );
+          pitchTilt = THREE.MathUtils.lerp(guardPitch * 0.65, 0.68, wind);
+          yawTwist = THREE.MathUtils.lerp(0.24, -0.28, wind);
+          rollTwist = THREE.MathUtils.lerp(-0.45, -0.38, wind);
+        }
+      } else if (gWhip > 0.001) {
+        if (gActiveStyle === 'overhand') {
+          if (gWhip < 0.38) {
+            const t = smoothstep(0, 0.38, gWhip);
+            this._throwRPos.set(
+              THREE.MathUtils.lerp(0.28, 0.115, t),
+              THREE.MathUtils.lerp(0.06, 0.025, t),
+              THREE.MathUtils.lerp(0.06, -0.44, t),
+            );
+            pitchTilt = THREE.MathUtils.lerp(0.65, -0.24, t);
+            yawTwist = THREE.MathUtils.lerp(-0.22, 0.18, t);
+          } else {
+            const t = smoothstep(0.38, 1.0, gWhip);
+            this._throwRPos.set(
+              THREE.MathUtils.lerp(0.115, -0.02, t),
+              THREE.MathUtils.lerp(0.025, -0.22, t),
+              THREE.MathUtils.lerp(-0.44, -0.26, t),
+            );
+            pitchTilt = THREE.MathUtils.lerp(-0.24, -0.58, t);
+            yawTwist = 0.24;
+          }
+        } else {
+          if (gWhip < 0.42) {
+            const t = smoothstep(0, 0.42, gWhip);
+            this._throwRPos.set(
+              THREE.MathUtils.lerp(0.20, 0.105, t),
+              THREE.MathUtils.lerp(-0.25, -0.045, t),
+              THREE.MathUtils.lerp(-0.12, -0.42, t),
+            );
+            pitchTilt = THREE.MathUtils.lerp(-0.45, 0.32, t);
+            yawTwist = 0.14;
+          } else {
+            const t = smoothstep(0.42, 1.0, gWhip);
+            this._throwRPos.set(
+              THREE.MathUtils.lerp(0.105, 0.06, t),
+              THREE.MathUtils.lerp(-0.045, -0.14, t),
+              THREE.MathUtils.lerp(-0.42, -0.30, t),
+            );
+            pitchTilt = THREE.MathUtils.lerp(0.32, 0.05, t);
+          }
+        }
+      }
+
+      if (spec.id === 'rgd5_frag' && this.throwStage === 'LEVER_RELEASED') {
+        const cookRatio = THREE.MathUtils.clamp(this.fuseElapsed / Math.max(0.5, spec.fuseDurationSec ?? 3.5), 0, 1);
+        this._throwRPos.x += Math.sin(elapsed * 36) * 0.0018 * (0.4 + cookRatio);
+        this._throwRPos.y += Math.cos(elapsed * 43) * 0.0012 * (0.4 + cookRatio);
+      }
+
+      this._unarmedPitchEuler.set(guardPitch * 0.72, 0, 0, 'YXZ');
+      this._throwRPos.applyEuler(this._unarmedPitchEuler).add(this._camLocalOrigin);
+
+      this._throwHandEuler.set(pitchTilt, yawTwist, rollTwist, 'YXZ');
+      this._throwHandQuat.setFromEuler(this._throwHandEuler);
+      this._rDesiredRoot.copy(this._throwRPos);
+      this._rDesiredQuatRoot.copy(this._throwHandQuat);
+      rightGripCurl = gWhip > 0.24 || this.throwCooldownHideTimer > 0 ? 0.35 : 0.92;
+    }
+
+    if (this.equipBlendTimer > 0 || vaultPinR > 0.001 || isThrowable) {
       this.rightHandBlender.blendTo(
         this._rDesiredRoot,
         isUnarmed ? this.rightHandBlender.quaternion : this._rDesiredQuatRoot,
@@ -1882,6 +2233,17 @@ export class CharacterAnimator {
 
       this._poleR.copy(this._readyPoleR).lerp(this._guardPoleR, poleGuardW);
       this._poleL.copy(this._readyPoleL).lerp(this._guardPoleL, poleGuardW);
+    } else if (isThrowable) {
+      const overhand =
+        this.throwStyle === 'overhand' && (this.throwLmbHeld || this.throwWhipTimer > 0);
+      this._throwPoleR.set(
+        this._shoulderR.x + (overhand ? 0.46 : 0.32),
+        this._shoulderR.y + (overhand ? -0.18 + this.throwCharge01 * 0.08 : -0.48),
+        this._shoulderR.z + (overhand ? 0.26 : 0.22),
+      );
+      this._throwPoleL.set(this._shoulderL.x - 0.34, this._shoulderL.y - 0.46, this._shoulderL.z + 0.20);
+      this._poleR.copy(this._throwPoleR);
+      this._poleL.copy(this._throwPoleL);
     } else {
       const ptW = this.weaponRig.getReadOnlyRigState().pointAimBlend;
       this._poleR
@@ -1925,12 +2287,14 @@ export class CharacterAnimator {
     );
     armR.hand.root.position.copy(this.rightArmIK.endPos);
     armR.hand.root.quaternion.copy(this._rQuatRoot);
-    armR.hand.root.updateMatrixWorld(true);
+    this.skeleton.root.updateMatrixWorld(true);
+    armR.hand.root.updateWorldMatrix(true, false);
 
     const weaponAction = this.weaponRig.weaponAnimator.getActiveAction();
     // Strict trigger discipline: right index finger straight off the trigger during Inspect, Reload, and Mag-Check
     const triggerEngaged =
       !isUnarmed &&
+      !isThrowable &&
       vaultPinR < 0.05 &&
       weaponAction === 'NONE' &&
       (state.isAds ||
@@ -1943,6 +2307,8 @@ export class CharacterAnimator {
       vaultPinR > 0.2 || isUnarmed ? 'unarmed' : spec.holdClass,
       triggerEngaged,
       this.rightHandBlender.gripCurl,
+      'none',
+      isThrowable ? { leverReleased: this.throwStage === 'LEVER_RELEASED' } : undefined,
     );
 
     // 2. Post-IK Rigid Hard-Lock: align weaponRig.root to solved right hand in hip-fire/action,
@@ -1950,6 +2316,7 @@ export class CharacterAnimator {
     const rigStatePost = this.weaponRig.getReadOnlyRigState();
     const aimLockWeightPost =
       !isUnarmed &&
+      !isThrowable &&
       this.actionType === 'NONE' &&
       weaponAction === 'NONE' &&
       this.combatMove === 'NONE' &&
@@ -1990,7 +2357,39 @@ export class CharacterAnimator {
       this.weaponRig.root.updateMatrixWorld(true);
     }
 
+    // Consume pending throw release strictly AFTER right-hand IK + rigid weapon hard-lock + updateWorldMatrix
+    if (this.pendingThrowRelease && this.getThrowableWhipProgress() >= 0.24) {
+      const pending = this.pendingThrowRelease;
+      this.pendingThrowRelease = null;
+      this.skeleton.throwHandSocket.updateWorldMatrix(true, false);
+      this.skeleton.throwHandSocket.getWorldPosition(this._tmpWorldA);
+      let remainingFuse = 3.5;
+      if (pending.spec.id === 'rgd5_frag') {
+        if (this.throwStage === 'LEVER_RELEASED') {
+          remainingFuse = Math.max(0.08, this.actualFuseSec - this.fuseElapsed);
+        } else {
+          remainingFuse = Math.max(
+            0.65,
+            (pending.spec.fuseDurationSec ?? 3.5) + (Math.random() * 2 - 1) * 0.25,
+          );
+          this.emitLeverReleasedSpoon(pending.spec);
+          this.audio?.playGrenadeLeverSnap?.();
+        }
+      }
+      this.restorePullRingToGrenade();
+      this.resetThrowableState();
+      this.throwCooldownHideTimer = 0.24;
+      this.callbacks.onThrowRelease?.(
+        pending.spec,
+        this._tmpWorldA,
+        remainingFuse,
+        pending.speedMps,
+        pending.style,
+      );
+    }
+
     // 3. Sample Left Hand target AFTER right-hand hard-lock (for armed weapons)
+    let leftPinchPose01 = 0;
     if (!isUnarmed) {
       if (this.weaponRig.hasLeftHandSocket) {
         this.weaponRig.leftHandSocketAnchor.getWorldPosition(this._lDesiredRoot);
@@ -2090,22 +2489,76 @@ export class CharacterAnimator {
         this._lDesiredRoot.copy(this._tmpWorldB).lerp(this._tmpWorldA, t);
       }
       leftGripCurl = 0.92;
-    } else if (this.actionType === 'THROW_PREP') {
+    } else if (isThrowable) {
       leftOverridden = true;
-      if (spec.id === 'rgd5_frag' && this.cookElapsed < 0.34) {
-        const t = Math.sin(smoothstep(0, 0.34, this.cookElapsed) * Math.PI);
-        this._tmpWorldB.copy(this._rTargetRoot);
-        this._tmpWorldB.x -= 0.04;
-        this._tmpWorldB.y += 0.03;
-        this._tmpWorldB.z -= 0.02;
-        this._lDesiredRoot.lerp(this._tmpWorldB, t);
-        leftGripCurl = 0.95;
+      const parts = this.weaponRig.getThrowableParts();
+      const activeStyle: SurvivalThrowStyle =
+        this.pendingThrowRelease?.style ?? (this.throwWhipTimer > 0 ? this.throwWhipStyle : this.throwStyle);
+      const isLobbing =
+        activeStyle === 'underhand' && (this.throwLmbHeld || this.throwWhipTimer > 0);
+
+      this.skeleton.leftChestBalanceAnchor.getWorldPosition(this._throwLPos);
+      this.skeleton.root.worldToLocal(this._throwLPos);
+      this.skeleton.leftEyeAimAnchor.getWorldPosition(this._throwEyeAimPos);
+      this.skeleton.root.worldToLocal(this._throwEyeAimPos);
+      this._throwHandEuler.set(guardPitch * 0.55, 0, 0, 'YXZ');
+      this._throwEyeAimPos
+        .sub(this._camLocalOrigin)
+        .applyEuler(this._throwHandEuler)
+        .add(this._camLocalOrigin);
+
+      if (spec.id === 'rgd5_frag' && this.throwStage === 'READY') {
+        leftPinchPose01 = 0;
+        leftGripCurl = 0.28;
+      } else if (spec.id === 'rgd5_frag' && this.pinPullPhase === 'REACH_PIN' && parts) {
+        const t = smoothstep(0.0, 0.16, this.pinPullElapsed);
+        parts.pinAnchor.getWorldPosition(this._throwPinPos);
+        this.skeleton.root.worldToLocal(this._throwPinPos);
+        this._throwLPos.lerp(this._throwPinPos, t);
+        leftPinchPose01 = smoothstep(0.06, 0.16, this.pinPullElapsed);
+        leftGripCurl = 0.80;
+      } else if (spec.id === 'rgd5_frag' && this.pinPullPhase === 'PULL_PIN' && parts) {
+        const t = smoothstep(0.16, 0.34, this.pinPullElapsed);
+        parts.pinAnchor.getWorldPosition(this._throwPinPos);
+        this.skeleton.root.worldToLocal(this._throwPinPos);
+        parts.bodyGroup.getWorldQuaternion(this._throwBodyQuat);
+        this._throwPullAxis
+          .copy(parts.pinPullAxis)
+          .applyQuaternion(this._throwBodyQuat)
+          .applyQuaternion(this._rootWorldQuatInv)
+          .normalize();
+        this._throwLPos.copy(this._throwPinPos).addScaledVector(this._throwPullAxis, 0.135 * t);
+        leftPinchPose01 = 1.0;
+        leftGripCurl = 0.88;
+      } else if (spec.id === 'rgd5_frag' && this.pinPullPhase === 'TUCK_POCKET' && parts) {
+        const t = smoothstep(0.34, 0.56, this.pinPullElapsed);
+        parts.pinAnchor.getWorldPosition(this._throwPinPos);
+        this.skeleton.root.worldToLocal(this._throwPinPos);
+        parts.bodyGroup.getWorldQuaternion(this._throwBodyQuat);
+        this._throwPullAxis
+          .copy(parts.pinPullAxis)
+          .applyQuaternion(this._throwBodyQuat)
+          .applyQuaternion(this._rootWorldQuatInv)
+          .normalize();
+        this._throwPinPos.addScaledVector(this._throwPullAxis, 0.135);
+        this.skeleton.leftPocketAnchor.getWorldPosition(this._throwLPos);
+        this.skeleton.root.worldToLocal(this._throwLPos);
+        this._throwLPos.lerpVectors(this._throwPinPos, this._throwLPos, t);
+        leftPinchPose01 = 1.0 - smoothstep(0.46, 0.56, this.pinPullElapsed);
+        leftGripCurl = THREE.MathUtils.lerp(0.88, 0.32, t);
+      } else if (!isLobbing) {
+        this._throwLPos.copy(this._throwEyeAimPos);
+        leftPinchPose01 = 0;
+        leftGripCurl = 0.18;
       } else {
-        this._lDesiredRoot.set(-0.15, eyeH - 0.14, -0.18);
-        this._tmpEuler.set(0.12, -0.25, 0.25, 'YXZ');
-        this._lDesiredQuatRoot.setFromEuler(this._tmpEuler);
-        leftGripCurl = 0.45;
+        leftPinchPose01 = 0;
+        leftGripCurl = 0.24;
       }
+
+      this._throwHandEuler.set(guardPitch * 0.4, -0.35, 0.42, 'YXZ');
+      this._throwLQuat.setFromEuler(this._throwHandEuler);
+      this._lDesiredRoot.copy(this._throwLPos);
+      this._lDesiredQuatRoot.copy(this._throwLQuat);
     } else if (this.actionType === 'MELEE_SWING' && !isFirearm) {
       leftOverridden = true;
       this._lDesiredRoot.set(-0.22, eyeH - 0.24, -0.02);
@@ -2257,14 +2710,24 @@ export class CharacterAnimator {
     );
     armL.hand.root.position.copy(this.leftArmIK.endPos);
     armL.hand.root.quaternion.copy(this._lQuatRoot);
-    armL.hand.root.updateMatrixWorld(true);
+    this.skeleton.root.updateMatrixWorld(true);
+    armL.hand.root.updateWorldMatrix(true, false);
 
-    // Sync physical detachable magazine & suppressor meshes into/out of left hand
+    // Sync physical detachable magazine, suppressor & grenade pull-ring meshes into/out of left hand
     this.weaponRig.weaponAnimator.syncPhysicalMagazineParent(armL.hand.root);
     this.weaponRig.weaponAnimator.syncPhysicalSuppressorParent(armL.hand.root, dt);
+    if (isThrowable) {
+      this.syncThrowablePullRingAttachment(spec);
+    }
 
     const leftHoldClass =
-      vaultPinL > 0.2 || isUnarmed ? 'unarmed' : leftOverridden ? 'melee_1h' : spec.holdClass;
+      vaultPinL > 0.2 || isUnarmed
+        ? 'unarmed'
+        : isThrowable
+          ? 'throwable'
+          : leftOverridden
+            ? 'melee_1h'
+            : spec.holdClass;
     const foregripPose =
       leftOverridden || vaultPinL > 0.2 || isUnarmed
         ? 'none'
@@ -2275,7 +2738,51 @@ export class CharacterAnimator {
       false,
       this.leftHandBlender.gripCurl,
       foregripPose,
+      leftPinchPose01 > 0.01 ? { pinchPose01: leftPinchPose01 } : undefined,
     );
+  }
+
+  private syncThrowablePullRingAttachment(spec: WeaponSpec): void {
+    const parts = this.weaponRig.getThrowableParts();
+    if (!parts) {
+      this.pullRingAttachedTo = null;
+      return;
+    }
+    const visibleInHand =
+      spec.holdClass === 'throwable' &&
+      spec.id === 'rgd5_frag' &&
+      this.throwCooldownHideTimer <= 0 &&
+      !this.pendingThrowRelease;
+
+    if (this.throwStage === 'READY' || this.pinPullPhase === 'REACH_PIN') {
+      const homeParent = parts.bodyGroup.parent;
+      if (homeParent && this.pullRingAttachedTo !== homeParent) {
+        homeParent.add(parts.pullRingMesh);
+        parts.pullRingMesh.position.set(-0.017, 0.052, 0.008);
+        parts.pullRingMesh.rotation.set(0, 0.42, 0);
+        parts.pullRingMesh.scale.setScalar(1);
+        this.pullRingAttachedTo = homeParent;
+      }
+      parts.pullRingMesh.visible = visibleInHand;
+    } else if (this.pinPullPhase === 'PULL_PIN') {
+      if (this.pullRingAttachedTo !== this.skeleton.leftPinPinchSocket) {
+        this.skeleton.leftPinPinchSocket.attach(parts.pullRingMesh);
+        this.pullRingAttachedTo = this.skeleton.leftPinPinchSocket;
+      }
+      parts.pullRingMesh.visible = visibleInHand;
+    } else if (this.pinPullPhase === 'TUCK_POCKET') {
+      if (this.pullRingAttachedTo !== this.skeleton.leftPocketAnchor && this.pinPullElapsed >= 0.48) {
+        this.skeleton.leftPocketAnchor.attach(parts.pullRingMesh);
+        this.pullRingAttachedTo = this.skeleton.leftPocketAnchor;
+      }
+      parts.pullRingMesh.visible = visibleInHand && this.pinPullElapsed < 0.50;
+    } else {
+      if (this.pullRingAttachedTo && this.pullRingAttachedTo !== this.skeleton.leftPocketAnchor) {
+        this.skeleton.leftPocketAnchor.attach(parts.pullRingMesh);
+        this.pullRingAttachedTo = this.skeleton.leftPocketAnchor;
+      }
+      parts.pullRingMesh.visible = false;
+    }
   }
 
   private computeUnarmedForearmAlignedHandQuat(

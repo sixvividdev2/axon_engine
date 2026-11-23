@@ -10,7 +10,7 @@ import { EquipSlotKind, WEAPONS, WeaponId, WeaponSpec } from '../data/weapons';
 import { ZombieManager } from './ai/ZombieManager';
 import { AudioEngine } from './audio/AudioEngine';
 import { BallisticsSystem } from './ballistics/BallisticsSystem';
-import { CharacterAnimator } from './character/CharacterAnimator';
+import { CharacterAnimator, SurvivalThrowStyle } from './character/CharacterAnimator';
 import { CharacterSkeleton } from './character/CharacterSkeleton';
 import { ControllerStateReader } from './character/ControllerStateReader';
 import {
@@ -158,6 +158,7 @@ export class GameEngine {
   private _tmpUp = new THREE.Vector3();
   private _tmpOrigin = new THREE.Vector3();
   private _throwVel = new THREE.Vector3();
+  private _tmpPlayerVel = new THREE.Vector3();
   private _muzzlePos = new THREE.Vector3();
   private _muzzleDir = new THREE.Vector3();
   private _tmpFlinch = { pitch: 0, yaw: 0 };
@@ -239,14 +240,14 @@ export class GameEngine {
     this.characterAnimator = new CharacterAnimator(this.characterSkeleton, this.weaponRig, this.audio);
     this.characterAnimator.setCallbacks({
       onMeleeImpact: (spec) => this.resolveMeleeImpact(spec),
-      onPinPulled: () => {
-        this.audio.playPinPull();
+      onLeverReleased: (_spec, spoonOrigin, spoonRight, spoonUp, spoonFwd) => {
+        this.throwables.spawnFlyingSpoon(spoonOrigin, spoonRight, spoonUp, spoonFwd, true);
       },
-      onThrowRelease: (spec, handWorldPos, remainingFuseSec) => {
-        this.spawnThrownProjectile(spec, handWorldPos, remainingFuseSec);
+      onThrowRelease: (spec, handWorldPos, remainingFuseSec, speedMps, style) => {
+        this.spawnThrownProjectile(spec, handWorldPos, remainingFuseSec, speedMps, style);
       },
       onOvercookedDetonate: (spec, handWorldPos) => {
-        this.spawnThrownProjectile(spec, handWorldPos, 0.01);
+        this.handleOvercookedThrowable(spec, handWorldPos);
       },
       onCombatShock: (pitchRad, yawRad, kickBackM) => {
         this.controller.applyRecoil(pitchRad, yawRad, kickBackM, { stanceCoupled: false });
@@ -514,6 +515,9 @@ export class GameEngine {
       isPointAim: this.controller.isPointAim,
       hasCantedOptic: this.weaponRig.hasCantedOptic(),
       laserOn: this.weaponRig.getReadOnlyRigState().laserOn,
+      throwableStatusLabel:
+        this.characterAnimator.getThrowableStatusLabel(WEAPONS[this.equippedWeaponId]) || undefined,
+      throwableLiveFuse: this.characterAnimator.isThrowableLiveFuse() || undefined,
       magCheckReadout: this.magCheckReadout ? { ...this.magCheckReadout } : null,
       toastMessage: this.toastMessage,
       recordingStartMs: this.recordingStartMs,
@@ -960,6 +964,7 @@ export class GameEngine {
     this.pendingReloadMagUid = null;
     this.pendingDepletedThrowable = null;
     this.firingHeld = false;
+    this.characterAnimator.holsterOrTossThrowable(WEAPONS[this.equippedWeaponId]);
     this.characterAnimator.cancelAction();
     this.equippedWeaponId = weaponId;
     const ws = this.getCurrentWeaponState();
@@ -2419,15 +2424,21 @@ export class GameEngine {
     spec: WeaponSpec,
     handWorldPos: THREE.Vector3,
     remainingFuseSec: number,
+    speedMps?: number,
+    style: SurvivalThrowStyle = 'overhand',
   ): void {
     const kind = spec.id === 'rgd5_frag' ? 'rgd5_frag' : 'throw_bolt';
     this.controller.getWorldLookDirection(this._tmpLook);
 
-    const speed = spec.throwVelocityMps ?? 18.5;
+    const speed = speedMps ?? spec.throwVelocityMps ?? 18.5;
     this._throwVel.copy(this._tmpLook).multiplyScalar(speed);
-    this._throwVel.y += 2.15;
+    this._throwVel.y += style === 'underhand' ? 2.1 : 2.35;
+    this.controller.getVelocity(this._tmpPlayerVel);
+    this._throwVel.x += this._tmpPlayerVel.x * 0.48;
+    this._throwVel.y += this._tmpPlayerVel.y * 0.30;
+    this._throwVel.z += this._tmpPlayerVel.z * 0.48;
 
-    this._tmpOrigin.copy(handWorldPos).addScaledVector(this._tmpLook, 0.18);
+    this._tmpOrigin.copy(handWorldPos).addScaledVector(this._tmpLook, 0.14);
     this.throwables.spawnThrowable(kind, this._tmpOrigin, this._throwVel, remainingFuseSec);
     this.audio.playWhoosh(kind === 'rgd5_frag');
 
@@ -2441,6 +2452,26 @@ export class GameEngine {
       }
       this.emitSnapshot(true);
     }
+  }
+
+  private handleOvercookedThrowable(spec: WeaponSpec, handWorldPos: THREE.Vector3): void {
+    if (spec.consumableOnThrow && spec.itemId) {
+      const placed = this.inventoryManager.findItemByItemIdPriority(spec.itemId, ['rig', 'pockets', 'backpack']);
+      if (placed) {
+        this.inventoryManager.consumeQuantityByUid(placed.item.uid, 1);
+      }
+      if (this.inventoryManager.getItemQuantity(spec.itemId) <= 0) {
+        this.pendingDepletedThrowable = spec.id;
+      }
+    }
+    this.controller.setGrenadeTension(0, false, 'underhand');
+    this.throwables.detonateAt(handWorldPos, this.world, this.controller.position, (dmg, bleed, orig) => {
+      this.applyPlayerBlastDamage(dmg, bleed, orig);
+    });
+    this.controller.applyRecoil(0.28, (Math.random() - 0.5) * 0.32, 0.055, {
+      stanceCoupled: false,
+    });
+    this.emitSnapshot(true);
   }
 
   private handlePlayerDeath(): void {
@@ -2673,6 +2704,13 @@ export class GameEngine {
         this._survivalMods.exertionRateMult = enc.exertionRateMult * vitalsRes.exertionRateMult;
         this._survivalMods.moveSpeedMult = enc.moveSpeedMult * vitalsRes.moveSpeedMult;
         this._survivalMods.canSprint = enc.canSprint && vitalsRes.canSprintVitals;
+
+        const tTension = this.characterAnimator.getThrowableTension();
+        this.controller.setGrenadeTension(
+          tTension.charge01,
+          tTension.liveCook,
+          tTension.throwStyle,
+        );
 
         this.controller.update(
           delta,
@@ -3153,8 +3191,10 @@ export class GameEngine {
           this.showToast('No grenades remaining');
           return;
         }
-        if (this.characterAnimator.triggerThrowPrep(wSpec)) {
-          this.audio.playReloadFoley('check');
+        if (!this.characterAnimator.beginThrowInput(wSpec)) {
+          if (wSpec.id === 'rgd5_frag') {
+            this.showToast('Pull pin with [RMB] first');
+          }
         }
       } else {
         this.firingHeld = true;
@@ -3181,6 +3221,17 @@ export class GameEngine {
       this.emitSnapshot(true);
     } else if (e.button === 2) {
       this.characterAnimator.interruptInspect();
+      const wSpec = WEAPONS[this.equippedWeaponId];
+      if (wSpec?.holdClass === 'throwable') {
+        this.input.ads = false;
+        this.input.sprint = false;
+        if (wSpec.id === 'rgd5_frag') {
+          if (!this.characterAnimator.pullThrowablePin(wSpec)) {
+            this.characterAnimator.releaseThrowableLever(wSpec);
+          }
+        }
+        return;
+      }
       this.input.ads = true;
       this.input.sprint = false;
     }
@@ -3196,8 +3247,8 @@ export class GameEngine {
     if (e.button === 0) {
       this.firingHeld = false;
       const wSpec = WEAPONS[this.equippedWeaponId];
-      if (wSpec.holdClass === 'throwable' && this.characterAnimator.getActiveAction() === 'THROW_PREP') {
-        this.characterAnimator.triggerThrowRelease(wSpec);
+      if (wSpec.holdClass === 'throwable') {
+        this.characterAnimator.releaseThrowInput(wSpec);
       }
     } else if (e.button === 2) {
       this.input.ads = false;
@@ -3234,8 +3285,14 @@ export class GameEngine {
     this.pointerLocked = document.pointerLockElement === this.renderer.domElement;
     if (!this.pointerLocked) {
       this.clearMovementInputs();
+      this.characterAnimator.resetThrowableInputOnFocusLoss();
     }
     this.emitSnapshot(true);
+  };
+
+  private onWindowBlur = (): void => {
+    this.clearMovementInputs();
+    this.characterAnimator.resetThrowableInputOnFocusLoss();
   };
 
   private onResize = (): void => {
@@ -3259,6 +3316,7 @@ export class GameEngine {
     window.addEventListener('auxclick', this.onAuxClick);
     window.addEventListener('wheel', this.onWheel, { passive: false });
     window.addEventListener('resize', this.onResize);
+    window.addEventListener('blur', this.onWindowBlur);
     document.addEventListener('pointerlockchange', this.onPointerLockChange);
     const canvas = this.renderer.domElement;
     canvas.addEventListener('mousedown', this.onMouseDown);
@@ -3278,6 +3336,7 @@ export class GameEngine {
     window.removeEventListener('auxclick', this.onAuxClick);
     window.removeEventListener('wheel', this.onWheel);
     window.removeEventListener('resize', this.onResize);
+    window.removeEventListener('blur', this.onWindowBlur);
     document.removeEventListener('pointerlockchange', this.onPointerLockChange);
     const canvas = this.renderer.domElement;
     canvas.removeEventListener('mousedown', this.onMouseDown);

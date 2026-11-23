@@ -88,22 +88,22 @@ export const GymHud: React.FC<GymHudProps> = ({
         />
       )}
 
-      {/* Authentic 4-Stage Grenade Manual of Arms Prompt (No exact millisecond fuse readout) */}
+      {/* Authentic 4-Stage Grenade Manual of Arms Prompt (Zero HUD power/cook bar) */}
       {snapshot.grenadeHoldStage !== 'HOLSTERED' && !gunsmithOpen && (
         <div
-          className={`pointer-events-none fixed top-[58%] left-1/2 z-30 w-72 -translate-x-1/2 border px-3 py-1.5 font-mono-tabular ${
+          className={`pointer-events-none fixed top-[58%] left-1/2 z-30 w-80 -translate-x-1/2 border px-3 py-1.5 font-mono-tabular ${
             snapshot.grenadeHoldStage === 'LEVER_RELEASED'
-              ? 'border-red-500/85 bg-neutral-950/92'
+              ? 'animate-pulse border-red-500/90 bg-red-950/60'
               : snapshot.grenadeHoldStage === 'PIN_PULLED'
                 ? 'border-amber-400/85 bg-neutral-950/92'
                 : 'border-neutral-600/90 bg-neutral-950/90'
           }`}
         >
-          <div className="flex items-center justify-between text-[10px] uppercase tracking-wider">
+          <div className="flex items-center justify-between gap-2 text-[10px] uppercase tracking-wider">
             <span
               className={
                 snapshot.grenadeHoldStage === 'LEVER_RELEASED'
-                  ? 'font-semibold text-red-400'
+                  ? 'font-semibold text-red-300'
                   : snapshot.grenadeHoldStage === 'PIN_PULLED'
                     ? 'font-semibold text-amber-300'
                     : 'font-semibold text-neutral-100'
@@ -116,27 +116,28 @@ export const GymHud: React.FC<GymHudProps> = ({
                   ? ' · PIN PULLED'
                   : ' · LIVE FUSE'}
             </span>
-            <span className="text-neutral-300">
+            <span className="text-neutral-200">
               {snapshot.grenadeHoldStage === 'DRAWN'
-                ? 'HOLD LMB PIN · [H] STOW'
+                ? 'RMB PIN · [H] STOW'
                 : snapshot.grenadeHoldStage === 'PIN_PULLED'
-                  ? 'RMB LEVER · REL LMB THROW'
-                  : 'RELEASE LMB TO THROW'}
+                  ? 'RMB SPOON · LMB LOB/HOLD'
+                  : snapshot.grenadeThrowHeld && snapshot.grenadeThrowStyle === 'overhand'
+                    ? 'REL LMB OVERHAND'
+                    : 'LMB LOB / HOLD'}
             </span>
           </div>
           {snapshot.grenadeHoldStage === 'PIN_PULLED' && (
-            <div className="mt-1 text-[9px] uppercase tracking-wider text-neutral-400">
-              Safety lever gripped — chemical delay NOT burning
+            <div className="mt-1 text-[9px] uppercase tracking-wider text-neutral-300">
+              {snapshot.grenadeThrowHeld
+                ? `Charging ${snapshot.grenadeThrowStyle === 'overhand' ? 'OVERHAND' : 'LOB'} — Release LMB`
+                : 'Safety lever gripped — chemical delay NOT burning'}
             </div>
           )}
           {snapshot.grenadeHoldStage === 'LEVER_RELEASED' && (
-            <div className="mt-1.5 h-1.5 w-full overflow-hidden bg-neutral-800">
-              <div
-                className={
-                  snapshot.grenadeCookRatio > 0.68 ? 'h-full bg-red-500' : 'h-full bg-amber-400'
-                }
-                style={{ width: `${Math.min(100, Math.round(snapshot.grenadeCookRatio * 100))}%` }}
-              />
+            <div className="mt-1 text-[9px] uppercase tracking-wider text-red-200">
+              {snapshot.grenadeThrowHeld
+                ? `LIVE FUSE — Charging ${snapshot.grenadeThrowStyle === 'overhand' ? 'OVERHAND' : 'LOB'} — Release LMB`
+                : 'Spoon detached — chemical delay burning'}
             </div>
           )}
         </div>
@@ -393,7 +394,7 @@ export const GymHud: React.FC<GymHudProps> = ({
                 <span className="text-neutral-200">L / Alt+L</span> Red / IR Laser
               </div>
               <div>
-                <span className="text-neutral-200">H / 5</span> Draw · LMB Pin · RMB Lever
+                <span className="text-neutral-200">H / 5</span> Draw · RMB Pin · RMB Spoon · LMB Throw
               </div>
               <div>
                 <span className="text-neutral-200">F / T / G</span> Flashlight &amp; Supp.

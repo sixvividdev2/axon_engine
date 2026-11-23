@@ -100,6 +100,17 @@ export const HudOverlay: React.FC<HudOverlayProps> = ({
               {snapshot.toastMessage}
             </span>
           )}
+          {snapshot.mode === 'playing' && snapshot.throwableStatusLabel && (
+            <span
+              className={`px-2.5 py-1 border font-mono-tabular text-[11px] uppercase tracking-wider ${
+                snapshot.throwableLiveFuse
+                  ? 'animate-pulse border-red-500/85 bg-red-950/75 text-red-200'
+                  : 'border-amber-400/75 bg-neutral-950/90 text-amber-200'
+              }`}
+            >
+              {snapshot.throwableStatusLabel}
+            </span>
+          )}
           {snapshot.mode === 'playing' && (
             <div className="flex flex-wrap items-center gap-1.5 text-[10px] font-mono-tabular text-neutral-400">
               {(

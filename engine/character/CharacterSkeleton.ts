@@ -163,6 +163,11 @@ export class CharacterSkeleton {
 
   /** Chest pouch target anchor in chest local space (used for RELOAD left-hand reach) */
   public readonly magPouchAnchor = new THREE.Object3D();
+  public readonly throwHandSocket = new THREE.Object3D();
+  public readonly leftPinPinchSocket = new THREE.Object3D();
+  public readonly leftPocketAnchor = new THREE.Object3D();
+  public readonly leftEyeAimAnchor = new THREE.Object3D();
+  public readonly leftChestBalanceAnchor = new THREE.Object3D();
 
   public readonly leftArm: ArticulatedArm;
   public readonly rightArm: ArticulatedArm;
@@ -496,6 +501,26 @@ export class CharacterSkeleton {
     // --- Articulated Arms (Clavicles, Upper Arms, Forearms, Articulated Hands) ---
     this.leftArm = this.buildArm(-1, 0.31, 0.29);
     this.rightArm = this.buildArm(1, 0.31, 0.29);
+
+    this.throwHandSocket.name = 'throw_hand_socket';
+    this.throwHandSocket.position.set(0, -0.026, -0.042);
+    this.rightArm.hand.root.add(this.throwHandSocket);
+
+    this.leftPinPinchSocket.name = 'left_pin_pinch_socket';
+    this.leftPinPinchSocket.position.set(0.015, -0.014, -0.092);
+    this.leftArm.hand.root.add(this.leftPinPinchSocket);
+
+    this.leftPocketAnchor.name = 'left_pocket_anchor';
+    this.leftPocketAnchor.position.set(-0.172, -0.08, -0.02);
+    this.pelvis.add(this.leftPocketAnchor);
+
+    this.leftEyeAimAnchor.name = 'left_eye_aim_anchor';
+    this.leftEyeAimAnchor.position.set(-0.145, 0.015, -0.44);
+    this.chest.add(this.leftEyeAimAnchor);
+
+    this.leftChestBalanceAnchor.name = 'left_chest_balance_anchor';
+    this.leftChestBalanceAnchor.position.set(-0.155, -0.14, -0.26);
+    this.chest.add(this.leftChestBalanceAnchor);
 
     // --- Articulated Legs (Thighs, Shins, Boots) ---
     this.leftLeg = this.buildLeg(-1, 0.41, 0.40, 0.085);
@@ -989,21 +1014,64 @@ export class CharacterSkeleton {
     triggerPulledOrAds: boolean,
     customCurl = 0.85,
     foregripStyle: 'none' | 'vertical' | 'angled' = 'none',
+    opts?: {
+      leverReleased?: boolean;
+      pinchPose01?: number;
+    },
   ): void {
     const hand = side === 'left' ? this.leftArm.hand : this.rightArm.hand;
     const s = hand.side;
     const scale = THREE.MathUtils.clamp(customCurl, 0, 1.15);
+    const pinchPose01 = THREE.MathUtils.clamp(opts?.pinchPose01 ?? 0, 0, 1);
 
     const setFinger = (
       f: ArticulatedFinger,
       proxDeg: number,
       midDeg: number,
       distDeg: number,
+      splayRad = 0,
     ): void => {
       f.proximal.rotation.x = -THREE.MathUtils.degToRad(proxDeg);
+      f.proximal.rotation.y = splayRad;
       f.middle.rotation.x = -THREE.MathUtils.degToRad(midDeg);
       f.distal.rotation.x = -THREE.MathUtils.degToRad(distDeg);
     };
+
+    if (side === 'left' && pinchPose01 > 0.01) {
+      const p = pinchPose01;
+      setFinger(
+        hand.index,
+        THREE.MathUtils.lerp(24 * scale, 48, p),
+        THREE.MathUtils.lerp(34 * scale, 54, p),
+        THREE.MathUtils.lerp(20 * scale, 26, p),
+        s * 0.12 * p,
+      );
+      setFinger(
+        hand.middle,
+        THREE.MathUtils.lerp(28 * scale, 56, p),
+        THREE.MathUtils.lerp(38 * scale, 68, p),
+        THREE.MathUtils.lerp(24 * scale, 44, p),
+      );
+      setFinger(
+        hand.ring,
+        THREE.MathUtils.lerp(31 * scale, 64, p),
+        THREE.MathUtils.lerp(41 * scale, 74, p),
+        THREE.MathUtils.lerp(26 * scale, 48, p),
+      );
+      setFinger(
+        hand.pinky,
+        THREE.MathUtils.lerp(34 * scale, 68, p),
+        THREE.MathUtils.lerp(44 * scale, 78, p),
+        THREE.MathUtils.lerp(28 * scale, 52, p),
+      );
+      hand.thumbProx.rotation.set(
+        THREE.MathUtils.lerp(-0.08, -0.34, p),
+        s * THREE.MathUtils.lerp(0.22, 0.56, p),
+        s * THREE.MathUtils.lerp(0.10, -0.08, p),
+      );
+      hand.thumbDist.rotation.set(THREE.MathUtils.lerp(-0.22, -0.44, p), 0, 0);
+      return;
+    }
 
     const isFirearm = holdClass === 'pistol' || holdClass === 'rifle' || holdClass === 'shotgun';
 
@@ -1067,13 +1135,37 @@ export class CharacterSkeleton {
     }
 
     if (holdClass === 'throwable') {
-      // Spherical palm cup cradling grenade or hex bolt
-      setFinger(hand.index, 24 * scale, 34 * scale, 22 * scale);
-      setFinger(hand.middle, 28 * scale, 38 * scale, 25 * scale);
-      setFinger(hand.ring, 31 * scale, 41 * scale, 27 * scale);
-      setFinger(hand.pinky, 34 * scale, 44 * scale, 29 * scale);
-      hand.thumbProx.rotation.set(-0.24, s * 0.48, -s * 0.16);
-      hand.thumbDist.rotation.set(-0.48, 0, 0);
+      if (side === 'right') {
+        const leverLift = opts?.leverReleased ? 14 : 0;
+        setFinger(hand.index, 46 * scale, 60 * scale, 36 * scale);
+        setFinger(
+          hand.middle,
+          Math.max(12, 54 * scale - leverLift),
+          Math.max(16, 66 * scale - leverLift),
+          Math.max(10, 42 * scale - leverLift * 0.6),
+        );
+        setFinger(
+          hand.ring,
+          Math.max(12, 58 * scale - leverLift),
+          Math.max(16, 70 * scale - leverLift),
+          Math.max(10, 44 * scale - leverLift * 0.6),
+        );
+        setFinger(
+          hand.pinky,
+          Math.max(12, 60 * scale - leverLift),
+          Math.max(16, 72 * scale - leverLift),
+          Math.max(10, 46 * scale - leverLift * 0.6),
+        );
+        hand.thumbProx.rotation.set(-0.24, s * 0.44, -s * 0.14);
+        hand.thumbDist.rotation.set(-0.42, 0, 0);
+      } else {
+        setFinger(hand.index, 12, 16, 10, -s * 0.04);
+        setFinger(hand.middle, 15, 20, 12);
+        setFinger(hand.ring, 18, 24, 14);
+        setFinger(hand.pinky, 22, 28, 16, s * 0.04);
+        hand.thumbProx.rotation.set(0.06, s * 0.24, s * 0.08);
+        hand.thumbDist.rotation.set(-0.14, 0, 0);
+      }
       return;
     }
 

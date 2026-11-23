@@ -1522,7 +1522,7 @@ export class AudioEngine implements IBodycamAudioSource {
     if (!this.ctx || !this.dryBus) return;
     const t = this.ctx.currentTime;
 
-    // Sharp metallic ring-twist + spoon spring click
+    // Sharp metallic ring-twist + pin extraction snap
     const ring = this.ctx.createOscillator();
     ring.type = 'triangle';
     ring.frequency.setValueAtTime(2850, t);
@@ -1534,18 +1534,55 @@ export class AudioEngine implements IBodycamAudioSource {
     rg.connect(this.dryBus);
     ring.start(t);
     ring.stop(t + 0.08);
+  }
 
-    const spoon = this.ctx.createOscillator();
-    spoon.type = 'square';
-    spoon.frequency.setValueAtTime(1900, t + 0.045);
-    spoon.frequency.exponentialRampToValueAtTime(720, t + 0.075);
+  public playGrenadePinPull(): void {
+    this.playPinPull();
+  }
+
+  public playGrenadeLeverSnap(): void {
+    this.ensureInitialized();
+    if (!this.ctx || !this.dryBus || !this.noiseBuffer) return;
+    const t = this.ctx.currentTime;
+
+    // Crisp striker snap + metallic spoon ping + soft fuse hiss kick
+    const snap = this.ctx.createOscillator();
+    snap.type = 'square';
+    snap.frequency.setValueAtTime(2350, t);
+    snap.frequency.exponentialRampToValueAtTime(760, t + 0.036);
     const sg = this.ctx.createGain();
-    sg.gain.setValueAtTime(0.18, t + 0.045);
-    sg.gain.exponentialRampToValueAtTime(0.001, t + 0.08);
-    spoon.connect(sg);
+    sg.gain.setValueAtTime(0.22, t);
+    sg.gain.exponentialRampToValueAtTime(0.001, t + 0.042);
+    snap.connect(sg);
     sg.connect(this.dryBus);
-    spoon.start(t + 0.045);
-    spoon.stop(t + 0.085);
+    snap.start(t);
+    snap.stop(t + 0.05);
+
+    const ping = this.ctx.createOscillator();
+    ping.type = 'triangle';
+    ping.frequency.setValueAtTime(3600, t + 0.02);
+    ping.frequency.exponentialRampToValueAtTime(1950, t + 0.085);
+    const pg = this.ctx.createGain();
+    pg.gain.setValueAtTime(0.14, t + 0.02);
+    pg.gain.exponentialRampToValueAtTime(0.001, t + 0.095);
+    ping.connect(pg);
+    pg.connect(this.dryBus);
+    ping.start(t + 0.02);
+    ping.stop(t + 0.10);
+
+    const fizz = this.ctx.createBufferSource();
+    fizz.buffer = this.noiseBuffer;
+    const hp = this.ctx.createBiquadFilter();
+    hp.type = 'bandpass';
+    hp.frequency.value = 3200;
+    hp.Q.value = 1.4;
+    const fg = this.ctx.createGain();
+    fg.gain.setValueAtTime(0.065, t + 0.025);
+    fg.gain.exponentialRampToValueAtTime(0.001, t + 0.22);
+    fizz.connect(hp);
+    hp.connect(fg);
+    fg.connect(this.dryBus);
+    fizz.start(t + 0.025, 0, 0.24);
   }
 
   public playWhoosh(heavy = false): void {

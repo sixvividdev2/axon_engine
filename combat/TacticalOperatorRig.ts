@@ -82,6 +82,12 @@ export interface TacticalCombatPose {
   handlingAction?: SyncedHandlingAction;
   /** Normalized 0..1 progress through active handling action */
   handlingProgress?: number;
+  /** Equipped tactical ordnance ID when performing a GRENADE_* handling action */
+  grenadeEquipmentId?: TacticalEquipmentId;
+  /** Normalized 0..1 throw tension / windup charge */
+  grenadeCharge01?: number;
+  /** Active grenade throw posture ('overhand' | 'underhand') */
+  grenadeThrowStyle?: 'overhand' | 'underhand';
 }
 
 export interface BuiltTacticalOperatorRig {
@@ -993,12 +999,41 @@ export class TacticalOperatorRigFactory {
     let baseSuppVisible = false;
     let isUnarmedWeapon = false;
 
+    // Right-palm grenade mount for 3P bone-driven ordnance animations (pin pull, cook, charge, throw)
+    const grenadeHoldMount = new THREE.Group();
+    grenadeHoldMount.name = 'grenadeHoldMount';
+    grenadeHoldMount.position.set(0, -lowerArmLen - 0.025, -0.022);
+    grenadeHoldMount.rotation.set(0.28, 0, 0);
+    grenadeHoldMount.visible = false;
+    rightArmParts.forearmPivot.add(grenadeHoldMount);
+
+    const heldGrenadeMeshes = new Map<TacticalEquipmentId, BuiltTacticalEquipmentMesh>();
+    const ensureHeldGrenadeMesh = (eqId: TacticalEquipmentId): BuiltTacticalEquipmentMesh => {
+      let existing = heldGrenadeMeshes.get(eqId);
+      if (!existing) {
+        existing = buildTacticalEquipmentMesh(eqId, {
+          withBeltClip: false,
+          scale: 1.08,
+          renderLayer: 0,
+        });
+        existing.group.visible = false;
+        grenadeHoldMount.add(existing.group);
+        heldGrenadeMeshes.set(eqId, existing);
+      }
+      return existing;
+    };
+
     const disposeWeapon = (): void => {
       if (weaponAsm) {
         weaponPivot.remove(weaponAsm.group);
         weaponAsm.dispose();
         weaponAsm = null;
       }
+      for (const built of heldGrenadeMeshes.values()) {
+        grenadeHoldMount.remove(built.group);
+        built.dispose();
+      }
+      heldGrenadeMeshes.clear();
       currentWeaponSig = '';
     };
 
@@ -1282,25 +1317,60 @@ export class TacticalOperatorRigFactory {
       pelvisGroup.position.set(0, vaultPelvisY, 0);
       pelvisGroup.rotation.set(0, 0, 0);
 
-      // 2. Upper Body lean, crouch forward cant, vault athletic pitch, and hit flinch
+      const hAct: SyncedHandlingAction =
+        pose.handlingAction && pose.handlingAction !== 'NONE'
+          ? pose.handlingAction
+          : reload > 0.05
+            ? 'RELOAD'
+            : 'NONE';
+      const hProg = THREE.MathUtils.clamp(pose.handlingProgress ?? 0, 0, 1);
+      const isGrenadeAct =
+        hAct === 'GRENADE_DRAW' ||
+        hAct === 'GRENADE_PIN_PULL' ||
+        hAct === 'GRENADE_COOK' ||
+        hAct === 'GRENADE_CHARGE' ||
+        hAct === 'GRENADE_THROW_OVERHAND' ||
+        hAct === 'GRENADE_THROW_UNDERHAND';
+      const gCharge = THREE.MathUtils.clamp(pose.grenadeCharge01 ?? 0, 0, 1);
+      const isGrenadeOverhand = (pose.grenadeThrowStyle ?? 'overhand') === 'overhand';
+
+      // 2. Upper Body lean, crouch forward cant, vault athletic pitch, grenade torso coil, and hit flinch
+      let grenadeTorsoYaw = 0;
+      let grenadeTorsoPitch = 0;
+      if (isGrenadeAct) {
+        if (hAct === 'GRENADE_CHARGE' && isGrenadeOverhand) {
+          grenadeTorsoYaw = -0.28 * gCharge;
+          grenadeTorsoPitch = 0.06 * gCharge;
+        } else if (hAct === 'GRENADE_THROW_OVERHAND') {
+          const whip = smoothstep3P(0.0, 0.34, hProg);
+          const rec = smoothstep3P(0.38, 1.0, hProg);
+          grenadeTorsoYaw = THREE.MathUtils.lerp(-0.28, 0.24, whip) * (1 - rec);
+          grenadeTorsoPitch = -0.14 * whip * (1 - rec);
+        } else if (hAct === 'GRENADE_THROW_UNDERHAND') {
+          const whip = smoothstep3P(0.0, 0.32, hProg);
+          const rec = smoothstep3P(0.36, 1.0, hProg);
+          grenadeTorsoYaw = 0.09 * whip * (1 - rec);
+          grenadeTorsoPitch = -0.07 * whip * (1 - rec);
+        }
+      }
       const crouchTorsoForward = -crouch * 0.12;
       const vaultTorsoForward = -vaultW * (vaultPeak * 0.36 + (isHighMantle ? 0.18 * vaultPeak : 0));
       const vaultRoll = vaultW * vaultPeak * (isHighMantle ? 0.04 : 0.18);
       upperBody.position.set(lean * 0.06 * (1 - vaultW), 0.035, -vaultW * vaultPeak * 0.05);
       upperBody.rotation.set(
-        crouchTorsoForward + vaultTorsoForward + pose.flinchPitch,
-        0,
+        crouchTorsoForward + vaultTorsoForward + pose.flinchPitch + grenadeTorsoPitch,
+        grenadeTorsoYaw,
         -lean * 0.24 * (1 - vaultW) + vaultRoll,
       );
 
       // 3. Head aim pitch tracking + subtle cheek-weld roll
-      const cheekWeldRoll = (ads - pointAim * 0.35) * 0.11 * (1 - vaultW);
+      const cheekWeldRoll = (ads - pointAim * 0.35) * 0.11 * (1 - vaultW) * (isGrenadeAct ? 0 : 1);
       headGroup.rotation.set(pitch * 0.76 * (1 - vaultW * 0.6) - vaultW * vaultPeak * 0.18, 0, -cheekWeldRoll);
 
       // 4. Local weaponSocket placement on upper chest / right shoulder ready-mount
-      const effAds = ads * (1 - vaultW);
-      const effPointAim = pointAim * (1 - vaultW);
-      const effCant = cant * (1 - vaultW);
+      const effAds = ads * (1 - vaultW) * (isGrenadeAct ? 0 : 1);
+      const effPointAim = pointAim * (1 - vaultW) * (isGrenadeAct ? 0 : 1);
+      const effCant = cant * (1 - vaultW) * (isGrenadeAct ? 0 : 1);
       const primaryAdsW = Math.max(0, effAds - Math.max(effPointAim, effCant));
       const cantW = Math.max(effPointAim, effCant);
 
@@ -1322,13 +1392,6 @@ export class TacticalOperatorRigFactory {
       wz = THREE.MathUtils.lerp(wz, -0.135, cantW);
       wepYaw = THREE.MathUtils.lerp(wepYaw, 0.04, cantW);
 
-      const hAct: SyncedHandlingAction =
-        pose.handlingAction && pose.handlingAction !== 'NONE'
-          ? pose.handlingAction
-          : reload > 0.05
-            ? 'RELOAD'
-            : 'NONE';
-      const hProg = THREE.MathUtils.clamp(pose.handlingProgress ?? 0, 0, 1);
       const isSuppAct = hAct === 'SUPPRESSOR_DETACH' || hAct === 'SUPPRESSOR_ATTACH';
       const suppEnv = isSuppAct
         ? smoothstep3P(0.0, 0.12, hProg) * (1 - smoothstep3P(0.88, 1.0, hProg))
@@ -1483,98 +1546,204 @@ export class TacticalOperatorRigFactory {
         }
       }
 
-      // 5. Two-bone Arm IK in upperBody local space -> hands stay locked on real weapon sockets
+      // 5. Two-bone Arm IK in upperBody local space -> hands stay locked on real weapon sockets (or grenade throw/pin/cook)
       _shR.set(shoulderX, shoulderY, -0.015);
       _shL.set(-shoulderX, shoulderY, -0.015);
       _pouchLocal.set(-0.07 * torsoW, 0.21, -0.145 * chestD);
 
-      if (isUnarmedWeapon) {
-        _gripR.set(shoulderX * 0.85, 0.28, -0.22);
-        _gripL.set(-shoulderX * 0.85, 0.28, -0.22);
-      } else {
-        _gripR.copy(rightGripLocal).applyQuaternion(weaponSocket.quaternion).add(weaponSocket.position);
-        _sockTmp.copy(leftHandguardLocal);
-        _sockTmp.z += pumpTravelZ;
-        _gripL.copy(_sockTmp).applyQuaternion(weaponSocket.quaternion).add(weaponSocket.position);
-      }
+      if (isGrenadeAct) {
+        weaponPivot.visible = false;
+        const throwingReleased =
+          (hAct === 'GRENADE_THROW_OVERHAND' || hAct === 'GRENADE_THROW_UNDERHAND') &&
+          hProg > 0.30;
+        grenadeHoldMount.visible = !throwingReleased;
 
-      // Replicate active firearm handling animations on 3P hands
-      if (!isUnarmedWeapon && vaultW < 0.25) {
-        if (hAct === 'RELOAD') {
-          _handAuxL.copy(magWellLocal).applyQuaternion(weaponSocket.quaternion).add(weaponSocket.position);
-          if (hProg > 0.001) {
-            if (hProg < 0.16) {
-              _gripL.lerp(_handAuxL, smoothstep3P(0.0, 0.16, hProg));
-            } else if (hProg < 0.38) {
-              _gripL.copy(_handAuxL).lerp(_pouchLocal, smoothstep3P(0.16, 0.38, hProg));
-            } else if (hProg < 0.48) {
-              _gripL.copy(_pouchLocal);
-            } else if (hProg < 0.66) {
-              _gripL.copy(_pouchLocal).lerp(_handAuxL, smoothstep3P(0.48, 0.66, hProg));
-            } else if (hProg < 0.86) {
-              _sockTmp.copy(boltRackLocal).applyQuaternion(weaponSocket.quaternion).add(weaponSocket.position);
-              _gripL.copy(_handAuxL).lerp(_sockTmp, smoothstep3P(0.66, 0.76, hProg));
-            } else {
-              _sockTmp.copy(boltRackLocal).applyQuaternion(weaponSocket.quaternion).add(weaponSocket.position);
-              _gripL.lerp(_sockTmp, 1 - smoothstep3P(0.86, 1.0, hProg));
-            }
-          } else if (effReload > 0.005) {
-            _reloadL.copy(_pouchLocal);
-            _gripL.lerp(_reloadL, effReload);
-          }
-        } else if (hAct === 'SUPPRESSOR_DETACH') {
-          _handAuxL.copy(suppGripLocal).applyQuaternion(weaponSocket.quaternion).add(weaponSocket.position);
-          if (hProg < 0.14) {
-            _gripL.lerp(_handAuxL, smoothstep3P(0.0, 0.14, hProg));
-          } else if (hProg < 0.72) {
-            _gripL.copy(_handAuxL);
-          } else if (hProg < 0.88) {
-            _gripL.copy(_handAuxL).lerp(_pouchLocal, smoothstep3P(0.72, 0.88, hProg));
-          } else {
-            _gripL.lerp(_pouchLocal, 1 - smoothstep3P(0.88, 1.0, hProg));
-          }
-        } else if (hAct === 'SUPPRESSOR_ATTACH') {
-          _handAuxL.copy(suppGripLocal).applyQuaternion(weaponSocket.quaternion).add(weaponSocket.position);
-          if (hProg < 0.16) {
-            _gripL.lerp(_pouchLocal, smoothstep3P(0.0, 0.16, hProg));
-          } else if (hProg < 0.30) {
-            _gripL.copy(_pouchLocal).lerp(_handAuxL, smoothstep3P(0.16, 0.30, hProg));
-          } else if (hProg < 0.86) {
-            _gripL.copy(_handAuxL);
-          } else {
-            _gripL.lerp(_handAuxL, 1 - smoothstep3P(0.86, 1.0, hProg));
-          }
-        } else if (hAct === 'BOLT') {
-          const bEnv = smoothstep3P(0.0, 0.20, hProg) * (1 - smoothstep3P(0.80, 1.0, hProg));
-          const bPull = Math.sin(smoothstep3P(0.20, 0.80, hProg) * Math.PI) * 0.065;
-          _sockTmp.copy(boltHandleLocal);
-          _sockTmp.z += bPull;
-          _handAuxR.copy(_sockTmp).applyQuaternion(weaponSocket.quaternion).add(weaponSocket.position);
-          _gripR.lerp(_handAuxR, bEnv);
-        } else if (
-          hAct === 'ZOOM_TWIST' ||
-          hAct === 'TURRET' ||
-          hAct === 'ILLUM' ||
-          hAct === 'LIGHT_PAD' ||
-          hAct === 'SELECTOR' ||
-          hAct === 'MAG_CHECK'
-        ) {
-          const mEnv = smoothstep3P(0.0, 0.25, hProg) * (1 - smoothstep3P(0.72, 1.0, hProg));
-          const targetSock =
-            hAct === 'ZOOM_TWIST'
-              ? zoomRingLocal
-              : hAct === 'TURRET'
-                ? turretLocal
-                : hAct === 'ILLUM'
-                  ? illumLocal
-                  : hAct === 'LIGHT_PAD'
-                    ? padLocal
-                    : hAct === 'SELECTOR'
-                      ? selectorLocal
-                      : magWellLocal;
-          _handAuxL.copy(targetSock).applyQuaternion(weaponSocket.quaternion).add(weaponSocket.position);
-          _gripL.lerp(_handAuxL, mEnv);
+        const activeEqId = pose.grenadeEquipmentId ?? DEFAULT_TACTICAL_EQUIPMENT_ID;
+        const activeGMesh = ensureHeldGrenadeMesh(activeEqId);
+        for (const [id, mesh] of heldGrenadeMeshes.entries()) {
+          mesh.group.visible = id === activeEqId && !throwingReleased;
         }
+        const pinStillIn =
+          hAct === 'GRENADE_DRAW' || (hAct === 'GRENADE_PIN_PULL' && hProg < 0.72);
+        const spoonStillOn = hAct === 'GRENADE_DRAW' || hAct === 'GRENADE_PIN_PULL';
+        activeGMesh.pullRingMesh.visible = pinStillIn;
+        activeGMesh.spoonGroup.visible = spoonStillOn;
+
+        // 3P 2-bone IK targets & elbow poles across Draw / Pin-Pull / Cook / Charge / Throw
+        _poleR.set(shoulderX + 0.22, shoulderY - 0.32, 0.14);
+        _poleL.set(-shoulderX - 0.18, shoulderY - 0.34, 0.06);
+
+        if (hAct === 'GRENADE_DRAW') {
+          const t = smoothstep3P(0.0, 1.0, hProg);
+          _gripR.set(
+            THREE.MathUtils.lerp(0.18 * torsoW, 0.13 * torsoW, t),
+            THREE.MathUtils.lerp(0.14, 0.36, t),
+            THREE.MathUtils.lerp(-0.10, -0.32, t),
+          );
+          _gripL.set(-0.14 * torsoW, THREE.MathUtils.lerp(0.24, 0.30, t), -0.24);
+        } else if (hAct === 'GRENADE_PIN_PULL') {
+          _gripR.set(0.09 * torsoW, 0.37, -0.34);
+          if (hProg < 0.34) {
+            const reachT = smoothstep3P(0.0, 0.34, hProg);
+            _gripL.set(
+              THREE.MathUtils.lerp(-0.14 * torsoW, 0.06 * torsoW, reachT),
+              THREE.MathUtils.lerp(0.30, 0.39, reachT),
+              THREE.MathUtils.lerp(-0.24, -0.34, reachT),
+            );
+          } else if (hProg < 0.72) {
+            const pullT = smoothstep3P(0.34, 0.72, hProg);
+            _gripL.set(
+              THREE.MathUtils.lerp(0.06 * torsoW, -0.10 * torsoW, pullT),
+              THREE.MathUtils.lerp(0.39, 0.37, pullT),
+              -0.34,
+            );
+          } else {
+            const tuckT = smoothstep3P(0.72, 1.0, hProg);
+            _gripL.set(
+              THREE.MathUtils.lerp(-0.10 * torsoW, -0.16 * torsoW, tuckT),
+              THREE.MathUtils.lerp(0.37, 0.17, tuckT),
+              THREE.MathUtils.lerp(-0.34, -0.12, tuckT),
+            );
+          }
+        } else if (hAct === 'GRENADE_COOK') {
+          _gripR.set(0.18 * torsoW, 0.48, -0.26);
+          _gripL.set(-0.16 * torsoW, 0.38, -0.34);
+          _poleR.set(shoulderX + 0.28, shoulderY - 0.16, 0.10);
+        } else if (hAct === 'GRENADE_CHARGE') {
+          if (isGrenadeOverhand) {
+            _gripR.set(
+              shoulderX + 0.08 + gCharge * 0.07,
+              shoulderY + 0.12 + gCharge * 0.10,
+              0.04 + gCharge * 0.14,
+            );
+            _gripL.set(-0.14 * torsoW, 0.42, -0.44 - gCharge * 0.06);
+            _poleR.set(shoulderX + 0.34, shoulderY - 0.04, 0.24);
+          } else {
+            _gripR.set(
+              shoulderX + 0.05,
+              0.18 - gCharge * 0.08,
+              -0.14 + gCharge * 0.12,
+            );
+            _gripL.set(-0.17 * torsoW, 0.34, -0.32);
+            _poleR.set(shoulderX + 0.24, shoulderY - 0.36, 0.22);
+          }
+        } else if (hAct === 'GRENADE_THROW_OVERHAND') {
+          const whip = smoothstep3P(0.0, 0.32, hProg);
+          const rec = smoothstep3P(0.36, 1.0, hProg);
+          _gripR.set(
+            THREE.MathUtils.lerp(shoulderX + 0.13, 0.09 * torsoW, whip),
+            THREE.MathUtils.lerp(shoulderY + 0.20, shoulderY + 0.02 - rec * 0.16, whip),
+            THREE.MathUtils.lerp(0.16, -0.50 + rec * 0.22, whip),
+          );
+          _gripL.set(-0.18 * torsoW, 0.28, -0.14);
+          _poleR.set(shoulderX + 0.32, shoulderY + 0.04 - whip * 0.22, 0.18 - whip * 0.18);
+        } else {
+          // GRENADE_THROW_UNDERHAND
+          const whip = smoothstep3P(0.0, 0.30, hProg);
+          const rec = smoothstep3P(0.36, 1.0, hProg);
+          _gripR.set(
+            THREE.MathUtils.lerp(shoulderX + 0.05, 0.10 * torsoW, whip),
+            THREE.MathUtils.lerp(0.12, 0.40 - rec * 0.14, whip),
+            THREE.MathUtils.lerp(0.04, -0.46 + rec * 0.18, whip),
+          );
+          _gripL.set(-0.16 * torsoW, 0.32, -0.26);
+        }
+      } else {
+        weaponPivot.visible = !isUnarmedWeapon;
+        grenadeHoldMount.visible = false;
+
+        if (isUnarmedWeapon) {
+          _gripR.set(shoulderX * 0.85, 0.28, -0.22);
+          _gripL.set(-shoulderX * 0.85, 0.28, -0.22);
+        } else {
+          _gripR.copy(rightGripLocal).applyQuaternion(weaponSocket.quaternion).add(weaponSocket.position);
+          _sockTmp.copy(leftHandguardLocal);
+          _sockTmp.z += pumpTravelZ;
+          _gripL.copy(_sockTmp).applyQuaternion(weaponSocket.quaternion).add(weaponSocket.position);
+        }
+
+        // Replicate active firearm handling animations on 3P hands
+        if (!isUnarmedWeapon && vaultW < 0.25) {
+          if (hAct === 'RELOAD') {
+            _handAuxL.copy(magWellLocal).applyQuaternion(weaponSocket.quaternion).add(weaponSocket.position);
+            if (hProg > 0.001) {
+              if (hProg < 0.16) {
+                _gripL.lerp(_handAuxL, smoothstep3P(0.0, 0.16, hProg));
+              } else if (hProg < 0.38) {
+                _gripL.copy(_handAuxL).lerp(_pouchLocal, smoothstep3P(0.16, 0.38, hProg));
+              } else if (hProg < 0.48) {
+                _gripL.copy(_pouchLocal);
+              } else if (hProg < 0.66) {
+                _gripL.copy(_pouchLocal).lerp(_handAuxL, smoothstep3P(0.48, 0.66, hProg));
+              } else if (hProg < 0.86) {
+                _sockTmp.copy(boltRackLocal).applyQuaternion(weaponSocket.quaternion).add(weaponSocket.position);
+                _gripL.copy(_handAuxL).lerp(_sockTmp, smoothstep3P(0.66, 0.76, hProg));
+              } else {
+                _sockTmp.copy(boltRackLocal).applyQuaternion(weaponSocket.quaternion).add(weaponSocket.position);
+                _gripL.lerp(_sockTmp, 1 - smoothstep3P(0.86, 1.0, hProg));
+              }
+            } else if (effReload > 0.005) {
+              _reloadL.copy(_pouchLocal);
+              _gripL.lerp(_reloadL, effReload);
+            }
+          } else if (hAct === 'SUPPRESSOR_DETACH') {
+            _handAuxL.copy(suppGripLocal).applyQuaternion(weaponSocket.quaternion).add(weaponSocket.position);
+            if (hProg < 0.14) {
+              _gripL.lerp(_handAuxL, smoothstep3P(0.0, 0.14, hProg));
+            } else if (hProg < 0.72) {
+              _gripL.copy(_handAuxL);
+            } else if (hProg < 0.88) {
+              _gripL.copy(_handAuxL).lerp(_pouchLocal, smoothstep3P(0.72, 0.88, hProg));
+            } else {
+              _gripL.lerp(_pouchLocal, 1 - smoothstep3P(0.88, 1.0, hProg));
+            }
+          } else if (hAct === 'SUPPRESSOR_ATTACH') {
+            _handAuxL.copy(suppGripLocal).applyQuaternion(weaponSocket.quaternion).add(weaponSocket.position);
+            if (hProg < 0.16) {
+              _gripL.lerp(_pouchLocal, smoothstep3P(0.0, 0.16, hProg));
+            } else if (hProg < 0.30) {
+              _gripL.copy(_pouchLocal).lerp(_handAuxL, smoothstep3P(0.16, 0.30, hProg));
+            } else if (hProg < 0.86) {
+              _gripL.copy(_handAuxL);
+            } else {
+              _gripL.lerp(_handAuxL, 1 - smoothstep3P(0.86, 1.0, hProg));
+            }
+          } else if (hAct === 'BOLT') {
+            const bEnv = smoothstep3P(0.0, 0.20, hProg) * (1 - smoothstep3P(0.80, 1.0, hProg));
+            const bPull = Math.sin(smoothstep3P(0.20, 0.80, hProg) * Math.PI) * 0.065;
+            _sockTmp.copy(boltHandleLocal);
+            _sockTmp.z += bPull;
+            _handAuxR.copy(_sockTmp).applyQuaternion(weaponSocket.quaternion).add(weaponSocket.position);
+            _gripR.lerp(_handAuxR, bEnv);
+          } else if (
+            hAct === 'ZOOM_TWIST' ||
+            hAct === 'TURRET' ||
+            hAct === 'ILLUM' ||
+            hAct === 'LIGHT_PAD' ||
+            hAct === 'SELECTOR' ||
+            hAct === 'MAG_CHECK'
+          ) {
+            const mEnv = smoothstep3P(0.0, 0.25, hProg) * (1 - smoothstep3P(0.72, 1.0, hProg));
+            const targetSock =
+              hAct === 'ZOOM_TWIST'
+                ? zoomRingLocal
+                : hAct === 'TURRET'
+                  ? turretLocal
+                  : hAct === 'ILLUM'
+                    ? illumLocal
+                    : hAct === 'LIGHT_PAD'
+                      ? padLocal
+                      : hAct === 'SELECTOR'
+                        ? selectorLocal
+                        : magWellLocal;
+            _handAuxL.copy(targetSock).applyQuaternion(weaponSocket.quaternion).add(weaponSocket.position);
+            _gripL.lerp(_handAuxL, mEnv);
+          }
+        }
+
+        // Natural tactical elbow poles (down, slightly outward & back; shift with canted roll)
+        _poleR.set(shoulderX + 0.22 + cantRollRad * 0.14, shoulderY - 0.36, 0.16);
+        _poleL.set(-shoulderX - 0.16 - vaultW * 0.14, shoulderY - 0.38 - cantRollRad * 0.08 + vaultW * 0.18, 0.05 + vaultW * 0.12);
       }
 
       if (vaultW > 0.005) {
@@ -1590,10 +1759,6 @@ export class TacticalOperatorRigFactory {
           _gripR.lerp(_vaultBraceR, vaultW * 0.72);
         }
       }
-
-      // Natural tactical elbow poles (down, slightly outward & back; shift with canted roll)
-      _poleR.set(shoulderX + 0.22 + cantRollRad * 0.14, shoulderY - 0.36, 0.16);
-      _poleL.set(-shoulderX - 0.16 - vaultW * 0.14, shoulderY - 0.38 - cantRollRad * 0.08 + vaultW * 0.18, 0.05 + vaultW * 0.12);
 
       // Solve Right Arm
       solveTwoBoneIK(_shR, _gripR, _poleR, upperArmLen, lowerArmLen, _ikRes);
@@ -1633,6 +1798,8 @@ export class TacticalOperatorRigFactory {
       rightArmParts.armPivot.rotation.set(0, 0, 0);
       rightArmParts.forearmPivot.rotation.set(0, 0, 0);
 
+      weaponPivot.visible = !isUnarmedWeapon;
+      grenadeHoldMount.visible = false;
       weaponSocket.position.set(0.138 * torsoW, 0.315, -0.145);
       weaponSocket.rotation.set(0, 0.11, 0);
       weaponPivot.position.set(0, 0, 0);

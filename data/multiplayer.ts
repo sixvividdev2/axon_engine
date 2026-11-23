@@ -5,6 +5,7 @@ import {
   LobbyKillfeedPolicy,
 } from './killfeedSettings';
 import { BattleRuleId, BotDifficultyId } from '../maps/types';
+import { TacticalEquipmentId } from './tacticalEquipment';
 
 export type { LobbyKillfeedPolicy };
 export type LobbyVisibility = 'public' | 'friends_only' | 'private';
@@ -338,7 +339,13 @@ export type SyncedHandlingAction =
   | 'SELECTOR'
   | 'LIGHT_PAD'
   | 'MAG_CHECK'
-  | 'INSPECT';
+  | 'INSPECT'
+  | 'GRENADE_DRAW'
+  | 'GRENADE_PIN_PULL'
+  | 'GRENADE_COOK'
+  | 'GRENADE_CHARGE'
+  | 'GRENADE_THROW_OVERHAND'
+  | 'GRENADE_THROW_UNDERHAND';
 
 export const VALID_SYNCED_HANDLING_ACTIONS: ReadonlySet<SyncedHandlingAction> = new Set([
   'NONE',
@@ -354,6 +361,12 @@ export const VALID_SYNCED_HANDLING_ACTIONS: ReadonlySet<SyncedHandlingAction> = 
   'LIGHT_PAD',
   'MAG_CHECK',
   'INSPECT',
+  'GRENADE_DRAW',
+  'GRENADE_PIN_PULL',
+  'GRENADE_COOK',
+  'GRENADE_CHARGE',
+  'GRENADE_THROW_OVERHAND',
+  'GRENADE_THROW_UNDERHAND',
 ]);
 
 export interface SyncedWeaponAttachments {
@@ -444,6 +457,9 @@ export interface GamePlayerStatePacket {
   att?: SyncedWeaponAttachments;
   ha?: SyncedHandlingAction;
   hprog?: number; // 0..1 normalized handling animation progress
+  geq?: TacticalEquipmentId;
+  gc?: number; // 0..1 normalized throw windup tension
+  gts?: 'overhand' | 'underhand';
   sup?: boolean;
   hp: number;
   maxHp: number;
@@ -547,6 +563,9 @@ export interface SyncedBotState {
   att?: SyncedWeaponAttachments;
   ha?: SyncedHandlingAction;
   hprog?: number; // 0..1 normalized handling animation progress
+  geq?: TacticalEquipmentId;
+  gc?: number;
+  gts?: 'overhand' | 'underhand';
   sup?: boolean;
   points?: number;
   reloading?: boolean;
@@ -855,6 +874,34 @@ export interface GameBotCommsPacket {
   ts: number;
 }
 
+export type GameGrenadeEventKind =
+  | 'pin_pull'
+  | 'spoon_pop'
+  | 'throw'
+  | 'live_drop'
+  | 'in_hand_detonate';
+
+export interface GameGrenadeEventPacket {
+  type: 'game:grenade_event';
+  senderUserId?: string;
+  senderUsername?: string;
+  senderTeam?: LobbyTeamId;
+  senderIsHost?: boolean;
+  actorId: string;
+  isBot?: boolean;
+  team?: 'A' | 'B' | 'FFA';
+  kind: GameGrenadeEventKind;
+  equipmentId: TacticalEquipmentId;
+  px: number;
+  py: number;
+  pz: number;
+  vx?: number;
+  vy?: number;
+  vz?: number;
+  fuseRemainingSec?: number;
+  ts: number;
+}
+
 export type GameSyncPacket =
   | GamePlayerStatePacket
   | GamePlayerFirePacket
@@ -880,6 +927,7 @@ export type GameSyncPacket =
   | GameMatchSyncPacket
   | GameTacticalPingPacket
   | GameEnvSyncPacket
-  | GameGlassShatterPacket;
+  | GameGlassShatterPacket
+  | GameGrenadeEventPacket;
 
 

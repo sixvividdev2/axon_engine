@@ -54,6 +54,8 @@ export interface HandPoseDynamicOptions {
   thumbFlick01?: number;
   /** 0..1 left-thumb press onto flashlight/laser pressure pad */
   padTap01?: number;
+  /** True when tactical grenade safety spoon has been released in hand */
+  leverReleased?: boolean;
 }
 
 export interface ArticulatedFinger {
@@ -138,6 +140,11 @@ export class CharacterSkeleton {
 
   public readonly magPouchAnchor = new THREE.Object3D();
   public readonly beltEquipmentMount = new THREE.Group();
+  public readonly throwHandSocket = new THREE.Object3D();
+  public readonly leftPinPinchSocket = new THREE.Object3D();
+  public readonly leftPocketAnchor = new THREE.Object3D();
+  public readonly leftEyeAimAnchor = new THREE.Object3D();
+  public readonly leftChestBalanceAnchor = new THREE.Object3D();
 
   private beltEquipmentMeshes: BuiltTacticalEquipmentMesh[] = [];
   private beltEquipmentState: {
@@ -697,6 +704,26 @@ export class CharacterSkeleton {
     socket_weapon_r.name = 'socket_weapon_r';
     socket_weapon_r.position.set(0, 0, -0.035);
     this.rightArm.hand.root.add(socket_weapon_r);
+
+    this.throwHandSocket.name = 'throw_hand_socket';
+    this.throwHandSocket.position.set(0, -0.026, -0.042);
+    this.rightArm.hand.root.add(this.throwHandSocket);
+
+    this.leftPinPinchSocket.name = 'left_pin_pinch_socket';
+    this.leftPinPinchSocket.position.set(0.015, -0.014, -0.092);
+    this.leftArm.hand.root.add(this.leftPinPinchSocket);
+
+    this.leftPocketAnchor.name = 'left_pocket_anchor';
+    this.leftPocketAnchor.position.set(-0.172 * p.pelvisWidthScale, -0.08, -0.02);
+    this.pelvis.add(this.leftPocketAnchor);
+
+    this.leftEyeAimAnchor.name = 'left_eye_aim_anchor';
+    this.leftEyeAimAnchor.position.set(-0.145, 0.015, -0.44);
+    this.chest.add(this.leftEyeAimAnchor);
+
+    this.leftChestBalanceAnchor.name = 'left_chest_balance_anchor';
+    this.leftChestBalanceAnchor.position.set(-0.155, -0.14, -0.26);
+    this.chest.add(this.leftChestBalanceAnchor);
 
     this.leftLeg = this.buildLeg(-1, p.thighLen, p.shinLen, p.ankleHeight);
     this.rightLeg = this.buildLeg(1, p.thighLen, p.shinLen, p.ankleHeight);
@@ -2274,6 +2301,42 @@ export class CharacterSkeleton {
         0,
         0,
       );
+      return;
+    }
+
+    if (holdClass === 'throwable') {
+      if (side === 'right') {
+        const leverLift = opts?.leverReleased ? 14 : 0;
+        setFinger(hand.index, 46 * scale, 60 * scale, 36 * scale);
+        setFinger(
+          hand.middle,
+          Math.max(12, 54 * scale - leverLift),
+          Math.max(16, 66 * scale - leverLift),
+          Math.max(10, 42 * scale - leverLift * 0.6),
+        );
+        setFinger(
+          hand.ring,
+          Math.max(12, 58 * scale - leverLift),
+          Math.max(16, 70 * scale - leverLift),
+          Math.max(10, 44 * scale - leverLift * 0.6),
+        );
+        setFinger(
+          hand.pinky,
+          Math.max(12, 60 * scale - leverLift),
+          Math.max(16, 72 * scale - leverLift),
+          Math.max(10, 46 * scale - leverLift * 0.6),
+        );
+        hand.thumbProx.rotation.set(-0.24, s * 0.44, -s * 0.14);
+        hand.thumbDist.rotation.set(-0.42, 0, 0);
+      } else {
+        // Left aiming / balance hand (open relaxed blade when not pinching pin)
+        setFinger(hand.index, 12, 16, 10, -s * 0.04);
+        setFinger(hand.middle, 15, 20, 12);
+        setFinger(hand.ring, 18, 24, 14);
+        setFinger(hand.pinky, 22, 28, 16, s * 0.04);
+        hand.thumbProx.rotation.set(0.06, s * 0.24, s * 0.08);
+        hand.thumbDist.rotation.set(-0.14, 0, 0);
+      }
       return;
     }
 

@@ -296,6 +296,12 @@ export class BodycamController {
   private lastMinWeaponPitchRad = WEAPON_MIN_PITCH_RAD;
   private lastMaxWeaponPitchRad = WEAPON_MAX_PITCH_RAD;
 
+  // Diegetic grenade wind-up tension & FOV focus
+  private grenadeCharge01 = 0;
+  private grenadeLiveCook = false;
+  private grenadeThrowStyle: 'overhand' | 'underhand' = 'underhand';
+  private grenadeStrainRoll = 0;
+
   private camera: THREE.PerspectiveCamera;
   private weaponRig: WeaponRig;
   private audio: AudioEngine;
@@ -351,6 +357,24 @@ export class BodycamController {
 
   public getLandingKneeBend(): number {
     return THREE.MathUtils.clamp(-(this.landingDipY + this.kneeShock) / 0.24, 0, 1.35);
+  }
+
+  public setGrenadeTension(
+    charge01: number,
+    liveCook = false,
+    throwStyle: 'overhand' | 'underhand' = 'overhand',
+  ): void {
+    this.grenadeCharge01 = THREE.MathUtils.clamp(charge01, 0, 1);
+    this.grenadeLiveCook = liveCook;
+    this.grenadeThrowStyle = throwStyle;
+  }
+
+  public getVelocity(out: THREE.Vector3): THREE.Vector3 {
+    return out.set(this.velX, this.velY, this.velZ);
+  }
+
+  public getCamera(): THREE.PerspectiveCamera {
+    return this.camera;
   }
 
   /** Shifts only active vault waypoints during Survival floating-origin rebasing (position is shifted by WorldBuilder) */
@@ -1825,16 +1849,30 @@ export class BodycamController {
       swayRoll +
       wakeRoll;
 
-    const chestPitch = baseChestPitch + this.camShakePitch;
-    const chestYaw = baseChestYaw + this.camShakeYaw;
-    const chestRoll = baseChestRoll + this.camShakeRoll;
+    const targetStrainRoll =
+      this.grenadeThrowStyle === 'overhand' && this.grenadeCharge01 > 0.02
+        ? -0.028 * this.grenadeCharge01
+        : 0;
+    this.grenadeStrainRoll = THREE.MathUtils.damp(this.grenadeStrainRoll, targetStrainRoll, 12, dt);
+
+    const gripStrainAmp =
+      (this.grenadeCharge01 > 0.85 ? ((this.grenadeCharge01 - 0.85) / 0.15) * 0.0022 : 0) +
+      (this.grenadeLiveCook ? 0.0012 : 0);
+    const gripStrainPitch = gripStrainAmp > 0 ? Math.sin(elapsed * 41.3) * gripStrainAmp : 0;
+    const gripStrainYaw = gripStrainAmp > 0 ? Math.cos(elapsed * 37.9) * gripStrainAmp : 0;
+
+    const chestPitch = baseChestPitch + this.camShakePitch + gripStrainPitch;
+    const chestYaw = baseChestYaw + this.camShakeYaw + gripStrainYaw;
+    const chestRoll = baseChestRoll + this.camShakeRoll + this.grenadeStrainRoll;
 
     this._aimEuler.set(chestPitch, chestYaw, chestRoll, 'YXZ');
     this.camera.quaternion.setFromEuler(this._aimEuler);
 
     // Wide ~98° Horizontal FOV -> dynamic Vertical FOV
     // Primary ADS: 82°; Canted Optic ADS: ~86° CQB focus; Point Aim: ~88° (0.90x tactical focus)
-    const targetHFov = this.isAds
+    const grenadeFovCompress =
+      this.grenadeThrowStyle === 'overhand' ? this.grenadeCharge01 * 3.8 : 0;
+    const targetHFov = (this.isAds
       ? ADS_HORIZONTAL_FOV_DEG
       : this.isCanted
         ? THREE.MathUtils.lerp(BASE_HORIZONTAL_FOV_DEG, ADS_HORIZONTAL_FOV_DEG, 0.72)
@@ -1842,7 +1880,7 @@ export class BodycamController {
           ? BASE_HORIZONTAL_FOV_DEG * 0.90
           : wantsSprint
             ? SPRINT_HORIZONTAL_FOV_DEG
-            : BASE_HORIZONTAL_FOV_DEG;
+            : BASE_HORIZONTAL_FOV_DEG) - grenadeFovCompress;
     const targetVFov = horizontalToVerticalFov(targetHFov, this.camera.aspect);
     if (Math.abs(this.camera.fov - targetVFov) > 0.05) {
       this.camera.fov = THREE.MathUtils.damp(this.camera.fov, targetVFov, 12, dt);

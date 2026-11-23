@@ -18,7 +18,9 @@ import {
   SecondaryPhysicsSolver,
   TACTICAL_EQUIPMENT_STORAGE_KEY,
   TacticalEquipmentStore,
+  TacticalGrenadeSystem,
   WeaponRig,
+  buildTacticalEquipmentMesh,
   simulateMaterialPenetration,
   simulateTrajectoryProfile,
   solveZeroPitchRad,
@@ -43,6 +45,12 @@ import {
   validateAndSanitizeGameMessage,
 } from '../../worker/gameRelayGuard';
 import { LobbyRoomState } from '../../data/multiplayer';
+import { WEAPONS } from '../../data/weapons';
+import { CharacterSkeleton as SurvivalCharacterSkeleton } from '../../engine/character/CharacterSkeleton';
+import { CharacterAnimator as SurvivalCharacterAnimator } from '../../engine/character/CharacterAnimator';
+import { CharacterDriverState } from '../../engine/character/ControllerStateReader';
+import { WeaponRig as SurvivalWeaponRig } from '../../engine/weapons/WeaponRig';
+import { TacticalOperatorRigFactory } from '../../combat/TacticalOperatorRig';
 
 /**
  * Minimal headless 2D canvas stub so Three.js CanvasTexture procedural PBR materials
@@ -1063,6 +1071,457 @@ describe('Phase 8 — Ratcheted Suppressor IK, Sprint Emergency Cancel, Geometry
     expect(botFireRes!.payload.caliberId).toBe('556x45');
   });
 });
+
+describe('Phase 4 — Bone-Driven Tactical Grenade Manual of Arms, Survival Parity & MP Relay Guard', () => {
+  it('exposes separable grenade parts (pullRingMesh, spoonGroup, anchors) and passes cross-operator rig parity with new grenade sockets', () => {
+    for (const eqId of ['m67_frag', 'm84_flash', 'm18_smoke', 'an_m14_thermite'] as const) {
+      const built = buildTacticalEquipmentMesh(eqId, { withBeltClip: false });
+      expect(built.pullRingMesh).toBeTruthy();
+      expect(built.spoonGroup).toBeTruthy();
+      expect(built.spoonAnchor).toBeTruthy();
+      expect(built.pinAnchor).toBeTruthy();
+      expect(built.pinPullAxis.length()).toBeGreaterThan(0.5);
+      built.dispose();
+    }
+
+    const male = new CharacterSkeleton(1, 'team_a', 'MALE');
+    const female = new CharacterSkeleton(1, 'team_b', 'FEMALE');
+    expect(male.throwHandSocket).toBeTruthy();
+    expect(male.leftPinPinchSocket).toBeTruthy();
+    expect(male.leftPocketAnchor).toBeTruthy();
+    expect(male.leftEyeAimAnchor).toBeTruthy();
+    expect(male.leftChestBalanceAnchor).toBeTruthy();
+    expect(female.throwHandSocket).toBeTruthy();
+    expect(female.leftPinPinchSocket).toBeTruthy();
+
+    const parity = validateCrossOperatorParity(male.root, female.root, 'STRICT');
+    expect(parity.valid).toBe(true);
+    expect(parity.issues).toHaveLength(0);
+    male.dispose();
+    female.dispose();
+  });
+
+  it('enforces 4-stage RMB pin/spoon + LMB underhand/overhand throw, safe holster vs live toss, focus-loss reset, and overcook detonation in TacticalGrenadeSystem', () => {
+    const scene = new THREE.Scene();
+    const adapter = new BodycamPhysicsWorld().createAdapter();
+    let inHandDetonations = 0;
+    let totalDetonations = 0;
+    const sys = new TacticalGrenadeSystem({
+      scene,
+      physics: adapter,
+      worldRaycastMeshes: [],
+      onDetonate: () => {
+        totalDetonations += 1;
+      },
+      onInHandDetonate: () => {
+        inHandDetonations += 1;
+      },
+    });
+    const skel = new CharacterSkeleton(1, 'team_a', 'MALE');
+
+    // Stage 1: Draw (fuse NOT running)
+    expect(sys.drawGrenade('m67_frag')).toBe(true);
+    expect(sys.getHoldStage()).toBe('DRAWN');
+    expect(sys.isLeverReleased()).toBe(false);
+    // Cannot pull spoon before pin or start throw while pin intact
+    expect(sys.releaseLever()).toBe(false);
+    expect(sys.beginThrowInput()).toBe(false);
+
+    // Stage 2: 1st RMB pulls pin into pocket, spoon stays gripped -> fuse MUST NOT run
+    expect(sys.pullPin()).toBe(true);
+    expect(sys.getHoldStage()).toBe('PIN_PULLED');
+    expect(sys.isLeverReleased()).toBe(false);
+    for (let i = 0; i < 160; i++) {
+      sys.update(0.05);
+      sys.syncHeldBoneAttachment(skel.throwHandSocket, skel.leftPinPinchSocket, skel.leftPocketAnchor);
+    }
+    expect(inHandDetonations).toBe(0);
+    expect(sys.getHoldStage()).toBe('PIN_PULLED');
+    expect(sys.getPinPullPhase()).toBe('EYE_AIM');
+
+    // Safe holster before lever release returns 'holstered' and spends 0 grenades
+    expect(
+      sys.holsterOrTossOnSwitch(new THREE.Vector3(0, 1.5, 0), new THREE.Vector3(0, 0, -1)),
+    ).toBe('holstered');
+    expect(sys.getHoldStage()).toBe('HOLSTERED');
+
+    // Quick LMB click (<0.18s) from PIN_PULLED -> underhand lob (~10.0 m/s)
+    expect(sys.drawGrenade('m67_frag')).toBe(true);
+    expect(sys.pullPin()).toBe(true);
+    expect(sys.beginThrowInput()).toBe(true);
+    sys.update(0.05);
+    expect(sys.releaseThrowInput()).toBe('underhand');
+    for (let i = 0; i < 3; i++) sys.update(0.03);
+    const lobRes = sys.consumePendingThrowRelease(
+      new THREE.Vector3(0.2, 1.4, -0.3),
+      new THREE.Vector3(0, 0, -1),
+    );
+    expect(lobRes).toBeTruthy();
+    expect(lobRes!.thrown).toBe(true);
+    expect(lobRes!.style).toBe('underhand');
+    expect(lobRes!.speedMps).toBeCloseTo(10.0, 2);
+    const launchedLob = sys.consumeLastLaunchedThrow();
+    expect(launchedLob?.style).toBe('underhand');
+
+    // Long LMB hold (>=0.18s) -> overhand power throw (13.5..22.5 m/s) & focus-loss guard
+    expect(sys.drawGrenade('m67_frag')).toBe(true);
+    expect(sys.pullPin()).toBe(true);
+    expect(sys.releaseLever()).toBe(true);
+    expect(sys.getHoldStage()).toBe('LEVER_RELEASED');
+    sys.syncHeldBoneAttachment(skel.throwHandSocket, skel.leftPinPinchSocket, skel.leftPocketAnchor);
+    expect(sys.getHeldGrenadeMesh()?.spoonGroup.visible).toBe(false);
+
+    expect(sys.beginThrowInput()).toBe(true);
+    for (let i = 0; i < 12; i++) sys.update(0.04); // 0.48s held -> overhand
+    expect(sys.getThrowStyle()).toBe('overhand');
+    expect(sys.getCharge01()).toBeGreaterThan(0.2);
+
+    // Window blur clears held LMB charge WITHOUT canceling the live lever-released fuse
+    sys.resetHeldInputOnFocusLoss();
+    expect(sys.isThrowInputHeld()).toBe(false);
+    expect(sys.getCharge01()).toBe(0);
+    expect(sys.getHoldStage()).toBe('LEVER_RELEASED');
+
+    // Switching weapons while lever is released tosses the live grenade clear ('tossed')
+    expect(
+      sys.holsterOrTossOnSwitch(new THREE.Vector3(0, 1.5, 0), new THREE.Vector3(0, 0, -1)),
+    ).toBe('tossed');
+    const tossedLive = sys.consumeLastLaunchedThrow();
+    expect(tossedLive).toBeTruthy();
+    expect(sys.getHoldStage()).toBe('HOLSTERED');
+
+    // Overhand release speed check + overcook in-hand detonation check
+    expect(sys.drawGrenade('m67_frag')).toBe(true);
+    expect(sys.pullPin()).toBe(true);
+    expect(sys.beginThrowInput()).toBe(true);
+    for (let i = 0; i < 25; i++) sys.update(0.05); // 1.25s full charge
+    expect(sys.releaseThrowInput()).toBe('overhand');
+    for (let i = 0; i < 3; i++) sys.update(0.03);
+    const powerRes = sys.consumePendingThrowRelease(
+      new THREE.Vector3(0.2, 1.4, -0.3),
+      new THREE.Vector3(0, 0, -1),
+    );
+    expect(powerRes?.style).toBe('overhand');
+    expect(powerRes?.speedMps).toBeCloseTo(22.5, 1);
+
+    // Overcooking in hand triggers onInHandDetonate & resets to HOLSTERED
+    expect(sys.drawGrenade('m84_flash')).toBe(true);
+    expect(sys.pullPin()).toBe(true);
+    expect(sys.releaseLever()).toBe(true);
+    for (let i = 0; i < 120; i++) {
+      sys.update(0.05, new THREE.Vector3(0, 1.4, 0));
+    }
+    expect(inHandDetonations).toBe(1);
+    expect(totalDetonations).toBeGreaterThanOrEqual(1);
+    expect(sys.getHoldStage()).toBe('HOLSTERED');
+
+    skel.dispose();
+    sys.dispose();
+  });
+
+  it('implements Survival RGD-5 4-stage RMB/LMB parity and Bolt click/hold throw in Survival CharacterAnimator', () => {
+    const scene = new THREE.Scene();
+    const skel = new SurvivalCharacterSkeleton(1);
+    const rig = new SurvivalWeaponRig(scene, true);
+    const animator = new SurvivalCharacterAnimator(skel, rig);
+    const adapter = new BodycamPhysicsWorld().createAdapter();
+
+    const released: Array<{ id: string; speed: number; style: string; fuse: number }> = [];
+    let overcooked = 0;
+    animator.setCallbacks({
+      onThrowRelease: (spec, _pos, remFuse, speed, style) => {
+        released.push({ id: spec.id, speed, style, fuse: remFuse });
+      },
+      onOvercookedDetonate: () => {
+        overcooked += 1;
+      },
+    });
+
+    const driverState: CharacterDriverState = {
+      position: new THREE.Vector3(0, 0, 0),
+      torsoYaw: 0,
+      torsoPitch: 0,
+      spinePitch: 0,
+      aimYaw: 0,
+      aimPitch: 0,
+      lean: 0,
+      crouch: false,
+      sprint: false,
+      isAds: false,
+      isCanted: false,
+      isPointAim: false,
+      isMoving: false,
+      grounded: true,
+      velY: 0,
+      stepSmoothOffsetY: 0,
+      landingKneeBend: 0,
+      landingCompression: 0,
+      stridePhase: 0,
+      wallPullback: 0,
+      recoilSpring: { z: 0, pitch: 0, roll: 0 },
+      chestHeight: 1.4,
+      cameraWorldPos: new THREE.Vector3(0, 1.42, 0),
+      cameraWorldQuat: new THREE.Quaternion(),
+      vaultState: {
+        active: false,
+        kind: 'VAULT_OVER',
+        mode: 'NONE',
+        progress: 0,
+        handPinWeightL: 0,
+        handPinWeightR: 0,
+        handLWorld: new THREE.Vector3(),
+        handRWorld: new THREE.Vector3(),
+        wallNormal: new THREE.Vector3(0, 0, 1),
+        vaultForward: new THREE.Vector3(0, 0, -1),
+        weaponRetentionMode: 'NONE',
+        weaponRetentionBlend: 0,
+        cameraPitchOffset: 0,
+        cameraRollOffset: 0,
+        cameraDipOffset: 0,
+        crouchTransitionWeight: 0,
+        legTuckWeight: 0,
+        headDuckWeight: 0,
+        maxCameraWorldY: Infinity,
+      },
+    };
+
+    const fragSpec = WEAPONS.rgd5_frag;
+    const boltSpec = WEAPONS.throw_bolt;
+    const groundFn = () => 0;
+
+    // RGD-5 requires pin pull before throwing
+    expect(animator.beginThrowInput(fragSpec)).toBe(false);
+    expect(animator.pullThrowablePin(fragSpec)).toBe(true);
+    expect(animator.getThrowableStage()).toBe('PIN_PULLED');
+    expect(animator.isThrowableLiveFuse()).toBe(false);
+
+    // Safe holster before lever release
+    expect(animator.holsterOrTossThrowable(fragSpec)).toBe('holstered');
+    expect(animator.getThrowableStage()).toBe('READY');
+
+    // Pin -> Lever -> Quick LMB lob
+    expect(animator.pullThrowablePin(fragSpec)).toBe(true);
+    expect(animator.releaseThrowableLever(fragSpec)).toBe(true);
+    expect(animator.isThrowableLiveFuse()).toBe(true);
+    expect(animator.beginThrowInput(fragSpec)).toBe(true);
+    animator.update(0.04, 0.04, driverState, fragSpec, groundFn, undefined, adapter);
+    expect(animator.releaseThrowInput(fragSpec)).toBe('underhand');
+    for (let i = 0; i < 4; i++) {
+      animator.update(0.03, 0.1 + i * 0.03, driverState, fragSpec, groundFn, undefined, adapter);
+    }
+    expect(released).toHaveLength(1);
+    expect(released[0].id).toBe('rgd5_frag');
+    expect(released[0].style).toBe('underhand');
+    expect(released[0].speed).toBeCloseTo(10.0, 2);
+
+    // Throwing Bolt bypasses pin/spoon and supports direct LMB hold -> overhand power throw
+    // Step 1 frame to switch equipped weapon from rgd5_frag -> throw_bolt (clears throwCooldownHideTimer)
+    animator.update(0.02, 0.5, driverState, boltSpec, groundFn, undefined, adapter);
+    expect(animator.beginThrowInput(boltSpec)).toBe(true);
+    for (let i = 0; i < 20; i++) {
+      animator.update(0.05, 1 + i * 0.05, driverState, boltSpec, groundFn, undefined, adapter);
+    }
+    expect(animator.releaseThrowInput(boltSpec)).toBe('overhand');
+    for (let i = 0; i < 4; i++) {
+      animator.update(0.03, 2 + i * 0.03, driverState, boltSpec, groundFn, undefined, adapter);
+    }
+    expect(released).toHaveLength(2);
+    expect(released[1].id).toBe('throw_bolt');
+    expect(released[1].style).toBe('overhand');
+    expect(released[1].speed).toBeGreaterThan(20);
+
+    // Switch back to RGD-5 and test overcooked in-hand detonation
+    animator.update(0.02, 2.5, driverState, fragSpec, groundFn, undefined, adapter);
+    expect(animator.pullThrowablePin(fragSpec)).toBe(true);
+    expect(animator.releaseThrowableLever(fragSpec)).toBe(true);
+    for (let i = 0; i < 110; i++) {
+      animator.update(0.05, 3 + i * 0.05, driverState, fragSpec, groundFn, undefined, adapter);
+    }
+    expect(overcooked).toBe(1);
+
+    rig.dispose();
+    skel.dispose();
+  });
+
+  it('animates 3P TacticalOperatorRig grenade stances (hides firearm, shows palm ordnance) and sanitizes MP grenade events', () => {
+    const factory = new TacticalOperatorRigFactory(1);
+    const opRig = factory.buildOperator('bot', 'bot_test', 'team_a', 'MALE');
+    opRig.setWeaponLoadout('m4a1', createBareAttachments());
+
+    opRig.applyCombatPose({
+      crouchBlend: 0,
+      leanBlend: 0,
+      aimPitch: 0.1,
+      adsBlend: 0,
+      pointAimBlend: 0,
+      cantBlend: 0,
+      reloadBlend: 0,
+      speedMps: 0,
+      walkCycle: 0,
+      sprint: false,
+      recoilKick: 0,
+      firingVibration: 0,
+      flinchPitch: 0,
+      handlingAction: 'GRENADE_CHARGE',
+      handlingProgress: 0.65,
+      grenadeEquipmentId: 'm67_frag',
+      grenadeCharge01: 0.85,
+      grenadeThrowStyle: 'overhand',
+    });
+    expect(opRig.weaponPivot.visible).toBe(false);
+    expect(opRig.muzzleFlash.visible).toBe(false);
+
+    opRig.applyCombatPose({
+      crouchBlend: 0,
+      leanBlend: 0,
+      aimPitch: 0,
+      adsBlend: 0,
+      pointAimBlend: 0,
+      cantBlend: 0,
+      reloadBlend: 0,
+      speedMps: 0,
+      walkCycle: 0,
+      sprint: false,
+      recoilKick: 0,
+      firingVibration: 0,
+      flinchPitch: 0,
+      handlingAction: 'NONE',
+      handlingProgress: 0,
+    });
+    expect(opRig.weaponPivot.visible).toBe(true);
+    factory.dispose();
+
+    const roomState: LobbyRoomState = {
+      code: 'GRN001',
+      hostUserId: 'host_1',
+      hostUsername: 'HOST',
+      visibility: 'private',
+      mode: 'battle',
+      battleRule: 'tdm',
+      mapId: 'timberline_compound',
+      maxPlayers: 8,
+      botsEnabled: true,
+      botCount: 2,
+      killLimit: 30,
+      botDifficulty: 'tactical',
+      status: 'in_match',
+      matchSequence: 1,
+      specialEvent: null,
+      members: [
+        {
+          userId: 'host_1',
+          username: 'HOST',
+          team: 'A',
+          ready: true,
+          isHost: true,
+          rank: 1,
+          prestige: 0,
+          connected: true,
+          joinedAt: Date.now(),
+        },
+        {
+          userId: 'peer_2',
+          username: 'PEER',
+          team: 'B',
+          ready: true,
+          isHost: false,
+          rank: 1,
+          prestige: 0,
+          connected: true,
+          joinedAt: Date.now(),
+        },
+      ],
+      chat: [],
+      updatedAt: Date.now(),
+    };
+    const matchState = createDefaultMatchState();
+
+    // Peer can broadcast own throw; spoofed actorId or isBot=true is rejected/overwritten
+    const peerThrow = validateAndSanitizeGameMessage(
+      {
+        type: 'game:grenade_event',
+        kind: 'throw',
+        equipmentId: 'm84_flash',
+        actorId: 'spoofed_host',
+        px: 3.5,
+        py: 1.6,
+        pz: -2.0,
+        vx: 12.0,
+        vy: 3.5,
+        vz: -14.0,
+        fuseRemainingSec: 2.2,
+      },
+      roomState,
+      matchState,
+      { userId: 'peer_2', username: 'PEER' },
+    );
+    expect(peerThrow).toBeTruthy();
+    expect(peerThrow!.payload.actorId).toBe('peer_2');
+    expect(peerThrow!.payload.equipmentId).toBe('m84_flash');
+    expect(peerThrow!.payload.fuseRemainingSec).toBe(2.2);
+
+    const spoofedBotThrow = validateAndSanitizeGameMessage(
+      {
+        type: 'game:grenade_event',
+        kind: 'throw',
+        equipmentId: 'm67_frag',
+        isBot: true,
+        actorId: 'bot_0',
+        px: 0,
+        py: 1,
+        pz: 0,
+      },
+      roomState,
+      matchState,
+      { userId: 'peer_2', username: 'PEER' },
+    );
+    expect(spoofedBotThrow).toBeNull();
+
+    const invalidEquip = validateAndSanitizeGameMessage(
+      {
+        type: 'game:grenade_event',
+        kind: 'throw',
+        equipmentId: 'nuke_exploit',
+        px: 0,
+        py: 1,
+        pz: 0,
+      },
+      roomState,
+      matchState,
+      { userId: 'peer_2', username: 'PEER' },
+    );
+    expect(invalidEquip).toBeNull();
+
+    // State sync sanitizes grenade fields geq, gc, gts alongside ha=GRENADE_CHARGE
+    const grenadeState = validateAndSanitizeGameMessage(
+      {
+        type: 'game:state',
+        x: 1,
+        y: 0,
+        z: 1,
+        yaw: 0,
+        pitch: 0,
+        ha: 'GRENADE_CHARGE',
+        hprog: 0.7,
+        geq: 'm18_smoke',
+        gc: 2.4,
+        gts: 'overhand',
+        hp: 100,
+        maxHp: 100,
+        alive: true,
+      },
+      roomState,
+      matchState,
+      { userId: 'peer_2', username: 'PEER' },
+    );
+    expect(grenadeState).toBeTruthy();
+    expect(grenadeState!.payload.ha).toBe('GRENADE_CHARGE');
+    expect(grenadeState!.payload.geq).toBe('m18_smoke');
+    expect(grenadeState!.payload.gc).toBe(1);
+    expect(grenadeState!.payload.gts).toBe('overhand');
+  });
+});
+
 
 
 

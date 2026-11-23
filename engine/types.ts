@@ -288,4 +288,6 @@ export interface GameSnapshot {
     avgLuminance: number;
     exposure: number;
   };
+  throwableStatusLabel?: string;
+  throwableLiveFuse?: boolean;
 }

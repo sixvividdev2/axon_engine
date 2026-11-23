@@ -91,7 +91,7 @@ export const TACTICAL_EQUIPMENT_CATALOG: Record<TacticalEquipmentId, TacticalEqu
     blastRadiusM: 15.0,
     maxDamage: 185,
     effectDurationSec: 0.4,
-    maxCarry: 2,
+    maxCarry: 4,
     throwSpeedMps: 15.8,
     accentHex: '#f59e0b',
     bodyHex: 0x3b4832,

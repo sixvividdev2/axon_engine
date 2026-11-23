@@ -17,6 +17,11 @@ import {
   unpackSyncedWeaponAttachments,
 } from '../data/multiplayer';
 import { WeaponAttachments } from '../data/attachments';
+import {
+  DEFAULT_TACTICAL_EQUIPMENT_ID,
+  isTacticalEquipmentId,
+  TacticalEquipmentId,
+} from '../data/tacticalEquipment';
 import { BattleScoreEntry, BattleTeamId } from './BattleBotAI';
 import {
   BuiltTacticalOperatorRig,
@@ -41,6 +46,9 @@ interface RemoteOperator {
   handlingAction: SyncedHandlingAction;
   handlingProgress: number;
   targetHandlingProgress: number;
+  grenadeEquipmentId: TacticalEquipmentId;
+  grenadeCharge01: number;
+  grenadeThrowStyle: 'overhand' | 'underhand';
   lastUpdateMs: number;
 
   // Interpolated vs target kinematic & stance state
@@ -340,6 +348,9 @@ export class RemotePlayerManager {
       handlingAction: 'NONE',
       handlingProgress: 0,
       targetHandlingProgress: 0,
+      grenadeEquipmentId: DEFAULT_TACTICAL_EQUIPMENT_ID,
+      grenadeCharge01: 0,
+      grenadeThrowStyle: 'overhand',
       lastUpdateMs: performance.now(),
 
       curPos: new THREE.Vector3(),
@@ -492,6 +503,15 @@ export class RemotePlayerManager {
       op.rig.setSuppressedVisual(op.suppressed);
     }
 
+    op.grenadeEquipmentId = isTacticalEquipmentId(pkt.geq)
+      ? pkt.geq
+      : op.grenadeEquipmentId;
+    op.grenadeCharge01 =
+      typeof pkt.gc === 'number' && Number.isFinite(pkt.gc)
+        ? THREE.MathUtils.clamp(pkt.gc, 0, 1)
+        : 0;
+    op.grenadeThrowStyle = pkt.gts === 'underhand' ? 'underhand' : 'overhand';
+
     // Catch missed one-shot fire packets via monotonic fireSeq delta
     if (typeof pkt.fireSeq === 'number' && pkt.fireSeq > op.lastFireSeq) {
       if (op.hasInitialState && op.muzzleFlashTimer <= 0) {
@@ -640,6 +660,8 @@ export class RemotePlayerManager {
     op.handlingAction = 'NONE';
     op.handlingProgress = 0;
     op.targetHandlingProgress = 0;
+    op.grenadeCharge01 = 0;
+    op.grenadeThrowStyle = 'overhand';
     op.hasInitialState = true;
     if (
       pkt.glovesEnabled !== undefined ||
@@ -793,8 +815,21 @@ export class RemotePlayerManager {
                   ? 1 / 0.34
                   : op.handlingAction === 'INSPECT'
                     ? 1 / 2.6
-                    : 1 / 0.45;
-        op.targetHandlingProgress = Math.min(1, op.targetHandlingProgress + dt * estRate * 0.85);
+                    : op.handlingAction === 'GRENADE_DRAW'
+                      ? 1 / 0.36
+                      : op.handlingAction === 'GRENADE_PIN_PULL'
+                        ? 1 / 0.56
+                        : op.handlingAction === 'GRENADE_THROW_OVERHAND'
+                          ? 1 / 0.34
+                          : op.handlingAction === 'GRENADE_THROW_UNDERHAND'
+                            ? 1 / 0.30
+                            : op.handlingAction === 'GRENADE_COOK' ||
+                                op.handlingAction === 'GRENADE_CHARGE'
+                              ? 0
+                              : 1 / 0.45;
+        if (estRate > 0) {
+          op.targetHandlingProgress = Math.min(1, op.targetHandlingProgress + dt * estRate * 0.85);
+        }
         op.handlingProgress += (op.targetHandlingProgress - op.handlingProgress) * poseAlpha;
       } else {
         op.handlingProgress = 0;
@@ -817,17 +852,24 @@ export class RemotePlayerManager {
       pose.flinchPitch = flinchPitch;
       pose.handlingAction = op.handlingAction;
       pose.handlingProgress = op.handlingProgress;
+      pose.grenadeEquipmentId = op.grenadeEquipmentId;
+      pose.grenadeCharge01 = op.grenadeCharge01;
+      pose.grenadeThrowStyle = op.grenadeThrowStyle;
       rig.applyCombatPose(pose);
 
       // Muzzle flash, laser & tactical light
+      const grenadeBusy = op.handlingAction.startsWith('GRENADE_');
       if (op.muzzleFlashTimer > 0) {
         op.muzzleFlashTimer = Math.max(0, op.muzzleFlashTimer - dt);
         if (op.muzzleFlashTimer <= 0) rig.muzzleFlash.visible = false;
       }
+      if (grenadeBusy) {
+        rig.muzzleFlash.visible = false;
+      }
       const suppBusy =
         op.handlingAction === 'SUPPRESSOR_DETACH' || op.handlingAction === 'SUPPRESSOR_ATTACH';
-      rig.laserBeam.visible = op.laserOn && !op.isReloading && !suppBusy;
-      rig.flashlightGlow.visible = op.flashlightOn;
+      rig.laserBeam.visible = op.laserOn && !op.isReloading && !suppBusy && !grenadeBusy;
+      rig.flashlightGlow.visible = op.flashlightOn && !grenadeBusy;
 
       // Nameplate height & distance/team visibility
       op.nameSprite.position.y = 2.08 - op.crouchBlend * 0.28;

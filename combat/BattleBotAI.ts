@@ -31,6 +31,7 @@ import {
 import {
   BotWeaponVisualClass,
   GameBotsSyncPacket,
+  GameGrenadeEventKind,
   OperatorUniformId,
   packSyncedWeaponAttachments,
   resolveOperatorUniformId,
@@ -40,6 +41,12 @@ import {
   TacticalPingKind,
   unpackSyncedWeaponAttachments,
 } from '../data/multiplayer';
+import {
+  DEFAULT_TACTICAL_EQUIPMENT_ID,
+  getTacticalEquipmentDef,
+  isTacticalEquipmentId,
+  TacticalEquipmentId,
+} from '../data/tacticalEquipment';
 import {
   getCompatibleAttachments,
   getOwnedSuppressorDef,
@@ -130,6 +137,17 @@ export interface BotCommsEvent {
   pingKind?: TacticalPingKind | null;
   pingLabel?: string | null;
   pingPos?: THREE.Vector3 | null;
+}
+
+export interface BotGrenadeEvent {
+  botId: string;
+  botName: string;
+  team: BattleTeamId;
+  kind: GameGrenadeEventKind;
+  equipmentId: TacticalEquipmentId;
+  origin: THREE.Vector3;
+  velocity: THREE.Vector3;
+  fuseRemainingSec: number;
 }
 
 export interface BotEconomyActionEvent {
@@ -420,6 +438,14 @@ interface PendingSquadAck {
   text: string;
 }
 
+type BotGrenadeStage =
+  | 'HOLSTERED'
+  | 'DRAWN'
+  | 'PIN_PULLED'
+  | 'LEVER_RELEASED'
+  | 'CHARGING'
+  | 'THROWING';
+
 interface BotActor {
   id: string;
   name: string;
@@ -441,6 +467,28 @@ interface BotActor {
   netHandlingAction: SyncedHandlingAction;
   netHandlingProgress: number;
   netSuppressed: boolean;
+
+  // Finite role-based tactical grenade pouch & 4-stage manual of arms FSM
+  grenadePouch: Partial<Record<TacticalEquipmentId, number>>;
+  primaryGrenadeId: TacticalEquipmentId;
+  grenadeCooldown: number;
+  grenadeStage: BotGrenadeStage;
+  grenadeStageTimer: number;
+  grenadeEquipId: TacticalEquipmentId;
+  grenadeFuseSec: number;
+  grenadeFuseRemaining: number;
+  grenadeCookTargetSec: number;
+  grenadeThrowStyle: 'overhand' | 'underhand';
+  grenadeCharge01: number;
+  grenadeChargeTarget: number;
+  grenadeSpoonPopped: boolean;
+  grenadeThrowDispatched: boolean;
+  grenadeTargetPos: THREE.Vector3;
+  grenadeOvercookRisk: boolean;
+  netGrenadeEquipId: TacticalEquipmentId;
+  netGrenadeCharge01: number;
+  netGrenadeThrowStyle: 'overhand' | 'underhand';
+
   alive: boolean;
   hp: number;
   maxHp: number;
@@ -589,6 +637,7 @@ export class BattleBotAI {
   private elapsedClockSec = 0;
   private readonly pendingAcks: PendingSquadAck[] = [];
   private onBotCommsCb: ((ev: BotCommsEvent) => void) | null = null;
+  private onBotGrenadeCb: ((ev: BotGrenadeEvent) => void) | null = null;
 
   public scoreA = 0;
   public scoreB = 0;
@@ -749,6 +798,10 @@ export class BattleBotAI {
       rig.setSuppressedVisual(suppressed);
       this.group.add(rig.root);
 
+      const initialPouch = this.buildBotGrenadePouch(i);
+      const initialPrimaryGrenade: TacticalEquipmentId =
+        this.coopInfectionMode || i % 4 !== 1 ? 'm67_frag' : 'm84_flash';
+
       const bot: BotActor = {
         id,
         name,
@@ -770,6 +823,25 @@ export class BattleBotAI {
         netHandlingAction: 'NONE',
         netHandlingProgress: 0,
         netSuppressed: suppressed,
+        grenadePouch: initialPouch,
+        primaryGrenadeId: initialPrimaryGrenade,
+        grenadeCooldown: 6 + i * 2.2 + Math.random() * 6,
+        grenadeStage: 'HOLSTERED',
+        grenadeStageTimer: 0,
+        grenadeEquipId: initialPrimaryGrenade,
+        grenadeFuseSec: 4.5,
+        grenadeFuseRemaining: 4.5,
+        grenadeCookTargetSec: 0,
+        grenadeThrowStyle: 'overhand',
+        grenadeCharge01: 0,
+        grenadeChargeTarget: 0.65,
+        grenadeSpoonPopped: false,
+        grenadeThrowDispatched: false,
+        grenadeTargetPos: new THREE.Vector3(),
+        grenadeOvercookRisk: false,
+        netGrenadeEquipId: initialPrimaryGrenade,
+        netGrenadeCharge01: 0,
+        netGrenadeThrowStyle: 'overhand',
         alive: true,
         hp: this.aiMaxHp,
         maxHp: this.aiMaxHp,
@@ -977,6 +1049,15 @@ export class BattleBotAI {
     bot.handlingAction = 'NONE';
     bot.handlingTimer = 0;
     bot.handlingDuration = 0;
+    bot.grenadeStage = 'HOLSTERED';
+    bot.grenadeStageTimer = 0;
+    bot.grenadeCharge01 = 0;
+    bot.grenadeSpoonPopped = false;
+    bot.grenadeThrowDispatched = false;
+    if (!this.coopInfectionMode) {
+      bot.grenadePouch = this.buildBotGrenadePouch(bot.botSeedIndex);
+    }
+    this.syncBotBeltGrenade(bot);
     bot.lowHpCalledOut = false;
     bot.economyGoal = null;
     bot.prevHasLos = false;
@@ -997,6 +1078,59 @@ export class BattleBotAI {
     bot.root.rotation.set(0, bot.yaw, 0);
     bot.muzzleFlash.visible = false;
     this.rebuildActiveHitMeshes();
+  }
+
+  private buildBotGrenadePouch(seedIndex: number): Partial<Record<TacticalEquipmentId, number>> {
+    if (this.coopInfectionMode) {
+      return { m67_frag: 2, an_m14_thermite: 1 };
+    }
+    if (seedIndex % 4 === 1) {
+      return { m84_flash: 2, m67_frag: 1 };
+    }
+    if (seedIndex % 4 === 3) {
+      return { m18_smoke: 1, m67_frag: 2 };
+    }
+    return { m67_frag: 2, m84_flash: 1 };
+  }
+
+  private getBotTotalGrenades(bot: BotActor): number {
+    let total = 0;
+    for (const v of Object.values(bot.grenadePouch)) {
+      if (typeof v === 'number' && v > 0) total += v;
+    }
+    return total;
+  }
+
+  private syncBotBeltGrenade(bot: BotActor): void {
+    const total = this.getBotTotalGrenades(bot);
+    const activeCount = bot.grenadePouch[bot.primaryGrenadeId] ?? 0;
+    let displayId = bot.primaryGrenadeId;
+    if (activeCount <= 0) {
+      for (const id of ['m67_frag', 'm84_flash', 'm18_smoke', 'an_m14_thermite'] as TacticalEquipmentId[]) {
+        if ((bot.grenadePouch[id] ?? 0) > 0) {
+          displayId = id;
+          break;
+        }
+      }
+    }
+    bot.rig.setBeltEquipment(
+      displayId,
+      'front_left',
+      total,
+      bot.alive && total > 0 && bot.grenadeStage === 'HOLSTERED',
+    );
+  }
+
+  public setBotGrenadeListener(listener: ((ev: BotGrenadeEvent) => void) | null): void {
+    this.onBotGrenadeCb = listener;
+  }
+
+  public replenishBotGrenades(): void {
+    for (let i = 0; i < this.bots.length; i++) {
+      const b = this.bots[i];
+      b.grenadePouch = this.buildBotGrenadePouch(b.botSeedIndex);
+      this.syncBotBeltGrenade(b);
+    }
   }
 
   public resetMatch(playerPos: Readonly<THREE.Vector3>): void {
@@ -1371,6 +1505,9 @@ export class BattleBotAI {
         att: packSyncedWeaponAttachments(b.attachments),
         ha,
         hprog: Number(hprog.toFixed(3)),
+        geq: b.grenadeStage !== 'HOLSTERED' ? b.grenadeEquipId : undefined,
+        gc: b.grenadeStage !== 'HOLSTERED' ? Number(b.grenadeCharge01.toFixed(3)) : undefined,
+        gts: b.grenadeStage !== 'HOLSTERED' ? b.grenadeThrowStyle : undefined,
         sup: b.suppressed,
         points: this.coopInfectionMode ? b.points : undefined,
         reloading: b.reloadTimer > 0,
@@ -1447,6 +1584,14 @@ export class BattleBotAI {
           : 0;
       bot.netHandlingAction = nextHa;
       bot.netHandlingProgress = nextHprog;
+      bot.netGrenadeEquipId = isTacticalEquipmentId(sb.geq)
+        ? sb.geq
+        : DEFAULT_TACTICAL_EQUIPMENT_ID;
+      bot.netGrenadeCharge01 =
+        typeof sb.gc === 'number' && Number.isFinite(sb.gc)
+          ? THREE.MathUtils.clamp(sb.gc, 0, 1)
+          : 0;
+      bot.netGrenadeThrowStyle = sb.gts === 'underhand' ? 'underhand' : 'overhand';
       if (nextHa !== 'SUPPRESSOR_DETACH' && nextHa !== 'SUPPRESSOR_ATTACH') {
         bot.rig.setSuppressedVisual(bot.netSuppressed);
       }
@@ -1596,6 +1741,34 @@ export class BattleBotAI {
     weaponLabel: string,
     killerBot?: BotActor,
   ): void {
+    // Live drop: if the bot had already popped its safety lever, drop the active armed grenade at palm
+    if (victim.grenadeSpoonPopped && victim.grenadeStage !== 'HOLSTERED') {
+      const palm = this.getBotPalmWorldPos(victim, new THREE.Vector3());
+      const dropVel = new THREE.Vector3(
+        (Math.random() - 0.5) * 1.4,
+        1.1,
+        (Math.random() - 0.5) * 1.4,
+      );
+      const prevCount = victim.grenadePouch[victim.grenadeEquipId] ?? 0;
+      victim.grenadePouch[victim.grenadeEquipId] = Math.max(0, prevCount - 1);
+      this.onBotGrenadeCb?.({
+        botId: victim.id,
+        botName: victim.name,
+        team: victim.team,
+        kind: 'live_drop',
+        equipmentId: victim.grenadeEquipId,
+        origin: palm,
+        velocity: dropVel,
+        fuseRemainingSec: Math.max(0.15, victim.grenadeFuseRemaining),
+      });
+    }
+    victim.grenadeStage = 'HOLSTERED';
+    victim.grenadeSpoonPopped = false;
+    victim.grenadeCharge01 = 0;
+    victim.handlingAction = 'NONE';
+    victim.handlingTimer = 0;
+    victim.handlingDuration = 0;
+
     victim.alive = false;
     victim.hp = 0;
     victim.deaths += 1;
@@ -2566,11 +2739,27 @@ export class BattleBotAI {
                 ? 1 / 2.25
                 : bot.netHandlingAction === 'BOLT'
                   ? 1 / 0.72
-                  : 1 / 0.36;
-          bot.netHandlingProgress = Math.min(1, bot.netHandlingProgress + dt * estRate * 0.75);
+                  : bot.netHandlingAction === 'GRENADE_PIN_PULL'
+                    ? 1 / 0.56
+                    : bot.netHandlingAction === 'GRENADE_DRAW' ||
+                        bot.netHandlingAction === 'GRENADE_THROW_OVERHAND'
+                      ? 1 / 0.34
+                      : bot.netHandlingAction === 'GRENADE_THROW_UNDERHAND'
+                        ? 1 / 0.30
+                        : bot.netHandlingAction === 'GRENADE_COOK' ||
+                            bot.netHandlingAction === 'GRENADE_CHARGE'
+                          ? 0
+                          : 1 / 0.36;
+          bot.netHandlingProgress =
+            estRate > 0
+              ? Math.min(1, bot.netHandlingProgress + dt * estRate * 0.75)
+              : bot.netHandlingProgress;
         }
         pose.handlingAction = bot.netHandlingAction;
         pose.handlingProgress = bot.netHandlingProgress;
+        pose.grenadeEquipmentId = bot.netGrenadeEquipId;
+        pose.grenadeCharge01 = bot.netGrenadeCharge01;
+        pose.grenadeThrowStyle = bot.netGrenadeThrowStyle;
 
         bot.bodyPivot.rotation.set(0, 0, 0);
         bot.bodyPivot.position.set(0, 0, 0);
@@ -2635,32 +2824,36 @@ export class BattleBotAI {
       if (bot.commsCooldown > 0) bot.commsCooldown = Math.max(0, bot.commsCooldown - dt);
       if (bot.meleeCooldown > 0) bot.meleeCooldown = Math.max(0, bot.meleeCooldown - dt);
       if (bot.suppToggleCooldown > 0) bot.suppToggleCooldown = Math.max(0, bot.suppToggleCooldown - dt);
+      if (bot.grenadeCooldown > 0) bot.grenadeCooldown = Math.max(0, bot.grenadeCooldown - dt);
       if (bot.hp > bot.maxHp * 0.65) bot.lowHpCalledOut = false;
       bot.recoilKick = Math.max(0, bot.recoilKick - dt * 7.2);
 
       // Step active weapon handling action (suppressor detach/attach, pump cycle, bolt cycle)
       if (bot.handlingAction !== 'NONE') {
         bot.handlingTimer += dt;
-        const isSuppAction =
-          bot.handlingAction === 'SUPPRESSOR_DETACH' ||
-          bot.handlingAction === 'SUPPRESSOR_ATTACH';
-        if (isSuppAction && (bot.vaultActive || bot.stunTimer > 0)) {
-          // Emergency cancel on vault or stun -> restore pre-action mounted/stowed state cleanly
-          bot.handlingAction = 'NONE';
-          bot.handlingTimer = 0;
-          bot.handlingDuration = 0;
-          bot.rig.setSuppressedVisual(bot.suppressed);
-          bot.suppToggleCooldown = 6.0;
-        } else if (bot.handlingTimer >= Math.max(0.05, bot.handlingDuration)) {
-          if (isSuppAction) {
-            bot.suppressed = bot.pendingSuppressorAttach;
-            bot.attachments = { ...bot.attachments, suppressorStowed: !bot.suppressed };
-            bot.rig.setWeaponLoadout(bot.weaponId, bot.attachments);
+        const isGrenadeSyncAction = bot.handlingAction.startsWith('GRENADE_');
+        if (!isGrenadeSyncAction) {
+          const isSuppAction =
+            bot.handlingAction === 'SUPPRESSOR_DETACH' ||
+            bot.handlingAction === 'SUPPRESSOR_ATTACH';
+          if (isSuppAction && (bot.vaultActive || bot.stunTimer > 0)) {
+            // Emergency cancel on vault or stun -> restore pre-action mounted/stowed state cleanly
+            bot.handlingAction = 'NONE';
+            bot.handlingTimer = 0;
+            bot.handlingDuration = 0;
             bot.rig.setSuppressedVisual(bot.suppressed);
+            bot.suppToggleCooldown = 6.0;
+          } else if (bot.handlingTimer >= Math.max(0.05, bot.handlingDuration)) {
+            if (isSuppAction) {
+              bot.suppressed = bot.pendingSuppressorAttach;
+              bot.attachments = { ...bot.attachments, suppressorStowed: !bot.suppressed };
+              bot.rig.setWeaponLoadout(bot.weaponId, bot.attachments);
+              bot.rig.setSuppressedVisual(bot.suppressed);
+            }
+            bot.handlingAction = 'NONE';
+            bot.handlingTimer = 0;
+            bot.handlingDuration = 0;
           }
-          bot.handlingAction = 'NONE';
-          bot.handlingTimer = 0;
-          bot.handlingDuration = 0;
         }
       }
 
@@ -2972,7 +3165,23 @@ export class BattleBotAI {
           bot.handlingAction === 'SUPPRESSOR_DETACH' ||
           bot.handlingAction === 'SUPPRESSOR_ATTACH' ||
           bot.handlingAction === 'PUMP' ||
-          bot.handlingAction === 'BOLT';
+          bot.handlingAction === 'BOLT' ||
+          bot.grenadeStage !== 'HOLSTERED';
+
+        // Consider initiating a 4-stage grenade throw from medium/close combat range
+        if (
+          bot.grenadeStage === 'HOLSTERED' &&
+          bot.grenadeCooldown <= 0 &&
+          bot.stunTimer <= 0 &&
+          bot.reloadTimer <= 0 &&
+          !isHandlingLocked &&
+          bot.burstShotsLeft <= 0 &&
+          !bot.vaultActive &&
+          horizDist >= 3.5 &&
+          horizDist <= 24.0
+        ) {
+          this.tryStartBotGrenade(bot, targetPos, horizDist, humans, zombies);
+        }
 
         if (bot.stunTimer > 0) {
           bot.stunTimer = Math.max(0, bot.stunTimer - dt);
@@ -3407,6 +3616,9 @@ export class BattleBotAI {
         bot.lastProgressZ = bot.pos.z;
       }
 
+      // Advance 4-stage bot grenade manual of arms FSM (handles draw, pin pull, optional spoon pop/cook, windup, and release)
+      this.stepBotGrenadeFSM(bot, dt, targetPos, humans);
+
       // Smooth yaw turn & tactical posture damping
       let yawDelta = bot.targetYaw - bot.yaw;
       while (yawDelta > Math.PI) yawDelta -= Math.PI * 2;
@@ -3421,7 +3633,10 @@ export class BattleBotAI {
         bot.walkCycle += dt * speedHoriz * 2.55;
       }
 
-      const isAimingFire = (bot.hasLos || bot.firingVisualTimer > 0) && bot.stunTimer <= 0;
+      const isAimingFire =
+        bot.grenadeStage === 'HOLSTERED' &&
+        (bot.hasLos || bot.firingVisualTimer > 0) &&
+        bot.stunTimer <= 0;
       const flinchPitch =
         bot.stunTimer > 0
           ? -0.22 + Math.sin(performance.now() * 0.018) * 0.1
@@ -3429,7 +3644,7 @@ export class BattleBotAI {
             ? Math.sin(bot.flinchTimer * 35) * 0.16
             : 0;
       let aimPitch = 0;
-      if (bot.hasLos && targetPos) {
+      if ((bot.hasLos || bot.grenadeStage !== 'HOLSTERED') && targetPos) {
         const horizDist = Math.max(0.5, Math.hypot(targetPos.x - bot.pos.x, targetPos.z - bot.pos.z));
         aimPitch = THREE.MathUtils.clamp(
           Math.atan2(targetPos.y - (bot.pos.y + 1.36 - bot.crouchBlend * 0.42), horizDist),
@@ -3449,7 +3664,7 @@ export class BattleBotAI {
         bot.reloadTimer > 0 ? Math.sin(Math.min(1, bot.reloadTimer / Math.max(0.2, bot.reloadDuration)) * Math.PI) : 0;
       pose.speedMps = speedHoriz;
       pose.walkCycle = bot.walkCycle;
-      pose.sprint = !bot.hasLos && bot.crouchBlend < 0.25 && speedHoriz > 3.1;
+      pose.sprint = !bot.hasLos && bot.grenadeStage === 'HOLSTERED' && bot.crouchBlend < 0.25 && speedHoriz > 3.1;
       pose.recoilKick = bot.recoilKick;
       pose.firingVibration = bot.firingVisualTimer > 0 ? Math.sin(performance.now() * 0.055) * 0.014 : 0;
       pose.flinchPitch = flinchPitch;
@@ -3470,12 +3685,387 @@ export class BattleBotAI {
         pose.handlingAction = 'NONE';
         pose.handlingProgress = 0;
       }
+      pose.grenadeEquipmentId = bot.grenadeEquipId;
+      pose.grenadeCharge01 = bot.grenadeCharge01;
+      pose.grenadeThrowStyle = bot.grenadeThrowStyle;
 
       bot.bodyPivot.rotation.set(0, 0, 0);
       bot.bodyPivot.position.set(0, 0, 0);
       bot.rig.applyCombatPose(pose);
       bot.root.position.copy(bot.pos);
       bot.root.rotation.set(0, bot.yaw, 0);
+    }
+  }
+
+  private getBotPalmWorldPos(bot: BotActor, out: THREE.Vector3): THREE.Vector3 {
+    const fx = -Math.sin(bot.yaw);
+    const fz = -Math.cos(bot.yaw);
+    const rx = Math.cos(bot.yaw);
+    const rz = -Math.sin(bot.yaw);
+    return out.set(
+      bot.pos.x + rx * 0.22 + fx * 0.34,
+      bot.pos.y + 1.38 - bot.crouchBlend * 0.38,
+      bot.pos.z + rz * 0.22 + fz * 0.34,
+    );
+  }
+
+  private hasFriendlyInBlastRadius(
+    bot: BotActor,
+    impactPos: Readonly<THREE.Vector3>,
+    radiusM: number,
+    humans: readonly BattleHumanTarget[],
+  ): boolean {
+    const rSq = radiusM * radiusM;
+    for (let i = 0; i < this.bots.length; i++) {
+      const other = this.bots[i];
+      if (!other.alive) continue;
+      if (other.id !== bot.id && this.isHostilePair(bot.team, other.team)) continue;
+      if (other.pos.distanceToSquared(impactPos) <= rSq) return true;
+    }
+    for (let h = 0; h < humans.length; h++) {
+      const hm = humans[h];
+      if (!hm.alive || this.isHostilePair(bot.team, hm.team)) continue;
+      if (hm.pos.distanceToSquared(impactPos) <= rSq) return true;
+    }
+    return false;
+  }
+
+  private solveBotThrowVelocity(
+    origin: Readonly<THREE.Vector3>,
+    target: Readonly<THREE.Vector3>,
+    style: 'overhand' | 'underhand',
+    out: THREE.Vector3,
+  ): THREE.Vector3 {
+    const dx = target.x - origin.x;
+    const dy = target.y - origin.y;
+    const dz = target.z - origin.z;
+    const horizDist = Math.max(0.5, Math.hypot(dx, dz));
+    const speed =
+      style === 'underhand'
+        ? 10.0
+        : THREE.MathUtils.clamp(12.2 + horizDist * 0.45, 13.5, 22.5);
+    const flightSec = horizDist / speed;
+    const arcLiftY = 0.5 * 9.81 * flightSec * flightSec * (style === 'underhand' ? 0.65 : 0.86);
+    out.set(dx, dy + arcLiftY, dz);
+    if (out.lengthSq() < 1e-4) {
+      out.set(0, 0.3, -1);
+    }
+    return out.normalize().multiplyScalar(speed);
+  }
+
+  private tryStartBotGrenade(
+    bot: BotActor,
+    targetPos: Readonly<THREE.Vector3>,
+    horizDist: number,
+    humans: readonly BattleHumanTarget[],
+    zombies: ReadonlyArray<BattleZombieTarget>,
+  ): void {
+    // Pick best available ordnance from finite pouch
+    let chosenId: TacticalEquipmentId | null = null;
+    if (this.coopInfectionMode) {
+      let nearbyZ = 0;
+      for (let z = 0; z < zombies.length; z++) {
+        if (zombies[z].pos.distanceToSquared(targetPos) <= 25) nearbyZ++;
+      }
+      if (nearbyZ < 3) return;
+      if ((bot.grenadePouch.an_m14_thermite ?? 0) > 0 && nearbyZ >= 4) {
+        chosenId = 'an_m14_thermite';
+      } else if ((bot.grenadePouch.m67_frag ?? 0) > 0) {
+        chosenId = 'm67_frag';
+      }
+    } else {
+      const order: TacticalEquipmentId[] =
+        horizDist < 10.5
+          ? ['m84_flash', 'm67_frag', 'm18_smoke', 'an_m14_thermite']
+          : ['m67_frag', 'm84_flash', 'an_m14_thermite', 'm18_smoke'];
+      for (const candidate of order) {
+        if ((bot.grenadePouch[candidate] ?? 0) <= 0) continue;
+        if (candidate === 'm67_frag' || candidate === 'an_m14_thermite') {
+          const safeR = candidate === 'm67_frag' ? 6.5 : 4.2;
+          if (this.hasFriendlyInBlastRadius(bot, targetPos, safeR, humans)) continue;
+        }
+        chosenId = candidate;
+        break;
+      }
+    }
+
+    if (!chosenId) return;
+    if (Math.random() > 0.24) {
+      bot.grenadeCooldown = 2.5 + Math.random() * 2.0;
+      return;
+    }
+
+    const def = getTacticalEquipmentDef(chosenId);
+    bot.grenadeEquipId = chosenId;
+    bot.grenadeFuseSec = Math.max(
+      0.8,
+      def.fuseSec + (Math.random() * 2 - 1) * def.fuseVarianceSec,
+    );
+    bot.grenadeFuseRemaining = bot.grenadeFuseSec;
+    bot.grenadeTargetPos.copy(targetPos);
+    bot.grenadeThrowStyle = horizDist < 9.0 ? 'underhand' : 'overhand';
+    bot.grenadeCharge01 = 0;
+    bot.grenadeChargeTarget =
+      bot.grenadeThrowStyle === 'underhand'
+        ? 0.15
+        : THREE.MathUtils.clamp((horizDist - 7) / 17, 0.25, 0.96);
+    bot.grenadeSpoonPopped = false;
+    bot.grenadeThrowDispatched = false;
+    bot.grenadeCookTargetSec =
+      chosenId === 'm67_frag' && horizDist >= 7.5 && Math.random() < 0.42
+        ? 0.45 + Math.random() * 0.75
+        : 0;
+    bot.grenadeOvercookRisk =
+      chosenId === 'm67_frag' && Math.random() < 0.04;
+    if (bot.grenadeOvercookRisk) {
+      bot.grenadeCookTargetSec = bot.grenadeFuseSec + 1.0;
+    }
+
+    bot.grenadeStage = 'DRAWN';
+    bot.grenadeStageTimer = 0;
+    bot.grenadeCooldown = 11.0 + Math.random() * 8.0;
+    bot.handlingAction = 'GRENADE_DRAW';
+    bot.handlingTimer = 0;
+    bot.handlingDuration = 0.34;
+    this.syncBotBeltGrenade(bot);
+    if (this.isAlliedBot(bot)) {
+      this.emitAlliedComms(
+        bot,
+        'status',
+        chosenId === 'm84_flash'
+          ? 'Flash out — shield your optics!'
+          : chosenId === 'm18_smoke'
+            ? 'Deploying smoke screen!'
+            : 'Frag out — watch your spacing!',
+      );
+    }
+  }
+
+  private stepBotGrenadeFSM(
+    bot: BotActor,
+    dt: number,
+    targetPos: THREE.Vector3 | null,
+    humans: readonly BattleHumanTarget[],
+  ): void {
+    if (bot.grenadeStage === 'HOLSTERED') return;
+
+    if (targetPos) {
+      bot.grenadeTargetPos.copy(targetPos);
+    }
+
+    // Live drop if stunned after releasing safety lever
+    if (bot.stunTimer > 0.25) {
+      if (bot.grenadeSpoonPopped) {
+        const palm = this.getBotPalmWorldPos(bot, new THREE.Vector3());
+        const prev = bot.grenadePouch[bot.grenadeEquipId] ?? 0;
+        bot.grenadePouch[bot.grenadeEquipId] = Math.max(0, prev - 1);
+        this.onBotGrenadeCb?.({
+          botId: bot.id,
+          botName: bot.name,
+          team: bot.team,
+          kind: 'live_drop',
+          equipmentId: bot.grenadeEquipId,
+          origin: palm,
+          velocity: new THREE.Vector3((Math.random() - 0.5) * 1.2, 1.0, (Math.random() - 0.5) * 1.2),
+          fuseRemainingSec: Math.max(0.15, bot.grenadeFuseRemaining),
+        });
+      }
+      bot.grenadeStage = 'HOLSTERED';
+      bot.grenadeSpoonPopped = false;
+      bot.grenadeCharge01 = 0;
+      bot.handlingAction = 'NONE';
+      bot.handlingTimer = 0;
+      bot.handlingDuration = 0;
+      this.syncBotBeltGrenade(bot);
+      return;
+    }
+
+    // Burn active pyrotechnic fuse if safety lever has been popped
+    if (bot.grenadeSpoonPopped) {
+      bot.grenadeFuseRemaining -= dt;
+      if (bot.grenadeFuseRemaining <= 0) {
+        const palm = this.getBotPalmWorldPos(bot, new THREE.Vector3());
+        const prev = bot.grenadePouch[bot.grenadeEquipId] ?? 0;
+        bot.grenadePouch[bot.grenadeEquipId] = Math.max(0, prev - 1);
+        const def = getTacticalEquipmentDef(bot.grenadeEquipId);
+        this.onBotGrenadeCb?.({
+          botId: bot.id,
+          botName: bot.name,
+          team: bot.team,
+          kind: 'in_hand_detonate',
+          equipmentId: bot.grenadeEquipId,
+          origin: palm,
+          velocity: new THREE.Vector3(),
+          fuseRemainingSec: 0,
+        });
+        bot.grenadeStage = 'HOLSTERED';
+        bot.grenadeSpoonPopped = false;
+        bot.grenadeCharge01 = 0;
+        bot.handlingAction = 'NONE';
+        bot.handlingTimer = 0;
+        bot.handlingDuration = 0;
+        this.syncBotBeltGrenade(bot);
+        if (def.category === 'lethal') {
+          this.killBot(bot, bot.name, bot.team, false, def.killfeedLabel);
+        }
+        return;
+      }
+    }
+
+    bot.grenadeStageTimer += dt;
+
+    if (bot.grenadeStage === 'DRAWN') {
+      bot.handlingAction = 'GRENADE_DRAW';
+      bot.handlingDuration = 0.34;
+      bot.handlingTimer = Math.min(0.34, bot.grenadeStageTimer);
+      if (bot.grenadeStageTimer >= 0.34) {
+        bot.grenadeStage = 'PIN_PULLED';
+        bot.grenadeStageTimer = 0;
+        bot.handlingAction = 'GRENADE_PIN_PULL';
+        bot.handlingDuration = 0.56;
+        bot.handlingTimer = 0;
+        const palm = this.getBotPalmWorldPos(bot, new THREE.Vector3());
+        this.onBotGrenadeCb?.({
+          botId: bot.id,
+          botName: bot.name,
+          team: bot.team,
+          kind: 'pin_pull',
+          equipmentId: bot.grenadeEquipId,
+          origin: palm,
+          velocity: new THREE.Vector3(),
+          fuseRemainingSec: bot.grenadeFuseRemaining,
+        });
+      }
+    } else if (bot.grenadeStage === 'PIN_PULLED') {
+      bot.handlingAction = 'GRENADE_PIN_PULL';
+      bot.handlingDuration = 0.56;
+      bot.handlingTimer = Math.min(0.56, bot.grenadeStageTimer);
+      if (bot.grenadeStageTimer >= 0.56) {
+        if (bot.grenadeCookTargetSec > 0) {
+          bot.grenadeStage = 'LEVER_RELEASED';
+          bot.grenadeStageTimer = 0;
+          bot.grenadeSpoonPopped = true;
+          bot.handlingAction = 'GRENADE_COOK';
+          bot.handlingDuration = Math.max(0.25, bot.grenadeCookTargetSec);
+          bot.handlingTimer = 0;
+          const palm = this.getBotPalmWorldPos(bot, new THREE.Vector3());
+          this.onBotGrenadeCb?.({
+            botId: bot.id,
+            botName: bot.name,
+            team: bot.team,
+            kind: 'spoon_pop',
+            equipmentId: bot.grenadeEquipId,
+            origin: palm,
+            velocity: new THREE.Vector3(Math.cos(bot.yaw) * 1.5, 1.2, -Math.sin(bot.yaw) * 1.5),
+            fuseRemainingSec: bot.grenadeFuseRemaining,
+          });
+        } else {
+          bot.grenadeStage = 'CHARGING';
+          bot.grenadeStageTimer = 0;
+          bot.handlingAction = 'GRENADE_CHARGE';
+          bot.handlingDuration = bot.grenadeThrowStyle === 'underhand' ? 0.14 : 0.45;
+          bot.handlingTimer = 0;
+        }
+      }
+    } else if (bot.grenadeStage === 'LEVER_RELEASED') {
+      bot.handlingAction = 'GRENADE_COOK';
+      bot.handlingDuration = Math.max(0.25, bot.grenadeCookTargetSec);
+      bot.handlingTimer = Math.min(bot.handlingDuration, bot.grenadeStageTimer);
+      if (bot.grenadeStageTimer >= bot.grenadeCookTargetSec) {
+        bot.grenadeStage = 'CHARGING';
+        bot.grenadeStageTimer = 0;
+        bot.handlingAction = 'GRENADE_CHARGE';
+        bot.handlingDuration = bot.grenadeThrowStyle === 'underhand' ? 0.14 : 0.42;
+        bot.handlingTimer = 0;
+      }
+    } else if (bot.grenadeStage === 'CHARGING') {
+      const chargeDur = bot.grenadeThrowStyle === 'underhand' ? 0.14 : 0.42;
+      bot.grenadeCharge01 = THREE.MathUtils.lerp(
+        0,
+        bot.grenadeChargeTarget,
+        THREE.MathUtils.clamp(bot.grenadeStageTimer / chargeDur, 0, 1),
+      );
+      bot.handlingAction = 'GRENADE_CHARGE';
+      bot.handlingDuration = chargeDur;
+      bot.handlingTimer = Math.min(chargeDur, bot.grenadeStageTimer);
+      if (bot.grenadeStageTimer >= chargeDur) {
+        // Last-moment friendly check on lethal ordnance: if teammate rushed in, abort only if unpopped
+        if (
+          !bot.grenadeSpoonPopped &&
+          (bot.grenadeEquipId === 'm67_frag' || bot.grenadeEquipId === 'an_m14_thermite') &&
+          this.hasFriendlyInBlastRadius(bot, bot.grenadeTargetPos, 5.5, humans)
+        ) {
+          bot.grenadeStage = 'HOLSTERED';
+          bot.grenadeCharge01 = 0;
+          bot.handlingAction = 'NONE';
+          bot.handlingTimer = 0;
+          bot.handlingDuration = 0;
+          this.syncBotBeltGrenade(bot);
+          return;
+        }
+        bot.grenadeStage = 'THROWING';
+        bot.grenadeStageTimer = 0;
+        bot.grenadeThrowDispatched = false;
+        bot.handlingAction =
+          bot.grenadeThrowStyle === 'underhand'
+            ? 'GRENADE_THROW_UNDERHAND'
+            : 'GRENADE_THROW_OVERHAND';
+        bot.handlingDuration = bot.grenadeThrowStyle === 'underhand' ? 0.30 : 0.34;
+        bot.handlingTimer = 0;
+      }
+    } else if (bot.grenadeStage === 'THROWING') {
+      const whipDur = bot.grenadeThrowStyle === 'underhand' ? 0.30 : 0.34;
+      bot.handlingAction =
+        bot.grenadeThrowStyle === 'underhand'
+          ? 'GRENADE_THROW_UNDERHAND'
+          : 'GRENADE_THROW_OVERHAND';
+      bot.handlingDuration = whipDur;
+      bot.handlingTimer = Math.min(whipDur, bot.grenadeStageTimer);
+      if (!bot.grenadeThrowDispatched && bot.grenadeStageTimer >= whipDur * 0.30) {
+        bot.grenadeThrowDispatched = true;
+        const palm = this.getBotPalmWorldPos(bot, new THREE.Vector3());
+        if (!bot.grenadeSpoonPopped) {
+          bot.grenadeSpoonPopped = true;
+          this.onBotGrenadeCb?.({
+            botId: bot.id,
+            botName: bot.name,
+            team: bot.team,
+            kind: 'spoon_pop',
+            equipmentId: bot.grenadeEquipId,
+            origin: palm.clone(),
+            velocity: new THREE.Vector3(Math.cos(bot.yaw) * 1.4, 1.1, -Math.sin(bot.yaw) * 1.4),
+            fuseRemainingSec: bot.grenadeFuseRemaining,
+          });
+        }
+        const vel = this.solveBotThrowVelocity(
+          palm,
+          bot.grenadeTargetPos,
+          bot.grenadeThrowStyle,
+          new THREE.Vector3(),
+        );
+        const prev = bot.grenadePouch[bot.grenadeEquipId] ?? 0;
+        bot.grenadePouch[bot.grenadeEquipId] = Math.max(0, prev - 1);
+        this.onBotGrenadeCb?.({
+          botId: bot.id,
+          botName: bot.name,
+          team: bot.team,
+          kind: 'throw',
+          equipmentId: bot.grenadeEquipId,
+          origin: palm,
+          velocity: vel,
+          fuseRemainingSec: Math.max(0.2, bot.grenadeFuseRemaining),
+        });
+        this.syncBotBeltGrenade(bot);
+      }
+      if (bot.grenadeStageTimer >= whipDur) {
+        bot.grenadeStage = 'HOLSTERED';
+        bot.grenadeSpoonPopped = false;
+        bot.grenadeCharge01 = 0;
+        bot.handlingAction = 'NONE';
+        bot.handlingTimer = 0;
+        bot.handlingDuration = 0;
+        this.syncBotBeltGrenade(bot);
+      }
     }
   }
 

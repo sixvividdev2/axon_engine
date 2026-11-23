@@ -20,6 +20,7 @@ import {
   DEFAULT_TRAUMA_MODIFIERS,
   GrenadeDetonationEvent,
   GrenadeHoldStage,
+  GrenadeThrowStyle,
   IBodycamWorldAdapter,
   IR_LAYER,
   LENS_PRESETS,
@@ -117,7 +118,9 @@ export interface GymSnapshot {
   grenadeMax: number;
   grenadeHoldStage: GrenadeHoldStage;
   grenadeCooking: boolean;
-  grenadeCookRatio: number;
+  grenadeStatusLabel: string;
+  grenadeThrowStyle: GrenadeThrowStyle;
+  grenadeThrowHeld: boolean;
   flashBlindAlpha: number;
   zeroDistanceM: number;
   zeroElevationMrad: number;
@@ -447,9 +450,11 @@ export class GymEngine {
       onDetonate: (ev) => {
         this.handleGrenadeDetonation(ev);
       },
+      onInHandDetonate: (ev) => {
+        this.handleGrenadeDetonation(ev, true);
+      },
     });
-
-    this.grenadeSystem.attachViewmodelCamera(this.camera);
+    this.animator.setGrenadeSystem(this.grenadeSystem);
 
     this.syncBeltEquipmentMesh();
     this.unsubTacticalEquipment = tacticalEquipmentStore.subscribe((sel) => {
@@ -874,9 +879,18 @@ export class GymEngine {
     this.emitSnapshot();
   }
 
-  private handleGrenadeDetonation(ev: GrenadeDetonationEvent): void {
+  private handleGrenadeDetonation(ev: GrenadeDetonationEvent, isInHand = false): void {
     const camPos = this.camera.position;
     const dist = camPos.distanceTo(ev.position);
+
+    if (isInHand) {
+      this.adrenalineStress = 1.0;
+      this.controller.applyRecoil(0.14, (Math.random() - 0.5) * 0.12, 0.045, 0.85, {
+        stanceCoupled: false,
+      });
+      this.postProcess.triggerNvgFlashSpike(1.0);
+      this.showToast(`Over-cooked ${ev.def.shortName} detonated in hand!`, 3.2);
+    }
 
     // Kick reactive AR500 steel targets & shatter nearby glass in Gym!
     if (!ev.isTick && (ev.kind === 'frag' || ev.kind === 'flash')) {
@@ -1505,7 +1519,7 @@ export class GymEngine {
   }
 
   private attemptFire(): void {
-    if (this.pdaDevice.isBlockingWeaponActions()) return;
+    if (this.pdaDevice.isBlockingWeaponActions() || this.grenadeSystem.isDrawn()) return;
     const prof = this.getWeaponProfile();
     if (prof.holdClass === 'unarmed') {
       if (this.semiTriggerConsumed || this.controller.isVaulting()) return;
@@ -1624,25 +1638,33 @@ export class GymEngine {
     this.postProcess.setSize(w, h);
   };
 
+  private clearHeldControlInputs(): void {
+    this.isFiring = false;
+    this.semiTriggerConsumed = false;
+    this.shiftHeld = false;
+    this.altHeld = false;
+    this.input.ads = false;
+    this.input.forward = false;
+    this.input.backward = false;
+    this.input.left = false;
+    this.input.right = false;
+    this.input.sprint = false;
+    this.input.leanLeft = false;
+    this.input.leanRight = false;
+    this.input.holdBreath = false;
+    this.input.vault = false;
+    this.grenadeSystem.resetHeldInputOnFocusLoss();
+  }
+
+  private readonly onWindowBlur = (): void => {
+    this.clearHeldControlInputs();
+    this.emitSnapshot();
+  };
+
   private readonly onPointerLockChange = (): void => {
     this.pointerLocked = document.pointerLockElement === this.renderer.domElement;
     if (!this.pointerLocked) {
-      this.isFiring = false;
-      this.shiftHeld = false;
-      this.altHeld = false;
-      this.input.ads = false;
-      this.input.forward = false;
-      this.input.backward = false;
-      this.input.left = false;
-      this.input.right = false;
-      this.input.sprint = false;
-      this.input.leanLeft = false;
-      this.input.leanRight = false;
-      this.input.holdBreath = false;
-      this.input.vault = false;
-      if (this.grenadeSystem.isDrawn() && !this.grenadeSystem.isLeverReleased()) {
-        this.grenadeSystem.cancelCook();
-      }
+      this.clearHeldControlInputs();
     }
     this.emitSnapshot();
   };
@@ -1732,11 +1754,18 @@ export class GymEngine {
 
     // Authentic 4-stage tactical grenade Manual of Arms when grenade is drawn
     if (this.grenadeSystem.isDrawn()) {
-      if (e.button === 0 && this.grenadeSystem.getHoldStage() === 'DRAWN') {
-        this.grenadeSystem.pullPin();
-        this.emitSnapshot();
-      } else if (e.button === 2 && this.grenadeSystem.getHoldStage() === 'PIN_PULLED') {
-        this.grenadeSystem.releaseLever();
+      this.input.ads = false;
+      const stage = this.grenadeSystem.getHoldStage();
+      if (e.button === 2) {
+        if (stage === 'DRAWN') {
+          this.grenadeSystem.pullPin();
+          this.emitSnapshot();
+        } else if (stage === 'PIN_PULLED') {
+          this.grenadeSystem.releaseLever();
+          this.emitSnapshot();
+        }
+      } else if (e.button === 0 && (stage === 'PIN_PULLED' || stage === 'LEVER_RELEASED')) {
+        this.grenadeSystem.beginThrowInput();
         this.emitSnapshot();
       }
       return;
@@ -1773,27 +1802,15 @@ export class GymEngine {
 
   private readonly onMouseUp = (e: MouseEvent): void => {
     if (e.button === 0) {
-      if (this.grenadeSystem.isPinPulled()) {
-        this.camera.getWorldDirection(this._throwDir);
-        this._throwOrigin.copy(this.camera.position);
-        this.controller.getVelocity(this._playerVelScratch);
-        if (
-          this.grenadeSystem.throwHeldGrenade(
-            this._throwOrigin,
-            this._throwDir,
-            this._playerVelScratch,
-          )
-        ) {
-          this.grenadeCount = Math.max(0, this.grenadeCount - 1);
-          this.syncBeltEquipmentMesh();
-          const def = getTacticalEquipmentDef(this.tacticalEquipmentId);
-          this.showToast(`Thrown: ${def.shortName} (${this.grenadeCount}/${this.grenadeMax})`);
-          this.emitSnapshot();
-        }
-        return;
+      if (this.grenadeSystem.isThrowInputHeld()) {
+        this.grenadeSystem.releaseThrowInput();
+        this.emitSnapshot();
       }
       this.isFiring = false;
       this.semiTriggerConsumed = false;
+      if (this.grenadeSystem.isDrawn()) {
+        return;
+      }
     } else if (e.button === 2) {
       this.input.ads = false;
     }
@@ -1973,7 +1990,7 @@ export class GymEngine {
             this.weaponRig.cancelZoomTwist();
             this.grenadeSystem.drawGrenade(this.tacticalEquipmentId);
             const def = getTacticalEquipmentDef(this.tacticalEquipmentId);
-            this.showToast(`${def.shortName} Drawn — LMB Pin · RMB Lever · Release LMB Throw`);
+            this.showToast(`${def.shortName} Drawn — [RMB] Pin · [RMB] Spoon · [LMB] Click Lob / Hold Throw`);
             this.emitSnapshot();
           }
         }
@@ -2030,6 +2047,7 @@ export class GymEngine {
 
   private bindEvents(): void {
     window.addEventListener('resize', this.onResize);
+    window.addEventListener('blur', this.onWindowBlur);
     document.addEventListener('pointerlockchange', this.onPointerLockChange);
     window.addEventListener('mousemove', this.onMouseMove);
     window.addEventListener('mousedown', this.onMouseDown);
@@ -2045,6 +2063,7 @@ export class GymEngine {
 
   private unbindEvents(): void {
     window.removeEventListener('resize', this.onResize);
+    window.removeEventListener('blur', this.onWindowBlur);
     document.removeEventListener('pointerlockchange', this.onPointerLockChange);
     window.removeEventListener('mousemove', this.onMouseMove);
     window.removeEventListener('mousedown', this.onMouseDown);
@@ -2159,7 +2178,8 @@ export class GymEngine {
     this.input.cant = false;
     const suppBusy = this.weaponRig.isSuppressorActionActive();
     const pdaBusy = this.pdaDevice.isBlockingWeaponActions();
-    if (suppBusy || pdaBusy) {
+    const grenadeDrawn = this.grenadeSystem.isDrawn();
+    if (suppBusy || pdaBusy || grenadeDrawn) {
       this.input.ads = false;
     }
     // Shift sprints ONLY when not aiming; while aiming, Shift (or Alt) exclusively engages Hold Breath
@@ -2168,6 +2188,11 @@ export class GymEngine {
 
     let isVaultingNow = false;
     if (!benchBusy) {
+      this.controller.setGrenadeTension(
+        this.grenadeSystem.getCharge01(),
+        this.grenadeSystem.isLeverReleased(),
+        this.grenadeSystem.getThrowStyle(),
+      );
       // 1. Step BodycamController (physics step-up, vault/mantle, lean clearance, breathing sway, WeaponRig)
       this.controller.update(
         dt,
@@ -2222,7 +2247,7 @@ export class GymEngine {
       this._fpsCamPos.copy(this.camera.position);
       this._fpsCamQuat.copy(this.camera.quaternion);
       this.weaponRig.root.visible =
-        !this.grenadeSystem.isDrawn() && !this.pdaDevice.isWeaponHidden();
+        !this.grenadeSystem.isWeaponHidden() && !this.pdaDevice.isWeaponHidden();
       this.skeleton.root.visible = true;
 
       // Bench interaction look-at raycast
@@ -2237,6 +2262,7 @@ export class GymEngine {
         this.lookingAtBench = false;
       }
     } else {
+      this.controller.setGrenadeTension(0, false, 'underhand');
       if (this.pdaDevice.isOpen()) {
         this.pdaDevice.setOpen(false);
       }
@@ -2267,10 +2293,19 @@ export class GymEngine {
     });
     const wasLiveBefore = this.grenadeSystem.isLeverReleased();
     this.grenadeSystem.update(dt, this.camera.position);
-    if (wasLiveBefore && !this.grenadeSystem.isLeverReleased()) {
+    const launched = this.grenadeSystem.consumeLastLaunchedThrow();
+    if (launched) {
+      this.grenadeCount = Math.max(0, this.grenadeCount - 1);
+      this.syncBeltEquipmentMesh();
+      const def = getTacticalEquipmentDef(launched.equipmentId);
+      const styleTag = launched.style === 'underhand' ? 'Underhand Lob' : 'Overhand Throw';
+      this.showToast(`${styleTag}: ${def.shortName} (${this.grenadeCount}/${this.grenadeMax})`);
+      this.emitSnapshot();
+    } else if (wasLiveBefore && !this.grenadeSystem.isLeverReleased()) {
       // Over-cooked live fuse in hand!
       this.grenadeCount = Math.max(0, this.grenadeCount - 1);
       this.syncBeltEquipmentMesh();
+      this.emitSnapshot();
     }
     if (this.flashBlindAlpha > 0) {
       this.flashBlindAlpha = Math.max(0, this.flashBlindAlpha - dt * 0.42);
@@ -2424,7 +2459,9 @@ export class GymEngine {
       grenadeMax: this.grenadeMax,
       grenadeHoldStage: this.grenadeSystem.getHoldStage(),
       grenadeCooking: this.grenadeSystem.isCooking(),
-      grenadeCookRatio: this.grenadeSystem.getCookRatio(),
+      grenadeStatusLabel: this.grenadeSystem.getActionStatusLabel(),
+      grenadeThrowStyle: this.grenadeSystem.getThrowStyle(),
+      grenadeThrowHeld: this.grenadeSystem.isThrowInputHeld(),
       flashBlindAlpha: this.flashBlindAlpha,
       zeroDistanceM: att.zeroDistanceM ?? getDefaultZeroDistanceM(prof.category),
       zeroElevationMrad: att.zeroElevationMrad ?? 0,

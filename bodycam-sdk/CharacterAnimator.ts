@@ -11,6 +11,7 @@ import {
   TwoBoneIKResult,
 } from './IKSolver';
 import { SecondaryPhysicsRigApplier } from './physics/SecondaryPhysicsRigApplier';
+import { TacticalGrenadeSystem } from './equipment/TacticalGrenadeSystem';
 import { TacticalPdaDevice } from './TacticalPdaDevice';
 import {
   BodycamMeleeAttackType,
@@ -101,8 +102,10 @@ export class CharacterAnimator {
   private equipBlendTimer = 0;
   private leftActionReturnTimer = 0;
   private rightPdaReturnTimer = 0;
+  private rightGrenadeReturnTimer = 0;
   private wasLeftOverridden = false;
   private wasPdaActive = false;
+  private wasGrenadeActive = false;
 
   private prevStridePhase = 0;
   private stepSign = 1;
@@ -264,6 +267,20 @@ export class CharacterAnimator {
   private readonly _pdaPoleR = new THREE.Vector3();
 
   private pdaDevice: TacticalPdaDevice | null = null;
+  private grenadeSystem: TacticalGrenadeSystem | null = null;
+  private readonly _grenadeRPos = new THREE.Vector3();
+  private readonly _grenadeLPos = new THREE.Vector3();
+  private readonly _grenadePinPos = new THREE.Vector3();
+  private readonly _grenadePocketPos = new THREE.Vector3();
+  private readonly _grenadePullAxisWorld = new THREE.Vector3();
+  private readonly _grenadeBodyWorldQuat = new THREE.Quaternion();
+  private readonly _grenadeHandEuler = new THREE.Euler(0, 0, 0, 'YXZ');
+  private readonly _grenadeHandQuat = new THREE.Quaternion();
+  private readonly _grenadeLQuat = new THREE.Quaternion();
+  private readonly _grenadePoleR = new THREE.Vector3();
+  private readonly _grenadePoleL = new THREE.Vector3();
+  private readonly _grenadeReleaseOrigin = new THREE.Vector3();
+  private readonly _grenadeReleaseForward = new THREE.Vector3();
 
   // Post-animation soft-tissue & gear secondary physics
   private readonly secondaryApplier: SecondaryPhysicsRigApplier;
@@ -288,6 +305,10 @@ export class CharacterAnimator {
 
   public setPdaDevice(pda: TacticalPdaDevice | null): void {
     this.pdaDevice = pda;
+  }
+
+  public setGrenadeSystem(grenadeSystem: TacticalGrenadeSystem | null): void {
+    this.grenadeSystem = grenadeSystem;
   }
 
   public setSecondaryRagdollDecay(active: boolean): void {
@@ -611,7 +632,7 @@ export class CharacterAnimator {
       kickShiftWeight * 0.16;
     const leanAngle = -leanSign * 1.22 + kickShiftWeight * 0.10;
 
-    // Torso twist & crisp shoulder protraction during unarmed Jab / Cross
+    // Torso twist & crisp shoulder protraction during unarmed Jab / Cross or grenade overhand windup
     let punchTorsoYaw = 0;
     let leftClavProtract = 0;
     let rightClavProtract = 0;
@@ -627,6 +648,26 @@ export class CharacterAnimator {
         punchTorsoYaw = 0.22 * drive;
         rightClavProtract = 0.36 * protractBoost * drive;
         leftClavProtract = -0.12 * drive;
+      }
+    } else if (this.grenadeSystem && this.grenadeSystem.getWeaponStowBlend() > 0.25) {
+      const style = this.grenadeSystem.getThrowStyle();
+      const charge = this.grenadeSystem.getCharge01();
+      const whip = this.grenadeSystem.getThrowWhipProgress();
+      if (style === 'overhand') {
+        if (this.grenadeSystem.isThrowInputHeld()) {
+          punchTorsoYaw = -0.34 * charge;
+          rightClavProtract = -0.26 * charge;
+          leftClavProtract = 0.14 * charge;
+        } else if (whip > 0.001) {
+          const swing = THREE.MathUtils.lerp(-0.34 * Math.max(0.35, charge), 0.18, smoothstep(0, 0.72, whip));
+          const retract = 1 - smoothstep(0.72, 1.0, whip);
+          punchTorsoYaw = swing * retract;
+          rightClavProtract = swing * 0.65 * retract;
+        }
+      } else if (whip > 0.001) {
+        const arc = Math.sin(whip * Math.PI);
+        punchTorsoYaw = 0.10 * arc;
+        rightClavProtract = 0.14 * arc;
       }
     }
 
@@ -714,7 +755,8 @@ export class CharacterAnimator {
         ? Math.max(rigState.adsBlend, rigState.cantBlend, rigState.pointAimBlend)
         : 0;
     const pdaStowW = this.pdaDevice ? this.pdaDevice.getWeaponStowBlend() : 0;
-    const reachClampWeight = (1 - aimLockWeight) * (1 - pdaStowW);
+    const grenadeStowW = this.grenadeSystem ? this.grenadeSystem.getWeaponStowBlend() : 0;
+    const reachClampWeight = (1 - aimLockWeight) * (1 - Math.max(pdaStowW, grenadeStowW));
 
     if (reachClampWeight > 0.001) {
       for (let iter = 0; iter < 2; iter++) {
@@ -1485,18 +1527,22 @@ export class CharacterAnimator {
     }
 
     const pdaStowW = this.pdaDevice ? this.pdaDevice.getWeaponStowBlend() : 0;
-    if (pdaStowW > 0.001) {
-      this._actionPosOffset.y -= 0.28 * pdaStowW;
-      this._actionPosOffset.z += 0.14 * pdaStowW;
-      this._actionRotOffset.x -= 0.45 * pdaStowW;
+    const grenadeStowW = this.grenadeSystem ? this.grenadeSystem.getWeaponStowBlend() : 0;
+    const totalStowW = Math.max(pdaStowW, grenadeStowW);
+    if (totalStowW > 0.001) {
+      this._actionPosOffset.y -= 0.29 * totalStowW;
+      this._actionPosOffset.z += 0.14 * totalStowW;
+      this._actionRotOffset.x -= 0.46 * totalStowW;
     }
 
+    const weaponHidden =
+      (this.pdaDevice?.isWeaponHidden() ?? false) || (this.grenadeSystem?.isWeaponHidden() ?? false);
     this.weaponRig.applyCharacterActionPose(
       this._actionPosOffset,
       this._actionRotOffset,
       0,
       0,
-      this.pdaDevice?.isWeaponHidden() ?? false,
+      weaponHidden,
     );
   }
 
@@ -1740,6 +1786,15 @@ export class CharacterAnimator {
     const pdaActiveHold =
       this.pdaDevice !== null && pdaIkW > 0.02 && vaultPinR < 0.15 && vaultPinL < 0.15;
 
+    const grenadeStowW = this.grenadeSystem ? this.grenadeSystem.getWeaponStowBlend() : 0;
+    const grenadeIkW = smoothstep(0.18, 0.72, grenadeStowW);
+    const grenadeActiveHold =
+      this.grenadeSystem !== null &&
+      grenadeIkW > 0.02 &&
+      !pdaActiveHold &&
+      vaultPinR < 0.15 &&
+      vaultPinL < 0.15;
+
     if (pdaActiveHold) {
       this.pdaDevice!.getRightGripWorldTransform(this._pdaRPosRoot, this._pdaRQuatRoot);
       this.skeleton.root.worldToLocal(this._pdaRPosRoot);
@@ -1759,6 +1814,130 @@ export class CharacterAnimator {
       }
       this._rDesiredRoot.lerp(this._pdaRPosRoot, pdaIkW);
       rightGripCurl = THREE.MathUtils.lerp(rightGripCurl, 0.45, pdaIkW);
+    } else if (grenadeActiveHold && this.grenadeSystem) {
+      const gs = this.grenadeSystem;
+      const gStage = gs.getHoldStage();
+      const gPhase = gs.getPinPullPhase();
+      const gCharge = gs.getCharge01();
+      const gStyle = gs.getThrowStyle();
+      const gWhip = gs.getThrowWhipProgress();
+      const gHeld = gs.isThrowInputHeld();
+
+      // Base chest-ready right palm target (relative to chest camera origin)
+      const idleBobY = Math.sin(elapsed * 2.2) * 0.003;
+      const drawReach = 1 - smoothstep(0.20, 0.56, grenadeStowW);
+      const readyX = 0.185;
+      const readyY = -0.105 + idleBobY;
+      const readyZ = -0.335;
+
+      // Interpolate from belt/hip grab up to chest ready
+      this._grenadeRPos.set(
+        THREE.MathUtils.lerp(readyX, 0.22, drawReach),
+        THREE.MathUtils.lerp(readyY, -0.34, drawReach),
+        THREE.MathUtils.lerp(readyZ, -0.08, drawReach),
+      );
+
+      let pitchTilt = guardPitch * 0.65;
+      let yawTwist = 0.24;
+      let rollTwist = -Math.PI * 0.5;
+
+      if (gStage === 'PIN_PULLED' || gStage === 'LEVER_RELEASED') {
+        if (gPhase === 'REACH_PIN' || gPhase === 'PULL_PIN') {
+          // Bring grenade gently closer to center-chest so left hand pinches ring cleanly
+          this._grenadeRPos.set(0.145, -0.095 + idleBobY, -0.315);
+          yawTwist = 0.34;
+        }
+        if (gHeld) {
+          if (gStyle === 'underhand') {
+            // Quick LMB click (<0.18s) preparation: drop smoothly to hip scoop
+            const prepT = smoothstep(0.0, 0.16, gs.getCharge01() + 0.45);
+            this._grenadeRPos.x = THREE.MathUtils.lerp(this._grenadeRPos.x, 0.205, prepT);
+            this._grenadeRPos.y = THREE.MathUtils.lerp(this._grenadeRPos.y, -0.255, prepT);
+            this._grenadeRPos.z = THREE.MathUtils.lerp(this._grenadeRPos.z, -0.14, prepT);
+            pitchTilt = -0.45;
+            yawTwist = 0.12;
+          } else {
+            // Hold LMB (>=0.18s): Overhand Power Charge draws arm UP & BACK behind right shoulder/ear
+            const wind = smoothstep(0.0, 1.0, gCharge);
+            const peakTremor =
+              gCharge > 0.85
+                ? Math.sin(elapsed * 44) * 0.0032 * ((gCharge - 0.85) / 0.15)
+                : 0;
+            this._grenadeRPos.set(
+              THREE.MathUtils.lerp(0.18, 0.295, wind) + peakTremor,
+              THREE.MathUtils.lerp(-0.09, 0.065, wind) + peakTremor * 0.6,
+              THREE.MathUtils.lerp(-0.31, 0.075, wind),
+            );
+            pitchTilt = THREE.MathUtils.lerp(guardPitch * 0.65, 0.68, wind);
+            yawTwist = THREE.MathUtils.lerp(0.24, -0.28, wind);
+            rollTwist = THREE.MathUtils.lerp(-Math.PI * 0.5, -Math.PI * 0.42, wind);
+          }
+        } else if (gWhip > 0.001) {
+          if (gStyle === 'overhand') {
+            // Explosive forward whip over shoulder -> release forward -> follow-through down
+            if (gWhip < 0.38) {
+              const t = smoothstep(0, 0.38, gWhip);
+              this._grenadeRPos.set(
+                THREE.MathUtils.lerp(0.28, 0.115, t),
+                THREE.MathUtils.lerp(0.06, 0.025, t),
+                THREE.MathUtils.lerp(0.06, -0.44, t),
+              );
+              pitchTilt = THREE.MathUtils.lerp(0.65, -0.24, t);
+              yawTwist = THREE.MathUtils.lerp(-0.22, 0.18, t);
+            } else {
+              const t = smoothstep(0.38, 1.0, gWhip);
+              this._grenadeRPos.set(
+                THREE.MathUtils.lerp(0.115, -0.02, t),
+                THREE.MathUtils.lerp(0.025, -0.22, t),
+                THREE.MathUtils.lerp(-0.44, -0.26, t),
+              );
+              pitchTilt = THREE.MathUtils.lerp(-0.24, -0.58, t);
+              yawTwist = 0.24;
+            }
+          } else {
+            // Smooth Underhand Lob scoop upward-forward
+            if (gWhip < 0.42) {
+              const t = smoothstep(0, 0.42, gWhip);
+              this._grenadeRPos.set(
+                THREE.MathUtils.lerp(0.20, 0.105, t),
+                THREE.MathUtils.lerp(-0.25, -0.045, t),
+                THREE.MathUtils.lerp(-0.12, -0.42, t),
+              );
+              pitchTilt = THREE.MathUtils.lerp(-0.45, 0.32, t);
+              yawTwist = 0.14;
+            } else {
+              const t = smoothstep(0.42, 1.0, gWhip);
+              this._grenadeRPos.set(
+                THREE.MathUtils.lerp(0.105, 0.06, t),
+                THREE.MathUtils.lerp(-0.045, -0.14, t),
+                THREE.MathUtils.lerp(-0.42, -0.30, t),
+              );
+              pitchTilt = THREE.MathUtils.lerp(0.32, 0.05, t);
+            }
+          }
+        }
+      }
+
+      if (gStage === 'LEVER_RELEASED') {
+        const cookRatio = gs.getCookRatio();
+        const burnTremor = Math.sin(elapsed * 36) * 0.0018 * (0.4 + cookRatio);
+        this._grenadeRPos.x += burnTremor;
+        this._grenadeRPos.y += Math.cos(elapsed * 43) * 0.0012 * (0.4 + cookRatio);
+      }
+
+      this._unarmedPitchEuler.set(guardPitch * 0.72, 0, 0, 'YXZ');
+      this._grenadeRPos.applyEuler(this._unarmedPitchEuler).add(this._camLocalOrigin);
+
+      this._grenadeHandEuler.set(pitchTilt, yawTwist, rollTwist, 'YXZ');
+      this._grenadeHandQuat.setFromEuler(this._grenadeHandEuler);
+
+      if (isUnarmed) {
+        this._rDesiredQuatRoot.copy(this._grenadeHandQuat);
+      } else {
+        this._rDesiredQuatRoot.slerp(this._grenadeHandQuat, grenadeIkW);
+      }
+      this._rDesiredRoot.lerp(this._grenadeRPos, grenadeIkW);
+      rightGripCurl = THREE.MathUtils.lerp(rightGripCurl, gWhip > 0.32 ? 0.35 : 0.92, grenadeIkW);
     }
 
     if (this.wasPdaActive && !pdaActiveHold) {
@@ -1769,20 +1948,39 @@ export class CharacterAnimator {
       this.rightPdaReturnTimer = Math.max(0, this.rightPdaReturnTimer - dt);
     }
 
+    if (this.wasGrenadeActive && !grenadeActiveHold) {
+      this.rightGrenadeReturnTimer = 0.16;
+    }
+    this.wasGrenadeActive = grenadeActiveHold;
+    if (this.rightGrenadeReturnTimer > 0) {
+      this.rightGrenadeReturnTimer = Math.max(0, this.rightGrenadeReturnTimer - dt);
+    }
+
     const usePdaRightQuat = pdaActiveHold && pdaIkW > 0.35;
+    const useGrenadeRightQuat = grenadeActiveHold && grenadeIkW > 0.25;
     if (
       this.equipBlendTimer > 0 ||
       vaultPinR > 0.001 ||
       boltHandW > 0.001 ||
       pdaActiveHold ||
-      this.rightPdaReturnTimer > 0
+      grenadeActiveHold ||
+      this.rightPdaReturnTimer > 0 ||
+      this.rightGrenadeReturnTimer > 0
     ) {
       this.rightHandBlender.blendTo(
         this._rDesiredRoot,
-        isUnarmed && !usePdaRightQuat ? this.rightHandBlender.quaternion : this._rDesiredQuatRoot,
+        isUnarmed && !usePdaRightQuat && !useGrenadeRightQuat
+          ? this.rightHandBlender.quaternion
+          : this._rDesiredQuatRoot,
         rightGripCurl,
         1,
-        vaultPinR > 0.001 ? 36 : pdaActiveHold || this.rightPdaReturnTimer > 0 ? 32 : boltHandW > 0.001 ? 34 : 32,
+        vaultPinR > 0.001
+          ? 36
+          : grenadeActiveHold || pdaActiveHold || this.rightPdaReturnTimer > 0 || this.rightGrenadeReturnTimer > 0
+            ? 32
+            : boltHandW > 0.001
+              ? 34
+              : 32,
         dt,
       );
     } else {
@@ -1800,7 +1998,7 @@ export class CharacterAnimator {
     // Elbow poles:
     //  - Unarmed Non-ADS Ready: natural downward-back hang by sides
     //  - Unarmed ADS Guard: pulled downward & inward tight against ribs (x: ±0.20, y: -0.45, z: +0.10 relative to chest cam)
-    //  - Armed / Vault: preserved ergonomic flare
+    //  - Armed / Vault / Grenade: ergonomic flare
     this._aimPoleEuler.set(
       rigState.aimPitch * 0.55,
       rigState.aimYaw * 0.70,
@@ -1838,6 +2036,21 @@ export class CharacterAnimator {
       this._pdaPoleL.set(this._shoulderL.x - 0.30, this._shoulderL.y - 0.50, this._shoulderL.z + 0.16);
       this._poleR.lerp(this._pdaPoleR, pdaIkW);
       this._poleL.lerp(this._pdaPoleL, pdaIkW);
+    } else if (grenadeActiveHold && this.grenadeSystem) {
+      const charge = this.grenadeSystem.getCharge01();
+      const overhand = this.grenadeSystem.getThrowStyle() === 'overhand' && (this.grenadeSystem.isThrowInputHeld() || this.grenadeSystem.getThrowWhipProgress() > 0);
+      this._grenadePoleR.set(
+        this._shoulderR.x + (overhand ? 0.46 : 0.32),
+        this._shoulderR.y + (overhand ? -0.18 + charge * 0.08 : -0.48),
+        this._shoulderR.z + (overhand ? 0.26 : 0.22),
+      );
+      this._grenadePoleL.set(
+        this._shoulderL.x - 0.34,
+        this._shoulderL.y - 0.46,
+        this._shoulderL.z + 0.20,
+      );
+      this._poleR.lerp(this._grenadePoleR, grenadeIkW);
+      this._poleL.lerp(this._grenadePoleL, grenadeIkW);
     }
     if (vaultPinR > 0.05) {
       this._poleR.set(this._shoulderR.x + 0.42, this._shoulderR.y - 0.36, this._shoulderR.z + 0.22);
@@ -1853,7 +2066,7 @@ export class CharacterAnimator {
     this.skeleton.root.updateMatrixWorld(true);
     solveTwoBoneIK(this._shoulderR, this._rTargetRoot, this._poleR, armR.upperLen, armR.lowerLen, this.rightArmIK);
     orientLimbAlongYInRootSpace(armR.upperArm, this.skeleton.root, this._shoulderR, this.rightArmIK.midPos, this._poleR);
-    if (isUnarmed && !usePdaRightQuat) {
+    if (isUnarmed && !usePdaRightQuat && !useGrenadeRightQuat) {
       this.computeUnarmedForearmAlignedHandQuat(1, this.rightArmIK.dir2, rightPronation, this._handAlignedQuat);
       if (vaultPinR > 0.001) {
         this._handAlignedQuat.slerp(this._vaultHandQuatRoot, vaultPinR);
@@ -1874,7 +2087,28 @@ export class CharacterAnimator {
       this._dorsalR,
     );
     setTransformInRootSpace(armR.hand.root, this.skeleton.root, this.rightArmIK.endPos, this._rQuatRoot);
-    armR.hand.root.updateMatrixWorld(true);
+    this.skeleton.root.updateMatrixWorld(true);
+    armR.hand.root.updateWorldMatrix(true, false);
+
+    // Synchronize physical bone-mounted ordnance & evaluate bone-locked throw release post-IK!
+    if (this.grenadeSystem) {
+      this.grenadeSystem.syncHeldBoneAttachment(
+        this.skeleton.throwHandSocket,
+        this.skeleton.leftPinPinchSocket,
+        this.skeleton.leftPocketAnchor,
+      );
+      if (this.grenadeSystem.isThrowing()) {
+        this.skeleton.throwHandSocket.updateWorldMatrix(true, false);
+        this.skeleton.throwHandSocket.getWorldPosition(this._grenadeReleaseOrigin);
+        controller.getCamera().getWorldDirection(this._grenadeReleaseForward);
+        controller.getVelocity(this._ctrlVel);
+        this.grenadeSystem.consumePendingThrowRelease(
+          this._grenadeReleaseOrigin,
+          this._grenadeReleaseForward,
+          this._ctrlVel,
+        );
+      }
+    }
 
     const anim = this.weaponRig.weaponAnimator;
     const weaponAsm = this.weaponRig.getModelAssembly();
@@ -1884,6 +2118,7 @@ export class CharacterAnimator {
     const triggerEngaged =
       !isUnarmed &&
       !pdaActiveHold &&
+      !grenadeActiveHold &&
       vaultPinR < 0.05 &&
       boltHandW < 0.05 &&
       !controller.isSprinting &&
@@ -1902,6 +2137,23 @@ export class CharacterAnimator {
         joy.x,
         joy.y,
       );
+    } else if (grenadeActiveHold && grenadeIkW > 0.45 && this.grenadeSystem) {
+      this._rightHandPoseOpts.profile = null;
+      this._rightHandPoseOpts.triggerPull01 = 0;
+      this._rightHandPoseOpts.thumbFlick01 = 0;
+      this._rightHandPoseOpts.pinchPose01 = 0;
+      this._rightHandPoseOpts.gripRelease01 = 0;
+      this._rightHandPoseOpts.suppressorGrip = false;
+      this._rightHandPoseOpts.padTap01 = 0;
+      this._rightHandPoseOpts.leverReleased = this.grenadeSystem.isLeverReleased();
+      this.skeleton.applyHandPose(
+        'right',
+        'throwable',
+        false,
+        this.rightHandBlender.gripCurl,
+        'none',
+        this._rightHandPoseOpts,
+      );
     } else {
       this._rightHandPoseOpts.profile = weaponAsm?.handPoseProfile ?? null;
       this._rightHandPoseOpts.triggerPull01 = triggerPull01;
@@ -1910,6 +2162,7 @@ export class CharacterAnimator {
       this._rightHandPoseOpts.gripRelease01 = 0;
       this._rightHandPoseOpts.suppressorGrip = false;
       this._rightHandPoseOpts.padTap01 = 0;
+      this._rightHandPoseOpts.leverReleased = false;
       this.skeleton.applyHandPose(
         'right',
         vaultPinR > 0.2 || isUnarmed ? 'unarmed' : spec.holdClass,
@@ -1930,7 +2183,8 @@ export class CharacterAnimator {
       vaultPinL < 0.05
         ? Math.max(rigState.adsBlend, rigState.cantBlend, rigState.pointAimBlend)
         : 0;
-    const hardLockW = (1 - aimLockWeightPost) * (1 - smoothstep(0.02, 0.25, pdaIkW));
+    const hardLockW =
+      (1 - aimLockWeightPost) * (1 - smoothstep(0.02, 0.25, Math.max(pdaIkW, grenadeIkW)));
 
     if (!isUnarmed && vaultPinR < 0.12 && boltHandW < 0.02 && hardLockW > 0.001) {
       armR.hand.root.getWorldPosition(this._solvedHandRWorldPos);
@@ -2321,6 +2575,87 @@ export class CharacterAnimator {
         this._lDesiredQuatRoot.slerp(this._pdaLQuatRoot, pdaIkW);
       }
       leftGripCurl = THREE.MathUtils.lerp(leftGripCurl, 0.45, pdaIkW);
+    } else if (grenadeActiveHold && this.grenadeSystem) {
+      leftOverridden = true;
+      const gs = this.grenadeSystem;
+      const gStage = gs.getHoldStage();
+      const gPhase = gs.getPinPullPhase();
+      const gElapsed = gs.getPinPullElapsed();
+      const gStyle = gs.getThrowStyle();
+      const isLobbing = gStyle === 'underhand' && (gs.isThrowInputHeld() || gs.getThrowWhipProgress() > 0);
+      const heldMesh = gs.getHeldGrenadeMesh();
+
+      // Pre-compute live chest-balance & eye-level aim anchors in skeleton.root local space
+      this.skeleton.leftChestBalanceAnchor.getWorldPosition(this._grenadeLPos);
+      this.skeleton.root.worldToLocal(this._grenadeLPos);
+      this.skeleton.leftEyeAimAnchor.getWorldPosition(this._grenadePocketPos);
+      this.skeleton.root.worldToLocal(this._grenadePocketPos);
+
+      // Pitch left eye-aim anchor smoothly with view pitch while staying below eye line, left-of-center
+      this._grenadeHandEuler.set(guardPitch * 0.55, 0, 0, 'YXZ');
+      this._grenadePocketPos.sub(this._camLocalOrigin).applyEuler(this._grenadeHandEuler).add(this._camLocalOrigin);
+
+      if (gStage === 'DRAWN') {
+        // Ready support blade by chest balance anchor
+        leftPinchPose01 = 0;
+        leftGripCurl = 0.28;
+      } else if (gPhase === 'REACH_PIN' && heldMesh) {
+        const t = smoothstep(0.0, 0.16, gElapsed);
+        heldMesh.pinAnchor.getWorldPosition(this._grenadePinPos);
+        this.skeleton.root.worldToLocal(this._grenadePinPos);
+        this._grenadeLPos.lerp(this._grenadePinPos, t);
+        leftPinchPose01 = smoothstep(0.06, 0.16, gElapsed);
+        leftGripCurl = 0.80;
+      } else if (gPhase === 'PULL_PIN' && heldMesh) {
+        const t = smoothstep(0.16, 0.34, gElapsed);
+        heldMesh.pinAnchor.getWorldPosition(this._grenadePinPos);
+        this.skeleton.root.worldToLocal(this._grenadePinPos);
+        heldMesh.bodyGroup.getWorldQuaternion(this._grenadeBodyWorldQuat);
+        this._grenadePullAxisWorld
+          .copy(heldMesh.pinPullAxis)
+          .applyQuaternion(this._grenadeBodyWorldQuat)
+          .applyQuaternion(this._rootWorldQuatInv)
+          .normalize();
+        this._grenadeLPos.copy(this._grenadePinPos).addScaledVector(this._grenadePullAxisWorld, 0.135 * t);
+        leftPinchPose01 = 1.0;
+        leftGripCurl = 0.88;
+      } else if (gPhase === 'TUCK_POCKET' && heldMesh) {
+        const t = smoothstep(0.34, 0.56, gElapsed);
+        heldMesh.pinAnchor.getWorldPosition(this._grenadePinPos);
+        this.skeleton.root.worldToLocal(this._grenadePinPos);
+        heldMesh.bodyGroup.getWorldQuaternion(this._grenadeBodyWorldQuat);
+        this._grenadePullAxisWorld
+          .copy(heldMesh.pinPullAxis)
+          .applyQuaternion(this._grenadeBodyWorldQuat)
+          .applyQuaternion(this._rootWorldQuatInv)
+          .normalize();
+        this._grenadePinPos.addScaledVector(this._grenadePullAxisWorld, 0.135);
+        this.skeleton.leftPocketAnchor.getWorldPosition(this._grenadeLPos);
+        this.skeleton.root.worldToLocal(this._grenadeLPos);
+        this._grenadeLPos.lerpVectors(this._grenadePinPos, this._grenadeLPos, t);
+        leftPinchPose01 = 1.0 - smoothstep(0.46, 0.56, gElapsed);
+        leftGripCurl = THREE.MathUtils.lerp(0.88, 0.32, t);
+      } else if (!isLobbing) {
+        // EYE_AIM / Overhand charge: extend left hand just below eye level, slightly left-of-center
+        this._grenadeLPos.copy(this._grenadePocketPos);
+        leftPinchPose01 = 0;
+        leftGripCurl = 0.18;
+      } else {
+        // Underhand click-lob: drop left hand smoothly to lower-chest balance
+        leftPinchPose01 = 0;
+        leftGripCurl = 0.24;
+      }
+
+      // Clean open tactical blade wrist orientation for left hand
+      this._grenadeHandEuler.set(guardPitch * 0.4, -0.35, 0.42, 'YXZ');
+      this._grenadeLQuat.setFromEuler(this._grenadeHandEuler);
+
+      this._lDesiredRoot.lerp(this._grenadeLPos, grenadeIkW);
+      if (isUnarmed) {
+        this._lDesiredQuatRoot.copy(this._grenadeLQuat);
+      } else {
+        this._lDesiredQuatRoot.slerp(this._grenadeLQuat, grenadeIkW);
+      }
     }
 
     if (this.wasLeftOverridden && !leftOverridden) {
@@ -2332,13 +2667,22 @@ export class CharacterAnimator {
     }
 
     const usePdaLeftQuat = pdaActiveHold && pdaIkW > 0.35;
+    const useGrenadeLeftQuat = grenadeActiveHold && grenadeIkW > 0.25;
     if (leftOverridden || this.equipBlendTimer > 0 || this.leftActionReturnTimer > 0) {
       this.leftHandBlender.blendTo(
         this._lDesiredRoot,
-        isUnarmed && !usePdaLeftQuat ? this.leftHandBlender.quaternion : this._lDesiredQuatRoot,
+        isUnarmed && !usePdaLeftQuat && !useGrenadeLeftQuat
+          ? this.leftHandBlender.quaternion
+          : this._lDesiredQuatRoot,
         leftGripCurl,
         1,
-        vaultPinL > 0.001 ? 38 : pdaActiveHold ? 32 : leftOverridden ? 30 : 34,
+        vaultPinL > 0.001
+          ? 38
+          : grenadeActiveHold || pdaActiveHold
+            ? 32
+            : leftOverridden
+              ? 30
+              : 34,
         dt,
       );
     } else {
@@ -2356,7 +2700,7 @@ export class CharacterAnimator {
     // 4. Solve Left Arm 2-Bone IK + Forearm-Aligned Zero-Hyperextension Wrist Orientation
     solveTwoBoneIK(this._shoulderL, this._lTargetRoot, this._poleL, armL.upperLen, armL.lowerLen, this.leftArmIK);
     orientLimbAlongYInRootSpace(armL.upperArm, this.skeleton.root, this._shoulderL, this.leftArmIK.midPos, this._poleL);
-    if (isUnarmed && !usePdaLeftQuat) {
+    if (isUnarmed && !usePdaLeftQuat && !useGrenadeLeftQuat) {
       this.computeUnarmedForearmAlignedHandQuat(-1, this.leftArmIK.dir2, leftPronation, this._handAlignedQuat);
       if (vaultPinL > 0.001) {
         this._handAlignedQuat.slerp(this._vaultHandQuatRoot, vaultPinL);
@@ -2377,7 +2721,8 @@ export class CharacterAnimator {
       this._dorsalL,
     );
     setTransformInRootSpace(armL.hand.root, this.skeleton.root, this.leftArmIK.endPos, this._lQuatRoot);
-    armL.hand.root.updateMatrixWorld(true);
+    this.skeleton.root.updateMatrixWorld(true);
+    armL.hand.root.updateWorldMatrix(true, false);
 
     // Sync physical detachable magazine, field suppressor (world-space continuity!), and shotgun reload shell into/out of left hand
     anim.syncPhysicalMagazineParent(armL.hand.root);
@@ -2385,11 +2730,13 @@ export class CharacterAnimator {
     anim.syncPhysicalShellParent(armL.hand.root);
 
     const leftHoldClass =
-      vaultPinL > 0.2 || isUnarmed
-        ? 'unarmed'
-        : leftOverridden && !leftSuppressorGrip && leftPinchPose01 < 0.05 && leftPadTap01 < 0.05
-          ? 'melee_1h'
-          : spec.holdClass;
+      grenadeActiveHold && grenadeIkW > 0.45
+        ? 'throwable'
+        : vaultPinL > 0.2 || isUnarmed
+          ? 'unarmed'
+          : leftOverridden && !leftSuppressorGrip && leftPinchPose01 < 0.05 && leftPadTap01 < 0.05
+            ? 'melee_1h'
+            : spec.holdClass;
     const foregripPose =
       (leftOverridden && leftPadTap01 < 0.05) || vaultPinL > 0.2 || isUnarmed
         ? 'none'
@@ -2404,6 +2751,7 @@ export class CharacterAnimator {
       this._leftHandPoseOpts.gripRelease01 = leftGripRelease01;
       this._leftHandPoseOpts.suppressorGrip = leftSuppressorGrip;
       this._leftHandPoseOpts.padTap01 = leftPadTap01;
+      this._leftHandPoseOpts.leverReleased = false;
       this.skeleton.applyHandPose(
         'left',
         leftHoldClass,

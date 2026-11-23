@@ -144,6 +144,14 @@ export interface WeaponModelAssembly {
   hasLaserAttachment: boolean;
   foregripPose: 'none' | 'vertical' | 'angled';
   readonly pinMesh: THREE.Object3D | null;
+  readonly throwableParts: {
+    bodyGroup: THREE.Group;
+    spoonAnchor: THREE.Object3D;
+    spoonGroup: THREE.Group;
+    pullRingMesh: THREE.Mesh;
+    pinAnchor: THREE.Object3D;
+    pinPullAxis: THREE.Vector3;
+  } | null;
   readonly ironSightRearUp: THREE.Object3D | null;
   readonly ironSightRearFolded: THREE.Object3D | null;
   readonly handPoseProfile: WeaponHandPoseProfile;
@@ -400,6 +408,7 @@ export class WeaponModelFactory {
     const opticGroup: THREE.Object3D | null = null;
     const reticleMaterial: THREE.ShaderMaterial | null = null;
     let pinMesh: THREE.Object3D | null = null;
+    let throwableParts: WeaponModelAssembly['throwableParts'] = null;
     let ironSightRearUp: THREE.Object3D | null = null;
     let ironSightRearFolded: THREE.Object3D | null = null;
 
@@ -2424,19 +2433,50 @@ export class WeaponModelFactory {
       group.add(shaft, bend, claw, chisel);
       sightAnchor.position.set(0, 0.03, -0.05);
     } else if (style === 'frag_grenade') {
+      const bodyGroup = new THREE.Group();
+      bodyGroup.name = 'rgd5_body_group';
       const body = new THREE.Mesh(track(new THREE.SphereGeometry(0.036, 14, 12)), mats.oliveFrag);
       body.scale.set(0.94, 1.18, 0.94);
       const seamBand = new THREE.Mesh(track(new THREE.CylinderGeometry(0.035, 0.035, 0.010, 14)), mats.gunmetal);
       const neck = new THREE.Mesh(track(new THREE.CylinderGeometry(0.012, 0.015, 0.026, 10)), mats.chromeSteel);
       neck.position.set(0, 0.048, 0);
-      const spoon = new THREE.Mesh(track(new THREE.BoxGeometry(0.012, 0.068, 0.010)), mats.chromeSteel);
-      spoon.position.set(0, 0.022, 0.034);
-      spoon.rotation.x = -0.18;
+      bodyGroup.add(body, seamBand, neck);
+
+      const spoonAnchor = new THREE.Object3D();
+      spoonAnchor.name = 'rgd5_spoon_anchor';
+      spoonAnchor.position.set(0.005, 0.056, 0);
+      bodyGroup.add(spoonAnchor);
+
+      const spoonGroup = new THREE.Group();
+      spoonGroup.name = 'rgd5_spoon_group';
+      const spoonTop = new THREE.Mesh(track(new THREE.BoxGeometry(0.022, 0.005, 0.012)), mats.chromeSteel);
+      spoonTop.position.set(0.010, 0, 0);
+      const spoonArm = new THREE.Mesh(track(new THREE.BoxGeometry(0.006, 0.062, 0.012)), mats.chromeSteel);
+      spoonArm.position.set(0.026, -0.030, 0);
+      spoonArm.rotation.z = 0.18;
+      spoonGroup.add(spoonTop, spoonArm);
+      spoonAnchor.add(spoonGroup);
+
       const ring = new THREE.Mesh(track(new THREE.TorusGeometry(0.013, 0.0022, 6, 14)), mats.chromeSteel);
-      ring.position.set(-0.016, 0.052, -0.004);
-      ring.rotation.y = Math.PI * 0.35;
+      ring.name = 'rgd5_pull_ring';
+      ring.position.set(-0.017, 0.052, 0.008);
+      ring.rotation.y = 0.42;
+
+      const pinAnchor = new THREE.Object3D();
+      pinAnchor.name = 'rgd5_pin_anchor';
+      pinAnchor.position.set(-0.024, 0.053, 0.011);
+      bodyGroup.add(pinAnchor);
+
       pinMesh = ring;
-      group.add(body, seamBand, neck, spoon, ring);
+      group.add(bodyGroup, ring);
+      throwableParts = {
+        bodyGroup,
+        spoonAnchor,
+        spoonGroup,
+        pullRingMesh: ring,
+        pinAnchor,
+        pinPullAxis: new THREE.Vector3(-0.88, 0.32, 0.34).normalize(),
+      };
       sightAnchor.position.set(0, 0.02, 0);
     } else if (style === 'metal_bolt') {
       const shaft = new THREE.Mesh(track(new THREE.CylinderGeometry(0.009, 0.009, 0.065, 8)), mats.chromeSteel);
@@ -2559,6 +2599,7 @@ export class WeaponModelFactory {
       hasLaserAttachment: false,
       foregripPose: 'none',
       pinMesh,
+      throwableParts,
       ironSightRearUp,
       ironSightRearFolded,
       handPoseProfile,

@@ -34,6 +34,14 @@ interface BlastFlash {
   maxAge: number;
 }
 
+interface FlyingSpoon {
+  mesh: THREE.Mesh;
+  vel: THREE.Vector3;
+  rotVel: THREE.Vector3;
+  age: number;
+  maxAge: number;
+}
+
 export class ThrowableSystem {
   private scene: THREE.Scene;
   private audio: AudioEngine;
@@ -41,6 +49,7 @@ export class ThrowableSystem {
   private zombies: ZombieManager;
 
   private items: ActiveThrowable[] = [];
+  private flyingSpoons: FlyingSpoon[] = [];
   private particles: BlastParticle[] = [];
   private flashes: BlastFlash[] = [];
 
@@ -59,6 +68,8 @@ export class ThrowableSystem {
   private fragMat = new THREE.MeshStandardMaterial({ color: 0x3f4c34, roughness: 0.65, metalness: 0.25 });
   private steelMat = new THREE.MeshStandardMaterial({ color: 0x5c6066, roughness: 0.35, metalness: 0.85 });
   private clothMat = new THREE.MeshStandardMaterial({ color: 0x998e75, roughness: 0.95, metalness: 0.02 });
+  private spoonGeo = new THREE.BoxGeometry(0.008, 0.062, 0.015);
+  private spoonMat = new THREE.MeshStandardMaterial({ color: 0x5c646d, roughness: 0.42, metalness: 0.82 });
 
   private sparkGeo = new THREE.BoxGeometry(0.035, 0.035, 0.09);
   private sparkMat = new THREE.MeshBasicMaterial({ color: 0xffc663 });
@@ -128,6 +139,53 @@ export class ThrowableSystem {
       settled: false,
       emittedLure: false,
     });
+  }
+
+  public spawnFlyingSpoon(
+    origin: Readonly<THREE.Vector3>,
+    right?: Readonly<THREE.Vector3>,
+    up?: Readonly<THREE.Vector3>,
+    fwd?: Readonly<THREE.Vector3>,
+    exactOrigin = true,
+  ): void {
+    const f = fwd ? fwd.clone().normalize() : new THREE.Vector3(0, 0, -1);
+    const u = up ? up.clone().normalize() : new THREE.Vector3(0, 1, 0);
+    const r = right ? right.clone().normalize() : new THREE.Vector3().crossVectors(f, u).normalize();
+
+    const mesh = new THREE.Mesh(this.spoonGeo, this.spoonMat);
+    mesh.castShadow = true;
+    if (exactOrigin) {
+      mesh.position.copy(origin);
+    } else {
+      mesh.position
+        .copy(origin)
+        .addScaledVector(f, 0.20)
+        .addScaledVector(r, 0.10)
+        .addScaledVector(u, 0.04);
+    }
+    this.scene.add(mesh);
+
+    const vel = new THREE.Vector3()
+      .addScaledVector(r, 2.2 + Math.random() * 1.1)
+      .addScaledVector(u, 2.5 + Math.random() * 0.9)
+      .addScaledVector(f, 1.2 + Math.random() * 0.8);
+
+    this.flyingSpoons.push({
+      mesh,
+      vel,
+      rotVel: new THREE.Vector3(16 + Math.random() * 10, -14, 22),
+      age: 0,
+      maxAge: 1.15,
+    });
+  }
+
+  public detonateAt(
+    origin: THREE.Vector3,
+    world: BuiltWorld,
+    playerPos: THREE.Vector3,
+    onPlayerBlastDamage: (damage: number, bleedChance: number, origin: THREE.Vector3) => void,
+  ): void {
+    this.detonateFrag(origin, world, playerPos, onPlayerBlastDamage);
   }
 
   public update(
@@ -270,6 +328,32 @@ export class ThrowableSystem {
       }
     }
 
+    // Update flying spoons ejected upon lever release
+    for (let i = this.flyingSpoons.length - 1; i >= 0; i--) {
+      const s = this.flyingSpoons[i];
+      s.age += dt;
+      s.vel.y -= 9.81 * dt;
+      s.mesh.position.addScaledVector(s.vel, dt);
+      s.mesh.rotation.x += s.rotVel.x * dt;
+      s.mesh.rotation.y += s.rotVel.y * dt;
+      s.mesh.rotation.z += s.rotVel.z * dt;
+      const gY = world.groundHeightAt(s.mesh.position.x, s.mesh.position.z) + 0.012;
+      if (s.mesh.position.y < gY) {
+        s.mesh.position.y = gY;
+        if (s.vel.y < -1.2) {
+          this.audio.playImpact(s.mesh.position, 'metal');
+        }
+        s.vel.y = -s.vel.y * 0.25;
+        s.vel.x *= 0.65;
+        s.vel.z *= 0.65;
+        s.rotVel.multiplyScalar(0.5);
+      }
+      if (s.age >= s.maxAge) {
+        this.scene.remove(s.mesh);
+        this.flyingSpoons.splice(i, 1);
+      }
+    }
+
     // Update blast particles
     for (let i = this.particles.length - 1; i >= 0; i--) {
       const p = this.particles[i];
@@ -384,6 +468,10 @@ export class ThrowableSystem {
       it.mesh.position.x -= shiftX;
       it.mesh.position.z -= shiftZ;
     }
+    for (const s of this.flyingSpoons) {
+      s.mesh.position.x -= shiftX;
+      s.mesh.position.z -= shiftZ;
+    }
     for (const p of this.particles) {
       p.mesh.position.x -= shiftX;
       p.mesh.position.z -= shiftZ;
@@ -396,9 +484,11 @@ export class ThrowableSystem {
 
   public dispose(): void {
     for (const it of this.items) this.scene.remove(it.mesh);
+    for (const s of this.flyingSpoons) this.scene.remove(s.mesh);
     for (const p of this.particles) this.scene.remove(p.mesh);
     for (const f of this.flashes) this.scene.remove(f.light);
     this.items = [];
+    this.flyingSpoons = [];
     this.particles = [];
     this.flashes = [];
     this.fragBodyGeo.dispose();
@@ -409,6 +499,8 @@ export class ThrowableSystem {
     this.fragMat.dispose();
     this.steelMat.dispose();
     this.clothMat.dispose();
+    this.spoonGeo.dispose();
+    this.spoonMat.dispose();
     this.sparkGeo.dispose();
     this.sparkMat.dispose();
     this.smokeGeo.dispose();

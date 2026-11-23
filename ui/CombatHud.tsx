@@ -601,22 +601,22 @@ export const CombatHud: React.FC<CombatHudProps> = ({
         </div>
       )}
 
-      {/* Authentic 4-Stage Grenade Manual of Arms Indicator */}
+      {/* Authentic 4-Stage Grenade Manual of Arms Indicator (Zero HUD power/cook bar) */}
       {snapshot.pointerLocked && snapshot.grenadeHoldStage !== 'HOLSTERED' && (
         <div
-          className={`fixed top-[56%] left-1/2 flex w-72 -translate-x-1/2 flex-col gap-1 border px-3.5 py-1.5 font-mono-tabular ${
+          className={`fixed top-[56%] left-1/2 flex w-80 -translate-x-1/2 flex-col gap-1 border px-3.5 py-1.5 font-mono-tabular ${
             snapshot.grenadeHoldStage === 'LEVER_RELEASED'
-              ? 'border-red-500/85 bg-neutral-950/92'
+              ? 'animate-pulse border-red-500/90 bg-red-950/60'
               : snapshot.grenadeHoldStage === 'PIN_PULLED'
                 ? 'border-amber-400/85 bg-neutral-950/92'
                 : 'border-neutral-600/85 bg-neutral-950/90'
           }`}
         >
-          <div className="flex items-center justify-between text-[10px] font-semibold uppercase tracking-wider">
+          <div className="flex items-center justify-between gap-2 text-[10px] font-semibold uppercase tracking-wider">
             <span
               className={
                 snapshot.grenadeHoldStage === 'LEVER_RELEASED'
-                  ? 'text-red-400'
+                  ? 'text-red-300'
                   : snapshot.grenadeHoldStage === 'PIN_PULLED'
                     ? 'text-amber-300'
                     : 'text-neutral-100'
@@ -629,27 +629,28 @@ export const CombatHud: React.FC<CombatHudProps> = ({
                   ? ' · PIN PULLED'
                   : ' · LIVE FUSE'}
             </span>
-            <span className="text-neutral-300">
+            <span className="text-neutral-200">
               {snapshot.grenadeHoldStage === 'DRAWN'
-                ? 'LMB PIN · [H] STOW'
+                ? 'RMB PIN · [H/4] STOW'
                 : snapshot.grenadeHoldStage === 'PIN_PULLED'
-                  ? 'RMB LEVER · REL LMB'
-                  : 'RELEASE LMB THROW'}
+                  ? 'RMB SPOON · LMB LOB/HOLD'
+                  : snapshot.grenadeThrowHeld && snapshot.grenadeThrowStyle === 'overhand'
+                    ? 'REL LMB OVERHAND'
+                    : 'LMB LOB / HOLD'}
             </span>
           </div>
           {snapshot.grenadeHoldStage === 'PIN_PULLED' && (
-            <div className="text-[9px] uppercase tracking-wider text-neutral-400">
-              Lever held — fuse NOT running
+            <div className="text-[9px] uppercase tracking-wider text-neutral-300">
+              {snapshot.grenadeThrowHeld
+                ? `Charging ${snapshot.grenadeThrowStyle === 'overhand' ? 'OVERHAND' : 'LOB'} — Release LMB`
+                : 'Lever gripped — fuse NOT running'}
             </div>
           )}
           {snapshot.grenadeHoldStage === 'LEVER_RELEASED' && (
-            <div className="h-1.5 w-full overflow-hidden bg-neutral-800">
-              <div
-                className={`h-full transition-all duration-75 ${
-                  snapshot.grenadeCookRatio > 0.68 ? 'bg-red-500' : 'bg-amber-400'
-                }`}
-                style={{ width: `${Math.min(100, Math.round(snapshot.grenadeCookRatio * 100))}%` }}
-              />
+            <div className="text-[9px] uppercase tracking-wider text-red-200">
+              {snapshot.grenadeThrowHeld
+                ? `LIVE FUSE — Charging ${snapshot.grenadeThrowStyle === 'overhand' ? 'OVERHAND' : 'LOB'} — Release LMB`
+                : 'Spoon detached — chemical delay burning'}
             </div>
           )}
         </div>

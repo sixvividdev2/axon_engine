@@ -256,6 +256,12 @@ export class BodycamController {
   private torsoAbsorbYaw = 0;
   private torsoAbsorbYawVel = 0;
 
+  // Diegetic grenade charge tension (FOV compression + counter-lean + peak-force tremor)
+  private grenadeCharge01 = 0;
+  private grenadeLiveCook = false;
+  private grenadeThrowStyle: 'overhand' | 'underhand' = 'underhand';
+  private grenadeStrainRoll = 0;
+
   // Grounded tactical vault & mantle traversal override (zero-GC)
   private readonly vaultDetector = new VaultDetector();
   private readonly vaultController = new VaultController();
@@ -305,6 +311,20 @@ export class BodycamController {
     const r = this.lastVaultBlockReason;
     this.lastVaultBlockReason = 'none';
     return r;
+  }
+
+  public setGrenadeTension(
+    charge01: number,
+    liveCook: boolean,
+    throwStyle: 'overhand' | 'underhand' = 'overhand',
+  ): void {
+    this.grenadeCharge01 = THREE.MathUtils.clamp(charge01, 0, 1);
+    this.grenadeLiveCook = liveCook;
+    this.grenadeThrowStyle = throwStyle;
+  }
+
+  public getCamera(): THREE.PerspectiveCamera {
+    return this.camera;
   }
 
   public isAirborne(): boolean {
@@ -2058,9 +2078,21 @@ export class BodycamController {
       activeVaultState.cameraRollOffset +
       swayRoll;
 
-    const chestPitch = baseChestPitch + this.camShakePitch;
-    const chestYaw = baseChestYaw + this.camShakeYaw;
-    const chestRoll = baseChestRoll + this.camShakeRoll;
+    const targetStrainRoll =
+      this.grenadeThrowStyle === 'overhand' && this.grenadeCharge01 > 0.02
+        ? -0.028 * this.grenadeCharge01
+        : 0;
+    this.grenadeStrainRoll = THREE.MathUtils.damp(this.grenadeStrainRoll, targetStrainRoll, 12, dt);
+
+    const gripStrainAmp =
+      (this.grenadeCharge01 > 0.85 ? ((this.grenadeCharge01 - 0.85) / 0.15) * 0.0022 : 0) +
+      (this.grenadeLiveCook ? 0.0012 : 0);
+    const gripStrainPitch = gripStrainAmp > 0 ? Math.sin(elapsed * 41.3) * gripStrainAmp : 0;
+    const gripStrainYaw = gripStrainAmp > 0 ? Math.cos(elapsed * 37.9) * gripStrainAmp : 0;
+
+    const chestPitch = baseChestPitch + this.camShakePitch + gripStrainPitch;
+    const chestYaw = baseChestYaw + this.camShakeYaw + gripStrainYaw;
+    const chestRoll = baseChestRoll + this.camShakeRoll + this.grenadeStrainRoll;
 
     // Measure angular whip velocity for shutter motion-blur
     const safeDt = Math.max(0.004, dt);
@@ -2077,7 +2109,9 @@ export class BodycamController {
 
     // Wide Horizontal FOV -> dynamic Vertical FOV
     // Primary ADS: full adsHFovDeg; Canted Optic ADS: ~0.85x CQB focus; Point Aim: ~0.90x tactical focus
-    const targetHFov = this.isAds
+    const grenadeFovCompress =
+      this.grenadeThrowStyle === 'overhand' ? this.grenadeCharge01 * 3.8 : 0;
+    const targetHFov = (this.isAds
       ? config.adsHFovDeg
       : this.isCanted
         ? THREE.MathUtils.lerp(config.baseHFovDeg, config.adsHFovDeg, 0.72)
@@ -2085,7 +2119,7 @@ export class BodycamController {
           ? config.baseHFovDeg * 0.90
           : wantsSprint
             ? config.sprintHFovDeg
-            : config.baseHFovDeg;
+            : config.baseHFovDeg) - grenadeFovCompress;
     const targetVFov = horizontalToVerticalFov(targetHFov, this.camera.aspect);
     if (Math.abs(this.camera.fov - targetVFov) > 0.05) {
       this.camera.fov = THREE.MathUtils.damp(this.camera.fov, targetVFov, 12, dt);

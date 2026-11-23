@@ -721,6 +721,9 @@ export class WeaponRig {
   private clearModel(): void {
     this.weaponAnimator.attachModel(null, 'pistol', false);
     if (this.assembly) {
+      if (this.assembly.throwableParts?.pullRingMesh.parent) {
+        this.assembly.throwableParts.pullRingMesh.parent.remove(this.assembly.throwableParts.pullRingMesh);
+      }
       this.modelGroup.remove(this.assembly.group);
       this.assembly.dispose();
       this.assembly = null;
@@ -728,6 +731,10 @@ export class WeaponRig {
     this.modelGroup.visible = true;
     this.modelGroup.position.set(0, 0, 0);
     this.modelGroup.rotation.set(0, 0, 0);
+  }
+
+  public getThrowableParts() {
+    return this.assembly?.throwableParts ?? null;
   }
 
   private buildWeaponModel(weaponId: WeaponId, attachmentsOrSuppressor: boolean | WeaponAttachments): void {
@@ -805,12 +812,16 @@ export class WeaponRig {
     _boltBackOffsetZ = 0,
     hideModel = false,
     hidePin = false,
+    hideSpoon = false,
   ): void {
     this.modelGroup.visible = !hideModel;
     this.modelGroup.position.copy(posOffset);
     this.modelGroup.rotation.copy(rotOffset);
-    if (this.assembly?.pinMesh) {
+    if (this.assembly?.pinMesh && !this.assembly.throwableParts) {
       this.assembly.pinMesh.visible = !hidePin;
+    }
+    if (this.assembly?.throwableParts) {
+      this.assembly.throwableParts.spoonGroup.visible = !hideSpoon;
     }
     this.modelGroup.updateMatrixWorld(true);
   }
