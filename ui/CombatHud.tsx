@@ -772,6 +772,73 @@ export const CombatHud: React.FC<CombatHudProps> = ({
         </div>
       </div>
 
+      {/* Contextual Door Interact Dot (hidden by default; white when near, amber when ready) + [F] Scroll Menu */}
+      {snapshot.pointerLocked &&
+        snapshot.playerAlive &&
+        !snapshot.isPdaOpen &&
+        snapshot.doorInteractReticle !== 'hidden' && (
+          <div className="pointer-events-none fixed inset-0 flex flex-col items-center justify-center">
+            <div
+              className={`h-1.5 w-1.5 rounded-full transition-transform duration-150 ${
+                snapshot.doorInteractReticle === 'ready'
+                  ? 'scale-125 bg-amber-400'
+                  : 'bg-neutral-100/80'
+              }`}
+            />
+            {snapshot.doorPrompt && snapshot.doorPrompt.options.length > 0 && (
+              <div
+                className="mt-5 min-w-[184px] border border-white/12 bg-[#0d0f12]/92 px-2.5 py-2"
+                style={{ borderRadius: 4 }}
+              >
+                <div className="mb-1.5 flex items-center justify-between gap-4 border-b border-white/10 pb-1 text-[11px] font-medium tracking-wide text-neutral-400">
+                  <span>{snapshot.doorPrompt.targetLabel}</span>
+                  {snapshot.doorPrompt.options.length > 1 && (
+                    <span className="font-mono-tabular text-[10px] text-neutral-500">Scroll</span>
+                  )}
+                </div>
+                <div className="flex flex-col gap-1">
+                  {snapshot.doorPrompt.options.map((opt, idx) => {
+                    const selected = idx === snapshot.doorPrompt!.selectedIndex;
+                    return (
+                      <div
+                        key={opt.id}
+                        className={`flex items-center justify-between gap-3 px-1.5 py-0.5 text-sm whitespace-nowrap transition-colors ${
+                          selected
+                            ? 'bg-amber-500/12 font-medium text-neutral-50'
+                            : 'text-neutral-400'
+                        }`}
+                        style={{ borderRadius: 3 }}
+                      >
+                        <div className="flex items-center gap-2">
+                          <span className="inline-flex h-5 w-5 items-center justify-center">
+                            {selected ? (
+                              <kbd className="inline-flex h-5 min-w-5 items-center justify-center border border-amber-500/65 bg-amber-500/20 px-1 font-mono-tabular text-[11px] font-semibold text-amber-300">
+                                {snapshot.doorPrompt!.key}
+                              </kbd>
+                            ) : (
+                              <span className="h-1 w-1 rounded-full bg-neutral-600" />
+                            )}
+                          </span>
+                          <span>{opt.label}</span>
+                        </div>
+                        {opt.hint && (
+                          <span
+                            className={`text-[11px] ${
+                              selected ? 'text-amber-300/85' : 'text-neutral-500'
+                            }`}
+                          >
+                            {opt.hint}
+                          </span>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
       {/* Bottom-Center Compact Controls Hint Strip */}
       {snapshot.pointerLocked && (
         <div
@@ -798,9 +865,10 @@ export const CombatHud: React.FC<CombatHudProps> = ({
               <span>MMB Pt-Aim</span>
               <span>V Bash</span>
               <span>X Kick</span>
+              <span className="text-amber-300">F + Scroll Doors</span>
               <span className="text-sky-300">Z Ping</span>
               {isBattle && <span>Tab Scoreboard</span>}
-              {isInfection && <span className="text-amber-300">F Interact · Hold F Repair</span>}
+              {isInfection && <span className="text-amber-300">Hold F Repair</span>}
               <span>F1 Optics</span>
             </>
           )}

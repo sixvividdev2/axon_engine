@@ -4,6 +4,7 @@ import { GraphicsQualityId } from '../data/graphicsQuality';
 import { TacticalEquipmentId } from '../data/tacticalEquipment';
 
 import type { TimeOfDayStartSetting, WeatherPresetId } from '../data/multiplayer';
+import type { DestructibleDoorSystem } from '../doors/DestructibleDoorSystem';
 import type { WaterShaderUniforms } from '../engine/world/WaterShader';
 import type { NightLightEntry, WettableSurfaceEntry } from '../engine/world/WeatherTimeSystem';
 import type { WindShaderUniforms } from '../engine/world/WindFoliageShader';
@@ -173,6 +174,8 @@ export interface BuiltMapInstance {
   supportsDynamicWeatherTime?: boolean;
   /** Optional shared wind/water/wetness/night-light hooks bound by WeatherTimeSystem */
   envBindings?: MapEnvBindings;
+  /** Optional physical destructible hinged door system for combat maps */
+  doorSystem?: DestructibleDoorSystem;
   /** Shatters a breakable glass pane/window and disables its paired physics collider */
   shatterBreakable?: (
     objOrId: THREE.Object3D | string,

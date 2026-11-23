@@ -593,6 +593,9 @@ interface BotActor {
   smokeAlertTimer: number;
   smokeFlankDir: number;
   smokeCloudPos: THREE.Vector3;
+  doorInteractCooldown: number;
+  doorAlertTimer: number;
+  doorAlertPos: THREE.Vector3;
 
   // 3D Hierarchy (Unified TacticalOperatorRig) & Articulated Ragdoll
   rig: BuiltTacticalOperatorRig;
@@ -942,6 +945,9 @@ export class BattleBotAI {
         smokeAlertTimer: 0,
         smokeFlankDir: Math.random() < 0.5 ? -1 : 1,
         smokeCloudPos: new THREE.Vector3(),
+        doorInteractCooldown: 0,
+        doorAlertTimer: 0,
+        doorAlertPos: new THREE.Vector3(),
         rig,
         ragdoll: new ArticulatedRagdoll(),
         root: rig.root,
@@ -1338,6 +1344,43 @@ export class BattleBotAI {
       team: best.team,
       text: ackLine,
     });
+  }
+
+  /**
+   * Acoustic Door Hearing for AI Bots:
+   *  - Quiet peeks / soft doorknob closes (loudness < 0.35) do NOT alert bots.
+   *  - Loud slams, melee bashes, breach kicks, and destructive door smashes alert nearby
+   *    hostile bots within radiusM to orient toward the breach and investigate.
+   */
+  public notifyDoorAcousticEvent(
+    pos: Readonly<THREE.Vector3>,
+    radiusM: number,
+    loudness: number,
+    actorTeam?: BattleTeamId,
+  ): void {
+    if (this.isClientReplica || loudness < 0.35 || radiusM <= 0.5) return;
+    const rSq = radiusM * radiusM;
+    for (let i = 0; i < this.bots.length; i++) {
+      const b = this.bots[i];
+      if (!b.alive) continue;
+      if (actorTeam && !this.isHostilePair(b.team, actorTeam)) continue;
+      if (b.pos.distanceToSquared(pos) > rSq) continue;
+
+      b.doorAlertPos.copy(pos);
+      b.doorAlertTimer = Math.max(b.doorAlertTimer, loudness >= 0.8 ? 5.5 : 3.2);
+      // Immediately snap attention yaw toward loud breach if not actively locked in a firefight
+      if (!b.hasLos) {
+        b.targetYaw = Math.atan2(pos.x - b.pos.x, pos.z - b.pos.z);
+        b.losTimer = Math.min(b.losTimer, 0.06);
+        if (loudness >= 0.75) {
+          const nearNode = findNearestNavNode(this.map.navGraph, pos);
+          if (nearNode) {
+            b.goalNodeId = nearNode.id;
+            b.repathTimer = 0.05;
+          }
+        }
+      }
+    }
   }
 
   public awardInfectionHitPoints(botId: string, amount = 10, damageDealt = 0): void {
@@ -3013,6 +3056,8 @@ export class BattleBotAI {
       if (bot.meleeCooldown > 0) bot.meleeCooldown = Math.max(0, bot.meleeCooldown - dt);
       if (bot.suppToggleCooldown > 0) bot.suppToggleCooldown = Math.max(0, bot.suppToggleCooldown - dt);
       if (bot.grenadeCooldown > 0) bot.grenadeCooldown = Math.max(0, bot.grenadeCooldown - dt);
+      if (bot.doorInteractCooldown > 0) bot.doorInteractCooldown = Math.max(0, bot.doorInteractCooldown - dt);
+      if (bot.doorAlertTimer > 0) bot.doorAlertTimer = Math.max(0, bot.doorAlertTimer - dt);
       if (bot.hp > bot.maxHp * 0.65) bot.lowHpCalledOut = false;
       bot.recoilKick = Math.max(0, bot.recoilKick - dt * 7.2);
 
@@ -3773,6 +3818,57 @@ export class BattleBotAI {
         this.map.physics.boundsMinZ + 0.6,
         this.map.physics.boundsMaxZ - 0.6,
       );
+
+      // Bot Physical Door Traversal: automatically open closed/barely-open doors ahead of path with 3P animation
+      if (this.map.doorSystem && bot.doorInteractCooldown <= 0 && Math.hypot(moveX, moveZ) > 0.35) {
+        const doors = this.map.doorSystem.getDoors();
+        for (let di = 0; di < doors.length; di++) {
+          const door = doors[di];
+          if (door.hingeMode !== 'attached') continue;
+          const openRatio = Math.abs(door.angleRad) / Math.max(0.1, door.spec.maxOpenRad);
+          if (!door.latched && openRatio >= 0.48) continue;
+          if (Math.abs(bot.pos.y - door.spec.hingePos[1]) > 1.35) continue;
+
+          this.map.doorSystem.getDoorCenterWorldPos(door.id, this._tmpMid);
+          const ddx = this._tmpMid.x - bot.pos.x;
+          const ddz = this._tmpMid.z - bot.pos.z;
+          const distSq = ddx * ddx + ddz * ddz;
+          if (distSq < 1.75 * 1.75) {
+            const forwardDot = ddx * moveX + ddz * moveZ;
+            if (forwardDot > 0.05) {
+              const speed = Math.hypot(moveX, moveZ);
+              const withSwing = this.map.doorSystem.isActorOnSwingWithSide(door.id, bot.pos);
+              const useKick = withSwing && (bot.hasLos || speed > 4.2);
+              if (useKick) {
+                this._tmpDir.set(moveX, 0, moveZ).normalize();
+                this.map.doorSystem.executeKick(door.id, this._tmpDir, speed, false, bot.team);
+                if (bot.handlingAction === 'NONE') {
+                  bot.handlingAction = 'DOOR_KICK';
+                  bot.handlingTimer = 0;
+                  bot.handlingDuration = 0.48;
+                }
+              } else {
+                this.map.doorSystem.executeOption(door.id, 'open', {
+                  actorPos: bot.pos,
+                  actorTeam: bot.team,
+                });
+                if (bot.handlingAction === 'NONE') {
+                  bot.handlingAction = 'DOOR_OPEN';
+                  bot.handlingTimer = 0;
+                  bot.handlingDuration = 0.54;
+                }
+              }
+              bot.doorInteractCooldown = 1.4;
+              break;
+            }
+          }
+        }
+      }
+
+      // If alerted to a loud nearby door breach and no active LOS target, orient toward breach origin
+      if (!bot.hasLos && bot.doorAlertTimer > 0) {
+        bot.targetYaw = Math.atan2(bot.doorAlertPos.x - bot.pos.x, bot.doorAlertPos.z - bot.pos.z);
+      }
 
       const resolved = this.resolveBotXZ(nextX, bot.pos.y, nextZ);
       bot.pos.x = resolved.x;

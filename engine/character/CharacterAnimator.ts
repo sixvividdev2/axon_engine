@@ -1342,11 +1342,16 @@ export class CharacterAnimator {
     const eyeY = state.position.y + state.stepSmoothOffsetY + state.chestHeight;
 
     if (attackType === 'kick') {
-      this._meleeDir.y = THREE.MathUtils.clamp(this._meleeDir.y * 0.45, -0.25, 0.22);
+      this._meleeDir.y = THREE.MathUtils.clamp(this._meleeDir.y, -0.73, 0.46);
       this._meleeDir.normalize();
+      const originDrop = THREE.MathUtils.lerp(
+        0.24,
+        0.08,
+        Math.min(1, Math.abs(this._meleeDir.y) * 1.4),
+      );
       this._meleeOrigin.set(
         state.position.x + this._meleeDir.x * 0.14,
-        eyeY - 0.30,
+        eyeY - originDrop,
         state.position.z + this._meleeDir.z * 0.14,
       );
     } else {
@@ -1647,60 +1652,106 @@ export class CharacterAnimator {
       this.footPitchR,
     );
 
-    // Tactical Push-Kick (X): Right-leg 2-bone IK override (Chamber -> Snap Thrust -> Plant Recovery)
+    // Tactical Push-Kick (X): Aim-tracked right-leg 2-bone IK (Chamber -> Snap Thrust -> Plant Recovery)
     if (this.combatMove === 'PUSH_KICK') {
       const p = THREE.MathUtils.clamp(this.combatTime / Math.max(0.01, this.combatDuration), 0, 1);
       const eyeH = state.chestHeight;
+
+      const kickPitch = THREE.MathUtils.clamp(state.torsoPitch + state.aimPitch, -0.82, 0.48);
+      const kickYaw = THREE.MathUtils.clamp(state.aimYaw, -0.44, 0.44);
+      const baseApexY = Math.max(this._hipR.y + 0.24, eyeH - 0.33);
+      const horizReach = 0.71 * Math.cos(kickPitch);
+      const apexX = THREE.MathUtils.clamp(0.03 - Math.sin(kickYaw) * horizReach, -0.34, 0.40);
+      const apexY = THREE.MathUtils.clamp(
+        baseApexY + Math.sin(kickPitch) * 0.62,
+        0.14,
+        eyeH - 0.06,
+      );
+      const apexZ = THREE.MathUtils.clamp(
+        this._hipR.z - 0.16 - Math.cos(kickYaw) * horizReach,
+        -0.86,
+        -0.24,
+      );
+      const apexPoleX = apexX + 0.05;
+      const apexPoleY = Math.max(apexY + 0.15, this._hipR.y + 0.06);
+      const apexPoleZ = apexZ - 0.24;
+      const bootPitchApex = THREE.MathUtils.clamp(
+        1.42 + (kickPitch >= 0 ? kickPitch * 0.65 : kickPitch * 0.85),
+        0.65,
+        1.78,
+      );
+      const bootYawApex = 0.04 + kickYaw * 0.72;
 
       this._ankleL.x = THREE.MathUtils.lerp(this._ankleL.x, -0.14, smoothstep(0.0, 0.16, p));
       this._ankleL.z = THREE.MathUtils.lerp(this._ankleL.z, 0.10, smoothstep(0.0, 0.16, p));
 
       let blend = 0;
       let bootPitchX = 0;
+      let bootYawY = 0.04;
 
       if (p < 0.16) {
         const t = smoothstep(0.0, 0.16, p);
         blend = t;
-        this._kickAnkleTarget.set(0.11, this._hipR.y - 0.12, this._hipR.z - 0.34);
-        this._kickPoleTarget.set(0.14, this._hipR.y + 0.30, this._hipR.z - 0.68);
+        this._kickAnkleTarget.set(
+          0.11 - Math.sin(kickYaw) * 0.10,
+          THREE.MathUtils.clamp(this._hipR.y - 0.12 + kickPitch * 0.12, 0.18, eyeH - 0.25),
+          this._hipR.z - 0.34,
+        );
+        this._kickPoleTarget.set(
+          0.14 - Math.sin(kickYaw) * 0.16,
+          this._hipR.y + 0.30 + kickPitch * 0.14,
+          this._hipR.z - 0.68,
+        );
         bootPitchX = 0.72 * t;
+        bootYawY = THREE.MathUtils.lerp(0.04, bootYawApex * 0.5, t);
       } else if (p < 0.34) {
         const t = easeOutQuart((p - 0.16) / 0.18);
         blend = 1;
         this._kickAnkleTarget.set(
-          THREE.MathUtils.lerp(0.11, 0.03, t),
-          THREE.MathUtils.lerp(this._hipR.y - 0.12, eyeH - 0.33, t),
-          THREE.MathUtils.lerp(this._hipR.z - 0.34, -0.66, t),
+          THREE.MathUtils.lerp(0.11 - Math.sin(kickYaw) * 0.10, apexX, t),
+          THREE.MathUtils.lerp(
+            THREE.MathUtils.clamp(this._hipR.y - 0.12 + kickPitch * 0.12, 0.18, eyeH - 0.25),
+            apexY,
+            t,
+          ),
+          THREE.MathUtils.lerp(this._hipR.z - 0.34, apexZ, t),
         );
         this._kickPoleTarget.set(
-          0.08,
-          THREE.MathUtils.lerp(this._hipR.y + 0.30, eyeH - 0.18, t),
-          -0.90,
+          THREE.MathUtils.lerp(0.14 - Math.sin(kickYaw) * 0.16, apexPoleX, t),
+          THREE.MathUtils.lerp(this._hipR.y + 0.30 + kickPitch * 0.14, apexPoleY, t),
+          THREE.MathUtils.lerp(this._hipR.z - 0.68, apexPoleZ, t),
         );
-        bootPitchX = THREE.MathUtils.lerp(0.72, 1.42, t);
+        bootPitchX = THREE.MathUtils.lerp(0.72, bootPitchApex, t);
+        bootYawY = THREE.MathUtils.lerp(bootYawApex * 0.5, bootYawApex, t);
       } else if (p < 0.42) {
         blend = 1;
-        this._kickAnkleTarget.set(0.03, eyeH - 0.33, -0.66);
-        this._kickPoleTarget.set(0.08, eyeH - 0.18, -0.90);
-        bootPitchX = 1.42;
+        this._kickAnkleTarget.set(apexX, apexY, apexZ);
+        this._kickPoleTarget.set(apexPoleX, apexPoleY, apexPoleZ);
+        bootPitchX = bootPitchApex;
+        bootYawY = bootYawApex;
       } else {
         const rec = smoothstep(0.42, 1.0, p);
         const rechamber = Math.sin(rec * Math.PI);
         blend = 1 - rec;
         this._kickAnkleTarget.set(
-          THREE.MathUtils.lerp(0.03, 0.13, rec),
-          THREE.MathUtils.lerp(eyeH - 0.33, this._hipR.y - 0.24, rec) + rechamber * 0.12,
-          THREE.MathUtils.lerp(-0.66, -0.18, rec),
+          THREE.MathUtils.lerp(apexX, 0.13, rec),
+          THREE.MathUtils.lerp(apexY, this._hipR.y - 0.24, rec) + rechamber * 0.12,
+          THREE.MathUtils.lerp(apexZ, -0.18, rec),
         );
-        this._kickPoleTarget.set(0.12, this._hipR.y + 0.05, -0.68);
-        bootPitchX = THREE.MathUtils.lerp(1.42, 0.0, rec);
+        this._kickPoleTarget.set(
+          THREE.MathUtils.lerp(apexPoleX, 0.12, rec),
+          THREE.MathUtils.lerp(apexPoleY, this._hipR.y + 0.05, rec),
+          THREE.MathUtils.lerp(apexPoleZ, -0.68, rec),
+        );
+        bootPitchX = THREE.MathUtils.lerp(bootPitchApex, 0.0, rec);
+        bootYawY = THREE.MathUtils.lerp(bootYawApex, 0.04, rec);
       }
 
       this._ankleR.lerp(this._kickAnkleTarget, blend);
       this._kneePoleR.lerp(this._kickPoleTarget, blend);
       this.skeleton.rightLeg.boot.rotation.set(
         THREE.MathUtils.lerp(this.skeleton.rightLeg.boot.rotation.x, bootPitchX, blend),
-        THREE.MathUtils.lerp(this.skeleton.rightLeg.boot.rotation.y, 0.04, blend),
+        THREE.MathUtils.lerp(this.skeleton.rightLeg.boot.rotation.y, bootYawY, blend),
         0,
       );
     }

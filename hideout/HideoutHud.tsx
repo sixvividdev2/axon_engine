@@ -90,7 +90,7 @@ export const HideoutHud: React.FC<HideoutHudProps> = ({
         </div>
       )}
 
-      {/* Contextual interact dot (hidden by default; white when near, yellow when ready) + [E] prompt */}
+      {/* Contextual interact dot (hidden by default; white when near, yellow when ready) + [F] Scroll menu */}
       {showLiveHud && snapshot.interactReticleState !== 'hidden' && (
         <div className="fixed inset-0 flex flex-col items-center justify-center">
           <div
@@ -101,31 +101,63 @@ export const HideoutHud: React.FC<HideoutHudProps> = ({
             }`}
           />
 
-          {snapshot.prompt && (
+          {snapshot.prompt && snapshot.prompt.options.length > 0 && (
             <div
-              className="mt-5 flex flex-col items-center gap-1.5 px-3.5 py-2 border border-white/12 bg-[#0d0f12]/90"
+              className="mt-5 min-w-[184px] border border-white/12 bg-[#0d0f12]/92 px-2.5 py-2"
               style={{ borderRadius: 4 }}
             >
-              <div className="flex items-center gap-2.5 text-sm font-medium text-neutral-100 whitespace-nowrap">
-                <kbd className="inline-flex h-6 min-w-6 items-center justify-center border border-amber-500/60 bg-amber-500/15 px-1.5 font-mono-tabular text-xs font-semibold text-amber-300">
-                  {snapshot.prompt.key}
-                </kbd>
-                <span>{snapshot.prompt.label}</span>
-              </div>
-              {snapshot.prompt.secondaryKey && snapshot.prompt.secondaryLabel && (
-                <div className="flex items-center gap-2 text-xs text-neutral-400 whitespace-nowrap">
-                  <kbd className="inline-flex h-5 min-w-5 items-center justify-center border border-white/15 bg-white/5 px-1 font-mono-tabular text-[11px] font-medium text-neutral-200">
-                    {snapshot.prompt.secondaryKey}
-                  </kbd>
-                  <span>{snapshot.prompt.secondaryLabel}</span>
+              {snapshot.prompt.targetLabel && (
+                <div className="mb-1.5 flex items-center justify-between gap-4 border-b border-white/10 pb-1 text-[11px] font-medium tracking-wide text-neutral-400">
+                  <span>{snapshot.prompt.targetLabel}</span>
+                  {snapshot.prompt.options.length > 1 && (
+                    <span className="font-mono-tabular text-[10px] text-neutral-500">Scroll</span>
+                  )}
                 </div>
               )}
+              <div className="flex flex-col gap-1">
+                {snapshot.prompt.options.map((opt, idx) => {
+                  const selected = idx === snapshot.prompt!.selectedIndex;
+                  return (
+                    <div
+                      key={opt.id}
+                      className={`flex items-center justify-between gap-3 px-1.5 py-0.5 text-sm whitespace-nowrap transition-colors ${
+                        selected
+                          ? 'bg-amber-500/12 font-medium text-neutral-50'
+                          : 'text-neutral-400'
+                      }`}
+                      style={{ borderRadius: 3 }}
+                    >
+                      <div className="flex items-center gap-2">
+                        <span className="inline-flex h-5 w-5 items-center justify-center">
+                          {selected ? (
+                            <kbd className="inline-flex h-5 min-w-5 items-center justify-center border border-amber-500/65 bg-amber-500/20 px-1 font-mono-tabular text-[11px] font-semibold text-amber-300">
+                              {snapshot.prompt!.key}
+                            </kbd>
+                          ) : (
+                            <span className="h-1 w-1 rounded-full bg-neutral-600" />
+                          )}
+                        </span>
+                        <span>{opt.label}</span>
+                      </div>
+                      {opt.hint && (
+                        <span
+                          className={`text-[11px] ${
+                            selected ? 'text-amber-300/85' : 'text-neutral-500'
+                          }`}
+                        >
+                          {opt.hint}
+                        </span>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
             </div>
           )}
         </div>
       )}
 
-      {/* Compact status toast (Personal Stash, Resupply, Weapon Swap) */}
+      {/* Compact status toast (Personal Stash, Resupply, Weapon Swap, Repair) */}
       {snapshot.toastMessage && !showPauseMenu && !modalOpen && (
         <div className="fixed bottom-14 left-1/2 -translate-x-1/2 border border-amber-500/35 bg-[#0e1013]/92 px-4 py-2 text-xs font-medium text-amber-100">
           {snapshot.toastMessage}
@@ -146,9 +178,13 @@ export const HideoutHud: React.FC<HideoutHudProps> = ({
           <div className="flex items-center gap-3 text-xs text-neutral-400">
             <span>WASD Move</span>
             <span aria-hidden="true">·</span>
-            <span>E Interact</span>
+            <span>Q/E Lean</span>
             <span aria-hidden="true">·</span>
-            <span>I Inspect</span>
+            <span>F + Scroll Interact</span>
+            <span aria-hidden="true">·</span>
+            <span>V Bash</span>
+            <span aria-hidden="true">·</span>
+            <span>X Kick</span>
             <span aria-hidden="true">·</span>
             <span>ESC Menu</span>
           </div>

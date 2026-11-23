@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import { BodycamPhysicsWorld, BodycamSurfaceMaterial } from '../bodycam-sdk';
+import { DestructibleDoorSystem } from '../doors/DestructibleDoorSystem';
 import { getGraphicsQualityProfile, GraphicsQualityId } from '../data/graphicsQuality';
 import { createStencilSignTexture } from '../gym/GymTextures';
 import { WettableSurfaceEntry } from '../engine/world/WeatherTimeSystem';
@@ -767,6 +768,45 @@ function buildKorsakovSubstation(
     };
   };
 
+  // === PHYSICAL DESTRUCTIBLE SWITCHGEAR CORRIDOR DOORS ===
+  const doorSystem = new DestructibleDoorSystem(sceneGroup, physics, isSoftwareGl);
+  const K_DOOR_W = 1.18;
+  const K_DOOR_H = 2.26;
+  const K_CLEAR = K_DOOR_W + 0.1;
+  const addSwitchDoorFrame = (ix: number, cz: number, openSpan: number): void => {
+    const wallH = CAT_Y - 0.14;
+    const sideW = Math.max(0.1, (openSpan - K_CLEAR) * 0.5);
+    const transH = Math.max(0.1, wallH - (K_DOOR_H + 0.05));
+    addSolidBox(ix, 0.08 + wallH * 0.5, cz - (K_CLEAR * 0.5 + sideW * 0.5), 0.4, wallH, sideW, matSlateWall, 'concrete');
+    addSolidBox(ix, 0.08 + wallH * 0.5, cz + (K_CLEAR * 0.5 + sideW * 0.5), 0.4, wallH, sideW, matSlateWall, 'concrete');
+    addSolidBox(ix, 0.08 + K_DOOR_H + 0.05 + transH * 0.5, cz, 0.4, transH, K_CLEAR, matDarkSteel, 'metal');
+  };
+
+  // West Switchgear North passage (x = -21.0, z = -7.25) & East Switchgear South passage (x = 21.0, z = +7.25)
+  addSwitchDoorFrame(-21.0, -7.25, 4.5);
+  doorSystem.addDoor({
+    id: 'korsakov_west_switch_door',
+    label: 'West Switchgear Door',
+    hingePos: [-21.0, 0.08, -7.25 - K_DOOR_W * 0.5],
+    closedYawRad: -Math.PI * 0.5,
+    swingSign: 1,
+    width: K_DOOR_W,
+    height: K_DOOR_H,
+    style: 'tactical_reinforced',
+  });
+
+  addSwitchDoorFrame(21.0, 7.25, 4.5);
+  doorSystem.addDoor({
+    id: 'korsakov_east_switch_door',
+    label: 'East Switchgear Door',
+    hingePos: [21.0, 0.08, 7.25 - K_DOOR_W * 0.5],
+    closedYawRad: -Math.PI * 0.5,
+    swingSign: -1,
+    width: K_DOOR_W,
+    height: K_DOOR_H,
+    style: 'tactical_reinforced',
+  });
+
   return {
     id: 'korsakov_substation',
     name: 'Korsakov Substation',
@@ -788,6 +828,7 @@ function buildKorsakovSubstation(
       windUniforms,
       wettableSurfaces,
     },
+    doorSystem,
     shatterBreakable,
     update: (_dt, elapsedSec) => {
       for (const bl of blueLights) {
@@ -795,6 +836,7 @@ function buildKorsakovSubstation(
       }
     },
     dispose: () => {
+      doorSystem.dispose();
       scene.remove(sceneGroup);
       envTex.dispose();
       ownedGeos.forEach((g) => g.dispose());

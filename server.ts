@@ -1779,6 +1779,7 @@ async function startServer() {
               powerOn: room.matchState.powerOn,
               openedDoorIds: room.matchState.openedDoorIds,
               unlockedZoneIds: room.matchState.unlockedZoneIds,
+              doors: Object.values(room.matchState.doors ?? {}),
               round: room.matchState.round,
               zombiesRemaining: room.matchState.zombiesRemaining,
               senderIsHost: true,

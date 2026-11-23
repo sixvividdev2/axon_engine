@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import { BodycamPhysicsWorld, BodycamSurfaceMaterial } from '../bodycam-sdk';
+import { DestructibleDoorSystem } from '../doors/DestructibleDoorSystem';
 import { getGraphicsQualityProfile, GraphicsQualityId } from '../data/graphicsQuality';
 import { createStencilSignTexture } from '../gym/GymTextures';
 import {
@@ -918,6 +919,84 @@ function buildPripyatBlock(
 
   physics.setRaycastMeshes(raycastMeshes);
 
+  // === 8. PHYSICAL DESTRUCTIBLE INTERIOR DOORS (PRIPYAT APARTMENT WINGS & NORTH HALLS) ===
+  const doorSystem = new DestructibleDoorSystem(sceneGroup, physics, isSoftwareGl);
+  const DOOR_W = 1.18;
+  const DOOR_H = 2.26;
+  const FRAME_CLEAR = DOOR_W + 0.1;
+
+  const addDoorInfill = (
+    axis: 'x' | 'z',
+    fixedCoord: number,
+    centerAlong: number,
+    openSpan: number,
+    openHeight: number,
+    floorY: number,
+    thick: number,
+  ): void => {
+    const sideW = Math.max(0.08, (openSpan - FRAME_CLEAR) * 0.5);
+    const transH = Math.max(0.08, openHeight - (DOOR_H + 0.05));
+    if (axis === 'x') {
+      addSolidBox(centerAlong - (FRAME_CLEAR * 0.5 + sideW * 0.5), floorY + openHeight * 0.5, fixedCoord, sideW, openHeight, thick, matTealPlaster, 'concrete');
+      addSolidBox(centerAlong + (FRAME_CLEAR * 0.5 + sideW * 0.5), floorY + openHeight * 0.5, fixedCoord, sideW, openHeight, thick, matTealPlaster, 'concrete');
+      addSolidBox(centerAlong, floorY + DOOR_H + 0.05 + transH * 0.5, fixedCoord, FRAME_CLEAR, transH, thick, matTealPlaster, 'concrete');
+    } else {
+      addSolidBox(fixedCoord, floorY + openHeight * 0.5, centerAlong - (FRAME_CLEAR * 0.5 + sideW * 0.5), thick, openHeight, sideW, matTealPlaster, 'concrete');
+      addSolidBox(fixedCoord, floorY + openHeight * 0.5, centerAlong + (FRAME_CLEAR * 0.5 + sideW * 0.5), thick, openHeight, sideW, matTealPlaster, 'concrete');
+      addSolidBox(fixedCoord, floorY + DOOR_H + 0.05 + transH * 0.5, centerAlong, thick, transH, FRAME_CLEAR, matTealPlaster, 'concrete');
+    }
+  };
+
+  // West Wing & East Wing ground teal partition doorways (z = 2.0, x = ±30.5)
+  addDoorInfill('x', 2.0, -30.5, 2.6, 2.5, 0.08, 0.3);
+  doorSystem.addDoor({
+    id: 'pripyat_west_wing_door',
+    label: 'West Wing Door',
+    hingePos: [-30.5 - DOOR_W * 0.5, 0.08, 2.0],
+    closedYawRad: 0,
+    swingSign: 1,
+    width: DOOR_W,
+    height: DOOR_H,
+    style: 'bunker_wood',
+  });
+
+  addDoorInfill('x', 2.0, 30.5, 2.6, 2.5, 0.08, 0.3);
+  doorSystem.addDoor({
+    id: 'pripyat_east_wing_door',
+    label: 'East Wing Door',
+    hingePos: [30.5 - DOOR_W * 0.5, 0.08, 2.0],
+    closedYawRad: 0,
+    swingSign: -1,
+    width: DOOR_W,
+    height: DOOR_H,
+    style: 'bunker_wood',
+  });
+
+  // North Block Ground interior corridor doors (x = ±14.5, z = -25.0)
+  addDoorInfill('z', -14.5, -25.0, 2.4, 2.5, 0.08, 0.32);
+  doorSystem.addDoor({
+    id: 'pripyat_north_west_door',
+    label: 'North Hall West Door',
+    hingePos: [-14.5, 0.08, -25.0 - DOOR_W * 0.5],
+    closedYawRad: -Math.PI * 0.5,
+    swingSign: 1,
+    width: DOOR_W,
+    height: DOOR_H,
+    style: 'bunker_wood',
+  });
+
+  addDoorInfill('z', 14.5, -25.0, 2.4, 2.5, 0.08, 0.32);
+  doorSystem.addDoor({
+    id: 'pripyat_north_east_door',
+    label: 'North Hall East Door',
+    hingePos: [14.5, 0.08, -25.0 - DOOR_W * 0.5],
+    closedYawRad: -Math.PI * 0.5,
+    swingSign: -1,
+    width: DOOR_W,
+    height: DOOR_H,
+    style: 'bunker_wood',
+  });
+
   return {
     id: 'pripyat_block',
     name: 'Pripyat Block',
@@ -940,6 +1019,7 @@ function buildPripyatBlock(
       wettableSurfaces,
       nightLights,
     },
+    doorSystem,
     update: (_dt, elapsedSec) => {
       for (const fl of flickerLights) {
         if (fl.broken) {
@@ -951,6 +1031,7 @@ function buildPripyatBlock(
       }
     },
     dispose: () => {
+      doorSystem.dispose();
       scene.remove(sceneGroup);
       envTex.dispose();
       ownedGeos.forEach((g) => g.dispose());

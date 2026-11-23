@@ -4,6 +4,7 @@ import {
   LobbyRoomState,
   OperatorUniformId,
   SyncedAimStance,
+  SyncedDoorState,
   SyncedHandlingAction,
   SyncedWeaponAttachments,
   VALID_SYNCED_HANDLING_ACTIONS,
@@ -14,6 +15,7 @@ export interface CachedMatchState {
   powerOn: boolean;
   openedDoorIds: string[];
   unlockedZoneIds: string[];
+  doors: Record<string, SyncedDoorState>;
   round: number;
   zombiesRemaining: number;
   updatedAt: number;
@@ -24,6 +26,7 @@ export function createDefaultMatchState(): CachedMatchState {
     powerOn: false,
     openedDoorIds: [],
     unlockedZoneIds: ['lobby', 'default'],
+    doors: {},
     round: 1,
     zombiesRemaining: 9,
     updatedAt: Date.now(),
@@ -61,7 +64,28 @@ const ALLOWED_GAME_TYPES = new Set<string>([
   'game:ping',
   'game:glass_shatter',
   'game:grenade_event',
+  'game:door_action',
 ]);
+
+const VALID_DOOR_ACTIONS = new Set<string>([
+  'open',
+  'peek',
+  'close',
+  'close_soft',
+  'kick_breach',
+  'kick_destroy',
+  'melee_bash',
+  'bullet_chip',
+  'nudge',
+  'repair',
+]);
+const VALID_DOOR_HINGE_MODES = new Set<string>([
+  'attached',
+  'sheared_flying',
+  'splitting',
+  'collapsed',
+]);
+const VALID_DOOR_OUTCOMES = new Set<string>(['none', 'hinge_shear', 'split_collapse']);
 
 const VALID_GRENADE_EVENT_KINDS = new Set<GameGrenadeEventKind>([
   'pin_pull',
@@ -707,6 +731,74 @@ export function validateAndSanitizeGameMessage(
       );
     } else {
       delete safePayload.fuseRemainingSec;
+    }
+  } else if (type === 'game:door_action') {
+    const doorId = String(parsed.doorId ?? '').trim().slice(0, 64);
+    const action = typeof parsed.action === 'string' ? parsed.action : '';
+    if (!doorId || !VALID_DOOR_ACTIONS.has(action)) {
+      return null;
+    }
+    const angleRad = Number(clampFinite(parsed.angleRad, -3.2, 3.2, 0).toFixed(4));
+    const angularVel = Number(clampFinite(parsed.angularVel, -24, 24, 0).toFixed(3));
+    const latched = Boolean(parsed.latched);
+    const dmgRaw = Math.floor(clampFinite(parsed.damageState, 0, 3, 0));
+    const damageState = (dmgRaw === 0 || dmgRaw === 1 || dmgRaw === 2 || dmgRaw === 3 ? dmgRaw : 0) as
+      | 0
+      | 1
+      | 2
+      | 3;
+    const chipDamage = Math.floor(clampFinite(parsed.chipDamage, 0, 1000, 0));
+    const hingeMode = (
+      typeof parsed.hingeMode === 'string' && VALID_DOOR_HINGE_MODES.has(parsed.hingeMode)
+        ? parsed.hingeMode
+        : 'attached'
+    ) as SyncedDoorState['hingeMode'];
+    const destructionOutcome = (
+      typeof parsed.destructionOutcome === 'string' &&
+      VALID_DOOR_OUTCOMES.has(parsed.destructionOutcome)
+        ? parsed.destructionOutcome
+        : 'none'
+    ) as SyncedDoorState['destructionOutcome'];
+    const seed = Math.floor(clampFinite(parsed.seed, 0, 10_000_000, 0));
+
+    safePayload.doorId = doorId;
+    safePayload.action = action;
+    safePayload.angleRad = angleRad;
+    safePayload.angularVel = angularVel;
+    safePayload.latched = latched;
+    safePayload.damageState = damageState;
+    safePayload.chipDamage = chipDamage;
+    safePayload.hingeMode = hingeMode;
+    safePayload.destructionOutcome = destructionOutcome;
+    safePayload.seed = seed;
+    if (isFiniteCoord(parsed.px) && isFiniteCoord(parsed.py) && isFiniteCoord(parsed.pz)) {
+      safePayload.px = Number(parsed.px.toFixed(3));
+      safePayload.py = Number(parsed.py.toFixed(3));
+      safePayload.pz = Number(parsed.pz.toFixed(3));
+    }
+    if (isFiniteCoord(parsed.dx, 5) && isFiniteCoord(parsed.dy, 5) && isFiniteCoord(parsed.dz, 5)) {
+      safePayload.dx = Number(parsed.dx.toFixed(3));
+      safePayload.dy = Number(parsed.dy.toFixed(3));
+      safePayload.dz = Number(parsed.dz.toFixed(3));
+    }
+
+    if (!matchState.doors) {
+      matchState.doors = {};
+    }
+    if (Object.keys(matchState.doors).length < 64 || matchState.doors[doorId]) {
+      matchState.doors[doorId] = {
+        doorId,
+        angleRad,
+        angularVel,
+        latched,
+        damageState,
+        chipDamage,
+        hingeMode,
+        destructionOutcome,
+        seed,
+      };
+      matchState.updatedAt = Date.now();
+      matchStateChanged = true;
     }
   }
 

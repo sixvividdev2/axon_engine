@@ -9,6 +9,7 @@ import {
   WeaponModelFactory,
 } from '../bodycam-sdk';
 import { loadoutStore } from '../data/loadoutStore';
+import { DestructibleDoorSystem } from '../doors/DestructibleDoorSystem';
 import { createHideoutMaterials, HideoutMaterialLibrary } from './HideoutMaterials';
 
 export type HideoutRoomId = 'arsenal' | 'gun_range' | 'ready_room' | 'zombies_portal';
@@ -64,6 +65,7 @@ export function resolveHideoutRoom(x: number, z: number): HideoutRoomBounds {
 export interface HideoutBunkerWorldHandle {
   physics: BodycamPhysicsWorld;
   materials: HideoutMaterialLibrary;
+  doorSystem: DestructibleDoorSystem;
   root: THREE.Group;
   raycastMeshes: THREE.Object3D[];
   interactableMeshes: THREE.Mesh[];
@@ -71,6 +73,7 @@ export interface HideoutBunkerWorldHandle {
   lockerOpen: boolean;
   toggleLockerDoor: () => boolean;
   triggerAmmoCratePop: () => void;
+  getPropInteractPos: (kind: HideoutInteractableKind, outPos: THREE.Vector3) => boolean;
   syncGunWallSlots: (slots: ReadonlyArray<string | null>) => void;
   setSlotWeaponVisual: (slotIndex: number, weaponId: string | null) => void;
   getSlotTransform: (
@@ -825,8 +828,84 @@ export function buildHideoutBunkerWorld(
   root.add(crateProxy);
   interactableMeshes.push(crateProxy);
 
-  // Register static world raycast meshes for player physics / bullet wall checks
+  // Register static world raycast meshes BEFORE mounting dynamic destructible doors
   physics.setRaycastMeshes(raycastMeshes);
+
+  // ============================================================================
+  // 6. PHYSICAL DESTRUCTIBLE BUNKER DOORS (REPAIRABLE IN HIDEOUT)
+  // ============================================================================
+  // Frame each 2.8m x 2.75m bulkhead corridor cleanly down to a flush 1.18m x 2.26m tactical doorway
+  const addBulkheadDoorInfill = (
+    cx: number,
+    cz: number,
+    alongZ: boolean,
+    wallDepth: number,
+    openingSpan: number,
+    doorSpan: number,
+    doorH: number,
+    portalH: number,
+  ): void => {
+    const sideW = (openingSpan - doorSpan) * 0.5;
+    const transomH = Math.max(0.1, portalH - doorH);
+    if (alongZ) {
+      addBoxStructure(cx, portalH * 0.5, cz - (doorSpan * 0.5 + sideW * 0.5), wallDepth, portalH, sideW, materials.concreteWall, 'concrete');
+      addBoxStructure(cx, portalH * 0.5, cz + (doorSpan * 0.5 + sideW * 0.5), wallDepth, portalH, sideW, materials.concreteWall, 'concrete');
+      addBoxStructure(cx, doorH + transomH * 0.5, cz, wallDepth, transomH, doorSpan, materials.darkSteel, 'metal');
+    } else {
+      addBoxStructure(cx - (doorSpan * 0.5 + sideW * 0.5), portalH * 0.5, cz, sideW, portalH, wallDepth, materials.concreteWall, 'concrete');
+      addBoxStructure(cx + (doorSpan * 0.5 + sideW * 0.5), portalH * 0.5, cz, sideW, portalH, wallDepth, materials.concreteWall, 'concrete');
+      addBoxStructure(cx, doorH + transomH * 0.5, cz, doorSpan, transomH, wallDepth, materials.darkSteel, 'metal');
+    }
+  };
+
+  const TACTICAL_DOOR_W = 1.18;
+  const TACTICAL_DOOR_H = 2.26;
+  const FRAME_CLEAR_W = TACTICAL_DOOR_W + 0.1;
+
+  // East Bulkhead (Gun Range) infill & repairable door (swings outward into +X Gun Range)
+  addBulkheadDoorInfill(6.18, 0, true, 0.34, DOOR_W, FRAME_CLEAR_W, TACTICAL_DOOR_H + 0.05, DOOR_H);
+  // West Bulkhead (Ready Room) infill & repairable door (swings outward into -X Ready Room)
+  addBulkheadDoorInfill(-6.18, 0, true, 0.34, DOOR_W, FRAME_CLEAR_W, TACTICAL_DOOR_H + 0.05, DOOR_H);
+  // South Bulkhead (Sector 4 Containment) infill & repairable door (swings outward into +Z Sector 4)
+  addBulkheadDoorInfill(0, 5.18, false, 0.34, DOOR_W, FRAME_CLEAR_W, TACTICAL_DOOR_H + 0.05, DOOR_H);
+
+  const doorSystem = new DestructibleDoorSystem(root, physics, isSoftwareGl);
+  doorSystem.addDoor({
+    id: 'hideout_gun_range_door',
+    label: 'Gun Range Door',
+    hingePos: [6.18, 0, -TACTICAL_DOOR_W * 0.5],
+    closedYawRad: -Math.PI * 0.5,
+    swingSign: 1,
+    width: TACTICAL_DOOR_W,
+    height: TACTICAL_DOOR_H,
+    thickness: 0.075,
+    repairable: true,
+    style: 'bunker_wood',
+  });
+  doorSystem.addDoor({
+    id: 'hideout_ready_room_door',
+    label: 'Ready Room Door',
+    hingePos: [-6.18, 0, -TACTICAL_DOOR_W * 0.5],
+    closedYawRad: -Math.PI * 0.5,
+    swingSign: -1,
+    width: TACTICAL_DOOR_W,
+    height: TACTICAL_DOOR_H,
+    thickness: 0.075,
+    repairable: true,
+    style: 'bunker_wood',
+  });
+  doorSystem.addDoor({
+    id: 'hideout_sector4_door',
+    label: 'Sector 4 Containment Door',
+    hingePos: [-TACTICAL_DOOR_W * 0.5, 0, 5.18],
+    closedYawRad: 0,
+    swingSign: -1,
+    width: TACTICAL_DOOR_W,
+    height: TACTICAL_DOOR_H,
+    thickness: 0.075,
+    repairable: true,
+    style: 'tactical_reinforced',
+  });
 
   // === Interactive Prop Animation State ===
   let lockerOpen = false;
@@ -872,9 +951,28 @@ export function buildHideoutBunkerWorld(
     return true;
   };
 
+  const getPropInteractPos = (kind: HideoutInteractableKind, outPos: THREE.Vector3): boolean => {
+    if (kind === 'locker_door') {
+      doorHandle.updateMatrixWorld(true);
+      doorHandle.getWorldPosition(outPos);
+      return true;
+    }
+    if (kind === 'ammo_crate') {
+      crateLidPivot.updateMatrixWorld(true);
+      outPos.set(crateX, crateH + 0.04, crateZ);
+      return true;
+    }
+    if (kind === 'prep_table_gunsmith') {
+      outPos.set(tableX, tableH + 0.04, tableZ);
+      return true;
+    }
+    return false;
+  };
+
   return {
     physics,
     materials,
+    doorSystem,
     root,
     raycastMeshes,
     interactableMeshes,
@@ -884,11 +982,13 @@ export function buildHideoutBunkerWorld(
     },
     toggleLockerDoor,
     triggerAmmoCratePop,
+    getPropInteractPos,
     syncGunWallSlots,
     setSlotWeaponVisual,
     getSlotTransform,
     updateProps,
     dispose: () => {
+      doorSystem.dispose();
       for (const slot of gunWallSlots) {
         if (slot.assembly) {
           slot.mountGroup.remove(slot.assembly.group);

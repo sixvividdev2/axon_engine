@@ -20,6 +20,34 @@ export interface PhysicsBoxCollider {
 }
 
 /**
+ * Dynamic oriented 2D slab collider (used for rotating physical hinged doors).
+ * Supports real-time angle updates and capsule push-nudge torque callbacks with zero GC.
+ */
+export interface PhysicsDynamicSlab {
+  id: string;
+  originX: number;
+  originZ: number;
+  minY: number;
+  maxY: number;
+  /** Unit direction vector in XZ from hinge origin toward latch edge */
+  dirX: number;
+  dirZ: number;
+  length: number;
+  halfThickness: number;
+  active: boolean;
+  /** When false (unlatched open door), capsule pushing nudges the door softly while resolving overlap */
+  rigidBlocked?: boolean;
+  onCapsulePush?: (
+    contactDistAlongSlab: number,
+    pushNormalX: number,
+    pushNormalZ: number,
+    penetration: number,
+    moveDeltaX: number,
+    moveDeltaZ: number,
+  ) => void;
+}
+
+/**
  * Axis-aligned walkable sloped ramp collider.
  * Slope rises linearly from baseY to topY along `riseAxis`.
  */
@@ -157,6 +185,7 @@ export function checkOverheadClearanceViaRaycast(
 export class BodycamPhysicsWorld {
   public readonly boxes: PhysicsBoxCollider[] = [];
   public readonly ramps: PhysicsRampCollider[] = [];
+  public readonly slabs: PhysicsDynamicSlab[] = [];
   public readonly surfaceZones: PhysicsSurfaceZone[] = [];
   public readonly interiorZones: PhysicsInteriorZone[] = [];
 
@@ -174,6 +203,14 @@ export class BodycamPhysicsWorld {
 
   public setRaycastMeshes(meshes: THREE.Object3D[]): void {
     this.raycastMeshes = meshes;
+  }
+
+  public addRaycastMesh(mesh: THREE.Object3D): void {
+    this.raycastMeshes.push(mesh);
+  }
+
+  public addDynamicSlab(slab: PhysicsDynamicSlab): void {
+    this.slabs.push(slab);
   }
 
   public addBox(box: PhysicsBoxCollider): void {
@@ -207,6 +244,7 @@ export class BodycamPhysicsWorld {
   public clear(): void {
     this.boxes.length = 0;
     this.ramps.length = 0;
+    this.slabs.length = 0;
     this.surfaceZones.length = 0;
     this.interiorZones.length = 0;
     this.raycastMeshes = [];
@@ -301,6 +339,8 @@ export class BodycamPhysicsWorld {
     height: number,
     maxStepUpM: number,
     allowStepCandidate: boolean,
+    moveDeltaX = 0,
+    moveDeltaZ = 0,
   ): {
     outX: number;
     outZ: number;
@@ -380,6 +420,57 @@ export class BodycamPhysicsWorld {
           }
         }
       }
+
+      // Dynamic oriented slabs (physical hinged doors)
+      for (let i = 0; i < this.slabs.length; i++) {
+        const s = this.slabs[i];
+        if (!s.active) continue;
+        if (pyMax <= s.minY + EPS || pyMin >= s.maxY - EPS) continue;
+
+        const relX = curX - s.originX;
+        const relZ = curZ - s.originZ;
+        const proj = THREE.MathUtils.clamp(relX * s.dirX + relZ * s.dirZ, 0, s.length);
+        const cx = s.originX + s.dirX * proj;
+        const cz = s.originZ + s.dirZ * proj;
+        const dx = curX - cx;
+        const dz = curZ - cz;
+        const distSq = dx * dx + dz * dz;
+        const combinedR = radius + s.halfThickness;
+
+        if (distSq < combinedR * combinedR - 1e-6) {
+          let nx: number;
+          let nz: number;
+          let pen: number;
+          if (distSq > 1e-8) {
+            const dist = Math.sqrt(distSq);
+            nx = dx / dist;
+            nz = dz / dist;
+            pen = combinedR - dist;
+          } else {
+            // Perpendicular to slab direction
+            nx = -s.dirZ;
+            nz = s.dirX;
+            pen = combinedR;
+          }
+
+          if (pass === 0 && s.onCapsulePush) {
+            // Push normal from capsule INTO slab is (-nx, -nz)
+            s.onCapsulePush(proj, -nx, -nz, pen, moveDeltaX, moveDeltaZ);
+          }
+
+          // When unlatched, push capsule out smoothly with slight compliance so walking nudges door naturally
+          const pushRatio = s.rigidBlocked === false ? 0.65 : 1.0;
+          curX += nx * pen * pushRatio;
+          curZ += nz * pen * pushRatio;
+          if (s.rigidBlocked !== false) {
+            hitWall = true;
+            wallNX = nx;
+            wallNZ = nz;
+          }
+          pushedThisPass = true;
+        }
+      }
+
       if (!pushedThisPass) break;
     }
 
@@ -432,7 +523,17 @@ export class BodycamPhysicsWorld {
     const targetZ = THREE.MathUtils.clamp(startZ + deltaZ, this.boundsMinZ, this.boundsMaxZ);
 
     // 1. Standard horizontal sweep at current elevation
-    const baseRes = this.resolveHorizontalBoxes(targetX, startY, targetZ, radius, height, maxStepUpM, true);
+    const baseRes = this.resolveHorizontalBoxes(
+      targetX,
+      startY,
+      targetZ,
+      radius,
+      height,
+      maxStepUpM,
+      true,
+      deltaX,
+      deltaZ,
+    );
 
     let finalX = baseRes.outX;
     let finalZ = baseRes.outZ;
@@ -624,6 +725,15 @@ export class BodycamPhysicsWorld {
     out.material = 'outdoor';
   }
 
+  private isVisibleInHierarchy(obj: THREE.Object3D): boolean {
+    let cur: THREE.Object3D | null = obj;
+    while (cur) {
+      if (!cur.visible) return false;
+      cur = cur.parent;
+    }
+    return true;
+  }
+
   public raycast(
     origin: Readonly<THREE.Vector3>,
     direction: Readonly<THREE.Vector3>,
@@ -637,14 +747,21 @@ export class BodycamPhysicsWorld {
     this._rayHits.length = 0;
     this._raycaster.intersectObjects(this.raycastMeshes, false, this._rayHits);
 
-    if (this._rayHits.length === 0) {
+    let h: THREE.Intersection | null = null;
+    for (let i = 0; i < this._rayHits.length; i++) {
+      if (this.isVisibleInHierarchy(this._rayHits[i].object)) {
+        h = this._rayHits[i];
+        break;
+      }
+    }
+
+    if (!h) {
       out.hit = false;
       out.distance = Infinity;
       out.object = null;
       return false;
     }
 
-    const h = this._rayHits[0];
     out.hit = true;
     out.distance = h.distance;
     out.pointX = h.point.x;

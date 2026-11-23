@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import { BodycamPhysicsWorld, BodycamSurfaceMaterial } from '../bodycam-sdk';
+import { DestructibleDoorSystem } from '../doors/DestructibleDoorSystem';
 import { getGraphicsQualityProfile, GraphicsQualityId } from '../data/graphicsQuality';
 import { createStencilSignTexture } from '../gym/GymTextures';
 import {
@@ -1479,6 +1480,73 @@ function buildTimberlineCompound(
 
   physics.setRaycastMeshes(raycastMeshes);
 
+  // === PHYSICAL DESTRUCTIBLE DOORS (ARMORY & UNDERGROUND BUNKER) ===
+  const doorSystem = new DestructibleDoorSystem(sceneGroup, physics, isSoftwareGl);
+  const DOOR_W = 1.18;
+  const DOOR_H = 2.26;
+  const FRAME_CLEAR = DOOR_W + 0.1;
+
+  const addBunkerDoorInfill = (
+    axis: 'x' | 'z',
+    fixedCoord: number,
+    centerAlong: number,
+    openSpan: number,
+    openHeight: number,
+    floorY: number,
+    thick: number,
+  ): void => {
+    const sideW = Math.max(0.08, (openSpan - FRAME_CLEAR) * 0.5);
+    const transH = Math.max(0.08, openHeight - (DOOR_H + 0.05));
+    if (axis === 'x') {
+      addSolidBox(centerAlong - (FRAME_CLEAR * 0.5 + sideW * 0.5), floorY + openHeight * 0.5, fixedCoord, sideW, openHeight, thick, matBunkerConcrete, 'concrete');
+      addSolidBox(centerAlong + (FRAME_CLEAR * 0.5 + sideW * 0.5), floorY + openHeight * 0.5, fixedCoord, sideW, openHeight, thick, matBunkerConcrete, 'concrete');
+      addSolidBox(centerAlong, floorY + DOOR_H + 0.05 + transH * 0.5, fixedCoord, FRAME_CLEAR, transH, thick, matSteel, 'metal');
+    } else {
+      addSolidBox(fixedCoord, floorY + openHeight * 0.5, centerAlong - (FRAME_CLEAR * 0.5 + sideW * 0.5), thick, openHeight, sideW, matBunkerConcrete, 'concrete');
+      addSolidBox(fixedCoord, floorY + openHeight * 0.5, centerAlong + (FRAME_CLEAR * 0.5 + sideW * 0.5), thick, openHeight, sideW, matBunkerConcrete, 'concrete');
+      addSolidBox(fixedCoord, floorY + DOOR_H + 0.05 + transH * 0.5, centerAlong, thick, transH, FRAME_CLEAR, matSteel, 'metal');
+    }
+  };
+
+  // Armory South Doorway (armX = 50, armZ = -40 -> z = -35.2, floor = 0.16)
+  addBunkerDoorInfill('x', armZ + 4.8, armX, 2.8, 2.6, 0.16, 0.4);
+  doorSystem.addDoor({
+    id: 'timberline_armory_south_door',
+    label: 'Armory South Door',
+    hingePos: [armX - DOOR_W * 0.5, 0.16, armZ + 4.8],
+    closedYawRad: 0,
+    swingSign: 1,
+    width: DOOR_W,
+    height: DOOR_H,
+    style: 'tactical_reinforced',
+  });
+
+  // Armory West Doorway (x = 43.2, z = -40, floor = 0.16)
+  addBunkerDoorInfill('z', armX - 6.8, armZ, 2.8, 2.6, 0.16, 0.4);
+  doorSystem.addDoor({
+    id: 'timberline_armory_west_door',
+    label: 'Armory West Door',
+    hingePos: [armX - 6.8, 0.16, armZ - DOOR_W * 0.5],
+    closedYawRad: -Math.PI * 0.5,
+    swingSign: 1,
+    width: DOOR_W,
+    height: DOOR_H,
+    style: 'tactical_reinforced',
+  });
+
+  // Underground Bunker Single Entry Door (x = 43.4, z = -6.0, swings outward west onto apron)
+  addBunkerDoorInfill('z', 43.4, -6.0, 2.4, 2.5, 0.02, 0.45);
+  doorSystem.addDoor({
+    id: 'timberline_bunker_entry_door',
+    label: 'Bunker Access Door',
+    hingePos: [43.4, 0.02, -6.0 - DOOR_W * 0.5],
+    closedYawRad: -Math.PI * 0.5,
+    swingSign: -1,
+    width: DOOR_W,
+    height: DOOR_H,
+    style: 'bunker_wood',
+  });
+
   const shatterBreakable = (
     objOrId: THREE.Object3D | string,
     impactPoint?: Readonly<THREE.Vector3>,
@@ -1555,6 +1623,7 @@ function buildTimberlineCompound(
       wettableSurfaces,
       nightLights,
     },
+    doorSystem,
     shatterBreakable,
     update: (dt, elapsedSec) => {
       // Smooth rotating radar dish + blinking aviation obstruction beacon
@@ -1595,6 +1664,7 @@ function buildTimberlineCompound(
       }
     },
     dispose: () => {
+      doorSystem.dispose();
       scene.remove(sceneGroup);
       envTex.dispose();
       ownedGeos.forEach((g) => g.dispose());

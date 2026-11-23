@@ -1293,13 +1293,33 @@ export class TacticalOperatorRigFactory {
       const kneeXL = Math.min(-0.06, baseKnee - liftL * 0.95 - trailL * 0.55 - vaultW * vaultLegLead * 1.45);
       const ankleXL = -(thighXL + kneeXL);
 
-      // Right leg (trails slightly behind lead leg over obstacle)
-      const swingR = sinR * strideAmp;
-      const liftR = Math.max(0, -cosR) * strideAmp * 0.78;
-      const trailR = Math.max(0, -sinR) * strideAmp * 0.65;
-      const thighXR = baseThigh + swingR * 0.85 + liftR * 0.35 + vaultW * vaultLegTrail * 0.88;
-      const kneeXR = Math.min(-0.06, baseKnee - liftR * 0.95 - trailR * 0.55 - vaultW * vaultLegTrail * 1.28);
-      const ankleXR = -(thighXR + kneeXR);
+      // Right leg (trails slightly behind lead leg over obstacle, OR thrusts forward during DOOR_KICK!)
+      const isDoorKick3P = pose.handlingAction === 'DOOR_KICK';
+      const kickProg = isDoorKick3P ? THREE.MathUtils.clamp(pose.handlingProgress ?? 0, 0, 1) : 0;
+      const kickChamber = isDoorKick3P ? smoothstep3P(0.0, 0.25, kickProg) : 0;
+      const kickThrust = isDoorKick3P
+        ? smoothstep3P(0.22, 0.45, kickProg) * (1 - smoothstep3P(0.55, 0.92, kickProg))
+        : 0;
+      const swingR = sinR * strideAmp * (1 - kickChamber * 0.85);
+      const liftR = Math.max(0, -cosR) * strideAmp * 0.78 * (1 - kickChamber * 0.85);
+      const trailR = Math.max(0, -sinR) * strideAmp * 0.65 * (1 - kickChamber * 0.85);
+      const thighXR =
+        baseThigh +
+        swingR * 0.85 +
+        liftR * 0.35 +
+        vaultW * vaultLegTrail * 0.88 +
+        kickChamber * 0.68 +
+        kickThrust * 0.62;
+      const kneeXR = Math.min(
+        -0.04,
+        baseKnee -
+          liftR * 0.95 -
+          trailR * 0.55 -
+          vaultW * vaultLegTrail * 1.28 -
+          kickChamber * 1.15 +
+          kickThrust * 1.25,
+      );
+      const ankleXR = -(thighXR + kneeXR) + kickThrust * 0.25;
 
       leftLegParts.hipPivot.rotation.set(thighXL, 0.05, vaultW * vaultPeak * 0.14);
       leftLegParts.kneePivot.rotation.set(kneeXL, 0, 0);
@@ -1311,11 +1331,13 @@ export class TacticalOperatorRigFactory {
 
       // Compute exact pelvis Y so the lowest planted boot sole rests flat on y = 0 (and lifts cleanly while vaulting)
       const reachL = thighLen * Math.cos(thighXL) + shinLen * Math.cos(thighXL + kneeXL);
-      const reachR = thighLen * Math.cos(thighXR) + shinLen * Math.cos(thighXR + kneeXR);
+      const reachR = isDoorKick3P
+        ? reachL
+        : thighLen * Math.cos(thighXR) + shinLen * Math.cos(thighXR + kneeXR);
       const groundedPelvisY = Math.max(reachL, reachR) + ankleHeight;
       const vaultPelvisY = THREE.MathUtils.lerp(Math.max(0.46, groundedPelvisY), restPelvisY - 0.06, vaultW * 0.65);
       pelvisGroup.position.set(0, vaultPelvisY, 0);
-      pelvisGroup.rotation.set(0, 0, 0);
+      pelvisGroup.rotation.set(-kickThrust * 0.14, 0, 0);
 
       const hAct: SyncedHandlingAction =
         pose.handlingAction && pose.handlingAction !== 'NONE'
@@ -1738,6 +1760,26 @@ export class TacticalOperatorRigFactory {
                         : magWellLocal;
             _handAuxL.copy(targetSock).applyQuaternion(weaponSocket.quaternion).add(weaponSocket.position);
             _gripL.lerp(_handAuxL, mEnv);
+          } else if (
+            hAct === 'DOOR_OPEN' ||
+            hAct === 'DOOR_PEEK' ||
+            hAct === 'DOOR_CLOSE_PUSH' ||
+            hAct === 'DOOR_CLOSE_SOFT' ||
+            hAct === 'PROP_INTERACT'
+          ) {
+            const reachEnv = smoothstep3P(0.0, 0.24, hProg) * (1 - smoothstep3P(0.72, 1.0, hProg));
+            const forwardZ =
+              hAct === 'DOOR_CLOSE_PUSH'
+                ? -0.58 - Math.sin(smoothstep3P(0.18, 0.72, hProg) * Math.PI) * 0.16
+                : -0.52;
+            const targetY =
+              hAct === 'DOOR_CLOSE_PUSH'
+                ? 0.34
+                : hAct === 'PROP_INTERACT'
+                  ? 0.24
+                  : 0.22; // Doorknob height relative to torso
+            _handAuxL.set(-0.08 * torsoW, targetY, forwardZ);
+            _gripL.lerp(_handAuxL, reachEnv);
           }
         }
 

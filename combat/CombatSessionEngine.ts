@@ -18,6 +18,7 @@ import {
   CharacterAnimator,
   CharacterSkeleton,
   createBodycamTelemetry,
+  createRaycastResult,
   DEFAULT_BODYCAM_SDK_CONFIG,
   DEFAULT_TRAUMA_MODIFIERS,
   GrenadeDetonationEvent,
@@ -77,6 +78,11 @@ import {
   MapInteractable,
 } from '../maps/types';
 import {
+  DoorInteractOption,
+  DoorInteractOptionId,
+} from '../doors/DestructibleDoorSystem';
+import { PlayerInteractAnimator } from '../doors/PlayerInteractAnimator';
+import {
   GameBarrierRepairRequestPacket,
   GameBarrierUpdatePacket,
   GameBotCommsPacket,
@@ -84,6 +90,7 @@ import {
   GameBotFirePacket,
   GameBotHitPlayerPacket,
   GameBotsSyncPacket,
+  GameDoorActionPacket,
   GameEnvSyncPacket,
   GameGlassShatterPacket,
   GameGrenadeEventKind,
@@ -169,6 +176,13 @@ export interface NearbyInteractPrompt {
   holdProgress?: number;
   planksRemaining?: number;
   maxPlanks?: number;
+}
+
+export interface CombatDoorPromptState {
+  key: 'F';
+  targetLabel: string;
+  options: DoorInteractOption[];
+  selectedIndex: number;
 }
 
 export interface ProjectedTacticalPing {
@@ -321,6 +335,10 @@ export interface CombatSessionSnapshot {
   nvgMount: NvgMountId;
   nvgActive: boolean;
   irIlluminatorOn: boolean;
+
+  // Unified [F] + Mouse Scroll Physical Door Interaction Prompt
+  doorInteractReticle: 'hidden' | 'near' | 'ready';
+  doorPrompt: CombatDoorPromptState | null;
 }
 
 type SnapshotListener = (snap: CombatSessionSnapshot) => void;
@@ -358,6 +376,18 @@ export class CombatSessionEngine {
   private readonly ballistics: BallisticsSolver;
   private readonly grenadeSystem: TacticalGrenadeSystem;
   private readonly pdaDevice: TacticalPdaDevice;
+  private readonly interactAnimator = new PlayerInteractAnimator();
+  private activeDoorId: string | null = null;
+  private activeDoorPrompt: CombatDoorPromptState | null = null;
+  private doorSelectedOptionIndex = 0;
+  private doorReticleState: 'hidden' | 'near' | 'ready' = 'hidden';
+  private lastKickHandlingTimer = 0;
+  private readonly _doorRaycaster = new THREE.Raycaster();
+  private readonly _doorCamPos = new THREE.Vector3();
+  private readonly _doorCamDir = new THREE.Vector3();
+  private readonly _doorIkPos = new THREE.Vector3();
+  private readonly _doorVelScratch = new THREE.Vector3();
+  private readonly _doorOcclHit: BodycamRaycastResult = createRaycastResult();
   private readonly weatherTime: WeatherTimeSystem | null = null;
   private envSyncAccum = 0;
   private readonly _pdaAllyBuf: PdaAllyMarker[] = [];
@@ -891,6 +921,23 @@ export class CombatSessionEngine {
     });
     this.animator.setGrenadeSystem(this.grenadeSystem);
 
+    // Wire physical destructible door acoustics & multiplayer sync if present on this map
+    if (this.map.doorSystem) {
+      this.map.doorSystem.setAudioVolume(this.config.masterVolume);
+      this.map.doorSystem.setAcousticListener((ev) => {
+        this.botAI?.notifyDoorAcousticEvent(ev.position, ev.radiusM, ev.loudness, ev.actorTeam);
+      });
+      this.map.doorSystem.setActionBroadcastListener((payload) => {
+        if (!this.mp) return;
+        const pkt: GameDoorActionPacket = {
+          type: 'game:door_action',
+          ...payload,
+          ts: Date.now(),
+        };
+        this.mp.sendMessage(pkt as unknown as Record<string, unknown>);
+      });
+    }
+
     this.syncBeltEquipmentMesh();
     this.unsubTacticalEquipment = tacticalEquipmentStore.subscribe((sel) => {
       const changedType = sel.equipmentId !== this.tacticalEquipmentId;
@@ -1325,7 +1372,14 @@ export class CombatSessionEngine {
 
     let syncedAction: SyncedHandlingAction = handlingSnap.action;
     let syncedProg = handlingSnap.progress;
-    if (grenadeStage !== 'HOLSTERED' || this.grenadeSystem.isThrowing()) {
+    if (this.lastKickHandlingTimer > 0) {
+      syncedAction = 'DOOR_KICK';
+      syncedProg = THREE.MathUtils.clamp(1 - this.lastKickHandlingTimer / 0.48, 0, 1);
+    } else if (this.interactAnimator.isActive()) {
+      const ia = this.interactAnimator.getSyncedHandlingAction();
+      syncedAction = ia.action;
+      syncedProg = ia.progress;
+    } else if (grenadeStage !== 'HOLSTERED' || this.grenadeSystem.isThrowing()) {
       if (grenadeWhipProg > 0) {
         syncedAction =
           grenadeThrowStyle === 'underhand'
@@ -1771,22 +1825,27 @@ export class CombatSessionEngine {
       return;
     }
 
-    if (type === 'game:match_sync' && this.params.mode === 'infection' && !this.isMpHost) {
+    if (type === 'game:match_sync') {
       const pkt = raw as unknown as GameMatchSyncPacket;
-      if (pkt.powerOn && !this.powerOn) {
-        this.applyMapInteractableEffect('power_switch', undefined, true);
+      if (Array.isArray(pkt.doors) && this.map.doorSystem) {
+        this.map.doorSystem.applySnapshotList(pkt.doors);
       }
-      if (Array.isArray(pkt.openedDoorIds)) {
-        for (const doorId of pkt.openedDoorIds) {
-          this.applyMapInteractableEffect(doorId, undefined, true);
+      if (this.params.mode === 'infection' && !this.isMpHost) {
+        if (pkt.powerOn && !this.powerOn) {
+          this.applyMapInteractableEffect('power_switch', undefined, true);
         }
-      }
-      if (Array.isArray(pkt.unlockedZoneIds) && this.zombieAI) {
-        for (const zoneId of pkt.unlockedZoneIds) {
-          this.zombieAI.unlockZone(zoneId);
+        if (Array.isArray(pkt.openedDoorIds)) {
+          for (const doorId of pkt.openedDoorIds) {
+            this.applyMapInteractableEffect(doorId, undefined, true);
+          }
         }
+        if (Array.isArray(pkt.unlockedZoneIds) && this.zombieAI) {
+          for (const zoneId of pkt.unlockedZoneIds) {
+            this.zombieAI.unlockZone(zoneId);
+          }
+        }
+        this.syncBotInfectionZones();
       }
-      this.syncBotInfectionZones();
       return;
     }
 
@@ -2103,6 +2162,13 @@ export class CombatSessionEngine {
       if (pkt.senderUserId === this.mp.localUserId) return;
       this._tmpImpactPoint.set(pkt.px, pkt.py, pkt.pz);
       this.handleWorldGlassShatter(pkt.breakableId, this._tmpImpactPoint, undefined, true);
+      return;
+    }
+
+    if (type === 'game:door_action' && this.map.doorSystem) {
+      const pkt = raw as unknown as GameDoorActionPacket;
+      if (pkt.senderUserId === this.mp.localUserId) return;
+      this.map.doorSystem.applyRemoteAction(pkt);
     }
   }
 
@@ -2930,11 +2996,22 @@ export class CombatSessionEngine {
       return;
     }
 
-    // Static environment breakable glass + surface audio (already shattered in BallisticsSolver when hit)
+    // Static environment breakable glass + destructible doors + surface audio
     if (ev.material === 'glass' || ud?.breakableGlass || ud?.breakableId) {
       if (obj && !ud?.shattered) {
         this.handleWorldGlassShatter(obj, ev.point, ev.incomingDir);
       }
+      return;
+    }
+    if (ud?.destructibleDoorId && this.map.doorSystem) {
+      this.map.doorSystem.applyBulletImpact(
+        String(ud.destructibleDoorId),
+        ev.point,
+        ev.incomingDir,
+        34,
+        this.localBattleTeam,
+      );
+      this.audio.playImpact(ev.point, 'wood');
       return;
     }
     if (ev.material === 'steel') this.audio.playImpact(ev.point, 'metal');
@@ -2985,6 +3062,27 @@ export class CombatSessionEngine {
     const isKick = ev.attackType === 'kick';
     const meleeDmg = isKick ? 42 : ev.attackType === 'bash' ? 68 : 52;
     const kbSpeed = isKick ? 7.8 : 4.6;
+
+    // Physical Destructible Doors: melee bash -> progressive 0->1->2->3; kick -> velocity-based breach/destroy
+    if (ud?.destructibleDoorId && this.map.doorSystem) {
+      const doorId = String(ud.destructibleDoorId);
+      if (isKick) {
+        this.controller.getVelocity(this._doorVelScratch);
+        const horizSpeed = Math.hypot(this._doorVelScratch.x, this._doorVelScratch.z);
+        this.map.doorSystem.executeKick(
+          doorId,
+          ev.direction,
+          horizSpeed,
+          this.controller.isSprinting,
+          this.localBattleTeam,
+        );
+        this.lastKickHandlingTimer = 0.48;
+      } else {
+        this.map.doorSystem.applyMeleeBash(doorId, ev.point, ev.direction, this.localBattleTeam);
+      }
+      this.emitSnapshot();
+      return;
+    }
 
     if (ud?.combatActorType === 'remote_player' && this.mp && this.remotePlayers) {
       const targetUserId = String(ud.actorId);
@@ -4257,6 +4355,19 @@ export class CombatSessionEngine {
       this.pdaDevice.applyWheel(e.deltaY);
       return;
     }
+    if (this.pointerLocked && this.activeDoorPrompt && this.activeDoorPrompt.options.length > 1) {
+      e.preventDefault();
+      const dir = e.deltaY > 0 ? 1 : -1;
+      const len = this.activeDoorPrompt.options.length;
+      this.doorSelectedOptionIndex = (this.doorSelectedOptionIndex + dir + len) % len;
+      this.activeDoorPrompt = {
+        ...this.activeDoorPrompt,
+        selectedIndex: this.doorSelectedOptionIndex,
+      };
+      this.audio.playWeaponCue('mode_toggle', { intensity: 0.2 });
+      this.emitSnapshot();
+      return;
+    }
     if (this.pointerLocked && !this.controller.isSprinting && this.weaponRig.hasVariableZoom()) {
       e.preventDefault();
       this.weaponRig.cycleOpticZoom(e.deltaY < 0 ? 1 : -1, true);
@@ -4338,7 +4449,9 @@ export class CombatSessionEngine {
       case 'KeyF':
         this.interactKeyHeld = true;
         if (!e.repeat) {
-          if (this.params.mode === 'infection' && this.nearbyInteractable) {
+          if (this.activeDoorId && this.activeDoorPrompt) {
+            this.executeSelectedDoorOption();
+          } else if (this.params.mode === 'infection' && this.nearbyInteractable) {
             // Window barriers use continuous Hold [F] repair; all other interactables trigger on press
             if (this.nearbyInteractable.kind !== 'window_barrier') {
               this.triggerInteract();
@@ -4411,6 +4524,7 @@ export class CombatSessionEngine {
         if (!e.repeat && !this.weaponRig.isSuppressorActionActive()) {
           if (this.animator.triggerPushKick(this.controller, this.getActiveTraumaModifiers()) === 'ok') {
             this.reloadTimer = 0;
+            this.lastKickHandlingTimer = 0.48;
           }
         }
         break;
@@ -5141,6 +5255,15 @@ export class CombatSessionEngine {
       );
 
       this.updatePdaTelemetry(dt);
+      if (this.lastKickHandlingTimer > 0) {
+        this.lastKickHandlingTimer = Math.max(0, this.lastKickHandlingTimer - dt);
+      }
+      if (this.interactAnimator.isActive()) {
+        const active = this.interactAnimator.update(dt, this.camera);
+        this.animator.setExternalHandOverride(active ? this.interactAnimator.ikOverride : null);
+      } else {
+        this.animator.setExternalHandOverride(null);
+      }
       this.animator.update(dt, this.elapsedSec, this.controller, this.adapter, prof, this.input.ads);
       this.animator.applyCameraAdditiveOverlay(this.camera);
     } else {
@@ -5195,8 +5318,13 @@ export class CombatSessionEngine {
       const firingChanged = this.isLocallyActivelyFiring() !== this.lastSentFiring;
       const reloadChanged =
         (this.reloadTimer > 0 || this.weaponRig.isTubularReloading()) !== this.lastSentReloading;
-      const handlingActionChanged =
-        this.weaponRig.getSyncedHandlingSnapshot().action !== this.lastSentHandlingAction;
+      const localHandlingNow: SyncedHandlingAction =
+        this.lastKickHandlingTimer > 0
+          ? 'DOOR_KICK'
+          : this.interactAnimator.isActive()
+            ? this.interactAnimator.getSyncedHandlingAction().action
+            : this.weaponRig.getSyncedHandlingSnapshot().action;
+      const handlingActionChanged = localHandlingNow !== this.lastSentHandlingAction;
       const grenadeStageChanged =
         this.grenadeSystem.getHoldStage() !== this.lastSentGrenadeStage ||
         this.grenadeSystem.isThrowInputHeld() !== this.lastSentGrenadeThrowHeld;
@@ -5239,8 +5367,12 @@ export class CombatSessionEngine {
       this.remotePlayers.update(dt, this.camera.position);
     }
 
-    // Step map animated fixtures & dynamic 5x weather/day-night system (+ 1 Hz MP Host broadcast)
+    // Step map animated fixtures, physical destructible doors & dynamic 5x weather/day-night system
     this.map.update?.(dt, this.elapsedSec);
+    if (this.map.doorSystem) {
+      this.map.doorSystem.update(dt, this.camera.position);
+      this.updateDoorInteractScan();
+    }
     if (this.weatherTime) {
       this.weatherTime.update(dt, this.camera.position, this.isMpHost || !this.mp);
       if (this.mp && this.isMpHost) {
@@ -5864,7 +5996,183 @@ export class CombatSessionEngine {
         this.nvgFlipped &&
         this.localGear.nvgMount !== 'none' &&
         this.irIlluminatorOn,
+      doorInteractReticle: this.doorReticleState,
+      doorPrompt: this.activeDoorPrompt
+        ? {
+            ...this.activeDoorPrompt,
+            options: this.activeDoorPrompt.options.map((o) => ({ ...o })),
+          }
+        : null,
     };
+  }
+
+  private updateDoorInteractScan(): void {
+    const prevRet = this.doorReticleState;
+    const prevSig = this.activeDoorPrompt
+      ? `${this.activeDoorPrompt.targetLabel}|${this.activeDoorPrompt.selectedIndex}|${this.activeDoorPrompt.options.map((o) => `${o.id}:${o.hint ?? ''}`).join(',')}`
+      : '';
+
+    if (
+      !this.map.doorSystem ||
+      !this.pointerLocked ||
+      !this.playerAlive ||
+      this.pdaDevice.isOpen()
+    ) {
+      this.activeDoorId = null;
+      this.activeDoorPrompt = null;
+      this.doorReticleState = 'hidden';
+      if (prevRet !== 'hidden' || prevSig !== '') this.emitSnapshot();
+      return;
+    }
+
+    const DOOR_MAX_M = 2.65;
+    const DOOR_NEAR_M = DOOR_MAX_M + 2.2;
+    this.camera.getWorldPosition(this._doorCamPos);
+    this.camera.getWorldDirection(this._doorCamDir).normalize();
+    this._doorRaycaster.set(this._doorCamPos, this._doorCamDir);
+    this._doorRaycaster.near = 0.08;
+    this._doorRaycaster.far = DOOR_NEAR_M;
+
+    const proxies = this.map.doorSystem.getInteractableMeshes();
+    const hits = this._doorRaycaster.intersectObjects(proxies, false);
+    this.controller.getVelocity(this._doorVelScratch);
+    const horizSpeed = Math.hypot(this._doorVelScratch.x, this._doorVelScratch.z);
+
+    let matchedId: string | null = null;
+    let nearDetected = false;
+
+    for (let i = 0; i < hits.length; i++) {
+      const h = hits[i];
+      if (!h.object.visible) continue;
+      const doorId = h.object.userData.destructibleDoorId as string | undefined;
+      if (!doorId) continue;
+      const opts = this.map.doorSystem.getInteractOptions(
+        doorId,
+        this.controller.isSprinting,
+        horizSpeed,
+        this._doorCamPos,
+      );
+      if (opts.length === 0) continue;
+
+      if (h.distance > 0.5) {
+        const blocked = this.adapter.raycast(
+          this._doorCamPos,
+          this._doorCamDir,
+          0.08,
+          h.distance - 0.35,
+          this._doorOcclHit,
+        );
+        if (blocked && this._doorOcclHit.object?.userData?.destructibleDoorId !== doorId) {
+          continue;
+        }
+      }
+
+      if (h.distance <= DOOR_MAX_M) {
+        matchedId = doorId;
+      } else {
+        nearDetected = true;
+      }
+      break;
+    }
+
+    if (!matchedId) {
+      this.activeDoorId = null;
+      this.activeDoorPrompt = null;
+      this.doorSelectedOptionIndex = 0;
+      this.doorReticleState = nearDetected ? 'near' : 'hidden';
+    } else {
+      if (matchedId !== this.activeDoorId) {
+        this.activeDoorId = matchedId;
+        this.doorSelectedOptionIndex = 0;
+      }
+      const door = this.map.doorSystem.getDoor(matchedId);
+      const opts = this.map.doorSystem.getInteractOptions(
+        matchedId,
+        this.controller.isSprinting,
+        horizSpeed,
+        this._doorCamPos,
+      );
+      this.doorSelectedOptionIndex = THREE.MathUtils.clamp(
+        this.doorSelectedOptionIndex,
+        0,
+        Math.max(0, opts.length - 1),
+      );
+      this.doorReticleState = 'ready';
+      this.activeDoorPrompt = {
+        key: 'F',
+        targetLabel: door?.label ?? 'Door',
+        options: opts,
+        selectedIndex: this.doorSelectedOptionIndex,
+      };
+    }
+
+    const nextSig = this.activeDoorPrompt
+      ? `${this.activeDoorPrompt.targetLabel}|${this.activeDoorPrompt.selectedIndex}|${this.activeDoorPrompt.options.map((o) => `${o.id}:${o.hint ?? ''}`).join(',')}`
+      : '';
+    if (this.doorReticleState !== prevRet || nextSig !== prevSig) {
+      this.emitSnapshot();
+    }
+  }
+
+  private executeSelectedDoorOption(): void {
+    if (!this.map.doorSystem || !this.activeDoorId || !this.activeDoorPrompt) return;
+    const opts = this.activeDoorPrompt.options;
+    if (opts.length === 0) return;
+    const idx = THREE.MathUtils.clamp(this.doorSelectedOptionIndex, 0, opts.length - 1);
+    const optId = opts[idx].id as DoorInteractOptionId;
+    const doorId = this.activeDoorId;
+
+    this.camera.getWorldPosition(this._doorCamPos);
+    this.camera.getWorldDirection(this._doorCamDir).normalize();
+    this.controller.getVelocity(this._doorVelScratch);
+    const horizSpeed = Math.hypot(this._doorVelScratch.x, this._doorVelScratch.z);
+
+    if (optId === 'kick') {
+      this.animator.interruptInspect();
+      this.input.ads = false;
+      this.animator.triggerPushKick(this.controller, this.getActiveTraumaModifiers());
+      this.reloadTimer = 0;
+      this.lastKickHandlingTimer = 0.48;
+      this.map.doorSystem.executeKick(
+        doorId,
+        this._doorCamDir,
+        horizSpeed,
+        this.controller.isSprinting,
+        this.localBattleTeam,
+      );
+      this.emitSnapshot();
+      return;
+    }
+
+    const ok = this.map.doorSystem.executeOption(doorId, optId, {
+      actorPos: this._doorCamPos,
+      actorForward: this._doorCamDir,
+      horizontalSpeedMps: horizSpeed,
+      isSprinting: this.controller.isSprinting,
+      actorTeam: this.localBattleTeam,
+    });
+    if (!ok) return;
+
+    if (optId === 'open' || optId === 'peek' || optId === 'close_soft') {
+      if (this.map.doorSystem.getDoorknobWorldPos(doorId, this._doorCamPos, this._doorIkPos)) {
+        const animKind =
+          optId === 'open'
+            ? 'DOOR_OPEN'
+            : optId === 'peek'
+              ? 'DOOR_PEEK'
+              : 'DOOR_CLOSE_SOFT';
+        this.interactAnimator.trigger(animKind, this._doorIkPos, (out) =>
+          Boolean(this.map.doorSystem?.getDoorknobWorldPos(doorId, this._doorCamPos, out)),
+        );
+      }
+    } else if (optId === 'close') {
+      if (this.map.doorSystem.getPushFaceWorldPos(doorId, this._doorCamPos, this._doorIkPos)) {
+        this.interactAnimator.trigger('DOOR_CLOSE_PUSH', this._doorIkPos, (out) =>
+          Boolean(this.map.doorSystem?.getPushFaceWorldPos(doorId, this._doorCamPos, out)),
+        );
+      }
+    }
+    this.emitSnapshot();
   }
 
   private updatePdaTelemetry(dt: number): void {

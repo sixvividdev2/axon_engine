@@ -32,6 +32,8 @@ import {
 } from '../data/attachments';
 import { graphicsQualityStore } from '../data/graphicsQuality';
 import { loadoutStore } from '../data/loadoutStore';
+import { DoorInteractOptionId } from '../doors/DestructibleDoorSystem';
+import { PlayerInteractAnimator } from '../doors/PlayerInteractAnimator';
 import { GunWallSwapChoreography } from './GunWallSwapChoreography';
 import {
   buildHideoutBunkerWorld,
@@ -44,13 +46,22 @@ import { hideoutStateStore } from './HideoutStateStore';
 
 export type InteractReticleState = 'hidden' | 'near' | 'ready';
 
-export interface HideoutPromptState {
-  key: string;
+export interface HideoutPromptOption {
+  id: string;
   label: string;
-  secondaryKey?: string;
-  secondaryLabel?: string;
-  kind: HideoutInteractableMeta['kind'];
+  hint?: string;
 }
+
+export interface HideoutPromptState {
+  key: 'F';
+  targetLabel?: string;
+  options: HideoutPromptOption[];
+  selectedIndex: number;
+}
+
+type ActiveInteractTarget =
+  | { source: 'prop'; meta: HideoutInteractableMeta; keyId: string }
+  | { source: 'door'; doorId: string; keyId: string };
 
 export interface HideoutSnapshot {
   pointerLocked: boolean;
@@ -102,6 +113,7 @@ export class HideoutSessionController {
   private readonly postProcess: BodycamPostProcess;
   private readonly scopeRenderer: ScopeRenderer;
   private readonly swapChoreography: GunWallSwapChoreography;
+  private readonly interactAnimator = new PlayerInteractAnimator();
   private readonly unsubOperatorGear: () => void;
   private readonly unsubLoadout: () => void;
 
@@ -135,8 +147,10 @@ export class HideoutSessionController {
   private shiftHeld = false;
   private currentRoomId: HideoutRoomId = 'arsenal';
   private currentRoomLabel = 'Arsenal Room';
-  private activeInteractable: HideoutInteractableMeta | null = null;
+  private activeTarget: ActiveInteractTarget | null = null;
   private activePrompt: HideoutPromptState | null = null;
+  private selectedOptionIndex = 0;
+  private lastTargetKeyId = '';
   private interactReticleState: InteractReticleState = 'hidden';
   private toastMessage: string | null = null;
   private toastTimeout: number | null = null;
@@ -163,6 +177,9 @@ export class HideoutSessionController {
   private readonly _slotQuat = new THREE.Quaternion();
   private readonly _startWeaponPos = new THREE.Vector3();
   private readonly _startWeaponQuat = new THREE.Quaternion();
+  private readonly _ikTargetPos = new THREE.Vector3();
+  private readonly _velScratch = new THREE.Vector3();
+  private readonly _scanObjects: THREE.Object3D[] = [];
   private readonly _runtimeProfile: BodycamWeaponProfile;
   private readonly _scopePassParams: ScopePassParams;
 
@@ -204,9 +221,27 @@ export class HideoutSessionController {
     this.camera = new THREE.PerspectiveCamera(72, width / height, 0.05, 140);
     this.scene.add(this.camera);
 
-    // Build 4-room Cold-War bunker shell & Arsenal Room props
+    // Build 4-room Cold-War bunker shell & Arsenal Room props + destructible doors
     this.world = buildHideoutBunkerWorld(this.scene, this.renderer, this.isSoftwareGl);
-    this.adapter = this.world.physics.createAdapter({});
+    this.world.doorSystem.setAudioVolume(this.config.masterVolume);
+    this.adapter = this.world.physics.createAdapter({
+      onMeleeHit: (ev) => {
+        const doorId = ev.object?.userData?.destructibleDoorId as string | undefined;
+        if (!doorId) return;
+        if (ev.attackType === 'kick') {
+          this.controller.getVelocity(this._velScratch);
+          const horizSpeed = Math.hypot(this._velScratch.x, this._velScratch.z);
+          this.world.doorSystem.executeKick(
+            doorId,
+            ev.direction,
+            horizSpeed,
+            this.controller.isSprinting,
+          );
+        } else {
+          this.world.doorSystem.applyMeleeBash(doorId, ev.point, ev.direction);
+        }
+      },
+    });
 
     // Audio, WeaponRig, 1P Operator Skeleton, Animator, BodycamController
     this.audio = new BodycamAudio();
@@ -397,6 +432,7 @@ export class HideoutSessionController {
       this.config.masterVolume,
       this.config.gearRattleGain,
     );
+    this.world.doorSystem.setAudioVolume(clamped);
     this.emitSnapshot(true);
   }
 
@@ -517,30 +553,111 @@ export class HideoutSessionController {
     }
   }
 
-  private handlePrimaryInteract(): void {
-    const target = this.activeInteractable;
-    if (!target) return;
+  private executeSelectedInteract(): void {
+    const target = this.activeTarget;
+    const prompt = this.activePrompt;
+    if (!target || !prompt || prompt.options.length === 0) return;
 
-    switch (target.kind) {
+    const safeIdx = THREE.MathUtils.clamp(this.selectedOptionIndex, 0, prompt.options.length - 1);
+    const chosen = prompt.options[safeIdx];
+    if (!chosen) return;
+
+    this.camera.getWorldPosition(this._camPos);
+    this.camera.getWorldDirection(this._lookDir).normalize();
+
+    if (target.source === 'door') {
+      const optId = chosen.id as DoorInteractOptionId;
+      this.controller.getVelocity(this._velScratch);
+      const horizSpeed = Math.hypot(this._velScratch.x, this._velScratch.z);
+      if (optId === 'kick') {
+        this.animator.interruptInspect();
+        this.input.ads = false;
+        this.animator.triggerPushKick(this.controller, DEFAULT_TRAUMA_MODIFIERS);
+        this.world.doorSystem.executeKick(
+          target.doorId,
+          this._lookDir,
+          horizSpeed,
+          this.controller.isSprinting,
+        );
+        this.emitSnapshot(true);
+        return;
+      }
+
+      const ok = this.world.doorSystem.executeOption(target.doorId, optId, {
+        actorPos: this._camPos,
+        actorForward: this._lookDir,
+        horizontalSpeedMps: horizSpeed,
+        isSprinting: this.controller.isSprinting,
+      });
+      if (!ok) return;
+
+      // Trigger corresponding 1P left-hand IK animation (doorknob turn or crisp open-palm push)
+      if (optId === 'open' || optId === 'peek' || optId === 'close_soft') {
+        if (this.world.doorSystem.getDoorknobWorldPos(target.doorId, this._camPos, this._ikTargetPos)) {
+          const animKind =
+            optId === 'open'
+              ? 'DOOR_OPEN'
+              : optId === 'peek'
+                ? 'DOOR_PEEK'
+                : 'DOOR_CLOSE_SOFT';
+          this.interactAnimator.trigger(animKind, this._ikTargetPos, (out) =>
+            this.world.doorSystem.getDoorknobWorldPos(target.doorId, this._camPos, out),
+          );
+        }
+      } else if (optId === 'close') {
+        if (this.world.doorSystem.getPushFaceWorldPos(target.doorId, this._camPos, this._ikTargetPos)) {
+          this.interactAnimator.trigger('DOOR_CLOSE_PUSH', this._ikTargetPos, (out) =>
+            this.world.doorSystem.getPushFaceWorldPos(target.doorId, this._camPos, out),
+          );
+        }
+      } else if (optId === 'repair') {
+        if (this.world.doorSystem.getDoorCenterWorldPos(target.doorId, this._ikTargetPos)) {
+          this.interactAnimator.trigger('PROP_INTERACT', this._ikTargetPos);
+        }
+        this.showToast('Door Repaired');
+      }
+      this.emitSnapshot(true);
+      return;
+    }
+
+    const meta = target.meta;
+    switch (meta.kind) {
       case 'gun_wall_slot': {
-        if (typeof target.slotIndex === 'number') {
-          this.triggerGunWallInteraction(target.slotIndex);
+        if (typeof meta.slotIndex === 'number') {
+          this.triggerGunWallInteraction(meta.slotIndex);
         }
         break;
       }
       case 'prep_table_gunsmith': {
+        if (this.world.getPropInteractPos('prep_table_gunsmith', this._ikTargetPos)) {
+          this.interactAnimator.trigger('PROP_INTERACT', this._ikTargetPos);
+        }
         this.audio.playGearRattle('weapon_swap', 0.45);
         this.setModalActive(true);
         this.callbacks.onOpenGunsmith();
         break;
       }
       case 'locker_door': {
-        const opened = this.world.toggleLockerDoor();
-        this.audio.playWeaponCue(opened ? 'bolt_pull' : 'bolt_lock', { intensity: 0.72 });
-        this.showToast('Personal Stash — Coming Soon');
+        if (chosen.id === 'operator_gear') {
+          this.audio.playGearRattle('weapon_swap', 0.45);
+          this.setModalActive(true);
+          this.callbacks.onOpenOperatorGear();
+        } else {
+          if (this.world.getPropInteractPos('locker_door', this._ikTargetPos)) {
+            this.interactAnimator.trigger('PROP_INTERACT', this._ikTargetPos, (out) =>
+              this.world.getPropInteractPos('locker_door', out),
+            );
+          }
+          const opened = this.world.toggleLockerDoor();
+          this.audio.playWeaponCue(opened ? 'bolt_pull' : 'bolt_lock', { intensity: 0.72 });
+          this.showToast('Personal Stash — Coming Soon');
+        }
         break;
       }
       case 'ammo_crate': {
+        if (this.world.getPropInteractPos('ammo_crate', this._ikTargetPos)) {
+          this.interactAnimator.trigger('PROP_INTERACT', this._ikTargetPos);
+        }
         this.world.triggerAmmoCratePop();
         hideoutStateStore.resupplyAllAmmo();
         if (this.equippedWeaponId !== 'unarmed') {
@@ -552,14 +669,6 @@ export class HideoutSessionController {
         this.emitSnapshot(true);
         break;
       }
-    }
-  }
-
-  private handleSecondaryInteract(): void {
-    if (this.activeInteractable?.kind === 'locker_door') {
-      this.audio.playGearRattle('weapon_swap', 0.45);
-      this.setModalActive(true);
-      this.callbacks.onOpenOperatorGear();
     }
   }
 
@@ -587,33 +696,80 @@ export class HideoutSessionController {
 
   private updateInteractableScan(): void {
     if (this.swapChoreography.isActive() || this.pauseOpen || this.modalActive) {
-      this.activeInteractable = null;
+      this.activeTarget = null;
       this.activePrompt = null;
       this.interactReticleState = 'hidden';
       return;
     }
 
     const NEAR_AWARENESS_EXTRA_M = 2.2;
+    const DOOR_INTERACT_MAX_M = 2.65;
     this.camera.getWorldPosition(this._camPos);
     this.camera.getWorldDirection(this._lookDir).normalize();
     this._raycaster.set(this._camPos, this._lookDir);
     this._raycaster.near = 0.08;
     this._raycaster.far = 5.4;
 
-    const hits = this._raycaster.intersectObjects(this.world.interactableMeshes, false);
-    let matched: HideoutInteractableMeta | null = null;
+    // Combine Hideout prop proxies + DestructibleDoorSystem proxies with zero allocation
+    this._scanObjects.length = 0;
+    for (let i = 0; i < this.world.interactableMeshes.length; i++) {
+      this._scanObjects.push(this.world.interactableMeshes[i]);
+    }
+    const doorProxies = this.world.doorSystem.getInteractableMeshes();
+    for (let i = 0; i < doorProxies.length; i++) {
+      this._scanObjects.push(doorProxies[i]);
+    }
+
+    const hits = this._raycaster.intersectObjects(this._scanObjects, false);
+    let matched: ActiveInteractTarget | null = null;
     let nearDetected = false;
 
     for (let i = 0; i < hits.length; i++) {
       const h = hits[i];
       if (!h.object.visible) continue;
+
+      const doorId = h.object.userData.destructibleDoorId as string | undefined;
+      if (doorId) {
+        this.controller.getVelocity(this._velScratch);
+        const horizSpeed = Math.hypot(this._velScratch.x, this._velScratch.z);
+        const doorOpts = this.world.doorSystem.getInteractOptions(
+          doorId,
+          this.controller.isSprinting,
+          horizSpeed,
+          this._camPos,
+        );
+        if (doorOpts.length === 0) continue;
+
+        const maxNear = DOOR_INTERACT_MAX_M + NEAR_AWARENESS_EXTRA_M;
+        if (h.distance > maxNear) continue;
+
+        if (h.distance > 0.5) {
+          const blocked = this.adapter.raycast(
+            this._camPos,
+            this._lookDir,
+            0.08,
+            h.distance - 0.35,
+            this._occlRayHit,
+          );
+          if (blocked && this._occlRayHit.object?.userData?.destructibleDoorId !== doorId) {
+            continue;
+          }
+        }
+
+        if (h.distance <= DOOR_INTERACT_MAX_M) {
+          matched = { source: 'door', doorId, keyId: `door:${doorId}` };
+        } else {
+          nearDetected = true;
+        }
+        break;
+      }
+
       const meta = h.object.userData.hideoutInteractable as HideoutInteractableMeta | undefined;
       if (!meta || !this.isInteractableActionable(meta)) continue;
 
       const maxNearDist = meta.maxDistanceM + NEAR_AWARENESS_EXTRA_M;
       if (h.distance > maxNearDist) continue;
 
-      // Prevent showing interact dot through solid bunker walls
       if (h.distance > 0.5) {
         const blocked = this.adapter.raycast(
           this._camPos,
@@ -626,73 +782,119 @@ export class HideoutSessionController {
       }
 
       if (h.distance <= meta.maxDistanceM) {
-        matched = meta;
+        matched = {
+          source: 'prop',
+          meta,
+          keyId: `prop:${meta.kind}:${meta.slotIndex ?? ''}`,
+        };
       } else {
         nearDetected = true;
       }
       break;
     }
 
-    this.activeInteractable = matched;
+    this.activeTarget = matched;
     if (!matched) {
       this.activePrompt = null;
+      this.lastTargetKeyId = '';
+      this.selectedOptionIndex = 0;
       this.interactReticleState = nearDetected ? 'near' : 'hidden';
       return;
     }
 
+    if (matched.keyId !== this.lastTargetKeyId) {
+      this.lastTargetKeyId = matched.keyId;
+      this.selectedOptionIndex = 0;
+    }
+
     this.interactReticleState = 'ready';
 
-    if (matched.kind === 'gun_wall_slot' && typeof matched.slotIndex === 'number') {
-      const slot = this.world.gunWallSlots[matched.slotIndex];
+    if (matched.source === 'door') {
+      this.controller.getVelocity(this._velScratch);
+      const horizSpeed = Math.hypot(this._velScratch.x, this._velScratch.z);
+      const door = this.world.doorSystem.getDoor(matched.doorId);
+      const opts = this.world.doorSystem.getInteractOptions(
+        matched.doorId,
+        this.controller.isSprinting,
+        horizSpeed,
+        this._camPos,
+      );
+      if (opts.length === 0) {
+        this.activeTarget = null;
+        this.activePrompt = null;
+        this.interactReticleState = 'hidden';
+        return;
+      }
+      this.selectedOptionIndex = THREE.MathUtils.clamp(this.selectedOptionIndex, 0, opts.length - 1);
+      this.activePrompt = {
+        key: 'F',
+        targetLabel: door?.label ?? 'Door',
+        options: opts,
+        selectedIndex: this.selectedOptionIndex,
+      };
+      return;
+    }
+
+    const meta = matched.meta;
+    if (meta.kind === 'gun_wall_slot' && typeof meta.slotIndex === 'number') {
+      const slot = this.world.gunWallSlots[meta.slotIndex];
       const slotWeaponId = slot?.weaponId ?? null;
       if (slotWeaponId) {
         const targetProf = resolveWeaponProfile(slotWeaponId);
         const verb = this.equippedWeaponId === 'unarmed' ? 'Equip' : 'Swap with';
+        this.selectedOptionIndex = 0;
         this.activePrompt = {
-          key: 'E',
-          label: `${verb} ${targetProf.name}`,
-          kind: matched.kind,
+          key: 'F',
+          options: [{ id: 'gun_wall', label: `${verb} ${targetProf.name}` }],
+          selectedIndex: 0,
         };
       } else if (this.equippedWeaponId !== 'unarmed') {
         const heldProf = resolveWeaponProfile(this.equippedWeaponId);
+        this.selectedOptionIndex = 0;
         this.activePrompt = {
-          key: 'E',
-          label: `Hang ${heldProf.name} on Rack`,
-          kind: matched.kind,
+          key: 'F',
+          options: [{ id: 'gun_wall', label: `Hang ${heldProf.name} on Rack` }],
+          selectedIndex: 0,
         };
       } else {
-        this.activeInteractable = null;
+        this.activeTarget = null;
         this.activePrompt = null;
         this.interactReticleState = 'hidden';
       }
       return;
     }
 
-    if (matched.kind === 'prep_table_gunsmith') {
+    if (meta.kind === 'prep_table_gunsmith') {
+      this.selectedOptionIndex = 0;
       this.activePrompt = {
-        key: 'E',
-        label: 'Gunsmith Workbench',
-        kind: matched.kind,
+        key: 'F',
+        options: [{ id: 'gunsmith', label: 'Gunsmith Workbench' }],
+        selectedIndex: 0,
       };
       return;
     }
 
-    if (matched.kind === 'locker_door') {
+    if (meta.kind === 'locker_door') {
+      const opts: HideoutPromptOption[] = [
+        { id: 'toggle_locker', label: this.world.lockerOpen ? 'Close Locker' : 'Open Locker' },
+        { id: 'operator_gear', label: 'Operator Gear' },
+      ];
+      this.selectedOptionIndex = THREE.MathUtils.clamp(this.selectedOptionIndex, 0, opts.length - 1);
       this.activePrompt = {
-        key: 'E',
-        label: this.world.lockerOpen ? 'Close Locker' : 'Open Locker',
-        secondaryKey: 'F',
-        secondaryLabel: 'Operator Gear',
-        kind: matched.kind,
+        key: 'F',
+        targetLabel: 'Tactical Locker',
+        options: opts,
+        selectedIndex: this.selectedOptionIndex,
       };
       return;
     }
 
-    if (matched.kind === 'ammo_crate') {
+    if (meta.kind === 'ammo_crate') {
+      this.selectedOptionIndex = 0;
       this.activePrompt = {
-        key: 'E',
-        label: 'Resupply Ammunition',
-        kind: matched.kind,
+        key: 'F',
+        options: [{ id: 'ammo_crate', label: 'Resupply Ammunition' }],
+        selectedIndex: 0,
       };
     }
   }
@@ -762,6 +964,22 @@ export class HideoutSessionController {
     if (this.pointerLocked) e.preventDefault();
   };
 
+  private readonly onWheel = (e: WheelEvent): void => {
+    if (!this.pointerLocked || this.pauseOpen || this.modalActive) return;
+    if (this.activePrompt && this.activePrompt.options.length > 1) {
+      e.preventDefault();
+      const dir = e.deltaY > 0 ? 1 : -1;
+      const len = this.activePrompt.options.length;
+      this.selectedOptionIndex = (this.selectedOptionIndex + dir + len) % len;
+      this.activePrompt = {
+        ...this.activePrompt,
+        selectedIndex: this.selectedOptionIndex,
+      };
+      this.audio.playWeaponCue('mode_toggle', { intensity: 0.2 });
+      this.emitSnapshot(true);
+    }
+  };
+
   private readonly onKeyDown = (e: KeyboardEvent): void => {
     if (this.modalActive) return;
 
@@ -802,15 +1020,31 @@ export class HideoutSessionController {
         this.input.leanLeft = true;
         break;
       case 'KeyE':
-        if (!e.repeat && this.activeInteractable) {
-          this.handlePrimaryInteract();
-        } else if (!this.activeInteractable) {
-          this.input.leanRight = true;
-        }
+        // Pure lean right — zero interference with [F] interactions!
+        this.input.leanRight = true;
         break;
       case 'KeyF':
-        if (!e.repeat && this.activeInteractable?.kind === 'locker_door') {
-          this.handleSecondaryInteract();
+        if (!e.repeat && this.activeTarget) {
+          this.executeSelectedInteract();
+        }
+        break;
+      case 'KeyV':
+        if (!e.repeat && !this.swapChoreography.isActive()) {
+          this.animator.interruptInspect();
+          this.input.ads = false;
+          if (this.equippedWeaponId === 'unarmed') {
+            this.animator.triggerUnarmedPunch(this.controller, false);
+          } else {
+            const prof = resolveWeaponProfile(this.equippedWeaponId);
+            this.animator.triggerArmedBash(this.controller, prof.holdClass);
+          }
+        }
+        break;
+      case 'KeyX':
+        if (!e.repeat && !this.swapChoreography.isActive()) {
+          this.animator.interruptInspect();
+          this.input.ads = false;
+          this.animator.triggerPushKick(this.controller, DEFAULT_TRAUMA_MODIFIERS);
         }
         break;
       case 'KeyI':
@@ -909,6 +1143,7 @@ export class HideoutSessionController {
     window.addEventListener('mousemove', this.onMouseMove);
     window.addEventListener('mousedown', this.onMouseDown);
     window.addEventListener('mouseup', this.onMouseUp);
+    window.addEventListener('wheel', this.onWheel, { passive: false });
     window.addEventListener('contextmenu', this.onContextMenu);
     window.addEventListener('keydown', this.onKeyDown);
     window.addEventListener('keyup', this.onKeyUp);
@@ -989,15 +1224,25 @@ export class HideoutSessionController {
         100,
       );
 
-      // Update interactive Arsenal props (locker hinge damping, ammo crate pop)
+      // Update interactive Arsenal props & physical destructible bunker doors
       this.world.updateProps(dt);
+      this.camera.getWorldPosition(this._camPos);
+      this.world.doorSystem.update(dt, this._camPos);
 
-      // Update Gun Wall two-handed swap choreography BEFORE CharacterAnimator solves arm IK
+      // Update Gun Wall two-handed swap choreography or 1P left-hand interact IK BEFORE CharacterAnimator
       if (swapping) {
+        this.interactAnimator.cancel();
         this.swapChoreography.update(dt, this.camera);
         this.animator.setExternalHandOverride(
           this.swapChoreography.isActive() ? this.swapChoreography.ikOverride : null,
         );
+      } else if (this.interactAnimator.isActive()) {
+        const stillActive = this.interactAnimator.update(dt, this.camera);
+        this.animator.setExternalHandOverride(
+          stillActive ? this.interactAnimator.ikOverride : null,
+        );
+      } else {
+        this.animator.setExternalHandOverride(null);
       }
 
       // Update full-body procedural skeleton & hand/finger IK
@@ -1025,12 +1270,15 @@ export class HideoutSessionController {
         this.currentRoomLabel = room.label;
       }
 
-      const prevPromptLabel = this.activePrompt?.label ?? '';
+      const prevSig = this.activePrompt
+        ? `${this.activePrompt.targetLabel ?? ''}|${this.activePrompt.selectedIndex}|${this.activePrompt.options.map((o) => `${o.id}:${o.label}:${o.hint ?? ''}`).join(',')}`
+        : '';
       const prevReticleState = this.interactReticleState;
       this.updateInteractableScan();
-      const promptChanged =
-        (this.activePrompt?.label ?? '') !== prevPromptLabel ||
-        this.interactReticleState !== prevReticleState;
+      const nextSig = this.activePrompt
+        ? `${this.activePrompt.targetLabel ?? ''}|${this.activePrompt.selectedIndex}|${this.activePrompt.options.map((o) => `${o.id}:${o.label}:${o.hint ?? ''}`).join(',')}`
+        : '';
+      const promptChanged = nextSig !== prevSig || this.interactReticleState !== prevReticleState;
 
       this._scopePassParams.dt = dt;
       this.controller.getWhipVelocity(this._whipVel);
@@ -1075,7 +1323,12 @@ export class HideoutSessionController {
       ammoReserve: hideoutStateStore.getReserveForWeapon(this.equippedWeaponId),
       isSwappingGunWall: this.swapChoreography.isActive(),
       interactReticleState: this.interactReticleState,
-      prompt: this.activePrompt ? { ...this.activePrompt } : null,
+      prompt: this.activePrompt
+        ? {
+            ...this.activePrompt,
+            options: this.activePrompt.options.map((o) => ({ ...o })),
+          }
+        : null,
       toastMessage: this.toastMessage,
       fps: this.currentFps,
       masterVolume: this.config.masterVolume,
@@ -1098,6 +1351,7 @@ export class HideoutSessionController {
     window.removeEventListener('mousemove', this.onMouseMove);
     window.removeEventListener('mousedown', this.onMouseDown);
     window.removeEventListener('mouseup', this.onMouseUp);
+    window.removeEventListener('wheel', this.onWheel);
     window.removeEventListener('contextmenu', this.onContextMenu);
     window.removeEventListener('keydown', this.onKeyDown);
     window.removeEventListener('keyup', this.onKeyUp);

@@ -844,7 +844,16 @@ export class RemotePlayerManager {
                             : op.handlingAction === 'GRENADE_COOK' ||
                                 op.handlingAction === 'GRENADE_CHARGE'
                               ? 0
-                              : 1 / 0.45;
+                              : op.handlingAction === 'DOOR_CLOSE_SOFT'
+                                ? 1 / 0.78
+                                : op.handlingAction === 'DOOR_KICK'
+                                  ? 1 / 0.58
+                                  : op.handlingAction === 'DOOR_OPEN' || op.handlingAction === 'DOOR_PEEK'
+                                    ? 1 / 0.54
+                                    : op.handlingAction === 'DOOR_CLOSE_PUSH' ||
+                                        op.handlingAction === 'PROP_INTERACT'
+                                      ? 1 / 0.40
+                                      : 1 / 0.45;
         if (estRate > 0) {
           op.targetHandlingProgress = Math.min(1, op.targetHandlingProgress + dt * estRate * 0.85);
         }

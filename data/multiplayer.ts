@@ -345,7 +345,13 @@ export type SyncedHandlingAction =
   | 'GRENADE_COOK'
   | 'GRENADE_CHARGE'
   | 'GRENADE_THROW_OVERHAND'
-  | 'GRENADE_THROW_UNDERHAND';
+  | 'GRENADE_THROW_UNDERHAND'
+  | 'DOOR_OPEN'
+  | 'DOOR_PEEK'
+  | 'DOOR_CLOSE_PUSH'
+  | 'DOOR_CLOSE_SOFT'
+  | 'DOOR_KICK'
+  | 'PROP_INTERACT';
 
 export const VALID_SYNCED_HANDLING_ACTIONS: ReadonlySet<SyncedHandlingAction> = new Set([
   'NONE',
@@ -367,6 +373,12 @@ export const VALID_SYNCED_HANDLING_ACTIONS: ReadonlySet<SyncedHandlingAction> = 
   'GRENADE_CHARGE',
   'GRENADE_THROW_OVERHAND',
   'GRENADE_THROW_UNDERHAND',
+  'DOOR_OPEN',
+  'DOOR_PEEK',
+  'DOOR_CLOSE_PUSH',
+  'DOOR_CLOSE_SOFT',
+  'DOOR_KICK',
+  'PROP_INTERACT',
 ]);
 
 export interface SyncedWeaponAttachments {
@@ -814,11 +826,59 @@ export interface GameMapInteractRejectedPacket {
   ts: number;
 }
 
+export interface SyncedDoorState {
+  doorId: string;
+  angleRad: number;
+  angularVel: number;
+  latched: boolean;
+  damageState: 0 | 1 | 2 | 3;
+  chipDamage: number;
+  hingeMode: 'attached' | 'sheared_flying' | 'splitting' | 'collapsed';
+  destructionOutcome: 'none' | 'hinge_shear' | 'split_collapse';
+  seed: number;
+}
+
+export interface GameDoorActionPacket {
+  type: 'game:door_action';
+  senderUserId?: string;
+  senderUsername?: string;
+  senderTeam?: LobbyTeamId;
+  senderIsHost?: boolean;
+  doorId: string;
+  action:
+    | 'open'
+    | 'peek'
+    | 'close'
+    | 'close_soft'
+    | 'kick_breach'
+    | 'kick_destroy'
+    | 'melee_bash'
+    | 'bullet_chip'
+    | 'nudge'
+    | 'repair';
+  angleRad: number;
+  angularVel: number;
+  latched: boolean;
+  damageState: 0 | 1 | 2 | 3;
+  chipDamage: number;
+  hingeMode: 'attached' | 'sheared_flying' | 'splitting' | 'collapsed';
+  destructionOutcome: 'none' | 'hinge_shear' | 'split_collapse';
+  seed: number;
+  px?: number;
+  py?: number;
+  pz?: number;
+  dx?: number;
+  dy?: number;
+  dz?: number;
+  ts: number;
+}
+
 export interface GameMatchSyncPacket {
   type: 'game:match_sync';
   powerOn: boolean;
   openedDoorIds: string[];
   unlockedZoneIds: string[];
+  doors?: SyncedDoorState[];
   round: number;
   zombiesRemaining: number;
   ts: number;
@@ -941,6 +1001,7 @@ export type GameSyncPacket =
   | GameTacticalPingPacket
   | GameEnvSyncPacket
   | GameGlassShatterPacket
-  | GameGrenadeEventPacket;
+  | GameGrenadeEventPacket
+  | GameDoorActionPacket;
 
 
