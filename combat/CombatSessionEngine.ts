@@ -631,7 +631,7 @@ export class CombatSessionEngine {
     );
     this.renderer.setSize(width, height);
     this.renderer.shadowMap.enabled = !this.isSoftwareGl && qProfile.castShadows;
-    this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    this.renderer.shadowMap.type = THREE.PCFShadowMap;
     this.renderer.toneMapping = THREE.NoToneMapping;
     this.renderer.domElement.style.display = 'block';
     this.renderer.domElement.style.width = '100%';

@@ -306,7 +306,7 @@ export class HideoutSessionController {
     );
     this.renderer.setSize(width, height);
     this.renderer.shadowMap.enabled = !this.isSoftwareGl && gfx.castShadows;
-    this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    this.renderer.shadowMap.type = THREE.PCFShadowMap;
     this.renderer.toneMapping = THREE.NoToneMapping; // Handled in BodycamPostProcess
     this.renderer.domElement.style.display = 'block';
     this.renderer.domElement.style.width = '100%';

@@ -81,7 +81,7 @@ export class CadGunsmithStage {
     renderer.toneMappingExposure = 1.12;
     renderer.setPixelRatio(this.isSoftwareGl ? 1 : Math.min(window.devicePixelRatio || 1, 2));
     renderer.shadowMap.enabled = !this.isSoftwareGl;
-    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    renderer.shadowMap.type = THREE.PCFShadowMap;
     renderer.setSize(width, height, false);
     renderer.domElement.style.display = 'block';
     renderer.domElement.style.width = '100%';

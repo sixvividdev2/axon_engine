@@ -730,7 +730,7 @@ export class OpenWorldSessionEngine {
       this.isSoftwareGl ? 1 : Math.min(window.devicePixelRatio || 1, 2),
     );
     this.renderer.shadowMap.enabled = !this.isSoftwareGl;
-    this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    this.renderer.shadowMap.type = THREE.PCFShadowMap;
     this.renderer.setSize(
       Math.max(1, container.clientWidth),
       Math.max(1, container.clientHeight),
