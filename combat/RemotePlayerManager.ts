@@ -40,6 +40,12 @@ interface RemoteOperator {
   maxHp: number;
   kills: number;
   deaths: number;
+  headshots: number;
+  assists: number;
+  grenadeKills: number;
+  meleeKills: number;
+  damageDealt: number;
+  afkSeconds: number;
   weaponId: string;
   attachments: WeaponAttachments;
   suppressed: boolean;
@@ -342,6 +348,12 @@ export class RemotePlayerManager {
       maxHp: 100,
       kills: 0,
       deaths: 0,
+      headshots: 0,
+      assists: 0,
+      grenadeKills: 0,
+      meleeKills: 0,
+      damageDealt: 0,
+      afkSeconds: 0,
       weaponId: 'm4a1',
       attachments: {},
       suppressed: false,
@@ -527,6 +539,12 @@ export class RemotePlayerManager {
     op.alive = Boolean(pkt.alive);
     op.kills = pkt.kills ?? op.kills;
     op.deaths = pkt.deaths ?? op.deaths;
+    if (typeof pkt.headshots === 'number') op.headshots = pkt.headshots;
+    if (typeof pkt.assists === 'number') op.assists = pkt.assists;
+    if (typeof pkt.grenadeKills === 'number') op.grenadeKills = pkt.grenadeKills;
+    if (typeof pkt.meleeKills === 'number') op.meleeKills = pkt.meleeKills;
+    if (typeof pkt.damageDealt === 'number') op.damageDealt = pkt.damageDealt;
+    if (typeof pkt.afkSeconds === 'number') op.afkSeconds = pkt.afkSeconds;
     op.flashlightOn = Boolean(pkt.flashlightOn);
     op.laserOn = Boolean(pkt.laserOn);
     op.lastUpdateMs = performance.now();
@@ -898,8 +916,15 @@ export class RemotePlayerManager {
         name: op.username,
         team: op.team,
         isPlayer: false,
+        isBot: false,
         kills: op.kills,
         deaths: op.deaths,
+        headshots: op.headshots,
+        assists: op.assists,
+        grenadeKills: op.grenadeKills,
+        meleeKills: op.meleeKills,
+        damageDealt: op.damageDealt,
+        afkSeconds: op.afkSeconds,
         alive: op.alive,
       });
     }

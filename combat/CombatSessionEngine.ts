@@ -65,6 +65,7 @@ import {
 import { getGraphicsQualityProfile, graphicsQualityStore } from '../data/graphicsQuality';
 import { killfeedPreferenceStore } from '../data/killfeedSettings';
 import { loadoutStore } from '../data/loadoutStore';
+import { CombatantMatchStats } from '../data/progression';
 import { SaveManager } from '../engine/persistence/SaveManager';
 import { WeatherTimeSystem } from '../engine/world/WeatherTimeSystem';
 import { getMapDefinitionById } from '../maps/MapRegistry';
@@ -252,6 +253,12 @@ export interface CombatSessionSnapshot {
   playerKills: number;
   playerDeaths: number;
   playerHeadshots: number;
+  playerAssists: number;
+  playerGrenadeKills: number;
+  playerMeleeKills: number;
+  playerDamageDealt: number;
+  playerAfkSeconds: number;
+  matchDurationSec: number;
   weaponKills: Record<string, number>;
   ffaLeaderName: string;
   ffaLeaderKills: number;
@@ -259,6 +266,7 @@ export interface CombatSessionSnapshot {
   matchOutcome: 'active' | 'victory' | 'defeat';
   killfeed: BattleKillfeedEntry[];
   scoreboard: BattleScoreEntry[];
+  combatants: CombatantMatchStats[];
 
   // Infection-specific state
   roundState: ZombieRoundState;
@@ -447,6 +455,16 @@ export class CombatSessionEngine {
   private playerKills = 0;
   private playerDeaths = 0;
   private playerHeadshots = 0;
+  private playerAssists = 0;
+  private playerGrenadeKills = 0;
+  private playerMeleeKills = 0;
+  private playerDamageDealt = 0;
+  private playerAfkSeconds = 0;
+  private matchDurationSec = 0;
+  private idleSinceInputSec = 0;
+  private readonly localRecentAttackers = new Map<string, number>();
+  private readonly zombieRecentAttackers = new Map<string, Map<string, number>>();
+  private readonly remoteRecentAttackers = new Map<string, Map<string, number>>();
   private weaponKills: Record<string, number> = {};
   private matchOutcome: 'active' | 'victory' | 'defeat' = 'active';
   private gameOver = false;
@@ -656,6 +674,12 @@ export class CombatSessionEngine {
       );
       this.botAI.setBotCommsListener((ev) => this.handleLocalBotComms(ev));
       this.botAI.setBotGrenadeListener((ev) => this.handleHostBotGrenadeEvent(ev));
+      this.botAI.setAssistListener((assisterId) => {
+        const localTargetId = this.mp ? `human:${this.mp.localUserId}` : 'player';
+        if (assisterId === 'player' || assisterId === localTargetId) {
+          this.playerAssists += 1;
+        }
+      });
     } else {
       this.zombieAI = new InfectionZombieAI(this.scene, this.map, this.audio, {
         zombieHealthMult: evCfg?.zombieHealthMult,
@@ -1377,6 +1401,12 @@ export class CombatSessionEngine {
       alive: this.playerAlive,
       kills: this.playerKills,
       deaths: this.playerDeaths,
+      assists: this.playerAssists,
+      headshots: this.playerHeadshots,
+      grenadeKills: this.playerGrenadeKills,
+      meleeKills: this.playerMeleeKills,
+      damageDealt: this.playerDamageDealt,
+      afkSeconds: Number(this.playerAfkSeconds.toFixed(1)),
       flashlightOn: this.flashlightOn && derived.hasFlashlight,
       laserOn: this.weaponRig.laserOn && derived.hasLaser,
       ts: Date.now(),
@@ -1550,6 +1580,14 @@ export class CombatSessionEngine {
 
       // If this remote hit eliminated us, broadcast authoritative kill event so killer & scoreboard update
       if (prevAlive && !this.playerAlive) {
+        const killMethod: 'bullet' | 'grenade' | 'melee' =
+          pkt.weaponId === 'melee'
+            ? 'melee'
+            : pkt.weaponId === 'm67_frag' ||
+                pkt.weaponId === 'm84_flash' ||
+                pkt.weaponId === 'an_m14_thermite'
+              ? 'grenade'
+              : 'bullet';
         const killPkt: GamePlayerKillPacket = {
           type: 'game:kill',
           killerUserId: pkt.senderUserId ?? 'unknown',
@@ -1561,6 +1599,7 @@ export class CombatSessionEngine {
           weaponId: pkt.weaponId,
           weaponName: pkt.weaponName,
           headshot: Boolean(pkt.headshot),
+          killMethod,
           ts: Date.now(),
         };
         this.mp.sendMessage(killPkt as unknown as Record<string, unknown>);
@@ -1643,6 +1682,8 @@ export class CombatSessionEngine {
             ? 'B'
             : 'A';
       const botInfo = this.botAI.getBotInfo(pkt.botId);
+      const killMethod: 'bullet' | 'grenade' | 'melee' =
+        pkt.killMethod ?? (pkt.melee ? 'melee' : 'bullet');
       const res = this.botAI.applyDamageFromPlayer(
         pkt.botId,
         pkt.damage,
@@ -1651,6 +1692,7 @@ export class CombatSessionEngine {
         pkt.senderUsername ?? 'OPERATOR',
         attackerTeam,
         `human:${pkt.senderUserId ?? ''}`,
+        killMethod,
       );
       if (res.killed && botInfo) {
         const killPkt: GamePlayerKillPacket = {
@@ -1664,6 +1706,7 @@ export class CombatSessionEngine {
           weaponId: pkt.weaponId,
           weaponName: pkt.weaponName,
           headshot: res.headshot,
+          killMethod,
           ts: Date.now(),
         };
         this.mp.sendMessage(killPkt as unknown as Record<string, unknown>);
@@ -1817,6 +1860,7 @@ export class CombatSessionEngine {
         this.hitmarkerKill = true;
         this.playerKills += 1;
         if (pkt.headshot) this.playerHeadshots += 1;
+        if (pkt.melee) this.playerMeleeKills += 1;
         if (pkt.weaponId && pkt.weaponId !== 'melee') this.recordWeaponKill(pkt.weaponId);
         // Client already received 10/20 hit points locally — award kill remainder cleanly
         const baseHitPts = pkt.melee ? 20 : 10;
@@ -2121,7 +2165,11 @@ export class CombatSessionEngine {
     if (this.mp && pkt.killerUserId === this.mp.localUserId) {
       this.playerKills += 1;
       if (pkt.headshot) this.playerHeadshots += 1;
-      if (pkt.weaponId && pkt.weaponId !== 'melee') this.recordWeaponKill(pkt.weaponId);
+      if (pkt.killMethod === 'grenade') this.playerGrenadeKills += 1;
+      if (pkt.killMethod === 'melee' || pkt.weaponId === 'melee') this.playerMeleeKills += 1;
+      if (pkt.weaponId && pkt.weaponId !== 'melee' && pkt.killMethod !== 'grenade') {
+        this.recordWeaponKill(pkt.weaponId);
+      }
       this.hitmarkerTimer = 0.32;
       this.hitmarkerHeadshot = pkt.headshot;
       this.hitmarkerKill = true;
@@ -2129,7 +2177,20 @@ export class CombatSessionEngine {
         pkt.headshot ? `HEADSHOT ELIMINATION · ${pkt.victimName}` : `ELIMINATED ${pkt.victimName}`,
         2.2,
       );
+    } else if (this.mp && pkt.victimUserId) {
+      const attackers = this.remoteRecentAttackers.get(pkt.victimUserId);
+      if (attackers) {
+        const hitAt = attackers.get(this.mp.localUserId);
+        if (
+          typeof hitAt === 'number' &&
+          performance.now() - hitAt <= 10000 &&
+          pkt.killerUserId !== this.mp.localUserId
+        ) {
+          this.playerAssists += 1;
+        }
+      }
     }
+    this.remoteRecentAttackers.delete(pkt.victimUserId);
 
     this.checkBattleVictory();
     this.emitSnapshot();
@@ -2205,6 +2266,16 @@ export class CombatSessionEngine {
     this.playerKills = 0;
     this.playerDeaths = 0;
     this.playerHeadshots = 0;
+    this.playerAssists = 0;
+    this.playerGrenadeKills = 0;
+    this.playerMeleeKills = 0;
+    this.playerDamageDealt = 0;
+    this.playerAfkSeconds = 0;
+    this.matchDurationSec = 0;
+    this.idleSinceInputSec = 0;
+    this.localRecentAttackers.clear();
+    this.zombieRecentAttackers.clear();
+    this.remoteRecentAttackers.clear();
     this.weaponKills = {};
     this.matchOutcome = 'active';
     this.playerAlive = true;
@@ -2384,6 +2455,11 @@ export class CombatSessionEngine {
           ? (targetPos: Readonly<THREE.Vector3>) =>
               this.grenadeSystem.evaluateFragDamageAt(ev.position, targetPos, ev.def).damage
           : undefined;
+      const attackerId = ev.sourceIsBot
+        ? (ev.sourceId ?? undefined)
+        : this.mp
+          ? `human:${this.mp.localUserId}`
+          : 'player';
       const res = this.botAI.applyAreaBlast(
         ev.position,
         ev.radiusM,
@@ -2393,13 +2469,16 @@ export class CombatSessionEngine {
         attackerTeam,
         ev.def.killfeedLabel,
         fragEvaluator,
+        attackerId,
       );
       if (res.hits > 0 && canAttributeLocalKills) {
+        this.playerDamageDealt += res.totalDamage;
         this.hitmarkerTimer = res.kills > 0 ? 0.34 : 0.2;
         this.hitmarkerHeadshot = false;
         this.hitmarkerKill = res.kills > 0;
         if (res.kills > 0) {
           this.playerKills += res.kills;
+          this.playerGrenadeKills += res.kills;
           if (this.mp) {
             for (const botId of res.killedBotIds) {
               const info = this.botAI.getBotInfo(botId);
@@ -2415,6 +2494,7 @@ export class CombatSessionEngine {
                 weaponId: ev.equipmentId,
                 weaponName: ev.def.killfeedLabel,
                 headshot: false,
+                killMethod: 'grenade',
                 ts: Date.now(),
               };
               this.mp.sendMessage(killPkt as unknown as Record<string, unknown>);
@@ -2475,6 +2555,8 @@ export class CombatSessionEngine {
           this.hitmarkerTimer = 0.22;
           this.hitmarkerHeadshot = false;
           this.hitmarkerKill = false;
+          this.playerDamageDealt += dmg;
+          this.recordRemoteDamageAttribution(target.userId, this.mp.localUserId);
           this.remotePlayers.triggerHitFlinch(target.userId);
           const hitPkt: GamePlayerHitPacket = {
             type: 'game:hit',
@@ -2495,11 +2577,13 @@ export class CombatSessionEngine {
     if (this.params.mode === 'infection' && this.zombieAI && canApplyAuthorityDamage) {
       const res = this.zombieAI.applyAreaBlast(ev.position, ev.radiusM, ev.maxDamage, ev.kind);
       if (res.hits > 0 && canAttributeLocalKills) {
+        this.playerDamageDealt += res.hits * Math.round(ev.maxDamage * 0.55);
         this.hitmarkerTimer = res.kills > 0 ? 0.34 : 0.2;
         this.hitmarkerHeadshot = false;
         this.hitmarkerKill = res.kills > 0;
         if (res.kills > 0) {
           this.playerKills += res.kills;
+          this.playerGrenadeKills += res.kills;
           this.pushMpKillfeed({
             killerName: this.mp?.localUsername ?? 'YOU',
             killerTeam: 'A',
@@ -2517,7 +2601,15 @@ export class CombatSessionEngine {
         }
         this.emitSnapshot();
       } else if (res.kills > 0 && ev.sourceIsBot) {
-        this.botAI?.awardInfectionKillPoints(ev.sourceId ?? '', false, false);
+        for (let k = 0; k < res.kills; k++) {
+          this.botAI?.awardInfectionKillPoints(
+            ev.sourceId ?? '',
+            false,
+            false,
+            true,
+            Math.round(ev.maxDamage * 0.5),
+          );
+        }
         this.pushMpKillfeed({
           killerName: ev.sourceName ?? 'SQUAD BOT',
           killerTeam: 'A',
@@ -2643,6 +2735,8 @@ export class CombatSessionEngine {
       this.hitmarkerTimer = headshot ? 0.22 : 0.16;
       this.hitmarkerHeadshot = headshot;
       this.hitmarkerKill = false;
+      this.playerDamageDealt += damage;
+      this.recordRemoteDamageAttribution(targetUserId, this.mp.localUserId);
       this.audio.playImpact(ev.point, headshot ? 'steel_plate' : 'wood');
       this.remotePlayers.triggerHitFlinch(targetUserId);
 
@@ -2678,6 +2772,9 @@ export class CombatSessionEngine {
         this.hitmarkerTimer = headshot ? 0.22 : 0.16;
         this.hitmarkerHeadshot = headshot;
         this.hitmarkerKill = false;
+        const mult = headshot ? 2.4 : hitZone === 'limb' ? 0.72 : 1.0;
+        this.playerDamageDealt += Math.round(Math.max(8, baseDmg * mult));
+        this.recordRemoteDamageAttribution(botId, this.mp.localUserId);
         this.audio.playImpact(ev.point, headshot ? 'steel_plate' : 'wood');
         this.botAI.triggerVisualFlinch(botId);
 
@@ -2704,8 +2801,10 @@ export class CombatSessionEngine {
         this.mp?.localUsername ?? 'YOU',
         this.localBattleTeam,
         this.mp ? `human:${this.mp.localUserId}` : 'player',
+        'bullet',
       );
       if (res.hit) {
+        this.playerDamageDealt += res.appliedDamage;
         this.hitmarkerTimer = res.killed ? 0.28 : 0.16;
         this.hitmarkerHeadshot = res.headshot;
         this.hitmarkerKill = res.killed;
@@ -2727,6 +2826,7 @@ export class CombatSessionEngine {
               weaponId: this._runtimeProfile.id,
               weaponName: this._runtimeProfile.name,
               headshot: res.headshot,
+              killMethod: 'bullet',
               ts: Date.now(),
             };
             this.mp.sendMessage(killPkt as unknown as Record<string, unknown>);
@@ -2781,6 +2881,9 @@ export class CombatSessionEngine {
         ev.incomingDir,
       );
       if (res.hit) {
+        const localAttackerId = this.mp ? `human:${this.mp.localUserId}` : 'player';
+        this.playerDamageDealt += Math.round(baseDmg);
+        this.recordZombieDamageAttribution(zombieId, localAttackerId);
         this.hitmarkerTimer = res.killed ? 0.28 : 0.16;
         this.hitmarkerHeadshot = res.headshot;
         this.hitmarkerKill = res.killed;
@@ -2796,6 +2899,7 @@ export class CombatSessionEngine {
           this.playerKills += 1;
           this.recordWeaponKill(this._runtimeProfile.id);
           if (res.headshot) this.playerHeadshots += 1;
+          this.resolveZombieKillAssists(zombieId, localAttackerId);
           this.pushMpKillfeed({
             killerName: this.mp?.localUsername ?? 'YOU',
             killerTeam: 'A',
@@ -2843,6 +2947,39 @@ export class CombatSessionEngine {
     this.weaponKills[weaponId] = (this.weaponKills[weaponId] ?? 0) + 1;
   }
 
+  private recordRemoteDamageAttribution(targetId: string, attackerId: string): void {
+    let map = this.remoteRecentAttackers.get(targetId);
+    if (!map) {
+      map = new Map<string, number>();
+      this.remoteRecentAttackers.set(targetId, map);
+    }
+    map.set(attackerId, performance.now());
+  }
+
+  private recordZombieDamageAttribution(zombieId: string, attackerId: string): void {
+    let map = this.zombieRecentAttackers.get(zombieId);
+    if (!map) {
+      map = new Map<string, number>();
+      this.zombieRecentAttackers.set(zombieId, map);
+    }
+    map.set(attackerId, performance.now());
+  }
+
+  private resolveZombieKillAssists(zombieId: string, killerId: string): void {
+    const map = this.zombieRecentAttackers.get(zombieId);
+    if (!map) return;
+    const nowMs = performance.now();
+    const localId = this.mp ? `human:${this.mp.localUserId}` : 'player';
+    for (const [assisterId, hitAt] of map.entries()) {
+      if (nowMs - hitAt > 10000) continue;
+      if (assisterId === killerId) continue;
+      if (assisterId === localId || assisterId === 'player') {
+        this.playerAssists += 1;
+      }
+    }
+    this.zombieRecentAttackers.delete(zombieId);
+  }
+
   private handleMeleeHit(ev: Readonly<BodycamMeleeHitEvent>): void {
     const ud = ev.object?.userData;
     const isKick = ev.attackType === 'kick';
@@ -2855,6 +2992,8 @@ export class CombatSessionEngine {
       this.hitmarkerTimer = 0.22;
       this.hitmarkerHeadshot = false;
       this.hitmarkerKill = false;
+      this.playerDamageDealt += meleeDmg;
+      this.recordRemoteDamageAttribution(targetUserId, this.mp.localUserId);
       this.audio.playImpact(ev.point, 'wood');
       this.remotePlayers.triggerHitFlinch(targetUserId);
 
@@ -2879,6 +3018,7 @@ export class CombatSessionEngine {
         this.hitmarkerTimer = 0.2;
         this.hitmarkerHeadshot = false;
         this.hitmarkerKill = false;
+        this.playerDamageDealt += meleeDmg;
         this.audio.playImpact(ev.point, 'wood');
         this.zombieAI.playVisualHitFeedback(zombieId, ev.point, false);
         this.addPoints(20, 'BASH');
@@ -2912,6 +3052,9 @@ export class CombatSessionEngine {
         ev.point,
       );
       if (res.hit) {
+        const localAttackerId = this.mp ? `human:${this.mp.localUserId}` : 'player';
+        this.playerDamageDealt += meleeDmg;
+        this.recordZombieDamageAttribution(zombieId, localAttackerId);
         this.hitmarkerTimer = res.killed ? 0.28 : 0.18;
         this.hitmarkerHeadshot = false;
         this.hitmarkerKill = res.killed;
@@ -2921,6 +3064,8 @@ export class CombatSessionEngine {
         }
         if (res.killed) {
           this.playerKills += 1;
+          this.playerMeleeKills += 1;
+          this.resolveZombieKillAssists(zombieId, localAttackerId);
           this.pushMpKillfeed({
             killerName: this.mp?.localUsername ?? 'YOU',
             killerTeam: 'A',
@@ -2963,6 +3108,8 @@ export class CombatSessionEngine {
         this.hitmarkerTimer = 0.22;
         this.hitmarkerHeadshot = false;
         this.hitmarkerKill = false;
+        this.playerDamageDealt += meleeDmg;
+        this.recordRemoteDamageAttribution(botId, this.mp.localUserId);
         this.audio.playImpact(ev.point, 'wood');
         this.botAI.triggerVisualFlinch(botId);
         const dmgPkt: GameBotDamagePacket = {
@@ -2973,6 +3120,7 @@ export class CombatSessionEngine {
           weaponId: 'melee',
           weaponName: isKick ? 'PUSH-KICK' : 'MELEE',
           melee: true,
+          killMethod: 'melee',
           ts: Date.now(),
         };
         this.mp.sendMessage(dmgPkt as unknown as Record<string, unknown>);
@@ -2989,14 +3137,17 @@ export class CombatSessionEngine {
         this.mp?.localUsername ?? 'YOU',
         this.localBattleTeam,
         this.mp ? `human:${this.mp.localUserId}` : 'player',
+        'melee',
       );
       if (res.hit) {
+        this.playerDamageDealt += res.appliedDamage;
         this.hitmarkerTimer = 0.22;
         this.hitmarkerHeadshot = false;
         this.hitmarkerKill = res.killed;
         this.audio.playImpact(ev.point, 'wood');
         if (res.killed) {
           this.playerKills += 1;
+          this.playerMeleeKills += 1;
           if (this.mp && botInfo) {
             const killPkt: GamePlayerKillPacket = {
               type: 'game:kill',
@@ -3009,6 +3160,7 @@ export class CombatSessionEngine {
               weaponId: 'melee',
               weaponName: isKick ? 'PUSH-KICK' : 'MELEE',
               headshot: false,
+              killMethod: 'melee',
               ts: Date.now(),
             };
             this.mp.sendMessage(killPkt as unknown as Record<string, unknown>);
@@ -3041,9 +3193,20 @@ export class CombatSessionEngine {
       { stanceCoupled: false },
     );
 
+    if (attackerId) {
+      this.localRecentAttackers.set(attackerId, performance.now());
+    }
+
     if (this.hp <= 0) {
       this.playerAlive = false;
       this.playerDeaths += 1;
+      const nowMs = performance.now();
+      const recentIds: string[] = [];
+      for (const [id, atMs] of this.localRecentAttackers.entries()) {
+        if (nowMs - atMs <= 10000) recentIds.push(id);
+      }
+      this.localRecentAttackers.clear();
+
       this.isFiring = false;
       this.input.ads = false;
       if (this.grenadeSystem.isLeverReleased()) {
@@ -3064,9 +3227,9 @@ export class CombatSessionEngine {
 
       if (this.params.mode === 'battle' && this.botAI) {
         if (!this.mp) {
-          this.botAI.recordPlayerDeath(attackerLabel, attackerTeam, attackerId);
+          this.botAI.recordPlayerDeath(attackerLabel, attackerTeam, attackerId, 'bullet', recentIds);
         } else if (!attackerId || attackerId.startsWith('bot_')) {
-          this.botAI.recordPlayerDeath(attackerLabel, attackerTeam, attackerId);
+          this.botAI.recordPlayerDeath(attackerLabel, attackerTeam, attackerId, 'bullet', recentIds);
         }
 
         if (!this.playerRespawnEnabled) {
@@ -3980,6 +4143,9 @@ export class CombatSessionEngine {
 
   private readonly onMouseMove = (e: MouseEvent): void => {
     if (!this.pointerLocked || !this.playerAlive) return;
+    if (Math.abs(e.movementX) > 0.5 || Math.abs(e.movementY) > 0.5) {
+      this.idleSinceInputSec = 0;
+    }
     const dx = THREE.MathUtils.clamp(e.movementX, -140, 140);
     const dy = THREE.MathUtils.clamp(e.movementY, -140, 140);
     if (this.pdaDevice.isOpen()) {
@@ -3991,6 +4157,7 @@ export class CombatSessionEngine {
   };
 
   private readonly onMouseDown = (e: MouseEvent): void => {
+    this.idleSinceInputSec = 0;
     if (e.button === 1) e.preventDefault();
     if (this.spectating && this.pointerLocked) {
       if (e.button === 0) {
@@ -4121,6 +4288,7 @@ export class CombatSessionEngine {
     }
 
     if (!this.pointerLocked || !this.playerAlive) return;
+    this.idleSinceInputSec = 0;
     this.audio.ensureInitialized();
 
     switch (e.code) {
@@ -4930,6 +5098,27 @@ export class CombatSessionEngine {
       !this.gameOver &&
       this.matchOutcome === 'active';
 
+    if (simActive) {
+      this.matchDurationSec += dt;
+      const anyHeldInput =
+        this.input.forward ||
+        this.input.backward ||
+        this.input.left ||
+        this.input.right ||
+        this.input.ads ||
+        this.isFiring ||
+        this.input.vault ||
+        this.interactKeyHeld;
+      if (anyHeldInput && this.pointerLocked) {
+        this.idleSinceInputSec = 0;
+      } else {
+        this.idleSinceInputSec += dt;
+        if (this.idleSinceInputSec >= 8.0) {
+          this.playerAfkSeconds += dt;
+        }
+      }
+    }
+
     // Step player controller, 3D PDA telemetry + choreography, & IK animator
     if (this.playerAlive) {
       this.controller.setGrenadeTension(
@@ -5279,11 +5468,17 @@ export class CombatSessionEngine {
                 hitEv.impactPoint,
                 hitEv.impactDir,
               );
+              if (res.hit) {
+                this.recordZombieDamageAttribution(hitEv.zombieId, hitEv.shooterId);
+              }
               if (res.killed) {
+                this.resolveZombieKillAssists(hitEv.zombieId, hitEv.shooterId);
                 this.botAI?.awardInfectionKillPoints(
                   hitEv.shooterId,
                   res.headshot,
                   Boolean(hitEv.melee),
+                  false,
+                  hitEv.damage,
                 );
                 this.pushMpKillfeed({
                   killerName: hitEv.shooterName,
@@ -5310,7 +5505,7 @@ export class CombatSessionEngine {
                   this.mp.sendMessage(killedPkt as unknown as Record<string, unknown>);
                 }
               } else if (res.hit) {
-                this.botAI?.awardInfectionHitPoints(hitEv.shooterId, 10);
+                this.botAI?.awardInfectionHitPoints(hitEv.shooterId, 10, hitEv.damage);
               }
             },
             {
@@ -5471,22 +5666,69 @@ export class CombatSessionEngine {
     const remoteScores = this.remotePlayers?.getScoreEntries() ?? [];
 
     // Merge local player + remote human operators + AI bots cleanly on scoreboard
+    const localStats = {
+      headshots: this.playerHeadshots,
+      assists: this.playerAssists,
+      grenadeKills: this.playerGrenadeKills,
+      meleeKills: this.playerMeleeKills,
+      damageDealt: this.playerDamageDealt,
+      afkSeconds: Number(this.playerAfkSeconds.toFixed(1)),
+    };
     const botBoard =
-      this.botAI?.getScoreboard(this.playerKills, this.playerDeaths, this.playerAlive) ?? [];
+      this.botAI?.getScoreboard(
+        this.playerKills,
+        this.playerDeaths,
+        this.playerAlive,
+        localStats,
+      ) ?? [
+        {
+          id: 'player',
+          name: 'YOU',
+          team: this.localBattleTeam,
+          isPlayer: true,
+          isBot: false,
+          kills: this.playerKills,
+          deaths: this.playerDeaths,
+          headshots: this.playerHeadshots,
+          assists: this.playerAssists,
+          grenadeKills: this.playerGrenadeKills,
+          meleeKills: this.playerMeleeKills,
+          damageDealt: this.playerDamageDealt,
+          afkSeconds: Number(this.playerAfkSeconds.toFixed(1)),
+          alive: this.playerAlive,
+        },
+      ];
     const mergedScoreboard: BattleScoreEntry[] = this.mp
       ? [
           ...botBoard.map((row) =>
             row.isPlayer
               ? {
                   ...row,
+                  id: this.mp!.localUserId,
                   name: this.mp!.localUsername,
                   team: this.localBattleTeam,
                 }
               : row,
           ),
           ...remoteScores,
-        ].sort((a, b) => b.kills - a.kills || a.deaths - b.deaths)
+        ].sort((a, b) => b.kills - a.kills || b.assists - a.assists || a.deaths - b.deaths)
       : botBoard;
+
+    const combatants: CombatantMatchStats[] = mergedScoreboard.map((row) => ({
+      id: row.id,
+      name: row.name,
+      team: row.team,
+      isLocalPlayer: row.isPlayer,
+      isBot: row.isBot,
+      kills: row.kills,
+      deaths: row.deaths,
+      headshots: row.headshots,
+      assists: row.assists,
+      grenadeKills: row.grenadeKills,
+      meleeKills: row.meleeKills,
+      damageDealt: row.damageDealt,
+      afkSeconds: row.afkSeconds,
+    }));
 
     const mergedKillfeed = [...this.mpKillfeed, ...(this.botAI?.getKillfeed() ?? [])]
       .sort((a, b) => b.timestampMs - a.timestampMs)
@@ -5549,6 +5791,12 @@ export class CombatSessionEngine {
       playerKills: this.playerKills,
       playerDeaths: this.playerDeaths,
       playerHeadshots: this.playerHeadshots,
+      playerAssists: this.playerAssists,
+      playerGrenadeKills: this.playerGrenadeKills,
+      playerMeleeKills: this.playerMeleeKills,
+      playerDamageDealt: this.playerDamageDealt,
+      playerAfkSeconds: Number(this.playerAfkSeconds.toFixed(1)),
+      matchDurationSec: Number(this.matchDurationSec.toFixed(1)),
       weaponKills: { ...this.weaponKills },
       ffaLeaderName,
       ffaLeaderKills,
@@ -5556,6 +5804,7 @@ export class CombatSessionEngine {
       matchOutcome: this.matchOutcome,
       killfeed: mergedKillfeed,
       scoreboard: mergedScoreboard,
+      combatants,
 
       roundState: this.zombieAI?.getRoundState() ?? {
         round: 1,

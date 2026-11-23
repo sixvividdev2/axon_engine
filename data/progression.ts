@@ -33,6 +33,103 @@ export interface WeaponProgressRecord {
   kills: number;
 }
 
+export type PostMatchBadgeId =
+  | 'most_kills'
+  | 'most_headshots'
+  | 'most_assists'
+  | 'grenadier'
+  | 'assassin'
+  | 'coward'
+  | 'afk_artist';
+
+export interface PostMatchBadgeMeta {
+  id: PostMatchBadgeId;
+  label: string;
+  description: string;
+}
+
+export const POST_MATCH_BADGES: Readonly<Record<PostMatchBadgeId, PostMatchBadgeMeta>> = {
+  most_kills: {
+    id: 'most_kills',
+    label: 'Most Kills',
+    description: 'Highest total eliminations in the match',
+  },
+  most_headshots: {
+    id: 'most_headshots',
+    label: 'Most Headshots',
+    description: 'Most precision headshot eliminations',
+  },
+  most_assists: {
+    id: 'most_assists',
+    label: 'Most Assists',
+    description: 'Most kill assists across engagements',
+  },
+  grenadier: {
+    id: 'grenadier',
+    label: 'Grenadier',
+    description: 'Most explosive & ordnance eliminations',
+  },
+  assassin: {
+    id: 'assassin',
+    label: 'Assassin',
+    description: 'Most close-quarters melee eliminations',
+  },
+  coward: {
+    id: 'coward',
+    label: 'Coward',
+    description: 'Least combat contribution among active operators',
+  },
+  afk_artist: {
+    id: 'afk_artist',
+    label: 'AFK-Artist',
+    description: 'Inactive for more than half of the match',
+  },
+};
+
+export interface CombatantMatchStats {
+  id: string;
+  name: string;
+  team: 'A' | 'B' | 'FFA';
+  isLocalPlayer: boolean;
+  isBot: boolean;
+  kills: number;
+  deaths: number;
+  headshots: number;
+  assists: number;
+  grenadeKills: number;
+  meleeKills: number;
+  damageDealt: number;
+  afkSeconds: number;
+}
+
+export interface MatchLeaderboardEntry extends CombatantMatchStats {
+  rankPosition: number;
+  /** Null represents infinite K/D (deaths === 0 with at least 1 kill). */
+  kdRatio: number | null;
+  kdDisplay: string;
+  afkRatio: number;
+  isMvp: boolean;
+  badges: PostMatchBadgeId[];
+}
+
+export interface MatchMvpHighlight {
+  id: string;
+  name: string;
+  team: 'A' | 'B' | 'FFA';
+  isLocalPlayer: boolean;
+  isBot: boolean;
+  kills: number;
+  deaths: number;
+  assists: number;
+  headshots: number;
+  grenadeKills: number;
+  meleeKills: number;
+  damageDealt: number;
+  kdRatio: number | null;
+  kdDisplay: string;
+  badges: PostMatchBadgeId[];
+}
+
 export interface MatchResultInput {
   mode: 'battle' | 'infection';
   kills: number;
@@ -41,6 +138,9 @@ export interface MatchResultInput {
   outcome: 'victory' | 'defeat' | 'completed';
   infectionRound?: number;
   weaponKills: Record<string, number>;
+  mapName?: string;
+  matchDurationSec?: number;
+  combatants?: CombatantMatchStats[];
 }
 
 export interface GunLevelDelta {
@@ -54,6 +154,13 @@ export interface GunLevelDelta {
 }
 
 export interface MatchProgressionSummary {
+  isGuest: boolean;
+  mode: 'battle' | 'infection';
+  mapName?: string;
+  matchOutcome: 'victory' | 'defeat' | 'completed';
+  matchDurationSec: number;
+  mvp: MatchMvpHighlight | null;
+  leaderboard: MatchLeaderboardEntry[];
   before: {
     rank: number;
     xp: number;
@@ -612,11 +719,20 @@ export function applyMatchProgression(
     highestInfectionRound: Math.max(career.highestInfectionRound, infectionRound),
   };
 
+  const postMatch = computePostMatchSummary(input);
+
   return {
     nextCareer,
     nextWeaponProgress,
     nextUnlockedAttachments,
     summary: {
+      isGuest: false,
+      mode: input.mode,
+      mapName: input.mapName,
+      matchOutcome: input.outcome,
+      matchDurationSec: postMatch.matchDurationSec,
+      mvp: postMatch.mvp,
+      leaderboard: postMatch.leaderboard,
       before: {
         rank: beforeRank,
         xp: beforeXp,
@@ -651,5 +767,283 @@ export function applyMatchProgression(
       autoGrantedSniperScopes,
       gunDeltas,
     },
+  };
+}
+
+function sanitizeCombatantStats(raw: CombatantMatchStats): CombatantMatchStats {
+  const kills = Math.max(0, Math.floor(raw.kills || 0));
+  const deaths = Math.max(0, Math.floor(raw.deaths || 0));
+  const headshots = Math.max(0, Math.min(kills, Math.floor(raw.headshots || 0)));
+  const assists = Math.max(0, Math.floor(raw.assists || 0));
+  const grenadeKills = Math.max(0, Math.min(kills, Math.floor(raw.grenadeKills || 0)));
+  const meleeKills = Math.max(0, Math.min(kills, Math.floor(raw.meleeKills || 0)));
+  const damageDealt = Math.max(0, Math.round(raw.damageDealt || 0));
+  const afkSeconds = Math.max(0, Number(raw.afkSeconds || 0));
+  return {
+    id: String(raw.id || 'unknown'),
+    name: String(raw.name || 'OPERATOR'),
+    team: raw.team === 'B' ? 'B' : raw.team === 'FFA' ? 'FFA' : 'A',
+    isLocalPlayer: Boolean(raw.isLocalPlayer),
+    isBot: Boolean(raw.isBot),
+    kills,
+    deaths,
+    headshots,
+    assists,
+    grenadeKills,
+    meleeKills,
+    damageDealt,
+    afkSeconds,
+  };
+}
+
+function computeKdSortValue(kills: number, deaths: number): number {
+  if (deaths === 0) {
+    return kills > 0 ? Number.POSITIVE_INFINITY : 0;
+  }
+  return kills / deaths;
+}
+
+function formatKdDisplay(kills: number, deaths: number): { kdRatio: number | null; kdDisplay: string } {
+  if (deaths === 0) {
+    if (kills > 0) {
+      return { kdRatio: null, kdDisplay: '∞' };
+    }
+    return { kdRatio: 0, kdDisplay: '0.00' };
+  }
+  const ratio = kills / deaths;
+  return { kdRatio: Number(ratio.toFixed(2)), kdDisplay: ratio.toFixed(2) };
+}
+
+/**
+ * Computes Match MVP (highest K/D ratio, treating 0 deaths with >=1 kill as infinite K/D
+ * and tie-breaking by kills, assists, headshots, damageDealt), full sorted leaderboard,
+ * and multi-award strength badges across all human and AI combatants.
+ */
+export function computePostMatchSummary(input: MatchResultInput): {
+  matchDurationSec: number;
+  mvp: MatchMvpHighlight | null;
+  leaderboard: MatchLeaderboardEntry[];
+} {
+  const matchDurationSec = Math.max(1, Math.round(input.matchDurationSec ?? 0));
+  const rawList: CombatantMatchStats[] =
+    Array.isArray(input.combatants) && input.combatants.length > 0
+      ? input.combatants.map(sanitizeCombatantStats)
+      : [
+          sanitizeCombatantStats({
+            id: 'player',
+            name: 'YOU',
+            team: 'A',
+            isLocalPlayer: true,
+            isBot: false,
+            kills: input.kills,
+            deaths: input.deaths,
+            headshots: input.headshots,
+            assists: 0,
+            grenadeKills: 0,
+            meleeKills: 0,
+            damageDealt: 0,
+            afkSeconds: 0,
+          }),
+        ];
+
+  if (rawList.length === 0) {
+    return { matchDurationSec, mvp: null, leaderboard: [] };
+  }
+
+  // 1. Determine Match MVP by highest K/D ratio (0 deaths + >0 kills = Infinity, tie-break by kills)
+  let mvpCandidate = rawList[0];
+  for (let i = 1; i < rawList.length; i++) {
+    const c = rawList[i];
+    const cKd = computeKdSortValue(c.kills, c.deaths);
+    const mKd = computeKdSortValue(mvpCandidate.kills, mvpCandidate.deaths);
+    if (cKd !== mKd) {
+      if (cKd > mKd) mvpCandidate = c;
+      continue;
+    }
+    if (c.kills !== mvpCandidate.kills) {
+      if (c.kills > mvpCandidate.kills) mvpCandidate = c;
+      continue;
+    }
+    if (c.assists !== mvpCandidate.assists) {
+      if (c.assists > mvpCandidate.assists) mvpCandidate = c;
+      continue;
+    }
+    if (c.headshots !== mvpCandidate.headshots) {
+      if (c.headshots > mvpCandidate.headshots) mvpCandidate = c;
+      continue;
+    }
+    if (c.damageDealt !== mvpCandidate.damageDealt) {
+      if (c.damageDealt > mvpCandidate.damageDealt) mvpCandidate = c;
+      continue;
+    }
+    if (c.deaths !== mvpCandidate.deaths) {
+      if (c.deaths < mvpCandidate.deaths) mvpCandidate = c;
+      continue;
+    }
+    if (c.isLocalPlayer && !mvpCandidate.isLocalPlayer) {
+      mvpCandidate = c;
+    }
+  }
+
+  // 2. Compute category maxima for positive strength badges
+  let maxKills = 0;
+  let maxHeadshots = 0;
+  let maxAssists = 0;
+  let maxGrenadeKills = 0;
+  let maxMeleeKills = 0;
+  for (const c of rawList) {
+    if (c.kills > maxKills) maxKills = c.kills;
+    if (c.headshots > maxHeadshots) maxHeadshots = c.headshots;
+    if (c.assists > maxAssists) maxAssists = c.assists;
+    if (c.grenadeKills > maxGrenadeKills) maxGrenadeKills = c.grenadeKills;
+    if (c.meleeKills > maxMeleeKills) maxMeleeKills = c.meleeKills;
+  }
+
+  // 3. Identify AFK-Artist (> 50% match duration AFK) and Coward (lowest active combat contribution, NOT AFK)
+  const afkArtistIds = new Set<string>();
+  const activeForCowardCheck: Array<{ id: string; score: number }> = [];
+  let topCombatScore = 0;
+
+  for (const c of rawList) {
+    const afkRatio = matchDurationSec > 0 ? Math.min(1, c.afkSeconds / matchDurationSec) : 0;
+    const combatScore = c.kills * 100 + c.assists * 45 + c.damageDealt * 0.5;
+    if (combatScore > topCombatScore) topCombatScore = combatScore;
+    if (afkRatio > 0.5) {
+      afkArtistIds.add(c.id);
+    } else {
+      activeForCowardCheck.push({ id: c.id, score: combatScore });
+    }
+  }
+
+  const cowardIds = new Set<string>();
+  if (rawList.length >= 2 && activeForCowardCheck.length >= 2 && topCombatScore > 0) {
+    let minScore = Number.POSITIVE_INFINITY;
+    for (const entry of activeForCowardCheck) {
+      if (entry.id === mvpCandidate.id) continue;
+      if (entry.score < minScore) {
+        minScore = entry.score;
+      }
+    }
+    if (Number.isFinite(minScore) && minScore < topCombatScore) {
+      for (const entry of activeForCowardCheck) {
+        if (entry.id !== mvpCandidate.id && entry.score === minScore) {
+          cowardIds.add(entry.id);
+        }
+      }
+    }
+  }
+
+  // 4. Sort full leaderboard (Kills desc -> Assists desc -> Deaths asc -> Headshots desc -> Damage desc)
+  const sorted = [...rawList].sort((a, b) => {
+    if (b.kills !== a.kills) return b.kills - a.kills;
+    if (b.assists !== a.assists) return b.assists - a.assists;
+    if (a.deaths !== b.deaths) return a.deaths - b.deaths;
+    if (b.headshots !== a.headshots) return b.headshots - a.headshots;
+    if (b.damageDealt !== a.damageDealt) return b.damageDealt - a.damageDealt;
+    if (a.isLocalPlayer !== b.isLocalPlayer) return a.isLocalPlayer ? -1 : 1;
+    return a.name.localeCompare(b.name);
+  });
+
+  const leaderboard: MatchLeaderboardEntry[] = sorted.map((c, idx) => {
+    const badges: PostMatchBadgeId[] = [];
+    if (maxKills > 0 && c.kills === maxKills) badges.push('most_kills');
+    if (maxHeadshots > 0 && c.headshots === maxHeadshots) badges.push('most_headshots');
+    if (maxAssists > 0 && c.assists === maxAssists) badges.push('most_assists');
+    if (maxGrenadeKills > 0 && c.grenadeKills === maxGrenadeKills) badges.push('grenadier');
+    if (maxMeleeKills > 0 && c.meleeKills === maxMeleeKills) badges.push('assassin');
+    if (cowardIds.has(c.id)) badges.push('coward');
+    if (afkArtistIds.has(c.id)) badges.push('afk_artist');
+
+    const { kdRatio, kdDisplay } = formatKdDisplay(c.kills, c.deaths);
+    const afkRatio = matchDurationSec > 0 ? Math.min(1, c.afkSeconds / matchDurationSec) : 0;
+
+    return {
+      ...c,
+      rankPosition: idx + 1,
+      kdRatio,
+      kdDisplay,
+      afkRatio,
+      isMvp: c.id === mvpCandidate.id,
+      badges,
+    };
+  });
+
+  const mvpRow = leaderboard.find((r) => r.isMvp) ?? leaderboard[0];
+  const mvp: MatchMvpHighlight = {
+    id: mvpRow.id,
+    name: mvpRow.name,
+    team: mvpRow.team,
+    isLocalPlayer: mvpRow.isLocalPlayer,
+    isBot: mvpRow.isBot,
+    kills: mvpRow.kills,
+    deaths: mvpRow.deaths,
+    assists: mvpRow.assists,
+    headshots: mvpRow.headshots,
+    grenadeKills: mvpRow.grenadeKills,
+    meleeKills: mvpRow.meleeKills,
+    damageDealt: mvpRow.damageDealt,
+    kdRatio: mvpRow.kdRatio,
+    kdDisplay: mvpRow.kdDisplay,
+    badges: [...mvpRow.badges],
+  };
+
+  return {
+    matchDurationSec,
+    mvp,
+    leaderboard,
+  };
+}
+
+/**
+ * Builds a complete post-match summary for unauthenticated guest sessions so every player
+ * sees the Match MVP, full leaderboard, and strength badges without career XP persistence.
+ */
+export function buildGuestMatchSummary(input: MatchResultInput): MatchProgressionSummary {
+  const postMatch = computePostMatchSummary(input);
+  const baseTitle = getRankTitleInfo(1).title;
+  const xpForNext = xpRequiredForNextRank(1);
+  const prestigeXpForNext = xpRequiredForNextPrestige(0);
+
+  return {
+    isGuest: true,
+    mode: input.mode,
+    mapName: input.mapName,
+    matchOutcome: input.outcome,
+    matchDurationSec: postMatch.matchDurationSec,
+    mvp: postMatch.mvp,
+    leaderboard: postMatch.leaderboard,
+    before: {
+      rank: 1,
+      xp: 0,
+      xpForNext,
+      prestige: 0,
+      prestigeXp: 0,
+      prestigeXpForNext,
+      title: baseTitle,
+    },
+    after: {
+      rank: 1,
+      xp: 0,
+      xpForNext,
+      prestige: 0,
+      prestigeXp: 0,
+      prestigeXpForNext,
+      title: baseTitle,
+    },
+    breakdown: {
+      killXp: 0,
+      headshotXp: 0,
+      deathPenaltyXp: 0,
+      matchOutcomeXp: 0,
+      roundBonusXp: 0,
+      netXp: 0,
+      cashEarned: 0,
+    },
+    rankedUp: false,
+    prestigedUp: false,
+    newlyUnlockedWeapons: [],
+    newlyUnlockedAttachments: [],
+    autoGrantedSniperScopes: [],
+    gunDeltas: [],
   };
 }

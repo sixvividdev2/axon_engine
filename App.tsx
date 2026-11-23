@@ -10,7 +10,7 @@ import { AuthProvider, useAuth } from './context/AuthContext';
 import { LobbyProvider, useLobby } from './context/LobbyContext';
 import { SocialProvider, useSocial } from './context/SocialContext';
 import { loadoutStore } from './data/loadoutStore';
-import { MatchProgressionSummary } from './data/progression';
+import { buildGuestMatchSummary, MatchProgressionSummary, MatchResultInput } from './data/progression';
 import { GymEngine, GymSnapshot } from './gym/GymEngine';
 import { GymHud } from './gym/GymHud';
 import { GymTunerPanel } from './gym/GymTunerPanel';
@@ -179,7 +179,7 @@ function CombatSessionView({
   onRestartInfection: () => void;
   onReturnToMenu: (tab?: 'battle' | 'infection') => void;
 }) {
-  const { user, commitMatch } = useAuth();
+  const { user, commitMatch, openAuthModal } = useAuth();
   const { lobby } = useLobby();
   const containerRef = useRef<HTMLDivElement | null>(null);
   const engineRef = useRef<CombatSessionEngine | null>(null);
@@ -217,32 +217,48 @@ function CombatSessionView({
     }
   }, [lobby, user]);
 
-  // Silently track progression during match and trigger the 4-phase Rank-Up Cinematic ONLY when match concludes
+  // Track match completion and display full post-match summary (MVP, leaderboard, badges + career XP for signed-in users)
   useEffect(() => {
-    if (!snapshot || !user || committedMatchRef.current) return;
+    if (!snapshot || committedMatchRef.current) return;
     const matchEnded =
       (snapshot.mode === 'battle' && snapshot.matchOutcome !== 'active') ||
       (snapshot.mode === 'infection' && snapshot.gameOver);
     if (!matchEnded) return;
 
     committedMatchRef.current = true;
-    void commitMatch({
+    const outcome =
+      snapshot.mode === 'battle'
+        ? snapshot.matchOutcome === 'victory'
+          ? 'victory'
+          : 'defeat'
+        : 'completed';
+
+    const combatants = snapshot.combatants.map((c) =>
+      c.isLocalPlayer && c.name === 'YOU' && user?.username
+        ? { ...c, name: user.username }
+        : c,
+    );
+
+    const matchInput: MatchResultInput = {
       mode: snapshot.mode,
       kills: snapshot.playerKills,
       headshots: snapshot.playerHeadshots,
       deaths: snapshot.playerDeaths,
-      outcome:
-        snapshot.mode === 'battle'
-          ? snapshot.matchOutcome === 'victory'
-            ? 'victory'
-            : 'defeat'
-          : 'completed',
+      outcome,
       infectionRound: snapshot.mode === 'infection' ? snapshot.roundState.round : undefined,
       weaponKills: snapshot.weaponKills,
-    }).then((summary) => {
-      if (summary) {
-        setRankSummary(summary);
-      }
+      mapName: snapshot.mapName,
+      matchDurationSec: snapshot.matchDurationSec,
+      combatants,
+    };
+
+    if (!user) {
+      setRankSummary(buildGuestMatchSummary(matchInput));
+      return;
+    }
+
+    void commitMatch(matchInput).then((summary) => {
+      setRankSummary(summary ?? buildGuestMatchSummary(matchInput));
     });
   }, [snapshot, user, commitMatch]);
 
@@ -280,6 +296,11 @@ function CombatSessionView({
         <RankUpCinematic
           summary={rankSummary}
           onContinue={() => setRankSummary(null)}
+          onSignIn={
+            rankSummary.isGuest
+              ? () => openAuthModal('Sign in to save career XP, rank progression, and weapon unlocks.')
+              : undefined
+          }
         />
       )}
     </main>

@@ -466,6 +466,12 @@ export interface GamePlayerStatePacket {
   alive: boolean;
   kills: number;
   deaths: number;
+  assists?: number;
+  headshots?: number;
+  grenadeKills?: number;
+  meleeKills?: number;
+  damageDealt?: number;
+  afkSeconds?: number;
   flashlightOn: boolean;
   laserOn: boolean;
   ts: number;
@@ -521,6 +527,7 @@ export interface GamePlayerKillPacket {
   weaponId: string;
   weaponName: string;
   headshot: boolean;
+  killMethod?: 'bullet' | 'grenade' | 'melee';
   ts: number;
 }
 
@@ -583,6 +590,11 @@ export interface SyncedBotState {
   maxHp: number;
   kills: number;
   deaths: number;
+  headshots?: number;
+  assists?: number;
+  grenadeKills?: number;
+  meleeKills?: number;
+  damageDealt?: number;
 }
 
 export interface GameBotsSyncPacket {
@@ -623,6 +635,7 @@ export interface GameBotDamagePacket {
   weaponId: string;
   weaponName: string;
   melee?: boolean;
+  killMethod?: 'bullet' | 'grenade' | 'melee';
   ts: number;
 }
 

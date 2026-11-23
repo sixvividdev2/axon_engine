@@ -67,8 +67,15 @@ export interface BattleScoreEntry {
   name: string;
   team: BattleTeamId;
   isPlayer: boolean;
+  isBot: boolean;
   kills: number;
   deaths: number;
+  headshots: number;
+  assists: number;
+  grenadeKills: number;
+  meleeKills: number;
+  damageDealt: number;
+  afkSeconds: number;
   alive: boolean;
 }
 
@@ -90,6 +97,7 @@ export interface BotDamageResult {
   killed: boolean;
   headshot: boolean;
   friendlyIgnored: boolean;
+  appliedDamage: number;
 }
 
 export interface BotPlayerDamageEvent {
@@ -494,6 +502,13 @@ interface BotActor {
   maxHp: number;
   kills: number;
   deaths: number;
+  headshots: number;
+  assists: number;
+  grenadeKills: number;
+  meleeKills: number;
+  damageDealt: number;
+  afkSeconds: number;
+  recentAttackers: Map<string, number>;
   respawnTimer: number;
   deathTimer: number;
 
@@ -638,6 +653,7 @@ export class BattleBotAI {
   private readonly pendingAcks: PendingSquadAck[] = [];
   private onBotCommsCb: ((ev: BotCommsEvent) => void) | null = null;
   private onBotGrenadeCb: ((ev: BotGrenadeEvent) => void) | null = null;
+  private onAssistAwardedCb: ((assisterId: string) => void) | null = null;
 
   public scoreA = 0;
   public scoreB = 0;
@@ -847,6 +863,13 @@ export class BattleBotAI {
         maxHp: this.aiMaxHp,
         kills: 0,
         deaths: 0,
+        headshots: 0,
+        assists: 0,
+        grenadeKills: 0,
+        meleeKills: 0,
+        damageDealt: 0,
+        afkSeconds: 0,
+        recentAttackers: new Map<string, number>(),
         respawnTimer: 0,
         deathTimer: 0,
         points: this.coopInfectionMode ? 500 : 0,
@@ -1125,6 +1148,10 @@ export class BattleBotAI {
     this.onBotGrenadeCb = listener;
   }
 
+  public setAssistListener(listener: ((assisterId: string) => void) | null): void {
+    this.onAssistAwardedCb = listener;
+  }
+
   public replenishBotGrenades(): void {
     for (let i = 0; i < this.bots.length; i++) {
       const b = this.bots[i];
@@ -1142,6 +1169,13 @@ export class BattleBotAI {
       const b = this.bots[i];
       b.kills = 0;
       b.deaths = 0;
+      b.headshots = 0;
+      b.assists = 0;
+      b.grenadeKills = 0;
+      b.meleeKills = 0;
+      b.damageDealt = 0;
+      b.afkSeconds = 0;
+      b.recentAttackers.clear();
       if (this.coopInfectionMode) {
         const pistolSpec = this.getWeaponSpec('glock_17');
         b.points = 500;
@@ -1306,17 +1340,29 @@ export class BattleBotAI {
     });
   }
 
-  public awardInfectionHitPoints(botId: string, amount = 10): void {
+  public awardInfectionHitPoints(botId: string, amount = 10, damageDealt = 0): void {
     if (!this.coopInfectionMode) return;
     const b = this.bots.find((item) => item.id === botId);
-    if (b) b.points += amount;
+    if (!b) return;
+    b.points += amount;
+    if (damageDealt > 0) b.damageDealt += Math.round(damageDealt);
   }
 
-  public awardInfectionKillPoints(botId: string, headshot: boolean, melee = false): void {
+  public awardInfectionKillPoints(
+    botId: string,
+    headshot: boolean,
+    melee = false,
+    grenade = false,
+    damageDealt = 0,
+  ): void {
     if (!this.coopInfectionMode) return;
     const b = this.bots.find((item) => item.id === botId);
     if (!b) return;
     b.kills += 1;
+    if (headshot) b.headshots += 1;
+    if (melee) b.meleeKills += 1;
+    if (grenade) b.grenadeKills += 1;
+    if (damageDealt > 0) b.damageDealt += Math.round(damageDealt);
     b.points += melee ? 130 : headshot ? 100 : 60;
   }
 
@@ -1520,6 +1566,11 @@ export class BattleBotAI {
         maxHp: b.maxHp,
         kills: b.kills,
         deaths: b.deaths,
+        headshots: b.headshots,
+        assists: b.assists,
+        grenadeKills: b.grenadeKills,
+        meleeKills: b.meleeKills,
+        damageDealt: b.damageDealt,
         firing: b.muzzleFlashTimer > 0 || b.burstShotsLeft > 0,
         crouch: Number(b.crouchBlend.toFixed(2)),
         lean: Number(b.leanBlend.toFixed(2)),
@@ -1602,6 +1653,11 @@ export class BattleBotAI {
       bot.maxHp = sb.maxHp || bot.maxHp;
       bot.kills = sb.kills;
       bot.deaths = sb.deaths;
+      if (typeof sb.headshots === 'number') bot.headshots = sb.headshots;
+      if (typeof sb.assists === 'number') bot.assists = sb.assists;
+      if (typeof sb.grenadeKills === 'number') bot.grenadeKills = sb.grenadeKills;
+      if (typeof sb.meleeKills === 'number') bot.meleeKills = sb.meleeKills;
+      if (typeof sb.damageDealt === 'number') bot.damageDealt = sb.damageDealt;
       bot.netPos.set(sb.x, sb.y, sb.z);
       bot.netYaw = sb.yaw;
       bot.netCrouch = typeof sb.crouch === 'number' ? sb.crouch : 0;
@@ -1685,10 +1741,19 @@ export class BattleBotAI {
     attackerName = 'YOU',
     attackerTeam?: BattleTeamId,
     attackerTargetId = 'player',
+    killMethod: 'bullet' | 'grenade' | 'melee' = 'bullet',
   ): BotDamageResult {
     const bot = this.bots.find((b) => b.id === botId);
     if (!bot || !bot.alive) {
-      return { hit: false, botId, botName: '', killed: false, headshot: false, friendlyIgnored: false };
+      return {
+        hit: false,
+        botId,
+        botName: '',
+        killed: false,
+        headshot: false,
+        friendlyIgnored: false,
+        appliedDamage: 0,
+      };
     }
     const resolvedTeam: BattleTeamId = attackerTeam ?? (this.rule === 'tdm' ? 'A' : 'FFA');
     if (this.coopInfectionMode || (this.rule === 'tdm' && bot.team === resolvedTeam)) {
@@ -1699,14 +1764,17 @@ export class BattleBotAI {
         killed: false,
         headshot: false,
         friendlyIgnored: true,
+        appliedDamage: 0,
       };
     }
 
     const headshot = hitZone === 'head';
     const mult = headshot ? 2.4 : hitZone === 'limb' ? 0.72 : 1.0;
-    const dmg = Math.max(8, baseDamage * mult);
-    bot.hp -= dmg;
+    const rawDmg = Math.max(8, baseDamage * mult);
+    const appliedDamage = Math.min(bot.hp, rawDmg);
+    bot.hp -= rawDmg;
     bot.flinchTimer = 0.16;
+    bot.recentAttackers.set(attackerTargetId, performance.now());
 
     // Alert bot immediately toward attacker if alive
     if (bot.hp > 0) {
@@ -1719,10 +1787,20 @@ export class BattleBotAI {
         killed: false,
         headshot,
         friendlyIgnored: false,
+        appliedDamage: Math.round(appliedDamage),
       };
     }
 
-    this.killBot(bot, attackerName, resolvedTeam, headshot, weaponLabel);
+    this.killBot(
+      bot,
+      attackerName,
+      resolvedTeam,
+      headshot,
+      weaponLabel,
+      undefined,
+      killMethod,
+      attackerTargetId,
+    );
     return {
       hit: true,
       botId: bot.id,
@@ -1730,6 +1808,7 @@ export class BattleBotAI {
       killed: true,
       headshot,
       friendlyIgnored: false,
+      appliedDamage: Math.round(appliedDamage),
     };
   }
 
@@ -1740,6 +1819,8 @@ export class BattleBotAI {
     headshot: boolean,
     weaponLabel: string,
     killerBot?: BotActor,
+    killMethod: 'bullet' | 'grenade' | 'melee' = 'bullet',
+    killerId?: string,
   ): void {
     // Live drop: if the bot had already popped its safety lever, drop the active armed grenade at palm
     if (victim.grenadeSpoonPopped && victim.grenadeStage !== 'HOLSTERED') {
@@ -1793,9 +1874,29 @@ export class BattleBotAI {
       headshot ? 4.4 : 3.9,
     );
 
+    const effectiveKillerId = killerBot?.id ?? killerId;
     if (killerBot) {
       killerBot.kills += 1;
+      if (headshot) killerBot.headshots += 1;
+      if (killMethod === 'grenade') killerBot.grenadeKills += 1;
+      if (killMethod === 'melee') killerBot.meleeKills += 1;
     }
+
+    // Award assists to any hostile attacker who damaged this bot within the last 10 seconds
+    const nowMs = performance.now();
+    for (const [assisterId, hitAtMs] of victim.recentAttackers.entries()) {
+      if (nowMs - hitAtMs > 10000) continue;
+      if (effectiveKillerId && assisterId === effectiveKillerId) continue;
+      const assistBot = this.bots.find((b) => b.id === assisterId);
+      if (assistBot) {
+        if (!this.isHostilePair(assistBot.team, victim.team)) continue;
+        assistBot.assists += 1;
+      } else {
+        this.onAssistAwardedCb?.(assisterId);
+      }
+    }
+    victim.recentAttackers.clear();
+
     if (this.rule === 'tdm') {
       if (killerTeam === 'A') this.scoreA += 1;
       else if (killerTeam === 'B') this.scoreB += 1;
@@ -1809,7 +1910,7 @@ export class BattleBotAI {
       victimTeam: victim.team,
       headshot,
       weaponLabel,
-      timestampMs: performance.now(),
+      timestampMs: nowMs,
     });
 
     this.rebuildActiveHitMeshes();
@@ -1827,13 +1928,17 @@ export class BattleBotAI {
     attackerTeam: BattleTeamId,
     weaponLabel: string,
     customFragEvaluator?: (targetPos: Readonly<THREE.Vector3>) => number,
-  ): { hits: number; kills: number; killedBotIds: string[] } {
+    attackerId?: string,
+  ): { hits: number; kills: number; killedBotIds: string[]; totalDamage: number } {
     if (this.isClientReplica || kind === 'smoke') {
-      return { hits: 0, kills: 0, killedBotIds: [] };
+      return { hits: 0, kills: 0, killedBotIds: [], totalDamage: 0 };
     }
     let hits = 0;
     let kills = 0;
+    let totalDamage = 0;
     const killedBotIds: string[] = [];
+    const attackerBot = attackerId ? this.bots.find((b) => b.id === attackerId) : undefined;
+    const nowMs = performance.now();
 
     for (let i = 0; i < this.bots.length; i++) {
       const bot = this.bots[i];
@@ -1849,10 +1954,23 @@ export class BattleBotAI {
         const fragDmg = customFragEvaluator(targetCenter);
         if (fragDmg <= 0.5) continue;
         hits += 1;
+        const applied = Math.min(bot.hp, fragDmg);
+        totalDamage += applied;
+        if (attackerBot) attackerBot.damageDealt += Math.round(applied);
+        if (attackerId) bot.recentAttackers.set(attackerId, nowMs);
         bot.hp -= fragDmg;
         bot.flinchTimer = Math.max(bot.flinchTimer, 0.34);
         if (bot.hp <= 0) {
-          this.killBot(bot, attackerName, attackerTeam, false, weaponLabel);
+          this.killBot(
+            bot,
+            attackerName,
+            attackerTeam,
+            false,
+            weaponLabel,
+            attackerBot,
+            'grenade',
+            attackerId,
+          );
           this._tmpDir.subVectors(targetCenter, origin);
           this._tmpDir.y = Math.max(0.35, this._tmpDir.y + 0.55);
           if (this._tmpDir.lengthSq() > 1e-4) {
@@ -1877,9 +1995,23 @@ export class BattleBotAI {
         bot.flinchTimer = Math.max(bot.flinchTimer, 0.55);
         bot.burstShotsLeft = 0;
         if (maxDamage > 0) {
-          bot.hp -= Math.round(maxDamage * falloff);
+          const flashDmg = Math.round(maxDamage * falloff);
+          const applied = Math.min(bot.hp, flashDmg);
+          totalDamage += applied;
+          if (attackerBot) attackerBot.damageDealt += Math.round(applied);
+          if (attackerId) bot.recentAttackers.set(attackerId, nowMs);
+          bot.hp -= flashDmg;
           if (bot.hp <= 0) {
-            this.killBot(bot, attackerName, attackerTeam, false, weaponLabel);
+            this.killBot(
+              bot,
+              attackerName,
+              attackerTeam,
+              false,
+              weaponLabel,
+              attackerBot,
+              'grenade',
+              attackerId,
+            );
             kills += 1;
             killedBotIds.push(bot.id);
           }
@@ -1888,11 +2020,24 @@ export class BattleBotAI {
       }
 
       const dmg = Math.max(6, maxDamage * Math.pow(falloff, kind === 'frag' ? 1.15 : 0.85));
+      const applied = Math.min(bot.hp, dmg);
+      totalDamage += applied;
+      if (attackerBot) attackerBot.damageDealt += Math.round(applied);
+      if (attackerId) bot.recentAttackers.set(attackerId, nowMs);
       bot.hp -= dmg;
       bot.flinchTimer = Math.max(bot.flinchTimer, kind === 'frag' ? 0.32 : 0.16);
 
       if (bot.hp <= 0) {
-        this.killBot(bot, attackerName, attackerTeam, false, weaponLabel);
+        this.killBot(
+          bot,
+          attackerName,
+          attackerTeam,
+          false,
+          weaponLabel,
+          attackerBot,
+          'grenade',
+          attackerId,
+        );
         // Apply radial blast impulse to ragdoll away from detonation point
         this._tmpDir.subVectors(targetCenter, origin);
         this._tmpDir.y = Math.max(0.35, this._tmpDir.y + 0.55);
@@ -1905,13 +2050,30 @@ export class BattleBotAI {
       }
     }
 
-    return { hits, kills, killedBotIds };
+    return { hits, kills, killedBotIds, totalDamage: Math.round(totalDamage) };
   }
 
-  public recordPlayerDeath(attackerName: string, attackerTeam: BattleTeamId, attackerId?: string): void {
+  public recordPlayerDeath(
+    attackerName: string,
+    attackerTeam: BattleTeamId,
+    attackerId?: string,
+    killMethod: 'bullet' | 'grenade' | 'melee' = 'bullet',
+    recentPlayerAttackers?: Iterable<string>,
+  ): void {
     const killerBot = attackerId ? this.bots.find((b) => b.id === attackerId) : undefined;
     if (killerBot) {
       killerBot.kills += 1;
+      if (killMethod === 'grenade') killerBot.grenadeKills += 1;
+      if (killMethod === 'melee') killerBot.meleeKills += 1;
+    }
+    if (recentPlayerAttackers) {
+      for (const assisterId of recentPlayerAttackers) {
+        if (attackerId && assisterId === attackerId) continue;
+        const assistBot = this.bots.find((b) => b.id === assisterId);
+        if (assistBot) {
+          assistBot.assists += 1;
+        }
+      }
     }
     if (this.rule === 'tdm' && attackerTeam === 'B') {
       this.scoreB += 1;
@@ -1940,15 +2102,34 @@ export class BattleBotAI {
     return this.killfeed.filter((k) => now - k.timestampMs < 6500);
   }
 
-  public getScoreboard(playerKills: number, playerDeaths: number, playerAlive: boolean): BattleScoreEntry[] {
+  public getScoreboard(
+    playerKills: number,
+    playerDeaths: number,
+    playerAlive: boolean,
+    localStats?: {
+      headshots: number;
+      assists: number;
+      grenadeKills: number;
+      meleeKills: number;
+      damageDealt: number;
+      afkSeconds: number;
+    },
+  ): BattleScoreEntry[] {
     const rows: BattleScoreEntry[] = [
       {
         id: 'player',
         name: 'YOU',
         team: this.rule === 'tdm' ? 'A' : 'FFA',
         isPlayer: true,
+        isBot: false,
         kills: playerKills,
         deaths: playerDeaths,
+        headshots: localStats?.headshots ?? 0,
+        assists: localStats?.assists ?? 0,
+        grenadeKills: localStats?.grenadeKills ?? 0,
+        meleeKills: localStats?.meleeKills ?? 0,
+        damageDealt: localStats?.damageDealt ?? 0,
+        afkSeconds: localStats?.afkSeconds ?? 0,
         alive: playerAlive,
       },
       ...this.bots.map((b) => ({
@@ -1956,13 +2137,20 @@ export class BattleBotAI {
         name: b.name,
         team: b.team,
         isPlayer: false,
+        isBot: true,
         kills: b.kills,
         deaths: b.deaths,
+        headshots: b.headshots,
+        assists: b.assists,
+        grenadeKills: b.grenadeKills,
+        meleeKills: b.meleeKills,
+        damageDealt: b.damageDealt,
+        afkSeconds: b.afkSeconds,
         alive: b.alive,
       })),
     ];
 
-    rows.sort((a, b) => b.kills - a.kills || a.deaths - b.deaths);
+    rows.sort((a, b) => b.kills - a.kills || b.assists - a.assists || a.deaths - b.deaths);
     return rows;
   }
 
@@ -4184,15 +4372,20 @@ export class BattleBotAI {
         });
       } else if (targetBot) {
         const hs = Math.random() < 0.16;
-        targetBot.hp -= this.diff.damagePerShot * (hs ? 2.0 : 1.0);
+        const rawDmg = this.diff.damagePerShot * (hs ? 2.0 : 1.0);
+        const applied = Math.min(targetBot.hp, rawDmg);
+        shooter.damageDealt += Math.round(applied);
+        targetBot.recentAttackers.set(shooter.id, performance.now());
+        targetBot.hp -= rawDmg;
         targetBot.flinchTimer = 0.14;
         if (targetBot.hp <= 0) {
-          this.killBot(targetBot, shooter.name, shooter.team, hs, shooter.weaponLabel, shooter);
+          this.killBot(targetBot, shooter.name, shooter.team, hs, shooter.weaponLabel, shooter, 'bullet', shooter.id);
           if (this.isAlliedBot(shooter) && Math.random() < 0.42) {
             this.emitAlliedComms(shooter, 'status', `Tango down! ${targetBot.name} neutralized.`);
           }
         }
       } else if (targetHuman && !this.coopInfectionMode) {
+        shooter.damageDealt += Math.round(this.diff.damagePerShot);
         onDamagePlayer({
           targetUserId: targetHuman.id,
           damage: this.diff.damagePerShot,
