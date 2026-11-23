@@ -72,6 +72,137 @@ export const HideoutHud: React.FC<HideoutHudProps> = ({
         </div>
       )}
 
+      {/* Gun Range top-center course HUD & hit-zone confirmation (zero backdrop-filter, zero pills) */}
+      {showLiveHud && (snapshot.currentRoomId === 'gun_range' || snapshot.gunRange.phase !== 'idle') && (
+        <div className="fixed left-1/2 top-5 -translate-x-1/2 flex flex-col items-center gap-2">
+          {snapshot.gunRange.phase === 'countdown' && (
+            <div className="flex items-baseline gap-3 border border-amber-500/40 bg-[#0d0f12]/92 px-4 py-1.5 text-xs">
+              <span className="font-display font-semibold tracking-wider text-amber-300">
+                30s CQB Course
+              </span>
+              <span className="text-neutral-600" aria-hidden="true">
+                ·
+              </span>
+              <span className="font-mono-tabular font-semibold text-neutral-100">
+                Starting in {Math.max(1, Math.ceil(snapshot.gunRange.countdownSec))}
+              </span>
+            </div>
+          )}
+
+          {snapshot.gunRange.phase === 'active' && (
+            <div className="flex items-baseline gap-3 border border-white/12 bg-[#0d0f12]/92 px-4 py-1.5 font-mono-tabular text-xs text-neutral-200">
+              <span
+                className={`font-semibold ${
+                  snapshot.gunRange.timeRemainingSec <= 5.0
+                    ? 'text-red-400'
+                    : 'text-amber-300'
+                }`}
+              >
+                {snapshot.gunRange.timeRemainingSec.toFixed(1)}s
+              </span>
+              <span className="text-neutral-600" aria-hidden="true">
+                ·
+              </span>
+              <span>
+                Score <strong className="font-semibold text-neutral-50">{snapshot.gunRange.score}</strong>
+              </span>
+              <span className="text-neutral-600" aria-hidden="true">
+                ·
+              </span>
+              <span>
+                Hits <strong className="font-semibold text-neutral-100">{snapshot.gunRange.hits}</strong>
+                {snapshot.gunRange.headshots > 0 ? ` (${snapshot.gunRange.headshots} HS)` : ''}
+              </span>
+              <span className="text-neutral-600" aria-hidden="true">
+                ·
+              </span>
+              <span>Acc {snapshot.gunRange.accuracyPct}%</span>
+              {snapshot.gunRange.streak >= 3 && (
+                <>
+                  <span className="text-neutral-600" aria-hidden="true">
+                    ·
+                  </span>
+                  <span className="text-amber-400">Streak x{snapshot.gunRange.streak}</span>
+                </>
+              )}
+            </div>
+          )}
+
+          {snapshot.gunRange.phase === 'finished' && (
+            <div className="flex items-baseline gap-3 border border-amber-500/35 bg-[#0d0f12]/92 px-4 py-1.5 font-mono-tabular text-xs text-neutral-200">
+              <span className="font-display font-semibold tracking-wide text-amber-300">
+                {snapshot.gunRange.isNewBest ? 'New Record' : 'Course Complete'}
+              </span>
+              <span className="text-neutral-600" aria-hidden="true">
+                ·
+              </span>
+              <span className="font-semibold text-neutral-50">{snapshot.gunRange.score} pts</span>
+              <span className="text-neutral-600" aria-hidden="true">
+                ·
+              </span>
+              <span>{snapshot.gunRange.hits} hits</span>
+              <span className="text-neutral-600" aria-hidden="true">
+                ·
+              </span>
+              <span>{snapshot.gunRange.accuracyPct}% acc</span>
+              <span className="text-neutral-600" aria-hidden="true">
+                ·
+              </span>
+              <span className="text-neutral-400">Best {snapshot.gunRange.bestScore}</span>
+            </div>
+          )}
+
+          {snapshot.gunRange.phase === 'idle' && snapshot.currentRoomId === 'gun_range' && (
+            <div className="flex items-baseline gap-2.5 text-xs text-neutral-300/85">
+              <span className="font-medium text-amber-300/90">Live Fire Active</span>
+              {snapshot.gunRange.bestScore > 0 && (
+                <>
+                  <span className="text-neutral-600" aria-hidden="true">
+                    ·
+                  </span>
+                  <span className="font-mono-tabular text-neutral-300">
+                    CQB Best {snapshot.gunRange.bestScore}
+                  </span>
+                </>
+              )}
+              <span className="text-neutral-600" aria-hidden="true">
+                ·
+              </span>
+              <span className="text-neutral-400">
+                Shoot Amber Paddle or Use Console [F] for 30s Course
+              </span>
+            </div>
+          )}
+
+          {/* Transient target impact confirmation tick (positioned cleanly above reticle/prompt) */}
+          {snapshot.gunRange.lastHit && (
+            <div
+              className={`font-mono-tabular text-xs font-medium tracking-wide ${
+                snapshot.gunRange.lastHit.isNoShoot
+                  ? 'text-red-400'
+                  : snapshot.gunRange.lastHit.zone === 'head' ||
+                      snapshot.gunRange.lastHit.zone === 'gong' ||
+                      snapshot.gunRange.lastHit.zone === 'paddle'
+                    ? 'text-amber-300'
+                    : 'text-neutral-100'
+              }`}
+            >
+              {snapshot.gunRange.lastHit.zone === 'no_shoot'
+                ? `NO-SHOOT ${snapshot.gunRange.lastHit.scoreDelta}`
+                : snapshot.gunRange.lastHit.zone === 'paddle'
+                  ? snapshot.gunRange.lastHit.label
+                  : snapshot.gunRange.lastHit.zone === 'head'
+                    ? `HEADSHOT +${snapshot.gunRange.lastHit.scoreDelta} · ${snapshot.gunRange.lastHit.distanceM}m`
+                    : snapshot.gunRange.lastHit.zone === 'gong'
+                      ? `STEEL GONG · ${snapshot.gunRange.lastHit.distanceM}m`
+                      : snapshot.gunRange.lastHit.zone === 'a_zone'
+                        ? `A-ZONE +${snapshot.gunRange.lastHit.scoreDelta} · ${snapshot.gunRange.lastHit.distanceM}m`
+                        : `TORSO +${snapshot.gunRange.lastHit.scoreDelta} · ${snapshot.gunRange.lastHit.distanceM}m`}
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Subtle bottom-right equipped weapon readout when exploring */}
       {showLiveHud && (
         <div className="fixed bottom-5 right-6 text-right">
@@ -81,6 +212,12 @@ export const HideoutHud: React.FC<HideoutHudProps> = ({
           {snapshot.equippedWeaponId !== 'unarmed' && (
             <div className="mt-0.5 flex items-center justify-end gap-2 font-mono-tabular text-xs text-neutral-400">
               <span>{snapshot.equippedCaliber}</span>
+              {snapshot.fireModeLabel && (
+                <>
+                  <span aria-hidden="true">·</span>
+                  <span className="text-neutral-300">{snapshot.fireModeLabel}</span>
+                </>
+              )}
               <span aria-hidden="true">·</span>
               <span className="text-amber-400">
                 {snapshot.ammoInMag}/{snapshot.ammoReserve}

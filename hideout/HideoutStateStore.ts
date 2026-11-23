@@ -15,6 +15,11 @@ export interface HideoutPersistedState {
   equippedWeaponId: string;
   /** Reserve ammo rounds keyed by BaseCaliberId */
   ammoReserve: Record<string, number>;
+  /** Phase 2 Gun Range 30s CQB Pop-Up Course personal bests */
+  gunRangeBestScore: number;
+  gunRangeBestHits: number;
+  gunRangeBestAccuracy: number;
+  gunRangeCoursesCompleted: number;
 }
 
 const STORAGE_KEY = 'axon_hideout_state_v1';
@@ -80,6 +85,10 @@ class HideoutStateStore {
       wallRackSlots: ['akm_762', 'hk_mp5', 'remington_870', 'mosin_m91_30', 'makarov_pm'],
       equippedWeaponId: defaultEquipped,
       ammoReserve: { ...DEFAULT_RESERVE_BY_CALIBER },
+      gunRangeBestScore: 0,
+      gunRangeBestHits: 0,
+      gunRangeBestAccuracy: 0,
+      gunRangeCoursesCompleted: 0,
     };
 
     try {
@@ -107,6 +116,23 @@ class HideoutStateStore {
         wallRackSlots: wallSlots,
         equippedWeaponId: equippedRaw,
         ammoReserve,
+        gunRangeBestScore:
+          typeof parsed.gunRangeBestScore === 'number' && Number.isFinite(parsed.gunRangeBestScore)
+            ? Math.max(0, Math.round(parsed.gunRangeBestScore))
+            : 0,
+        gunRangeBestHits:
+          typeof parsed.gunRangeBestHits === 'number' && Number.isFinite(parsed.gunRangeBestHits)
+            ? Math.max(0, Math.round(parsed.gunRangeBestHits))
+            : 0,
+        gunRangeBestAccuracy:
+          typeof parsed.gunRangeBestAccuracy === 'number' && Number.isFinite(parsed.gunRangeBestAccuracy)
+            ? Math.max(0, Math.min(100, Math.round(parsed.gunRangeBestAccuracy)))
+            : 0,
+        gunRangeCoursesCompleted:
+          typeof parsed.gunRangeCoursesCompleted === 'number' &&
+          Number.isFinite(parsed.gunRangeCoursesCompleted)
+            ? Math.max(0, Math.round(parsed.gunRangeCoursesCompleted))
+            : 0,
       };
     } catch {
       return fallback;
@@ -129,6 +155,10 @@ class HideoutStateStore {
       wallRackSlots: [...this.state.wallRackSlots],
       equippedWeaponId: this.state.equippedWeaponId,
       ammoReserve: { ...this.state.ammoReserve },
+      gunRangeBestScore: this.state.gunRangeBestScore,
+      gunRangeBestHits: this.state.gunRangeBestHits,
+      gunRangeBestAccuracy: this.state.gunRangeBestAccuracy,
+      gunRangeCoursesCompleted: this.state.gunRangeCoursesCompleted,
     };
   }
 
@@ -312,6 +342,22 @@ class HideoutStateStore {
       ammoReserve: nextReserve,
     };
     this.saveAndEmit();
+  }
+
+  public recordGunRangeRun(score: number, hits: number, accuracyPct: number): boolean {
+    const cleanScore = Math.max(0, Math.round(score));
+    const cleanHits = Math.max(0, Math.round(hits));
+    const cleanAcc = Math.max(0, Math.min(100, Math.round(accuracyPct)));
+    const isNewBest = cleanScore > this.state.gunRangeBestScore && cleanScore > 0;
+    this.state = {
+      ...this.state,
+      gunRangeBestScore: Math.max(this.state.gunRangeBestScore, cleanScore),
+      gunRangeBestHits: Math.max(this.state.gunRangeBestHits, cleanHits),
+      gunRangeBestAccuracy: Math.max(this.state.gunRangeBestAccuracy, cleanAcc),
+      gunRangeCoursesCompleted: this.state.gunRangeCoursesCompleted + 1,
+    };
+    this.saveAndEmit();
+    return isNewBest;
   }
 
   public subscribe(fn: HideoutStateListener): () => void {

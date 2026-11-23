@@ -11,6 +11,8 @@ import {
 import { loadoutStore } from '../data/loadoutStore';
 import { DestructibleDoorSystem } from '../doors/DestructibleDoorSystem';
 import { createHideoutMaterials, HideoutMaterialLibrary } from './HideoutMaterials';
+import { HideoutGunRange, HideoutGunRangeCallbacks } from './HideoutGunRange';
+import { hideoutStateStore } from './HideoutStateStore';
 
 export type HideoutRoomId = 'arsenal' | 'gun_range' | 'ready_room' | 'zombies_portal';
 
@@ -18,7 +20,9 @@ export type HideoutInteractableKind =
   | 'gun_wall_slot'
   | 'prep_table_gunsmith'
   | 'locker_door'
-  | 'ammo_crate';
+  | 'ammo_crate'
+  | 'range_console'
+  | 'range_ammo_box';
 
 export interface HideoutInteractableMeta {
   kind: HideoutInteractableKind;
@@ -66,6 +70,7 @@ export interface HideoutBunkerWorldHandle {
   physics: BodycamPhysicsWorld;
   materials: HideoutMaterialLibrary;
   doorSystem: DestructibleDoorSystem;
+  gunRange: HideoutGunRange;
   root: THREE.Group;
   raycastMeshes: THREE.Object3D[];
   interactableMeshes: THREE.Mesh[];
@@ -102,6 +107,7 @@ export function buildHideoutBunkerWorld(
   scene: THREE.Scene,
   renderer: THREE.WebGLRenderer,
   isSoftwareGl: boolean,
+  gunRangeCallbacks?: HideoutGunRangeCallbacks,
 ): HideoutBunkerWorldHandle {
   const physics = new BodycamPhysicsWorld();
   physics.baseFloorY = 0;
@@ -828,7 +834,24 @@ export function buildHideoutBunkerWorld(
   root.add(crateProxy);
   interactableMeshes.push(crateProxy);
 
-  // Register static world raycast meshes BEFORE mounting dynamic destructible doors
+  // ============================================================================
+  // 5B. PHASE 2 GUN RANGE — REACTIVE TARGETS & 30-SECOND CQB POP-UP COURSE
+  // ============================================================================
+  // Mounted BEFORE physics.setRaycastMeshes so every target plate, gong, paper
+  // board, CQB pop-up, and shoot-house barricade is registered for live bullets.
+  const gunRange = new HideoutGunRange(
+    root,
+    physics,
+    materials,
+    raycastMeshes,
+    interactableMeshes,
+    isSoftwareGl,
+    maxAniso,
+    hideoutStateStore.getState().gunRangeBestScore,
+    gunRangeCallbacks,
+  );
+
+  // Register static world & Gun Range raycast meshes BEFORE mounting dynamic destructible doors
   physics.setRaycastMeshes(raycastMeshes);
 
   // ============================================================================
@@ -937,6 +960,9 @@ export function buildHideoutBunkerWorld(
     } else {
       crateLidPivot.rotation.x = 0;
     }
+
+    // Step Gun Range reactive targets, swinging gongs, and 30s CQB pop-up course
+    gunRange.update(clampedDt);
   };
 
   const getSlotTransform = (
@@ -966,6 +992,12 @@ export function buildHideoutBunkerWorld(
       outPos.set(tableX, tableH + 0.04, tableZ);
       return true;
     }
+    if (kind === 'range_console') {
+      return gunRange.getConsoleWorldPos(outPos);
+    }
+    if (kind === 'range_ammo_box') {
+      return gunRange.getRangeAmmoWorldPos(outPos);
+    }
     return false;
   };
 
@@ -973,6 +1005,7 @@ export function buildHideoutBunkerWorld(
     physics,
     materials,
     doorSystem,
+    gunRange,
     root,
     raycastMeshes,
     interactableMeshes,
@@ -988,6 +1021,7 @@ export function buildHideoutBunkerWorld(
     getSlotTransform,
     updateProps,
     dispose: () => {
+      gunRange.dispose();
       doorSystem.dispose();
       for (const slot of gunWallSlots) {
         if (slot.assembly) {
