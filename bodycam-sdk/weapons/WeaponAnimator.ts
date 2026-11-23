@@ -51,8 +51,61 @@ export type WeaponSuppressorSubPhase =
   | 'REACH_MUZZLE'
   | 'REACH_POUCH'
   | 'TWIST_THREAD'
+  | 'CLEAR_PULL'
   | 'STOW_OR_CLEAR'
   | 'RETURN_GRIP';
+
+export type WeaponHandlingMicroAction =
+  | 'NONE'
+  | 'ZOOM_TWIST'
+  | 'TURRET'
+  | 'ILLUM'
+  | 'SELECTOR'
+  | 'LIGHT_PAD';
+
+export type WeaponSyncedHandlingAction =
+  | 'NONE'
+  | 'RELOAD'
+  | 'PUMP'
+  | 'BOLT'
+  | 'SUPPRESSOR_DETACH'
+  | 'SUPPRESSOR_ATTACH'
+  | 'ZOOM_TWIST'
+  | 'TURRET'
+  | 'ILLUM'
+  | 'SELECTOR'
+  | 'LIGHT_PAD'
+  | 'MAG_CHECK'
+  | 'INSPECT';
+
+export type TubularReloadPhase =
+  | 'NONE'
+  | 'ENTER'
+  | 'OPEN_BREECH'
+  | 'BREECH_LOAD'
+  | 'CLOSE_BREECH'
+  | 'FEED_SHELL'
+  | 'EXIT';
+
+export interface RatchetedSuppressorTwistSample {
+  /** 0..1 cumulative rotational progress across 3 discrete strokes (frozen during regrips) */
+  cumulativeAngle01: number;
+  /** 0..1 cumulative axial thread travel across 3 discrete strokes (frozen during regrips) */
+  axial01: number;
+  /** Signed left-wrist pronation/supination roll in radians synchronized with torque & regrip */
+  wristRollRad: number;
+  /** 0..1 finger grip release opening during regrip roll-back (0 = firm grip, 1 = open fingers) */
+  gripRelease01: number;
+  /** Subtle counter-torque roll imparted onto the weapon body during active turning */
+  weaponCounterRollRad: number;
+  /** Active stroke index 0, 1, or 2 */
+  strokeIndex: number;
+}
+
+export interface WeaponSyncedHandlingSnapshot {
+  action: WeaponSyncedHandlingAction;
+  progress: number;
+}
 
 export interface WeaponPoseUpdateInput {
   dt: number;
@@ -155,11 +208,75 @@ export function dampSlerp(
 }
 
 const INSPECT_DURATION_SEC = 3.2;
-const SUPPRESSOR_TOGGLE_DURATION_SEC = 2.15;
+export const SUPPRESSOR_TOGGLE_DURATION_SEC = 2.45;
 const SUPPRESSOR_THREAD_TRAVEL_M = 0.032;
+const SUPPRESSOR_CLEAR_PULL_M = 0.025;
+const SUPPRESSOR_STROKE_COUNT = 3;
+const SUPPRESSOR_TORQUE_FRAC = 0.68;
+const SUPPRESSOR_TOTAL_RAD = Math.PI * 2; // 3 x ~120° ratcheted strokes = 360° total visual turn
 const BLOWBACK_BACK_SEC = 0.025; // ~25ms rearward blowback
 const BLOWBACK_FWD_SEC = 0.045; // ~45ms forward return to battery
 const BLOWBACK_TOTAL_SEC = BLOWBACK_BACK_SEC + BLOWBACK_FWD_SEC;
+
+/**
+ * Pure deterministic 3-stroke ratcheted suppressor twist evaluator shared by 1P, 3P AI/remote rigs, and unit tests.
+ * During each stroke's torque window [0..0.68], wrist & suppressor rotate synchronously and thread axially.
+ * During each stroke's regrip window [0.68..1.0], fingers release (`gripRelease01` peaks), wrist rolls back,
+ * and the suppressor's rotation & axial thread position remain strictly stationary (zero telekinetic spinning).
+ */
+export function evalRatchetedSuppressorTwist(
+  twistT: number,
+  attach: boolean,
+  out: RatchetedSuppressorTwistSample = {
+    cumulativeAngle01: 0,
+    axial01: 0,
+    wristRollRad: 0,
+    gripRelease01: 0,
+    weaponCounterRollRad: 0,
+    strokeIndex: 0,
+  },
+): RatchetedSuppressorTwistSample {
+  const clamped = THREE.MathUtils.clamp(twistT, 0, 1);
+  const scaled = clamped * SUPPRESSOR_STROKE_COUNT;
+  const strokeIndex = Math.min(SUPPRESSOR_STROKE_COUNT - 1, Math.floor(scaled));
+  const localU =
+    strokeIndex === SUPPRESSOR_STROKE_COUNT - 1 && scaled >= SUPPRESSOR_STROKE_COUNT
+      ? 1
+      : scaled - strokeIndex;
+  const sign = attach ? 1 : -1;
+  const strokeSpan = 1 / SUPPRESSOR_STROKE_COUNT;
+  const maxWristRoll = 0.58;
+
+  if (localU <= SUPPRESSOR_TORQUE_FRAC) {
+    const tau = smoothstep(0, SUPPRESSOR_TORQUE_FRAC, localU);
+    const prog = strokeIndex * strokeSpan + tau * strokeSpan;
+    out.cumulativeAngle01 = prog;
+    out.axial01 = prog;
+    out.wristRollRad = THREE.MathUtils.lerp(-sign * maxWristRoll, sign * maxWristRoll, tau);
+    // Quick finger clamp on start of stroke
+    out.gripRelease01 = (1 - smoothstep(0, 0.14, tau)) * 0.25;
+    out.weaponCounterRollRad = -sign * Math.sin(tau * Math.PI) * 0.026;
+  } else {
+    const r = (localU - SUPPRESSOR_TORQUE_FRAC) / (1 - SUPPRESSOR_TORQUE_FRAC);
+    const frozenProg = (strokeIndex + 1) * strokeSpan;
+    out.cumulativeAngle01 = frozenProg;
+    out.axial01 = frozenProg;
+    out.weaponCounterRollRad = 0;
+    if (strokeIndex < SUPPRESSOR_STROKE_COUNT - 1) {
+      // Open fingers cleanly off tube, roll wrist back to start of next stroke, re-clamp
+      out.gripRelease01 = Math.sin(r * Math.PI) * 0.88;
+      const rollBack = smoothstep(0.12, 0.88, r);
+      out.wristRollRad = THREE.MathUtils.lerp(sign * maxWristRoll, -sign * maxWristRoll, rollBack);
+    } else {
+      // Final stroke settle: relax wrist cleanly to neutral for clear-pull / return
+      const settle = smoothstep(0, 1, r);
+      out.wristRollRad = THREE.MathUtils.lerp(sign * maxWristRoll, 0, settle);
+      out.gripRelease01 = attach ? settle * 0.45 : 0;
+    }
+  }
+  out.strokeIndex = strokeIndex;
+  return out;
+}
 
 /**
  * Portable Mechanical Gun Animator & Pose-Graph Interpolator for the Bodycam SDK:
@@ -206,6 +323,10 @@ export class WeaponAnimator {
   private hammerTimer = 0;
   private triggerTimer = 0;
   private pumpCycleTimer = -1;
+  private pumpEjectPending = false;
+  private pumpCycleSuppressed = false;
+  private pumpRackBackCueFired = false;
+  private pumpRackFwdCueFired = false;
   private isBoltLockedOpen = false;
   private manualBoltPull01 = 0;
   private magSeatImpulseY = 0;
@@ -232,18 +353,59 @@ export class WeaponAnimator {
   private reloadCueOutFired = false;
   private reloadCueInFired = false;
   private reloadCueRackFired = false;
+  private reloadStartedFromEmpty = false;
   private magCheckOutFired = false;
   private magCheckInFired = false;
   private magazineDetachedInHand = false;
   private magCheckPullM = 0;
   private inspectLeftHandSlideZ = 0;
 
-  // Suppressor field twist-and-stow state
+  // Shell-by-shell tubular shotgun reload state machine
+  private tubularPhase: TubularReloadPhase = 'NONE';
+  private tubularPhaseTime = 0;
+  private tubularPhaseDuration = 0.24;
+  private tubularShellsRemaining = 0;
+  private tubularShellsTotal = 0;
+  private tubularShellsLoaded = 0;
+  private tubularInterruptRequested = false;
+  private tubularShellInHand = false;
+  private tubularShellInsertedThisCycle = false;
+  private tubularPumpOpen01 = 0;
+  private tubularOnShellInserted: (() => void) | null = null;
+  private tubularOnComplete: (() => void) | null = null;
+
+  // Non-blocking combat-interruptible firearm handling micro-actions
+  private microAction: WeaponHandlingMicroAction = 'NONE';
+  private microActionTime = 0;
+  private microActionDuration = 0.24;
+  private selectorAngleTarget = 0;
+  private selectorAngleCurrent = 0;
+  private illumDialAngleTarget = 0;
+  private illumDialAngleCurrent = 0;
+
+  // Suppressor field ratcheted twist-and-stow state
   private suppressorInHand = false;
   private suppressorPreActionVisible = true;
   private suppressorTwistPhase01 = 0;
   private suppressorCueMask = 0;
   private suppressorOnComplete: ((attached: boolean) => void) | null = null;
+  private suppressorHandoffBlend = 0;
+  private readonly _suppTwistSample: RatchetedSuppressorTwistSample = {
+    cumulativeAngle01: 0,
+    axial01: 0,
+    wristRollRad: 0,
+    gripRelease01: 0,
+    weaponCounterRollRad: 0,
+    strokeIndex: 0,
+  };
+  private readonly _suppPalmTargetPos = new THREE.Vector3(0.006, -0.024, -0.044);
+  private readonly _suppPalmTargetQuat = new THREE.Quaternion().setFromEuler(
+    new THREE.Euler(Math.PI * 0.46, 0.08, -Math.PI * 0.35),
+  );
+  private readonly _syncedHandlingSnapshot: WeaponSyncedHandlingSnapshot = {
+    action: 'NONE',
+    progress: 0,
+  };
 
   // Pooled brass casings & ejection-port micro-smoke puffs (zero per-frame allocations)
   private readonly casingPool: PooledBrassCasing[] = [];
@@ -348,6 +510,7 @@ export class WeaponAnimator {
     triggerEquipBlend = true,
   ): void {
     this.restoreMagazineHome();
+    this.restoreReloadShellHome();
     if (this.isSuppressorActionActive()) {
       this.restoreSuppressorHome(this.suppressorPreActionVisible);
     }
@@ -355,12 +518,26 @@ export class WeaponAnimator {
     this.suppressorInHand = false;
     this.suppressorTwistPhase01 = 0;
     this.suppressorCueMask = 0;
+    this.suppressorHandoffBlend = 0;
+    this.tubularPhase = 'NONE';
+    this.tubularShellsRemaining = 0;
+    this.tubularShellInHand = false;
+    this.tubularPumpOpen01 = 0;
+    this.tubularOnShellInserted = null;
+    this.tubularOnComplete = null;
+    this.microAction = 'NONE';
+    this.microActionTime = 0;
+    this.selectorAngleTarget = 0;
+    this.selectorAngleCurrent = 0;
+    this.illumDialAngleTarget = 0;
+    this.illumDialAngleCurrent = 0;
     this.assembly = assembly;
     this.weightClass = weightClass;
     this.blowbackTimer = -1;
     this.hammerTimer = 0;
     this.triggerTimer = 0;
     this.pumpCycleTimer = -1;
+    this.pumpEjectPending = false;
     this.boltCycleTimer = -1;
     this.boltRightHandBlend = 0;
     this.boltCycleOffsetZ = 0;
@@ -438,6 +615,52 @@ export class WeaponAnimator {
     return this.boltCycleOffsetZ;
   }
 
+  public getTriggerPull01(): number {
+    if (this.triggerTimer <= 0) return 0;
+    return Math.sin(THREE.MathUtils.clamp(this.triggerTimer / 0.09, 0, 1) * Math.PI);
+  }
+
+  public isPumpCycling(): boolean {
+    return this.pumpCycleTimer >= 0;
+  }
+
+  public getPumpCycleProgress(): number {
+    if (this.pumpCycleTimer < 0) return 0;
+    return THREE.MathUtils.clamp(this.pumpCycleTimer / 0.33, 0, 1);
+  }
+
+  public isTubularReloading(): boolean {
+    return this.tubularPhase !== 'NONE';
+  }
+
+  public getTubularReloadPhase(): TubularReloadPhase {
+    return this.tubularPhase;
+  }
+
+  public getTubularPhaseProgress(): number {
+    if (this.tubularPhase === 'NONE') return 0;
+    return THREE.MathUtils.clamp(
+      this.tubularPhaseTime / Math.max(0.05, this.tubularPhaseDuration),
+      0,
+      1,
+    );
+  }
+
+  public isTubularShellInHand(): boolean {
+    return this.tubularShellInHand;
+  }
+
+  public isArBoltCatchSlap(): boolean {
+    if (this.action !== 'RELOAD' || !this.reloadStartedFromEmpty) return false;
+    const style = this.assembly?.visualStyle;
+    return (
+      style === 'carbine_ar' ||
+      style === 'ARCarbine' ||
+      style === 'PistonCarbine' ||
+      style === 'AR10_HeavyDMR'
+    );
+  }
+
   public isSuppressorActionActive(): boolean {
     return this.action === 'SUPPRESSOR_ATTACH' || this.action === 'SUPPRESSOR_DETACH';
   }
@@ -450,20 +673,32 @@ export class WeaponAnimator {
     return this.suppressorTwistPhase01;
   }
 
+  public getSuppressorWristRollRad(): number {
+    if (!this.isSuppressorActionActive()) return 0;
+    return this._suppTwistSample.wristRollRad;
+  }
+
+  public getSuppressorGripRelease01(): number {
+    if (!this.isSuppressorActionActive()) return 0;
+    return this._suppTwistSample.gripRelease01;
+  }
+
   public getSuppressorSubPhase(): WeaponSuppressorSubPhase {
     if (this.action === 'SUPPRESSOR_DETACH') {
       const p = this.getActionProgress();
-      if (p < 0.12) return 'TILT_WEAPON';
-      if (p < 0.24) return 'REACH_MUZZLE';
-      if (p < 0.64) return 'TWIST_THREAD';
-      if (p < 0.84) return 'STOW_OR_CLEAR';
+      if (p < 0.10) return 'TILT_WEAPON';
+      if (p < 0.21) return 'REACH_MUZZLE';
+      if (p < 0.61) return 'TWIST_THREAD';
+      if (p < 0.67) return 'CLEAR_PULL';
+      if (p < 0.86) return 'STOW_OR_CLEAR';
       return 'RETURN_GRIP';
     }
     if (this.action === 'SUPPRESSOR_ATTACH') {
       const p = this.getActionProgress();
-      if (p < 0.12) return 'TILT_WEAPON';
-      if (p < 0.32) return 'REACH_POUCH';
-      if (p < 0.44) return 'REACH_MUZZLE';
+      if (p < 0.10) return 'TILT_WEAPON';
+      if (p < 0.28) return 'REACH_POUCH';
+      if (p < 0.40) return 'REACH_MUZZLE';
+      if (p < 0.44) return 'CLEAR_PULL';
       if (p < 0.84) return 'TWIST_THREAD';
       return 'RETURN_GRIP';
     }
@@ -479,6 +714,104 @@ export class WeaponAnimator {
     if (p < 0.65) return 'INSERT_MAG';
     if (p < 0.86) return 'RACK_BOLT';
     return 'RETURN';
+  }
+
+  public getActiveMicroAction(): WeaponHandlingMicroAction {
+    return this.microAction;
+  }
+
+  public getMicroActionProgress(): number {
+    if (this.microAction === 'NONE') return 0;
+    return THREE.MathUtils.clamp(
+      this.microActionTime / Math.max(0.05, this.microActionDuration),
+      0,
+      1,
+    );
+  }
+
+  public getMicroActionWeight(): number {
+    if (this.microAction === 'NONE') return 0;
+    const p = this.getMicroActionProgress();
+    if (p < 0.28) return smoothstep(0, 0.28, p);
+    if (p < 0.72) return 1;
+    return 1 - smoothstep(0.72, 1, p);
+  }
+
+  public getRightThumbFlick01(): number {
+    if (this.microAction !== 'SELECTOR') return 0;
+    if (this.assembly?.selectorSide !== 'right_thumb') return 0;
+    return this.getMicroActionWeight();
+  }
+
+  public isBlockingFiringAction(): boolean {
+    return (
+      this.action === 'RELOAD' ||
+      this.action === 'SUPPRESSOR_ATTACH' ||
+      this.action === 'SUPPRESSOR_DETACH' ||
+      this.boltCycleTimer >= 0 ||
+      this.pumpCycleTimer >= 0
+    );
+  }
+
+  /** Compact network-ready handling snapshot for multiplayer & 3P AI replication */
+  public getSyncedHandlingSnapshot(): Readonly<WeaponSyncedHandlingSnapshot> {
+    const snap = this._syncedHandlingSnapshot;
+    if (this.action === 'SUPPRESSOR_DETACH') {
+      snap.action = 'SUPPRESSOR_DETACH';
+      snap.progress = this.getActionProgress();
+      return snap;
+    }
+    if (this.action === 'SUPPRESSOR_ATTACH') {
+      snap.action = 'SUPPRESSOR_ATTACH';
+      snap.progress = this.getActionProgress();
+      return snap;
+    }
+    if (this.action === 'RELOAD') {
+      snap.action = 'RELOAD';
+      snap.progress = this.getActionProgress();
+      return snap;
+    }
+    if (this.tubularPhase !== 'NONE') {
+      snap.action = 'RELOAD';
+      const frac =
+        this.tubularShellsTotal > 0
+          ? (this.tubularShellsLoaded + this.getTubularPhaseProgress()) / (this.tubularShellsTotal + 1)
+          : this.getTubularPhaseProgress();
+      snap.progress = THREE.MathUtils.clamp(frac, 0, 1);
+      return snap;
+    }
+    if (this.boltCycleTimer >= 0) {
+      snap.action = 'BOLT';
+      snap.progress = THREE.MathUtils.clamp(
+        this.boltCycleTimer / Math.max(0.4, this.boltCycleDuration),
+        0,
+        1,
+      );
+      return snap;
+    }
+    if (this.pumpCycleTimer >= 0) {
+      snap.action = 'PUMP';
+      snap.progress = this.getPumpCycleProgress();
+      return snap;
+    }
+    if (this.action === 'MAG_CHECK') {
+      snap.action = 'MAG_CHECK';
+      snap.progress = this.getActionProgress();
+      return snap;
+    }
+    if (this.action === 'INSPECT') {
+      snap.action = 'INSPECT';
+      snap.progress = this.getActionProgress();
+      return snap;
+    }
+    if (this.microAction !== 'NONE') {
+      snap.action = this.microAction;
+      snap.progress = this.getMicroActionProgress();
+      return snap;
+    }
+    snap.action = 'NONE';
+    snap.progress = 0;
+    return snap;
   }
 
   public emitWeaponCue(
@@ -509,6 +842,12 @@ export class WeaponAnimator {
     remainingAmmoAfterShot?: number,
     opts?: WeaponFireAnimOptions,
   ): void {
+    // Strictly block firing while suppressor is being detached or mounted
+    if (this.isSuppressorActionActive()) return;
+    this.cancelMicroAction();
+    if (this.tubularPhase !== 'NONE') {
+      this.abortTubularReloadImmediate();
+    }
     if (this.action === 'INSPECT' || this.action === 'MAG_CHECK') {
       this.interruptInspect();
     }
@@ -540,17 +879,27 @@ export class WeaponAnimator {
       return;
     }
 
-    this.blowbackTimer = 0;
-    if (this.assembly?.pumpForend && opts?.cyclePump !== false) {
+    const willPumpCycle = Boolean(this.assembly?.pumpForend && opts?.cyclePump !== false);
+    this.blowbackTimer = willPumpCycle ? -1 : 0;
+    if (willPumpCycle) {
       this.pumpCycleTimer = 0;
+      this.pumpEjectPending = true;
+      this.pumpCycleSuppressed = suppressed;
+      this.pumpRackBackCueFired = false;
+      this.pumpRackFwdCueFired = false;
     }
     if (remainingAmmoAfterShot !== undefined) {
-      this.isBoltLockedOpen = remainingAmmoAfterShot <= 0;
+      this.isBoltLockedOpen = !willPumpCycle && remainingAmmoAfterShot <= 0;
     }
-    this.spawnCasingAndSmoke(suppressed);
+    // Pump shotguns eject spent hull at the apex of rearward pump extraction rather than on ignition
+    if (!willPumpCycle) {
+      this.spawnCasingAndSmoke(suppressed);
+    }
   }
 
   public triggerDryFire(): void {
+    if (this.isSuppressorActionActive()) return;
+    this.cancelMicroAction();
     if (this.action === 'INSPECT') {
       this.interruptInspect();
     }
@@ -561,6 +910,10 @@ export class WeaponAnimator {
 
   public triggerReload(durationSec: number): void {
     if (this.isSuppressorActionActive()) return;
+    this.cancelMicroAction();
+    if (this.tubularPhase !== 'NONE') {
+      this.abortTubularReloadImmediate();
+    }
     if (this.action === 'INSPECT') {
       this.interruptInspect();
     }
@@ -571,11 +924,135 @@ export class WeaponAnimator {
     this.reloadCueOutFired = false;
     this.reloadCueInFired = false;
     this.reloadCueRackFired = false;
+    this.reloadStartedFromEmpty = this.isBoltLockedOpen;
     this.magazineDetachedInHand = false;
   }
 
+  /**
+   * Shell-by-shell tubular shotgun reload:
+   *  - If empty chamber, racks pump open, drops first shell into side ejection port/breech, closes pump,
+   *    then feeds remaining shells one-by-one into underside loading port.
+   *  - Supports instant click-to-fire interruption (`interruptTubularReload()`).
+   */
+  public triggerTubularReload(
+    shellsToLoad: number,
+    isEmptyChamber: boolean,
+    onShellInserted?: () => void,
+    onComplete?: () => void,
+  ): boolean {
+    if (shellsToLoad <= 0) return false;
+    if (
+      this.isSuppressorActionActive() ||
+      this.action === 'RELOAD' ||
+      this.tubularPhase !== 'NONE' ||
+      this.pumpCycleTimer >= 0
+    ) {
+      return false;
+    }
+    this.cancelMicroAction();
+    if (this.action === 'INSPECT' || this.action === 'MAG_CHECK') {
+      this.interruptInspect();
+    }
+    this.tubularShellsRemaining = shellsToLoad;
+    this.tubularShellsTotal = shellsToLoad;
+    this.tubularShellsLoaded = 0;
+    this.tubularInterruptRequested = false;
+    this.tubularShellInHand = false;
+    this.tubularShellInsertedThisCycle = false;
+    this.tubularPumpOpen01 = 0;
+    this.tubularOnShellInserted = onShellInserted ?? null;
+    this.tubularOnComplete = onComplete ?? null;
+    this.tubularPhase = isEmptyChamber ? 'OPEN_BREECH' : 'ENTER';
+    this.tubularPhaseTime = 0;
+    this.tubularPhaseDuration = isEmptyChamber ? 0.24 : 0.18;
+    this.emitCue('ads_rustle', 0.72);
+    return true;
+  }
+
+  /** Request graceful immediate exit from tubular reload (e.g., player clicks LMB to fire loaded shell) */
+  public interruptTubularReload(): void {
+    if (this.tubularPhase === 'NONE') return;
+    this.tubularInterruptRequested = true;
+    if (this.tubularPhase === 'FEED_SHELL' && this.tubularPhaseTime < this.tubularPhaseDuration * 0.45) {
+      this.tubularShellInHand = false;
+      this.restoreReloadShellHome();
+      this.tubularPhase = 'EXIT';
+      this.tubularPhaseTime = 0;
+      this.tubularPhaseDuration = 0.12;
+      this.interruptFastBlendTimer = 0.14;
+    }
+  }
+
+  private abortTubularReloadImmediate(): void {
+    this.tubularPhase = 'NONE';
+    this.tubularPhaseTime = 0;
+    this.tubularShellsRemaining = 0;
+    this.tubularShellInHand = false;
+    this.tubularPumpOpen01 = 0;
+    this.tubularOnShellInserted = null;
+    this.tubularOnComplete = null;
+    this.restoreReloadShellHome();
+    this.interruptFastBlendTimer = 0.14;
+  }
+
+  public triggerMicroAction(
+    kind: WeaponHandlingMicroAction,
+    durationSec?: number,
+    param?: number,
+  ): boolean {
+    if (kind === 'NONE') return false;
+    if (
+      this.action === 'RELOAD' ||
+      this.action === 'MAG_CHECK' ||
+      this.isSuppressorActionActive() ||
+      this.tubularPhase !== 'NONE' ||
+      this.boltCycleTimer >= 0 ||
+      this.pumpCycleTimer >= 0
+    ) {
+      return false;
+    }
+    if (this.action === 'INSPECT') {
+      this.interruptInspect();
+    }
+    this.microAction = kind;
+    this.microActionTime = 0;
+    this.microActionDuration =
+      durationSec ??
+      (kind === 'ZOOM_TWIST'
+        ? 0.28
+        : kind === 'TURRET'
+          ? 0.24
+          : kind === 'ILLUM'
+            ? 0.22
+            : kind === 'SELECTOR'
+              ? 0.18
+              : 0.16);
+
+    if (kind === 'SELECTOR') {
+      // Rotate physical selector lever between detents (~28° per click)
+      const step = param !== undefined ? param : 1;
+      this.selectorAngleTarget =
+        param !== undefined ? step * 0.48 : this.selectorAngleTarget > 0.2 ? 0 : 0.52;
+      this.emitCue('mode_toggle', 0.92);
+    } else if (kind === 'ILLUM') {
+      this.illumDialAngleTarget += 0.62;
+      this.emitCue('mode_toggle', 0.68);
+    } else if (kind === 'TURRET') {
+      this.emitCue('mode_toggle', 0.62);
+    } else if (kind === 'LIGHT_PAD') {
+      this.emitCue('mode_toggle', 0.55);
+    }
+    return true;
+  }
+
+  public cancelMicroAction(): void {
+    this.microAction = 'NONE';
+    this.microActionTime = 0;
+  }
+
   public triggerMagCheck(durationSec: number): void {
-    if (this.action === 'RELOAD' || this.isSuppressorActionActive()) return;
+    if (this.action === 'RELOAD' || this.isSuppressorActionActive() || this.tubularPhase !== 'NONE') return;
+    this.cancelMicroAction();
     if (this.action === 'INSPECT') {
       this.interruptInspect();
     }
@@ -588,7 +1065,7 @@ export class WeaponAnimator {
     this.magCheckPullM = 0;
   }
 
-  /** Trigger blocking ~2.15s realistic field suppressor twist-and-stow sequence (`G` key) */
+  /** Trigger blocking ~2.45s realistic 3-stroke ratcheted suppressor detach/reattach sequence (`G` key) */
   public triggerSuppressorToggle(
     attach: boolean,
     onComplete?: (attached: boolean) => void,
@@ -599,10 +1076,13 @@ export class WeaponAnimator {
       this.action === 'RELOAD' ||
       this.action === 'MAG_CHECK' ||
       this.isSuppressorActionActive() ||
-      this.boltCycleTimer >= 0
+      this.tubularPhase !== 'NONE' ||
+      this.boltCycleTimer >= 0 ||
+      this.pumpCycleTimer >= 0
     ) {
       return false;
     }
+    this.cancelMicroAction();
     if (this.action === 'INSPECT') {
       this.interruptInspect();
     }
@@ -611,10 +1091,16 @@ export class WeaponAnimator {
     this.suppressorInHand = false;
     this.suppressorTwistPhase01 = 0;
     this.suppressorCueMask = 0;
+    this.suppressorHandoffBlend = 0;
+    this._suppTwistSample.cumulativeAngle01 = 0;
+    this._suppTwistSample.axial01 = 0;
+    this._suppTwistSample.wristRollRad = 0;
+    this._suppTwistSample.gripRelease01 = 0;
+    this._suppTwistSample.weaponCounterRollRad = 0;
     this.suppressorOnComplete = onComplete ?? null;
     this.action = attach ? 'SUPPRESSOR_ATTACH' : 'SUPPRESSOR_DETACH';
     this.actionTime = 0;
-    this.actionDuration = Math.max(1.4, durationSec);
+    this.actionDuration = Math.max(1.8, durationSec);
     this.emitCue('ads_rustle', 0.78);
     return true;
   }
@@ -625,10 +1111,12 @@ export class WeaponAnimator {
       !this.assembly ||
       this.action === 'RELOAD' ||
       this.action === 'MAG_CHECK' ||
-      this.isSuppressorActionActive()
+      this.isSuppressorActionActive() ||
+      this.tubularPhase !== 'NONE'
     ) {
       return false;
     }
+    this.cancelMicroAction();
     if (this.action === 'INSPECT') {
       this.interruptInspect();
       return false;
@@ -655,6 +1143,10 @@ export class WeaponAnimator {
 
   public cancelAction(): void {
     this.restoreMagazineHome();
+    if (this.tubularPhase !== 'NONE') {
+      this.abortTubularReloadImmediate();
+    }
+    this.cancelMicroAction();
     if (this.isSuppressorActionActive()) {
       this.restoreSuppressorHome(this.suppressorPreActionVisible);
     }
@@ -662,6 +1154,10 @@ export class WeaponAnimator {
     this.suppressorInHand = false;
     this.suppressorTwistPhase01 = 0;
     this.suppressorCueMask = 0;
+    this.suppressorHandoffBlend = 0;
+    this._suppTwistSample.wristRollRad = 0;
+    this._suppTwistSample.gripRelease01 = 0;
+    this._suppTwistSample.weaponCounterRollRad = 0;
     this.action = 'NONE';
     this.actionTime = 0;
     this.manualBoltPull01 = 0;
@@ -674,6 +1170,7 @@ export class WeaponAnimator {
   /** Safely returns the physical suppressor mesh back to muzzleMountSocket with clean thread home transform */
   public restoreSuppressorHome(visibleOverride?: boolean): void {
     this.suppressorInHand = false;
+    this.suppressorHandoffBlend = 0;
     const supp = this.assembly?.suppressor;
     if (!supp || !this.assembly) return;
     if (supp.parent !== this.assembly.muzzleMountSocket) {
@@ -688,32 +1185,87 @@ export class WeaponAnimator {
     }
   }
 
+  /** Safely returns the physical shotgun reload shell back hidden inside the weapon group */
+  public restoreReloadShellHome(): void {
+    const shell = this.assembly?.reloadShellMesh;
+    if (!shell || !this.assembly) return;
+    if (shell.parent !== this.assembly.group) {
+      this.assembly.group.add(shell);
+    }
+    shell.visible = false;
+    shell.position.set(0, 0, 0);
+    shell.rotation.set(0, 0, 0);
+  }
+
+  /**
+   * Called by CharacterAnimator to physically hold `assembly.reloadShellMesh` in `handL`
+   * during shell-by-shell tubular shotgun reloads.
+   */
+  public syncPhysicalShellParent(leftHandRoot: THREE.Object3D): void {
+    const shell = this.assembly?.reloadShellMesh;
+    if (!shell || !this.assembly) return;
+
+    if (this.tubularPhase !== 'NONE' && this.tubularShellInHand) {
+      if (shell.parent !== leftHandRoot) {
+        leftHandRoot.add(shell);
+        shell.position.set(0.008, -0.020, -0.044);
+        shell.rotation.set(0, 0, 0);
+      }
+      shell.visible = true;
+    } else if (shell.visible || shell.parent !== this.assembly.group) {
+      this.restoreReloadShellHome();
+    }
+  }
+
   /**
    * Called by CharacterAnimator to physically parent `assembly.suppressor` into `handL`
-   * while stowing to / retrieving from the chest pouch, and re-parent to `muzzleMountSocket` for threading.
+   * while stowing to / retrieving from the chest pouch, preserving world-space continuity on handoff
+   * (zero visual pop!) and re-parenting cleanly to `muzzleMountSocket` for coaxial threading.
    */
-  public syncPhysicalSuppressorParent(leftHandRoot: THREE.Object3D): void {
+  public syncPhysicalSuppressorParent(leftHandRoot: THREE.Object3D, dt = 0.016): void {
     const supp = this.assembly?.suppressor;
     if (!supp || !this.assembly) return;
 
     if (this.isSuppressorActionActive() && this.suppressorInHand) {
       if (supp.parent !== leftHandRoot) {
-        leftHandRoot.add(supp);
-        // Grip suppressor cylinder lengthwise in the left palm
-        supp.position.set(0.008, -0.024, -0.048);
-        supp.rotation.set(Math.PI * 0.46, 0.08, -Math.PI * 0.35);
+        if (this.action === 'SUPPRESSOR_DETACH') {
+          // Seamless world-space handoff off muzzle threads into left palm (zero pop!)
+          supp.updateWorldMatrix(true, false);
+          leftHandRoot.updateWorldMatrix(true, false);
+          leftHandRoot.attach(supp);
+          this.suppressorHandoffBlend = 0;
+        } else {
+          // Emerging from chest pouch into left palm
+          leftHandRoot.add(supp);
+          supp.position.copy(this._suppPalmTargetPos);
+          supp.quaternion.copy(this._suppPalmTargetQuat);
+          supp.scale.set(1, 1, 1);
+          this.suppressorHandoffBlend = 1;
+        }
+      } else if (this.action === 'SUPPRESSOR_DETACH' && this.suppressorHandoffBlend < 1) {
+        // Smoothly settle suppressor into natural palm carry during travel to chest pouch
+        this.suppressorHandoffBlend = Math.min(1, this.suppressorHandoffBlend + dt * 7.5);
+        const alpha = 1 - Math.exp(-14 * dt);
+        supp.position.lerp(this._suppPalmTargetPos, alpha);
+        supp.quaternion.slerp(this._suppPalmTargetQuat, alpha);
       }
       const p = this.getActionProgress();
       if (this.action === 'SUPPRESSOR_DETACH') {
-        supp.visible = p < 0.80;
+        supp.visible = p < 0.83;
       } else {
-        supp.visible = p >= 0.21;
+        supp.visible = p >= 0.20;
       }
     } else if (supp.parent !== this.assembly.muzzleMountSocket) {
-      this.assembly.muzzleMountSocket.add(supp);
       const homeZ = typeof supp.userData.homeZ === 'number' ? supp.userData.homeZ : 0;
-      supp.position.set(0, 0, homeZ);
-      supp.rotation.set(0, 0, 0);
+      this.assembly.muzzleMountSocket.add(supp);
+      if (this.action === 'SUPPRESSOR_ATTACH') {
+        // Coaxial alignment right ahead of barrel threads before engaging 3-stroke thread-on
+        supp.position.set(0, 0, homeZ - SUPPRESSOR_THREAD_TRAVEL_M - SUPPRESSOR_CLEAR_PULL_M);
+        supp.rotation.set(0, 0, 0);
+      } else {
+        supp.position.set(0, 0, homeZ);
+        supp.rotation.set(0, 0, 0);
+      }
       supp.scale.set(1, 1, 1);
     }
   }
@@ -741,14 +1293,20 @@ export class WeaponAnimator {
     if (!mag || !this.assembly) return;
 
     if (this.action === 'RELOAD' && this.magazineDetachedInHand) {
+      const p = this.getActionProgress();
       if (mag.parent !== leftHandRoot) {
         leftHandRoot.add(mag);
         // Seat magazine cleanly inside the left gloved palm (-Z is finger forward, -Y is palm face)
         mag.position.set(0.008, -0.028, -0.044);
         mag.rotation.set(Math.PI * 0.45, 0.15, -Math.PI * 0.42);
       }
+      // Subtle rock-and-lock pitch cant for AK magazines entering receiver
+      const style = this.assembly.visualStyle;
+      if ((style === 'carbine_ak' || style === 'rifle_ak' || style === 'AKStamped' || style === 'SovietDMR') && p > 0.50) {
+        const rock = Math.sin(smoothstep(0.50, 0.63, p) * Math.PI) * 0.28;
+        mag.rotation.set(Math.PI * 0.45 - rock, 0.15, -Math.PI * 0.42);
+      }
       // Briefly hide spent mag right inside the chest rig pouch during the split-second mag swap
-      const p = this.getActionProgress();
       mag.visible = !(p >= 0.37 && p <= 0.46);
     } else {
       if (mag.parent !== this.assembly.group) {
@@ -829,12 +1387,20 @@ export class WeaponAnimator {
           this.magSeatImpulseVel += 0.24;
           this.emitCue('mag_in', 1.05);
         }
+        const arBoltCatch = this.isArBoltCatchSlap();
         if (!this.reloadCueRackFired && p >= 0.72) {
           this.reloadCueRackFired = true;
-          this.emitCue('rack', 1.0);
+          if (arBoltCatch) {
+            // AR-15/AR-10/HK416 empty bolt-catch paddle slap releases carrier instantaneously
+            this.isBoltLockedOpen = false;
+            this.magSeatImpulseVel += 0.12;
+            this.emitCue('bolt_lock', 1.0);
+          } else {
+            this.emitCue('rack', 1.0);
+          }
         }
         // Physical charging-handle / slide rack movement (p: 0.70 -> 0.86)
-        if (p >= 0.70 && p <= 0.86) {
+        if (!arBoltCatch && p >= 0.70 && p <= 0.86) {
           const r = (p - 0.70) / 0.16;
           if (r < 0.55) {
             this.manualBoltPull01 = smoothstep(0.0, 0.55, r);
@@ -884,81 +1450,142 @@ export class WeaponAnimator {
         const homeZ = supp && typeof supp.userData.homeZ === 'number' ? supp.userData.homeZ : 0;
 
         if (!isAttach) {
-          // DETACH: 0.00-0.12 TILT -> 0.12-0.24 REACH_MUZZLE -> 0.24-0.64 TWIST_THREAD -> 0.64-0.84 STOW -> 0.84-1.00 RETURN
-          if (p >= 0.25 && (this.suppressorCueMask & 1) === 0) {
+          // DETACH (2.45s): 0.00-0.10 TILT -> 0.10-0.21 REACH -> 0.21-0.61 3x RATCHET TWIST -> 0.61-0.67 CLEAR_PULL -> 0.67-0.86 STOW -> 0.86-1.00 RETURN
+          if (p >= 0.215 && (this.suppressorCueMask & 1) === 0) {
             this.suppressorCueMask |= 1;
-            this.emitCue('suppressor_lock', 0.85);
+            this.emitCue('suppressor_lock', 0.86);
           }
-          if (p >= 0.31 && (this.suppressorCueMask & 2) === 0) {
+          if (p >= 0.225 && (this.suppressorCueMask & 2) === 0) {
             this.suppressorCueMask |= 2;
-            this.emitCue('suppressor_twist', 0.95);
+            this.emitCue('suppressor_twist', 0.96);
           }
-          if (p >= 0.43 && (this.suppressorCueMask & 4) === 0) {
+          if (p >= 0.358 && (this.suppressorCueMask & 4) === 0) {
             this.suppressorCueMask |= 4;
-            this.emitCue('suppressor_twist', 0.9);
+            this.emitCue('suppressor_twist', 0.92);
           }
-          if (p >= 0.55 && (this.suppressorCueMask & 8) === 0) {
+          if (p >= 0.492 && (this.suppressorCueMask & 8) === 0) {
             this.suppressorCueMask |= 8;
-            this.emitCue('suppressor_twist', 0.82);
+            this.emitCue('suppressor_twist', 0.86);
           }
-          if (p >= 0.78 && (this.suppressorCueMask & 16) === 0) {
+          if (p >= 0.80 && (this.suppressorCueMask & 16) === 0) {
             this.suppressorCueMask |= 16;
-            this.emitCue('ads_rustle', 0.75);
+            this.emitCue('ads_rustle', 0.78);
           }
 
-          if (p < 0.64) {
+          if (p < 0.61) {
             this.suppressorInHand = false;
-            const twistT = THREE.MathUtils.clamp((p - 0.24) / 0.40, 0, 1);
+            const twistT = THREE.MathUtils.clamp((p - 0.21) / 0.40, 0, 1);
             this.suppressorTwistPhase01 = twistT;
+            if (p >= 0.21) {
+              evalRatchetedSuppressorTwist(twistT, false, this._suppTwistSample);
+            } else {
+              this._suppTwistSample.cumulativeAngle01 = 0;
+              this._suppTwistSample.axial01 = 0;
+              this._suppTwistSample.wristRollRad = 0;
+              this._suppTwistSample.gripRelease01 = 0;
+              this._suppTwistSample.weaponCounterRollRad = 0;
+            }
             if (supp && supp.parent === this.assembly?.muzzleMountSocket) {
               supp.visible = true;
-              supp.position.set(0, 0, homeZ - twistT * SUPPRESSOR_THREAD_TRAVEL_M);
-              supp.rotation.set(0, 0, -twistT * Math.PI * 2 * 3.5);
+              supp.position.set(
+                0,
+                0,
+                homeZ - this._suppTwistSample.axial01 * SUPPRESSOR_THREAD_TRAVEL_M,
+              );
+              supp.rotation.set(0, 0, -this._suppTwistSample.cumulativeAngle01 * SUPPRESSOR_TOTAL_RAD);
+            }
+          } else if (p < 0.67) {
+            // Clear-pull: slide suppressor straight forward off the muzzle crown before detaching to left hand
+            this.suppressorInHand = false;
+            this.suppressorTwistPhase01 = 1;
+            const clearT = smoothstep(0.61, 0.67, p);
+            this._suppTwistSample.wristRollRad = 0;
+            this._suppTwistSample.gripRelease01 = 0;
+            this._suppTwistSample.weaponCounterRollRad = 0;
+            if (supp && supp.parent === this.assembly?.muzzleMountSocket) {
+              supp.visible = true;
+              supp.position.set(
+                0,
+                0,
+                homeZ - SUPPRESSOR_THREAD_TRAVEL_M - clearT * SUPPRESSOR_CLEAR_PULL_M,
+              );
+              supp.rotation.set(0, 0, -SUPPRESSOR_TOTAL_RAD);
             }
           } else {
-            this.suppressorInHand = p < 0.84;
+            this.suppressorInHand = p < 0.86;
             this.suppressorTwistPhase01 = 1;
+            this._suppTwistSample.wristRollRad = 0;
+            this._suppTwistSample.gripRelease01 = p >= 0.83 ? 0.6 : 0;
+            this._suppTwistSample.weaponCounterRollRad = 0;
             if (supp && !this.suppressorInHand) {
               this.restoreSuppressorHome(false);
             }
           }
         } else {
-          // ATTACH: 0.00-0.12 TILT -> 0.12-0.32 REACH_POUCH -> 0.32-0.44 REACH_MUZZLE -> 0.44-0.84 TWIST_THREAD -> 0.84-1.00 RETURN
-          if (p >= 0.22 && (this.suppressorCueMask & 1) === 0) {
+          // ATTACH (2.45s): 0.00-0.10 TILT -> 0.10-0.28 POUCH -> 0.28-0.40 REACH_MUZZLE -> 0.40-0.44 SEAT_THREADS -> 0.44-0.84 3x RATCHET TWIST -> 0.84-1.00 RETURN
+          if (p >= 0.20 && (this.suppressorCueMask & 1) === 0) {
             this.suppressorCueMask |= 1;
             this.emitCue('ads_rustle', 0.78);
           }
-          if (p >= 0.48 && (this.suppressorCueMask & 2) === 0) {
+          if (p >= 0.455 && (this.suppressorCueMask & 2) === 0) {
             this.suppressorCueMask |= 2;
             this.emitCue('suppressor_twist', 0.88);
           }
-          if (p >= 0.60 && (this.suppressorCueMask & 4) === 0) {
+          if (p >= 0.588 && (this.suppressorCueMask & 4) === 0) {
             this.suppressorCueMask |= 4;
             this.emitCue('suppressor_twist', 0.94);
           }
-          if (p >= 0.72 && (this.suppressorCueMask & 8) === 0) {
+          if (p >= 0.722 && (this.suppressorCueMask & 8) === 0) {
             this.suppressorCueMask |= 8;
             this.emitCue('suppressor_twist', 1.0);
           }
-          if (p >= 0.82 && (this.suppressorCueMask & 16) === 0) {
+          if (p >= 0.825 && (this.suppressorCueMask & 16) === 0) {
             this.suppressorCueMask |= 16;
             this.emitCue('suppressor_lock', 1.05);
           }
 
-          if (p < 0.44) {
-            this.suppressorInHand = p >= 0.21;
+          if (p < 0.40) {
+            this.suppressorInHand = p >= 0.20;
             this.suppressorTwistPhase01 = 0;
-          } else {
+            this._suppTwistSample.wristRollRad = 0;
+            this._suppTwistSample.gripRelease01 = p < 0.20 ? 0.55 : 0;
+            this._suppTwistSample.weaponCounterRollRad = 0;
+          } else if (p < 0.44) {
+            // Coaxial alignment slide onto barrel crown threads
             this.suppressorInHand = false;
-            const twistT = THREE.MathUtils.clamp((p - 0.44) / 0.40, 0, 1);
-            this.suppressorTwistPhase01 = twistT;
+            this.suppressorTwistPhase01 = 0;
+            const seatT = smoothstep(0.40, 0.44, p);
+            this._suppTwistSample.wristRollRad = THREE.MathUtils.lerp(0, -0.58, seatT);
+            this._suppTwistSample.gripRelease01 = 0;
+            this._suppTwistSample.weaponCounterRollRad = 0;
             if (supp) {
               if (supp.parent !== this.assembly?.muzzleMountSocket) {
                 this.assembly?.muzzleMountSocket.add(supp);
               }
               supp.visible = true;
-              supp.position.set(0, 0, homeZ - (1 - twistT) * SUPPRESSOR_THREAD_TRAVEL_M);
-              supp.rotation.set(0, 0, twistT * Math.PI * 2 * 3.5);
+              supp.position.set(
+                0,
+                0,
+                homeZ - SUPPRESSOR_THREAD_TRAVEL_M - (1 - seatT) * SUPPRESSOR_CLEAR_PULL_M,
+              );
+              supp.rotation.set(0, 0, 0);
+            }
+          } else {
+            this.suppressorInHand = false;
+            const twistT = THREE.MathUtils.clamp((p - 0.44) / 0.40, 0, 1);
+            this.suppressorTwistPhase01 = twistT;
+            evalRatchetedSuppressorTwist(twistT, true, this._suppTwistSample);
+            if (supp) {
+              if (supp.parent !== this.assembly?.muzzleMountSocket) {
+                this.assembly?.muzzleMountSocket.add(supp);
+              }
+              supp.visible = true;
+              supp.position.set(
+                0,
+                0,
+                homeZ - (1 - this._suppTwistSample.axial01) * SUPPRESSOR_THREAD_TRAVEL_M,
+              );
+              supp.rotation.set(0, 0, this._suppTwistSample.cumulativeAngle01 * SUPPRESSOR_TOTAL_RAD);
             }
           }
         }
@@ -969,6 +1596,9 @@ export class WeaponAnimator {
           this.suppressorInHand = false;
           this.suppressorTwistPhase01 = 0;
           this.suppressorCueMask = 0;
+          this._suppTwistSample.wristRollRad = 0;
+          this._suppTwistSample.gripRelease01 = 0;
+          this._suppTwistSample.weaponCounterRollRad = 0;
           this.restoreSuppressorHome(isAttach);
           this.action = 'NONE';
           this.actionTime = 0;
@@ -976,6 +1606,122 @@ export class WeaponAnimator {
         }
       }
     }
+
+    // 1b. Advance shell-by-shell tubular shotgun reload state machine
+    this.tubularPumpOpen01 = 0;
+    if (this.tubularPhase !== 'NONE') {
+      const speed = Math.max(0.5, reloadSpeedMult);
+      this.tubularPhaseTime += dt * speed;
+      const tp = this.getTubularPhaseProgress();
+
+      if (this.tubularPhase === 'OPEN_BREECH') {
+        this.tubularPumpOpen01 = smoothstep(0.15, 0.85, tp);
+        if (tp >= 0.25 && this.tubularPhaseTime - dt * speed < this.tubularPhaseDuration * 0.25) {
+          this.emitCue('rack', 0.88);
+        }
+        if (tp >= 1) {
+          this.tubularPhase = 'BREECH_LOAD';
+          this.tubularPhaseTime = 0;
+          this.tubularPhaseDuration = 0.44;
+          this.tubularShellInsertedThisCycle = false;
+        }
+      } else if (this.tubularPhase === 'BREECH_LOAD') {
+        this.tubularPumpOpen01 = 1;
+        this.tubularShellInHand = tp >= 0.22 && tp < 0.78;
+        if (!this.tubularShellInsertedThisCycle && tp >= 0.78) {
+          this.tubularShellInsertedThisCycle = true;
+          this.tubularShellsRemaining = Math.max(0, this.tubularShellsRemaining - 1);
+          this.tubularShellsLoaded++;
+          this.magSeatImpulseVel += 0.14;
+          this.emitCue('mag_in', 0.82);
+          this.tubularOnShellInserted?.();
+        }
+        if (tp >= 1) {
+          this.tubularShellInHand = false;
+          this.tubularPhase = 'CLOSE_BREECH';
+          this.tubularPhaseTime = 0;
+          this.tubularPhaseDuration = 0.22;
+        }
+      } else if (this.tubularPhase === 'CLOSE_BREECH') {
+        this.tubularPumpOpen01 = 1 - smoothstep(0.1, 0.85, tp);
+        if (tp >= 0.35 && this.tubularPhaseTime - dt * speed < this.tubularPhaseDuration * 0.35) {
+          this.emitCue('bolt_lock', 0.96);
+        }
+        if (tp >= 1) {
+          this.tubularPumpOpen01 = 0;
+          if (this.tubularInterruptRequested || this.tubularShellsRemaining <= 0) {
+            this.tubularPhase = 'EXIT';
+            this.tubularPhaseTime = 0;
+            this.tubularPhaseDuration = 0.16;
+          } else {
+            this.tubularPhase = 'FEED_SHELL';
+            this.tubularPhaseTime = 0;
+            this.tubularPhaseDuration = 0.42;
+            this.tubularShellInsertedThisCycle = false;
+          }
+        }
+      } else if (this.tubularPhase === 'ENTER') {
+        if (tp >= 1) {
+          this.tubularPhase = 'FEED_SHELL';
+          this.tubularPhaseTime = 0;
+          this.tubularPhaseDuration = 0.42;
+          this.tubularShellInsertedThisCycle = false;
+        }
+      } else if (this.tubularPhase === 'FEED_SHELL') {
+        this.tubularShellInHand = tp >= 0.18 && tp < 0.74;
+        if (!this.tubularShellInsertedThisCycle && tp >= 0.74) {
+          this.tubularShellInsertedThisCycle = true;
+          this.tubularShellsRemaining = Math.max(0, this.tubularShellsRemaining - 1);
+          this.tubularShellsLoaded++;
+          this.magSeatImpulseVel += 0.12;
+          this.emitCue('mag_in', 0.76);
+          this.tubularOnShellInserted?.();
+        }
+        if (tp >= 1) {
+          this.tubularShellInHand = false;
+          if (this.tubularInterruptRequested || this.tubularShellsRemaining <= 0) {
+            this.tubularPhase = 'EXIT';
+            this.tubularPhaseTime = 0;
+            this.tubularPhaseDuration = 0.16;
+          } else {
+            this.tubularPhaseTime = 0;
+            this.tubularShellInsertedThisCycle = false;
+          }
+        }
+      } else if (this.tubularPhase === 'EXIT') {
+        this.tubularShellInHand = false;
+        if (tp >= 1) {
+          const cb = this.tubularOnComplete;
+          this.tubularPhase = 'NONE';
+          this.tubularPhaseTime = 0;
+          this.tubularOnShellInserted = null;
+          this.tubularOnComplete = null;
+          this.restoreReloadShellHome();
+          cb?.();
+        }
+      }
+    }
+
+    // 1c. Advance non-blocking firearm handling micro-actions + physical selector/dial rotation
+    if (this.microAction !== 'NONE') {
+      this.microActionTime += dt;
+      if (this.microActionTime >= this.microActionDuration) {
+        this.microAction = 'NONE';
+        this.microActionTime = 0;
+      }
+    }
+    this.selectorAngleCurrent = THREE.MathUtils.damp(
+      this.selectorAngleCurrent,
+      this.selectorAngleTarget,
+      28,
+      dt,
+    );
+    this.illumDialAngleCurrent = THREE.MathUtils.damp(
+      this.illumDialAngleCurrent,
+      this.illumDialAngleTarget,
+      22,
+      dt,
+    );
 
     // 2. Mag-seat tactile spring impulse
     const kSeat = 320;
@@ -999,20 +1745,37 @@ export class WeaponAnimator {
     }
     const locked01 = this.isBoltLockedOpen ? 0.92 : 0;
 
-    // 4. Shotgun pump-action forend + bolt cycle (after shot)
-    let pump01 = 0;
+    // 4. Shotgun two-stage asymmetric ADS-persistent pump-action forend + bolt cycle (after shot)
+    //    0.04s recoil unlock -> 0.12s crisp rearward extraction + apex hull ejection -> 0.04s dwell -> 0.13s forward lockup
+    let pump01 = this.tubularPumpOpen01;
     if (this.pumpCycleTimer >= 0) {
       this.pumpCycleTimer += dt;
-      const delay = 0.08;
-      const dur = 0.28;
-      if (this.pumpCycleTimer > delay) {
-        const tp = (this.pumpCycleTimer - delay) / dur;
-        if (tp >= 1) {
-          this.pumpCycleTimer = -1;
+      const t = this.pumpCycleTimer;
+      if (t >= 0.33) {
+        this.pumpCycleTimer = -1;
+        this.pumpEjectPending = false;
+      } else if (t > 0.04) {
+        if (t < 0.16) {
+          // Stage 1: sharp rearward extraction
+          pump01 = Math.max(pump01, smoothstep(0.04, 0.16, t));
+          if (!this.pumpRackBackCueFired && t >= 0.06) {
+            this.pumpRackBackCueFired = true;
+            this.emitCue('rack', 0.9);
+          }
+        } else if (t < 0.20) {
+          // Apex dwell + spent hull ejection
+          pump01 = 1;
+          if (this.pumpEjectPending) {
+            this.pumpEjectPending = false;
+            this.spawnCasingAndSmoke(this.pumpCycleSuppressed);
+          }
         } else {
-          pump01 = Math.sin(tp * Math.PI);
-          if (tp > 0.12 && tp < 0.18 && this.pumpCycleTimer - dt <= delay + dur * 0.12) {
-            this.emitCue('rack', 0.85);
+          // Stage 2: decisive forward chamber lockup
+          pump01 = Math.max(pump01, 1 - smoothstep(0.20, 0.33, t));
+          if (!this.pumpRackFwdCueFired && t >= 0.24) {
+            this.pumpRackFwdCueFired = true;
+            this.magSeatImpulseVel += 0.10;
+            this.emitCue('bolt_lock', 0.92);
           }
         }
       }
@@ -1102,7 +1865,13 @@ export class WeaponAnimator {
         asm.cylinderPivot.rotation.z = this.cylinderAngle;
       }
       if (asm.pumpForend) {
-        asm.pumpForend.position.z = asm.pumpBaseZ + pump01 * 0.078;
+        asm.pumpForend.position.z = asm.pumpBaseZ + pump01 * 0.082;
+      }
+      if (asm.selectorLever) {
+        asm.selectorLever.rotation.x = this.selectorAngleCurrent;
+      }
+      if (asm.illumDialMesh) {
+        asm.illumDialMesh.rotation.z = this.illumDialAngleCurrent;
       }
       if (asm.hammer) {
         if (this.hammerTimer > 0) this.hammerTimer = Math.max(0, this.hammerTimer - dt);
@@ -1170,6 +1939,16 @@ export class WeaponAnimator {
       this.interruptInspect();
     }
 
+    // Emergency sprint / vault cancel during suppressor detach/reattach: cleanly restores pre-action mounted/stowed state
+    if (this.isSuppressorActionActive() && (input.isSprinting || input.vaultRetentionBlend > 0.12)) {
+      this.cancelAction();
+    }
+
+    // Sprint / vault cancels non-blocking handling micro-actions immediately
+    if (this.microAction !== 'NONE' && (input.isSprinting || input.vaultRetentionBlend > 0.1)) {
+      this.cancelMicroAction();
+    }
+
     if (this.equipTimer > 0) {
       this.equipTimer = Math.max(0, this.equipTimer - dt);
     }
@@ -1189,6 +1968,7 @@ export class WeaponAnimator {
       this.action === 'INSPECT' ||
       this.action === 'SUPPRESSOR_ATTACH' ||
       this.action === 'SUPPRESSOR_DETACH' ||
+      this.tubularPhase !== 'NONE' ||
       input.vaultRetentionBlend > 0.12;
     const hasCantedOptic = Boolean(this.assembly?.hasCantedOptic);
     const allowCant =
@@ -1499,6 +2279,34 @@ export class WeaponAnimator {
       this._actionQuat.copy(this._adsQuat).multiply(this._addQuat.setFromEuler(this._tmpEuler));
       this._targetPos.lerp(this._tmpVecA, raiseEnv);
       this._targetQuat.slerp(this._actionQuat, raiseEnv);
+    } else if (this.tubularPhase !== 'NONE' && input.isFirearm) {
+      // Shell-by-shell tubular shotgun reload cant (38°-42° inboard so underside loading port faces left hand cleanly)
+      let env = 1;
+      const tp = this.getTubularPhaseProgress();
+      if (this.tubularPhase === 'ENTER' || this.tubularPhase === 'OPEN_BREECH') {
+        env = smoothstep(0, 0.85, tp);
+      } else if (this.tubularPhase === 'EXIT') {
+        env = 1 - smoothstep(0, 1, tp);
+      }
+      const isBreechPhase =
+        this.tubularPhase === 'OPEN_BREECH' ||
+        this.tubularPhase === 'BREECH_LOAD' ||
+        this.tubularPhase === 'CLOSE_BREECH';
+      const cantDeg = isBreechPhase ? -34 : 42;
+      this._actionPos.set(
+        this._hipPos.x - 0.055 * env,
+        this._hipPos.y + (isBreechPhase ? 0.012 : 0.028) * env,
+        this._hipPos.z + 0.045 * env,
+      );
+      this._tmpEuler.set(
+        0.18 * env,
+        0.26 * env,
+        THREE.MathUtils.degToRad(cantDeg) * env,
+        'YXZ',
+      );
+      this._actionQuat.copy(this._hipQuat).multiply(this._addQuat.setFromEuler(this._tmpEuler));
+      this._targetPos.lerp(this._actionPos, env);
+      this._targetQuat.slerp(this._actionQuat, env);
     } else if (
       (this.action === 'SUPPRESSOR_ATTACH' || this.action === 'SUPPRESSOR_DETACH') &&
       input.isFirearm
@@ -1506,12 +2314,12 @@ export class WeaponAnimator {
       // Field suppressor twist-and-stow workspace: tilt firearm ~35° inward and pull slightly closer
       // so the muzzle threads stay framed cleanly in front of the chest bodycam while the left hand works.
       const p = this.getActionProgress();
-      const env = smoothstep(0.0, 0.12, p) * (1 - smoothstep(0.84, 1.0, p));
-      const twistVib =
+      const env = smoothstep(0.0, 0.10, p) * (1 - smoothstep(0.84, 1.0, p));
+      const counterTorque =
         this.getSuppressorSubPhase() === 'TWIST_THREAD'
-          ? Math.sin(this.suppressorTwistPhase01 * Math.PI * 7) * 0.014
+          ? this._suppTwistSample.weaponCounterRollRad
           : 0;
-      const pullInZ = this.weightClass === 'pistol' ? 0.045 : 0.085;
+      const pullInZ = this.weightClass === 'pistol' ? 0.045 : 0.088;
       this._actionPos.set(
         this._hipPos.x - 0.075 * env,
         this._hipPos.y + 0.028 * env,
@@ -1520,12 +2328,21 @@ export class WeaponAnimator {
       this._tmpEuler.set(
         0.16 * env,
         0.44 * env,
-        THREE.MathUtils.degToRad(35) * env + twistVib,
+        THREE.MathUtils.degToRad(35) * env + counterTorque,
         'YXZ',
       );
       this._actionQuat.copy(this._hipQuat).multiply(this._addQuat.setFromEuler(this._tmpEuler));
       this._targetPos.lerp(this._actionPos, env);
       this._targetQuat.slerp(this._actionQuat, env);
+    }
+
+    // Subtle ADS-persistent physical recoil-dip/cant during shotgun pump cycle (never breaks ADS cheek-weld!)
+    if (this.pumpCycleTimer >= 0 && input.isFirearm) {
+      const pp = this.getPumpCycleProgress();
+      const pumpBump = Math.sin(pp * Math.PI);
+      const adsScale = THREE.MathUtils.lerp(1.0, 0.42, this.adsBlend);
+      this._tmpEuler.set(0.032 * pumpBump * adsScale, 0, -0.055 * pumpBump * adsScale, 'YXZ');
+      this._targetQuat.multiply(this._addQuat.setFromEuler(this._tmpEuler));
     }
 
     // --- VAULT RETENTION ---
@@ -1548,7 +2365,7 @@ export class WeaponAnimator {
     if (vBlend > 0.15) {
       this.activePoseState = 'VaultRetention';
       poseLambda = 18;
-    } else if (this.action === 'RELOAD') {
+    } else if (this.action === 'RELOAD' || this.tubularPhase !== 'NONE') {
       this.activePoseState = 'Reload';
       poseLambda = 15;
     } else if (this.action === 'MAG_CHECK') {

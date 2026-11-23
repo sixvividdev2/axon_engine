@@ -38,6 +38,23 @@ import {
   getBeltSlotTransforms,
 } from './equipment/TacticalEquipmentMesh';
 import { tacticalEquipmentStore } from './equipment/TacticalEquipmentStore';
+import { WeaponHandPoseProfile } from './weapons/WeaponModelFactory';
+
+export interface HandPoseDynamicOptions {
+  profile?: Readonly<WeaponHandPoseProfile> | null;
+  /** 0..1 live trigger squeeze flexion on right index finger */
+  triggerPull01?: number;
+  /** 0..1 thumb-index pinch pose for scope throw-lever, elevation turret, or illum dial */
+  pinchPose01?: number;
+  /** 0..1 finger release opening during suppressor ratcheted regrip strokes */
+  gripRelease01?: number;
+  /** True when left hand is gripping a cylindrical suppressor tube */
+  suppressorGrip?: boolean;
+  /** 0..1 right-thumb flick reaching toward receiver safety/fire-selector */
+  thumbFlick01?: number;
+  /** 0..1 left-thumb press onto flashlight/laser pressure pad */
+  padTap01?: number;
+}
 
 export interface ArticulatedFinger {
   proximal: THREE.Group;
@@ -2010,13 +2027,27 @@ export class CharacterSkeleton {
     triggerPulledOrAds: boolean,
     customCurl = 0.85,
     foregripStyle: 'none' | 'vertical' | 'angled' = 'none',
+    opts?: HandPoseDynamicOptions,
   ): void {
     const hand = side === 'left' ? this.leftArm.hand : this.rightArm.hand;
     const s = hand.side;
     const scale = THREE.MathUtils.clamp(customCurl, 0, 1.15);
+    const profile = opts?.profile ?? null;
+    const triggerPull01 = THREE.MathUtils.clamp(opts?.triggerPull01 ?? 0, 0, 1);
+    const pinchPose01 = THREE.MathUtils.clamp(opts?.pinchPose01 ?? 0, 0, 1);
+    const gripRelease01 = THREE.MathUtils.clamp(opts?.gripRelease01 ?? 0, 0, 1);
+    const thumbFlick01 = THREE.MathUtils.clamp(opts?.thumbFlick01 ?? 0, 0, 1);
+    const padTap01 = THREE.MathUtils.clamp(opts?.padTap01 ?? 0, 0, 1);
 
-    const setFinger = (f: ArticulatedFinger, proxDeg: number, midDeg: number, distDeg: number): void => {
+    const setFinger = (
+      f: ArticulatedFinger,
+      proxDeg: number,
+      midDeg: number,
+      distDeg: number,
+      splayYRad = 0,
+    ): void => {
       f.proximal.rotation.x = -THREE.MathUtils.degToRad(proxDeg);
+      f.proximal.rotation.y = splayYRad;
       f.middle.rotation.x = -THREE.MathUtils.degToRad(midDeg);
       f.distal.rotation.x = -THREE.MathUtils.degToRad(distDeg);
     };
@@ -2024,54 +2055,198 @@ export class CharacterSkeleton {
     const isFirearm = holdClass === 'pistol' || holdClass === 'rifle' || holdClass === 'shotgun';
 
     if (side === 'right' && isFirearm) {
-      setFinger(hand.middle, 34 * scale, 48 * scale, 28 * scale);
-      setFinger(hand.ring, 37 * scale, 51 * scale, 31 * scale);
-      setFinger(hand.pinky, 40 * scale, 54 * scale, 34 * scale);
+      // Geometry-driven right-hand wrap: tighter around slim grips (Makarov 0.024m), wider open arc on chunky grips (Deagle 0.036m)
+      const gripW = profile ? profile.gripWidthM : 0.029;
+      const gripD = profile ? profile.gripDepthM : 0.044;
+      const girthNorm = THREE.MathUtils.clamp(
+        ((gripW - 0.024) / 0.014) * 0.6 + ((gripD - 0.038) / 0.016) * 0.4,
+        0,
+        1,
+      );
+      // Slimmer grip = slightly higher proximal/mid wrap without clipping through frame
+      const gripTight = THREE.MathUtils.lerp(1.12, 0.80, girthNorm) * scale;
+      const gripDistTight = THREE.MathUtils.lerp(1.16, 0.74, girthNorm) * scale;
+
+      setFinger(hand.middle, 34 * gripTight, 49 * gripTight, 30 * gripDistTight);
+      setFinger(hand.ring, 37 * gripTight, 52 * gripTight, 33 * gripDistTight);
+      setFinger(hand.pinky, 41 * gripTight, 56 * gripTight, 36 * gripDistTight);
+
       if (triggerPulledOrAds) {
-        setFinger(hand.index, 22, 42, 26);
+        // Finger curved naturally onto trigger shoe + live firing squeeze
+        const pullProx = 22 + triggerPull01 * 18;
+        const pullMid = 40 + triggerPull01 * 24;
+        const pullDist = 25 + triggerPull01 * 15;
+        setFinger(hand.index, pullProx, pullMid, pullDist, 0);
       } else {
-        setFinger(hand.index, 6, 12, 8);
+        // Strict trigger discipline: straight index finger indexed high along frame/receiver outside guard
+        setFinger(hand.index, 4, 7, 4, -s * 0.09);
       }
-      hand.thumbProx.rotation.set(-0.18, s * 0.58, -s * 0.22);
-      hand.thumbDist.rotation.set(-0.56, 0, 0);
+
+      // Thumb wraps high tang; smoothly flicks up/forward when actuating left-side safety/selector
+      const baseThumbX = THREE.MathUtils.lerp(-0.20, -0.14, girthNorm);
+      const baseThumbY = s * THREE.MathUtils.lerp(0.62, 0.50, girthNorm);
+      const baseThumbZ = -s * 0.22;
+      hand.thumbProx.rotation.set(
+        THREE.MathUtils.lerp(baseThumbX, 0.16, thumbFlick01),
+        THREE.MathUtils.lerp(baseThumbY, s * 0.22, thumbFlick01),
+        THREE.MathUtils.lerp(baseThumbZ, s * 0.14, thumbFlick01),
+      );
+      hand.thumbDist.rotation.set(THREE.MathUtils.lerp(-0.56, -0.18, thumbFlick01), 0, 0);
+      return;
+    }
+
+    // Left-hand suppressor cylinder grip with dynamic ratcheted regrip release
+    if (side === 'left' && opts?.suppressorGrip) {
+      const suppR = profile ? profile.suppressorRadiusM : 0.019;
+      // Larger suppressor diameter -> slightly wider finger arc
+      const rNorm = THREE.MathUtils.clamp((suppR - 0.015) / 0.010, 0, 1);
+      const closedScale = THREE.MathUtils.lerp(1.06, 0.84, rNorm) * scale;
+      // Release opens fingers clearly off the tube during regrip roll-back
+      const gripMul = THREE.MathUtils.lerp(closedScale, 0.30, gripRelease01);
+
+      setFinger(hand.index, 52 * gripMul, 66 * gripMul, 42 * gripMul, gripRelease01 * 0.08);
+      setFinger(hand.middle, 56 * gripMul, 70 * gripMul, 45 * gripMul);
+      setFinger(hand.ring, 58 * gripMul, 72 * gripMul, 47 * gripMul);
+      setFinger(hand.pinky, 60 * gripMul, 74 * gripMul, 49 * gripMul, -gripRelease01 * 0.06);
+      hand.thumbProx.rotation.set(
+        THREE.MathUtils.lerp(-0.30, -0.06, gripRelease01),
+        s * THREE.MathUtils.lerp(0.46, 0.22, gripRelease01),
+        THREE.MathUtils.lerp(-s * 0.12, s * 0.12, gripRelease01),
+      );
+      hand.thumbDist.rotation.set(THREE.MathUtils.lerp(-0.48, -0.12, gripRelease01), 0, 0);
+      return;
+    }
+
+    // Left-hand thumb-index pinch pose (scope throw-lever, elevation turret, illumination dial)
+    if (side === 'left' && pinchPose01 > 0.01) {
+      const p = pinchPose01;
+      // Thumb and index oppose cleanly to pinch dial/lever; lower 3 fingers curl naturally clear
+      setFinger(
+        hand.index,
+        THREE.MathUtils.lerp(24 * scale, 48, p),
+        THREE.MathUtils.lerp(34 * scale, 54, p),
+        THREE.MathUtils.lerp(20 * scale, 26, p),
+        s * 0.12 * p,
+      );
+      setFinger(
+        hand.middle,
+        THREE.MathUtils.lerp(28 * scale, 56, p),
+        THREE.MathUtils.lerp(38 * scale, 68, p),
+        THREE.MathUtils.lerp(24 * scale, 44, p),
+      );
+      setFinger(
+        hand.ring,
+        THREE.MathUtils.lerp(31 * scale, 64, p),
+        THREE.MathUtils.lerp(41 * scale, 74, p),
+        THREE.MathUtils.lerp(26 * scale, 48, p),
+      );
+      setFinger(
+        hand.pinky,
+        THREE.MathUtils.lerp(34 * scale, 68, p),
+        THREE.MathUtils.lerp(44 * scale, 78, p),
+        THREE.MathUtils.lerp(28 * scale, 52, p),
+      );
+      hand.thumbProx.rotation.set(
+        THREE.MathUtils.lerp(-0.08, -0.34, p),
+        s * THREE.MathUtils.lerp(0.22, 0.56, p),
+        s * THREE.MathUtils.lerp(0.10, -0.08, p),
+      );
+      hand.thumbDist.rotation.set(THREE.MathUtils.lerp(-0.22, -0.44, p), 0, 0);
       return;
     }
 
     if (side === 'left' && (holdClass === 'rifle' || holdClass === 'shotgun')) {
-      if (foregripStyle === 'vertical') {
-        setFinger(hand.index, 74 * scale, 88 * scale, 54 * scale);
-        setFinger(hand.middle, 80 * scale, 94 * scale, 58 * scale);
-        setFinger(hand.ring, 84 * scale, 98 * scale, 62 * scale);
-        setFinger(hand.pinky, 88 * scale, 102 * scale, 66 * scale);
-        hand.thumbProx.rotation.set(-0.34, s * 0.44, -s * 0.16);
-        hand.thumbDist.rotation.set(-0.52, 0, 0);
+      const style =
+        foregripStyle === 'vertical'
+          ? 'vertical_grip'
+          : foregripStyle === 'angled'
+            ? 'angled_grip'
+            : (profile?.supportStyle ?? 'handguard');
+      const suppR = profile ? profile.supportRadiusM : 0.026;
+      const rNorm = THREE.MathUtils.clamp((suppR - 0.014) / 0.020, 0, 1);
+      const wrapScale = THREE.MathUtils.lerp(1.12, 0.78, rNorm) * scale;
+
+      if (style === 'vertical_grip') {
+        setFinger(hand.index, 72 * wrapScale, 86 * wrapScale, 52 * wrapScale);
+        setFinger(hand.middle, 78 * wrapScale, 92 * wrapScale, 56 * wrapScale);
+        setFinger(hand.ring, 82 * wrapScale, 96 * wrapScale, 60 * wrapScale);
+        setFinger(hand.pinky, 86 * wrapScale, 100 * wrapScale, 64 * wrapScale);
+        hand.thumbProx.rotation.set(
+          THREE.MathUtils.lerp(-0.34, 0.04, padTap01),
+          s * THREE.MathUtils.lerp(0.44, 0.24, padTap01),
+          THREE.MathUtils.lerp(-s * 0.16, s * 0.14, padTap01),
+        );
+        hand.thumbDist.rotation.set(THREE.MathUtils.lerp(-0.52, -0.18, padTap01), 0, 0);
         return;
       }
-      if (foregripStyle === 'angled') {
-        setFinger(hand.index, 14 * scale, 22 * scale, 12 * scale);
-        setFinger(hand.middle, 28 * scale, 42 * scale, 26 * scale);
-        setFinger(hand.ring, 33 * scale, 47 * scale, 29 * scale);
-        setFinger(hand.pinky, 38 * scale, 52 * scale, 32 * scale);
-        hand.thumbProx.rotation.set(0.08, s * 0.12, s * 0.28);
-        hand.thumbDist.rotation.set(-0.14, 0, 0);
+      if (style === 'angled_grip') {
+        setFinger(hand.index, 15 * wrapScale, 24 * wrapScale, 13 * wrapScale);
+        setFinger(hand.middle, 28 * wrapScale, 42 * wrapScale, 26 * wrapScale);
+        setFinger(hand.ring, 33 * wrapScale, 47 * wrapScale, 29 * wrapScale);
+        setFinger(hand.pinky, 38 * wrapScale, 52 * wrapScale, 32 * wrapScale);
+        hand.thumbProx.rotation.set(
+          THREE.MathUtils.lerp(0.08, 0.18, padTap01),
+          s * THREE.MathUtils.lerp(0.12, 0.26, padTap01),
+          s * THREE.MathUtils.lerp(0.28, 0.12, padTap01),
+        );
+        hand.thumbDist.rotation.set(THREE.MathUtils.lerp(-0.14, -0.30, padTap01), 0, 0);
         return;
       }
-      setFinger(hand.index, 20 * scale, 30 * scale, 18 * scale);
-      setFinger(hand.middle, 24 * scale, 35 * scale, 22 * scale);
-      setFinger(hand.ring, 27 * scale, 38 * scale, 24 * scale);
-      setFinger(hand.pinky, 31 * scale, 42 * scale, 26 * scale);
-      hand.thumbProx.rotation.set(-0.06, s * 0.20, s * 0.14);
-      hand.thumbDist.rotation.set(-0.22, 0, 0);
+      if (style === 'pump_forend') {
+        // Firm cradled cup around ribbed shotgun pump forend
+        setFinger(hand.index, 30 * wrapScale, 44 * wrapScale, 28 * wrapScale);
+        setFinger(hand.middle, 34 * wrapScale, 48 * wrapScale, 31 * wrapScale);
+        setFinger(hand.ring, 38 * wrapScale, 52 * wrapScale, 34 * wrapScale);
+        setFinger(hand.pinky, 42 * wrapScale, 56 * wrapScale, 36 * wrapScale);
+        hand.thumbProx.rotation.set(
+          THREE.MathUtils.lerp(-0.10, 0.08, padTap01),
+          s * THREE.MathUtils.lerp(0.24, 0.30, padTap01),
+          s * 0.16,
+        );
+        hand.thumbDist.rotation.set(THREE.MathUtils.lerp(-0.28, -0.36, padTap01), 0, 0);
+        return;
+      }
+      if (style === 'handguard_cradle') {
+        // Modern high-thumb C-clamp over slim free-float MLOK handguard
+        setFinger(hand.index, 24 * wrapScale, 36 * wrapScale, 22 * wrapScale);
+        setFinger(hand.middle, 29 * wrapScale, 42 * wrapScale, 26 * wrapScale);
+        setFinger(hand.ring, 33 * wrapScale, 46 * wrapScale, 29 * wrapScale);
+        setFinger(hand.pinky, 37 * wrapScale, 50 * wrapScale, 32 * wrapScale);
+        hand.thumbProx.rotation.set(
+          THREE.MathUtils.lerp(0.04, 0.16, padTap01),
+          s * THREE.MathUtils.lerp(0.32, 0.38, padTap01),
+          s * THREE.MathUtils.lerp(0.26, 0.14, padTap01),
+        );
+        hand.thumbDist.rotation.set(THREE.MathUtils.lerp(-0.16, -0.34, padTap01), 0, 0);
+        return;
+      }
+      setFinger(hand.index, 22 * wrapScale, 32 * wrapScale, 20 * wrapScale);
+      setFinger(hand.middle, 26 * wrapScale, 37 * wrapScale, 24 * wrapScale);
+      setFinger(hand.ring, 29 * wrapScale, 40 * wrapScale, 26 * wrapScale);
+      setFinger(hand.pinky, 33 * wrapScale, 44 * wrapScale, 28 * wrapScale);
+      hand.thumbProx.rotation.set(
+        THREE.MathUtils.lerp(-0.06, 0.12, padTap01),
+        s * THREE.MathUtils.lerp(0.20, 0.30, padTap01),
+        s * THREE.MathUtils.lerp(0.14, 0.08, padTap01),
+      );
+      hand.thumbDist.rotation.set(THREE.MathUtils.lerp(-0.22, -0.34, padTap01), 0, 0);
       return;
     }
 
     if (side === 'left' && holdClass === 'pistol') {
-      setFinger(hand.index, 26 * scale, 38 * scale, 22 * scale);
-      setFinger(hand.middle, 30 * scale, 42 * scale, 25 * scale);
-      setFinger(hand.ring, 33 * scale, 45 * scale, 27 * scale);
-      setFinger(hand.pinky, 36 * scale, 48 * scale, 29 * scale);
-      hand.thumbProx.rotation.set(-0.04, s * 0.14, 0);
-      hand.thumbDist.rotation.set(-0.10, 0, 0);
+      const gripW = profile ? profile.gripWidthM : 0.029;
+      const wrapScale = THREE.MathUtils.lerp(1.06, 0.84, THREE.MathUtils.clamp((gripW - 0.024) / 0.014, 0, 1)) * scale;
+      setFinger(hand.index, 26 * wrapScale, 38 * wrapScale, 22 * wrapScale);
+      setFinger(hand.middle, 30 * wrapScale, 42 * wrapScale, 25 * wrapScale);
+      setFinger(hand.ring, 33 * wrapScale, 45 * wrapScale, 27 * wrapScale);
+      setFinger(hand.pinky, 36 * wrapScale, 48 * wrapScale, 29 * wrapScale);
+      // Forward-indexed support thumb on pistol frame (presses WML paddle on padTap01)
+      hand.thumbProx.rotation.set(
+        THREE.MathUtils.lerp(-0.04, 0.14, padTap01),
+        s * THREE.MathUtils.lerp(0.14, 0.24, padTap01),
+        s * THREE.MathUtils.lerp(0.02, -0.08, padTap01),
+      );
+      hand.thumbDist.rotation.set(THREE.MathUtils.lerp(-0.10, -0.28, padTap01), 0, 0);
       return;
     }
 

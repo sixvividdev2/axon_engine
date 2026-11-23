@@ -653,47 +653,49 @@ export class BodycamController {
     );
 
     if (stanceCoupled) {
-      // 2. Camera / cheek-weld channel:
-      //    Hip-Fire: calm, steady horizon (~0.25x mild sympathetic jolt, negligible roll)
-      //    Point Aim: 50% balanced punch
-      //    Canted ADS (0.92) & Primary ADS (1.00): crisp cheek-weld pitch/yaw/roll snap + micro-translation
+      // 2. Camera / cheek-weld channel scaled progressively by caliber recoil energy:
+      //    Light 9mm/5.56: crisp, controlled punch. Heavy 7.62/12ga/.50 AE/.338/23mm: visceral shoulder/cheek shock.
+      const recoilEnergy = THREE.MathUtils.clamp((Math.abs(pitchRad) / 0.036 + kickBackM / 0.026) * 0.5, 0.55, 2.8);
+      const caliberPunchBoost = 1.0 + Math.max(0, recoilEnergy - 1.0) * 0.34;
       const climbBreathScale = THREE.MathUtils.lerp(1.0, 0.70, this.holdBreathBlend);
       const driftBreathScale = THREE.MathUtils.lerp(1.0, 0.25, this.holdBreathBlend);
-      const camShakeGain = cheekWeld * magScopeAtten * adsCamScale;
+      const camShakeGain = cheekWeld * magScopeAtten * adsCamScale * caliberPunchBoost;
       const sympGain =
-        THREE.MathUtils.lerp(0.25, 0.68, cheekWeld) *
+        THREE.MathUtils.lerp(0.28, 0.74, cheekWeld) *
         magScopeAtten *
+        caliberPunchBoost *
         THREE.MathUtils.lerp(1.0, adsCamScale, cheekWeld * 0.75);
 
-      this.sympPitchVel += pitchRad * 0.22 * 24 * sympGain * climbBreathScale;
-      this.sympYawVel += yawJitter * 0.2 * 20 * sympGain * driftBreathScale;
+      this.sympPitchVel += pitchRad * 0.24 * 24 * sympGain * climbBreathScale;
+      this.sympYawVel += yawJitter * 0.22 * 20 * sympGain * driftBreathScale;
 
       // Coupled upper-body / torso biomechanical absorption of recoil torque & axial kick
-      const absorbGain = THREE.MathUtils.lerp(1.0, 0.42, cheekWeld);
-      this.torsoAbsorbPitchVel += (pitchRad * 2.2 + kickBackM * 1.6) * absorbGain * climbBreathScale;
-      this.torsoAbsorbYawVel += yawJitter * 1.85 * absorbGain * driftBreathScale;
+      const absorbGain = THREE.MathUtils.lerp(1.05, 0.46, cheekWeld) * caliberPunchBoost;
+      this.torsoAbsorbPitchVel += (pitchRad * 2.35 + kickBackM * 1.8) * absorbGain * climbBreathScale;
+      this.torsoAbsorbYawVel += yawJitter * 1.95 * absorbGain * driftBreathScale;
 
       if (camShakeGain > 0.001) {
-        this.camShakePitchVel += pitchRad * 26.0 * camShakeGain * THREE.MathUtils.lerp(1.0, 0.82, this.holdBreathBlend);
+        this.camShakePitchVel +=
+          pitchRad * 28.5 * camShakeGain * THREE.MathUtils.lerp(1.0, 0.82, this.holdBreathBlend);
         this.camShakeYawVel +=
-          (yawJitter * 22.0 + (Math.random() - 0.5) * Math.abs(pitchRad) * 10.5) *
+          (yawJitter * 23.0 + (Math.random() - 0.5) * Math.abs(pitchRad) * 11.5) *
           camShakeGain *
           THREE.MathUtils.lerp(1.0, 0.65, this.holdBreathBlend);
         this.camShakeRollVel +=
-          (yawJitter * 16.0 + (Math.random() - 0.5) * Math.abs(pitchRad) * 14.0) * camShakeGain;
+          (yawJitter * 18.0 + (Math.random() - 0.5) * Math.abs(pitchRad) * 16.5) * camShakeGain;
         this.camShakePosXVel +=
-          ((Math.random() - 0.5) * 0.16 + yawJitter * 2.4) * camShakeGain;
+          ((Math.random() - 0.5) * 0.18 + yawJitter * 2.6) * camShakeGain;
         this.camShakePosYVel +=
-          (kickBackM * 4.8 + Math.abs(pitchRad) * 2.2) * camShakeGain;
+          (kickBackM * 5.4 + Math.abs(pitchRad) * 2.5) * camShakeGain;
       }
 
       // Free-aim climb: looser upward climb in Hip-Fire, tighter shoulder-braced climb in ADS (~30% mitigated while holding breath)
-      const freeAimClimbScale = THREE.MathUtils.lerp(1.12, 0.68, cheekWeld) * climbBreathScale;
+      const freeAimClimbScale = THREE.MathUtils.lerp(1.14, 0.70, cheekWeld) * climbBreathScale;
       const maxAimForStop = this.lastMaxWeaponPitchRad - this.getWeaponRootPitch();
       this.aimPitch = Math.min(
         0.24,
         maxAimForStop,
-        this.aimPitch + pitchRad * 0.22 * freeAimClimbScale,
+        this.aimPitch + pitchRad * 0.23 * freeAimClimbScale,
       );
     } else {
       // Non-firearm physical shock (melee strikes, blast waves, damage flinch):

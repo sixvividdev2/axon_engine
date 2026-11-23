@@ -102,10 +102,12 @@ import {
   GameZombiesSyncPacket,
   LobbyMember,
   OperatorUniformId,
+  packSyncedWeaponAttachments,
   resolveOperatorUniformId,
   SpecialEventConfig,
   SquadCommsCategory,
   SyncedAimStance,
+  SyncedHandlingAction,
   TacticalPingKind,
   TacticalPingTargetType,
 } from '../data/multiplayer';
@@ -370,6 +372,7 @@ export class CombatSessionEngine {
   private lastSentStance: SyncedAimStance = 'HIP';
   private lastSentFiring = false;
   private lastSentReloading = false;
+  private lastSentHandlingAction: SyncedHandlingAction = 'NONE';
   private lastImmediateStateFlushMs = 0;
   private nextMapInteractReqSeq = 1;
   private readonly pendingMapInteractRequests = new Map<
@@ -1260,6 +1263,8 @@ export class CombatSessionEngine {
       this.pointerLocked &&
       this.playerAlive &&
       this.reloadTimer <= 0 &&
+      !this.weaponRig.isTubularReloading() &&
+      !this.weaponRig.isBlockingFiringAction() &&
       this._runtimeProfile.holdClass !== 'unarmed' &&
       (this.magAmmoByWeapon[this._runtimeProfile.id] ?? 0) > 0
     );
@@ -1274,11 +1279,13 @@ export class CombatSessionEngine {
     const isPointAim = this.controller.isPointAim;
     const isCanted = this.controller.isCanted;
     const isFiringNow = this.isLocallyActivelyFiring();
-    const isReloadingNow = this.reloadTimer > 0;
+    const isReloadingNow = this.reloadTimer > 0 || this.weaponRig.isTubularReloading();
+    const handlingSnap = this.weaponRig.getSyncedHandlingSnapshot();
 
     this.lastSentStance = aimStance;
     this.lastSentFiring = isFiringNow;
     this.lastSentReloading = isReloadingNow;
+    this.lastSentHandlingAction = handlingSnap.action;
 
     const pkt: GamePlayerStatePacket = {
       type: 'game:state',
@@ -1309,6 +1316,10 @@ export class CombatSessionEngine {
       nvgFlipped: this.nvgFlipped && this.localGear.nvgMount !== 'none',
       lean,
       weaponId: this.equippedWeaponId,
+      att: packSyncedWeaponAttachments(this.weaponRig.getAttachments()),
+      ha: handlingSnap.action,
+      hprog: Number(handlingSnap.progress.toFixed(3)),
+      sup: derived.isSuppressed,
       hp: Math.round(this.hp),
       maxHp: this.maxHp,
       alive: this.playerAlive,
@@ -1416,7 +1427,16 @@ export class CombatSessionEngine {
 
     if (type === 'game:bot_fire' && this.botAI && !this.isMpHost) {
       const pkt = raw as unknown as GameBotFirePacket;
-      this.botAI.playRemoteBotFire(pkt.botId, pkt.ox, pkt.oy, pkt.oz, pkt.ex, pkt.ey, pkt.ez);
+      this.botAI.playRemoteBotFire(
+        pkt.botId,
+        pkt.ox,
+        pkt.oy,
+        pkt.oz,
+        pkt.ex,
+        pkt.ey,
+        pkt.ez,
+        Boolean(pkt.sup),
+      );
       return;
     }
 
@@ -3401,13 +3421,48 @@ export class CombatSessionEngine {
   private startReload(): void {
     if (!this.playerAlive || this.pdaDevice.isBlockingWeaponActions() || this.weaponRig.isSuppressorActionActive()) return;
     const prof = this._runtimeProfile;
-    if (prof.magCapacity <= 0 || this.reloadTimer > 0 || this.controller.isVaulting()) return;
+    if (prof.magCapacity <= 0 || this.reloadTimer > 0 || this.weaponRig.isTubularReloading() || this.controller.isVaulting()) return;
     const curMag = this.magAmmoByWeapon[prof.id] ?? 0;
     if (curMag >= prof.magCapacity) return;
 
     const reserve = this.reserveAmmoByWeapon[prof.id] ?? -1;
     if (reserve === 0) {
       this.showToast('No Reserve Ammo — Buy Ammo at Wall-Buy');
+      return;
+    }
+
+    const isTubularShotgun = prof.holdClass === 'shotgun' && prof.fireMode === 'pump';
+    if (isTubularShotgun) {
+      const missing = prof.magCapacity - curMag;
+      const shellsToLoad = reserve < 0 ? missing : Math.min(missing, reserve);
+      if (shellsToLoad <= 0) return;
+      const weaponId = prof.id;
+      const started = this.weaponRig.triggerTubularReload(
+        shellsToLoad,
+        curMag === 0,
+        () => {
+          if (this._runtimeProfile.id !== weaponId || !this.playerAlive) return;
+          const resNow = this.reserveAmmoByWeapon[weaponId] ?? -1;
+          if (resNow === 0) {
+            this.weaponRig.interruptTubularReload();
+            return;
+          }
+          const magNow = this.magAmmoByWeapon[weaponId] ?? 0;
+          if (magNow >= prof.magCapacity) return;
+          this.magAmmoByWeapon[weaponId] = magNow + 1;
+          if (resNow > 0) {
+            this.reserveAmmoByWeapon[weaponId] = resNow - 1;
+          }
+          this.weaponRig.setAmmoState(magNow + 1);
+          this.emitSnapshot();
+        },
+        () => {
+          this.emitSnapshot();
+        },
+      );
+      if (started) {
+        this.emitSnapshot();
+      }
       return;
     }
 
@@ -3435,10 +3490,19 @@ export class CombatSessionEngine {
     }
 
     if (prof.fireMode === 'none' || prof.magCapacity <= 0) return;
+    const curAmmo = this.magAmmoByWeapon[prof.id] ?? 0;
+    if (this.weaponRig.isTubularReloading()) {
+      if (curAmmo > 0 && !this.controller.isSprinting && !this.controller.isVaulting()) {
+        this.weaponRig.interruptTubularReload();
+        this.reloadTimer = 0;
+      } else {
+        return;
+      }
+    }
     if (
       this.reloadTimer > 0 ||
       this.fireCooldown > 0 ||
-      this.weaponRig.isBoltCycling() ||
+      this.weaponRig.isBlockingFiringAction() ||
       this.controller.isSprinting ||
       this.controller.isVaulting() ||
       this.animator.isCombatBusy()
@@ -3450,7 +3514,6 @@ export class CombatSessionEngine {
     const isSingle = prof.fireMode === 'semi' || prof.fireMode === 'bolt' || prof.fireMode === 'pump';
     if (isSingle && this.semiTriggerConsumed) return;
 
-    const curAmmo = this.magAmmoByWeapon[prof.id] ?? 0;
     if (curAmmo <= 0) {
       this.weaponRig.triggerDryFire();
       this.semiTriggerConsumed = true;
@@ -3543,6 +3606,7 @@ export class CombatSessionEngine {
     this.flashlightOn = !this.flashlightOn;
     this.weaponRig.flashlight.visible = this.flashlightOn;
     this.weaponRig.flashlight.intensity = this.flashlightOn ? 32 : 0;
+    this.weaponRig.triggerTacticalSwitch();
     this.audio.playTacticalSwitchClick(this.flashlightOn);
     this.emitSnapshot();
   }
@@ -3550,6 +3614,7 @@ export class CombatSessionEngine {
   private toggleLaser(): void {
     if (!this.weaponRig.getDerivedStats().hasLaser) return;
     this.weaponRig.laserOn = !this.weaponRig.laserOn;
+    this.weaponRig.triggerTacticalSwitch();
     this.audio.playTacticalSwitchClick(this.weaponRig.laserOn);
     this.emitSnapshot();
   }
@@ -3561,7 +3626,8 @@ export class CombatSessionEngine {
       this.matchOutcome !== 'active' ||
       this.pdaDevice.isBlockingWeaponActions() ||
       this.controller.isVaulting() ||
-      this.reloadTimer > 0
+      this.reloadTimer > 0 ||
+      this.weaponRig.isTubularReloading()
     ) {
       return;
     }
@@ -3784,7 +3850,7 @@ export class CombatSessionEngine {
       this.pdaDevice.applyWheel(e.deltaY);
       return;
     }
-    if (this.pointerLocked && this.controller.isAds && this.weaponRig.hasVariableZoom()) {
+    if (this.pointerLocked && !this.controller.isSprinting && this.weaponRig.hasVariableZoom()) {
       e.preventDefault();
       this.weaponRig.cycleOpticZoom(e.deltaY < 0 ? 1 : -1, true);
       this.emitSnapshot();
@@ -3941,13 +4007,13 @@ export class CombatSessionEngine {
         }
         break;
       case 'BracketRight':
-        if (!e.repeat && this.controller.isAds && this.weaponRig.hasVariableZoom()) {
+        if (!e.repeat && !this.controller.isSprinting && this.weaponRig.hasVariableZoom()) {
           this.weaponRig.cycleOpticZoom(1, true);
           this.emitSnapshot();
         }
         break;
       case 'BracketLeft':
-        if (!e.repeat && this.controller.isAds && this.weaponRig.hasVariableZoom()) {
+        if (!e.repeat && !this.controller.isSprinting && this.weaponRig.hasVariableZoom()) {
           this.weaponRig.cycleOpticZoom(-1, true);
           this.emitSnapshot();
         }
@@ -4688,9 +4754,12 @@ export class CombatSessionEngine {
       const nowPerf = performance.now();
       const stanceChanged = this.controller.aimStance !== this.lastSentStance;
       const firingChanged = this.isLocallyActivelyFiring() !== this.lastSentFiring;
-      const reloadChanged = (this.reloadTimer > 0) !== this.lastSentReloading;
+      const reloadChanged =
+        (this.reloadTimer > 0 || this.weaponRig.isTubularReloading()) !== this.lastSentReloading;
+      const handlingActionChanged =
+        this.weaponRig.getSyncedHandlingSnapshot().action !== this.lastSentHandlingAction;
       const urgentTransition =
-        (stanceChanged || firingChanged || reloadChanged) &&
+        (stanceChanged || firingChanged || reloadChanged || handlingActionChanged) &&
         nowPerf - this.lastImmediateStateFlushMs >= 16;
 
       if (this.netSendAccum >= 0.05 || urgentTransition) {
@@ -4783,7 +4852,12 @@ export class CombatSessionEngine {
       ];
       const onHostBotFire =
         this.mp && this.isMpHost
-          ? (botId: string, origin: Readonly<THREE.Vector3>, end: Readonly<THREE.Vector3>) => {
+          ? (
+              botId: string,
+              origin: Readonly<THREE.Vector3>,
+              end: Readonly<THREE.Vector3>,
+              meta?: { weaponId: string; caliberId: string; suppressed: boolean },
+            ) => {
               const firePkt: GameBotFirePacket = {
                 type: 'game:bot_fire',
                 botId,
@@ -4793,6 +4867,9 @@ export class CombatSessionEngine {
                 ex: Number(end.x.toFixed(3)),
                 ey: Number(end.y.toFixed(3)),
                 ez: Number(end.z.toFixed(3)),
+                weaponId: meta?.weaponId,
+                caliberId: meta?.caliberId,
+                sup: meta?.suppressed,
                 ts: Date.now(),
               };
               this.mp!.sendMessage(firePkt as unknown as Record<string, unknown>);
@@ -5181,7 +5258,7 @@ export class CombatSessionEngine {
       ammoInMag: this.magAmmoByWeapon[prof.id] ?? 0,
       magCapacity: prof.magCapacity,
       reserveAmmo: this.reserveAmmoByWeapon[prof.id] ?? -1,
-      isReloading: this.reloadTimer > 0,
+      isReloading: this.reloadTimer > 0 || this.weaponRig.isTubularReloading(),
       armedAdsMode: this.adsModeByWeapon[prof.id] ?? 'PRIMARY',
       hasCantedOptic: this.weaponRig.hasCantedOptic(),
       isMagnifiedOptic: this.weaponRig.isMagnifiedOpticActive(),

@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import { BodycamController } from './BodycamController';
-import { CharacterSkeleton } from './CharacterSkeleton';
+import { CharacterSkeleton, HandPoseDynamicOptions } from './CharacterSkeleton';
 import { IBodycamAudioSource } from './IBodycamAudioSource';
 import {
   createTwoBoneIKResult,
@@ -253,6 +253,13 @@ export class CharacterAnimator {
   private readonly _pdaRPosRoot = new THREE.Vector3();
   private readonly _pdaLQuatRoot = new THREE.Quaternion();
   private readonly _pdaRQuatRoot = new THREE.Quaternion();
+  private readonly _microPosWorld = new THREE.Vector3();
+  private readonly _microQuatWorld = new THREE.Quaternion();
+  private readonly _microPosRoot = new THREE.Vector3();
+  private readonly _microQuatRoot = new THREE.Quaternion();
+  private readonly _breechRoot = new THREE.Vector3();
+  private readonly _rightHandPoseOpts: HandPoseDynamicOptions = {};
+  private readonly _leftHandPoseOpts: HandPoseDynamicOptions = {};
   private readonly _pdaPoleL = new THREE.Vector3();
   private readonly _pdaPoleR = new THREE.Vector3();
 
@@ -479,7 +486,12 @@ export class CharacterAnimator {
   private isLeftHandOverriddenByAction(spec: BodycamWeaponProfile): boolean {
     const isFirearm = spec.holdClass === 'pistol' || spec.holdClass === 'rifle' || spec.holdClass === 'shotgun';
     if (this.combatMove === 'ARMED_BASH' && spec.holdClass === 'pistol') return true;
-    const act = this.weaponRig.weaponAnimator.getActiveAction();
+    const anim = this.weaponRig.weaponAnimator;
+    if (isFirearm && anim.isTubularReloading()) {
+      const ph = anim.getTubularReloadPhase();
+      return ph !== 'OPEN_BREECH' && ph !== 'CLOSE_BREECH';
+    }
+    const act = anim.getActiveAction();
     return (
       isFirearm &&
       (act === 'RELOAD' ||
@@ -1696,16 +1708,19 @@ export class CharacterAnimator {
       this._rDesiredQuatRoot.premultiply(this._rootWorldQuatInv);
 
       if (boltHandW > 0.001) {
-        this.weaponRig.boltRackAnchor.getWorldPosition(this._boltRackRoot);
-        const boltOffsetZ = this.weaponRig.weaponAnimator.getBoltCycleOffsetZ();
-        if (Math.abs(boltOffsetZ) > 1e-5) {
-          this.weaponRig.weaponPivot.getWorldQuaternion(this._inspectWeaponQuat);
-          this._inspectSlideWorld.set(0, 0, boltOffsetZ).applyQuaternion(this._inspectWeaponQuat);
-          this._boltRackRoot.add(this._inspectSlideWorld);
+        // Track physical bolt knob socket directly (rotates upward & pulls rearward with boltHandlePivot)
+        if (!this.weaponRig.getBoltHandleWorldPosition(this._boltRackRoot)) {
+          this.weaponRig.boltRackAnchor.getWorldPosition(this._boltRackRoot);
+          const boltOffsetZ = this.weaponRig.weaponAnimator.getBoltCycleOffsetZ();
+          if (Math.abs(boltOffsetZ) > 1e-5) {
+            this.weaponRig.weaponPivot.getWorldQuaternion(this._inspectWeaponQuat);
+            this._inspectSlideWorld.set(0, 0, boltOffsetZ).applyQuaternion(this._inspectWeaponQuat);
+            this._boltRackRoot.add(this._inspectSlideWorld);
+          }
         }
         this.skeleton.root.worldToLocal(this._boltRackRoot);
         this._rDesiredRoot.lerp(this._boltRackRoot, boltHandW);
-        rightGripCurl = THREE.MathUtils.lerp(rightGripCurl, 0.88, boltHandW);
+        rightGripCurl = THREE.MathUtils.lerp(rightGripCurl, 0.90, boltHandW);
       }
     }
 
@@ -1861,15 +1876,24 @@ export class CharacterAnimator {
     setTransformInRootSpace(armR.hand.root, this.skeleton.root, this.rightArmIK.endPos, this._rQuatRoot);
     armR.hand.root.updateMatrixWorld(true);
 
-    const weaponAction = this.weaponRig.weaponAnimator.getActiveAction();
-    // Strict trigger discipline: right index finger straight off the trigger during Inspect, Reload, Mag-Check, and Bolt Cycling
+    const anim = this.weaponRig.weaponAnimator;
+    const weaponAsm = this.weaponRig.getModelAssembly();
+    const weaponAction = anim.getActiveAction();
+    const triggerPull01 = anim.getTriggerPull01();
+    // Strict trigger discipline: right index finger straight off the trigger during Sprint, Inspect, Reload, Tubular Reload, Mag-Check, Suppressor Toggle, and Bolt Cycling
     const triggerEngaged =
       !isUnarmed &&
       !pdaActiveHold &&
       vaultPinR < 0.05 &&
       boltHandW < 0.05 &&
+      !controller.isSprinting &&
       weaponAction === 'NONE' &&
-      (controller.isAds || controller.isCanted || controller.isPointAim || rigState.recoilZ > 0.004);
+      !anim.isTubularReloading() &&
+      (controller.isAds ||
+        controller.isCanted ||
+        controller.isPointAim ||
+        rigState.recoilZ > 0.004 ||
+        triggerPull01 > 0.02);
     if (pdaActiveHold && pdaIkW > 0.55) {
       const joy = this.pdaDevice!.getJoystickTilt();
       this.skeleton.applyPdaHandPose(
@@ -1879,11 +1903,20 @@ export class CharacterAnimator {
         joy.y,
       );
     } else {
+      this._rightHandPoseOpts.profile = weaponAsm?.handPoseProfile ?? null;
+      this._rightHandPoseOpts.triggerPull01 = triggerPull01;
+      this._rightHandPoseOpts.thumbFlick01 = anim.getRightThumbFlick01();
+      this._rightHandPoseOpts.pinchPose01 = 0;
+      this._rightHandPoseOpts.gripRelease01 = 0;
+      this._rightHandPoseOpts.suppressorGrip = false;
+      this._rightHandPoseOpts.padTap01 = 0;
       this.skeleton.applyHandPose(
         'right',
         vaultPinR > 0.2 || isUnarmed ? 'unarmed' : spec.holdClass,
         triggerEngaged,
         this.rightHandBlender.gripCurl,
+        'none',
+        this._rightHandPoseOpts,
       );
     }
 
@@ -1931,22 +1964,29 @@ export class CharacterAnimator {
     }
 
     // 3. Sample Left Hand target AFTER right-hand hard-lock (for armed weapons)
+    //    Uses live `assembly.leftHandSocket` transform so pump-action shotguns weld support hand 1:1 to `pumpForend`!
+    let leftPinchPose01 = 0;
+    let leftPadTap01 = 0;
+    let leftSuppressorGrip = false;
+    let leftGripRelease01 = 0;
+
     if (!isUnarmed) {
       if (this.weaponRig.hasLeftHandSocket) {
-        this.weaponRig.leftHandSocketAnchor.getWorldPosition(this._lDesiredRoot);
+        if (!this.weaponRig.getLiveLeftHandSocketWorldTransform(this._lDesiredRoot, this._lDesiredQuatRoot)) {
+          this.weaponRig.leftHandSocketAnchor.getWorldPosition(this._lDesiredRoot);
+          this.weaponRig.leftHandSocketAnchor.getWorldQuaternion(this._lDesiredQuatRoot);
+        }
         // Subtle natural handL shift along handguard during Inspect Phase 2
-        const inspectSlideZ = this.weaponRig.weaponAnimator.getInspectLeftHandSlideZ();
+        const inspectSlideZ = anim.getInspectLeftHandSlideZ();
         if (Math.abs(inspectSlideZ) > 1e-5) {
           this.weaponRig.weaponPivot.getWorldQuaternion(this._inspectWeaponQuat);
           this._inspectSlideWorld.set(0, 0, inspectSlideZ).applyQuaternion(this._inspectWeaponQuat);
           this._lDesiredRoot.add(this._inspectSlideWorld);
         }
         this.skeleton.root.worldToLocal(this._lDesiredRoot);
-        this.weaponRig.leftHandSocketAnchor.getWorldQuaternion(this._lDesiredQuatRoot);
         this._lDesiredQuatRoot.premultiply(this._rootWorldQuatInv);
-        const asm = this.weaponRig.getModelAssembly();
-        if (asm) {
-          leftGripCurl = asm.leftGripCurl;
+        if (weaponAsm) {
+          leftGripCurl = weaponAsm.leftGripCurl;
         }
       } else {
         const guardBob = Math.sin(elapsed * 2.0) * 0.006;
@@ -1968,9 +2008,10 @@ export class CharacterAnimator {
       }
       leftGripCurl = THREE.MathUtils.lerp(leftGripCurl, 0.16, vaultPinL);
     } else if (weaponAction === 'RELOAD' && isFirearm) {
-      // Physical detachable magazine reload: Reach MagWell -> Pull Mag to Pouch -> Swap -> Seat Mag -> Rack Slide/Bolt -> Return
+      // Physical detachable magazine reload: Reach MagWell -> Pull Mag to Pouch -> Swap -> Seat Mag -> Rack/AR Bolt-Catch Slap -> Return
       leftOverridden = true;
-      const p = this.weaponRig.weaponAnimator.getActionProgress();
+      const p = anim.getActionProgress();
+      const arSlap = anim.isArBoltCatchSlap();
 
       this.skeleton.magPouchAnchor.getWorldPosition(this._magPouchRoot);
       this.skeleton.root.worldToLocal(this._magPouchRoot);
@@ -2001,27 +2042,93 @@ export class CharacterAnimator {
         this._lDesiredRoot.copy(this._magPouchRoot).lerp(this._magWellRoot, t);
         leftGripCurl = 0.95;
       } else if (p < 0.86) {
-        // RACK_BOLT: reaches up to slide/charging handle and pulls rearward to chamber & release lockback
-        const t = smoothstep(0.65, 0.72, p);
-        const pullBack =
-          p >= 0.70 && p <= 0.86 ? Math.sin(((p - 0.70) / 0.16) * Math.PI) * 0.055 : 0;
-        this.weaponRig.weaponPivot.getWorldQuaternion(this._inspectWeaponQuat);
-        this._inspectSlideWorld.set(0, 0, pullBack).applyQuaternion(this._inspectWeaponQuat);
-        this._inspectSlideWorld.applyQuaternion(this._rootWorldQuatInv);
-        this._tmpWorldB.copy(this._boltRackRoot).add(this._inspectSlideWorld);
-        this._lDesiredRoot.copy(this._magWellRoot).lerp(this._tmpWorldB, t);
-        leftGripCurl = 0.90;
+        if (arSlap) {
+          // AR-15/HK416 crisp palm slap on left-receiver bolt catch paddle
+          const t = smoothstep(0.65, 0.72, p);
+          const slapTap = p >= 0.70 && p <= 0.80 ? Math.sin(((p - 0.70) / 0.10) * Math.PI) : 0;
+          this._tmpWorldB.copy(this._magWellRoot);
+          this._tmpWorldB.y += 0.055;
+          this._tmpWorldB.x -= 0.028 - slapTap * 0.018;
+          this._lDesiredRoot.copy(this._magWellRoot).lerp(this._tmpWorldB, t);
+          leftGripCurl = THREE.MathUtils.lerp(0.85, 0.32, slapTap);
+        } else {
+          // RACK_BOLT: reaches up to slide/charging handle and pulls rearward to chamber & release lockback
+          const t = smoothstep(0.65, 0.72, p);
+          const pullBack =
+            p >= 0.70 && p <= 0.86 ? Math.sin(((p - 0.70) / 0.16) * Math.PI) * 0.055 : 0;
+          this.weaponRig.weaponPivot.getWorldQuaternion(this._inspectWeaponQuat);
+          this._inspectSlideWorld.set(0, 0, pullBack).applyQuaternion(this._inspectWeaponQuat);
+          this._inspectSlideWorld.applyQuaternion(this._rootWorldQuatInv);
+          this._tmpWorldB.copy(this._boltRackRoot).add(this._inspectSlideWorld);
+          this._lDesiredRoot.copy(this._magWellRoot).lerp(this._tmpWorldB, t);
+          leftGripCurl = 0.90;
+        }
       } else {
         // RETURN: crisp handL return back to forend/support grip
         const t = smoothstep(0.86, 1.0, p);
         this._tmpWorldB.copy(this._lDesiredRoot);
-        this._lDesiredRoot.copy(this._boltRackRoot).lerp(this._tmpWorldB, t);
-        leftGripCurl = THREE.MathUtils.lerp(0.90, spec.leftHandSocket?.gripCurl ?? 0.85, t);
+        const fromPt = arSlap ? this._magWellRoot : this._boltRackRoot;
+        this._lDesiredRoot.copy(fromPt).lerp(this._tmpWorldB, t);
+        leftGripCurl = THREE.MathUtils.lerp(0.85, spec.leftHandSocket?.gripCurl ?? 0.85, t);
+      }
+    } else if (anim.isTubularReloading() && isFirearm) {
+      // Shell-by-shell tubular shotgun reload IK:
+      //  - OPEN_BREECH / CLOSE_BREECH keep left hand welded 1:1 to pumpForend (no override!)
+      //  - BREECH_LOAD reaches chest shell loop -> drops 1st shell directly into side ejection port
+      //  - FEED_SHELL cycles chest shell loop -> underside loading port for each shell
+      const ph = anim.getTubularReloadPhase();
+      const tp = anim.getTubularPhaseProgress();
+      if (ph !== 'OPEN_BREECH' && ph !== 'CLOSE_BREECH') {
+        leftOverridden = true;
+        this.skeleton.magPouchAnchor.getWorldPosition(this._magPouchRoot);
+        this.skeleton.root.worldToLocal(this._magPouchRoot);
+        this.weaponRig.magWellAnchor.getWorldPosition(this._magWellRoot);
+        this.skeleton.root.worldToLocal(this._magWellRoot);
+        this._tmpWorldA.copy(this._lDesiredRoot);
+
+        if (ph === 'ENTER') {
+          this._lDesiredRoot.copy(this._tmpWorldA).lerp(this._magPouchRoot, smoothstep(0, 1, tp));
+          leftGripCurl = 0.80;
+        } else if (ph === 'BREECH_LOAD') {
+          if (this.weaponRig.getEjectionPortWorldPosition(this._breechRoot)) {
+            this.skeleton.root.worldToLocal(this._breechRoot);
+          } else {
+            this._breechRoot.copy(this._magWellRoot);
+          }
+          if (tp < 0.24) {
+            this._lDesiredRoot.copy(this._tmpWorldA).lerp(this._magPouchRoot, smoothstep(0, 0.24, tp));
+            leftGripCurl = 0.85;
+          } else if (tp < 0.78) {
+            this._lDesiredRoot.copy(this._magPouchRoot).lerp(this._breechRoot, smoothstep(0.24, 0.74, tp));
+            leftPinchPose01 = 0.85;
+          } else {
+            this._lDesiredRoot.copy(this._breechRoot).lerp(this._tmpWorldA, smoothstep(0.78, 1, tp));
+            leftGripCurl = 0.85;
+          }
+        } else if (ph === 'FEED_SHELL') {
+          if (tp < 0.22) {
+            this._lDesiredRoot.copy(this._magWellRoot).lerp(this._magPouchRoot, smoothstep(0, 0.22, tp));
+            leftGripCurl = 0.82;
+          } else if (tp < 0.76) {
+            this._lDesiredRoot.copy(this._magPouchRoot).lerp(this._magWellRoot, smoothstep(0.22, 0.72, tp));
+            leftPinchPose01 = 0.72;
+          } else {
+            // Thumb push up into magazine tube gate
+            const push = Math.sin(smoothstep(0.76, 1, tp) * Math.PI);
+            this._lDesiredRoot.copy(this._magWellRoot);
+            this._lDesiredRoot.y += push * 0.018;
+            leftPinchPose01 = 0.55;
+          }
+        } else {
+          // EXIT
+          this._lDesiredRoot.copy(this._magWellRoot).lerp(this._tmpWorldA, smoothstep(0, 1, tp));
+          leftGripCurl = THREE.MathUtils.lerp(0.84, spec.leftHandSocket?.gripCurl ?? 0.85, tp);
+        }
       }
     } else if (weaponAction === 'MAG_CHECK' && isFirearm) {
       // Physical magazine check: reach magwell, extract ~3.2cm, inspect witness holes, push back & return
       leftOverridden = true;
-      const p = this.weaponRig.weaponAnimator.getActionProgress();
+      const p = anim.getActionProgress();
       this.weaponRig.magWellAnchor.getWorldPosition(this._magWellRoot);
       this.skeleton.root.worldToLocal(this._magWellRoot);
 
@@ -2044,11 +2151,12 @@ export class CharacterAnimator {
       (weaponAction === 'SUPPRESSOR_DETACH' || weaponAction === 'SUPPRESSOR_ATTACH') &&
       isFirearm
     ) {
-      // Field suppressor twist-and-stow left-hand 2-bone IK sequence
+      // Realistic 2.45s 3-stroke ratcheted suppressor detach/reattach IK sequence
       leftOverridden = true;
       const isAttach = weaponAction === 'SUPPRESSOR_ATTACH';
-      const p = this.weaponRig.weaponAnimator.getActionProgress();
-      const twist01 = this.weaponRig.weaponAnimator.getSuppressorTwistPhase01();
+      const p = anim.getActionProgress();
+      const wristRoll = anim.getSuppressorWristRollRad();
+      const gripRelease = anim.getSuppressorGripRelease01();
 
       this.skeleton.magPouchAnchor.getWorldPosition(this._magPouchRoot);
       this.skeleton.root.worldToLocal(this._magPouchRoot);
@@ -2073,55 +2181,63 @@ export class CharacterAnimator {
       this._tmpWorldA.copy(this._lDesiredRoot);
 
       if (!isAttach) {
-        // DETACH: 0.00-0.12 TILT -> 0.12-0.24 REACH_MUZZLE -> 0.24-0.64 TWIST -> 0.64-0.84 STOW -> 0.84-1.00 RETURN
-        if (p < 0.12) {
+        // DETACH: 0.00-0.10 TILT -> 0.10-0.21 REACH -> 0.21-0.61 3x RATCHET TWIST -> 0.61-0.67 CLEAR_PULL -> 0.67-0.86 STOW -> 0.86-1.00 RETURN
+        if (p < 0.10) {
           this._lDesiredRoot.copy(this._tmpWorldA);
           leftGripCurl = 0.85;
-        } else if (p < 0.24) {
-          const t = smoothstep(0.12, 0.24, p);
+        } else if (p < 0.21) {
+          const t = smoothstep(0.10, 0.21, p);
           this._lDesiredRoot.copy(this._tmpWorldA).lerp(this._suppressorMountRoot, t);
+          leftSuppressorGrip = t > 0.6;
+          leftGripRelease01 = (1 - t) * 0.45;
           leftGripCurl = THREE.MathUtils.lerp(0.85, 0.94, t);
-        } else if (p < 0.64) {
+        } else if (p < 0.67) {
           this._lDesiredRoot.copy(this._suppressorMountRoot);
-          // Ergonomic 3.5-cycle wrist twist roll
-          const twistRoll = Math.sin(twist01 * Math.PI * 7) * 0.54;
-          this._suppressorTwistEuler.set(0.08, -0.14, twistRoll, 'YXZ');
+          this._suppressorTwistEuler.set(0.08, -0.14, wristRoll, 'YXZ');
           this._suppressorTwistQuat.setFromEuler(this._suppressorTwistEuler);
           this._lDesiredQuatRoot.multiply(this._suppressorTwistQuat);
-          leftGripCurl = 0.96;
-        } else if (p < 0.84) {
-          const t = smoothstep(0.64, 0.80, p);
+          leftSuppressorGrip = true;
+          leftGripRelease01 = gripRelease;
+          leftGripCurl = 0.95;
+        } else if (p < 0.86) {
+          const t = smoothstep(0.67, 0.83, p);
           this._lDesiredRoot.copy(this._suppressorMountRoot).lerp(this._magPouchRoot, t);
-          leftGripCurl = p < 0.80 ? 0.95 : 0.72;
+          leftSuppressorGrip = p < 0.83;
+          leftGripRelease01 = p >= 0.83 ? 0.55 : 0;
+          leftGripCurl = p < 0.83 ? 0.94 : 0.72;
         } else {
-          const t = smoothstep(0.84, 1.0, p);
+          const t = smoothstep(0.86, 1.0, p);
           this._lDesiredRoot.copy(this._magPouchRoot).lerp(this._tmpWorldA, t);
           leftGripCurl = THREE.MathUtils.lerp(0.72, spec.leftHandSocket?.gripCurl ?? 0.85, t);
         }
       } else {
-        // ATTACH: 0.00-0.12 TILT -> 0.12-0.32 REACH_POUCH -> 0.32-0.44 REACH_MUZZLE -> 0.44-0.84 TWIST -> 0.84-1.00 RETURN
-        if (p < 0.12) {
+        // ATTACH: 0.00-0.10 TILT -> 0.10-0.28 POUCH -> 0.28-0.40 REACH_MUZZLE -> 0.40-0.44 SEAT -> 0.44-0.84 3x RATCHET TWIST -> 0.84-1.00 RETURN
+        if (p < 0.10) {
           this._lDesiredRoot.copy(this._tmpWorldA);
           leftGripCurl = 0.85;
-        } else if (p < 0.32) {
-          const t = smoothstep(0.12, 0.24, p);
+        } else if (p < 0.28) {
+          const t = smoothstep(0.10, 0.22, p);
           this._lDesiredRoot.copy(this._tmpWorldA).lerp(this._magPouchRoot, t);
-          leftGripCurl = p < 0.21 ? 0.72 : 0.95;
-        } else if (p < 0.44) {
-          const t = smoothstep(0.32, 0.44, p);
+          leftSuppressorGrip = p >= 0.20;
+          leftGripRelease01 = p < 0.20 ? 0.5 : 0;
+          leftGripCurl = p < 0.20 ? 0.72 : 0.95;
+        } else if (p < 0.40) {
+          const t = smoothstep(0.28, 0.40, p);
           this._lDesiredRoot.copy(this._magPouchRoot).lerp(this._suppressorMountRoot, t);
+          leftSuppressorGrip = true;
           leftGripCurl = 0.95;
         } else if (p < 0.84) {
           this._lDesiredRoot.copy(this._suppressorMountRoot);
-          const twistRoll = -Math.sin(twist01 * Math.PI * 7) * 0.54;
-          this._suppressorTwistEuler.set(0.08, -0.14, twistRoll, 'YXZ');
+          this._suppressorTwistEuler.set(0.08, -0.14, wristRoll, 'YXZ');
           this._suppressorTwistQuat.setFromEuler(this._suppressorTwistEuler);
           this._lDesiredQuatRoot.multiply(this._suppressorTwistQuat);
-          leftGripCurl = 0.96;
+          leftSuppressorGrip = true;
+          leftGripRelease01 = gripRelease;
+          leftGripCurl = 0.95;
         } else {
           const t = smoothstep(0.84, 1.0, p);
           this._lDesiredRoot.copy(this._suppressorMountRoot).lerp(this._tmpWorldA, t);
-          leftGripCurl = THREE.MathUtils.lerp(0.92, spec.leftHandSocket?.gripCurl ?? 0.85, t);
+          leftGripCurl = THREE.MathUtils.lerp(0.90, spec.leftHandSocket?.gripCurl ?? 0.85, t);
         }
       }
     } else if (this.combatMove === 'ARMED_BASH' && spec.holdClass === 'pistol') {
@@ -2132,7 +2248,7 @@ export class CharacterAnimator {
       this._lDesiredQuatRoot.setFromEuler(this._tmpEuler);
       leftGripCurl = 0.88;
     } else if (isFirearm && this.weaponRig.isZoomTwistActive()) {
-      // 0.28s interruptible LPVO magnification ring throw-lever twist with left hand IK
+      // 0.28s interruptible LPVO/scope magnification throw-lever pinch & sweep (works in ADS + ready stance!)
       const zoomW = this.weaponRig.getZoomRingIkOverride(
         this._zoomRingPosWorld,
         this._zoomRingQuatWorld,
@@ -2144,7 +2260,52 @@ export class CharacterAnimator {
         this._zoomRingQuatRoot.copy(this._zoomRingQuatWorld).premultiply(this._rootWorldQuatInv);
         this._lDesiredRoot.lerp(this._zoomRingPosRoot, zoomW);
         this._lDesiredQuatRoot.slerp(this._zoomRingQuatRoot, zoomW * 0.72);
-        leftGripCurl = THREE.MathUtils.lerp(leftGripCurl, 0.76, zoomW);
+        leftPinchPose01 = zoomW;
+        leftGripCurl = THREE.MathUtils.lerp(leftGripCurl, 0.78, zoomW);
+      }
+    } else if (isFirearm && anim.getActiveMicroAction() !== 'NONE') {
+      // Non-blocking combat-interruptible firearm handling micro-actions (turret, illum, support-hand selector, light/laser pad)
+      const mAct = anim.getActiveMicroAction();
+      const mw = anim.getMicroActionWeight();
+      if (mw > 0.001) {
+        let gotTarget = false;
+        if (mAct === 'TURRET') {
+          gotTarget = this.weaponRig.getElevationTurretWorldTransform(
+            this._microPosWorld,
+            this._microQuatWorld,
+          );
+          if (gotTarget) leftPinchPose01 = mw;
+        } else if (mAct === 'ILLUM') {
+          gotTarget = this.weaponRig.getIllumDialWorldTransform(
+            this._microPosWorld,
+            this._microQuatWorld,
+          );
+          if (gotTarget) leftPinchPose01 = mw;
+        } else if (mAct === 'SELECTOR' && weaponAsm?.selectorSide === 'support_hand') {
+          gotTarget = this.weaponRig.getSelectorWorldTransform(
+            this._microPosWorld,
+            this._microQuatWorld,
+          );
+          if (gotTarget) leftPinchPose01 = mw * 0.72;
+        } else if (mAct === 'LIGHT_PAD') {
+          gotTarget = this.weaponRig.getPressurePadWorldTransform(
+            this._microPosWorld,
+            this._microQuatWorld,
+          );
+          if (gotTarget) leftPadTap01 = mw;
+        }
+
+        if (gotTarget) {
+          leftOverridden = true;
+          this._microPosRoot.copy(this._microPosWorld);
+          this.skeleton.root.worldToLocal(this._microPosRoot);
+          this._microQuatRoot.copy(this._microQuatWorld).premultiply(this._rootWorldQuatInv);
+          const posBlend = mAct === 'LIGHT_PAD' ? mw * 0.55 : mw;
+          this._lDesiredRoot.lerp(this._microPosRoot, posBlend);
+          if (mAct !== 'LIGHT_PAD') {
+            this._lDesiredQuatRoot.slerp(this._microQuatRoot, mw * 0.62);
+          }
+        }
       }
     }
 
@@ -2177,7 +2338,7 @@ export class CharacterAnimator {
         isUnarmed && !usePdaLeftQuat ? this.leftHandBlender.quaternion : this._lDesiredQuatRoot,
         leftGripCurl,
         1,
-        vaultPinL > 0.001 ? 38 : pdaActiveHold ? 32 : leftOverridden ? 28 : 34,
+        vaultPinL > 0.001 ? 38 : pdaActiveHold ? 32 : leftOverridden ? 30 : 34,
         dt,
       );
     } else {
@@ -2218,25 +2379,38 @@ export class CharacterAnimator {
     setTransformInRootSpace(armL.hand.root, this.skeleton.root, this.leftArmIK.endPos, this._lQuatRoot);
     armL.hand.root.updateMatrixWorld(true);
 
-    // Sync physical detachable magazine & field suppressor meshes into/out of left hand
-    this.weaponRig.weaponAnimator.syncPhysicalMagazineParent(armL.hand.root);
-    this.weaponRig.weaponAnimator.syncPhysicalSuppressorParent(armL.hand.root);
+    // Sync physical detachable magazine, field suppressor (world-space continuity!), and shotgun reload shell into/out of left hand
+    anim.syncPhysicalMagazineParent(armL.hand.root);
+    anim.syncPhysicalSuppressorParent(armL.hand.root, dt);
+    anim.syncPhysicalShellParent(armL.hand.root);
 
     const leftHoldClass =
-      vaultPinL > 0.2 || isUnarmed ? 'unarmed' : leftOverridden ? 'melee_1h' : spec.holdClass;
+      vaultPinL > 0.2 || isUnarmed
+        ? 'unarmed'
+        : leftOverridden && !leftSuppressorGrip && leftPinchPose01 < 0.05 && leftPadTap01 < 0.05
+          ? 'melee_1h'
+          : spec.holdClass;
     const foregripPose =
-      leftOverridden || vaultPinL > 0.2 || isUnarmed
+      (leftOverridden && leftPadTap01 < 0.05) || vaultPinL > 0.2 || isUnarmed
         ? 'none'
-        : (this.weaponRig.getModelAssembly()?.foregripPose ?? 'none');
+        : (weaponAsm?.foregripPose ?? 'none');
     if (pdaActiveHold && pdaIkW > 0.55) {
       this.skeleton.applyPdaHandPose('left', 0, 0, 0);
     } else {
+      this._leftHandPoseOpts.profile = weaponAsm?.handPoseProfile ?? null;
+      this._leftHandPoseOpts.triggerPull01 = 0;
+      this._leftHandPoseOpts.thumbFlick01 = 0;
+      this._leftHandPoseOpts.pinchPose01 = leftPinchPose01;
+      this._leftHandPoseOpts.gripRelease01 = leftGripRelease01;
+      this._leftHandPoseOpts.suppressorGrip = leftSuppressorGrip;
+      this._leftHandPoseOpts.padTap01 = leftPadTap01;
       this.skeleton.applyHandPose(
         'left',
         leftHoldClass,
         false,
         this.leftHandBlender.gripCurl,
         foregripPose,
+        this._leftHandPoseOpts,
       );
     }
   }

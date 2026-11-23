@@ -30,6 +30,18 @@ import {
   BuiltTacticalEquipmentMesh,
   getBeltSlotTransforms,
 } from '../bodycam-sdk/equipment/TacticalEquipmentMesh';
+import { resolveWeaponProfile } from '../bodycam-sdk/weaponProfiles';
+import {
+  evalRatchetedSuppressorTwist,
+  RatchetedSuppressorTwistSample,
+} from '../bodycam-sdk/weapons/WeaponAnimator';
+import { WeaponAssembler } from '../bodycam-sdk/weapons/WeaponAssembler';
+import {
+  WeaponModelAssembly,
+  WeaponModelFactory,
+} from '../bodycam-sdk/weapons/WeaponModelFactory';
+import { normalizeWeaponAttachments, WeaponAttachments } from '../data/attachments';
+import { SyncedHandlingAction } from '../data/multiplayer';
 
 export type TacticalActorKind = 'remote_player' | 'bot';
 
@@ -66,6 +78,10 @@ export interface TacticalCombatPose {
   vaultProgress?: number;
   /** Vault maneuver kind for distinct brace vs mantle posture */
   vaultKind?: 'VAULT_OVER' | 'CLIMB_ONTO' | 'HIGH_MANTLE';
+  /** Active synced firearm handling action (reload, suppressor toggle, pump, bolt, zoom, etc.) */
+  handlingAction?: SyncedHandlingAction;
+  /** Normalized 0..1 progress through active handling action */
+  handlingProgress?: number;
 }
 
 export interface BuiltTacticalOperatorRig {
@@ -95,6 +111,9 @@ export interface BuiltTacticalOperatorRig {
     visible?: boolean,
   ) => void;
   setWeaponClass: (weaponClass: 'pistol' | 'smg' | 'shotgun' | 'rifle') => void;
+  setWeaponLoadout: (weaponId: string, attachments?: WeaponAttachments | null) => void;
+  setSuppressedVisual: (suppressed: boolean) => void;
+  disposeWeapon: () => void;
   setGearAppearance: (gear: {
     glovesEnabled?: boolean;
     gloveColor?: string;
@@ -146,6 +165,38 @@ const _armQuat = new THREE.Quaternion();
 const _armQuatInv = new THREE.Quaternion();
 const _foreQuat = new THREE.Quaternion();
 const _fallbackVec = new THREE.Vector3();
+const _handAuxL = new THREE.Vector3();
+const _handAuxR = new THREE.Vector3();
+const _pouchLocal = new THREE.Vector3();
+const _sockTmp = new THREE.Vector3();
+const _suppTwistSample: RatchetedSuppressorTwistSample = {
+  cumulativeAngle01: 0,
+  axial01: 0,
+  wristRollRad: 0,
+  gripRelease01: 0,
+  weaponCounterRollRad: 0,
+  strokeIndex: 0,
+};
+
+function smoothstep3P(edge0: number, edge1: number, x: number): number {
+  const t = THREE.MathUtils.clamp((x - edge0) / Math.max(1e-5, edge1 - edge0), 0, 1);
+  return t * t * (3 - 2 * t);
+}
+
+function buildAttachmentSig(weaponId: string, att?: WeaponAttachments | null): string {
+  if (!att) return `${weaponId}|bare`;
+  return [
+    weaponId,
+    att.optic ?? '',
+    att.muzzle ?? '',
+    att.suppressorStowed ? 'S' : '',
+    att.tactical ?? '',
+    att.foregrip ?? '',
+    att.railAdapter ?? '',
+    att.canted ?? '',
+    att.magazine ?? '',
+  ].join('|');
+}
 
 /**
  * Computes an orientation quaternion in the same frame as `dir` and `poleHint`
@@ -249,14 +300,6 @@ export class TacticalOperatorRigFactory {
   private readonly geoEarPro: THREE.CylinderGeometry;
   private readonly geoHairBun: THREE.SphereGeometry;
 
-  private readonly geoRifleReceiver: THREE.BoxGeometry;
-  private readonly geoRifleHandguard: THREE.BoxGeometry;
-  private readonly geoRifleStock: THREE.BoxGeometry;
-  private readonly geoRifleButtpad: THREE.BoxGeometry;
-  private readonly geoRiflePistolGrip: THREE.BoxGeometry;
-  private readonly geoRifleMag: THREE.BoxGeometry;
-  private readonly geoRifleOptic: THREE.BoxGeometry;
-  private readonly geoRifleBarrel: THREE.CylinderGeometry;
   private readonly geoFlash: THREE.OctahedronGeometry;
   private readonly geoLaser: THREE.CylinderGeometry;
   private readonly geoLightGlow: THREE.SphereGeometry;
@@ -330,16 +373,7 @@ export class TacticalOperatorRigFactory {
     this.geoEarPro.rotateZ(Math.PI * 0.5);
     this.geoHairBun = this.track(new THREE.SphereGeometry(0.052, 10, 8));
 
-    // Articulated Tactical Carbine Silhouette (origin near rear receiver / grip area, barrel along -Z)
-    this.geoRifleReceiver = this.track(new THREE.BoxGeometry(0.052, 0.084, 0.27));
-    this.geoRifleHandguard = this.track(new THREE.BoxGeometry(0.044, 0.052, 0.29));
-    this.geoRifleStock = this.track(new THREE.BoxGeometry(0.04, 0.082, 0.20));
-    this.geoRifleButtpad = this.track(new THREE.BoxGeometry(0.044, 0.11, 0.024));
-    this.geoRiflePistolGrip = this.track(new THREE.BoxGeometry(0.032, 0.105, 0.046));
-    this.geoRifleMag = this.track(new THREE.BoxGeometry(0.027, 0.145, 0.064));
-    this.geoRifleOptic = this.track(new THREE.BoxGeometry(0.04, 0.046, 0.105));
-    this.geoRifleBarrel = this.track(new THREE.CylinderGeometry(0.012, 0.012, 0.26, 6));
-    this.geoRifleBarrel.rotateX(Math.PI * 0.5);
+    // Weapon muzzle FX & tactical beam primitives
     this.geoFlash = this.track(new THREE.OctahedronGeometry(0.09, 0));
     this.geoLaser = this.track(new THREE.CylinderGeometry(0.0036, 0.0036, 15, 4));
     this.geoLaser.rotateX(Math.PI * 0.5);
@@ -921,26 +955,7 @@ export class TacticalOperatorRigFactory {
     weaponPivot.name = 'weaponPivot';
     weaponSocket.add(weaponPivot);
 
-    // Rifle geometry built around local origin (rear receiver) so stock seats into right shoulder
-    const receiver = makeMesh(this.geoRifleReceiver, 'gun');
-    receiver.position.set(0, 0.0, -0.08);
-    const handguard = makeMesh(this.geoRifleHandguard, 'gunAccent');
-    handguard.position.set(0, 0.008, -0.355);
-    const stock = makeMesh(this.geoRifleStock, 'gunAccent');
-    stock.position.set(0, -0.01, 0.14);
-    const buttpad = makeMesh(this.geoRifleButtpad, 'sole');
-    buttpad.position.set(0, -0.014, 0.242);
-    const pistolGrip = makeMesh(this.geoRiflePistolGrip, 'gunAccent');
-    pistolGrip.position.set(0, -0.072, -0.006);
-    pistolGrip.rotation.x = -0.32;
-    const mag = makeMesh(this.geoRifleMag, 'gunAccent');
-    mag.position.set(0, -0.095, -0.145);
-    mag.rotation.x = 0.16;
-    const optic = makeMesh(this.geoRifleOptic, 'hardware');
-    optic.position.set(0, 0.062, -0.065);
-    const barrel = makeMesh(this.geoRifleBarrel, 'gun');
-    barrel.position.set(0, 0.01, -0.585);
-
+    // Real procedural PBR weapon assembly mounted inside weaponPivot (Layer 0, thirdPersonMode: true)
     const muzzleFlash = makeMesh(this.geoFlash, 'flash');
     muzzleFlash.position.set(0, 0.01, -0.74);
     muzzleFlash.visible = false;
@@ -953,164 +968,174 @@ export class TacticalOperatorRigFactory {
     flashlightGlow.position.set(-0.026, -0.008, -0.52);
     flashlightGlow.visible = false;
 
-    weaponPivot.add(
-      receiver,
-      handguard,
-      stock,
-      buttpad,
-      pistolGrip,
-      mag,
-      optic,
-      barrel,
-      muzzleFlash,
-      laserBeam,
-      flashlightGlow,
-    );
+    weaponPivot.add(muzzleFlash, laserBeam, flashlightGlow);
 
-    // Local grip anchors in weaponSocket space for 2-bone arm IK (updated dynamically per weapon class)
+    // Local grip anchors in weaponSocket space for 2-bone arm IK (updated dynamically from real assembly sockets)
     const rightGripLocal = new THREE.Vector3(0.0, -0.078, -0.012);
     const leftHandguardLocal = new THREE.Vector3(-0.018, -0.022, -0.295);
+    const magWellLocal = new THREE.Vector3(0.0, -0.095, -0.145);
+    const boltRackLocal = new THREE.Vector3(-0.025, 0.025, -0.10);
+    const boltHandleLocal = new THREE.Vector3(0.04, 0.015, -0.06);
+    const suppGripLocal = new THREE.Vector3(0.0, 0.01, -0.66);
+    const zoomRingLocal = new THREE.Vector3(-0.022, 0.075, -0.08);
+    const turretLocal = new THREE.Vector3(0.0, 0.09, -0.12);
+    const illumLocal = new THREE.Vector3(-0.024, 0.075, -0.11);
+    const selectorLocal = new THREE.Vector3(-0.022, -0.01, -0.03);
+    const padLocal = new THREE.Vector3(-0.022, 0.02, -0.28);
+
+    let weaponAsm: WeaponModelAssembly | null = null;
+    let currentWeaponSig = '';
+    let baseMagY = 0;
+    let basePumpZ = 0;
+    let baseBoltZ = 0;
+    let baseSuppPos = new THREE.Vector3();
+    let baseSuppRot = new THREE.Euler();
+    let baseSuppVisible = false;
+    let isUnarmedWeapon = false;
+
+    const disposeWeapon = (): void => {
+      if (weaponAsm) {
+        weaponPivot.remove(weaponAsm.group);
+        weaponAsm.dispose();
+        weaponAsm = null;
+      }
+      currentWeaponSig = '';
+    };
+
+    this.disposables.push({ dispose: disposeWeapon });
+
+    const setWeaponLoadout = (
+      weaponId: string,
+      rawAttachments?: WeaponAttachments | null,
+    ): void => {
+      const prof = resolveWeaponProfile(weaponId || 'm4a1');
+      const normalized = normalizeWeaponAttachments(prof.id, rawAttachments);
+      const sig = buildAttachmentSig(prof.id, normalized);
+      if (sig === currentWeaponSig && weaponAsm) return;
+      currentWeaponSig = sig;
+
+      if (weaponAsm) {
+        weaponPivot.remove(weaponAsm.group);
+        weaponAsm.dispose();
+        weaponAsm = null;
+      }
+
+      isUnarmedWeapon = prof.holdClass === 'unarmed' || prof.visualStyle === 'unarmed';
+      if (isUnarmedWeapon) {
+        muzzleFlash.visible = false;
+        laserBeam.visible = false;
+        flashlightGlow.visible = false;
+        return;
+      }
+
+      const asm = WeaponModelFactory.build(
+        {
+          id: prof.id,
+          holdClass: prof.holdClass,
+          barrelLengthM: prof.barrelLengthM,
+          visualStyle: prof.visualStyle,
+          rightHandSocket: prof.rightHandSocket,
+          leftHandSocket: prof.leftHandSocket,
+          muzzleOffset: prof.muzzleOffset,
+          supportsSuppressor: prof.supportsSuppressor,
+          finish: prof.finish,
+          railType: prof.railType,
+          isRevolver: prof.isRevolver,
+          renderLayer: 0,
+        },
+        false,
+      );
+
+      WeaponAssembler.applyAttachments(
+        asm,
+        prof.massKg,
+        prof.barrelLengthM,
+        prof.magCapacity,
+        normalized,
+        { thirdPersonMode: true },
+      );
+
+      asm.group.traverse((obj) => {
+        obj.layers.set(0);
+        if ((obj as THREE.Mesh).isMesh) {
+          obj.castShadow = true;
+          obj.receiveShadow = true;
+        }
+      });
+
+      weaponPivot.add(asm.group);
+      weaponAsm = asm;
+
+      // Sync real socket anchors for 3P 2-bone arm IK & muzzle/laser/light FX
+      rightGripLocal.copy(asm.rightHandSocket.position);
+      leftHandguardLocal.copy(asm.leftHandSocket.position);
+      magWellLocal.copy(asm.magWellSocket.position);
+      boltRackLocal.copy(asm.boltRackSocket.position);
+      if (asm.boltHandleSocket) boltHandleLocal.copy(asm.boltHandleSocket.position);
+      else boltHandleLocal.copy(asm.boltRackSocket.position);
+      if (asm.suppressorGripSocket) {
+        suppGripLocal.copy(asm.suppressorGripSocket.position);
+      } else if (asm.suppressor) {
+        suppGripLocal.copy(asm.suppressor.position);
+      } else {
+        suppGripLocal.copy(asm.muzzleSocket.position);
+      }
+      if (asm.zoomRingSocket) zoomRingLocal.copy(asm.zoomRingSocket.position);
+      else zoomRingLocal.set(-0.02, 0.072, -0.09);
+      if (asm.elevationTurretSocket) turretLocal.copy(asm.elevationTurretSocket.position);
+      else turretLocal.set(0, 0.088, -0.11);
+      if (asm.illumDialSocket) illumLocal.copy(asm.illumDialSocket.position);
+      else illumLocal.set(-0.022, 0.072, -0.10);
+      selectorLocal.copy(asm.selectorSocket.position);
+      padLocal.copy(asm.pressurePadSocket.position);
+
+      baseMagY = asm.magazine ? asm.magazine.position.y : 0;
+      basePumpZ = asm.pumpForend ? asm.pumpForend.position.z : 0;
+      baseBoltZ = asm.slideOrBolt ? asm.slideOrBolt.position.z : 0;
+      if (asm.suppressor) {
+        baseSuppPos.copy(asm.suppressor.position);
+        baseSuppRot.copy(asm.suppressor.rotation);
+        baseSuppVisible = asm.suppressor.visible;
+      } else {
+        baseSuppVisible = false;
+      }
+
+      muzzleFlash.position.copy(asm.muzzleSocket.position);
+      laserBeam.position.set(
+        asm.laserSocket.position.x,
+        asm.laserSocket.position.y,
+        asm.laserSocket.position.z - 7.5,
+      );
+      flashlightGlow.position.copy(asm.flashlightSocket.position);
+    };
+
+    const setSuppressedVisual = (suppressed: boolean): void => {
+      if (weaponAsm?.suppressor) {
+        weaponAsm.suppressor.visible = suppressed;
+        baseSuppVisible = suppressed;
+      }
+      if (weaponAsm) {
+        muzzleFlash.position.copy(weaponAsm.muzzleSocket.position);
+        if (suppressed && weaponAsm.suppressor) {
+          muzzleFlash.position.z = weaponAsm.suppressor.position.z - 0.10;
+        }
+      }
+    };
 
     const setWeaponClass = (weaponClass: 'pistol' | 'smg' | 'shotgun' | 'rifle'): void => {
-      if (weaponClass === 'pistol') {
-        // Compact semi-auto service pistol (Glock 17) held in two-handed tactical isosceles grip
-        receiver.visible = true;
-        receiver.scale.set(0.58, 0.72, 0.76);
-        receiver.position.set(0, 0.015, -0.17);
-
-        handguard.visible = false;
-        stock.visible = false;
-        buttpad.visible = false;
-        optic.visible = false;
-        mag.visible = false;
-
-        pistolGrip.visible = true;
-        pistolGrip.scale.set(0.86, 0.92, 0.92);
-        pistolGrip.position.set(0, -0.052, -0.105);
-        pistolGrip.rotation.x = -0.34;
-
-        barrel.visible = true;
-        barrel.scale.set(0.95, 0.34, 0.95);
-        barrel.position.set(0, 0.018, -0.285);
-
-        muzzleFlash.position.set(0, 0.018, -0.34);
-        rightGripLocal.set(0.008, -0.055, -0.105);
-        leftHandguardLocal.set(-0.016, -0.058, -0.125);
-        return;
-      }
-
-      if (weaponClass === 'smg') {
-        // Compact PDW / Submachine gun (MP5 / AKS-74U)
-        receiver.visible = true;
-        receiver.scale.set(0.9, 0.92, 0.82);
-        receiver.position.set(0, 0.0, -0.08);
-
-        handguard.visible = true;
-        handguard.scale.set(0.92, 0.9, 0.62);
-        handguard.position.set(0, 0.006, -0.27);
-
-        stock.visible = true;
-        stock.scale.set(0.82, 0.72, 0.86);
-        stock.position.set(0, -0.006, 0.12);
-
-        buttpad.visible = true;
-        buttpad.position.set(0, -0.01, 0.215);
-
-        pistolGrip.visible = true;
-        pistolGrip.scale.set(1, 1, 1);
-        pistolGrip.position.set(0, -0.072, -0.006);
-        pistolGrip.rotation.x = -0.32;
-
-        mag.visible = true;
-        mag.scale.set(0.75, 1.1, 0.72);
-        mag.position.set(0, -0.105, -0.145);
-        mag.rotation.x = 0.22;
-
-        optic.visible = true;
-        optic.position.set(0, 0.058, -0.065);
-
-        barrel.visible = true;
-        barrel.scale.set(0.95, 0.62, 0.95);
-        barrel.position.set(0, 0.008, -0.42);
-
-        muzzleFlash.position.set(0, 0.008, -0.52);
-        rightGripLocal.set(0.0, -0.078, -0.012);
-        leftHandguardLocal.set(-0.018, -0.022, -0.245);
-        return;
-      }
-
-      if (weaponClass === 'shotgun') {
-        // Pump / Tactical Shotgun (Remington 870 / SPAS-12)
-        receiver.visible = true;
-        receiver.scale.set(1.04, 0.92, 1.05);
-        receiver.position.set(0, 0.0, -0.08);
-
-        handguard.visible = true;
-        handguard.scale.set(1.18, 0.98, 0.92);
-        handguard.position.set(0, -0.012, -0.35);
-
-        stock.visible = true;
-        stock.scale.set(1.02, 1.0, 1.04);
-        stock.position.set(0, -0.016, 0.145);
-
-        buttpad.visible = true;
-        buttpad.position.set(0, -0.02, 0.25);
-
-        pistolGrip.visible = true;
-        pistolGrip.scale.set(1, 0.92, 1);
-        pistolGrip.position.set(0, -0.068, 0.012);
-        pistolGrip.rotation.x = -0.42;
-
-        mag.visible = false;
-        optic.visible = false;
-
-        barrel.visible = true;
-        barrel.scale.set(1.38, 1.18, 1.38);
-        barrel.position.set(0, 0.014, -0.62);
-
-        muzzleFlash.position.set(0, 0.014, -0.80);
-        rightGripLocal.set(0.0, -0.074, 0.01);
-        leftHandguardLocal.set(-0.018, -0.028, -0.335);
-        return;
-      }
-
-      // Default: Carbine / Assault Rifle (M4A1 / AKM / HK416)
-      receiver.visible = true;
-      receiver.scale.set(1, 1, 1);
-      receiver.position.set(0, 0.0, -0.08);
-
-      handguard.visible = true;
-      handguard.scale.set(1, 1, 1);
-      handguard.position.set(0, 0.008, -0.355);
-
-      stock.visible = true;
-      stock.scale.set(1, 1, 1);
-      stock.position.set(0, -0.01, 0.14);
-
-      buttpad.visible = true;
-      buttpad.position.set(0, -0.014, 0.242);
-
-      pistolGrip.visible = true;
-      pistolGrip.scale.set(1, 1, 1);
-      pistolGrip.position.set(0, -0.072, -0.006);
-      pistolGrip.rotation.x = -0.32;
-
-      mag.visible = true;
-      mag.scale.set(1, 1, 1);
-      mag.position.set(0, -0.095, -0.145);
-      mag.rotation.x = 0.16;
-
-      optic.visible = true;
-      optic.position.set(0, 0.062, -0.065);
-
-      barrel.visible = true;
-      barrel.scale.set(1, 1, 1);
-      barrel.position.set(0, 0.01, -0.585);
-
-      muzzleFlash.position.set(0, 0.01, -0.74);
-      rightGripLocal.set(0.0, -0.078, -0.012);
-      leftHandguardLocal.set(-0.018, -0.022, -0.295);
+      const defaultId =
+        weaponClass === 'pistol'
+          ? 'glock_17'
+          : weaponClass === 'smg'
+            ? 'mp5_9mm'
+            : weaponClass === 'shotgun'
+              ? 'remington_870'
+              : 'm4a1';
+      setWeaponLoadout(defaultId, null);
     };
+
+    // Build default carbine immediately
+    setWeaponLoadout('m4a1', null);
 
     let customHelmetMat: THREE.MeshStandardMaterial | null = null;
     let customGloveMat: THREE.MeshStandardMaterial | null = null;
@@ -1297,11 +1322,39 @@ export class TacticalOperatorRigFactory {
       wz = THREE.MathUtils.lerp(wz, -0.135, cantW);
       wepYaw = THREE.MathUtils.lerp(wepYaw, 0.04, cantW);
 
-      // Reload posture dip
-      wx = THREE.MathUtils.lerp(wx, 0.085 * torsoW, reload);
-      wy = THREE.MathUtils.lerp(wy, 0.275, reload);
-      wz = THREE.MathUtils.lerp(wz, -0.175, reload);
-      wepYaw = THREE.MathUtils.lerp(wepYaw, 0.30, reload);
+      const hAct: SyncedHandlingAction =
+        pose.handlingAction && pose.handlingAction !== 'NONE'
+          ? pose.handlingAction
+          : reload > 0.05
+            ? 'RELOAD'
+            : 'NONE';
+      const hProg = THREE.MathUtils.clamp(pose.handlingProgress ?? 0, 0, 1);
+      const isSuppAct = hAct === 'SUPPRESSOR_DETACH' || hAct === 'SUPPRESSOR_ATTACH';
+      const suppEnv = isSuppAct
+        ? smoothstep3P(0.0, 0.12, hProg) * (1 - smoothstep3P(0.88, 1.0, hProg))
+        : 0;
+      const isInspectAct = hAct === 'INSPECT';
+      const inspectEnv = isInspectAct
+        ? smoothstep3P(0.0, 0.18, hProg) * (1 - smoothstep3P(0.82, 1.0, hProg))
+        : 0;
+
+      // Reload / Suppressor / Inspect posture dip
+      const effReload = hAct === 'RELOAD' ? Math.max(reload, smoothstep3P(0.0, 0.12, hProg) * (1 - smoothstep3P(0.88, 1.0, hProg))) : reload;
+      wx = THREE.MathUtils.lerp(wx, 0.085 * torsoW, effReload);
+      wy = THREE.MathUtils.lerp(wy, 0.275, effReload);
+      wz = THREE.MathUtils.lerp(wz, -0.175, effReload);
+      wepYaw = THREE.MathUtils.lerp(wepYaw, 0.30, effReload);
+
+      if (suppEnv > 0.005) {
+        wx = THREE.MathUtils.lerp(wx, 0.095 * torsoW, suppEnv);
+        wy = THREE.MathUtils.lerp(wy, 0.30, suppEnv);
+        wz = THREE.MathUtils.lerp(wz, -0.08, suppEnv);
+        wepYaw = THREE.MathUtils.lerp(wepYaw, 0.36, suppEnv);
+      } else if (inspectEnv > 0.005) {
+        wx = THREE.MathUtils.lerp(wx, 0.07 * torsoW, inspectEnv);
+        wy = THREE.MathUtils.lerp(wy, 0.36, inspectEnv);
+        wepYaw = THREE.MathUtils.lerp(wepYaw, 0.42, inspectEnv);
+      }
 
       // Vault/climb retention tuck (keeps rifle controlled at right ribcage while left hand braces ledge)
       if (vaultW > 0.005) {
@@ -1314,30 +1367,214 @@ export class TacticalOperatorRigFactory {
       const recoilZKick = recoil * 0.045 + Math.abs(pose.firingVibration) * 0.35;
       const recoilPitchKick = recoil * 0.095 + pose.firingVibration;
       const cantRollRad = effPointAim * 0.61 + effCant * 0.70;
-      const reloadPitchOffset = -reload * 0.42;
-      const reloadRollOffset = reload * 0.42;
+      const reloadPitchOffset = -effReload * 0.38 - suppEnv * 0.22;
+      const reloadRollOffset = effReload * 0.38 + suppEnv * 0.30 + inspectEnv * 0.55;
       const vaultWepPitch = -vaultW * 0.48;
       const vaultWepRoll = -vaultW * 0.28;
 
       weaponSocket.position.set(wx, wy, wz + recoilZKick);
       weaponSocket.rotation.set(
-        pitch * (1 - vaultW) + recoilPitchKick + reloadPitchOffset + vaultWepPitch,
+        pitch * (1 - vaultW) * (1 - suppEnv * 0.7) + recoilPitchKick + reloadPitchOffset + vaultWepPitch,
         wepYaw,
         cantRollRad + reloadRollOffset + vaultWepRoll,
       );
       weaponPivot.position.set(0, 0, 0);
       weaponPivot.rotation.set(0, 0, 0);
 
-      // 5. Two-bone Arm IK in upperBody local space -> hands stay locked on grip/handguard or brace ledge on vault
+      // Animate 3P weapon sub-parts (pump forend, magazine drop, bolt handle, suppressor twist)
+      let pumpTravelZ = 0;
+      if (weaponAsm) {
+        if (weaponAsm.pumpForend) {
+          if (hAct === 'PUMP') {
+            pumpTravelZ =
+              hProg < 0.45
+                ? smoothstep3P(0.0, 0.45, hProg) * 0.085
+                : (1 - smoothstep3P(0.45, 1.0, hProg)) * 0.085;
+          }
+          weaponAsm.pumpForend.position.z = basePumpZ + pumpTravelZ;
+        }
+        if (weaponAsm.magazine) {
+          if (hAct === 'RELOAD' && hProg > 0.14 && hProg < 0.66) {
+            const outT = smoothstep3P(0.14, 0.34, hProg);
+            const inT = smoothstep3P(0.48, 0.65, hProg);
+            const drop = hProg < 0.42 ? outT : 1 - inT;
+            weaponAsm.magazine.position.y = baseMagY - drop * 0.16;
+            weaponAsm.magazine.visible = !(hProg >= 0.34 && hProg <= 0.48);
+          } else {
+            weaponAsm.magazine.position.y = baseMagY;
+            weaponAsm.magazine.visible = true;
+          }
+        }
+        if (weaponAsm.slideOrBolt) {
+          const boltBack =
+            hAct === 'BOLT'
+              ? Math.sin(smoothstep3P(0.18, 0.82, hProg) * Math.PI) * 0.065
+              : hAct === 'RELOAD' && hProg > 0.70 && hProg < 0.88
+                ? Math.sin(smoothstep3P(0.70, 0.88, hProg) * Math.PI) * 0.055
+                : recoil * 0.032;
+          weaponAsm.slideOrBolt.position.z = baseBoltZ + boltBack;
+        }
+        if (weaponAsm.suppressor) {
+          if (hAct === 'SUPPRESSOR_DETACH') {
+            if (hProg < 0.14) {
+              weaponAsm.suppressor.visible = true;
+              weaponAsm.suppressor.position.copy(baseSuppPos);
+              weaponAsm.suppressor.rotation.copy(baseSuppRot);
+            } else if (hProg < 0.62) {
+              evalRatchetedSuppressorTwist((hProg - 0.14) / 0.48, false, _suppTwistSample);
+              weaponAsm.suppressor.visible = true;
+              weaponAsm.suppressor.position.set(
+                baseSuppPos.x,
+                baseSuppPos.y,
+                baseSuppPos.z - _suppTwistSample.axial01 * 0.022,
+              );
+              weaponAsm.suppressor.rotation.set(
+                baseSuppRot.x,
+                baseSuppRot.y,
+                baseSuppRot.z + _suppTwistSample.cumulativeAngle01 * Math.PI * 3.0,
+              );
+            } else if (hProg < 0.74) {
+              const pullT = smoothstep3P(0.62, 0.74, hProg);
+              weaponAsm.suppressor.visible = true;
+              weaponAsm.suppressor.position.set(
+                baseSuppPos.x,
+                baseSuppPos.y,
+                baseSuppPos.z - 0.022 - pullT * 0.055,
+              );
+            } else {
+              weaponAsm.suppressor.visible = false;
+              weaponAsm.suppressor.position.copy(baseSuppPos);
+              weaponAsm.suppressor.rotation.copy(baseSuppRot);
+            }
+          } else if (hAct === 'SUPPRESSOR_ATTACH') {
+            if (hProg < 0.28) {
+              weaponAsm.suppressor.visible = false;
+            } else if (hProg < 0.40) {
+              const seatT = smoothstep3P(0.28, 0.40, hProg);
+              weaponAsm.suppressor.visible = true;
+              weaponAsm.suppressor.position.set(
+                baseSuppPos.x,
+                baseSuppPos.y,
+                baseSuppPos.z - 0.022 - (1 - seatT) * 0.055,
+              );
+            } else if (hProg < 0.86) {
+              evalRatchetedSuppressorTwist((hProg - 0.40) / 0.46, true, _suppTwistSample);
+              weaponAsm.suppressor.visible = true;
+              weaponAsm.suppressor.position.set(
+                baseSuppPos.x,
+                baseSuppPos.y,
+                baseSuppPos.z - (1 - _suppTwistSample.axial01) * 0.022,
+              );
+              weaponAsm.suppressor.rotation.set(
+                baseSuppRot.x,
+                baseSuppRot.y,
+                baseSuppRot.z + (1 - _suppTwistSample.cumulativeAngle01) * Math.PI * 3.0,
+              );
+            } else {
+              weaponAsm.suppressor.visible = true;
+              weaponAsm.suppressor.position.copy(baseSuppPos);
+              weaponAsm.suppressor.rotation.copy(baseSuppRot);
+            }
+          } else {
+            weaponAsm.suppressor.position.copy(baseSuppPos);
+            weaponAsm.suppressor.rotation.copy(baseSuppRot);
+            weaponAsm.suppressor.visible = baseSuppVisible;
+          }
+        }
+      }
+
+      // 5. Two-bone Arm IK in upperBody local space -> hands stay locked on real weapon sockets
       _shR.set(shoulderX, shoulderY, -0.015);
       _shL.set(-shoulderX, shoulderY, -0.015);
+      _pouchLocal.set(-0.07 * torsoW, 0.21, -0.145 * chestD);
 
-      _gripR.copy(rightGripLocal).applyQuaternion(weaponSocket.quaternion).add(weaponSocket.position);
-      _gripL.copy(leftHandguardLocal).applyQuaternion(weaponSocket.quaternion).add(weaponSocket.position);
+      if (isUnarmedWeapon) {
+        _gripR.set(shoulderX * 0.85, 0.28, -0.22);
+        _gripL.set(-shoulderX * 0.85, 0.28, -0.22);
+      } else {
+        _gripR.copy(rightGripLocal).applyQuaternion(weaponSocket.quaternion).add(weaponSocket.position);
+        _sockTmp.copy(leftHandguardLocal);
+        _sockTmp.z += pumpTravelZ;
+        _gripL.copy(_sockTmp).applyQuaternion(weaponSocket.quaternion).add(weaponSocket.position);
+      }
 
-      if (reload > 0.005) {
-        _reloadL.set(-0.04 * torsoW, 0.20, -0.155);
-        _gripL.lerp(_reloadL, reload);
+      // Replicate active firearm handling animations on 3P hands
+      if (!isUnarmedWeapon && vaultW < 0.25) {
+        if (hAct === 'RELOAD') {
+          _handAuxL.copy(magWellLocal).applyQuaternion(weaponSocket.quaternion).add(weaponSocket.position);
+          if (hProg > 0.001) {
+            if (hProg < 0.16) {
+              _gripL.lerp(_handAuxL, smoothstep3P(0.0, 0.16, hProg));
+            } else if (hProg < 0.38) {
+              _gripL.copy(_handAuxL).lerp(_pouchLocal, smoothstep3P(0.16, 0.38, hProg));
+            } else if (hProg < 0.48) {
+              _gripL.copy(_pouchLocal);
+            } else if (hProg < 0.66) {
+              _gripL.copy(_pouchLocal).lerp(_handAuxL, smoothstep3P(0.48, 0.66, hProg));
+            } else if (hProg < 0.86) {
+              _sockTmp.copy(boltRackLocal).applyQuaternion(weaponSocket.quaternion).add(weaponSocket.position);
+              _gripL.copy(_handAuxL).lerp(_sockTmp, smoothstep3P(0.66, 0.76, hProg));
+            } else {
+              _sockTmp.copy(boltRackLocal).applyQuaternion(weaponSocket.quaternion).add(weaponSocket.position);
+              _gripL.lerp(_sockTmp, 1 - smoothstep3P(0.86, 1.0, hProg));
+            }
+          } else if (effReload > 0.005) {
+            _reloadL.copy(_pouchLocal);
+            _gripL.lerp(_reloadL, effReload);
+          }
+        } else if (hAct === 'SUPPRESSOR_DETACH') {
+          _handAuxL.copy(suppGripLocal).applyQuaternion(weaponSocket.quaternion).add(weaponSocket.position);
+          if (hProg < 0.14) {
+            _gripL.lerp(_handAuxL, smoothstep3P(0.0, 0.14, hProg));
+          } else if (hProg < 0.72) {
+            _gripL.copy(_handAuxL);
+          } else if (hProg < 0.88) {
+            _gripL.copy(_handAuxL).lerp(_pouchLocal, smoothstep3P(0.72, 0.88, hProg));
+          } else {
+            _gripL.lerp(_pouchLocal, 1 - smoothstep3P(0.88, 1.0, hProg));
+          }
+        } else if (hAct === 'SUPPRESSOR_ATTACH') {
+          _handAuxL.copy(suppGripLocal).applyQuaternion(weaponSocket.quaternion).add(weaponSocket.position);
+          if (hProg < 0.16) {
+            _gripL.lerp(_pouchLocal, smoothstep3P(0.0, 0.16, hProg));
+          } else if (hProg < 0.30) {
+            _gripL.copy(_pouchLocal).lerp(_handAuxL, smoothstep3P(0.16, 0.30, hProg));
+          } else if (hProg < 0.86) {
+            _gripL.copy(_handAuxL);
+          } else {
+            _gripL.lerp(_handAuxL, 1 - smoothstep3P(0.86, 1.0, hProg));
+          }
+        } else if (hAct === 'BOLT') {
+          const bEnv = smoothstep3P(0.0, 0.20, hProg) * (1 - smoothstep3P(0.80, 1.0, hProg));
+          const bPull = Math.sin(smoothstep3P(0.20, 0.80, hProg) * Math.PI) * 0.065;
+          _sockTmp.copy(boltHandleLocal);
+          _sockTmp.z += bPull;
+          _handAuxR.copy(_sockTmp).applyQuaternion(weaponSocket.quaternion).add(weaponSocket.position);
+          _gripR.lerp(_handAuxR, bEnv);
+        } else if (
+          hAct === 'ZOOM_TWIST' ||
+          hAct === 'TURRET' ||
+          hAct === 'ILLUM' ||
+          hAct === 'LIGHT_PAD' ||
+          hAct === 'SELECTOR' ||
+          hAct === 'MAG_CHECK'
+        ) {
+          const mEnv = smoothstep3P(0.0, 0.25, hProg) * (1 - smoothstep3P(0.72, 1.0, hProg));
+          const targetSock =
+            hAct === 'ZOOM_TWIST'
+              ? zoomRingLocal
+              : hAct === 'TURRET'
+                ? turretLocal
+                : hAct === 'ILLUM'
+                  ? illumLocal
+                  : hAct === 'LIGHT_PAD'
+                    ? padLocal
+                    : hAct === 'SELECTOR'
+                      ? selectorLocal
+                      : magWellLocal;
+          _handAuxL.copy(targetSock).applyQuaternion(weaponSocket.quaternion).add(weaponSocket.position);
+          _gripL.lerp(_handAuxL, mEnv);
+        }
       }
 
       if (vaultW > 0.005) {
@@ -1441,6 +1678,9 @@ export class TacticalOperatorRigFactory {
       resetRagdollPose,
       setBeltEquipment,
       setWeaponClass,
+      setWeaponLoadout,
+      setSuppressedVisual,
+      disposeWeapon,
       setGearAppearance,
     };
   }

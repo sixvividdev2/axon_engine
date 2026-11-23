@@ -11,6 +11,7 @@ import { WeaponModelAssembly, WeaponModelFactory } from '../../bodycam-sdk/weapo
 import {
   computeDerivedWeaponStats,
   DerivedWeaponStats,
+  getOwnedSuppressorDef,
   normalizeWeaponAttachments,
   WeaponAttachments,
 } from '../../data/attachments';
@@ -369,13 +370,97 @@ export class WeaponRig {
   public cycleOpticZoom(dir: 1 | -1): number {
     const levels = this.derivedStats.opticZoomLevels;
     if (levels.length <= 1) return this.getActiveOpticZoomMult();
-    this.opticZoomIndex = Math.max(0, Math.min(levels.length - 1, this.opticZoomIndex + dir));
+    const nextIdx = Math.max(0, Math.min(levels.length - 1, this.opticZoomIndex + dir));
+    if (nextIdx !== this.opticZoomIndex) {
+      this.opticZoomIndex = nextIdx;
+      this.weaponAnimator.triggerMicroAction('ZOOM_TWIST', 0.28);
+    }
     return levels[this.opticZoomIndex];
   }
 
   public toggleReticleIllumination(): boolean {
     this.reticleIlluminated = !this.reticleIlluminated;
+    this.weaponAnimator.triggerMicroAction('ILLUM', 0.24);
     return this.reticleIlluminated;
+  }
+
+  public triggerTacticalSwitch(): void {
+    this.weaponAnimator.triggerMicroAction('LIGHT_PAD', 0.19);
+  }
+
+  public isSuppressorActionActive(): boolean {
+    return this.weaponAnimator.isSuppressorActionActive();
+  }
+
+  public isBlockingFiringAction(): boolean {
+    return this.weaponAnimator.isBlockingFiringAction();
+  }
+
+  public triggerFieldSuppressorToggle(
+    onCommit: (nowAttached: boolean) => void,
+  ): 'started_detach' | 'started_attach' | 'no_suppressor' | 'busy' {
+    if (!this.assembly?.suppressor || !getOwnedSuppressorDef(this.currentAttachments)) {
+      return 'no_suppressor';
+    }
+    if (this.weaponAnimator.isSuppressorActionActive() || this.weaponAnimator.isReloading()) {
+      return 'busy';
+    }
+    const attach = Boolean(this.currentAttachments.suppressorStowed);
+    const started = this.weaponAnimator.triggerSuppressorToggle(attach, (nowAttached) => {
+      this.currentAttachments = normalizeWeaponAttachments(this.currentWeaponId, {
+        ...this.currentAttachments,
+        suppressorStowed: nowAttached ? undefined : true,
+      });
+      const spec = WEAPONS[this.currentWeaponId];
+      if (this.assembly) {
+        this.derivedStats = WeaponAssembler.applyAttachments(
+          this.assembly,
+          this.getBaseMassKg(spec),
+          spec.barrelLengthM,
+          30,
+          this.currentAttachments,
+        );
+        this.syncSocketsFromAssembly(this.assembly);
+      }
+      onCommit(nowAttached);
+    });
+    if (!started) return 'busy';
+    return attach ? 'started_attach' : 'started_detach';
+  }
+
+  public getSuppressorMountWorldPosition(outPos: THREE.Vector3): boolean {
+    if (!this.assembly) return false;
+    this.root.updateMatrixWorld(true);
+    if (this.assembly.suppressorGripSocket) {
+      this.assembly.suppressorGripSocket.getWorldPosition(outPos);
+      return true;
+    }
+    if (this.assembly.suppressor) {
+      this.assembly.suppressor.getWorldPosition(outPos);
+      return true;
+    }
+    return false;
+  }
+
+  public getZoomRingWorldPosition(outPos: THREE.Vector3): boolean {
+    if (!this.assembly?.zoomRingSocket) return false;
+    this.root.updateMatrixWorld(true);
+    this.assembly.zoomRingSocket.getWorldPosition(outPos);
+    return true;
+  }
+
+  public getIllumDialWorldPosition(outPos: THREE.Vector3): boolean {
+    if (!this.assembly?.illumDialSocket) return false;
+    this.root.updateMatrixWorld(true);
+    this.assembly.illumDialSocket.getWorldPosition(outPos);
+    return true;
+  }
+
+  public getPressurePadWorldPosition(outPos: THREE.Vector3): boolean {
+    if (!this.assembly?.pressurePadSocket) return false;
+    this.root.updateMatrixWorld(true);
+    this.assembly.pressurePadSocket.getWorldPosition(outPos);
+    return true;
   }
 
   private syncOpticZoomIndex(): void {

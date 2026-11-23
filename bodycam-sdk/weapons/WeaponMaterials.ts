@@ -4,10 +4,12 @@ import { WeaponFinishPreset } from '../types';
 export interface WeaponPBRMaterialLibrary {
   gunmetal: THREE.MeshStandardMaterial;
   anodized: THREE.MeshStandardMaterial;
-  chromeSteel: THREE.MeshStandardMaterial;
+  chromeSteel: THREE.MeshPhysicalMaterial;
   bluedSteel: THREE.MeshStandardMaterial;
   wornPolymer: THREE.MeshStandardMaterial;
   checkeredGrip: THREE.MeshStandardMaterial;
+  recessedCavity: THREE.MeshStandardMaterial;
+  sightWhiteDot: THREE.MeshStandardMaterial;
   bakelite: THREE.MeshStandardMaterial;
   laminatedWood: THREE.MeshStandardMaterial;
   walnutWood: THREE.MeshStandardMaterial;
@@ -37,7 +39,14 @@ function createCanvasTexture(
   isColor: boolean,
   repeatX = 1,
   repeatY = 1,
-): THREE.CanvasTexture {
+): THREE.Texture {
+  if (typeof document === 'undefined') {
+    const data = new Uint8Array([180, 180, 180, 255]);
+    const fallback = new THREE.DataTexture(data, 1, 1, THREE.RGBAFormat);
+    fallback.colorSpace = isColor ? THREE.SRGBColorSpace : THREE.NoColorSpace;
+    fallback.needsUpdate = true;
+    return fallback;
+  }
   const canvas = document.createElement('canvas');
   canvas.width = width;
   canvas.height = height;
@@ -60,25 +69,27 @@ export function getWeaponPBRMaterialLibrary(): WeaponPBRMaterialLibrary {
 
   const textures: THREE.Texture[] = [];
 
+  // 1. Satin / Parkerized Gunmetal albedo, roughness & subtle micro-grain bump
   const metalAlbedo = createCanvasTexture(
     256,
     256,
     (ctx, w, h) => {
-      ctx.fillStyle = '#272b30';
+      ctx.fillStyle = '#2b3038';
       ctx.fillRect(0, 0, w, h);
-      for (let i = 0; i < 650; i++) {
+      for (let i = 0; i < 820; i++) {
         const y = Math.random() * h;
-        const lum = 34 + Math.floor(Math.random() * 26);
-        ctx.fillStyle = `rgba(${lum},${lum + 3},${lum + 6},0.22)`;
-        ctx.fillRect(0, y, w, 1 + Math.random() * 1.4);
+        const lum = 34 + Math.floor(Math.random() * 28);
+        ctx.fillStyle = `rgba(${lum},${lum + 3},${lum + 7},0.20)`;
+        ctx.fillRect(0, y, w, 1 + Math.random() * 1.2);
       }
-      for (let i = 0; i < 70; i++) {
+      // Subtle parkerized edge sheen patches
+      for (let i = 0; i < 90; i++) {
         const x = Math.random() * w;
         const y = Math.random() * h;
         const r = 6 + Math.random() * 22;
         const g = ctx.createRadialGradient(x, y, 0, x, y, r);
-        g.addColorStop(0, 'rgba(115,122,130,0.16)');
-        g.addColorStop(1, 'rgba(35,38,42,0)');
+        g.addColorStop(0, 'rgba(130,138,148,0.16)');
+        g.addColorStop(1, 'rgba(34,38,44,0)');
         ctx.fillStyle = g;
         ctx.fillRect(x - r, y - r, r * 2, r * 2);
       }
@@ -91,30 +102,89 @@ export function getWeaponPBRMaterialLibrary(): WeaponPBRMaterialLibrary {
     256,
     256,
     (ctx, w, h) => {
-      ctx.fillStyle = '#626262';
+      ctx.fillStyle = '#686868';
       ctx.fillRect(0, 0, w, h);
-      for (let i = 0; i < 500; i++) {
-        const v = 70 + Math.floor(Math.random() * 65);
-        ctx.fillStyle = `rgba(${v},${v},${v},0.3)`;
-        ctx.fillRect(0, Math.random() * h, w, 1.5);
+      for (let i = 0; i < 720; i++) {
+        const v = 76 + Math.floor(Math.random() * 68);
+        ctx.fillStyle = `rgba(${v},${v},${v},0.30)`;
+        ctx.fillRect(0, Math.random() * h, w, 1.4);
       }
     },
     false,
     2,
     2,
   );
-  textures.push(metalAlbedo, metalRough);
+  const metalBump = createCanvasTexture(
+    128,
+    128,
+    (ctx, w, h) => {
+      ctx.fillStyle = '#808080';
+      ctx.fillRect(0, 0, w, h);
+      for (let i = 0; i < 2400; i++) {
+        const v = 104 + Math.floor(Math.random() * 48);
+        ctx.fillStyle = `rgb(${v},${v},${v})`;
+        ctx.fillRect(Math.random() * w, Math.random() * h, 1.5, 1.5);
+      }
+    },
+    false,
+    3,
+    3,
+  );
 
+  // 2. Directional Anisotropic Brushed Stainless / Chrome Steel (Desert Eagle, Revolvers, Bolts)
+  const brushedSteelAlbedo = createCanvasTexture(
+    256,
+    256,
+    (ctx, w, h) => {
+      ctx.fillStyle = '#cfd5dc';
+      ctx.fillRect(0, 0, w, h);
+      for (let i = 0; i < 1200; i++) {
+        const y = Math.random() * h;
+        const lum = 185 + Math.floor(Math.random() * 56);
+        ctx.fillStyle = `rgba(${lum},${lum + 2},${lum + 5},0.28)`;
+        ctx.fillRect(0, y, w, 0.9 + Math.random() * 1.1);
+      }
+      // Fine handling micro-scratches
+      for (let i = 0; i < 160; i++) {
+        const x = Math.random() * w;
+        const y = Math.random() * h;
+        ctx.fillStyle = 'rgba(250,252,255,0.22)';
+        ctx.fillRect(x, y, 16 + Math.random() * 46, 0.8);
+      }
+    },
+    true,
+    2,
+    2,
+  );
+  const brushedSteelRough = createCanvasTexture(
+    256,
+    256,
+    (ctx, w, h) => {
+      ctx.fillStyle = '#383838';
+      ctx.fillRect(0, 0, w, h);
+      for (let i = 0; i < 950; i++) {
+        const v = 34 + Math.floor(Math.random() * 44);
+        ctx.fillStyle = `rgba(${v},${v},${v},0.35)`;
+        ctx.fillRect(0, Math.random() * h, w, 1.1);
+      }
+    },
+    false,
+    2,
+    2,
+  );
+  textures.push(metalAlbedo, metalRough, metalBump, brushedSteelAlbedo, brushedSteelRough);
+
+  // 3. Stippled / Checkered Matte Polymer
   const polymerAlbedo = createCanvasTexture(
     256,
     256,
     (ctx, w, h) => {
-      ctx.fillStyle = '#1b1d20';
+      ctx.fillStyle = '#181a1e';
       ctx.fillRect(0, 0, w, h);
-      for (let i = 0; i < 4200; i++) {
-        const v = 18 + Math.floor(Math.random() * 24);
-        ctx.fillStyle = `rgb(${v},${v + 1},${v + 2})`;
-        ctx.fillRect(Math.random() * w, Math.random() * h, 2, 2);
+      for (let i = 0; i < 5200; i++) {
+        const v = 16 + Math.floor(Math.random() * 22);
+        ctx.fillStyle = `rgb(${v},${v + 1},${v + 3})`;
+        ctx.fillRect(Math.random() * w, Math.random() * h, 1.8, 1.8);
       }
     },
     true,
@@ -125,11 +195,11 @@ export function getWeaponPBRMaterialLibrary(): WeaponPBRMaterialLibrary {
     128,
     128,
     (ctx, w, h) => {
-      ctx.fillStyle = '#404040';
+      ctx.fillStyle = '#3a3a3a';
       ctx.fillRect(0, 0, w, h);
-      ctx.strokeStyle = '#d4d4d4';
+      ctx.strokeStyle = '#dadada';
       ctx.lineWidth = 2;
-      const step = 10;
+      const step = 9;
       for (let i = -h; i < w + h; i += step) {
         ctx.beginPath();
         ctx.moveTo(i, 0);
@@ -147,6 +217,7 @@ export function getWeaponPBRMaterialLibrary(): WeaponPBRMaterialLibrary {
   );
   textures.push(polymerAlbedo, checkeringBump);
 
+  // 4. Bakelite & Figured Walnut / Laminated Wood Grain + Roughness + Bump
   const bakeliteAlbedo = createCanvasTexture(
     256,
     256,
@@ -187,19 +258,20 @@ export function getWeaponPBRMaterialLibrary(): WeaponPBRMaterialLibrary {
     256,
     256,
     (ctx, w, h) => {
-      ctx.fillStyle = '#6f3e20';
+      ctx.fillStyle = '#6c3b1e';
       ctx.fillRect(0, 0, w, h);
       for (let y = 0; y < h; y += 2) {
-        const wave = Math.sin(y * 0.14) * 14 + Math.cos(y * 0.05) * 9;
-        const r = Math.min(255, Math.max(0, 112 + Math.floor(wave)));
-        const g = Math.min(255, Math.max(0, 60 + Math.floor(wave * 0.6)));
-        const b = Math.min(255, Math.max(0, 29 + Math.floor(wave * 0.35)));
+        const wave = Math.sin(y * 0.14) * 16 + Math.cos(y * 0.05) * 11 + Math.sin(y * 0.31) * 6;
+        const r = Math.min(255, Math.max(0, 110 + Math.floor(wave)));
+        const g = Math.min(255, Math.max(0, 58 + Math.floor(wave * 0.58)));
+        const b = Math.min(255, Math.max(0, 27 + Math.floor(wave * 0.32)));
         ctx.fillStyle = `rgb(${r},${g},${b})`;
         ctx.fillRect(0, y, w, 2);
       }
-      for (let i = 0; i < 260; i++) {
-        ctx.fillStyle = 'rgba(28,14,6,0.22)';
-        ctx.fillRect(Math.random() * w, Math.random() * h, 14 + Math.random() * 40, 1);
+      // Figured walnut pores & dark cathedral grain arcs
+      for (let i = 0; i < 320; i++) {
+        ctx.fillStyle = i % 4 === 0 ? 'rgba(182,114,62,0.14)' : 'rgba(26,12,5,0.24)';
+        ctx.fillRect(Math.random() * w, Math.random() * h, 16 + Math.random() * 44, 1.2);
       }
     },
     true,
@@ -232,12 +304,12 @@ export function getWeaponPBRMaterialLibrary(): WeaponPBRMaterialLibrary {
     256,
     256,
     (ctx, w, h) => {
-      ctx.fillStyle = '#9a9a9a';
+      ctx.fillStyle = '#929292';
       ctx.fillRect(0, 0, w, h);
-      for (let y = 0; y < h; y += 3) {
-        const v = 135 + Math.floor(Math.sin(y * 0.2) * 28);
+      for (let y = 0; y < h; y += 2) {
+        const v = 128 + Math.floor(Math.sin(y * 0.22) * 32 + Math.cos(y * 0.08) * 14);
         ctx.fillStyle = `rgb(${v},${v},${v})`;
-        ctx.fillRect(0, y, w, 3);
+        ctx.fillRect(0, y, w, 2);
       }
     },
     false,
@@ -251,43 +323,73 @@ export function getWeaponPBRMaterialLibrary(): WeaponPBRMaterialLibrary {
       color: 0xffffff,
       map: metalAlbedo,
       roughnessMap: metalRough,
-      metalness: 0.86,
-      roughness: 0.36,
+      bumpMap: metalBump,
+      bumpScale: 0.0007,
+      metalness: 0.78,
+      roughness: 0.40,
     }),
     anodized: new THREE.MeshStandardMaterial({
-      color: 0x1e2227,
+      color: 0x22262c,
       roughnessMap: metalRough,
-      metalness: 0.80,
-      roughness: 0.30,
+      bumpMap: metalBump,
+      bumpScale: 0.0005,
+      metalness: 0.76,
+      roughness: 0.38,
     }),
-    chromeSteel: new THREE.MeshStandardMaterial({
-      color: 0xc8cfd6,
-      metalness: 0.94,
-      roughness: 0.18,
+    chromeSteel: new THREE.MeshPhysicalMaterial({
+      color: 0xffffff,
+      map: brushedSteelAlbedo,
+      roughnessMap: brushedSteelRough,
+      bumpMap: brushedSteelRough,
+      bumpScale: 0.0006,
+      metalness: 0.92,
+      roughness: 0.20,
+      anisotropy: 0.72,
+      anisotropyRotation: 0,
+      clearcoat: 0.08,
+      clearcoatRoughness: 0.25,
     }),
     bluedSteel: new THREE.MeshStandardMaterial({
-      color: 0x1f2836,
+      color: 0x1d2635,
       roughnessMap: metalRough,
-      metalness: 0.90,
-      roughness: 0.26,
+      bumpMap: metalBump,
+      bumpScale: 0.0004,
+      metalness: 0.88,
+      roughness: 0.28,
     }),
     wornPolymer: new THREE.MeshStandardMaterial({
       color: 0xffffff,
       map: polymerAlbedo,
-      metalness: 0.08,
-      roughness: 0.76,
+      bumpMap: metalBump,
+      bumpScale: 0.0008,
+      metalness: 0.05,
+      roughness: 0.84,
     }),
     checkeredGrip: new THREE.MeshStandardMaterial({
-      color: 0x202327,
+      color: 0x1e2126,
       map: polymerAlbedo,
       bumpMap: checkeringBump,
-      bumpScale: 0.0028,
-      metalness: 0.06,
-      roughness: 0.84,
+      bumpScale: 0.0032,
+      metalness: 0.05,
+      roughness: 0.86,
+    }),
+    recessedCavity: new THREE.MeshStandardMaterial({
+      color: 0x08080a,
+      metalness: 0.0,
+      roughness: 0.96,
+    }),
+    sightWhiteDot: new THREE.MeshStandardMaterial({
+      color: 0xf4f7f8,
+      emissive: 0xdff7ea,
+      emissiveIntensity: 0.48,
+      roughness: 0.28,
+      metalness: 0.0,
     }),
     bakelite: new THREE.MeshStandardMaterial({
       color: 0xffffff,
       map: bakeliteAlbedo,
+      bumpMap: woodRough,
+      bumpScale: 0.0008,
       metalness: 0.06,
       roughness: 0.44,
     }),
@@ -295,6 +397,8 @@ export function getWeaponPBRMaterialLibrary(): WeaponPBRMaterialLibrary {
       color: 0xffffff,
       map: woodAlbedo,
       roughnessMap: woodRough,
+      bumpMap: woodRough,
+      bumpScale: 0.0014,
       metalness: 0.04,
       roughness: 0.62,
     }),
@@ -302,13 +406,17 @@ export function getWeaponPBRMaterialLibrary(): WeaponPBRMaterialLibrary {
       color: 0xb88668,
       map: woodAlbedo,
       roughnessMap: woodRough,
-      metalness: 0.05,
+      bumpMap: woodRough,
+      bumpScale: 0.0016,
+      metalness: 0.04,
       roughness: 0.56,
     }),
     arcticRedLaminate: new THREE.MeshStandardMaterial({
       color: 0xffffff,
       map: arcticWoodAlbedo,
       roughnessMap: woodRough,
+      bumpMap: woodRough,
+      bumpScale: 0.0012,
       metalness: 0.04,
       roughness: 0.52,
     }),
@@ -333,8 +441,8 @@ export function getWeaponPBRMaterialLibrary(): WeaponPBRMaterialLibrary {
     olivePolymer: new THREE.MeshStandardMaterial({
       color: 0x454a3b,
       roughnessMap: metalRough,
-      metalness: 0.10,
-      roughness: 0.72,
+      metalness: 0.08,
+      roughness: 0.76,
     }),
     translucentSmoke: new THREE.MeshPhysicalMaterial({
       color: 0x484d54,
@@ -357,15 +465,15 @@ export function getWeaponPBRMaterialLibrary(): WeaponPBRMaterialLibrary {
     tritiumGreen: new THREE.MeshStandardMaterial({
       color: 0x7eff9a,
       emissive: 0x35ff6c,
-      emissiveIntensity: 2.3,
-      roughness: 0.2,
+      emissiveIntensity: 1.6,
+      roughness: 0.22,
       metalness: 0.0,
     }),
     fiberOrange: new THREE.MeshStandardMaterial({
       color: 0xff6e2b,
       emissive: 0xff4512,
-      emissiveIntensity: 2.0,
-      roughness: 0.2,
+      emissiveIntensity: 1.5,
+      roughness: 0.22,
       metalness: 0.0,
     }),
     oliveFrag: new THREE.MeshStandardMaterial({

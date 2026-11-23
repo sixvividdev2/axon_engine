@@ -16,7 +16,11 @@ import {
   IBodycamWorldAdapter,
 } from './types';
 import { SDK_WEAPON_PROFILES } from './weaponProfiles';
-import { WeaponAnimator, WeaponPoseUpdateInput } from './weapons/WeaponAnimator';
+import {
+  WeaponAnimator,
+  WeaponPoseUpdateInput,
+  WeaponSyncedHandlingSnapshot,
+} from './weapons/WeaponAnimator';
 import { WeaponAssembler } from './weapons/WeaponAssembler';
 import { WeaponModelAssembly, WeaponModelFactory } from './weapons/WeaponModelFactory';
 
@@ -362,6 +366,28 @@ export class WeaponRig {
     this.weaponAnimator.triggerReload(durationSec);
   }
 
+  public triggerTubularReload(
+    shellsToLoad: number,
+    isEmptyChamber: boolean,
+    onShellInserted?: () => void,
+    onComplete?: () => void,
+  ): boolean {
+    return this.weaponAnimator.triggerTubularReload(
+      shellsToLoad,
+      isEmptyChamber,
+      onShellInserted,
+      onComplete,
+    );
+  }
+
+  public interruptTubularReload(): void {
+    this.weaponAnimator.interruptTubularReload();
+  }
+
+  public isTubularReloading(): boolean {
+    return this.weaponAnimator.isTubularReloading();
+  }
+
   public triggerMagCheck(durationSec: number): void {
     this.weaponAnimator.triggerMagCheck(durationSec);
   }
@@ -371,6 +397,7 @@ export class WeaponRig {
   }
 
   public cancelAction(): void {
+    this.cancelZoomTwist();
     this.weaponAnimator.cancelAction();
   }
 
@@ -378,8 +405,42 @@ export class WeaponRig {
     return this.weaponAnimator.isBoltCycling();
   }
 
+  public isBlockingFiringAction(): boolean {
+    return this.weaponAnimator.isBlockingFiringAction();
+  }
+
+  public triggerTurretClick(): void {
+    if (!this.lastIsSprinting) {
+      this.weaponAnimator.triggerMicroAction('TURRET', 0.24);
+    }
+  }
+
+  public triggerIllumToggle(): void {
+    if (!this.lastIsSprinting) {
+      this.weaponAnimator.triggerMicroAction('ILLUM', 0.22);
+    }
+  }
+
+  public triggerSelectorFlick(fireModeIdx?: number): void {
+    if (!this.lastIsSprinting) {
+      this.weaponAnimator.triggerMicroAction('SELECTOR', 0.18, fireModeIdx);
+    } else {
+      this.weaponAnimator.emitWeaponCue('mode_toggle', 0.9);
+    }
+  }
+
+  public triggerTacticalSwitch(): void {
+    if (!this.lastIsSprinting) {
+      this.weaponAnimator.triggerMicroAction('LIGHT_PAD', 0.16);
+    }
+  }
+
   public emitModeToggleCue(): void {
-    this.weaponAnimator.emitWeaponCue('mode_toggle', 0.9);
+    this.triggerSelectorFlick();
+  }
+
+  public getSyncedHandlingSnapshot(): Readonly<WeaponSyncedHandlingSnapshot> {
+    return this.weaponAnimator.getSyncedHandlingSnapshot();
   }
 
   public getModelAssembly(): WeaponModelAssembly | null {
@@ -436,11 +497,101 @@ export class WeaponRig {
     return shouldAttach ? 'started_attach' : 'started_detach';
   }
 
-  /** Returns the world position of the suppressor barrel thread mount for left-hand 2-bone IK targeting. */
+  /**
+   * Returns the live world position of the suppressor body grip midpoint for left-hand 2-bone IK targeting
+   * (tracks axial thread travel & clear-pull dynamically when mounted on muzzleMountSocket).
+   */
   public getSuppressorMountWorldPosition(out: THREE.Vector3): boolean {
     if (!this.assembly) return false;
     this.root.updateMatrixWorld(true);
-    this.assembly.muzzleMountSocket.getWorldPosition(out);
+    const supp = this.assembly.suppressor;
+    if (supp && supp.parent === this.assembly.muzzleMountSocket) {
+      // Midpoint of suppressor body tracks live axial travel during 3-stroke twist & clear-pull
+      const suppLen = this.assembly.handPoseProfile.suppressorLengthM || 0.16;
+      const homeZ = typeof supp.userData.homeZ === 'number' ? supp.userData.homeZ : 0;
+      const axialDeltaZ = supp.position.z - homeZ;
+      this.assembly.suppressorGripSocket.getWorldPosition(out);
+      if (Math.abs(axialDeltaZ) > 1e-5) {
+        this.assembly.muzzleMountSocket.getWorldQuaternion(this._tmpQuat);
+        this._barrelDir.set(0, 0, axialDeltaZ).applyQuaternion(this._tmpQuat);
+        out.add(this._barrelDir);
+      } else if (suppLen <= 0.01) {
+        this.assembly.muzzleMountSocket.getWorldPosition(out);
+      }
+      return true;
+    }
+    this.assembly.suppressorGripSocket.getWorldPosition(out);
+    return true;
+  }
+
+  /** Reads live world transform of `assembly.leftHandSocket` (follows pumpForend 1:1 on pump shotguns!). */
+  public getLiveLeftHandSocketWorldTransform(
+    outPos: THREE.Vector3,
+    outQuat: THREE.Quaternion,
+  ): boolean {
+    if (!this.assembly || !this.hasLeftHandSocket) return false;
+    this.root.updateMatrixWorld(true);
+    this.assembly.leftHandSocket.getWorldPosition(outPos);
+    this.assembly.leftHandSocket.getWorldQuaternion(outQuat);
+    return true;
+  }
+
+  /** Reads live world position of `assembly.boltHandleSocket` (follows boltHandlePivot rotation & travel). */
+  public getBoltHandleWorldPosition(outPos: THREE.Vector3): boolean {
+    if (!this.assembly) return false;
+    this.root.updateMatrixWorld(true);
+    this.assembly.boltHandleSocket.getWorldPosition(outPos);
+    return true;
+  }
+
+  public getEjectionPortWorldPosition(outPos: THREE.Vector3): boolean {
+    if (!this.assembly) return false;
+    this.root.updateMatrixWorld(true);
+    this.assembly.ejectionPortSocket.getWorldPosition(outPos);
+    return true;
+  }
+
+  public getElevationTurretWorldTransform(
+    outPos: THREE.Vector3,
+    outQuat: THREE.Quaternion,
+  ): boolean {
+    if (!this.assembly?.elevationTurretSocket) return false;
+    this.root.updateMatrixWorld(true);
+    this.assembly.elevationTurretSocket.getWorldPosition(outPos);
+    this.assembly.elevationTurretSocket.getWorldQuaternion(outQuat);
+    return true;
+  }
+
+  public getIllumDialWorldTransform(
+    outPos: THREE.Vector3,
+    outQuat: THREE.Quaternion,
+  ): boolean {
+    if (!this.assembly?.illumDialSocket) return false;
+    this.root.updateMatrixWorld(true);
+    this.assembly.illumDialSocket.getWorldPosition(outPos);
+    this.assembly.illumDialSocket.getWorldQuaternion(outQuat);
+    return true;
+  }
+
+  public getSelectorWorldTransform(
+    outPos: THREE.Vector3,
+    outQuat: THREE.Quaternion,
+  ): boolean {
+    if (!this.assembly) return false;
+    this.root.updateMatrixWorld(true);
+    this.assembly.selectorSocket.getWorldPosition(outPos);
+    this.assembly.selectorSocket.getWorldQuaternion(outQuat);
+    return true;
+  }
+
+  public getPressurePadWorldTransform(
+    outPos: THREE.Vector3,
+    outQuat: THREE.Quaternion,
+  ): boolean {
+    if (!this.assembly) return false;
+    this.root.updateMatrixWorld(true);
+    this.assembly.pressurePadSocket.getWorldPosition(outPos);
+    this.assembly.pressurePadSocket.getWorldQuaternion(outQuat);
     return true;
   }
 
@@ -479,9 +630,16 @@ export class WeaponRig {
 
     if (this.opticZoomIndex !== prevIdx) {
       this.audio?.playZoomRatchetClick?.(target);
-      if (withIkTwist && this.assembly?.zoomRingSocket && this.lastIsAds && !this.lastIsSprinting) {
+      // Realistic throw-lever pinch & sweep in BOTH ADS and hip/ready stance (interruptible on fire/sprint)
+      if (
+        withIkTwist &&
+        this.assembly?.zoomRingSocket &&
+        !this.lastIsSprinting &&
+        !this.weaponAnimator.isBlockingFiringAction()
+      ) {
         this.zoomTwistActive = true;
         this.zoomTwistTimer = 0;
+        this.weaponAnimator.triggerMicroAction('ZOOM_TWIST', this.zoomTwistDuration);
       }
     }
     return target;
@@ -490,6 +648,9 @@ export class WeaponRig {
   public cancelZoomTwist(): void {
     this.zoomTwistActive = false;
     this.zoomTwistTimer = 0;
+    if (this.weaponAnimator.getActiveMicroAction() === 'ZOOM_TWIST') {
+      this.weaponAnimator.cancelMicroAction();
+    }
   }
 
   public isZoomTwistActive(): boolean {
@@ -520,13 +681,23 @@ export class WeaponRig {
     return w;
   }
 
-  public setZeroConfig(zeroDistanceM: number, zeroElevationMrad: number, zeroPitchRad: number): void {
+  public setZeroConfig(
+    zeroDistanceM: number,
+    zeroElevationMrad: number,
+    zeroPitchRad: number,
+    triggerHandIk = false,
+  ): void {
+    const changed = Math.abs(zeroDistanceM - this.zeroDistanceM) > 1e-3 ||
+      Math.abs(zeroElevationMrad - this.zeroElevationMrad) > 1e-4;
     this.zeroDistanceM = zeroDistanceM;
     this.zeroElevationMrad = zeroElevationMrad;
     this.zeroPitchRad = zeroPitchRad;
     if (this.assembly?.elevationTurretMesh) {
       // 1 full turret revolution = 10 MRAD
       this.assembly.elevationTurretMesh.rotation.y = -(zeroElevationMrad / 10) * Math.PI * 2;
+    }
+    if (triggerHandIk && changed) {
+      this.triggerTurretClick();
     }
   }
 
@@ -551,6 +722,7 @@ export class WeaponRig {
 
   public toggleReticleIllumination(): boolean {
     this.reticleIlluminated = !this.reticleIlluminated;
+    this.triggerIllumToggle();
     return this.reticleIlluminated;
   }
 
@@ -954,6 +1126,8 @@ export class WeaponRig {
     remainingAmmoAfterShot?: number,
     cyclePump?: boolean,
   ): void {
+    if (this.isSuppressorActionActive()) return;
+    this.cancelZoomTwist();
     const flashScale = suppressed ? 0.12 : this.derivedStats.muzzleFlashScale;
     this.flashTimer = suppressed ? 0.025 : 0.045;
     this.muzzleFlashLight.intensity = suppressed ? 1.8 : 14.5 * flashScale;
@@ -1427,10 +1601,13 @@ export class WeaponRig {
     this.pointAimBlend = this.weaponAnimator.pointAimBlend;
     this.sprintBlend = this.weaponAnimator.sprintBlend;
 
-    // 6. Smooth variable-zoom magnification interpolation & 0.28s interruptible zoom-ring IK timer
+    // 6. Smooth variable-zoom magnification interpolation & 0.28s interruptible zoom-ring IK timer (ADS + ready stance!)
     if (
       this.zoomTwistActive &&
-      (isSprinting || !isAds || this.weaponAnimator.getActiveAction() !== 'NONE' || vaultRetentionBlend > 0.1)
+      (isSprinting ||
+        this.weaponAnimator.getActiveAction() !== 'NONE' ||
+        this.weaponAnimator.isTubularReloading() ||
+        vaultRetentionBlend > 0.1)
     ) {
       this.cancelZoomTwist();
     }

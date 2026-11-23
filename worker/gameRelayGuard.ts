@@ -3,6 +3,9 @@ import {
   LobbyRoomState,
   OperatorUniformId,
   SyncedAimStance,
+  SyncedHandlingAction,
+  SyncedWeaponAttachments,
+  VALID_SYNCED_HANDLING_ACTIONS,
 } from '../data/multiplayer';
 
 export interface CachedMatchState {
@@ -94,6 +97,48 @@ function addUniqueCapped(list: string[], id: string, maxLen = 64): void {
   if (!list.includes(clean) && list.length < maxLen) {
     list.push(clean);
   }
+}
+
+function sanitizeAttachmentSlotId(val: unknown): string | null | undefined {
+  if (val === undefined) return undefined;
+  if (val === null) return null;
+  if (typeof val !== 'string') return undefined;
+  const clean = val.trim().slice(0, 40);
+  return clean.length > 0 ? clean : null;
+}
+
+export function sanitizeSyncedWeaponAttachments(
+  raw: unknown,
+): SyncedWeaponAttachments | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const obj = raw as Record<string, unknown>;
+  const out: SyncedWeaponAttachments = {};
+  const o = sanitizeAttachmentSlotId(obj.o);
+  if (o !== undefined) out.o = o;
+  const m = sanitizeAttachmentSlotId(obj.m);
+  if (m !== undefined) out.m = m;
+  if (typeof obj.ss === 'boolean') out.ss = obj.ss;
+  const u = sanitizeAttachmentSlotId(obj.u);
+  if (u !== undefined) out.u = u;
+  const g = sanitizeAttachmentSlotId(obj.g);
+  if (g !== undefined) out.g = g;
+  const r = sanitizeAttachmentSlotId(obj.r);
+  if (r !== undefined) out.r = r;
+  const c = sanitizeAttachmentSlotId(obj.c);
+  if (c !== undefined) out.c = c;
+  const mag = sanitizeAttachmentSlotId(obj.mag);
+  if (mag !== undefined) out.mag = mag;
+  return out;
+}
+
+export function sanitizeSyncedHandlingAction(raw: unknown): SyncedHandlingAction {
+  if (
+    typeof raw === 'string' &&
+    VALID_SYNCED_HANDLING_ACTIONS.has(raw as SyncedHandlingAction)
+  ) {
+    return raw as SyncedHandlingAction;
+  }
+  return 'NONE';
 }
 
 export interface GameRelayResult {
@@ -205,6 +250,19 @@ export function validateAndSanitizeGameMessage(
     }
     safePayload.lean = Number(clampFinite(parsed.lean, -1, 1, 0).toFixed(2));
     safePayload.weaponId = String(parsed.weaponId ?? 'm4a1').slice(0, 40);
+    const cleanAtt = sanitizeSyncedWeaponAttachments(parsed.att);
+    if (cleanAtt) {
+      safePayload.att = cleanAtt;
+    } else {
+      delete safePayload.att;
+    }
+    safePayload.ha = sanitizeSyncedHandlingAction(parsed.ha);
+    safePayload.hprog = Number(clampFinite(parsed.hprog, 0, 1, 0).toFixed(3));
+    if (typeof parsed.sup === 'boolean') {
+      safePayload.sup = parsed.sup;
+    } else {
+      delete safePayload.sup;
+    }
     safePayload.hp = Math.round(clampFinite(parsed.hp, 0, 1000, 100));
     safePayload.maxHp = Math.round(clampFinite(parsed.maxHp, 1, 1000, 100));
     safePayload.alive = Boolean(parsed.alive);
@@ -212,6 +270,51 @@ export function validateAndSanitizeGameMessage(
     safePayload.deaths = Math.floor(clampFinite(parsed.deaths, 0, 10000, 0));
     safePayload.flashlightOn = Boolean(parsed.flashlightOn);
     safePayload.laserOn = Boolean(parsed.laserOn);
+  } else if (type === 'game:bots_sync') {
+    if (Array.isArray(parsed.bots)) {
+      safePayload.bots = parsed.bots.slice(0, 24).map((entry) => {
+        if (!entry || typeof entry !== 'object') return entry;
+        const b = entry as Record<string, unknown>;
+        const cleanBot: Record<string, unknown> = { ...b };
+        if (typeof b.weaponId === 'string') {
+          cleanBot.weaponId = b.weaponId.slice(0, 40);
+        }
+        const bAtt = sanitizeSyncedWeaponAttachments(b.att);
+        if (bAtt) cleanBot.att = bAtt;
+        else delete cleanBot.att;
+        if (b.ha !== undefined) {
+          cleanBot.ha = sanitizeSyncedHandlingAction(b.ha);
+        }
+        if (b.hprog !== undefined) {
+          cleanBot.hprog = Number(clampFinite(b.hprog, 0, 1, 0).toFixed(3));
+        }
+        if (typeof b.sup === 'boolean') {
+          cleanBot.sup = b.sup;
+        }
+        return cleanBot;
+      });
+    }
+  } else if (type === 'game:bot_fire') {
+    if (
+      !isFiniteCoord(parsed.ox) ||
+      !isFiniteCoord(parsed.oy) ||
+      !isFiniteCoord(parsed.oz) ||
+      !isFiniteCoord(parsed.ex) ||
+      !isFiniteCoord(parsed.ey) ||
+      !isFiniteCoord(parsed.ez)
+    ) {
+      return null;
+    }
+    safePayload.botId = String(parsed.botId ?? '').slice(0, 40);
+    if (typeof parsed.weaponId === 'string') {
+      safePayload.weaponId = parsed.weaponId.slice(0, 40);
+    }
+    if (typeof parsed.caliberId === 'string') {
+      safePayload.caliberId = parsed.caliberId.slice(0, 32);
+    }
+    if (typeof parsed.sup === 'boolean') {
+      safePayload.sup = parsed.sup;
+    }
   } else if (type === 'game:fire') {
     if (
       !isFiniteCoord(parsed.ox) ||

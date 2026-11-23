@@ -22,6 +22,7 @@ import {
   simulateMaterialPenetration,
   simulateTrajectoryProfile,
   solveZeroPitchRad,
+  resolveWeaponProfile,
   validateCrossOperatorParity,
   validateOperatorRig,
 } from '../index';
@@ -35,6 +36,13 @@ import {
   normalizeWeaponAttachments,
 } from '../../data/attachments';
 import { AMMO_VARIANTS } from '../../data/calibers';
+import { evalRatchetedSuppressorTwist, RatchetedSuppressorTwistSample } from '../weapons/WeaponAnimator';
+import { WeaponModelFactory } from '../weapons/WeaponModelFactory';
+import {
+  createDefaultMatchState,
+  validateAndSanitizeGameMessage,
+} from '../../worker/gameRelayGuard';
+import { LobbyRoomState } from '../../data/multiplayer';
 
 /**
  * Minimal headless 2D canvas stub so Three.js CanvasTexture procedural PBR materials
@@ -760,5 +768,301 @@ describe('Phase 7 — Rail-Adapter Optics, Razor PiP Hollow Geometry & Ballistic
     expect(ar500Stop.outcome).not.toBe('penetrate');
   });
 });
+
+describe('Phase 8 — Ratcheted Suppressor IK, Sprint Emergency Cancel, Geometry Hand Poses & MP Guard Parity', () => {
+  it('evaluates 3-stroke ratcheted suppressor twist with stationary regrip intervals and positive finger release', () => {
+    const out: RatchetedSuppressorTwistSample = {
+      cumulativeAngle01: 0,
+      axial01: 0,
+      wristRollRad: 0,
+      gripRelease01: 0,
+      weaponCounterRollRad: 0,
+      strokeIndex: 0,
+    };
+
+    // Start of stroke 0 -> 0 progress
+    evalRatchetedSuppressorTwist(0, false, out);
+    expect(out.cumulativeAngle01).toBeCloseTo(0, 5);
+    expect(out.axial01).toBeCloseTo(0, 5);
+    expect(out.strokeIndex).toBe(0);
+
+    // End of twist portion of stroke 0 (u = 0.68 / 3) vs mid-regrip (u = 0.84 / 3):
+    // Suppressor cumulative angle & axial travel MUST stay frozen while fingers open to regrip!
+    evalRatchetedSuppressorTwist(0.68 / 3, false, out);
+    const angleAtRegripStart = out.cumulativeAngle01;
+    const axialAtRegripStart = out.axial01;
+    expect(angleAtRegripStart).toBeCloseTo(1 / 3, 4);
+
+    evalRatchetedSuppressorTwist(0.84 / 3, false, out);
+    expect(out.cumulativeAngle01).toBeCloseTo(angleAtRegripStart, 5);
+    expect(out.axial01).toBeCloseTo(axialAtRegripStart, 5);
+    expect(out.gripRelease01).toBeGreaterThan(0.5);
+
+    // Stroke 1 and Stroke 2 reach 2/3 and 1.0 respectively
+    evalRatchetedSuppressorTwist((1 + 0.72) / 3, true, out);
+    expect(out.strokeIndex).toBe(1);
+    expect(out.cumulativeAngle01).toBeCloseTo(2 / 3, 4);
+
+    evalRatchetedSuppressorTwist(1.0, true, out);
+    expect(out.strokeIndex).toBe(2);
+    expect(out.cumulativeAngle01).toBeCloseTo(1.0, 5);
+    expect(out.axial01).toBeCloseTo(1.0, 5);
+  });
+
+  it('blocks firing during suppressor toggle and emergency-cancels cleanly on sprint preserving pre-action state', () => {
+    const scene = new THREE.Scene();
+    const rig = new WeaponRig(scene, true);
+    const prof = SDK_WEAPON_PROFILES.m4_556;
+    const suppDef = getCompatibleAttachments('m4_556', 'muzzle').find((d) => d.isSuppressor)!;
+    const att = normalizeWeaponAttachments('m4_556', { muzzle: suppDef.id });
+    const adapter = new BodycamPhysicsWorld().createAdapter();
+    const camPos = new THREE.Vector3(0, 1.5, 0);
+    const camQuat = new THREE.Quaternion();
+    rig.setWeaponProfile(prof, att);
+
+    let completed = false;
+    expect(rig.triggerFieldSuppressorToggle(() => { completed = true; })).toBe('started_detach');
+    expect(rig.isBlockingFiringAction()).toBe(true);
+    expect(rig.getSyncedHandlingSnapshot().action).toBe('SUPPRESSOR_DETACH');
+
+    // Step 15 frames normally
+    for (let i = 0; i < 15; i++) {
+      rig.updateRig(
+        1 / 60,
+        i / 60,
+        prof,
+        0,
+        0,
+        false,
+        false,
+        false,
+        false,
+        0,
+        0,
+        0,
+        camPos,
+        camQuat,
+        adapter,
+        DEFAULT_BODYCAM_SDK_CONFIG,
+      );
+    }
+    expect(rig.isBlockingFiringAction()).toBe(true);
+
+    // Trigger emergency cancel via sprint (arg 8 = isSprinting: true) -> must abort cleanly and keep suppressor mounted!
+    rig.updateRig(
+      1 / 60,
+      16 / 60,
+      prof,
+      0,
+      0,
+      false,
+      false,
+      true,
+      true,
+      0,
+      0,
+      0,
+      camPos,
+      camQuat,
+      adapter,
+      DEFAULT_BODYCAM_SDK_CONFIG,
+    );
+    expect(rig.isSuppressorActionActive()).toBe(false);
+    expect(rig.isBlockingFiringAction()).toBe(false);
+    expect(completed).toBe(false);
+    expect(rig.isSuppressorStowed()).toBe(false);
+    expect(rig.getDerivedStats().isSuppressed).toBe(true);
+  });
+
+  it('builds valid geometry-driven handPoseProfile data across pistol, rifle, and pump shotgun models', () => {
+    const ids = ['glock_17', 'm4_556', 'remington_870'] as const;
+    for (const id of ids) {
+      const built = WeaponModelFactory.build(resolveWeaponProfile(id));
+      const hp = built.handPoseProfile;
+      expect(hp).toBeTruthy();
+      expect(hp.gripWidthM).toBeGreaterThan(0.015);
+      expect(hp.gripWidthM).toBeLessThan(0.06);
+      expect(hp.supportRadiusM).toBeGreaterThan(0.01);
+      expect(hp.supportRadiusM).toBeLessThan(0.06);
+      expect(hp.triggerReachM).toBeGreaterThan(0.01);
+      expect(hp.triggerReachM).toBeLessThan(0.12);
+      expect(built.trigger).toBeTruthy();
+    }
+    const glock = WeaponModelFactory.build(resolveWeaponProfile('glock_17'));
+    expect(glock.handPoseProfile.supportStyle).toBe('pistol_cup');
+    const rem = WeaponModelFactory.build(resolveWeaponProfile('remington_870'));
+    expect(rem.handPoseProfile.supportStyle).toBe('pump_forend');
+  });
+
+  it('sanitizes att, ha, hprog, and sup across game:state, game:bots_sync, and game:bot_fire in gameRelayGuard', () => {
+    const roomState: LobbyRoomState = {
+      code: 'TST001',
+      hostUserId: 'host_1',
+      hostUsername: 'HOST',
+      visibility: 'private',
+      mode: 'battle',
+      battleRule: 'tdm',
+      mapId: 'timberline_compound',
+      maxPlayers: 8,
+      botsEnabled: true,
+      botCount: 4,
+      killLimit: 30,
+      botDifficulty: 'tactical',
+      status: 'in_match',
+      matchSequence: 1,
+      specialEvent: null,
+      members: [
+        {
+          userId: 'host_1',
+          username: 'HOST',
+          team: 'A',
+          ready: true,
+          isHost: true,
+          rank: 1,
+          prestige: 0,
+          connected: true,
+          joinedAt: Date.now(),
+        },
+        {
+          userId: 'peer_2',
+          username: 'PEER',
+          team: 'B',
+          ready: true,
+          isHost: false,
+          rank: 1,
+          prestige: 0,
+          connected: true,
+          joinedAt: Date.now(),
+        },
+      ],
+      chat: [],
+      updatedAt: Date.now(),
+    };
+    const matchState = createDefaultMatchState();
+
+    // 1. Valid & out-of-range game:state from peer
+    const stateRes = validateAndSanitizeGameMessage(
+      {
+        type: 'game:state',
+        x: 1.5,
+        y: 0.0,
+        z: -3.25,
+        yaw: 0.5,
+        pitch: 0.1,
+        weaponId: 'm4a1',
+        att: { o: 'optic_razor_1_6', m: 'muzzle_socom_556', ss: false, evil: 'DROP TABLE' },
+        ha: 'SUPPRESSOR_DETACH',
+        hprog: 1.75,
+        sup: true,
+        hp: 100,
+        maxHp: 100,
+        alive: true,
+      },
+      roomState,
+      matchState,
+      { userId: 'peer_2', username: 'PEER' },
+    );
+    expect(stateRes).toBeTruthy();
+    expect(stateRes!.payload.ha).toBe('SUPPRESSOR_DETACH');
+    expect(stateRes!.payload.hprog).toBe(1);
+    expect(stateRes!.payload.sup).toBe(true);
+    expect(stateRes!.payload.att).toEqual({
+      o: 'optic_razor_1_6',
+      m: 'muzzle_socom_556',
+      ss: false,
+    });
+
+    // Invalid ha enum degrades cleanly to 'NONE'
+    const badHaRes = validateAndSanitizeGameMessage(
+      {
+        type: 'game:state',
+        x: 0,
+        y: 0,
+        z: 0,
+        yaw: 0,
+        pitch: 0,
+        ha: 'EXPLOIT_ACTION',
+        hprog: -5,
+        hp: 100,
+        maxHp: 100,
+        alive: true,
+      },
+      roomState,
+      matchState,
+      { userId: 'peer_2', username: 'PEER' },
+    );
+    expect(badHaRes).toBeTruthy();
+    expect(badHaRes!.payload.ha).toBe('NONE');
+    expect(badHaRes!.payload.hprog).toBe(0);
+
+    // 2. Host game:bots_sync & game:bot_fire preserve sanitized att, ha, hprog, sup
+    const botSyncRes = validateAndSanitizeGameMessage(
+      {
+        type: 'game:bots_sync',
+        scoreA: 2,
+        scoreB: 1,
+        bots: [
+          {
+            id: 'bot_0',
+            name: 'ALPHA-1',
+            team: 'A',
+            weaponId: 'm4a1',
+            att: { o: 'optic_eotech_exps3', m: 'muzzle_socom_556', ss: false },
+            ha: 'SUPPRESSOR_ATTACH',
+            hprog: 0.42,
+            sup: true,
+            x: 2,
+            y: 0,
+            z: 4,
+            yaw: 1.2,
+            alive: true,
+            hp: 100,
+            maxHp: 100,
+            kills: 1,
+            deaths: 0,
+          },
+        ],
+      },
+      roomState,
+      matchState,
+      { userId: 'host_1', username: 'HOST' },
+    );
+    expect(botSyncRes).toBeTruthy();
+    const syncedBots = botSyncRes!.payload.bots as Array<Record<string, unknown>>;
+    expect(syncedBots).toHaveLength(1);
+    expect(syncedBots[0].ha).toBe('SUPPRESSOR_ATTACH');
+    expect(syncedBots[0].hprog).toBe(0.42);
+    expect(syncedBots[0].sup).toBe(true);
+    expect(syncedBots[0].att).toEqual({
+      o: 'optic_eotech_exps3',
+      m: 'muzzle_socom_556',
+      ss: false,
+    });
+
+    const botFireRes = validateAndSanitizeGameMessage(
+      {
+        type: 'game:bot_fire',
+        botId: 'bot_0',
+        ox: 1,
+        oy: 1.5,
+        oz: 2,
+        ex: 10,
+        ey: 1.5,
+        ez: 2,
+        weaponId: 'm4a1',
+        caliberId: '556x45',
+        sup: true,
+      },
+      roomState,
+      matchState,
+      { userId: 'host_1', username: 'HOST' },
+    );
+    expect(botFireRes).toBeTruthy();
+    expect(botFireRes!.payload.sup).toBe(true);
+    expect(botFireRes!.payload.weaponId).toBe('m4a1');
+    expect(botFireRes!.payload.caliberId).toBe('556x45');
+  });
+});
+
 
 

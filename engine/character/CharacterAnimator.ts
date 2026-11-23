@@ -16,6 +16,10 @@ import { WeaponRig } from '../weapons/WeaponRig';
 import { CharacterSkeleton } from './CharacterSkeleton';
 import { CharacterDriverState } from './ControllerStateReader';
 import {
+  evalRatchetedSuppressorTwist,
+  RatchetedSuppressorTwistSample,
+} from '../../bodycam-sdk/weapons/WeaponAnimator';
+import {
   createTwoBoneIKResult,
   IKTargetBlender,
   orientLimbAlongY,
@@ -268,6 +272,18 @@ export class CharacterAnimator {
   private readonly _handAlignedQuat = new THREE.Quaternion();
   private readonly _inspectSlideWorld = new THREE.Vector3();
   private readonly _inspectWeaponQuat = new THREE.Quaternion();
+  private readonly _suppTargetRoot = new THREE.Vector3();
+  private readonly _suppTwistQuat = new THREE.Quaternion();
+  private readonly _suppTwistAxis = new THREE.Vector3(0, 0, 1);
+  private readonly _suppTwistSample: RatchetedSuppressorTwistSample = {
+    cumulativeAngle01: 0,
+    axial01: 0,
+    wristRollRad: 0,
+    gripRelease01: 0,
+    weaponCounterRollRad: 0,
+    strokeIndex: 0,
+  };
+  private readonly _microTargetRoot = new THREE.Vector3();
 
   constructor(skeleton: CharacterSkeleton, weaponRig: WeaponRig, audio?: IBodycamAudioSource) {
     this.skeleton = skeleton;
@@ -2094,6 +2110,89 @@ export class CharacterAnimator {
       leftOverridden = true;
       this._lDesiredRoot.set(-0.22, eyeH - 0.24, -0.02);
       leftGripCurl = 0.85;
+    } else if (
+      (weaponAction === 'SUPPRESSOR_DETACH' || weaponAction === 'SUPPRESSOR_ATTACH') &&
+      isFirearm
+    ) {
+      leftOverridden = true;
+      const p = this.weaponRig.weaponAnimator.getActionProgress();
+      this.skeleton.magPouchAnchor.getWorldPosition(this._magPouchRoot);
+      this.skeleton.root.worldToLocal(this._magPouchRoot);
+      if (this.weaponRig.getSuppressorMountWorldPosition(this._suppTargetRoot)) {
+        this.skeleton.root.worldToLocal(this._suppTargetRoot);
+      } else {
+        this._suppTargetRoot.copy(this._lDesiredRoot);
+      }
+
+      if (weaponAction === 'SUPPRESSOR_DETACH') {
+        if (p < 0.14) {
+          const t = smoothstep(0.0, 0.14, p);
+          this._lDesiredRoot.lerp(this._suppTargetRoot, t);
+          leftGripCurl = THREE.MathUtils.lerp(0.82, 0.94, t);
+        } else if (p < 0.62) {
+          const twistT = (p - 0.14) / 0.48;
+          evalRatchetedSuppressorTwist(twistT, false, this._suppTwistSample);
+          this._lDesiredRoot.copy(this._suppTargetRoot);
+          this._suppTwistQuat.setFromAxisAngle(this._suppTwistAxis, this._suppTwistSample.wristRollRad);
+          this._lDesiredQuatRoot.multiply(this._suppTwistQuat);
+          leftGripCurl = THREE.MathUtils.lerp(0.96, 0.46, this._suppTwistSample.gripRelease01);
+        } else if (p < 0.72) {
+          this._lDesiredRoot.copy(this._suppTargetRoot);
+          leftGripCurl = 0.96;
+        } else if (p < 0.88) {
+          const t = smoothstep(0.72, 0.88, p);
+          this._lDesiredRoot.copy(this._suppTargetRoot).lerp(this._magPouchRoot, t);
+          leftGripCurl = 0.95;
+        } else {
+          const t = smoothstep(0.88, 1.0, p);
+          this._tmpWorldB.copy(this._lDesiredRoot);
+          this._lDesiredRoot.copy(this._magPouchRoot).lerp(this._tmpWorldB, t);
+          leftGripCurl = THREE.MathUtils.lerp(0.72, spec.leftHandSocket?.gripCurl ?? 0.85, t);
+        }
+      } else {
+        if (p < 0.16) {
+          const t = smoothstep(0.0, 0.16, p);
+          this._lDesiredRoot.lerp(this._magPouchRoot, t);
+          leftGripCurl = THREE.MathUtils.lerp(0.76, 0.94, t);
+        } else if (p < 0.30) {
+          const t = smoothstep(0.16, 0.30, p);
+          this._lDesiredRoot.copy(this._magPouchRoot).lerp(this._suppTargetRoot, t);
+          leftGripCurl = 0.95;
+        } else if (p < 0.40) {
+          this._lDesiredRoot.copy(this._suppTargetRoot);
+          leftGripCurl = 0.96;
+        } else if (p < 0.86) {
+          const twistT = (p - 0.40) / 0.46;
+          evalRatchetedSuppressorTwist(twistT, true, this._suppTwistSample);
+          this._lDesiredRoot.copy(this._suppTargetRoot);
+          this._suppTwistQuat.setFromAxisAngle(this._suppTwistAxis, this._suppTwistSample.wristRollRad);
+          this._lDesiredQuatRoot.multiply(this._suppTwistQuat);
+          leftGripCurl = THREE.MathUtils.lerp(0.96, 0.46, this._suppTwistSample.gripRelease01);
+        } else {
+          const t = smoothstep(0.86, 1.0, p);
+          this._tmpWorldB.copy(this._lDesiredRoot);
+          this._lDesiredRoot.copy(this._suppTargetRoot).lerp(this._tmpWorldB, t);
+          leftGripCurl = THREE.MathUtils.lerp(0.92, spec.leftHandSocket?.gripCurl ?? 0.85, t);
+        }
+      }
+    } else if (this.weaponRig.weaponAnimator.getActiveMicroAction() !== 'NONE' && isFirearm) {
+      const micro = this.weaponRig.weaponAnimator.getActiveMicroAction();
+      const mp = this.weaponRig.weaponAnimator.getMicroActionProgress();
+      const env = smoothstep(0.0, 0.28, mp) * (1 - smoothstep(0.68, 1.0, mp));
+      let hasTarget = false;
+      if (micro === 'ZOOM_TWIST') {
+        hasTarget = this.weaponRig.getZoomRingWorldPosition(this._microTargetRoot);
+      } else if (micro === 'ILLUM') {
+        hasTarget = this.weaponRig.getIllumDialWorldPosition(this._microTargetRoot);
+      } else if (micro === 'LIGHT_PAD') {
+        hasTarget = this.weaponRig.getPressurePadWorldPosition(this._microTargetRoot);
+      }
+      if (hasTarget && env > 0.005) {
+        leftOverridden = true;
+        this.skeleton.root.worldToLocal(this._microTargetRoot);
+        this._lDesiredRoot.lerp(this._microTargetRoot, env);
+        leftGripCurl = THREE.MathUtils.lerp(leftGripCurl, 0.72, env);
+      }
     } else if (this.combatMove === 'ARMED_BASH' && spec.holdClass === 'pistol') {
       // Support left hand clears to protective chest guard during right-hand pistol whip
       leftOverridden = true;
@@ -2160,8 +2259,9 @@ export class CharacterAnimator {
     armL.hand.root.quaternion.copy(this._lQuatRoot);
     armL.hand.root.updateMatrixWorld(true);
 
-    // Sync physical detachable magazine mesh into/out of left hand during Reload & Mag-Check
+    // Sync physical detachable magazine & suppressor meshes into/out of left hand
     this.weaponRig.weaponAnimator.syncPhysicalMagazineParent(armL.hand.root);
+    this.weaponRig.weaponAnimator.syncPhysicalSuppressorParent(armL.hand.root, dt);
 
     const leftHoldClass =
       vaultPinL > 0.2 || isUnarmed ? 'unarmed' : leftOverridden ? 'melee_1h' : spec.holdClass;

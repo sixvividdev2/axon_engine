@@ -13,7 +13,10 @@ import {
   OperatorUniformId,
   resolveOperatorUniformId,
   SyncedAimStance,
+  SyncedHandlingAction,
+  unpackSyncedWeaponAttachments,
 } from '../data/multiplayer';
+import { WeaponAttachments } from '../data/attachments';
 import { BattleScoreEntry, BattleTeamId } from './BattleBotAI';
 import {
   BuiltTacticalOperatorRig,
@@ -33,6 +36,11 @@ interface RemoteOperator {
   kills: number;
   deaths: number;
   weaponId: string;
+  attachments: WeaponAttachments;
+  suppressed: boolean;
+  handlingAction: SyncedHandlingAction;
+  handlingProgress: number;
+  targetHandlingProgress: number;
   lastUpdateMs: number;
 
   // Interpolated vs target kinematic & stance state
@@ -134,6 +142,8 @@ export class RemotePlayerManager {
     recoilKick: 0,
     firingVibration: 0,
     flinchPitch: 0,
+    handlingAction: 'NONE',
+    handlingProgress: 0,
   };
 
   constructor(
@@ -278,9 +288,12 @@ export class RemotePlayerManager {
           newRig.root.visible = wasVisible;
           oldRoot.remove(existing.nameSprite);
           newRig.root.add(existing.nameSprite);
+          existing.rig.disposeWeapon();
           this.group.remove(oldRoot);
           this.group.add(newRig.root);
           existing.rig = newRig;
+          existing.rig.setWeaponLoadout(existing.weaponId, existing.attachments);
+          existing.rig.setSuppressedVisual(existing.suppressed);
           existing.operatorId = targetOperatorId;
           existing.gearSig = '';
         }
@@ -292,6 +305,7 @@ export class RemotePlayerManager {
       ? normalizeOperatorId(explicitOperatorId)
       : DEFAULT_OPERATOR_ID;
     const rig = this.rigFactory.buildOperator('remote_player', userId, targetUniformId, operatorId);
+    rig.setWeaponLoadout('m4a1', {});
     rig.root.visible = false; // Hidden until first network position arrives
 
     // Overhead callsign nameplate
@@ -321,6 +335,11 @@ export class RemotePlayerManager {
       kills: 0,
       deaths: 0,
       weaponId: 'm4a1',
+      attachments: {},
+      suppressed: false,
+      handlingAction: 'NONE',
+      handlingProgress: 0,
+      targetHandlingProgress: 0,
       lastUpdateMs: performance.now(),
 
       curPos: new THREE.Vector3(),
@@ -435,18 +454,54 @@ export class RemotePlayerManager {
     op.isReloading = Boolean(pkt.isReloading);
     op.targetReload = op.isReloading ? 1 : 0;
 
+    op.sprint = Boolean(pkt.sprint);
+    op.weaponId = pkt.weaponId || op.weaponId;
+    if (pkt.att !== undefined) {
+      op.attachments = unpackSyncedWeaponAttachments(pkt.att);
+    }
+    if (typeof pkt.sup === 'boolean') {
+      op.suppressed = pkt.sup;
+    }
+    op.rig.setWeaponLoadout(op.weaponId, op.attachments);
+
+    // Sync active firearm handling action & normalized progress
+    const nextAction: SyncedHandlingAction =
+      pkt.ha ?? (op.isReloading ? 'RELOAD' : 'NONE');
+    const nextProg =
+      typeof pkt.hprog === 'number' && Number.isFinite(pkt.hprog)
+        ? THREE.MathUtils.clamp(pkt.hprog, 0, 1)
+        : nextAction === 'NONE'
+          ? 0
+          : op.targetHandlingProgress;
+
+    if (nextAction !== op.handlingAction) {
+      op.handlingAction = nextAction;
+      op.handlingProgress = nextProg;
+      op.targetHandlingProgress = nextProg;
+    } else {
+      if (nextProg + 0.25 < op.handlingProgress) {
+        op.handlingProgress = nextProg;
+      }
+      op.targetHandlingProgress = nextProg;
+    }
+
+    if (
+      op.handlingAction !== 'SUPPRESSOR_DETACH' &&
+      op.handlingAction !== 'SUPPRESSOR_ATTACH'
+    ) {
+      op.rig.setSuppressedVisual(op.suppressed);
+    }
+
     // Catch missed one-shot fire packets via monotonic fireSeq delta
     if (typeof pkt.fireSeq === 'number' && pkt.fireSeq > op.lastFireSeq) {
       if (op.hasInitialState && op.muzzleFlashTimer <= 0) {
-        op.muzzleFlashTimer = 0.045;
+        op.muzzleFlashTimer = op.suppressed ? 0.025 : 0.045;
         op.recoilKickTimer = 0.095;
-        op.rig.muzzleFlash.visible = true;
+        op.rig.muzzleFlash.visible = !op.suppressed;
       }
       op.lastFireSeq = pkt.fireSeq;
     }
 
-    op.sprint = Boolean(pkt.sprint);
-    op.weaponId = pkt.weaponId || op.weaponId;
     op.hp = pkt.hp;
     op.maxHp = Math.max(1, pkt.maxHp || 100);
     op.alive = Boolean(pkt.alive);
@@ -522,6 +577,12 @@ export class RemotePlayerManager {
       }
     }
 
+    if (pkt.weaponId && pkt.weaponId !== op.weaponId) {
+      op.weaponId = pkt.weaponId;
+      op.rig.setWeaponLoadout(op.weaponId, op.attachments);
+    }
+    op.suppressed = Boolean(pkt.suppressed);
+
     op.muzzleFlashTimer = pkt.suppressed ? 0.032 : 0.068;
     op.recoilKickTimer = 0.11;
     op.rig.muzzleFlash.visible = !pkt.suppressed;
@@ -576,6 +637,9 @@ export class RemotePlayerManager {
     op.isReloading = false;
     op.targetReload = 0;
     op.reloadBlend = 0;
+    op.handlingAction = 'NONE';
+    op.handlingProgress = 0;
+    op.targetHandlingProgress = 0;
     op.hasInitialState = true;
     if (
       pkt.glovesEnabled !== undefined ||
@@ -625,6 +689,7 @@ export class RemotePlayerManager {
     }
     for (const [uid, op] of Array.from(this.players.entries())) {
       if (!activeIds.has(uid)) {
+        op.rig.disposeWeapon();
         this.group.remove(op.rig.root);
         op.nameTexture.dispose();
         (op.nameSprite.material as THREE.SpriteMaterial).dispose();
@@ -715,6 +780,26 @@ export class RemotePlayerManager {
       const shotKick = op.recoilKickTimer > 0 ? op.recoilKickTimer / 0.11 : 0;
       const sustainedVibe = op.isFiring ? Math.sin(performance.now() * 0.055) * 0.016 : 0;
 
+      // Smoothly advance & interpolate active handling progress between 20Hz packets
+      if (op.handlingAction !== 'NONE') {
+        const estRate =
+          op.handlingAction === 'SUPPRESSOR_DETACH' || op.handlingAction === 'SUPPRESSOR_ATTACH'
+            ? 1 / 2.45
+            : op.handlingAction === 'RELOAD'
+              ? 1 / 2.25
+              : op.handlingAction === 'BOLT'
+                ? 1 / 0.72
+                : op.handlingAction === 'PUMP'
+                  ? 1 / 0.34
+                  : op.handlingAction === 'INSPECT'
+                    ? 1 / 2.6
+                    : 1 / 0.45;
+        op.targetHandlingProgress = Math.min(1, op.targetHandlingProgress + dt * estRate * 0.85);
+        op.handlingProgress += (op.targetHandlingProgress - op.handlingProgress) * poseAlpha;
+      } else {
+        op.handlingProgress = 0;
+      }
+
       // Unified grounded crouch knees, local weaponSocket shoulder mount, Point Aim cant, and 2-bone arm IK
       const pose = this._poseScratch;
       pose.crouchBlend = op.crouchBlend;
@@ -730,6 +815,8 @@ export class RemotePlayerManager {
       pose.recoilKick = shotKick;
       pose.firingVibration = sustainedVibe;
       pose.flinchPitch = flinchPitch;
+      pose.handlingAction = op.handlingAction;
+      pose.handlingProgress = op.handlingProgress;
       rig.applyCombatPose(pose);
 
       // Muzzle flash, laser & tactical light
@@ -737,7 +824,9 @@ export class RemotePlayerManager {
         op.muzzleFlashTimer = Math.max(0, op.muzzleFlashTimer - dt);
         if (op.muzzleFlashTimer <= 0) rig.muzzleFlash.visible = false;
       }
-      rig.laserBeam.visible = op.laserOn && !op.isReloading;
+      const suppBusy =
+        op.handlingAction === 'SUPPRESSOR_DETACH' || op.handlingAction === 'SUPPRESSOR_ATTACH';
+      rig.laserBeam.visible = op.laserOn && !op.isReloading && !suppBusy;
       rig.flashlightGlow.visible = op.flashlightOn;
 
       // Nameplate height & distance/team visibility
@@ -858,6 +947,7 @@ export class RemotePlayerManager {
 
   public dispose(): void {
     for (const op of this.players.values()) {
+      op.rig.disposeWeapon();
       op.nameTexture.dispose();
       (op.nameSprite.material as THREE.SpriteMaterial).dispose();
     }

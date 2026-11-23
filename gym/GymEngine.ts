@@ -609,6 +609,9 @@ export class GymEngine {
     });
     this.saveManager.saveGymLoadout(this.attachmentsByWeapon);
     this.syncRuntimeProfile();
+    if (!this.world.gunsmithBench.isOpen()) {
+      this.weaponRig.triggerTurretClick();
+    }
     this.emitSnapshot();
   }
 
@@ -952,7 +955,8 @@ export class GymEngine {
       this.world.gunsmithBench.isActiveOrTransitioning() ||
       this.controller.isVaulting() ||
       this.pdaDevice.isBlockingWeaponActions() ||
-      this.reloadTimer > 0
+      this.reloadTimer > 0 ||
+      this.weaponRig.isTubularReloading()
     ) {
       return;
     }
@@ -1255,6 +1259,7 @@ export class GymEngine {
       return;
     }
     this.weaponRig.laserOn = !this.weaponRig.laserOn;
+    this.weaponRig.triggerTacticalSwitch();
     this.audio.playTacticalSwitchClick(this.weaponRig.laserOn);
     this.showToast(
       this.weaponRig.laserOn
@@ -1274,6 +1279,7 @@ export class GymEngine {
     const next = this.weaponRig.laserMode === 'visible_red' ? 'ir_green' : 'visible_red';
     this.weaponRig.setLaserMode(next);
     this.weaponRig.laserOn = true;
+    this.weaponRig.triggerTacticalSwitch();
     this.audio.playTacticalSwitchClick(true);
     this.showToast(`Laser Mode: ${next === 'ir_green' ? 'IR Green' : 'Visible Red'}`);
     this.emitSnapshot();
@@ -1292,6 +1298,7 @@ export class GymEngine {
     this.flashlightOn = !this.flashlightOn;
     this.weaponRig.flashlight.visible = this.flashlightOn;
     this.weaponRig.flashlight.intensity = this.flashlightOn ? 32 : 0;
+    this.weaponRig.triggerTacticalSwitch();
     this.audio.playTacticalSwitchClick(this.flashlightOn);
     this.showToast(this.flashlightOn ? 'Weapon Light: ON' : 'Weapon Light: OFF');
     this.emitSnapshot();
@@ -1318,14 +1325,43 @@ export class GymEngine {
     if (
       prof.magCapacity <= 0 ||
       this.reloadTimer > 0 ||
+      this.weaponRig.isTubularReloading() ||
       this.controller.isVaulting() ||
       this.pdaDevice.isBlockingWeaponActions() ||
       this.weaponRig.isSuppressorActionActive()
     ) {
       return;
     }
-    if ((this.magAmmoByWeapon[prof.id] ?? 0) >= prof.magCapacity) {
+    const curAmmo = this.magAmmoByWeapon[prof.id] ?? 0;
+    if (curAmmo >= prof.magCapacity) {
       this.showToast(`Mag Full (${prof.magCapacity}/${prof.magCapacity})`);
+      return;
+    }
+    const isTubularShotgun = prof.holdClass === 'shotgun' && prof.fireMode === 'pump';
+    if (isTubularShotgun) {
+      const shellsNeeded = prof.magCapacity - curAmmo;
+      const weaponId = prof.id;
+      const started = this.weaponRig.triggerTubularReload(
+        shellsNeeded,
+        curAmmo === 0,
+        () => {
+          if (this.equippedWeaponId !== weaponId) return;
+          const nextAmmo = Math.min(prof.magCapacity, (this.magAmmoByWeapon[weaponId] ?? 0) + 1);
+          this.magAmmoByWeapon[weaponId] = nextAmmo;
+          this.weaponRig.setAmmoState(nextAmmo);
+          this.emitSnapshot();
+        },
+        () => {
+          if (this.equippedWeaponId !== weaponId) return;
+          const finalAmmo = this.magAmmoByWeapon[weaponId] ?? 0;
+          this.showToast(`Loaded: ${finalAmmo}/${prof.magCapacity}`);
+          this.emitSnapshot();
+        },
+      );
+      if (started) {
+        this.showToast(`Loading ${prof.name} shells...`);
+        this.emitSnapshot();
+      }
       return;
     }
     this.reloadTimer = prof.reloadDurationSec;
@@ -1486,11 +1522,19 @@ export class GymEngine {
       return;
     }
     if (prof.fireMode === 'none' || prof.magCapacity <= 0) return;
+    const currentAmmo = this.magAmmoByWeapon[prof.id] ?? 0;
+    if (this.weaponRig.isTubularReloading()) {
+      if (currentAmmo > 0 && !this.controller.isSprinting && !this.controller.isVaulting()) {
+        this.weaponRig.interruptTubularReload();
+        this.reloadTimer = 0;
+      } else {
+        return;
+      }
+    }
     if (
       this.reloadTimer > 0 ||
       this.fireCooldown > 0 ||
-      this.weaponRig.isBoltCycling() ||
-      this.weaponRig.isSuppressorActionActive() ||
+      this.weaponRig.isBlockingFiringAction() ||
       this.controller.isSprinting ||
       this.controller.isVaulting() ||
       this.animator.isCombatBusy()
@@ -1502,7 +1546,6 @@ export class GymEngine {
       prof.fireMode === 'semi' || prof.fireMode === 'bolt' || prof.fireMode === 'pump';
     if (isSingleShotMode && this.semiTriggerConsumed) return;
 
-    const currentAmmo = this.magAmmoByWeapon[prof.id] ?? 0;
     if (currentAmmo <= 0) {
       this.weaponRig.triggerDryFire();
       this.semiTriggerConsumed = true;
@@ -1768,8 +1811,8 @@ export class GymEngine {
     }
     if (
       this.pointerLocked &&
-      this.controller.isAds &&
       !this.world.gunsmithBench.isOpen() &&
+      !this.controller.isSprinting &&
       this.weaponRig.hasVariableZoom()
     ) {
       e.preventDefault();
@@ -1906,12 +1949,12 @@ export class GymEngine {
         }
         break;
       case 'BracketRight':
-        if (!e.repeat && this.controller.isAds && this.weaponRig.hasVariableZoom()) {
+        if (!e.repeat && !this.controller.isSprinting && this.weaponRig.hasVariableZoom()) {
           this.cycleOpticZoom(1);
         }
         break;
       case 'BracketLeft':
-        if (!e.repeat && this.controller.isAds && this.weaponRig.hasVariableZoom()) {
+        if (!e.repeat && !this.controller.isSprinting && this.weaponRig.hasVariableZoom()) {
           this.cycleOpticZoom(-1);
         }
         break;
@@ -2346,7 +2389,7 @@ export class GymEngine {
       spas12Mode: this.spas12Mode,
       ammoInMag: this.magAmmoByWeapon[prof.id] ?? 0,
       magCapacity: prof.magCapacity,
-      isReloading: this.reloadTimer > 0,
+      isReloading: this.reloadTimer > 0 || this.weaponRig.isTubularReloading(),
       laserOn: this.weaponRig.laserOn && prof.supportsLaser && derived.hasLaser,
       laserMode: this.weaponRig.laserMode,
       flashlightOn: this.flashlightOn && derived.hasFlashlight,

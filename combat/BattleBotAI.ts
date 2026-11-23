@@ -32,11 +32,21 @@ import {
   BotWeaponVisualClass,
   GameBotsSyncPacket,
   OperatorUniformId,
+  packSyncedWeaponAttachments,
   resolveOperatorUniformId,
   SquadCommsCategory,
   SyncedBotState,
+  SyncedHandlingAction,
   TacticalPingKind,
+  unpackSyncedWeaponAttachments,
 } from '../data/multiplayer';
+import {
+  getCompatibleAttachments,
+  getOwnedSuppressorDef,
+  normalizeWeaponAttachments,
+  WeaponAttachments,
+} from '../data/attachments';
+import { SUPPRESSOR_TOGGLE_DURATION_SEC } from '../bodycam-sdk/weapons/WeaponAnimator';
 import {
   BuiltTacticalOperatorRig,
   TacticalCombatPose,
@@ -348,6 +358,50 @@ function buildBotWeaponSpec(weaponId: string): BotWeaponCombatSpec {
   };
 }
 
+/**
+ * Builds an authentic, rule-normalized armory attachment kit for AI bots so bots carry
+ * real procedural optics, grips, and suppressors matching human operator loadouts.
+ */
+function buildBotAttachmentsForWeapon(
+  weaponId: string,
+  seedIdx: number,
+  coopInfection: boolean,
+): WeaponAttachments {
+  // True pistol-start in Infection starts clean until bots purchase upgraded weapons
+  if (coopInfection && weaponId === 'glock_17') {
+    return normalizeWeaponAttachments(weaponId, {});
+  }
+
+  const raw: WeaponAttachments = {};
+  const rails = getCompatibleAttachments(weaponId, 'railAdapter', raw);
+  if (rails.length > 0 && seedIdx % 2 === 0) {
+    raw.railAdapter = rails[0].id;
+  }
+
+  const optics = getCompatibleAttachments(weaponId, 'optic', raw);
+  if (optics.length > 0) {
+    const pickedOptic = optics[seedIdx % optics.length];
+    raw.optic = pickedOptic.id;
+  }
+
+  const grips = getCompatibleAttachments(weaponId, 'foregrip', raw);
+  if (grips.length > 0 && seedIdx % 3 !== 2) {
+    raw.foregrip = grips[seedIdx % grips.length].id;
+  }
+
+  const muzzles = getCompatibleAttachments(weaponId, 'muzzle', raw);
+  const suppressors = muzzles.filter((m) => m.isSuppressor);
+  if (suppressors.length > 0 && seedIdx % 2 === 0) {
+    raw.muzzle = suppressors[0].id;
+    raw.suppressorStowed = false;
+  } else if (muzzles.length > 0) {
+    const nonSupp = muzzles.find((m) => !m.isSuppressor);
+    if (nonSupp) raw.muzzle = nonSupp.id;
+  }
+
+  return normalizeWeaponAttachments(weaponId, raw);
+}
+
 interface BotEconomyGoal {
   kind: BotEconomyActionEvent['kind'];
   interactableId: string;
@@ -375,6 +429,18 @@ interface BotActor {
   weaponId: string;
   weaponLabel: string;
   weaponClass: BotWeaponVisualClass;
+  botSeedIndex: number;
+  attachments: WeaponAttachments;
+  ownsSuppressor: boolean;
+  suppressed: boolean;
+  handlingAction: SyncedHandlingAction;
+  handlingTimer: number;
+  handlingDuration: number;
+  suppToggleCooldown: number;
+  pendingSuppressorAttach: boolean;
+  netHandlingAction: SyncedHandlingAction;
+  netHandlingProgress: number;
+  netSuppressed: boolean;
   alive: boolean;
   hp: number;
   maxHp: number;
@@ -675,7 +741,12 @@ export class BattleBotAI {
         : resolveOperatorUniformId('battle', team);
       const rig = this.rigFactory.buildOperator('bot', id, uniformId, operatorId);
       const initSpec = this.getWeaponSpec(weaponId);
+      const initAtt = buildBotAttachmentsForWeapon(initSpec.id, i, this.coopInfectionMode);
+      const ownsSuppressor = Boolean(getOwnedSuppressorDef(initAtt));
+      const suppressed = ownsSuppressor && !initAtt.suppressorStowed;
       rig.setWeaponClass(initSpec.visualClass);
+      rig.setWeaponLoadout(initSpec.id, initAtt);
+      rig.setSuppressedVisual(suppressed);
       this.group.add(rig.root);
 
       const bot: BotActor = {
@@ -687,6 +758,18 @@ export class BattleBotAI {
         weaponId: initSpec.id,
         weaponLabel: initSpec.label,
         weaponClass: initSpec.visualClass,
+        botSeedIndex: i,
+        attachments: initAtt,
+        ownsSuppressor,
+        suppressed,
+        handlingAction: 'NONE',
+        handlingTimer: 0,
+        handlingDuration: 0,
+        suppToggleCooldown: 12 + i * 3.5 + Math.random() * 8,
+        pendingSuppressorAttach: suppressed,
+        netHandlingAction: 'NONE',
+        netHandlingProgress: 0,
+        netSuppressed: suppressed,
         alive: true,
         hp: this.aiMaxHp,
         maxHp: this.aiMaxHp,
@@ -891,6 +974,9 @@ export class BattleBotAI {
     bot.reactionTimer = this.diff.reactionSec;
     bot.flinchTimer = 0;
     bot.reloadTimer = 0;
+    bot.handlingAction = 'NONE';
+    bot.handlingTimer = 0;
+    bot.handlingDuration = 0;
     bot.lowHpCalledOut = false;
     bot.economyGoal = null;
     bot.prevHasLos = false;
@@ -903,6 +989,8 @@ export class BattleBotAI {
     bot.ragdoll.deactivate();
     bot.rig.resetRagdollPose();
     bot.rig.setWeaponClass(bot.weaponClass);
+    bot.rig.setWeaponLoadout(bot.weaponId, bot.attachments);
+    bot.rig.setSuppressedVisual(bot.suppressed);
     bot.root.visible = true;
     bot.root.position.copy(bot.pos);
     bot.root.quaternion.identity();
@@ -950,8 +1038,16 @@ export class BattleBotAI {
     bot.weaponId = spec.id;
     bot.weaponLabel = spec.label;
     bot.weaponClass = spec.visualClass;
+    bot.attachments = buildBotAttachmentsForWeapon(spec.id, bot.botSeedIndex, this.coopInfectionMode);
+    bot.ownsSuppressor = Boolean(getOwnedSuppressorDef(bot.attachments));
+    bot.suppressed = bot.ownsSuppressor && !bot.attachments.suppressorStowed;
+    bot.handlingAction = 'NONE';
+    bot.handlingTimer = 0;
+    bot.handlingDuration = 0;
     bot.reloadDuration = spec.reloadSec / (bot.perks.has('rapid_handling') ? 1.6 : 1.0);
     bot.rig.setWeaponClass(spec.visualClass);
+    bot.rig.setWeaponLoadout(spec.id, bot.attachments);
+    bot.rig.setSuppressedVisual(bot.suppressed);
   }
 
   private grantBotInfectionWeapon(bot: BotActor, weaponId: string): BotWeaponCombatSpec {
@@ -1166,6 +1262,7 @@ export class BattleBotAI {
 
   private swapBotOperatorRig(bot: BotActor, nextOperatorId: OperatorId): void {
     const wasVisible = bot.root.visible;
+    bot.rig.disposeWeapon();
     this.group.remove(bot.root);
     const rig = this.rigFactory.buildOperator('bot', bot.id, bot.uniformId, nextOperatorId);
     rig.root.position.copy(bot.pos);
@@ -1176,6 +1273,8 @@ export class BattleBotAI {
     bot.operatorId = nextOperatorId;
     bot.rig = rig;
     bot.rig.setWeaponClass(bot.weaponClass);
+    bot.rig.setWeaponLoadout(bot.weaponId, bot.attachments);
+    bot.rig.setSuppressedVisual(bot.suppressed);
     bot.root = rig.root;
     bot.bodyPivot = rig.bodyPivot;
     bot.leftLeg = rig.leftLeg;
@@ -1251,32 +1350,46 @@ export class BattleBotAI {
   }
 
   public exportSyncSnapshot(): GameBotsSyncPacket {
-    const bots: SyncedBotState[] = this.bots.map((b) => ({
-      id: b.id,
-      name: b.name,
-      team: b.team,
-      uniformId: b.uniformId,
-      operatorId: b.operatorId,
-      weaponId: b.weaponId,
-      weaponLabel: b.weaponLabel,
-      weaponClass: b.weaponClass,
-      points: this.coopInfectionMode ? b.points : undefined,
-      reloading: b.reloadTimer > 0,
-      x: Number(b.pos.x.toFixed(3)),
-      y: Number(b.pos.y.toFixed(3)),
-      z: Number(b.pos.z.toFixed(3)),
-      yaw: Number(b.yaw.toFixed(4)),
-      alive: b.alive,
-      hp: Math.round(b.hp),
-      maxHp: b.maxHp,
-      kills: b.kills,
-      deaths: b.deaths,
-      firing: b.muzzleFlashTimer > 0 || b.burstShotsLeft > 0,
-      crouch: Number(b.crouchBlend.toFixed(2)),
-      lean: Number(b.leanBlend.toFixed(2)),
-      vaulting: b.vaultActive,
-      vaultProgress: b.vaultActive ? Number(b.vaultT.toFixed(2)) : 0,
-    }));
+    const bots: SyncedBotState[] = this.bots.map((b) => {
+      let ha: SyncedHandlingAction = b.handlingAction;
+      let hprog = 0;
+      if (ha !== 'NONE' && b.handlingDuration > 0) {
+        hprog = THREE.MathUtils.clamp(b.handlingTimer / b.handlingDuration, 0, 1);
+      } else if (b.reloadTimer > 0) {
+        ha = 'RELOAD';
+        hprog = THREE.MathUtils.clamp(1 - b.reloadTimer / Math.max(0.2, b.reloadDuration), 0, 1);
+      }
+      return {
+        id: b.id,
+        name: b.name,
+        team: b.team,
+        uniformId: b.uniformId,
+        operatorId: b.operatorId,
+        weaponId: b.weaponId,
+        weaponLabel: b.weaponLabel,
+        weaponClass: b.weaponClass,
+        att: packSyncedWeaponAttachments(b.attachments),
+        ha,
+        hprog: Number(hprog.toFixed(3)),
+        sup: b.suppressed,
+        points: this.coopInfectionMode ? b.points : undefined,
+        reloading: b.reloadTimer > 0,
+        x: Number(b.pos.x.toFixed(3)),
+        y: Number(b.pos.y.toFixed(3)),
+        z: Number(b.pos.z.toFixed(3)),
+        yaw: Number(b.yaw.toFixed(4)),
+        alive: b.alive,
+        hp: Math.round(b.hp),
+        maxHp: b.maxHp,
+        kills: b.kills,
+        deaths: b.deaths,
+        firing: b.muzzleFlashTimer > 0 || b.burstShotsLeft > 0,
+        crouch: Number(b.crouchBlend.toFixed(2)),
+        lean: Number(b.leanBlend.toFixed(2)),
+        vaulting: b.vaultActive,
+        vaultProgress: b.vaultActive ? Number(b.vaultT.toFixed(2)) : 0,
+      };
+    });
     return {
       type: 'game:bots_sync',
       scoreA: this.scoreA,
@@ -1317,8 +1430,26 @@ export class BattleBotAI {
       }
       if (sb.weaponId) bot.weaponId = sb.weaponId;
       if (sb.weaponLabel) bot.weaponLabel = sb.weaponLabel;
+      if (sb.att !== undefined) {
+        bot.attachments = unpackSyncedWeaponAttachments(sb.att);
+      }
+      if (typeof sb.sup === 'boolean') {
+        bot.netSuppressed = sb.sup;
+        bot.suppressed = sb.sup;
+      }
+      bot.rig.setWeaponLoadout(bot.weaponId, bot.attachments);
       if (typeof sb.points === 'number') bot.points = sb.points;
       bot.netReloading = Boolean(sb.reloading);
+      const nextHa: SyncedHandlingAction = sb.ha ?? (bot.netReloading ? 'RELOAD' : 'NONE');
+      const nextHprog =
+        typeof sb.hprog === 'number' && Number.isFinite(sb.hprog)
+          ? THREE.MathUtils.clamp(sb.hprog, 0, 1)
+          : 0;
+      bot.netHandlingAction = nextHa;
+      bot.netHandlingProgress = nextHprog;
+      if (nextHa !== 'SUPPRESSOR_DETACH' && nextHa !== 'SUPPRESSOR_ATTACH') {
+        bot.rig.setSuppressedVisual(bot.netSuppressed);
+      }
 
       const wasAlive = bot.alive;
       bot.alive = sb.alive;
@@ -1370,12 +1501,22 @@ export class BattleBotAI {
     }
   }
 
-  public playRemoteBotFire(botId: string, ox: number, oy: number, oz: number, ex: number, ey: number, ez: number): void {
+  public playRemoteBotFire(
+    botId: string,
+    ox: number,
+    oy: number,
+    oz: number,
+    ex: number,
+    ey: number,
+    ez: number,
+    suppressed = false,
+  ): void {
     const bot = this.bots.find((b) => b.id === botId);
     const spec = bot ? this.getWeaponSpec(bot.weaponId) : null;
+    const isSup = suppressed || Boolean(bot?.suppressed);
     if (bot && bot.alive) {
-      bot.muzzleFlash.visible = true;
-      bot.muzzleFlashTimer = 0.055;
+      bot.muzzleFlash.visible = !isSup;
+      bot.muzzleFlashTimer = isSup ? 0.025 : 0.055;
       bot.firingVisualTimer = 0.16;
       bot.recoilKick = Math.min(1, bot.recoilKick + 0.85);
     }
@@ -1386,7 +1527,7 @@ export class BattleBotAI {
       position: this._tmpMuzzle,
       weightClass: spec?.weightClass ?? 'carbine',
       caliberId: spec?.caliberId ?? '556x45',
-      suppressed: false,
+      suppressed: isSup,
       intensity: spec?.visualClass === 'pistol' ? 0.56 : 0.72,
     });
   }
@@ -2303,7 +2444,12 @@ export class BattleBotAI {
     matchActive: boolean,
     onDamagePlayer: (ev: BotPlayerDamageEvent) => void,
     humanTargets?: BattleHumanTarget[],
-    onBotFire?: (botId: string, origin: Readonly<THREE.Vector3>, end: Readonly<THREE.Vector3>) => void,
+    onBotFire?: (
+      botId: string,
+      origin: Readonly<THREE.Vector3>,
+      end: Readonly<THREE.Vector3>,
+      meta?: { weaponId: string; caliberId: string; suppressed: boolean },
+    ) => void,
     isLineBlockedBySmoke?: (a: Readonly<THREE.Vector3>, b: Readonly<THREE.Vector3>) => boolean,
     getActiveSmokeClouds?: () => readonly ActiveSmokeCloudInfo[],
     zombieTargets?: ReadonlyArray<BattleZombieTarget>,
@@ -2411,6 +2557,20 @@ export class BattleBotAI {
         pose.vaultBlend = bot.netVaulting ? 1 : 0;
         pose.vaultProgress = bot.netVaultProgress;
         pose.vaultKind = 'VAULT_OVER';
+        if (bot.netHandlingAction !== 'NONE') {
+          const estRate =
+            bot.netHandlingAction === 'SUPPRESSOR_DETACH' ||
+            bot.netHandlingAction === 'SUPPRESSOR_ATTACH'
+              ? 1 / SUPPRESSOR_TOGGLE_DURATION_SEC
+              : bot.netHandlingAction === 'RELOAD'
+                ? 1 / 2.25
+                : bot.netHandlingAction === 'BOLT'
+                  ? 1 / 0.72
+                  : 1 / 0.36;
+          bot.netHandlingProgress = Math.min(1, bot.netHandlingProgress + dt * estRate * 0.75);
+        }
+        pose.handlingAction = bot.netHandlingAction;
+        pose.handlingProgress = bot.netHandlingProgress;
 
         bot.bodyPivot.rotation.set(0, 0, 0);
         bot.bodyPivot.position.set(0, 0, 0);
@@ -2474,8 +2634,35 @@ export class BattleBotAI {
       if (bot.unstuckBoostTimer > 0) bot.unstuckBoostTimer = Math.max(0, bot.unstuckBoostTimer - dt);
       if (bot.commsCooldown > 0) bot.commsCooldown = Math.max(0, bot.commsCooldown - dt);
       if (bot.meleeCooldown > 0) bot.meleeCooldown = Math.max(0, bot.meleeCooldown - dt);
+      if (bot.suppToggleCooldown > 0) bot.suppToggleCooldown = Math.max(0, bot.suppToggleCooldown - dt);
       if (bot.hp > bot.maxHp * 0.65) bot.lowHpCalledOut = false;
       bot.recoilKick = Math.max(0, bot.recoilKick - dt * 7.2);
+
+      // Step active weapon handling action (suppressor detach/attach, pump cycle, bolt cycle)
+      if (bot.handlingAction !== 'NONE') {
+        bot.handlingTimer += dt;
+        const isSuppAction =
+          bot.handlingAction === 'SUPPRESSOR_DETACH' ||
+          bot.handlingAction === 'SUPPRESSOR_ATTACH';
+        if (isSuppAction && (bot.vaultActive || bot.stunTimer > 0)) {
+          // Emergency cancel on vault or stun -> restore pre-action mounted/stowed state cleanly
+          bot.handlingAction = 'NONE';
+          bot.handlingTimer = 0;
+          bot.handlingDuration = 0;
+          bot.rig.setSuppressedVisual(bot.suppressed);
+          bot.suppToggleCooldown = 6.0;
+        } else if (bot.handlingTimer >= Math.max(0.05, bot.handlingDuration)) {
+          if (isSuppAction) {
+            bot.suppressed = bot.pendingSuppressorAttach;
+            bot.attachments = { ...bot.attachments, suppressorStowed: !bot.suppressed };
+            bot.rig.setWeaponLoadout(bot.weaponId, bot.attachments);
+            bot.rig.setSuppressedVisual(bot.suppressed);
+          }
+          bot.handlingAction = 'NONE';
+          bot.handlingTimer = 0;
+          bot.handlingDuration = 0;
+        }
+      }
 
       // Timed tactical reload step
       if (bot.reloadTimer > 0) {
@@ -2527,6 +2714,8 @@ export class BattleBotAI {
         pose.vaultBlend = Math.sin(t * Math.PI);
         pose.vaultProgress = t;
         pose.vaultKind = bot.vaultKind;
+        pose.handlingAction = 'NONE';
+        pose.handlingProgress = 0;
 
         bot.bodyPivot.rotation.set(0, 0, 0);
         bot.bodyPivot.position.set(0, 0, 0);
@@ -2766,14 +2955,31 @@ export class BattleBotAI {
         moveX = (strafeX * 0.72 + nx * radial) * moveSpeed * 0.68;
         moveZ = (strafeZ * 0.72 + nz * radial) * moveSpeed * 0.68;
 
-        // 3. Burst-Fire Engagement (Weapon-spec accurate, finite ammo + reloads + melee fallback in Infection)
+        // 3. Burst-Fire Engagement (Weapon-spec accurate, finite ammo + reloads + handling locks + melee fallback)
         const activeSpec = this.getWeaponSpec(bot.weaponId);
+        const isSuppBusy =
+          bot.handlingAction === 'SUPPRESSOR_DETACH' ||
+          bot.handlingAction === 'SUPPRESSOR_ATTACH';
+        // Emergency close-quarters cancel if enemy rushes inside 9.5m while threading suppressor
+        if (isSuppBusy && horizDist < 9.5) {
+          bot.handlingAction = 'NONE';
+          bot.handlingTimer = 0;
+          bot.handlingDuration = 0;
+          bot.rig.setSuppressedVisual(bot.suppressed);
+          bot.suppToggleCooldown = 6.5;
+        }
+        const isHandlingLocked =
+          bot.handlingAction === 'SUPPRESSOR_DETACH' ||
+          bot.handlingAction === 'SUPPRESSOR_ATTACH' ||
+          bot.handlingAction === 'PUMP' ||
+          bot.handlingAction === 'BOLT';
+
         if (bot.stunTimer > 0) {
           bot.stunTimer = Math.max(0, bot.stunTimer - dt);
           bot.burstShotsLeft = 0;
           moveX *= 0.25;
           moveZ *= 0.25;
-        } else if (bot.reloadTimer > 0) {
+        } else if (bot.reloadTimer > 0 || isHandlingLocked) {
           bot.burstShotsLeft = 0;
         } else if (bot.reactionTimer > 0) {
           bot.reactionTimer -= dt;
@@ -2851,6 +3057,17 @@ export class BattleBotAI {
                   onBotFire,
                   onHitZombie,
                 );
+                // Trigger realistic post-shot pump or bolt cycle for manual-action firearms
+                const firedProf = resolveWeaponProfile(bot.weaponId);
+                if (firedProf.category === 'shotguns' && firedProf.fireMode === 'pump') {
+                  bot.handlingAction = 'PUMP';
+                  bot.handlingTimer = 0;
+                  bot.handlingDuration = 0.34;
+                } else if (firedProf.fireMode === 'bolt') {
+                  bot.handlingAction = 'BOLT';
+                  bot.handlingTimer = 0;
+                  bot.handlingDuration = 0.72;
+                }
               }
             }
           }
@@ -2858,6 +3075,22 @@ export class BattleBotAI {
       } else {
         if (bot.stunTimer > 0) {
           bot.stunTimer = Math.max(0, bot.stunTimer - dt);
+        }
+        // Tactical suppressor field toggle when out of direct line-of-sight
+        if (
+          bot.ownsSuppressor &&
+          bot.suppToggleCooldown <= 0 &&
+          bot.reloadTimer <= 0 &&
+          bot.handlingAction === 'NONE' &&
+          !bot.vaultActive &&
+          bot.stunTimer <= 0
+        ) {
+          bot.suppToggleCooldown = 22 + Math.random() * 18;
+          const shouldAttach = !bot.suppressed;
+          bot.pendingSuppressorAttach = shouldAttach;
+          bot.handlingAction = shouldAttach ? 'SUPPRESSOR_ATTACH' : 'SUPPRESSOR_DETACH';
+          bot.handlingTimer = 0;
+          bot.handlingDuration = SUPPRESSOR_TOGGLE_DURATION_SEC;
         }
         if (bot.smokeAlertTimer > 0) {
           bot.smokeAlertTimer = Math.max(0, bot.smokeAlertTimer - dt);
@@ -3223,6 +3456,20 @@ export class BattleBotAI {
       pose.vaultBlend = 0;
       pose.vaultProgress = 0;
       pose.vaultKind = 'VAULT_OVER';
+      if (bot.handlingAction !== 'NONE' && bot.handlingDuration > 0) {
+        pose.handlingAction = bot.handlingAction;
+        pose.handlingProgress = THREE.MathUtils.clamp(bot.handlingTimer / bot.handlingDuration, 0, 1);
+      } else if (bot.reloadTimer > 0) {
+        pose.handlingAction = 'RELOAD';
+        pose.handlingProgress = THREE.MathUtils.clamp(
+          1 - bot.reloadTimer / Math.max(0.2, bot.reloadDuration),
+          0,
+          1,
+        );
+      } else {
+        pose.handlingAction = 'NONE';
+        pose.handlingProgress = 0;
+      }
 
       bot.bodyPivot.rotation.set(0, 0, 0);
       bot.bodyPivot.position.set(0, 0, 0);
@@ -3282,11 +3529,16 @@ export class BattleBotAI {
     targetHuman: BattleHumanTarget | null,
     targetZombie: BattleZombieTarget | null,
     onDamagePlayer: (ev: BotPlayerDamageEvent) => void,
-    onBotFire?: (botId: string, origin: Readonly<THREE.Vector3>, end: Readonly<THREE.Vector3>) => void,
+    onBotFire?: (
+      botId: string,
+      origin: Readonly<THREE.Vector3>,
+      end: Readonly<THREE.Vector3>,
+      meta?: { weaponId: string; caliberId: string; suppressed: boolean },
+    ) => void,
     onHitZombie?: (ev: BotZombieHitEvent) => void,
   ): void {
-    shooter.muzzleFlash.visible = true;
-    shooter.muzzleFlashTimer = 0.055;
+    shooter.muzzleFlash.visible = !shooter.suppressed;
+    shooter.muzzleFlashTimer = shooter.suppressed ? 0.025 : 0.055;
     shooter.firingVisualTimer = 0.16;
     shooter.recoilKick = Math.min(1, shooter.recoilKick + 0.85);
     shooter.muzzleFlash.getWorldPosition(this._tmpMuzzle);
@@ -3304,13 +3556,17 @@ export class BattleBotAI {
 
     const endPos = this._tmpOrigin.copy(this._tmpMuzzle).addScaledVector(this._tmpDir, Math.min(dist + 4, 48));
     this.spawnTracer(this._tmpMuzzle, endPos);
-    onBotFire?.(shooter.id, this._tmpMuzzle, endPos);
+    onBotFire?.(shooter.id, this._tmpMuzzle, endPos, {
+      weaponId: shooter.weaponId,
+      caliberId: spec.caliberId,
+      suppressed: shooter.suppressed,
+    });
 
     this.audio.playWeaponCue('fire', {
       position: this._tmpMuzzle,
       weightClass: spec.weightClass,
       caliberId: spec.caliberId,
-      suppressed: false,
+      suppressed: shooter.suppressed,
       intensity: spec.visualClass === 'pistol' ? 0.56 : 0.72,
     });
 
@@ -3360,6 +3616,9 @@ export class BattleBotAI {
   }
 
   public dispose(): void {
+    for (let i = 0; i < this.bots.length; i++) {
+      this.bots[i].rig.disposeWeapon();
+    }
     this.group.parent?.remove(this.group);
     this.rigFactory.dispose();
     for (const d of this.disposables) {

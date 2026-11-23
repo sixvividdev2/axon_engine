@@ -90,6 +90,13 @@ export class GunsmithBench {
   private readonly _pinWorld = new THREE.Vector3();
   private readonly _pinNdc = new THREE.Vector3();
   private readonly _socketCenterOffset = new THREE.Vector3();
+  private readonly _boundsBox = new THREE.Box3();
+  private readonly _boundsSize = new THREE.Vector3();
+  private readonly _boundsCenter = new THREE.Vector3();
+  private readonly _boundsSphere = new THREE.Sphere();
+  private minOrbitDist = 0.34;
+  private maxOrbitDist = 1.55;
+  private lastCameraFovDeg = 55;
 
   constructor(opts: GunsmithBenchBuildOptions) {
     this.scene = opts.scene;
@@ -463,6 +470,50 @@ export class GunsmithBench {
     return THREE.MathUtils.clamp(0.50 + profile.barrelLengthM * 0.30, 0.62, 0.92);
   }
 
+  private refitShowcaseBounds(profile: BodycamWeaponProfile): void {
+    const asm = this.showcaseAssembly;
+    if (!asm) {
+      this.targetDist = this.computeIdealOrbitDist(profile);
+      return;
+    }
+
+    // Reset offset briefly to compute clean local bounds in cradleAnchor space
+    asm.group.position.set(0, 0, 0);
+    const prevVis = asm.group.visible;
+    asm.group.visible = true;
+    this.cradleAnchor.updateMatrixWorld(true);
+
+    this._boundsBox.setFromObject(asm.group);
+    if (!this._boundsBox.isEmpty()) {
+      // Transform world box back into cradleAnchor local space for exact centering
+      const invMat = this._lookMat.copy(this.cradleAnchor.matrixWorld).invert();
+      this._boundsBox.applyMatrix4(invMat);
+      this._boundsBox.getCenter(this._boundsCenter);
+      this._boundsBox.getSize(this._boundsSize);
+      this._boundsBox.getBoundingSphere(this._boundsSphere);
+
+      // Center weapon lengthwise (Z) & laterally (X) over vise cradle, keep receiver resting cleanly above jaws
+      asm.group.position.set(
+        -this._boundsCenter.x,
+        Math.max(-0.04, Math.min(0.06, -this._boundsBox.min.y * 0.25)),
+        -this._boundsCenter.z,
+      );
+
+      // Derive FOV-aware framing distance so pistols never clip the near plane and suppressed snipers fit completely
+      const halfFovRad = THREE.MathUtils.degToRad(THREE.MathUtils.clamp(this.lastCameraFovDeg, 35, 85) * 0.5);
+      const radius = Math.max(0.11, this._boundsSphere.radius);
+      const idealDist = (radius / Math.sin(halfFovRad)) * 1.16;
+      this.minOrbitDist = THREE.MathUtils.clamp(radius * 1.48, 0.28, 0.72);
+      this.maxOrbitDist = THREE.MathUtils.clamp(radius * 4.4, 0.95, 2.20);
+      this.targetDist = THREE.MathUtils.clamp(idealDist, this.minOrbitDist * 1.12, this.maxOrbitDist * 0.85);
+    } else {
+      this.targetDist = this.computeIdealOrbitDist(profile);
+    }
+
+    asm.group.visible = prevVis;
+    this.cradleAnchor.updateMatrixWorld(true);
+  }
+
   public enter(
     camera: THREE.Camera,
     profile: BodycamWeaponProfile,
@@ -470,16 +521,18 @@ export class GunsmithBench {
   ): void {
     this._entryPos.copy(camera.position);
     this._entryQuat.copy(camera.quaternion);
+    if (camera instanceof THREE.PerspectiveCamera) {
+      this.lastCameraFovDeg = camera.fov;
+    }
 
     this.active = true;
     this.orbitYaw = 0.52;
     this.orbitPitch = 0.24;
     this.orbitYawVel = 0;
     this.orbitPitchVel = 0;
-    this.targetDist = this.computeIdealOrbitDist(profile);
-    this.orbitDist = this.targetDist;
 
     this.setShowcaseWeapon(profile, attachments);
+    this.orbitDist = this.targetDist;
     if (this.showcaseAssembly) {
       this.showcaseAssembly.group.visible = true;
     }
@@ -552,7 +605,7 @@ export class GunsmithBench {
       safeProfile.magCapacity,
       this.showcaseAttachments,
     );
-    this.cradleAnchor.updateMatrixWorld(true);
+    this.refitShowcaseBounds(safeProfile);
     return this.showcaseStats;
   }
 
@@ -587,8 +640,8 @@ export class GunsmithBench {
   public zoomWheel(deltaY: number): void {
     this.targetDist = THREE.MathUtils.clamp(
       this.targetDist + deltaY * 0.00065,
-      0.32,
-      1.45,
+      this.minOrbitDist,
+      this.maxOrbitDist,
     );
   }
 

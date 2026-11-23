@@ -16,6 +16,12 @@ import {
   WeaponModelAssembly,
   WeaponPBRMaterialLibrary,
 } from './WeaponModelFactory';
+import { buildMuzzleBoreCap } from './WeaponGeometryPrimitives';
+
+export interface WeaponAssemblerOptions {
+  /** When true (3P AI bots & remote multiplayer rigs), skips PiP/collimated shaders and uses static lensGlass. */
+  thirdPersonMode?: boolean;
+}
 
 interface MountedAttachmentCache {
   root: THREE.Group;
@@ -151,12 +157,26 @@ export class WeaponAssembler {
     assembly.zoomRingPivot = null;
     assembly.zoomRingSocket = null;
     assembly.elevationTurretMesh = null;
+    assembly.elevationTurretSocket = null;
+    assembly.illumDialMesh = null;
+    assembly.illumDialSocket = null;
     assembly.suppressor = null;
     assembly.flashlightModule = null;
     assembly.laserModule = null;
     assembly.hasFlashlightAttachment = false;
     assembly.hasLaserAttachment = false;
     assembly.foregripPose = 'none';
+
+    // Restore base hand pose profile & suppressor grip socket defaults
+    assembly.handPoseProfile.supportStyle = assembly.handPoseProfile.baseSupportStyle;
+    assembly.handPoseProfile.supportRadiusM = assembly.handPoseProfile.baseSupportRadiusM;
+    assembly.handPoseProfile.suppressorRadiusM = 0.018;
+    assembly.handPoseProfile.suppressorLengthM = 0.16;
+    assembly.suppressorGripSocket.position.set(
+      assembly.muzzleBasePos.x,
+      assembly.muzzleBasePos.y,
+      assembly.muzzleBasePos.z - 0.085,
+    );
 
     if (assembly.ironSightRearUp) assembly.ironSightRearUp.visible = true;
     if (assembly.ironSightRearFolded) assembly.ironSightRearFolded.visible = false;
@@ -187,8 +207,10 @@ export class WeaponAssembler {
     baseBarrelLengthM: number,
     baseMagCapacity: number,
     attachments?: WeaponAttachments | null,
+    options?: WeaponAssemblerOptions,
   ): DerivedWeaponStats {
     this.clearAttachments(assembly);
+    const thirdPersonMode = Boolean(options?.thirdPersonMode);
 
     const mats = getWeaponPBRMaterialLibrary();
     const geos: THREE.BufferGeometry[] = [];
@@ -448,15 +470,20 @@ export class WeaponAssembler {
         const btnMinus = btnPlus.clone();
         btnMinus.position.x = 0.0135;
 
-        const reticleMat = createParallaxCollimatedReticleMaterial({
-          mode: 'rmr_dot',
-          reticleColorHex: primaryReticleHex,
-          coatingTintHex: 0x1a6880,
-          brightness: 2.95,
-        });
-        customMats.push(reticleMat);
+        const reticleMat = thirdPersonMode
+          ? null
+          : createParallaxCollimatedReticleMaterial({
+              mode: 'rmr_dot',
+              reticleColorHex: primaryReticleHex,
+              coatingTintHex: 0x1a6880,
+              brightness: 2.95,
+            });
+        if (reticleMat) customMats.push(reticleMat);
         const reticleCenterY = rmrBaseY + 0.0142;
-        const glass = new THREE.Mesh(track(new THREE.PlaneGeometry(0.0192, 0.0144)), reticleMat);
+        const glass = new THREE.Mesh(
+          track(new THREE.PlaneGeometry(0.0192, 0.0144)),
+          reticleMat ?? mats.lensGlass,
+        );
         glass.position.set(0, reticleCenterY, -0.004);
         glass.renderOrder = 4;
 
@@ -514,17 +541,25 @@ export class WeaponAssembler {
         dial.rotation.z = Math.PI * 0.5;
         dial.position.set(0.0165, mountBaseY + 0.0068, 0.016);
 
-        const reticleMat = createParallaxCollimatedReticleMaterial({
-          mode: 'kobra_chevron',
-          reticleColorHex: resolveReticleColorHex(attachments?.reticleColor, 0xff2b1f),
-          coatingTintHex: 0x22687e,
-          brightness: 2.75,
-        });
-        customMats.push(reticleMat);
-        const glass = new THREE.Mesh(track(new THREE.CircleGeometry(0.0145, 22)), reticleMat);
+        const reticleMat = thirdPersonMode
+          ? null
+          : createParallaxCollimatedReticleMaterial({
+              mode: 'kobra_chevron',
+              reticleColorHex: resolveReticleColorHex(attachments?.reticleColor, 0xff2b1f),
+              coatingTintHex: 0x22687e,
+              brightness: 2.75,
+            });
+        if (reticleMat) customMats.push(reticleMat);
+        const glass = new THREE.Mesh(
+          track(new THREE.CircleGeometry(0.0145, 22)),
+          reticleMat ?? mats.lensGlass,
+        );
         glass.position.set(0, reticleCenterY, -0.012);
         glass.renderOrder = 4;
 
+        const kobraIllumSocket = new THREE.Object3D();
+        kobraIllumSocket.name = 'illumDialSocket';
+        kobraIllumSocket.position.set(-0.018, mountBaseY + 0.010, 0.016);
         opticMount.add(
           base,
           emitter,
@@ -535,8 +570,11 @@ export class WeaponAssembler {
           hoodTop,
           dial,
           glass,
+          kobraIllumSocket,
         );
         assembly.opticGroup = opticMount;
+        assembly.illumDialMesh = dial;
+        assembly.illumDialSocket = kobraIllumSocket;
         assembly.reticleMaterial = reticleMat;
         assembly.sightAnchor.position.set(
           opticRestPos.x,
@@ -593,15 +631,20 @@ export class WeaponAssembler {
         );
         hoodTop.position.set(0, mountBaseY + 0.043, 0.006);
 
-        const reticleMat = createParallaxCollimatedReticleMaterial({
-          mode: 'eotech_holo',
-          reticleColorHex: resolveReticleColorHex(attachments?.reticleColor, 0xff281a),
-          coatingTintHex: 0x1c5973,
-          brightness: 2.85,
-        });
-        customMats.push(reticleMat);
+        const reticleMat = thirdPersonMode
+          ? null
+          : createParallaxCollimatedReticleMaterial({
+              mode: 'eotech_holo',
+              reticleColorHex: resolveReticleColorHex(attachments?.reticleColor, 0xff281a),
+              coatingTintHex: 0x1c5973,
+              brightness: 2.85,
+            });
+        if (reticleMat) customMats.push(reticleMat);
         const reticleCenterY = mountBaseY + 0.027;
-        const glass = new THREE.Mesh(track(new THREE.PlaneGeometry(0.027, 0.025)), reticleMat);
+        const glass = new THREE.Mesh(
+          track(new THREE.PlaneGeometry(0.027, 0.025)),
+          reticleMat ?? mats.lensGlass,
+        );
         glass.position.set(0, reticleCenterY, 0.004);
         glass.renderOrder = 4;
 
@@ -612,6 +655,9 @@ export class WeaponAssembler {
         frontGlass.position.set(0, reticleCenterY, -0.019);
         frontGlass.renderOrder = 3;
 
+        const eoIllumSocket = new THREE.Object3D();
+        eoIllumSocket.name = 'illumDialSocket';
+        eoIllumSocket.position.set(-0.020, mountBaseY + 0.022, 0.020);
         opticMount.add(
           qdBase,
           qdLever,
@@ -624,8 +670,10 @@ export class WeaponAssembler {
           hoodTop,
           glass,
           frontGlass,
+          eoIllumSocket,
         );
         assembly.opticGroup = opticMount;
+        assembly.illumDialSocket = eoIllumSocket;
         assembly.reticleMaterial = reticleMat;
         assembly.sightAnchor.position.set(
           opticRestPos.x,
@@ -682,14 +730,19 @@ export class WeaponAssembler {
         );
         topCap.position.set(0, tubeCenterY + 0.0155, -0.006);
 
-        const reticleMat = createParallaxCollimatedReticleMaterial({
-          mode: 't2_dot',
-          reticleColorHex: primaryReticleHex,
-          coatingTintHex: 0x165268,
-          brightness: 2.95,
-        });
-        customMats.push(reticleMat);
-        const rearGlass = new THREE.Mesh(track(new THREE.CircleGeometry(innerR, 22)), reticleMat);
+        const reticleMat = thirdPersonMode
+          ? null
+          : createParallaxCollimatedReticleMaterial({
+              mode: 't2_dot',
+              reticleColorHex: primaryReticleHex,
+              coatingTintHex: 0x165268,
+              brightness: 2.95,
+            });
+        if (reticleMat) customMats.push(reticleMat);
+        const rearGlass = new THREE.Mesh(
+          track(new THREE.CircleGeometry(innerR, 22)),
+          reticleMat ?? mats.lensGlass,
+        );
         rearGlass.position.set(0, tubeCenterY, 0.014);
         rearGlass.renderOrder = 4;
 
@@ -697,8 +750,13 @@ export class WeaponAssembler {
         frontGlass.position.set(0, tubeCenterY, -0.025);
         frontGlass.renderOrder = 3;
 
-        opticMount.add(qdRiser, qdClamp, tubeBody, rheostat, topCap, rearGlass, frontGlass);
+        const t2IllumSocket = new THREE.Object3D();
+        t2IllumSocket.name = 'illumDialSocket';
+        t2IllumSocket.position.set(-0.016, tubeCenterY + 0.004, 0.006);
+        opticMount.add(qdRiser, qdClamp, tubeBody, rheostat, topCap, rearGlass, frontGlass, t2IllumSocket);
         assembly.opticGroup = opticMount;
+        assembly.illumDialMesh = rheostat;
+        assembly.illumDialSocket = t2IllumSocket;
         assembly.reticleMaterial = reticleMat;
         assembly.sightAnchor.position.set(
           opticRestPos.x,
@@ -762,18 +820,22 @@ export class WeaponAssembler {
         windDrum.rotation.z = Math.PI * 0.5;
         windDrum.position.set(0.020, scopeCenterY, -0.004);
 
-        const scopeMat = createScopeLensMaterial({
-          reticleMode: 'pso_prism',
-          reticleColorHex: primaryReticleHex,
-          coatingTintHex: 0x1a7254,
-        });
-        scopeMat.userData.hasIllumination = Boolean(opticDef.hasIlluminatedReticle);
-        scopeMat.uniforms.uIlluminated.value = opticDef.hasIlluminatedReticle ? 1.0 : 0.0;
-        customMats.push(scopeMat);
+        const scopeMat = thirdPersonMode
+          ? null
+          : createScopeLensMaterial({
+              reticleMode: 'pso_prism',
+              reticleColorHex: primaryReticleHex,
+              coatingTintHex: 0x1a7254,
+            });
+        if (scopeMat) {
+          scopeMat.userData.hasIllumination = Boolean(opticDef.hasIlluminatedReticle);
+          scopeMat.uniforms.uIlluminated.value = opticDef.hasIlluminatedReticle ? 1.0 : 0.0;
+          customMats.push(scopeMat);
+        }
         const ocularRadius = 0.0144;
         const reticleGlass = new THREE.Mesh(
           track(new THREE.CircleGeometry(ocularRadius, 28)),
-          scopeMat,
+          scopeMat ?? mats.lensGlass,
         );
         reticleGlass.position.set(0, scopeCenterY, 0.073);
         reticleGlass.renderOrder = 6;
@@ -785,6 +847,9 @@ export class WeaponAssembler {
         objGlass.position.set(0, scopeCenterY, -0.084);
         objGlass.renderOrder = 3;
 
+        const elevSocket = new THREE.Object3D();
+        elevSocket.name = 'elevationTurretSocket';
+        elevSocket.position.set(-0.014, scopeCenterY + 0.024, -0.004);
         opticMount.add(
           riser,
           ringF,
@@ -796,9 +861,11 @@ export class WeaponAssembler {
           windDrum,
           reticleGlass,
           objGlass,
+          elevSocket,
         );
         assembly.opticGroup = opticMount;
         assembly.elevationTurretMesh = elevDrum;
+        assembly.elevationTurretSocket = elevSocket;
         assembly.reticleMaterial = scopeMat;
         assembly.scopeLensMaterial = scopeMat;
         assembly.ocularRadiusM = ocularRadius;
@@ -943,19 +1010,23 @@ export class WeaponAssembler {
         illumDial.rotation.z = Math.PI * 0.5;
         illumDial.position.set(-0.020, scopeCenterY, -0.004);
 
-        const scopeMat = createScopeLensMaterial({
-          reticleMode: 'lpvo_mildot',
-          reticleColorHex: primaryReticleHex,
-          coatingTintHex: 0x1a5a78,
-        });
-        scopeMat.userData.hasIllumination = Boolean(opticDef.hasIlluminatedReticle);
-        scopeMat.uniforms.uIlluminated.value = opticDef.hasIlluminatedReticle ? 1.0 : 0.0;
-        customMats.push(scopeMat);
+        const scopeMat = thirdPersonMode
+          ? null
+          : createScopeLensMaterial({
+              reticleMode: 'lpvo_mildot',
+              reticleColorHex: primaryReticleHex,
+              coatingTintHex: 0x1a5a78,
+            });
+        if (scopeMat) {
+          scopeMat.userData.hasIllumination = Boolean(opticDef.hasIlluminatedReticle);
+          scopeMat.uniforms.uIlluminated.value = opticDef.hasIlluminatedReticle ? 1.0 : 0.0;
+          customMats.push(scopeMat);
+        }
         // Strictly inside ocularBell inner bore (0.0156) and cleanly separated from zoomRing (rear edge at 0.066)
         const ocularRadius = 0.0151;
         const reticleGlass = new THREE.Mesh(
           track(new THREE.CircleGeometry(ocularRadius, 32)),
-          scopeMat,
+          scopeMat ?? mats.lensGlass,
         );
         reticleGlass.position.set(0, scopeCenterY, 0.085);
         reticleGlass.renderOrder = 6;
@@ -966,6 +1037,13 @@ export class WeaponAssembler {
         );
         objGlass.position.set(0, scopeCenterY, -0.125);
         objGlass.renderOrder = 3;
+
+        const elevSocket = new THREE.Object3D();
+        elevSocket.name = 'elevationTurretSocket';
+        elevSocket.position.set(-0.015, scopeCenterY + 0.026, -0.004);
+        const illumSocket = new THREE.Object3D();
+        illumSocket.name = 'illumDialSocket';
+        illumSocket.position.set(-0.026, scopeCenterY + 0.002, -0.004);
 
         opticMount.add(
           cantileverBase,
@@ -979,11 +1057,16 @@ export class WeaponAssembler {
           illumDial,
           reticleGlass,
           objGlass,
+          elevSocket,
+          illumSocket,
         );
         assembly.opticGroup = opticMount;
         assembly.zoomRingPivot = zoomRingPivot;
         assembly.zoomRingSocket = zoomRingSocket;
         assembly.elevationTurretMesh = elevTurretGroup;
+        assembly.elevationTurretSocket = elevSocket;
+        assembly.illumDialMesh = illumDial;
+        assembly.illumDialSocket = illumSocket;
         assembly.reticleMaterial = scopeMat;
         assembly.scopeLensMaterial = scopeMat;
         assembly.ocularRadiusM = ocularRadius;
@@ -1069,18 +1152,22 @@ export class WeaponAssembler {
         );
         battCap.position.set(-0.012, scopeCenterY - 0.016, 0.028);
 
-        const scopeMat = createScopeLensMaterial({
-          reticleMode: 'pso_prism',
-          reticleColorHex: resolveReticleColorHex(attachments?.reticleColor, 0xff8c1a),
-          coatingTintHex: 0x1a7254,
-        });
-        scopeMat.userData.hasIllumination = Boolean(opticDef.hasIlluminatedReticle);
-        scopeMat.uniforms.uIlluminated.value = opticDef.hasIlluminatedReticle ? 1.0 : 0.0;
-        customMats.push(scopeMat);
+        const scopeMat = thirdPersonMode
+          ? null
+          : createScopeLensMaterial({
+              reticleMode: 'pso_prism',
+              reticleColorHex: resolveReticleColorHex(attachments?.reticleColor, 0xff8c1a),
+              coatingTintHex: 0x1a7254,
+            });
+        if (scopeMat) {
+          scopeMat.userData.hasIllumination = Boolean(opticDef.hasIlluminatedReticle);
+          scopeMat.uniforms.uIlluminated.value = opticDef.hasIlluminatedReticle ? 1.0 : 0.0;
+          customMats.push(scopeMat);
+        }
         const ocularRadius = 0.0144;
         const reticleGlass = new THREE.Mesh(
           track(new THREE.CircleGeometry(ocularRadius, 28)),
-          scopeMat,
+          scopeMat ?? mats.lensGlass,
         );
         reticleGlass.position.set(0, scopeCenterY, 0.082);
         reticleGlass.renderOrder = 6;
@@ -1092,6 +1179,13 @@ export class WeaponAssembler {
         objGlass.position.set(0, scopeCenterY, -0.104);
         objGlass.renderOrder = 3;
 
+        const elevSocket = new THREE.Object3D();
+        elevSocket.name = 'elevationTurretSocket';
+        elevSocket.position.set(-0.014, scopeCenterY + 0.024, -0.008);
+        const illumSocket = new THREE.Object3D();
+        illumSocket.name = 'illumDialSocket';
+        illumSocket.position.set(-0.020, scopeCenterY - 0.015, 0.028);
+
         opticMount.add(
           riser,
           scopeBody,
@@ -1102,9 +1196,14 @@ export class WeaponAssembler {
           battCap,
           reticleGlass,
           objGlass,
+          elevSocket,
+          illumSocket,
         );
         assembly.opticGroup = opticMount;
         assembly.elevationTurretMesh = elevDrumGroup;
+        assembly.elevationTurretSocket = elevSocket;
+        assembly.illumDialMesh = battCap;
+        assembly.illumDialSocket = illumSocket;
         assembly.reticleMaterial = scopeMat;
         assembly.scopeLensMaterial = scopeMat;
         assembly.ocularRadiusM = ocularRadius;
@@ -1210,18 +1309,22 @@ export class WeaponAssembler {
         zoomRingSocket.position.set(-0.025, 0.022, 0.004);
         zoomRingPivot.add(zoomRing, atacrLever, zoomRingSocket);
 
-        const scopeMat = createScopeLensMaterial({
-          reticleMode: 'sniper_mildot',
-          reticleColorHex: primaryReticleHex,
-          coatingTintHex: 0x164a78,
-        });
-        scopeMat.userData.hasIllumination = Boolean(opticDef.hasIlluminatedReticle);
-        scopeMat.uniforms.uIlluminated.value = opticDef.hasIlluminatedReticle ? 1.0 : 0.0;
-        customMats.push(scopeMat);
+        const scopeMat = thirdPersonMode
+          ? null
+          : createScopeLensMaterial({
+              reticleMode: 'sniper_mildot',
+              reticleColorHex: primaryReticleHex,
+              coatingTintHex: 0x164a78,
+            });
+        if (scopeMat) {
+          scopeMat.userData.hasIllumination = Boolean(opticDef.hasIlluminatedReticle);
+          scopeMat.uniforms.uIlluminated.value = opticDef.hasIlluminatedReticle ? 1.0 : 0.0;
+          customMats.push(scopeMat);
+        }
         const ocularRadius = 0.0171;
         const reticleGlass = new THREE.Mesh(
           track(new THREE.CircleGeometry(ocularRadius, 32)),
-          scopeMat,
+          scopeMat ?? mats.lensGlass,
         );
         reticleGlass.position.set(0, scopeCenterY, 0.094);
         reticleGlass.renderOrder = 6;
@@ -1233,6 +1336,13 @@ export class WeaponAssembler {
         objGlass.position.set(0, scopeCenterY, -0.205);
         objGlass.renderOrder = 3;
 
+        const elevSocket = new THREE.Object3D();
+        elevSocket.name = 'elevationTurretSocket';
+        elevSocket.position.set(-0.018, scopeCenterY + 0.032, -0.016);
+        const illumSocket = new THREE.Object3D();
+        illumSocket.name = 'illumDialSocket';
+        illumSocket.position.set(-0.032, scopeCenterY + 0.002, -0.016);
+
         opticMount.add(
           mountBase,
           mainTube,
@@ -1243,11 +1353,16 @@ export class WeaponAssembler {
           zoomRingPivot,
           reticleGlass,
           objGlass,
+          elevSocket,
+          illumSocket,
         );
         assembly.opticGroup = opticMount;
         assembly.zoomRingPivot = zoomRingPivot;
         assembly.zoomRingSocket = zoomRingSocket;
         assembly.elevationTurretMesh = elevTurretGroup;
+        assembly.elevationTurretSocket = elevSocket;
+        assembly.illumDialMesh = parallaxTurret;
+        assembly.illumDialSocket = illumSocket;
         assembly.reticleMaterial = scopeMat;
         assembly.scopeLensMaterial = scopeMat;
         assembly.ocularRadiusM = ocularRadius;
@@ -1330,7 +1445,7 @@ export class WeaponAssembler {
 
       let localReticleY = 0.040;
       let localReticleZ = 0.005;
-      let cantReticleMat: THREE.ShaderMaterial;
+      let cantReticleMat: THREE.ShaderMaterial | null = null;
 
       if (cantDef.id === 'canted_eotech_holo') {
         const qd = new THREE.Mesh(
@@ -1379,17 +1494,19 @@ export class WeaponAssembler {
         );
         hTop.position.set(0, localReticleY + 0.013, 0.005);
 
-        cantReticleMat = createParallaxCollimatedReticleMaterial({
-          mode: 'eotech_holo',
-          reticleColorHex: resolveReticleColorHex(attachments?.cantedReticleColor, 0xff281a),
-          coatingTintHex: 0x1c5973,
-          brightness: 2.85,
-        });
-        customMats.push(cantReticleMat);
+        cantReticleMat = thirdPersonMode
+          ? null
+          : createParallaxCollimatedReticleMaterial({
+              mode: 'eotech_holo',
+              reticleColorHex: resolveReticleColorHex(attachments?.cantedReticleColor, 0xff281a),
+              coatingTintHex: 0x1c5973,
+              brightness: 2.85,
+            });
+        if (cantReticleMat) customMats.push(cantReticleMat);
 
         const glass = new THREE.Mesh(
           track(new THREE.PlaneGeometry(0.022, 0.020)),
-          cantReticleMat,
+          cantReticleMat ?? mats.lensGlass,
         );
         glass.position.set(0, localReticleY, localReticleZ);
         glass.renderOrder = 4;
@@ -1448,17 +1565,19 @@ export class WeaponAssembler {
         );
         hTop.position.set(0, localReticleY + 0.0125, -0.008);
 
-        cantReticleMat = createParallaxCollimatedReticleMaterial({
-          mode: 'kobra_chevron',
-          reticleColorHex: resolveReticleColorHex(attachments?.cantedReticleColor, 0xff2b1f),
-          coatingTintHex: 0x22687e,
-          brightness: 2.75,
-        });
-        customMats.push(cantReticleMat);
+        cantReticleMat = thirdPersonMode
+          ? null
+          : createParallaxCollimatedReticleMaterial({
+              mode: 'kobra_chevron',
+              reticleColorHex: resolveReticleColorHex(attachments?.cantedReticleColor, 0xff2b1f),
+              coatingTintHex: 0x22687e,
+              brightness: 2.75,
+            });
+        if (cantReticleMat) customMats.push(cantReticleMat);
 
         const glass = new THREE.Mesh(
           track(new THREE.CircleGeometry(0.0115, 20)),
-          cantReticleMat,
+          cantReticleMat ?? mats.lensGlass,
         );
         glass.position.set(0, localReticleY, localReticleZ);
         glass.renderOrder = 4;
@@ -1502,19 +1621,21 @@ export class WeaponAssembler {
         dial.rotation.z = Math.PI * 0.5;
         dial.position.set(0.0148, tubeY - 0.001, 0.004);
 
-        cantReticleMat = createParallaxCollimatedReticleMaterial({
-          mode: 't2_dot',
-          reticleColorHex: cantedReticleHex,
-          coatingTintHex: 0x165268,
-          brightness: 2.95,
-        });
-        customMats.push(cantReticleMat);
+        cantReticleMat = thirdPersonMode
+          ? null
+          : createParallaxCollimatedReticleMaterial({
+              mode: 't2_dot',
+              reticleColorHex: cantedReticleHex,
+              coatingTintHex: 0x165268,
+              brightness: 2.95,
+            });
+        if (cantReticleMat) customMats.push(cantReticleMat);
         localReticleY = tubeY;
         localReticleZ = 0.010;
 
         const rearGlass = new THREE.Mesh(
           track(new THREE.CircleGeometry(innerR, 20)),
-          cantReticleMat,
+          cantReticleMat ?? mats.lensGlass,
         );
         rearGlass.position.set(0, tubeY, localReticleZ);
         rearGlass.renderOrder = 4;
@@ -1559,6 +1680,9 @@ export class WeaponAssembler {
       assembly.muzzleMountSocket.add(mGroup);
       mountedGroups.push(mGroup);
 
+      let suppRadiusM = 0.018;
+      let suppLengthM = muzzleDef.extraLengthM ?? 0.16;
+      let suppGripMidZ = -0.095;
       if (muzzleDef.id === 'muzzle_pbs4_545') {
         const rearLock = new THREE.Mesh(
           track(new THREE.CylinderGeometry(0.014, 0.0155, 0.028, 12)),
@@ -1584,8 +1708,13 @@ export class WeaponAssembler {
         );
         endCap.rotation.x = Math.PI * 0.5;
         endCap.position.z = -0.178;
-        mGroup.add(rearLock, coneChamber, mainCan, endCap);
+        const boreCap = buildMuzzleBoreCap(track, mats, 0.0185, 0.0056, 0, mats.anodized);
+        boreCap.position.z = -0.1842;
+        mGroup.add(rearLock, coneChamber, mainCan, endCap, boreCap);
         assembly.suppressor = mGroup;
+        suppRadiusM = 0.0205;
+        suppLengthM = 0.184;
+        suppGripMidZ = -0.112;
       } else if (muzzleDef.id === 'muzzle_338_suppressor') {
         const rearLock = new THREE.Mesh(
           track(new THREE.CylinderGeometry(0.017, 0.0185, 0.032, 14)),
@@ -1605,8 +1734,13 @@ export class WeaponAssembler {
         );
         endCap.rotation.x = Math.PI * 0.5;
         endCap.position.z = -0.214;
-        mGroup.add(rearLock, mainCan, endCap);
+        const boreCap = buildMuzzleBoreCap(track, mats, 0.0195, 0.0068, 0, mats.anodized);
+        boreCap.position.z = -0.2212;
+        mGroup.add(rearLock, mainCan, endCap, boreCap);
         assembly.suppressor = mGroup;
+        suppRadiusM = 0.0225;
+        suppLengthM = 0.221;
+        suppGripMidZ = -0.118;
       } else if (muzzleDef.id === 'muzzle_9mm_suppressor') {
         const piston = new THREE.Mesh(
           track(new THREE.CylinderGeometry(0.0155, 0.0155, 0.022, 12)),
@@ -1626,8 +1760,13 @@ export class WeaponAssembler {
         );
         endCap.rotation.x = Math.PI * 0.5;
         endCap.position.z = -0.154;
-        mGroup.add(piston, can, endCap);
+        const boreCap = buildMuzzleBoreCap(track, mats, 0.0142, 0.0054, 0, mats.gunmetal);
+        boreCap.position.z = -0.1592;
+        mGroup.add(piston, can, endCap, boreCap);
         assembly.suppressor = mGroup;
+        suppRadiusM = 0.0152;
+        suppLengthM = 0.159;
+        suppGripMidZ = -0.086;
       } else if (muzzleDef.id === 'muzzle_nagant_bramit') {
         const collar = new THREE.Mesh(
           track(new THREE.CylinderGeometry(0.013, 0.014, 0.028, 12)),
@@ -1641,8 +1780,13 @@ export class WeaponAssembler {
         );
         tube.rotation.x = Math.PI * 0.5;
         tube.position.z = -0.084;
-        mGroup.add(collar, tube);
+        const boreCap = buildMuzzleBoreCap(track, mats, 0.0145, 0.0048, 0, mats.gunmetal);
+        boreCap.position.z = -0.1422;
+        mGroup.add(collar, tube, boreCap);
         assembly.suppressor = mGroup;
+        suppRadiusM = 0.0145;
+        suppLengthM = 0.142;
+        suppGripMidZ = -0.082;
       } else if (muzzleDef.id === 'muzzle_salvo_12ga') {
         // Distinctive Rectangular Multi-Rod Baffled Salvo 12 Shotgun Suppressor
         const choke = new THREE.Mesh(
@@ -1661,8 +1805,13 @@ export class WeaponAssembler {
           mats.gunmetal,
         );
         topRib.position.set(0, 0.018, -0.112);
-        mGroup.add(choke, rectBody, topRib);
+        const boreCap = buildMuzzleBoreCap(track, mats, 0.016, 0.0094, 0, mats.anodized);
+        boreCap.position.z = -0.2042;
+        mGroup.add(choke, rectBody, topRib, boreCap);
         assembly.suppressor = mGroup;
+        suppRadiusM = 0.024;
+        suppLengthM = 0.204;
+        suppGripMidZ = -0.112;
       } else if (muzzleDef.id === 'muzzle_comp_ak') {
         // DTK-2 multi-baffle slotted AK/Rifle muzzle brake
         const collar = new THREE.Mesh(
@@ -1687,7 +1836,23 @@ export class WeaponAssembler {
           mats.gunmetal,
         );
         baffle2.position.z = -0.050;
-        mGroup.add(collar, baffle1, bridge, baffle2);
+        const boreCap = buildMuzzleBoreCap(track, mats, 0.011, 0.0052, 0, mats.gunmetal);
+        boreCap.position.z = -0.0582;
+        mGroup.add(collar, baffle1, bridge, baffle2, boreCap);
+      }
+
+      if (muzzleDef.isSuppressor) {
+        const muzzleRestPos = getSocketRestPosInAssemblyGroup(
+          assembly,
+          assembly.muzzleMountSocket,
+        );
+        assembly.suppressorGripSocket.position.set(
+          muzzleRestPos.x,
+          muzzleRestPos.y,
+          muzzleRestPos.z - convExtraLenM + suppGripMidZ,
+        );
+        assembly.handPoseProfile.suppressorRadiusM = suppRadiusM;
+        assembly.handPoseProfile.suppressorLengthM = suppLengthM;
       }
 
       if (muzzleDef.isSuppressor && attachments?.suppressorStowed) {
@@ -1890,6 +2055,27 @@ export class WeaponAssembler {
           tacRestPos.z - 0.075,
         );
       }
+
+      // Position pressurePadSocket for snappy support-thumb tap animation (WML paddle on pistols, top/left tape switch on rifles)
+      if (isPistolStyle) {
+        assembly.pressurePadSocket.position.set(
+          tacRestPos.x - 0.015,
+          tacRestPos.y - 0.002,
+          tacRestPos.z + 0.026,
+        );
+      } else {
+        const tapePad = new THREE.Mesh(
+          track(new THREE.BoxGeometry(0.014, 0.004, 0.036)),
+          mats.wornPolymer,
+        );
+        tapePad.position.set(isShotgunStyle ? 0.0 : -0.022, 0.016, 0.034);
+        tacGroup.add(tapePad);
+        assembly.pressurePadSocket.position.set(
+          tacRestPos.x + (isShotgunStyle ? -0.010 : -0.024),
+          tacRestPos.y + 0.018,
+          tacRestPos.z + 0.034,
+        );
+      }
     }
 
     // -------------------------------------------------------------------------
@@ -1953,6 +2139,13 @@ export class WeaponAssembler {
       }
 
       assembly.foregripPose = (gripDef.foregripPose ?? 'none') as ForegripPoseStyle;
+      if (gripDef.id === 'grip_vertical_rk') {
+        assembly.handPoseProfile.supportStyle = 'vertical_grip';
+        assembly.handPoseProfile.supportRadiusM = 0.0155;
+      } else if (gripDef.id === 'grip_angled_afg') {
+        assembly.handPoseProfile.supportStyle = 'angled_grip';
+        assembly.handPoseProfile.supportRadiusM = 0.019;
+      }
       if (assembly.hasLeftHandSocket) {
         const off = gripDef.leftHandSocketOffset ?? [0, 0, 0];
         const rOff = gripDef.leftHandRotOffset ?? [0, 0, 0];

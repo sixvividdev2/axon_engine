@@ -1873,6 +1873,35 @@ export class GameEngine {
     this.emitSnapshot(true);
   }
 
+  public toggleFieldSuppressor(): void {
+    if (
+      this.mode !== 'playing' ||
+      this.controller.isVaulting() ||
+      this.reloadTimerSec > 0 ||
+      this.equippedWeaponId === 'unarmed'
+    ) {
+      return;
+    }
+    const ws = this.getCurrentWeaponState();
+    const weaponId = this.equippedWeaponId;
+    const res = this.weaponRig.triggerFieldSuppressorToggle((nowAttached) => {
+      if (this.equippedWeaponId !== weaponId) return;
+      if (!ws.attachments) ws.attachments = {};
+      ws.attachments.suppressorStowed = nowAttached ? undefined : true;
+      this.showToast(nowAttached ? 'Suppressor Attached' : 'Suppressor Stowed');
+      this.emitSnapshot(true);
+    });
+    if (res === 'no_suppressor') {
+      this.showToast('No Suppressor Equipped');
+      return;
+    }
+    if (res === 'busy') return;
+    this.firingHeld = false;
+    this.input.ads = false;
+    this.showToast(res === 'started_attach' ? 'Attaching Suppressor...' : 'Stowing Suppressor...');
+    this.emitSnapshot(true);
+  }
+
   private dropItemAtFeet(item: InventoryItemInstance): void {
     this.controller.getWorldLookDirection(this._tmpLook);
     this.world.dropItemAt(
@@ -2033,7 +2062,13 @@ export class GameEngine {
     if (this.mode !== 'playing' || !this.pointerLocked) return;
     if (this.controller.isVaulting()) return;
     if (this.equippedWeaponId === 'unarmed') return;
-    if (this.reloadTimerSec > 0 || this.fireCooldownSec > 0) return;
+    if (
+      this.reloadTimerSec > 0 ||
+      this.fireCooldownSec > 0 ||
+      this.weaponRig.isBlockingFiringAction()
+    ) {
+      return;
+    }
     if (this.characterAnimator.getActiveAction() === 'MELEE_SWING' || this.characterAnimator.isCombatBusy()) return;
 
     const wSpec = WEAPONS[this.equippedWeaponId];
@@ -2070,7 +2105,9 @@ export class GameEngine {
 
     const remainingRounds = (ws.chambered ? 1 : 0) + (ws.loadedMag ? getMagRoundCount(ws.loadedMag) : 0);
     const derived = this.weaponRig.getDerivedStats();
-    const suppressed = Boolean(ws.suppressorAttachedId) || derived.isSuppressed;
+    const suppressed =
+      derived.isSuppressed ||
+      (Boolean(ws.suppressorAttachedId) && !ws.attachments?.suppressorStowed);
     const caliber = CALIBERS[firedCaliber];
     this.fireCooldownSec = 60 / Math.max(60, wSpec.rpm);
     this.characterAnimator.interruptInspect();
@@ -2920,10 +2957,12 @@ export class GameEngine {
           } else if (e.altKey || this.altHeld) {
             e.preventDefault();
             const mode = this.weaponRig.cycleLaserMode();
+            this.weaponRig.triggerTacticalSwitch();
             this.audio.playTacticalSwitchClick(true);
             this.showToast(mode === 'red' ? 'Rail Laser: Visible Red' : 'Rail Laser: IR Green');
           } else {
             const on = this.weaponRig.toggleLaser();
+            this.weaponRig.triggerTacticalSwitch();
             this.audio.playTacticalSwitchClick(on);
             this.showToast(on ? 'Rail Laser ON' : 'Rail Laser OFF');
           }
@@ -2943,6 +2982,9 @@ export class GameEngine {
       case 'KeyR':
         if (!e.repeat) this.startReload();
         break;
+      case 'KeyG':
+        if (!e.repeat) this.toggleFieldSuppressor();
+        break;
       case 'KeyI':
         if (!e.repeat) this.performWeaponInspect();
         break;
@@ -2956,11 +2998,13 @@ export class GameEngine {
           } else if (this.battery <= 0.001) {
             this.flashlightOn = false;
             this.weaponRig.flashlight.visible = false;
+            this.weaponRig.triggerTacticalSwitch();
             this.audio.playFlashlightClick();
             this.showToast('Battery dead — swap AA/CR123A in Tab');
           } else {
             this.flashlightOn = !this.flashlightOn;
             this.weaponRig.flashlight.visible = this.flashlightOn;
+            this.weaponRig.triggerTacticalSwitch();
             this.audio.playFlashlightClick();
             this.emitSnapshot(true);
           }
@@ -2980,7 +3024,7 @@ export class GameEngine {
         }
         break;
       case 'BracketRight':
-        if (!e.repeat && this.controller.isAds && this.weaponRig.hasVariableZoom()) {
+        if (!e.repeat && !this.controller.isSprinting && this.weaponRig.hasVariableZoom()) {
           const prev = this.weaponRig.getActiveOpticZoomMult();
           const next = this.weaponRig.cycleOpticZoom(1);
           if (Math.abs(next - prev) >= 0.01) {
@@ -2990,7 +3034,7 @@ export class GameEngine {
         }
         break;
       case 'BracketLeft':
-        if (!e.repeat && this.controller.isAds && this.weaponRig.hasVariableZoom()) {
+        if (!e.repeat && !this.controller.isSprinting && this.weaponRig.hasVariableZoom()) {
           const prev = this.weaponRig.getActiveOpticZoomMult();
           const next = this.weaponRig.cycleOpticZoom(-1);
           if (Math.abs(next - prev) >= 0.01) {
@@ -3172,7 +3216,7 @@ export class GameEngine {
       this.mode === 'playing' &&
       this.pointerLocked &&
       !this.tunerOpen &&
-      this.controller.isAds &&
+      !this.controller.isSprinting &&
       this.weaponRig.hasVariableZoom()
     ) {
       e.preventDefault();

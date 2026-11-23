@@ -1,4 +1,5 @@
 import { OperatorId } from '../bodycam-sdk/operator/OperatorTypes';
+import { WeaponAttachments } from './attachments';
 import {
   isValidLobbyKillfeedPolicy,
   LobbyKillfeedPolicy,
@@ -324,6 +325,80 @@ export function formatLobbyModeLabel(mode: LobbyModeId, battleRule: BattleRuleId
 export type OperatorUniformId = 'team_a' | 'team_b' | 'ffa' | 'infection';
 export type SyncedAimStance = 'HIP' | 'ADS' | 'POINT_AIM' | 'CANTED_ADS';
 
+export type SyncedHandlingAction =
+  | 'NONE'
+  | 'RELOAD'
+  | 'PUMP'
+  | 'BOLT'
+  | 'SUPPRESSOR_DETACH'
+  | 'SUPPRESSOR_ATTACH'
+  | 'ZOOM_TWIST'
+  | 'TURRET'
+  | 'ILLUM'
+  | 'SELECTOR'
+  | 'LIGHT_PAD'
+  | 'MAG_CHECK'
+  | 'INSPECT';
+
+export const VALID_SYNCED_HANDLING_ACTIONS: ReadonlySet<SyncedHandlingAction> = new Set([
+  'NONE',
+  'RELOAD',
+  'PUMP',
+  'BOLT',
+  'SUPPRESSOR_DETACH',
+  'SUPPRESSOR_ATTACH',
+  'ZOOM_TWIST',
+  'TURRET',
+  'ILLUM',
+  'SELECTOR',
+  'LIGHT_PAD',
+  'MAG_CHECK',
+  'INSPECT',
+]);
+
+export interface SyncedWeaponAttachments {
+  o?: string | null;
+  m?: string | null;
+  ss?: boolean;
+  u?: string | null;
+  g?: string | null;
+  r?: string | null;
+  c?: string | null;
+  mag?: string | null;
+}
+
+export function packSyncedWeaponAttachments(
+  att?: Readonly<WeaponAttachments> | null,
+): SyncedWeaponAttachments {
+  const out: SyncedWeaponAttachments = {};
+  if (!att) return out;
+  if (att.optic) out.o = att.optic;
+  if (att.muzzle) out.m = att.muzzle;
+  if (att.suppressorStowed) out.ss = true;
+  if (att.tactical) out.u = att.tactical;
+  if (att.foregrip) out.g = att.foregrip;
+  if (att.railAdapter) out.r = att.railAdapter;
+  if (att.canted) out.c = att.canted;
+  if (att.magazine) out.mag = att.magazine;
+  return out;
+}
+
+export function unpackSyncedWeaponAttachments(
+  packed?: Readonly<SyncedWeaponAttachments> | null,
+): WeaponAttachments {
+  if (!packed) return {};
+  return {
+    optic: packed.o ?? null,
+    muzzle: packed.m ?? null,
+    suppressorStowed: packed.ss ? true : undefined,
+    tactical: packed.u ?? null,
+    foregrip: packed.g ?? null,
+    railAdapter: packed.r ?? null,
+    canted: packed.c ?? null,
+    magazine: packed.mag ?? null,
+  };
+}
+
 export function resolveOperatorUniformId(
   mode: 'battle' | 'infection',
   team: 'A' | 'B' | 'FFA',
@@ -366,6 +441,10 @@ export interface GamePlayerStatePacket {
   nvgFlipped?: boolean;
   lean: number; // -1..1
   weaponId: string;
+  att?: SyncedWeaponAttachments;
+  ha?: SyncedHandlingAction;
+  hprog?: number; // 0..1 normalized handling animation progress
+  sup?: boolean;
   hp: number;
   maxHp: number;
   alive: boolean;
@@ -465,6 +544,10 @@ export interface SyncedBotState {
   weaponId?: string;
   weaponLabel?: string;
   weaponClass?: BotWeaponVisualClass;
+  att?: SyncedWeaponAttachments;
+  ha?: SyncedHandlingAction;
+  hprog?: number; // 0..1 normalized handling animation progress
+  sup?: boolean;
   points?: number;
   reloading?: boolean;
   x: number;
@@ -498,6 +581,9 @@ export interface GameBotFirePacket {
   senderUserId?: string;
   senderIsHost?: boolean;
   botId: string;
+  weaponId?: string;
+  caliberId?: string;
+  sup?: boolean;
   ox: number;
   oy: number;
   oz: number;
