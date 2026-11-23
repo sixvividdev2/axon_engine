@@ -1,6 +1,7 @@
 import React from 'react';
 import {
   Crosshair,
+  Laptop,
   Shield,
   Sliders,
   User,
@@ -17,6 +18,7 @@ import {
   useGraphicsQuality,
 } from '../data/graphicsQuality';
 import { HubTabId } from '../ui/MainMenuHub';
+import { OpsLaptopTabId } from './HideoutOpsLaptopModal';
 import { HideoutSnapshot } from './HideoutSessionController';
 
 interface HideoutHudProps {
@@ -25,6 +27,7 @@ interface HideoutHudProps {
   onRequestLock: () => void;
   onOpenGunsmith: () => void;
   onOpenOperatorGear: () => void;
+  onOpenOpsLaptop: (tab?: OpsLaptopTabId) => void;
   onVolumeChange: (volume: number) => void;
   onGraphicsChange: (quality: GraphicsQualityId) => void;
   onOpenClassicHub: (tab: HubTabId) => void;
@@ -42,6 +45,7 @@ export const HideoutHud: React.FC<HideoutHudProps> = ({
   onRequestLock,
   onOpenGunsmith,
   onOpenOperatorGear,
+  onOpenOpsLaptop,
   onVolumeChange,
   onGraphicsChange,
   onOpenClassicHub,
@@ -467,50 +471,67 @@ export const HideoutHud: React.FC<HideoutHudProps> = ({
             {/* Hideout Stations */}
             <div className="mt-5 space-y-2">
               <div className="text-xs font-medium text-neutral-400">Hideout Stations</div>
-              <div className="grid grid-cols-2 gap-2">
+              <div className="grid grid-cols-3 gap-2">
+                <button
+                  type="button"
+                  onClick={() => onOpenOpsLaptop('battle')}
+                  className="flex items-center justify-center gap-1.5 border border-sky-500/35 bg-[#151c24] px-2.5 py-2.5 text-xs font-medium text-sky-100 transition-colors hover:border-sky-400 hover:bg-[#1b2430] whitespace-nowrap"
+                >
+                  <Laptop className="h-3.5 w-3.5 text-sky-400" />
+                  <span>Ops Laptop</span>
+                </button>
                 <button
                   type="button"
                   onClick={onOpenGunsmith}
-                  className="flex items-center justify-center gap-2 border border-white/10 bg-[#171a20] px-3 py-2.5 text-xs font-medium text-neutral-100 transition-colors hover:border-amber-500/50 hover:bg-[#1d2128] whitespace-nowrap"
+                  className="flex items-center justify-center gap-1.5 border border-white/10 bg-[#171a20] px-2.5 py-2.5 text-xs font-medium text-neutral-100 transition-colors hover:border-amber-500/50 hover:bg-[#1d2128] whitespace-nowrap"
                 >
                   <Wrench className="h-3.5 w-3.5 text-amber-400" />
-                  <span>Gunsmith Bench</span>
+                  <span>Gunsmith</span>
                 </button>
                 <button
                   type="button"
                   onClick={onOpenOperatorGear}
-                  className="flex items-center justify-center gap-2 border border-white/10 bg-[#171a20] px-3 py-2.5 text-xs font-medium text-neutral-100 transition-colors hover:border-amber-500/50 hover:bg-[#1d2128] whitespace-nowrap"
+                  className="flex items-center justify-center gap-1.5 border border-white/10 bg-[#171a20] px-2.5 py-2.5 text-xs font-medium text-neutral-100 transition-colors hover:border-amber-500/50 hover:bg-[#1d2128] whitespace-nowrap"
                 >
                   <Shield className="h-3.5 w-3.5 text-amber-400" />
-                  <span>Operator Gear</span>
+                  <span>Operator</span>
                 </button>
               </div>
             </div>
 
-            {/* Temporary Phase 1-3 Match Access (before Phase 4 Laptop & Phase 5 Portal) */}
+            {/* Quick Match Deployment & Training */}
             <div className="mt-5 space-y-2">
-              <div className="text-xs font-medium text-neutral-400">Deploy & Training</div>
-              <div className="grid grid-cols-2 gap-2">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-medium text-neutral-400">Deploy &amp; Training</span>
                 <button
                   type="button"
                   onClick={() => onOpenClassicHub('battle')}
-                  className="border border-white/10 bg-[#171a20] px-3 py-2 text-xs font-medium text-neutral-200 transition-colors hover:border-white/25 hover:bg-[#1d2128] whitespace-nowrap"
+                  className="text-[11px] text-neutral-500 underline-offset-2 transition-colors hover:text-neutral-300 hover:underline whitespace-nowrap"
                 >
-                  Battle Modes
+                  Classic Menu Hub
+                </button>
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  type="button"
+                  onClick={() => onOpenOpsLaptop('battle')}
+                  className="border border-white/10 bg-[#171a20] px-3 py-2 text-xs font-medium text-neutral-200 transition-colors hover:border-amber-500/50 hover:bg-[#1d2128] whitespace-nowrap"
+                >
+                  Combat Ops
                 </button>
                 <button
                   type="button"
-                  onClick={() => onOpenClassicHub('infection')}
+                  onClick={() => onOpenOpsLaptop('infection')}
                   className="border border-white/10 bg-[#171a20] px-3 py-2 text-xs font-medium text-neutral-200 transition-colors hover:border-red-500/45 hover:bg-[#1d2128] whitespace-nowrap"
                 >
-                  Zombies Infection
+                  Containment Ops
                 </button>
                 <button
                   type="button"
-                  onClick={() => onOpenClassicHub('multiplayer')}
-                  className="border border-white/10 bg-[#171a20] px-3 py-2 text-xs font-medium text-neutral-200 transition-colors hover:border-white/25 hover:bg-[#1d2128] whitespace-nowrap"
+                  onClick={() => onOpenOpsLaptop('multiplayer')}
+                  className="border border-white/10 bg-[#171a20] px-3 py-2 text-xs font-medium text-neutral-200 transition-colors hover:border-sky-400/50 hover:bg-[#1d2128] whitespace-nowrap"
                 >
-                  Multiplayer Squads
+                  Squads &amp; Lobbies
                 </button>
                 <button
                   type="button"

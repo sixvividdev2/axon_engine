@@ -65,6 +65,8 @@ import {
 } from './HideoutBunkerWorld';
 import { GunRangeSnapshot } from './HideoutGunRange';
 import { LongRangeSnapshot } from './HideoutLongRangeGallery';
+import { OpsLaptopTabId } from './HideoutOpsLaptopModal';
+import { ReadyRoomBriefingState } from './HideoutReadyRoom';
 import { hideoutStateStore } from './HideoutStateStore';
 
 export type InteractReticleState = 'hidden' | 'near' | 'ready';
@@ -123,6 +125,9 @@ export interface HideoutControllerCallbacks {
   isWeaponUnlocked: (weaponId: string) => boolean;
   onOpenGunsmith: () => void;
   onOpenOperatorGear: () => void;
+  onOpenOpsLaptop: (initialTab?: OpsLaptopTabId) => void;
+  onQuickDeployBattle: () => void;
+  onCycleStagedMap: () => string;
 }
 
 type HideoutListener = (snap: HideoutSnapshot) => void;
@@ -595,6 +600,10 @@ export class HideoutSessionController {
     this.world.syncGunWallSlots(nextState.wallRackSlots);
     this.applyEquippedWeaponRig(nextState.equippedWeaponId, false);
     this.emitSnapshot(true);
+  }
+
+  public syncOpsBriefing(state: ReadyRoomBriefingState): void {
+    this.world.readyRoom.setBriefingState(state);
   }
 
   public setModalActive(open: boolean): void {
@@ -1496,6 +1505,46 @@ export class HideoutSessionController {
         this.emitSnapshot(true);
         break;
       }
+      case 'ops_laptop': {
+        if (this.world.readyRoom.isLaptopBroken()) {
+          this.audio.playWeaponCue('dryfire', { intensity: 0.45 });
+          this.showToast('Ops Command Laptop Damaged — Reload Hideout to Repair');
+          break;
+        }
+        if (this.world.getPropInteractPos('ops_laptop', this._ikTargetPos)) {
+          this.interactAnimator.trigger('PROP_INTERACT', this._ikTargetPos);
+        }
+        this.audio.playWeaponCue('mode_toggle', { intensity: 0.5 });
+        if (chosen.id === 'quick_deploy') {
+          this.setModalActive(true);
+          this.callbacks.onQuickDeployBattle();
+        } else if (chosen.id === 'open_squads') {
+          this.setModalActive(true);
+          this.callbacks.onOpenOpsLaptop('multiplayer');
+        } else {
+          this.setModalActive(true);
+          this.callbacks.onOpenOpsLaptop('battle');
+        }
+        break;
+      }
+      case 'ops_briefing_board': {
+        if (this.world.getPropInteractPos('ops_briefing_board', this._ikTargetPos)) {
+          this.interactAnimator.trigger('PROP_INTERACT', this._ikTargetPos);
+        }
+        this.audio.playWeaponCue('mode_toggle', { intensity: 0.45 });
+        if (chosen.id === 'cycle_sector') {
+          const nextMapName = this.callbacks.onCycleStagedMap();
+          this.showToast(`Staged Sector: ${nextMapName}`);
+        } else if (chosen.id === 'open_ops_from_board') {
+          if (this.world.readyRoom.isLaptopBroken()) {
+            this.showToast('Ops Command Laptop Damaged — Reload Hideout to Repair');
+            break;
+          }
+          this.setModalActive(true);
+          this.callbacks.onOpenOpsLaptop('battle');
+        }
+        break;
+      }
     }
   }
 
@@ -1795,6 +1844,47 @@ export class HideoutSessionController {
       this.activePrompt = {
         key: 'F',
         targetLabel: 'Ballistics Control Console',
+        options: opts,
+        selectedIndex: this.selectedOptionIndex,
+      };
+      return;
+    }
+
+    if (meta.kind === 'ops_laptop') {
+      if (this.world.readyRoom.isLaptopBroken()) {
+        this.selectedOptionIndex = 0;
+        this.activePrompt = {
+          key: 'F',
+          targetLabel: 'Ops Command Laptop',
+          options: [{ id: 'broken_laptop', label: 'Terminal Damaged', hint: 'Reload to Repair' }],
+          selectedIndex: 0,
+        };
+        return;
+      }
+      const opts: HideoutPromptOption[] = [
+        { id: 'open_ops', label: 'Open Ops Command Terminal', hint: 'Battle · Squads · Ops' },
+        { id: 'quick_deploy', label: 'Quick Deploy Staged Match' },
+        { id: 'open_squads', label: 'Squads & Multiplayer Lobbies' },
+      ];
+      this.selectedOptionIndex = THREE.MathUtils.clamp(this.selectedOptionIndex, 0, opts.length - 1);
+      this.activePrompt = {
+        key: 'F',
+        targetLabel: 'Ops Command Laptop',
+        options: opts,
+        selectedIndex: this.selectedOptionIndex,
+      };
+      return;
+    }
+
+    if (meta.kind === 'ops_briefing_board') {
+      const opts: HideoutPromptOption[] = [
+        { id: 'cycle_sector', label: 'Cycle Staged Combat Sector' },
+        { id: 'open_ops_from_board', label: 'Open Ops Command Terminal' },
+      ];
+      this.selectedOptionIndex = THREE.MathUtils.clamp(this.selectedOptionIndex, 0, opts.length - 1);
+      this.activePrompt = {
+        key: 'F',
+        targetLabel: 'Tactical Sector Briefing Board',
         options: opts,
         selectedIndex: this.selectedOptionIndex,
       };

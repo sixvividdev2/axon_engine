@@ -17,6 +17,7 @@ import {
   HideoutLongRangeCallbacks,
   HideoutLongRangeGallery,
 } from './HideoutLongRangeGallery';
+import { HideoutReadyRoom } from './HideoutReadyRoom';
 import { hideoutStateStore } from './HideoutStateStore';
 
 export type HideoutRoomId = 'arsenal' | 'gun_range' | 'ready_room' | 'zombies_portal';
@@ -28,7 +29,9 @@ export type HideoutInteractableKind =
   | 'ammo_crate'
   | 'range_console'
   | 'range_ammo_box'
-  | 'ballistics_console';
+  | 'ballistics_console'
+  | 'ops_laptop'
+  | 'ops_briefing_board';
 
 export interface HideoutInteractableMeta {
   kind: HideoutInteractableKind;
@@ -79,6 +82,7 @@ export interface HideoutBunkerWorldHandle {
   doorSystem: DestructibleDoorSystem;
   gunRange: HideoutGunRange;
   longRangeGallery: HideoutLongRangeGallery;
+  readyRoom: HideoutReadyRoom;
   root: THREE.Group;
   raycastMeshes: THREE.Object3D[];
   interactableMeshes: THREE.Mesh[];
@@ -936,7 +940,21 @@ export function buildHideoutBunkerWorld(
     longRangeCallbacks,
   );
 
-  // Register static world & Gun Range raycast meshes BEFORE mounting dynamic destructible doors
+  // ============================================================================
+  // 5D. PHASE 4 READY ROOM — OPS COMMAND LAPTOP & TACTICAL BRIEFING WALL
+  // ============================================================================
+  const readyRoom = new HideoutReadyRoom(
+    root,
+    physics,
+    materials,
+    electronics,
+    raycastMeshes,
+    interactableMeshes,
+    isSoftwareGl,
+    maxAniso,
+  );
+
+  // Register static world, Gun Range & Ready Room raycast meshes BEFORE mounting dynamic doors
   physics.setRaycastMeshes(raycastMeshes);
 
   // ============================================================================
@@ -1046,9 +1064,10 @@ export function buildHideoutBunkerWorld(
       crateLidPivot.rotation.x = 0;
     }
 
-    // Step Gun Range reactive targets, 30s CQB course, 100m Long-Range Gallery & sparks
+    // Step Gun Range reactive targets, 30s CQB course, 100m Gallery, Ready Room displays & sparks
     gunRange.update(clampedDt);
     longRangeGallery.update(clampedDt);
+    readyRoom.update(clampedDt);
     electronics.update(clampedDt, listenerPos);
   };
 
@@ -1088,6 +1107,12 @@ export function buildHideoutBunkerWorld(
     if (kind === 'ballistics_console') {
       return longRangeGallery.getConsoleWorldPos(outPos);
     }
+    if (kind === 'ops_laptop') {
+      return readyRoom.getLaptopWorldPos(outPos);
+    }
+    if (kind === 'ops_briefing_board') {
+      return readyRoom.getBoardWorldPos(outPos);
+    }
     return false;
   };
 
@@ -1098,6 +1123,7 @@ export function buildHideoutBunkerWorld(
     doorSystem,
     gunRange,
     longRangeGallery,
+    readyRoom,
     root,
     raycastMeshes,
     interactableMeshes,
@@ -1113,6 +1139,7 @@ export function buildHideoutBunkerWorld(
     getSlotTransform,
     updateProps,
     dispose: () => {
+      readyRoom.dispose();
       longRangeGallery.dispose();
       gunRange.dispose();
       electronics.dispose();

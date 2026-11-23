@@ -444,6 +444,28 @@ function AppShell() {
     <>
       {view.kind === 'hideout' && (
         <HideoutView
+          battleConfig={battleConfig}
+          infectionConfig={infectionConfig}
+          onChangeBattleConfig={setBattleConfig}
+          onChangeInfectionConfig={setInfectionConfig}
+          onLaunchBattle={(cfg) => {
+            setBattleConfig(cfg);
+            setView({
+              kind: 'combat',
+              params: { mode: 'battle', battleConfig: cfg },
+              sessionKey: Date.now(),
+              isMultiplayer: false,
+            });
+          }}
+          onLaunchInfection={(cfg) => {
+            setInfectionConfig(cfg);
+            setView({
+              kind: 'combat',
+              params: { mode: 'infection', infectionConfig: cfg },
+              sessionKey: Date.now(),
+              isMultiplayer: false,
+            });
+          }}
           onOpenClassicHub={(tab) => setView({ kind: 'menu', tab })}
           onLaunchPlayground={() => setView({ kind: 'playground' })}
         />
