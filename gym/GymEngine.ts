@@ -745,9 +745,15 @@ export class GymEngine {
     this.audio.ensureInitialized();
     this.tunerOpen = false;
     if (this.world.gunsmithBench.isOpen()) return;
-    if (document.pointerLockElement !== this.renderer.domElement) {
+    const el = this.renderer.domElement;
+    if (document.pointerLockElement !== el && typeof el.requestPointerLock === 'function') {
       try {
-        void this.renderer.domElement.requestPointerLock();
+        const res = el.requestPointerLock() as unknown as Promise<void> | undefined;
+        if (res && typeof res.catch === 'function') {
+          res.catch(() => {
+            // Ignore Chromium post-ESC pointer-lock cooldown or gesture rejections
+          });
+        }
       } catch {
         // Ignore browser pointer lock rejection
       }

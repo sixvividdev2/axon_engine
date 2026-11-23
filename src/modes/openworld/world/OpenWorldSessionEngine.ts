@@ -288,8 +288,15 @@ export class OpenWorldSessionEngine {
   };
 
   public requestPointerLock(): void {
+    const el = this.renderer.domElement;
+    if (document.pointerLockElement === el || typeof el.requestPointerLock !== 'function') return;
     try {
-      this.renderer.domElement.requestPointerLock?.();
+      const res = el.requestPointerLock() as unknown as Promise<void> | undefined;
+      if (res && typeof res.catch === 'function') {
+        res.catch(() => {
+          // Ignore Chromium post-ESC pointer-lock cooldown or headless rejections
+        });
+      }
     } catch {
       // Ignore pointer lock rejection in automated/headless environments
     }

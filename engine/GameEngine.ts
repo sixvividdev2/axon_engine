@@ -724,26 +724,34 @@ export class GameEngine {
 
   public requestLock(): void {
     const canvas = this.renderer.domElement;
-    if (document.pointerLockElement !== canvas) {
+    if (document.pointerLockElement !== canvas && typeof canvas.requestPointerLock === 'function') {
+      const requestFallback = (): void => {
+        try {
+          const fallbackRes = canvas.requestPointerLock() as unknown as Promise<void> | undefined;
+          if (fallbackRes && typeof fallbackRes.catch === 'function') {
+            fallbackRes.catch(() => {
+              // Ignore Chromium post-ESC pointer-lock cooldown or gesture rejections
+            });
+          }
+        } catch {
+          // Ignore synchronous browser gesture rejections
+        }
+      };
+
       try {
         const res = (
           canvas.requestPointerLock as unknown as (opts?: { unadjustedMovement?: boolean }) => Promise<void> | void
-        )?.({ unadjustedMovement: true });
+        )({ unadjustedMovement: true });
         if (res && typeof (res as Promise<void>).catch === 'function') {
-          (res as Promise<void>).catch(() => {
-            try {
-              canvas.requestPointerLock?.();
-            } catch {
-              // Ignore fallback error
+          (res as Promise<void>).catch((err: unknown) => {
+            const name = err instanceof DOMException ? err.name : '';
+            if (name === 'NotSupportedError' || name === 'TypeError') {
+              requestFallback();
             }
           });
         }
       } catch {
-        try {
-          canvas.requestPointerLock?.();
-        } catch {
-          // Ignore browser gesture rejections
-        }
+        requestFallback();
       }
     }
   }
