@@ -20,6 +20,7 @@ import {
 import { HubTabId } from '../ui/MainMenuHub';
 import { OpsLaptopTabId } from './HideoutOpsLaptopModal';
 import { HideoutSnapshot } from './HideoutSessionController';
+import { PMC_FACTIONS, useHideoutShardAdapter } from '../src/modes/openworld';
 
 interface HideoutHudProps {
   snapshot: HideoutSnapshot;
@@ -54,6 +55,7 @@ export const HideoutHud: React.FC<HideoutHudProps> = ({
   const { user, openAuthModal, openAccountSettings } = useAuth();
   const { openDrawer: openSocialDrawer, incomingRequests } = useSocial();
   const [graphicsQuality, setGraphicsQuality] = useGraphicsQuality();
+  const { activeCharacter, bankruptcy } = useHideoutShardAdapter();
 
   const showLiveHud = snapshot.pointerLocked && !snapshot.pauseOpen && !modalOpen;
   const showEntryPrompt = !snapshot.pointerLocked && !snapshot.pauseOpen && !modalOpen;
@@ -61,18 +63,51 @@ export const HideoutHud: React.FC<HideoutHudProps> = ({
 
   return (
     <div className="pointer-events-none fixed inset-0 z-10 select-none">
-      {/* Subtle top-left room location readout (clean unboxed typography) */}
+      {/* Subtle top-left room location & active Perimeter Ops operator readout (clean unboxed typography) */}
       {!showPauseMenu && !modalOpen && (
-        <div className="fixed left-6 top-5 flex items-baseline gap-3 text-neutral-200/85">
-          <span className="font-display text-sm font-semibold tracking-wider text-neutral-100">
-            {snapshot.currentRoomLabel}
-          </span>
-          <span className="text-xs text-neutral-500" aria-hidden="true">
-            ·
-          </span>
-          <span className="font-mono-tabular text-xs text-neutral-400">
-            {snapshot.fps} FPS
-          </span>
+        <div className="fixed left-6 top-5 flex flex-col gap-0.5 text-neutral-200/85">
+          <div className="flex items-baseline gap-3">
+            <span className="font-display text-sm font-semibold tracking-wider text-neutral-100">
+              {snapshot.currentRoomLabel}
+            </span>
+            <span className="text-xs text-neutral-500" aria-hidden="true">
+              ·
+            </span>
+            <span className="font-mono-tabular text-xs text-neutral-400">
+              {snapshot.fps} FPS
+            </span>
+          </div>
+          {activeCharacter && (
+            <div className="flex flex-wrap items-baseline gap-x-2 font-mono-tabular text-xs">
+              <span className="font-semibold text-emerald-300">{activeCharacter.callsign}</span>
+              <span className="text-neutral-600" aria-hidden="true">
+                ·
+              </span>
+              <span className="text-neutral-300">{activeCharacter.shardMode}</span>
+              <span className="text-neutral-600" aria-hidden="true">
+                ·
+              </span>
+              <span className="text-neutral-400">
+                {PMC_FACTIONS[activeCharacter.pmcFaction].name}
+              </span>
+              <span className="text-neutral-600" aria-hidden="true">
+                ·
+              </span>
+              <span className="text-neutral-200">
+                ${activeCharacter.cash.toLocaleString()}
+              </span>
+              {bankruptcy?.isBankruptcyRisk && (
+                <>
+                  <span className="text-neutral-600" aria-hidden="true">
+                    ·
+                  </span>
+                  <span className="font-semibold text-red-400">
+                    BANKRUPTCY WARNING · MEDEVAC ${bankruptcy.nextRespawnFee.toLocaleString()}
+                  </span>
+                </>
+              )}
+            </div>
+          )}
         </div>
       )}
 
@@ -489,7 +524,15 @@ export const HideoutHud: React.FC<HideoutHudProps> = ({
             {/* Hideout Stations */}
             <div className="mt-5 space-y-2">
               <div className="text-xs font-medium text-neutral-400">Hideout Stations</div>
-              <div className="grid grid-cols-3 gap-2">
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  type="button"
+                  onClick={() => onOpenOpsLaptop('perimeter')}
+                  className="flex items-center justify-center gap-1.5 border border-emerald-500/40 bg-[#121e1b] px-2.5 py-2.5 text-xs font-medium text-emerald-100 transition-colors hover:border-emerald-400 hover:bg-[#172824] whitespace-nowrap"
+                >
+                  <User className="h-3.5 w-3.5 text-emerald-400" />
+                  <span>Perimeter Roster</span>
+                </button>
                 <button
                   type="button"
                   onClick={() => onOpenOpsLaptop('battle')}

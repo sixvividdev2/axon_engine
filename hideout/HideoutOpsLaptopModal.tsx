@@ -1,5 +1,6 @@
 import React, { useMemo, useState } from 'react';
 import {
+  Compass,
   Crosshair,
   Lock,
   Radio,
@@ -30,8 +31,9 @@ import {
 import { MapSelector } from '../ui/MapSelector';
 import { MultiplayerHubPanel } from '../ui/MultiplayerHubPanel';
 import { WeatherTimeControls } from '../ui/WeatherTimeControls';
+import { PerimeterOpsTerminalPanel, useHideoutShardAdapter } from '../src/modes/openworld';
 
-export type OpsLaptopTabId = 'battle' | 'multiplayer' | 'infection';
+export type OpsLaptopTabId = 'perimeter' | 'battle' | 'multiplayer' | 'infection';
 
 interface HideoutOpsLaptopModalProps {
   initialTab: OpsLaptopTabId;
@@ -81,8 +83,11 @@ export const HideoutOpsLaptopModal: React.FC<HideoutOpsLaptopModalProps> = ({
     useTacticalEquipmentSelection();
   const loadoutState = useLoadoutStore();
   const activeLoadout = loadoutState.slots[loadoutState.activeIndex] ?? loadoutState.slots[0];
+  const { activeCharacter, bankruptcy } = useHideoutShardAdapter();
 
-  const [activeTab, setActiveTab] = useState<OpsLaptopTabId>(lobby ? 'multiplayer' : initialTab);
+  const [activeTab, setActiveTab] = useState<OpsLaptopTabId>(
+    initialTab === 'perimeter' ? 'perimeter' : lobby ? 'multiplayer' : initialTab,
+  );
 
   const infectionRecords: Record<string, InfectionMapRecord> = useMemo(() => {
     const sm = new SaveManager();
@@ -125,6 +130,18 @@ export const HideoutOpsLaptopModal: React.FC<HideoutOpsLaptopModalProps> = ({
           </span>
 
           <nav className="flex items-center gap-1.5" aria-label="Operations Mode">
+            <button
+              type="button"
+              onClick={() => setActiveTab('perimeter')}
+              className={`flex cursor-pointer items-center gap-2 border px-3.5 py-2 text-xs font-semibold transition-colors whitespace-nowrap shrink-0 ${
+                activeTab === 'perimeter'
+                  ? 'border-emerald-400 bg-emerald-500/18 text-emerald-100'
+                  : 'border-white/10 bg-[#151a22] text-neutral-400 hover:border-white/25 hover:text-neutral-100'
+              }`}
+            >
+              <Compass className="h-3.5 w-3.5" />
+              <span>Perimeter Ops</span>
+            </button>
             <button
               type="button"
               onClick={() => setActiveTab('battle')}
@@ -187,6 +204,27 @@ export const HideoutOpsLaptopModal: React.FC<HideoutOpsLaptopModalProps> = ({
               ·
             </span>
             <span className="text-neutral-400">Loadout {activeLoadout.name}</span>
+            {activeCharacter && (
+              <>
+                <span className="text-neutral-600" aria-hidden="true">
+                  ·
+                </span>
+                <span className="font-semibold text-emerald-300">
+                  {activeCharacter.callsign} ({activeCharacter.shardMode}) · $
+                  {activeCharacter.cash.toLocaleString()}
+                </span>
+                {bankruptcy?.isBankruptcyRisk && (
+                  <>
+                    <span className="text-neutral-600" aria-hidden="true">
+                      ·
+                    </span>
+                    <span className="font-semibold text-red-400">
+                      BANKRUPTCY RISK (MEDEVAC ${bankruptcy.nextRespawnFee.toLocaleString()})
+                    </span>
+                  </>
+                )}
+              </>
+            )}
             {lobby && (
               <>
                 <span className="text-neutral-600" aria-hidden="true">
@@ -221,6 +259,8 @@ export const HideoutOpsLaptopModal: React.FC<HideoutOpsLaptopModalProps> = ({
 
         {/* Terminal Body */}
         <div className="flex-1 overflow-y-auto px-6 py-5">
+          {activeTab === 'perimeter' && <PerimeterOpsTerminalPanel />}
+
           {activeTab === 'battle' && (
             <div className="flex flex-col gap-5">
               {/* Top Row: Heading + TDM/FFA Selector */}

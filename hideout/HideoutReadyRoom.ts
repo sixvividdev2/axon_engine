@@ -4,6 +4,8 @@ import { HideoutElectronicsSystem } from './HideoutElectronicsSystem';
 import { HideoutMaterialLibrary } from './HideoutMaterials';
 import type { HideoutInteractableMeta } from './HideoutBunkerWorld';
 
+import type { ReadyRoomOpenWorldSummary } from '../src/modes/openworld/HideoutShardAdapter';
+
 export interface ReadyRoomBriefingState {
   mapId: string;
   mapName: string;
@@ -22,6 +24,7 @@ export interface ReadyRoomBriefingState {
   lobbyCode: string | null;
   lobbyMembersCount: number;
   lobbyMaxPlayers: number;
+  openWorldCharacter?: ReadyRoomOpenWorldSummary | null;
 }
 
 const DEFAULT_BRIEFING: ReadyRoomBriefingState = {
@@ -1125,7 +1128,21 @@ export class HideoutReadyRoom {
   }
 
   public setBriefingState(next: ReadyRoomBriefingState): void {
+    const prevOw = this.briefing.openWorldCharacter;
+    const nextOw = next.openWorldCharacter;
+    const owChanged =
+      prevOw?.slotId !== nextOw?.slotId ||
+      prevOw?.callsign !== nextOw?.callsign ||
+      prevOw?.shardMode !== nextOw?.shardMode ||
+      prevOw?.factionName !== nextOw?.factionName ||
+      prevOw?.bodyTypeLabel !== nextOw?.bodyTypeLabel ||
+      prevOw?.cashUsd !== nextOw?.cashUsd ||
+      prevOw?.respawnFeeUsd !== nextOw?.respawnFeeUsd ||
+      prevOw?.isBankruptcyRisk !== nextOw?.isBankruptcyRisk ||
+      prevOw?.ownedWeaponCount !== nextOw?.ownedWeaponCount;
+
     const changed =
+      owChanged ||
       next.mapId !== this.briefing.mapId ||
       next.ruleLabel !== this.briefing.ruleLabel ||
       next.botCount !== this.briefing.botCount ||
@@ -1142,7 +1159,10 @@ export class HideoutReadyRoom {
       next.lobbyMembersCount !== this.briefing.lobbyMembersCount;
 
     if (!changed) return;
-    this.briefing = { ...next };
+    this.briefing = {
+      ...next,
+      openWorldCharacter: nextOw ? { ...nextOw } : null,
+    };
     this.redrawAllDisplays();
   }
 
@@ -1174,40 +1194,82 @@ export class HideoutReadyRoom {
     ctx.fillStyle = '#090d12';
     ctx.fillRect(0, 0, w, h);
 
+    const ow = b.openWorldCharacter;
+
     // Top bar
     ctx.fillStyle = '#111822';
     ctx.fillRect(0, 0, w, 40);
-    ctx.fillStyle = '#38bdf8';
+    ctx.fillStyle = ow?.isBankruptcyRisk ? '#ef4444' : '#38bdf8';
     ctx.fillRect(0, 38, w, 2);
 
     ctx.fillStyle = '#f8fafc';
     ctx.font = '700 17px "IBM Plex Mono", monospace';
-    ctx.fillText('OPS COMMAND TERMINAL', 16, 26);
+    ctx.fillText(ow ? 'PERIMETER OPS TERMINAL' : 'OPS COMMAND TERMINAL', 16, 26);
 
     ctx.textAlign = 'right';
-    ctx.fillStyle = b.lobbyCode ? '#38bdf8' : '#f59e0b';
+    ctx.fillStyle = ow
+      ? ow.isBankruptcyRisk
+        ? '#f87171'
+        : '#34d399'
+      : b.lobbyCode
+        ? '#38bdf8'
+        : '#f59e0b';
     ctx.font = '600 13px "IBM Plex Mono", monospace';
-    ctx.fillText(b.lobbyCode ? `SQUAD ${b.lobbyCode}` : 'SOLO STAGED', w - 16, 25);
+    ctx.fillText(
+      ow
+        ? `${ow.shardMode} · ${ow.factionShort}`
+        : b.lobbyCode
+          ? `SQUAD ${b.lobbyCode}`
+          : 'SOLO STAGED',
+      w - 16,
+      25,
+    );
     ctx.textAlign = 'left';
 
-    // Sector panel
-    ctx.fillStyle = '#10161e';
+    // Sector or Active Character panel
+    ctx.fillStyle = ow?.isBankruptcyRisk ? '#1b0f12' : '#10161e';
     ctx.fillRect(16, 54, w - 32, 92);
-    ctx.strokeStyle = 'rgba(56, 189, 248, 0.35)';
+    ctx.strokeStyle = ow?.isBankruptcyRisk
+      ? 'rgba(248, 113, 113, 0.7)'
+      : 'rgba(56, 189, 248, 0.35)';
     ctx.lineWidth = 1.5;
     ctx.strokeRect(16, 54, w - 32, 92);
 
-    ctx.fillStyle = '#7dd3fc';
-    ctx.font = '600 12px "IBM Plex Mono", monospace';
-    ctx.fillText('STAGED COMBAT SECTOR', 28, 76);
+    if (ow) {
+      ctx.fillStyle = ow.isBankruptcyRisk ? '#fca5a5' : '#7dd3fc';
+      ctx.font = '600 12px "IBM Plex Mono", monospace';
+      ctx.fillText(
+        ow.isBankruptcyRisk
+          ? 'BANKRUPTCY WARNING · DEATH WIPES CHARACTER'
+          : `ACTIVE ROSTER OPERATOR · TIER ${ow.progressionTier}`,
+        28,
+        76,
+      );
 
-    ctx.fillStyle = '#f8fafc';
-    ctx.font = '700 24px "IBM Plex Mono", monospace';
-    ctx.fillText(b.mapName.toUpperCase().slice(0, 24), 28, 108);
+      ctx.fillStyle = '#f8fafc';
+      ctx.font = '700 24px "IBM Plex Mono", monospace';
+      ctx.fillText(ow.callsign.toUpperCase().slice(0, 22), 28, 108);
 
-    ctx.fillStyle = '#94a3b8';
-    ctx.font = '500 13px "IBM Plex Mono", monospace';
-    ctx.fillText(`${b.ruleLabel} · ${b.botCount} Bots · ${b.killLimit} Kills`, 28, 132);
+      ctx.fillStyle = '#cbd5e1';
+      ctx.font = '500 13px "IBM Plex Mono", monospace';
+      ctx.fillText(
+        `CASH $${ow.cashUsd.toLocaleString()} · MEDEVAC $${ow.respawnFeeUsd.toLocaleString()} · ${ow.ownedWeaponCount} WALL GUNS`,
+        28,
+        132,
+      );
+    } else {
+      ctx.fillStyle = '#7dd3fc';
+      ctx.font = '600 12px "IBM Plex Mono", monospace';
+      ctx.fillText('STAGED COMBAT SECTOR', 28, 76);
+
+      ctx.fillStyle = '#f8fafc';
+      ctx.font = '700 24px "IBM Plex Mono", monospace';
+      ctx.fillText(b.mapName.toUpperCase().slice(0, 24), 28, 108);
+
+      ctx.fillStyle = '#94a3b8';
+      ctx.font = '500 13px "IBM Plex Mono", monospace';
+      ctx.fillText(`${b.ruleLabel} · ${b.botCount} Bots · ${b.killLimit} Kills`, 28, 132);
+    }
 
     // Telemetry grid
     const rowY = 164;
@@ -1230,21 +1292,35 @@ export class HideoutReadyRoom {
 
     ctx.fillStyle = '#94a3b8';
     ctx.font = '600 11px "IBM Plex Mono", monospace';
-    ctx.fillText('CONDITIONS', 276, rowY + 20);
+    ctx.fillText(ow ? 'FACTION · RIG' : 'CONDITIONS', 276, rowY + 20);
     ctx.fillStyle = '#fbbf24';
     ctx.font = '600 14px "IBM Plex Mono", monospace';
-    ctx.fillText(`${b.weatherLabel} · ${b.timeOfDayLabel}`, 276, rowY + 44);
+    ctx.fillText(
+      ow ? `${ow.factionName} · ${ow.bodyTypeLabel}` : `${b.weatherLabel} · ${b.timeOfDayLabel}`,
+      276,
+      rowY + 44,
+    );
     ctx.fillStyle = '#cbd5e1';
     ctx.font = '500 12px "IBM Plex Mono", monospace';
-    ctx.fillText(`AI ${b.difficultyLabel} · ${b.rankLabel}`, 276, rowY + 68);
+    ctx.fillText(
+      ow ? `${ow.shardLabel.slice(0, 26)}` : `AI ${b.difficultyLabel} · ${b.rankLabel}`,
+      276,
+      rowY + 68,
+    );
 
     // Bottom action banner
-    ctx.fillStyle = '#f59e0b';
+    ctx.fillStyle = ow?.isBankruptcyRisk ? '#dc2626' : '#f59e0b';
     ctx.fillRect(16, 266, w - 32, 38);
-    ctx.fillStyle = '#090a0b';
+    ctx.fillStyle = ow?.isBankruptcyRisk ? '#fef2f2' : '#090a0b';
     ctx.textAlign = 'center';
     ctx.font = '700 15px "IBM Plex Mono", monospace';
-    ctx.fillText('[F] OPEN OPS TERMINAL · QUICK DEPLOY READY', w * 0.5, 290);
+    ctx.fillText(
+      ow?.isBankruptcyRisk
+        ? '[F] OPEN ROSTER · BANKRUPTCY RISK ACTIVE'
+        : '[F] OPEN OPS TERMINAL · ROSTER & DEPLOY',
+      w * 0.5,
+      290,
+    );
     ctx.textAlign = 'left';
 
     this.laptopTex.needsUpdate = true;
@@ -1444,10 +1520,40 @@ export class HideoutReadyRoom {
       ctx.fillText(val.slice(0, 26), 22, y + 26);
     };
 
-    drawField(78, 'PRIMARY FIREARM', b.primaryWeaponName, '#fef3c7');
-    drawField(142, 'SECONDARY SIDEARM', b.secondaryWeaponName, '#e2e8f0');
-    drawField(206, 'BELT ORDNANCE', b.grenadeName, '#7dd3fc');
-    drawField(268, 'OPERATOR RIG · RANK', `${b.operatorLabel} · ${b.rankLabel}`, '#cbd5e1');
+    const ow = b.openWorldCharacter;
+    if (ow) {
+      drawField(
+        78,
+        'ROSTER OPERATOR · SHARD',
+        `${ow.callsign} · ${ow.shardMode}`,
+        '#fef3c7',
+      );
+      drawField(
+        142,
+        'PMC FACTION · BODY RIG',
+        `${ow.factionName} · ${ow.bodyTypeLabel}`,
+        '#7dd3fc',
+      );
+      drawField(
+        206,
+        'ARSENAL WALL · LIQUID CASH',
+        `${ow.ownedWeaponCount} Firearms · $${ow.cashUsd.toLocaleString()}`,
+        ow.isBankruptcyRisk ? '#f87171' : '#34d399',
+      );
+      drawField(
+        268,
+        'MEDEVAC STATUS',
+        ow.isBankruptcyRisk
+          ? `BANKRUPTCY RISK ($${ow.respawnFeeUsd.toLocaleString()})`
+          : `COVERED · FEE $${ow.respawnFeeUsd.toLocaleString()}`,
+        ow.isBankruptcyRisk ? '#fca5a5' : '#cbd5e1',
+      );
+    } else {
+      drawField(78, 'PRIMARY FIREARM', b.primaryWeaponName, '#fef3c7');
+      drawField(142, 'SECONDARY SIDEARM', b.secondaryWeaponName, '#e2e8f0');
+      drawField(206, 'BELT ORDNANCE', b.grenadeName, '#7dd3fc');
+      drawField(268, 'OPERATOR RIG · RANK', `${b.operatorLabel} · ${b.rankLabel}`, '#cbd5e1');
+    }
 
     this.loadoutMonTex.needsUpdate = true;
   }

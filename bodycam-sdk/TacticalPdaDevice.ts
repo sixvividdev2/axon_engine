@@ -41,6 +41,13 @@ export interface PdaHudTelemetry {
   zoneLabel?: string;
   allies?: readonly PdaAllyMarker[];
   pings?: readonly PdaPingMarker[];
+  characterCallsign?: string;
+  shardLabel?: string;
+  factionLabel?: string;
+  cashUsd?: number;
+  respawnFeeUsd?: number;
+  bankruptcyWarning?: boolean;
+  bankruptcyText?: string;
 }
 
 export interface PdaOrthoCaptureOptions {
@@ -1478,6 +1485,28 @@ export class TacticalPdaDevice {
 
     ctx.restore();
 
+    // Diegetic Perimeter Operations Bankruptcy Warning Banner (never conveyed by color alone)
+    if (this.telemetry.bankruptcyWarning) {
+      const warnH = 44;
+      ctx.fillStyle = 'rgba(127, 29, 29, 0.94)';
+      ctx.fillRect(0, mapTop, SCREEN_W, warnH);
+      ctx.strokeStyle = '#f87171';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(0, mapTop + warnH);
+      ctx.lineTo(SCREEN_W, mapTop + warnH);
+      ctx.stroke();
+
+      ctx.fillStyle = '#fef2f2';
+      ctx.font = 'bold 16px monospace';
+      ctx.textAlign = 'center';
+      const msg =
+        this.telemetry.bankruptcyText ||
+        'BANKRUPTCY WARNING · INSUFFICIENT MEDEVAC FUNDS · DEATH WIPES CHARACTER';
+      ctx.fillText(msg.slice(0, 86), SCREEN_W * 0.5, mapTop + 27);
+      ctx.textAlign = 'left';
+    }
+
     // === 4. BOTTOM STATUS STRIP ===
     ctx.fillStyle = '#0d1519';
     ctx.fillRect(0, mapBot, SCREEN_W, SCREEN_H - mapBot);
@@ -1490,14 +1519,43 @@ export class TacticalPdaDevice {
     ctx.fillStyle = '#94a3b8';
     ctx.font = '13px monospace';
     ctx.textAlign = 'left';
+    if (this.telemetry.characterCallsign) {
+      const cashStr =
+        typeof this.telemetry.cashUsd === 'number'
+          ? `$${this.telemetry.cashUsd.toLocaleString()}`
+          : '--';
+      const feeStr =
+        typeof this.telemetry.respawnFeeUsd === 'number'
+          ? `$${this.telemetry.respawnFeeUsd.toLocaleString()}`
+          : '--';
+      ctx.fillStyle = this.telemetry.bankruptcyWarning ? '#fca5a5' : '#cbd5e1';
+      ctx.fillText(
+        `${this.telemetry.characterCallsign.toUpperCase()} · ${this.telemetry.shardLabel ?? 'OW'} · ${this.telemetry.factionLabel ?? 'PMC'} · CASH ${cashStr} · MEDEVAC ${feeStr}`,
+        16,
+        SCREEN_H - 13,
+      );
+    } else {
+      ctx.fillText(
+        `GRID ${Math.round(this.telemetry.playerX)}E ${Math.round(-this.telemetry.playerZ)}N · LMB+DRAG PAN · WHEEL ZOOM · R/RMB CENTER`,
+        16,
+        SCREEN_H - 13,
+      );
+    }
+    ctx.textAlign = 'right';
+    ctx.fillStyle = this.telemetry.bankruptcyWarning
+      ? '#f87171'
+      : this.centerOnPlayer
+        ? '#10b981'
+        : '#38bdf8';
     ctx.fillText(
-      `GRID ${Math.round(this.telemetry.playerX)}E ${Math.round(-this.telemetry.playerZ)}N · LMB+DRAG PAN · WHEEL ZOOM · R/RMB CENTER`,
-      16,
+      this.telemetry.bankruptcyWarning
+        ? 'MEDEVAC UNFUNDED'
+        : this.centerOnPlayer
+          ? 'GPS LOCKED'
+          : 'FREE PAN',
+      SCREEN_W - 16,
       SCREEN_H - 13,
     );
-    ctx.textAlign = 'right';
-    ctx.fillStyle = this.centerOnPlayer ? '#10b981' : '#38bdf8';
-    ctx.fillText(this.centerOnPlayer ? 'GPS LOCKED' : 'FREE PAN', SCREEN_W - 16, SCREEN_H - 13);
 
     // Boot scanline wipe effect
     if (bootProgress < 1) {

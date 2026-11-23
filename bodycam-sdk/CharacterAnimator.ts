@@ -103,7 +103,7 @@ function isActorHitZone(zone: BodycamMeleeHitZone): boolean {
  *  - 100% decoupled from game-specific entities (reports contacts via IBodycamWorldAdapter.onMeleeHit)
  */
 export class CharacterAnimator {
-  private readonly skeleton: CharacterSkeleton;
+  private skeleton: CharacterSkeleton;
   private readonly weaponRig: WeaponRig;
   private audio?: IBodycamAudioSource;
 
@@ -337,7 +337,7 @@ export class CharacterAnimator {
   private readonly _grenadeReleaseForward = new THREE.Vector3();
 
   // Post-animation soft-tissue & gear secondary physics
-  private readonly secondaryApplier: SecondaryPhysicsRigApplier;
+  private secondaryApplier: SecondaryPhysicsRigApplier;
   private prevRecoilZ = 0;
   private readonly _ctrlVel = new THREE.Vector3();
   private readonly _secInput = {
@@ -362,6 +362,13 @@ export class CharacterAnimator {
     this.weaponRig = weaponRig;
     this.audio = audio;
     this.secondaryApplier = new SecondaryPhysicsRigApplier(skeleton);
+  }
+
+  public setSkeleton(skeleton: CharacterSkeleton): void {
+    if (this.skeleton === skeleton) return;
+    this.skeleton = skeleton;
+    this.secondaryApplier = new SecondaryPhysicsRigApplier(skeleton);
+    this.footWorldInit = false;
   }
 
   public setExternalHandOverride(override: Readonly<ExternalHandIkOverride> | null): void {

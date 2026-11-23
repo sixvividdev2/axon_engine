@@ -23,6 +23,7 @@ import {
   IBodycamWorldAdapter,
   operatorAssetLoader,
   OperatorGearConfig,
+  OperatorId,
   operatorSelectionStore,
   resolveWeaponProfile,
   ScopePassParams,
@@ -32,6 +33,7 @@ import {
   TacticalGrenadeSystem,
   tacticalEquipmentStore,
   TacticalPdaDevice,
+  type PdaHudTelemetry,
   type PdaPingMarker,
   WeaponRig,
 } from '../bodycam-sdk';
@@ -71,6 +73,7 @@ import { LongRangeSnapshot } from './HideoutLongRangeGallery';
 import { OpsLaptopTabId } from './HideoutOpsLaptopModal';
 import { ReadyRoomBriefingState } from './HideoutReadyRoom';
 import { hideoutStateStore } from './HideoutStateStore';
+import { hideoutShardAdapter } from '../src/modes/openworld/HideoutShardAdapter';
 
 export type InteractReticleState = 'hidden' | 'near' | 'ready';
 
@@ -166,7 +169,9 @@ export class HideoutSessionController {
   private readonly ballistics: BallisticsSolver;
   private readonly audio: BodycamAudio;
   private readonly weaponRig: WeaponRig;
-  private readonly skeleton: CharacterSkeleton;
+  private skeleton: CharacterSkeleton;
+  private currentOperatorId: OperatorId;
+  private readonly maxAniso: number;
   private readonly animator: CharacterAnimator;
   private readonly controller: BodycamController;
   private readonly postProcess: BodycamPostProcess;
@@ -175,11 +180,25 @@ export class HideoutSessionController {
   private readonly grenadeSystem: TacticalGrenadeSystem;
   private readonly pdaDevice: TacticalPdaDevice;
   private readonly _pdaMotionScratch = createPdaMotionState();
+  private readonly _pdaTelemetryScratch: PdaHudTelemetry = {
+    playerX: 0,
+    playerZ: 0,
+    playerYawRad: 0,
+    gameClockText: '12:00',
+    weatherLabel: 'BUNKER',
+    windSpeedMps: 0.0,
+    windAngleRad: 0.0,
+    modeLabel: 'HIDEOUT',
+    zoneLabel: 'ARSENAL ROOM',
+    pings: HIDEOUT_PDA_MARKERS,
+  };
   private readonly irIlluminatorLight: THREE.SpotLight;
   private readonly irIlluminatorTarget: THREE.Object3D;
   private readonly interactAnimator = new PlayerInteractAnimator();
+  private readonly unsubOperatorId: () => void;
   private readonly unsubOperatorGear: () => void;
   private readonly unsubLoadout: () => void;
+  private readonly unsubOpenWorld: () => void;
 
   private config: BodycamSDKConfig = { ...DEFAULT_BODYCAM_SDK_CONFIG };
   private readonly telemetry: BodycamTelemetry = createBodycamTelemetry();
@@ -474,12 +493,14 @@ export class HideoutSessionController {
     this.weaponRig.flashlight.intensity = 0;
     this.scene.add(this.weaponRig.root);
 
-    const maxAniso = Math.min(8, this.renderer.capabilities.getMaxAnisotropy());
+    this.maxAniso = Math.min(8, this.renderer.capabilities.getMaxAnisotropy());
+    hideoutShardAdapter.syncOperatorRigFromActiveCharacter(true);
     this.localGear = operatorSelectionStore.getGearConfig();
+    this.currentOperatorId = operatorSelectionStore.getSelectedOperator();
     const loadedOp = operatorAssetLoader.loadProceduralOperator(
-      operatorSelectionStore.getSelectedOperator(),
+      this.currentOperatorId,
       {
-        maxAnisotropy: maxAniso,
+        maxAnisotropy: this.maxAniso,
         uniformId: this.localGear.uniformId,
         gear: this.localGear,
         previewMode: false,
@@ -604,8 +625,15 @@ export class HideoutSessionController {
       laserOffset: [...SDK_WEAPON_PROFILES.m4a1.laserOffset],
     };
 
-    // Sync Gun Wall strictly with unlocked/owned weapons & equip persisted weapon
+    // Sync Gun Wall strictly with active character (or classic career) owned weapons
     this.syncOwnedWeapons();
+    this.refreshPdaOpenWorldOverlay();
+
+    // Live M/F skeleton hot-swap when operator body type changes (e.g., switching roster slots)
+    this.unsubOperatorId = operatorSelectionStore.subscribe((nextOpId) => {
+      if (nextOpId === this.currentOperatorId || this.disposed) return;
+      this.rebuildOperatorSkeleton(nextOpId);
+    });
 
     // Live updates when operator gear or Gunsmith attachments change
     this.unsubOperatorGear = operatorSelectionStore.subscribeGear((nextGear) => {
@@ -631,8 +659,17 @@ export class HideoutSessionController {
       // Refresh currently held weapon attachments & Gun Wall mounted builds live
       if (!this.swapChoreography.isActive()) {
         this.applyEquippedWeaponRig(this.equippedWeaponId, false);
-        this.world.syncGunWallSlots(hideoutStateStore.getState().wallRackSlots);
+        this.world.syncGunWallSlots(hideoutShardAdapter.getWallRackSlots());
         this.emitSnapshot(true);
+      }
+    });
+
+    // Live updates when Perimeter Ops character roster, Arsenal Wall, or Bankruptcy status changes
+    this.unsubOpenWorld = hideoutShardAdapter.subscribe(() => {
+      if (this.disposed) return;
+      this.refreshPdaOpenWorldOverlay();
+      if (!this.swapChoreography.isActive()) {
+        this.syncOwnedWeapons();
       }
     });
 
@@ -654,8 +691,55 @@ export class HideoutSessionController {
     this.scheduleNextFrame();
   }
 
+  private rebuildOperatorSkeleton(nextOpId: OperatorId): void {
+    const oldSkeleton = this.skeleton;
+    this.scene.remove(oldSkeleton.root);
+    oldSkeleton.dispose();
+
+    this.currentOperatorId = nextOpId;
+    this.localGear = operatorSelectionStore.getGearConfig();
+    const loadedOp = operatorAssetLoader.loadProceduralOperator(nextOpId, {
+      maxAnisotropy: this.maxAniso,
+      uniformId: this.localGear.uniformId,
+      gear: this.localGear,
+      previewMode: false,
+      validationMode: 'SAFE_FALLBACK',
+    });
+    this.skeleton = loadedOp.skeleton;
+    this.skeleton.setFirstPersonHeadShadowOnly(true);
+    this.skeleton.enableArmViewmodelLayer();
+    this.scene.add(this.skeleton.root);
+    this.animator.setSkeleton(this.skeleton);
+    this.syncBeltEquipmentMesh();
+    this.syncNvgRuntime();
+  }
+
+  private refreshPdaOpenWorldOverlay(): void {
+    const ov = hideoutShardAdapter.getPdaTelemetryOverlay();
+    const t = this._pdaTelemetryScratch;
+    if (ov.active) {
+      t.modeLabel = `PERIMETER · ${ov.shardLabel ?? 'OW'}`;
+      t.characterCallsign = ov.characterCallsign;
+      t.shardLabel = ov.shardLabel;
+      t.factionLabel = ov.factionLabel;
+      t.cashUsd = ov.cashUsd;
+      t.respawnFeeUsd = ov.respawnFeeUsd;
+      t.bankruptcyWarning = ov.bankruptcyWarning;
+      t.bankruptcyText = ov.bankruptcyText;
+    } else {
+      t.modeLabel = 'HIDEOUT';
+      t.characterCallsign = undefined;
+      t.shardLabel = undefined;
+      t.factionLabel = undefined;
+      t.cashUsd = undefined;
+      t.respawnFeeUsd = undefined;
+      t.bankruptcyWarning = false;
+      t.bankruptcyText = undefined;
+    }
+  }
+
   public syncOwnedWeapons(): void {
-    const nextState = hideoutStateStore.syncWithUnlockedCheck(this.callbacks.isWeaponUnlocked);
+    const nextState = hideoutShardAdapter.syncOwnedWeapons(this.callbacks.isWeaponUnlocked);
     this.world.syncGunWallSlots(nextState.wallRackSlots);
     this.applyEquippedWeaponRig(nextState.equippedWeaponId, false);
     this.emitSnapshot(true);
@@ -828,21 +912,23 @@ export class HideoutSessionController {
     let nextId = 'unarmed';
     if (slot === 1) {
       const loadout = loadoutStore.getActiveSlot();
-      nextId = this.callbacks.isWeaponUnlocked(loadout.primaryWeaponId)
+      const classicId = this.callbacks.isWeaponUnlocked(loadout.primaryWeaponId)
         ? loadout.primaryWeaponId
         : 'm4a1';
+      nextId = hideoutShardAdapter.resolveQuickSlotWeaponId(1, classicId);
     } else if (slot === 2) {
       const loadout = loadoutStore.getActiveSlot();
-      nextId = this.callbacks.isWeaponUnlocked(loadout.secondaryWeaponId)
+      const classicId = this.callbacks.isWeaponUnlocked(loadout.secondaryWeaponId)
         ? loadout.secondaryWeaponId
         : 'glock_17';
+      nextId = hideoutShardAdapter.resolveQuickSlotWeaponId(2, classicId);
     }
     if (nextId === this.equippedWeaponId) return;
     this.input.ads = false;
     this.isFiring = false;
     this.semiTriggerConsumed = false;
-    hideoutStateStore.setEquippedWeaponDirect(nextId);
-    this.world.syncGunWallSlots(hideoutStateStore.getState().wallRackSlots);
+    const nextRack = hideoutShardAdapter.setEquippedWeaponDirect(nextId);
+    this.world.syncGunWallSlots(nextRack);
     this.applyEquippedWeaponRig(nextId, true);
     const prof = resolveWeaponProfile(nextId);
     this.showToast(nextId === 'unarmed' ? 'Unarmed (Fists)' : `Equipped ${prof.name}`);
@@ -1008,9 +1094,7 @@ export class HideoutSessionController {
 
   private getActiveAmmoVariant(weaponId = this.equippedWeaponId): AmmoVariantDef {
     const calId = this.getActiveBaseCaliberId(weaponId);
-    const stored = hideoutStateStore.getState().ammoVariantByWeapon[weaponId] as
-      | AmmoVariantId
-      | undefined;
+    const stored = hideoutShardAdapter.getAmmoVariantId(weaponId) as AmmoVariantId | undefined;
     if (stored && AMMO_VARIANTS[stored]?.caliberId === calId) {
       return AMMO_VARIANTS[stored];
     }
@@ -1020,7 +1104,7 @@ export class HideoutSessionController {
   private getZeroDistanceForWeapon(weaponId = this.equippedWeaponId): number {
     if (weaponId === 'unarmed') return 100;
     const base = resolveWeaponProfile(weaponId);
-    const stored = hideoutStateStore.getState().zeroDistanceByWeapon[base.id];
+    const stored = hideoutShardAdapter.getZeroDistance(base.id);
     if (typeof stored === 'number' && Number.isFinite(stored)) return stored;
     const att = loadoutStore.getActiveWeaponBuild(base.id).attachments;
     return att.zeroDistanceM ?? getDefaultZeroDistanceM(base.category);
@@ -1068,7 +1152,7 @@ export class HideoutSessionController {
     const nextIdx = (idx + dir + presets.length) % presets.length;
     const nextDist = presets[nextIdx];
     const prof = resolveWeaponProfile(this.equippedWeaponId);
-    hideoutStateStore.setWeaponZeroDistance(prof.id, nextDist);
+    hideoutShardAdapter.setWeaponZeroDistance(prof.id, nextDist);
     this.syncWeaponBallistics();
     this.weaponRig.triggerTurretClick();
     this.audio.playTurretClick(dir > 0);
@@ -1088,7 +1172,7 @@ export class HideoutSessionController {
     const cur = this.getActiveAmmoVariant(prof.id);
     const curIdx = variants.findIndex((v) => v.id === cur.id);
     const next = variants[(curIdx + 1) % variants.length];
-    hideoutStateStore.setWeaponAmmoVariant(prof.id, next.id);
+    hideoutShardAdapter.setWeaponAmmoVariant(prof.id, next.id);
     this.syncWeaponBallistics();
     this.audio.playWeaponCue('mag_in', { intensity: 0.7 });
     this.showToast(`Ammo Loaded: ${next.label} (${Math.round(next.baseVelocityMs)} m/s)`);
@@ -1131,7 +1215,7 @@ export class HideoutSessionController {
     if (playLidPop) {
       this.world.triggerAmmoCratePop();
     }
-    hideoutStateStore.resupplyAllAmmo();
+    hideoutShardAdapter.resupplyAllAmmo();
     this.reloadTimer = 0;
     this.pendingReloadWeaponId = null;
     if (this.weaponRig.isTubularReloading()) {
@@ -1370,9 +1454,8 @@ export class HideoutSessionController {
         }
       },
       onComplete: (idx, nextEquipped) => {
-        hideoutStateStore.commitRackSwap(idx);
-        const synced = hideoutStateStore.getState();
-        this.world.syncGunWallSlots(synced.wallRackSlots);
+        const swapRes = hideoutShardAdapter.commitRackSwap(idx);
+        this.world.syncGunWallSlots(swapRes.wallRackSlots);
         this.animator.clearExternalHandOverride();
         this.applyEquippedWeaponRig(nextEquipped, false);
         this.weaponRig.root.visible = true;
@@ -1482,6 +1565,10 @@ export class HideoutSessionController {
           this.audio.playGearRattle('weapon_swap', 0.45);
           this.setModalActive(true);
           this.callbacks.onOpenOperatorGear();
+        } else if (chosen.id === 'open_stash_roster') {
+          this.audio.playGearRattle('weapon_swap', 0.45);
+          this.setModalActive(true);
+          this.callbacks.onOpenOpsLaptop('perimeter');
         } else {
           if (this.world.getPropInteractPos('locker_door', this._ikTargetPos)) {
             this.interactAnimator.trigger('PROP_INTERACT', this._ikTargetPos, (out) =>
@@ -1490,7 +1577,7 @@ export class HideoutSessionController {
           }
           const opened = this.world.toggleLockerDoor();
           this.audio.playWeaponCue(opened ? 'bolt_pull' : 'bolt_lock', { intensity: 0.72 });
-          this.showToast('Personal Stash — Coming Soon');
+          this.showToast(opened ? 'Tactical Locker Opened' : 'Tactical Locker Closed');
         }
         break;
       }
@@ -1574,7 +1661,10 @@ export class HideoutSessionController {
           this.interactAnimator.trigger('PROP_INTERACT', this._ikTargetPos);
         }
         this.audio.playWeaponCue('mode_toggle', { intensity: 0.5 });
-        if (chosen.id === 'quick_deploy') {
+        if (chosen.id === 'open_perimeter') {
+          this.setModalActive(true);
+          this.callbacks.onOpenOpsLaptop('perimeter');
+        } else if (chosen.id === 'quick_deploy') {
           this.setModalActive(true);
           this.callbacks.onQuickDeployBattle();
         } else if (chosen.id === 'open_squads') {
@@ -1811,8 +1901,9 @@ export class HideoutSessionController {
 
     if (meta.kind === 'locker_door') {
       const opts: HideoutPromptOption[] = [
-        { id: 'toggle_locker', label: this.world.lockerOpen ? 'Close Locker' : 'Open Locker' },
+        { id: 'open_stash_roster', label: 'Personal Stash & Roster', hint: 'Perimeter Ops' },
         { id: 'operator_gear', label: 'Operator Gear' },
+        { id: 'toggle_locker', label: this.world.lockerOpen ? 'Close Locker' : 'Open Locker' },
       ];
       this.selectedOptionIndex = THREE.MathUtils.clamp(this.selectedOptionIndex, 0, opts.length - 1);
       this.activePrompt = {
@@ -1921,6 +2012,7 @@ export class HideoutSessionController {
         return;
       }
       const opts: HideoutPromptOption[] = [
+        { id: 'open_perimeter', label: 'Perimeter Ops Roster & Shards', hint: '3 Slots · Stash' },
         { id: 'open_ops', label: 'Open Ops Command Terminal', hint: 'Battle · Squads · Ops' },
         { id: 'quick_deploy', label: 'Quick Deploy Staged Match' },
         { id: 'open_squads', label: 'Squads & Multiplayer Lobbies' },
@@ -2227,7 +2319,7 @@ export class HideoutSessionController {
         ) {
           const prof = resolveWeaponProfile(this.equippedWeaponId);
           const curMag = this.magAmmoByWeapon[prof.id] ?? prof.magCapacity;
-          const reserve = hideoutStateStore.getReserveForWeapon(prof.id);
+          const reserve = hideoutShardAdapter.getReserveForWeapon(prof.id);
           if (curMag < prof.magCapacity && reserve > 0) {
             const needed = Math.min(prof.magCapacity - curMag, reserve);
             if (prof.holdClass === 'shotgun' && prof.fireMode === 'pump') {
@@ -2236,7 +2328,7 @@ export class HideoutSessionController {
                 curMag === 0,
                 () => {
                   if (this.equippedWeaponId !== prof.id) return;
-                  const took = hideoutStateStore.consumeReserve(prof.id, 1);
+                  const took = hideoutShardAdapter.consumeReserve(prof.id, 1);
                   if (took > 0) {
                     const nextAmmo = Math.min(
                       prof.magCapacity,
@@ -2528,7 +2620,7 @@ export class HideoutSessionController {
             const rProf = resolveWeaponProfile(reloadId);
             const curMag = this.magAmmoByWeapon[rProf.id] ?? 0;
             const needed = Math.max(0, rProf.magCapacity - curMag);
-            const taken = hideoutStateStore.consumeReserve(rProf.id, needed);
+            const taken = hideoutShardAdapter.consumeReserve(rProf.id, needed);
             if (taken > 0) {
               const nextAmmo = curMag + taken;
               this.magAmmoByWeapon[rProf.id] = nextAmmo;
@@ -2572,19 +2664,13 @@ export class HideoutSessionController {
         this.animator.setExternalHandOverride(null);
       }
 
-      // Update 3D Tactical PDA before IK animator consumes wrist sockets
-      this.pdaDevice.setTelemetry({
-        playerX: this.controller.position.x,
-        playerZ: this.controller.position.z,
-        playerYawRad: this.controller.aimYaw,
-        gameClockText: '12:00',
-        weatherLabel: 'BUNKER',
-        windSpeedMps: 0.0,
-        windAngleRad: 0.0,
-        modeLabel: 'HIDEOUT',
-        zoneLabel: this.currentRoomLabel.toUpperCase(),
-        pings: HIDEOUT_PDA_MARKERS,
-      });
+      // Update 3D Tactical PDA before IK animator consumes wrist sockets (zero-GC scratch reuse)
+      const pdaTel = this._pdaTelemetryScratch;
+      pdaTel.playerX = this.controller.position.x;
+      pdaTel.playerZ = this.controller.position.z;
+      pdaTel.playerYawRad = this.controller.aimYaw;
+      pdaTel.zoneLabel = this.currentRoomLabel.toUpperCase();
+      this.pdaDevice.setTelemetry(pdaTel);
       this.controller.writePdaMotionState(this._pdaMotionScratch);
       this.pdaDevice.update(
         dt,
@@ -2712,7 +2798,7 @@ export class HideoutSessionController {
       fireModeLabel: this.getFireModeLabel(prof),
       ammoInMag,
       magCapacity: this.equippedWeaponId === 'unarmed' ? 0 : prof.magCapacity,
-      ammoReserve: hideoutStateStore.getReserveForWeapon(this.equippedWeaponId),
+      ammoReserve: hideoutShardAdapter.getReserveForWeapon(this.equippedWeaponId),
       grenadeDrawn: this.grenadeSystem.isDrawn(),
       grenadeHoldStage: this.grenadeSystem.getHoldStage(),
       grenadeName: grenadeDef.shortName,
@@ -2765,8 +2851,10 @@ export class HideoutSessionController {
     this.renderer.domElement.removeEventListener('webglcontextlost', this.onContextLost);
     this.renderer.domElement.removeEventListener('webglcontextrestored', this.onContextRestored);
 
+    this.unsubOperatorId();
     this.unsubOperatorGear();
     this.unsubLoadout();
+    this.unsubOpenWorld();
     this.camera.remove(this.pdaDevice.root);
     this.pdaDevice.dispose();
     this.grenadeSystem.dispose();

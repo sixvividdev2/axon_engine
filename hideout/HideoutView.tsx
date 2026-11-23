@@ -19,6 +19,7 @@ import { HideoutHud } from './HideoutHud';
 import { HideoutOpsLaptopModal, OpsLaptopTabId } from './HideoutOpsLaptopModal';
 import { ReadyRoomBriefingState } from './HideoutReadyRoom';
 import { HideoutSessionController, HideoutSnapshot } from './HideoutSessionController';
+import { useHideoutShardAdapter } from '../src/modes/openworld';
 
 interface HideoutViewProps {
   battleConfig: BattleMatchConfig;
@@ -60,6 +61,7 @@ export const HideoutView: React.FC<HideoutViewProps> = ({
   const { selection: tacticalSelection } = useTacticalEquipmentSelection();
   const loadoutState = useLoadoutStore();
   const activeLoadout = loadoutState.slots[loadoutState.activeIndex] ?? loadoutState.slots[0];
+  const openWorldSnap = useHideoutShardAdapter();
 
   const containerRef = useRef<HTMLDivElement | null>(null);
   const controllerRef = useRef<HideoutSessionController | null>(null);
@@ -135,6 +137,7 @@ export const HideoutView: React.FC<HideoutViewProps> = ({
       lobbyCode: lobby?.code ?? null,
       lobbyMembersCount: lobby?.members.length ?? 0,
       lobbyMaxPlayers: lobby?.maxPlayers ?? 0,
+      openWorldCharacter: openWorldSnap.readyRoomSummary,
     };
   }, [
     battleConfig,
@@ -145,6 +148,7 @@ export const HideoutView: React.FC<HideoutViewProps> = ({
     lobby?.code,
     lobby?.members.length,
     lobby?.maxPlayers,
+    openWorldSnap.readyRoomSummary,
   ]);
 
   const briefingRef = useRef(readyRoomBriefing);
