@@ -3,7 +3,9 @@ import {
   ActiveSmokeCloudInfo,
   ArticulatedRagdoll,
   BodycamAudio,
+  BodycamRaycastResult,
   BodycamWeaponWeightClass,
+  createRaycastResult,
   GYM_ARMORY_WEAPONS,
   IBodycamWorldAdapter,
   resolveWeaponProfile,
@@ -107,6 +109,8 @@ export interface BotPlayerDamageEvent {
   attackerName: string;
   attackerId: string;
   attackerTeam: BattleTeamId;
+  weaponId?: string;
+  caliberId?: string;
 }
 
 export interface BattleHumanTarget {
@@ -554,6 +558,8 @@ interface BotActor {
   targetLean: number;
   netLean: number;
   postureEvalTimer: number;
+  wallObstruction01: number;
+  beltWallTuck01: number;
 
   vaultActive: boolean;
   vaultKind: VaultKind;
@@ -641,6 +647,7 @@ export class BattleBotAI {
   private readonly coopInfectionMode: boolean;
   private readonly localAllyTeam: BattleTeamId;
   private readonly worldAdapter: IBodycamWorldAdapter | null;
+  private readonly worldOnlyAdapter: IBodycamWorldAdapter;
   private readonly vaultDetector = new VaultDetector();
   private readonly _vaultCandidate: VaultCandidate = createVaultCandidate();
   private isClientReplica: boolean;
@@ -677,6 +684,10 @@ export class BattleBotAI {
   private readonly _tmpMid = new THREE.Vector3();
   private readonly _tmpToTarget = new THREE.Vector3();
   private readonly _tmpUp = new THREE.Vector3(0, 1, 0);
+  private readonly _wallProbeOrigin = new THREE.Vector3();
+  private readonly _wallProbeDir = new THREE.Vector3();
+  private readonly _wallProbeRight = new THREE.Vector3();
+  private readonly _wallRayOut: BodycamRaycastResult = createRaycastResult();
   private readonly _poseScratch: TacticalCombatPose = {
     crouchBlend: 0,
     leanBlend: 0,
@@ -694,6 +705,8 @@ export class BattleBotAI {
     vaultBlend: 0,
     vaultProgress: 0,
     vaultKind: 'VAULT_OVER',
+    wallObstruction01: 0,
+    beltWallTuck01: 0,
   };
 
   constructor(
@@ -710,7 +723,8 @@ export class BattleBotAI {
     this.rule = rule;
     this.coopInfectionMode = Boolean(tuning?.coopInfectionMode);
     this.localAllyTeam = tuning?.localAllyTeam ?? 'A';
-    this.worldAdapter = tuning?.worldAdapter ?? map.physics.createAdapter();
+    this.worldOnlyAdapter = map.physics.createAdapter();
+    this.worldAdapter = tuning?.worldAdapter ?? this.worldOnlyAdapter;
     const baseDiff = DIFFICULTY_TABLE[difficulty];
     const accMult = Math.max(0.25, Math.min(2.5, tuning?.aiAccuracyMult ?? 1.0));
     const spdMult = Math.max(0.5, Math.min(2.0, tuning?.aiMoveSpeedMult ?? 1.0));
@@ -911,6 +925,8 @@ export class BattleBotAI {
         targetLean: 0,
         netLean: 0,
         postureEvalTimer: Math.random() * 0.25,
+        wallObstruction01: 0,
+        beltWallTuck01: 0,
         vaultActive: false,
         vaultKind: 'VAULT_OVER',
         vaultStartPos: new THREE.Vector3(),
@@ -984,6 +1000,9 @@ export class BattleBotAI {
     for (let i = 0; i < this.bots.length; i++) {
       const b = this.bots[i];
       if (!b.alive) continue;
+      for (let j = 0; j < b.rig.beltHitMeshes.length; j++) {
+        this.activeHitMeshes.push(b.rig.beltHitMeshes[j]);
+      }
       for (let j = 0; j < b.hitMeshes.length; j++) {
         this.activeHitMeshes.push(b.hitMeshes[j]);
       }
@@ -1148,6 +1167,82 @@ export class BattleBotAI {
       total,
       bot.alive && total > 0 && bot.grenadeStage === 'HOLSTERED',
     );
+    this.rebuildActiveHitMeshes();
+  }
+
+  public consumeBotBeltGrenade(
+    botId: string,
+    preferredId?: TacticalEquipmentId,
+  ): TacticalEquipmentId | null {
+    const bot = this.bots.find((b) => b.id === botId);
+    if (!bot || !bot.alive) return null;
+
+    let chosen: TacticalEquipmentId | null = null;
+    if (preferredId && (bot.grenadePouch[preferredId] ?? 0) > 0) {
+      chosen = preferredId;
+    } else if ((bot.grenadePouch[bot.primaryGrenadeId] ?? 0) > 0) {
+      chosen = bot.primaryGrenadeId;
+    } else {
+      for (const id of ['m67_frag', 'm84_flash', 'm18_smoke', 'an_m14_thermite'] as TacticalEquipmentId[]) {
+        if ((bot.grenadePouch[id] ?? 0) > 0) {
+          chosen = id;
+          break;
+        }
+      }
+    }
+    if (!chosen) return null;
+
+    bot.grenadePouch[chosen] = Math.max(0, (bot.grenadePouch[chosen] ?? 0) - 1);
+    this.syncBotBeltGrenade(bot);
+    return chosen;
+  }
+
+  private updateBotWallClearance(bot: BotActor, dt: number, aimPitch: number): void {
+    const fx = -Math.sin(bot.yaw);
+    const fz = -Math.cos(bot.yaw);
+    const rx = Math.cos(bot.yaw);
+    const rz = -Math.sin(bot.yaw);
+
+    // 1) Forward weapon barrel obstruction probe -> CQB weapon pullback so AI rifles never poke through walls
+    const barrelReach =
+      bot.weaponClass === 'pistol'
+        ? 0.60
+        : 0.96 + (bot.suppressed ? 0.14 : 0);
+    const chestY = bot.pos.y + 1.32 - bot.crouchBlend * 0.38;
+    let targetWallObs = 0;
+
+    this._wallProbeDir.set(fx, Math.sin(aimPitch) * 0.45, fz).normalize();
+    this._wallProbeOrigin.set(bot.pos.x - fx * 0.08, chestY, bot.pos.z - fz * 0.08);
+    if (
+      this.worldOnlyAdapter.raycast(
+        this._wallProbeOrigin,
+        this._wallProbeDir,
+        0.02,
+        barrelReach + 0.12,
+        this._wallRayOut,
+      )
+    ) {
+      targetWallObs = THREE.MathUtils.clamp((barrelReach + 0.08 - this._wallRayOut.distance) / 0.42, 0, 1);
+    }
+
+    // 2) Short 4-way waist probe -> pulls belt & belt grenades inward when pressed flush against walls
+    const beltY = bot.pos.y + 0.90 - bot.crouchBlend * 0.34;
+    let minBeltDist = 0.36;
+    this._wallProbeRight.set(rx, 0, rz);
+    for (let d = 0; d < 4; d++) {
+      this._wallProbeOrigin.set(bot.pos.x, beltY, bot.pos.z);
+      if (d === 0) this._wallProbeDir.set(fx, 0, fz);
+      else if (d === 1) this._wallProbeDir.set(-fx, 0, -fz);
+      else if (d === 2) this._wallProbeDir.copy(this._wallProbeRight);
+      else this._wallProbeDir.copy(this._wallProbeRight).negate();
+      if (this.worldOnlyAdapter.raycast(this._wallProbeOrigin, this._wallProbeDir, 0.02, 0.36, this._wallRayOut)) {
+        if (this._wallRayOut.distance < minBeltDist) minBeltDist = this._wallRayOut.distance;
+      }
+    }
+    const targetBeltTuck = THREE.MathUtils.clamp((0.33 - minBeltDist) / 0.16, 0, 1);
+
+    bot.wallObstruction01 = THREE.MathUtils.damp(bot.wallObstruction01, targetWallObs, 18, dt);
+    bot.beltWallTuck01 = THREE.MathUtils.damp(bot.beltWallTuck01, targetBeltTuck, 18, dt);
   }
 
   public setBotGrenadeListener(listener: ((ev: BotGrenadeEvent) => void) | null): void {
@@ -2988,9 +3083,12 @@ export class BattleBotAI {
         }
         pose.handlingAction = bot.netHandlingAction;
         pose.handlingProgress = bot.netHandlingProgress;
+        this.updateBotWallClearance(bot, dt, 0);
         pose.grenadeEquipmentId = bot.netGrenadeEquipId;
         pose.grenadeCharge01 = bot.netGrenadeCharge01;
         pose.grenadeThrowStyle = bot.netGrenadeThrowStyle;
+        pose.wallObstruction01 = bot.wallObstruction01;
+        pose.beltWallTuck01 = bot.beltWallTuck01;
 
         bot.bodyPivot.rotation.set(0, 0, 0);
         bot.bodyPivot.position.set(0, 0, 0);
@@ -3142,6 +3240,8 @@ export class BattleBotAI {
         pose.vaultKind = bot.vaultKind;
         pose.handlingAction = 'NONE';
         pose.handlingProgress = 0;
+        pose.wallObstruction01 = 0;
+        pose.beltWallTuck01 = 0;
 
         bot.bodyPivot.rotation.set(0, 0, 0);
         bot.bodyPivot.position.set(0, 0, 0);
@@ -3969,9 +4069,12 @@ export class BattleBotAI {
         pose.handlingAction = 'NONE';
         pose.handlingProgress = 0;
       }
+      this.updateBotWallClearance(bot, dt, aimPitch);
       pose.grenadeEquipmentId = bot.grenadeEquipId;
       pose.grenadeCharge01 = bot.grenadeCharge01;
       pose.grenadeThrowStyle = bot.grenadeThrowStyle;
+      pose.wallObstruction01 = bot.wallObstruction01;
+      pose.beltWallTuck01 = bot.beltWallTuck01;
 
       bot.bodyPivot.rotation.set(0, 0, 0);
       bot.bodyPivot.position.set(0, 0, 0);
@@ -4489,6 +4592,8 @@ export class BattleBotAI {
           attackerName: shooter.name,
           attackerId: shooter.id,
           attackerTeam: shooter.team,
+          weaponId: shooter.weaponId,
+          caliberId: spec.caliberId,
         });
       }
     }

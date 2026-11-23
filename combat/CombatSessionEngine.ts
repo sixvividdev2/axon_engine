@@ -59,7 +59,9 @@ import {
   resolveBaseCaliberId,
 } from '../data/calibers';
 import {
+  computeBeltGrenadeDetonationChance,
   getTacticalEquipmentDef,
+  isTacticalEquipmentId,
   TacticalBeltSlot,
   TacticalEquipmentId,
 } from '../data/tacticalEquipment';
@@ -438,6 +440,22 @@ export class CombatSessionEngine {
   private readonly playerMoveSpeedMult: number = 1.0;
   private readonly _tmpImpactPoint = new THREE.Vector3();
   private readonly _tmpImpactDir = new THREE.Vector3();
+  private readonly _meleeSphereRight = new THREE.Vector3();
+  private readonly _meleeSphereUp = new THREE.Vector3();
+  private readonly _meleeSphereOrigin = new THREE.Vector3();
+  private readonly _meleeSphereWorldUp = new THREE.Vector3(0, 1, 0);
+  private readonly _meleeSphereFallbackRight = new THREE.Vector3(1, 0, 0);
+  private readonly _meleeSphereScratch: BodycamRaycastResult = createRaycastResult();
+  private readonly _remoteWallRayScratch: BodycamRaycastResult = createRaycastResult();
+  private readonly _localBeltGrenadePos = new THREE.Vector3();
+  private worldOnlyRaycastFn:
+    | ((
+        origin: Readonly<THREE.Vector3>,
+        dir: Readonly<THREE.Vector3>,
+        near: number,
+        far: number,
+      ) => number)
+    | null = null;
 
   private config: BodycamSDKConfig = { ...DEFAULT_BODYCAM_SDK_CONFIG };
   private readonly _runtimeConfig: BodycamSDKConfig = { ...DEFAULT_BODYCAM_SDK_CONFIG };
@@ -1129,6 +1147,65 @@ export class CombatSessionEngine {
       return hitWorld;
     };
 
+    this.worldOnlyRaycastFn = (origin, dir, near, far) => {
+      if (base.raycast(origin, dir, near, far, this._remoteWallRayScratch)) {
+        return this._remoteWallRayScratch.distance;
+      }
+      return Infinity;
+    };
+
+    const volumetricMeleeSpherecast = (
+      origin: Readonly<THREE.Vector3>,
+      direction: Readonly<THREE.Vector3>,
+      radius: number,
+      maxDistance: number,
+      outResult: BodycamRaycastResult,
+    ): boolean => {
+      this._meleeSphereRight.crossVectors(direction as THREE.Vector3, this._meleeSphereWorldUp);
+      if (this._meleeSphereRight.lengthSq() < 1e-4) {
+        this._meleeSphereRight.crossVectors(direction as THREE.Vector3, this._meleeSphereFallbackRight);
+      }
+      this._meleeSphereRight.normalize();
+      this._meleeSphereUp.crossVectors(this._meleeSphereRight, direction as THREE.Vector3).normalize();
+
+      const ringR = Math.max(0.02, radius * 0.72);
+      let bestDist = Infinity;
+      let found = false;
+
+      for (let i = 0; i < 7; i++) {
+        this._meleeSphereOrigin.copy(origin);
+        if (i > 0) {
+          const ang = ((i - 1) / 6) * Math.PI * 2;
+          this._meleeSphereOrigin.addScaledVector(this._meleeSphereRight, Math.cos(ang) * ringR);
+          this._meleeSphereOrigin.addScaledVector(this._meleeSphereUp, Math.sin(ang) * ringR);
+        }
+        if (raycastWithActors(this._meleeSphereOrigin, direction, 0.01, maxDistance, this._meleeSphereScratch)) {
+          const effDist = i === 0 ? this._meleeSphereScratch.distance - 0.035 : this._meleeSphereScratch.distance;
+          if (effDist < bestDist) {
+            bestDist = effDist;
+            found = true;
+            outResult.hit = true;
+            outResult.distance = this._meleeSphereScratch.distance;
+            outResult.pointX = this._meleeSphereScratch.pointX;
+            outResult.pointY = this._meleeSphereScratch.pointY;
+            outResult.pointZ = this._meleeSphereScratch.pointZ;
+            outResult.normalX = this._meleeSphereScratch.normalX;
+            outResult.normalY = this._meleeSphereScratch.normalY;
+            outResult.normalZ = this._meleeSphereScratch.normalZ;
+            outResult.surface = this._meleeSphereScratch.surface;
+            outResult.object = this._meleeSphereScratch.object;
+          }
+        }
+      }
+
+      if (!found) {
+        outResult.hit = false;
+        outResult.distance = Infinity;
+        outResult.object = null;
+      }
+      return found;
+    };
+
     return {
       sweepCapsule: (startPos, dx, dy, dz, radius, height, maxStepUpM, outResult) => {
         base.sweepCapsule(startPos, dx, dy, dz, radius, height, maxStepUpM, outResult);
@@ -1156,8 +1233,7 @@ export class CombatSessionEngine {
         ? (x, y, z, out) => base.sampleInterior!(x, y, z, out)
         : undefined,
       getTraumaModifiers: () => this.getActiveTraumaModifiers(),
-      meleeSpherecast: (origin, direction, _radius, maxDistance, outResult) =>
-        raycastWithActors(origin, direction, 0.05, maxDistance, outResult),
+      meleeSpherecast: volumetricMeleeSpherecast,
       onMeleeHit: (ev) => this.handleMeleeHit(ev),
       shatterBreakable: (obj, pt, dir) => this.handleWorldGlassShatter(obj, pt, dir),
     };
@@ -1631,6 +1707,17 @@ export class CombatSessionEngine {
         attackerTeam,
         pkt.senderUserId,
       );
+      if (this.playerAlive) {
+        const estEnergyJ = this.estimateEnergyFromWeaponOrDamage(pkt.weaponId, undefined, pkt.damage);
+        this.tryRollLocalBeltGrenadeImpact(
+          pkt.senderUsername ?? 'OPERATOR',
+          attackerTeam,
+          pkt.senderUserId,
+          false,
+          estEnergyJ,
+          pkt.hitZone === 'belt_grenade',
+        );
+      }
 
       // If this remote hit eliminated us, broadcast authoritative kill event so killer & scoreboard update
       if (prevAlive && !this.playerAlive) {
@@ -1776,6 +1863,10 @@ export class CombatSessionEngine {
       if (!this.playerAlive || this.gameOver || this.matchOutcome !== 'active') return;
       const prevAlive = this.playerAlive;
       this.applyPlayerDamage(pkt.damage, pkt.botName, pkt.botTeam, pkt.botId);
+      if (this.playerAlive) {
+        const estEnergyJ = this.estimateEnergyFromWeaponOrDamage(undefined, undefined, pkt.damage);
+        this.tryRollLocalBeltGrenadeImpact(pkt.botName, pkt.botTeam, pkt.botId, true, estEnergyJ, false);
+      }
       if (prevAlive && !this.playerAlive) {
         const killPkt: GamePlayerKillPacket = {
           type: 'game:kill',
@@ -2401,6 +2492,64 @@ export class CombatSessionEngine {
     );
   }
 
+  private estimateEnergyFromWeaponOrDamage(
+    weaponId?: string,
+    caliberId?: string,
+    damage = 16,
+  ): number {
+    const cal = (caliberId ?? (weaponId ? resolveWeaponProfile(weaponId).defaultCaliberId : '') ?? '').toLowerCase();
+    if (cal.includes('50') || cal.includes('338')) return 4800;
+    if (cal.includes('762x51') || cal.includes('308') || cal.includes('12ga')) return 3200;
+    if (cal.includes('762x39') || cal.includes('556') || cal.includes('545')) return 1800;
+    if (cal.includes('45') || cal.includes('10mm') || cal.includes('357')) return 720;
+    if (cal.includes('9x19') || cal.includes('9mm')) return 520;
+    return THREE.MathUtils.clamp(damage * 95, 320, 3400);
+  }
+
+  private tryRollLocalBeltGrenadeImpact(
+    attackerName: string,
+    attackerTeam: BattleTeamId | undefined,
+    attackerId: string | undefined,
+    isBot: boolean,
+    estimatedEnergyJ: number,
+    directBeltHit: boolean,
+  ): void {
+    if (!this.playerAlive || !this.tacticalMountOnBelt || this.grenadeCount <= 0) return;
+    // Direct belt-grenade hit always checks detonation; incoming body shots have a waist-belt strike chance
+    if (!directBeltHit && Math.random() > 0.13) return;
+
+    const eqId = this.tacticalEquipmentId;
+    const detChance = computeBeltGrenadeDetonationChance(estimatedEnergyJ);
+    const detonated = Math.random() < detChance;
+
+    this.grenadeCount = Math.max(0, this.grenadeCount - 1);
+    this.syncBeltEquipmentMesh();
+
+    if (!this.skeleton.getBeltGrenadeWorldPosition(this._localBeltGrenadePos)) {
+      this._localBeltGrenadePos.set(
+        this.controller.position.x,
+        this.controller.position.y + 0.92,
+        this.controller.position.z,
+      );
+    }
+
+    if (detonated) {
+      this.grenadeSystem.detonateImmediately(eqId, this._localBeltGrenadePos, {
+        isRemote: true,
+        sourceIsBot: isBot,
+        sourceId: attackerId,
+        sourceName: attackerName,
+        sourceTeam: attackerTeam,
+      });
+      this.showToast(`BELT ${getTacticalEquipmentDef(eqId).shortName} SHOT — DETONATION!`, 2.8);
+    } else {
+      this.grenadeSystem.spawnBeltDudSpark(this._localBeltGrenadePos);
+      this.audio.playImpact(this._localBeltGrenadePos, 'steel_plate');
+      this.showToast('Belt Grenade Struck · Disabled', 2.2);
+    }
+    this.emitSnapshot();
+  }
+
   private replenishInfectionRoundGrenade(): void {
     const def = getTacticalEquipmentDef(this.tacticalEquipmentId);
     if (this.grenadeCount < def.maxCarry) {
@@ -2794,6 +2943,46 @@ export class CombatSessionEngine {
         return;
       }
       const hitZone = String(ud.hitZone ?? 'thorax');
+      if (hitZone === 'belt_grenade') {
+        const poppedEq =
+          this.remotePlayers.consumeRemoteBeltGrenade(targetUserId) ??
+          (isTacticalEquipmentId(ud.beltGrenadeEquipmentId) ? ud.beltGrenadeEquipmentId : 'm67_frag');
+        const detChance = computeBeltGrenadeDetonationChance(ev.impactEnergyJ, ev.ammo?.coreType);
+        const detonated = Math.random() < detChance;
+
+        this.hitmarkerTimer = detonated ? 0.28 : 0.18;
+        this.hitmarkerHeadshot = detonated;
+        this.hitmarkerKill = false;
+        this.remotePlayers.triggerHitFlinch(targetUserId);
+
+        if (detonated) {
+          this.grenadeSystem.detonateImmediately(poppedEq, ev.point, {
+            sourceId: `human:${this.mp.localUserId}`,
+            sourceName: this.mp.localUsername,
+            sourceTeam: this.localBattleTeam,
+            sourceIsBot: false,
+          });
+          this.showToast(`BELT ${getTacticalEquipmentDef(poppedEq).shortName} DETONATED!`, 2.4);
+          const hitPkt: GamePlayerHitPacket = {
+            type: 'game:hit',
+            targetUserId,
+            damage: poppedEq === 'm67_frag' ? 120 : poppedEq === 'an_m14_thermite' ? 45 : 18,
+            hitZone: 'belt_grenade',
+            headshot: false,
+            weaponId: poppedEq,
+            weaponName: `${getTacticalEquipmentDef(poppedEq).shortName} BELT COOK-OFF`,
+            ts: Date.now(),
+          };
+          this.mp.sendMessage(hitPkt as unknown as Record<string, unknown>);
+        } else {
+          this.grenadeSystem.spawnBeltDudSpark(ev.point);
+          this.audio.playImpact(ev.point, 'steel_plate');
+          this.showToast('Belt Grenade Shot · Disabled', 1.8);
+        }
+        this.emitSnapshot();
+        return;
+      }
+
       const headshot = hitZone === 'head';
       const zoneMult = headshot ? 2.1 : hitZone === 'limb' ? 0.72 : 1.0;
       const damage = Math.max(1, Math.min(250, Math.round(this.computeWeaponBaseDamage(ev) * zoneMult)));
@@ -2827,6 +3016,47 @@ export class CombatSessionEngine {
       const botId = String(ud.actorId);
       const hitZone = String(ud.hitZone ?? 'thorax');
       const baseDmg = this.computeWeaponBaseDamage(ev);
+
+      // Shootable physical belt grenade: caliber/energy-scaled live cook-off OR metallic spark dud
+      if (hitZone === 'belt_grenade') {
+        const botInfo = this.botAI.getBotInfo(botId);
+        if (!botInfo || !botInfo.alive) return;
+        if (
+          this.params.mode === 'battle' &&
+          this.params.battleConfig.rule === 'tdm' &&
+          botInfo.team === this.localBattleTeam
+        ) {
+          return;
+        }
+        const preferredEq = isTacticalEquipmentId(ud.beltGrenadeEquipmentId)
+          ? ud.beltGrenadeEquipmentId
+          : undefined;
+        const poppedEq =
+          this.botAI.consumeBotBeltGrenade(botId, preferredEq) ?? preferredEq ?? 'm67_frag';
+        const detChance = computeBeltGrenadeDetonationChance(ev.impactEnergyJ, ev.ammo?.coreType);
+        const detonated = Math.random() < detChance;
+
+        this.hitmarkerTimer = detonated ? 0.28 : 0.18;
+        this.hitmarkerHeadshot = detonated;
+        this.hitmarkerKill = false;
+        this.botAI.triggerVisualFlinch(botId);
+
+        if (detonated) {
+          this.grenadeSystem.detonateImmediately(poppedEq, ev.point, {
+            sourceId: this.mp ? `human:${this.mp.localUserId}` : 'player',
+            sourceName: this.mp?.localUsername ?? 'YOU',
+            sourceTeam: this.localBattleTeam,
+            sourceIsBot: false,
+          });
+          this.showToast(`BELT ${getTacticalEquipmentDef(poppedEq).shortName} DETONATED!`, 2.4);
+        } else {
+          this.grenadeSystem.spawnBeltDudSpark(ev.point);
+          this.audio.playImpact(ev.point, 'steel_plate');
+          this.showToast('Belt Grenade Shot · Disabled', 1.8);
+        }
+        this.emitSnapshot();
+        return;
+      }
 
       if (this.mp && !this.isMpHost) {
         const info = this.botAI.getBotInfo(botId);
@@ -5364,7 +5594,7 @@ export class CombatSessionEngine {
         }
       }
 
-      this.remotePlayers.update(dt, this.camera.position);
+      this.remotePlayers.update(dt, this.camera.position, this.worldOnlyRaycastFn ?? undefined);
     }
 
     // Step map animated fixtures, physical destructible doors & dynamic 5x weather/day-night system
@@ -5484,6 +5714,21 @@ export class CombatSessionEngine {
                 dmgEv.attackerTeam,
                 dmgEv.attackerId,
               );
+              if (this.playerAlive) {
+                const estEnergyJ = this.estimateEnergyFromWeaponOrDamage(
+                  dmgEv.weaponId,
+                  dmgEv.caliberId,
+                  dmgEv.damage,
+                );
+                this.tryRollLocalBeltGrenadeImpact(
+                  dmgEv.attackerName,
+                  dmgEv.attackerTeam,
+                  dmgEv.attackerId,
+                  true,
+                  estEnergyJ,
+                  false,
+                );
+              }
             } else if (this.mp && this.isMpHost) {
               const hitPkt: GameBotHitPlayerPacket = {
                 type: 'game:bot_hit_player',

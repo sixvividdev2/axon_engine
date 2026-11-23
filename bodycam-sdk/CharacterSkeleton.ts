@@ -519,13 +519,13 @@ export class CharacterSkeleton {
     const buckleMesh = new THREE.Mesh(this.geo(createRoundedPouchGeo(0.048, 0.036, 0.014, 0.006)), this.hardwareMat);
     buckleMesh.position.set(0, 0.052, -0.105 * p.pelvisDepthScale);
 
-    const dumpPouch = new THREE.Mesh(this.geo(createRoundedPouchGeo(0.088, 0.115, 0.034, 0.016)), this.pouchMat);
+    const dumpPouch = new THREE.Mesh(this.geo(createRoundedPouchGeo(0.084, 0.112, 0.030, 0.014)), this.pouchMat);
     dumpPouch.rotation.y = Math.PI * 0.5;
-    dumpPouch.position.set(-0.165 * p.pelvisWidthScale, -0.02, 0.01);
+    dumpPouch.position.set(-0.148 * p.pelvisWidthScale, -0.02, 0.01);
 
-    const holster = new THREE.Mesh(this.geo(createRoundedPouchGeo(0.078, 0.135, 0.028, 0.014)), this.hardwareMat);
+    const holster = new THREE.Mesh(this.geo(createRoundedPouchGeo(0.074, 0.132, 0.026, 0.013)), this.hardwareMat);
     holster.rotation.y = -Math.PI * 0.5;
-    holster.position.set(0.165 * p.pelvisWidthScale, -0.04, -0.005);
+    holster.position.set(0.148 * p.pelvisWidthScale, -0.04, -0.005);
 
     this.pelvis.add(pelvisMesh, beltMesh, buckleMesh, dumpPouch, holster);
 
@@ -2469,6 +2469,29 @@ export class CharacterSkeleton {
     visible: boolean;
   }> {
     return this.beltEquipmentState;
+  }
+
+  /**
+   * Gently compresses the mounted belt equipment inward toward the waist centerline
+   * when the operator backs or leans flush against a wall so belt grenades never clip.
+   */
+  public setBeltWallTuck(tuck01: number): void {
+    const t = THREE.MathUtils.clamp(tuck01, 0, 1);
+    const radialScale = 1 - t * 0.24;
+    this.beltEquipmentMount.scale.set(radialScale, 1, radialScale);
+  }
+
+  /**
+   * Copies the world position of the first mounted belt grenade into `out`.
+   * Returns false if no belt grenades are mounted/visible.
+   */
+  public getBeltGrenadeWorldPosition(out: THREE.Vector3): boolean {
+    if (!this.beltEquipmentMount.visible || this.beltEquipmentMeshes.length === 0) {
+      return false;
+    }
+    this.beltEquipmentMeshes[0].group.updateMatrixWorld(true);
+    this.beltEquipmentMeshes[0].group.getWorldPosition(out);
+    return true;
   }
 
   public dispose(): void {

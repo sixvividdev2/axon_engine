@@ -88,6 +88,10 @@ export interface TacticalCombatPose {
   grenadeCharge01?: number;
   /** Active grenade throw posture ('overhand' | 'underhand') */
   grenadeThrowStyle?: 'overhand' | 'underhand';
+  /** 0..1 forward wall/door obstruction compressing 3P weapon into CQB retention */
+  wallObstruction01?: number;
+  /** 0..1 waist wall proximity compressing belt equipment radially inward */
+  beltWallTuck01?: number;
 }
 
 export interface BuiltTacticalOperatorRig {
@@ -107,6 +111,7 @@ export interface BuiltTacticalOperatorRig {
   laserBeam: THREE.Mesh;
   flashlightGlow: THREE.Mesh;
   hitMeshes: THREE.Mesh[];
+  beltHitMeshes: THREE.Mesh[];
   applyUniform: (uniformId: OperatorUniformId) => void;
   applyCombatPose: (pose: TacticalCombatPose) => void;
   resetRagdollPose: () => void;
@@ -576,10 +581,10 @@ export class TacticalOperatorRigFactory {
     buckle.position.set(0, 0.06, -0.112 * pelvisD);
 
     const dumpPouch = makeMesh(this.geoDumpPouch, 'pouch');
-    dumpPouch.position.set(-0.168 * pelvisW, -0.01, 0.01);
+    dumpPouch.position.set(-0.148 * pelvisW, -0.01, 0.01);
 
     const holster = makeMesh(this.geoHolster, 'hardware');
-    holster.position.set(0.168 * pelvisW, -0.03, -0.005);
+    holster.position.set(0.148 * pelvisW, -0.03, -0.005);
 
     pelvisGroup.add(pelvisMesh, beltMesh, buckle, dumpPouch, holster);
 
@@ -588,6 +593,15 @@ export class TacticalOperatorRigFactory {
     beltEquipmentMount.name = 'belt_tactical_equipment_slot';
     pelvisGroup.add(beltEquipmentMount);
     const beltBuiltItems: BuiltTacticalEquipmentMesh[] = [];
+    const beltHitMeshes: THREE.Mesh[] = [];
+    const beltHitGeo = new THREE.SphereGeometry(0.056, 8, 8);
+    const beltHitMat = new THREE.MeshBasicMaterial({
+      transparent: true,
+      opacity: 0,
+      colorWrite: false,
+      depthWrite: false,
+    });
+    this.disposables.push(beltHitGeo, beltHitMat);
 
     const setBeltEquipment = (
       equipmentId: TacticalEquipmentId,
@@ -600,6 +614,7 @@ export class TacticalOperatorRigFactory {
         beltBuiltItems[i].dispose();
       }
       beltBuiltItems.length = 0;
+      beltHitMeshes.length = 0;
       if (!visible || count <= 0) {
         beltEquipmentMount.visible = false;
         return;
@@ -612,6 +627,22 @@ export class TacticalOperatorRigFactory {
         const tf = transforms[i];
         built.group.position.set(tf.position[0], tf.position[1], tf.position[2]);
         built.group.rotation.set(tf.rotation[0], tf.rotation[1], tf.rotation[2]);
+
+        // Dedicated shootable ballistic hit-proxy centered on each physical belt grenade
+        const hitProxy = new THREE.Mesh(beltHitGeo, beltHitMat);
+        hitProxy.name = `belt_grenade_hit_${i}`;
+        hitProxy.position.set(0, -0.015, 0);
+        hitProxy.userData = {
+          combatActorType: actorType,
+          actorId,
+          hitZone: 'belt_grenade',
+          surfaceMaterial: 'metal',
+          beltGrenadeEquipmentId: equipmentId,
+          beltGrenadeIndex: i,
+        };
+        built.group.add(hitProxy);
+        beltHitMeshes.push(hitProxy);
+
         beltEquipmentMount.add(built.group);
         beltBuiltItems.push(built);
       }
@@ -626,6 +657,7 @@ export class TacticalOperatorRigFactory {
           beltBuiltItems[i].dispose();
         }
         beltBuiltItems.length = 0;
+        beltHitMeshes.length = 0;
       },
     });
 
@@ -1339,6 +1371,11 @@ export class TacticalOperatorRigFactory {
       pelvisGroup.position.set(0, vaultPelvisY, 0);
       pelvisGroup.rotation.set(-kickThrust * 0.14, 0, 0);
 
+      // Compress belt-mounted gear slightly inward when pressed against nearby walls/doors
+      const beltTuck = THREE.MathUtils.clamp(pose.beltWallTuck01 ?? 0, 0, 1);
+      const beltScaleXZ = 1 - beltTuck * 0.24;
+      beltEquipmentMount.scale.set(beltScaleXZ, 1, beltScaleXZ);
+
       const hAct: SyncedHandlingAction =
         pose.handlingAction && pose.handlingAction !== 'NONE'
           ? pose.handlingAction
@@ -1449,6 +1486,15 @@ export class TacticalOperatorRigFactory {
         wepYaw = THREE.MathUtils.lerp(wepYaw, -0.22, vaultW);
       }
 
+      // CQB wall-obstruction compression: pulls rifle back into high-ready/chest retention so barrels never poke through walls
+      const wallObs = THREE.MathUtils.clamp(pose.wallObstruction01 ?? 0, 0, 1) * (1 - vaultW);
+      if (wallObs > 0.005 && !isGrenadeAct) {
+        wx = THREE.MathUtils.lerp(wx, 0.115 * torsoW, wallObs);
+        wy = THREE.MathUtils.lerp(wy, 0.255, wallObs);
+        wz = THREE.MathUtils.lerp(wz, 0.055, wallObs);
+        wepYaw = THREE.MathUtils.lerp(wepYaw, 0.42, wallObs);
+      }
+
       const recoilZKick = recoil * 0.045 + Math.abs(pose.firingVibration) * 0.35;
       const recoilPitchKick = recoil * 0.095 + pose.firingVibration;
       const cantRollRad = effPointAim * 0.61 + effCant * 0.70;
@@ -1456,12 +1502,18 @@ export class TacticalOperatorRigFactory {
       const reloadRollOffset = effReload * 0.38 + suppEnv * 0.30 + inspectEnv * 0.55;
       const vaultWepPitch = -vaultW * 0.48;
       const vaultWepRoll = -vaultW * 0.28;
+      const wallPitchOffset = wallObs * 0.86;
+      const wallRollOffset = wallObs * 0.16;
 
       weaponSocket.position.set(wx, wy, wz + recoilZKick);
       weaponSocket.rotation.set(
-        pitch * (1 - vaultW) * (1 - suppEnv * 0.7) + recoilPitchKick + reloadPitchOffset + vaultWepPitch,
+        pitch * (1 - vaultW) * (1 - suppEnv * 0.7) * (1 - wallObs * 0.82) +
+          recoilPitchKick +
+          reloadPitchOffset +
+          vaultWepPitch +
+          wallPitchOffset,
         wepYaw,
-        cantRollRad + reloadRollOffset + vaultWepRoll,
+        cantRollRad + reloadRollOffset + vaultWepRoll + wallRollOffset,
       );
       weaponPivot.position.set(0, 0, 0);
       weaponPivot.rotation.set(0, 0, 0);
@@ -1882,6 +1934,7 @@ export class TacticalOperatorRigFactory {
       laserBeam,
       flashlightGlow,
       hitMeshes,
+      beltHitMeshes,
       applyUniform,
       applyCombatPose,
       resetRagdollPose,

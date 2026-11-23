@@ -1459,7 +1459,7 @@ export class WeaponRig {
       }
     }
 
-    // 4. Physical Wall Pullback Raycast parameterized by weapon barrel length + weight class
+    // 4. Physical Wall Pullback Multi-Ray Envelope (prevents barrel, suppressor & handguard clipping)
     this.root.updateMatrixWorld(true);
     this.shoulderAnchor.getWorldPosition(this._shoulderWorld);
     this._barrelDir
@@ -1470,19 +1470,64 @@ export class WeaponRig {
 
     const effectiveBarrelLenM =
       this.derivedStats.barrelLengthM > 0 ? this.derivedStats.barrelLengthM : spec.barrelLengthM;
-    const triggerDist = Math.min(1.24, (effectiveBarrelLenM + 0.24) * config.wallPullbackScale);
-    const hit = adapter.raycast(this._shoulderWorld, this._barrelDir, 0.08, triggerDist + 0.05, this._rayHit);
-    const wallDist = hit ? this._rayHit.distance : 999;
-    const pullbackSpan = 0.34 + effectiveBarrelLenM * 0.14;
+    const backStepM = 0.14;
+    const triggerDist = Math.min(1.32, (effectiveBarrelLenM + 0.30) * config.wallPullbackScale);
+    const probeMax = triggerDist + backStepM + 0.05;
+
+    // Build orthonormal lateral/vertical offsets around barrel axis (zero GC via _camCenterDir & _tmpEuler)
+    const bx = this._barrelDir.x;
+    const by = this._barrelDir.y;
+    const bz = this._barrelDir.z;
+    let rx = -bz;
+    let rz = bx;
+    const rLen = Math.hypot(rx, rz);
+    if (rLen > 1e-4) {
+      rx /= rLen;
+      rz /= rLen;
+    } else {
+      rx = 1;
+      rz = 0;
+    }
+
+    let hit = false;
+    let wallDist = 999;
+    let bestHitY = this._shoulderWorld.y;
+    let bestHitNormalY = 0;
+    const offsets: ReadonlyArray<[number, number]> = [
+      [0, 0],
+      [0.065, 0],
+      [-0.065, 0],
+      [0, -0.055],
+    ];
+    for (let i = 0; i < offsets.length; i++) {
+      const ox = offsets[i][0];
+      const oy = offsets[i][1];
+      this._camCenterDir.set(
+        this._shoulderWorld.x - bx * backStepM + rx * ox,
+        this._shoulderWorld.y - by * backStepM + oy,
+        this._shoulderWorld.z - bz * backStepM + rz * ox,
+      );
+      if (adapter.raycast(this._camCenterDir, this._barrelDir, 0.02, probeMax, this._rayHit)) {
+        const effDist = Math.max(0, this._rayHit.distance - backStepM);
+        if (effDist < wallDist) {
+          wallDist = effDist;
+          hit = true;
+          bestHitY = this._rayHit.pointY;
+          bestHitNormalY = this._rayHit.normalY;
+        }
+      }
+    }
+
+    const pullbackSpan = 0.32 + effectiveBarrelLenM * 0.14;
     let targetPullback =
       wallDist < triggerDist
         ? THREE.MathUtils.clamp((triggerDist - wallDist) / pullbackSpan, 0, 1)
         : 0;
 
     if (hit && targetPullback > 0) {
-      const hitBelowShoulder = this._shoulderWorld.y - this._rayHit.pointY;
-      if (this._rayHit.normalY > 0.65 && this._barrelDir.y < -0.20) {
-        const floorFade = THREE.MathUtils.clamp((0.82 - this._rayHit.normalY) / 0.17, 0, 1);
+      const hitBelowShoulder = this._shoulderWorld.y - bestHitY;
+      if (bestHitNormalY > 0.65 && this._barrelDir.y < -0.20) {
+        const floorFade = THREE.MathUtils.clamp((0.82 - bestHitNormalY) / 0.17, 0, 1);
         targetPullback *= floorFade;
       } else if (this._barrelDir.y < -0.25 && hitBelowShoulder > 0.28) {
         const downFade = THREE.MathUtils.clamp((-0.25 - this._barrelDir.y) / 0.23, 0, 1);
@@ -1492,7 +1537,7 @@ export class WeaponRig {
     if (this.vaultRetentionBlend > 0.05) {
       targetPullback *= 1 - this.vaultRetentionBlend;
     }
-    this.pullbackRatio = THREE.MathUtils.damp(this.pullbackRatio, targetPullback, 16, dt);
+    this.pullbackRatio = THREE.MathUtils.damp(this.pullbackRatio, targetPullback, 20, dt);
 
     // 5. Evaluate Pose Graph + exact sightAnchor ADS + Bore-Anchored Point Aim convergence + mechanical gun animation
     const isPistol = spec.weightClass === 'pistol';

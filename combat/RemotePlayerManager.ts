@@ -90,6 +90,9 @@ interface RemoteOperator {
   laserOn: boolean;
   hasInitialState: boolean;
   gearSig: string;
+  wallObstruction01: number;
+  beltWallTuck01: number;
+  beltGrenadeCount: number;
 
   // Unified Tactical 3D Rig
   rig: BuiltTacticalOperatorRig;
@@ -142,6 +145,9 @@ export class RemotePlayerManager {
   private readonly _tmpStart = new THREE.Vector3();
   private readonly _tmpEnd = new THREE.Vector3();
   private readonly _tmpSoundPos = new THREE.Vector3();
+  private readonly _wallProbeOrigin = new THREE.Vector3();
+  private readonly _wallProbeDir = new THREE.Vector3();
+  private readonly _wallProbeRight = new THREE.Vector3();
   private readonly _poseScratch: TacticalCombatPose = {
     crouchBlend: 0,
     leanBlend: 0,
@@ -158,6 +164,8 @@ export class RemotePlayerManager {
     flinchPitch: 0,
     handlingAction: 'NONE',
     handlingProgress: 0,
+    wallObstruction01: 0,
+    beltWallTuck01: 0,
   };
 
   constructor(
@@ -397,6 +405,9 @@ export class RemotePlayerManager {
       laserOn: false,
       hasInitialState: false,
       gearSig: '',
+      wallObstruction01: 0,
+      beltWallTuck01: 0,
+      beltGrenadeCount: 1,
 
       rig,
       nameSprite,
@@ -680,6 +691,8 @@ export class RemotePlayerManager {
     op.targetHandlingProgress = 0;
     op.grenadeCharge01 = 0;
     op.grenadeThrowStyle = 'overhand';
+    op.beltGrenadeCount = 1;
+    op.rig.setBeltEquipment(op.grenadeEquipmentId, 'front_left', 1, true);
     op.hasInitialState = true;
     if (
       pkt.glovesEnabled !== undefined ||
@@ -703,6 +716,14 @@ export class RemotePlayerManager {
       }
     }
     op.rig.root.visible = true;
+  }
+
+  public consumeRemoteBeltGrenade(userId: string): TacticalEquipmentId | null {
+    const op = this.players.get(userId);
+    if (!op || !op.alive || op.beltGrenadeCount <= 0) return null;
+    op.beltGrenadeCount = Math.max(0, op.beltGrenadeCount - 1);
+    op.rig.setBeltEquipment(op.grenadeEquipmentId, 'front_left', op.beltGrenadeCount, op.beltGrenadeCount > 0);
+    return op.grenadeEquipmentId;
   }
 
   public triggerHitFlinch(userId: string): void {
@@ -754,7 +775,16 @@ export class RemotePlayerManager {
     tr.mesh.visible = true;
   }
 
-  public update(dt: number, localCameraPos: Readonly<THREE.Vector3>): void {
+  public update(
+    dt: number,
+    localCameraPos: Readonly<THREE.Vector3>,
+    worldRaycastDist?: (
+      origin: Readonly<THREE.Vector3>,
+      dir: Readonly<THREE.Vector3>,
+      near: number,
+      far: number,
+    ) => number,
+  ): void {
     // Update pooled tracers
     for (let i = 0; i < this.tracers.length; i++) {
       const tr = this.tracers[i];
@@ -862,6 +892,49 @@ export class RemotePlayerManager {
         op.handlingProgress = 0;
       }
 
+      // 3P Weapon & Belt anti-clipping probe against world geometry (zero-GC)
+      let targetWallObs = 0;
+      let targetBeltTuck = 0;
+      if (worldRaycastDist) {
+        const fx = -Math.sin(op.curYaw);
+        const fz = -Math.cos(op.curYaw);
+        const rx = Math.cos(op.curYaw);
+        const rz = -Math.sin(op.curYaw);
+        const chestY = op.curPos.y + 1.32 - op.crouchBlend * 0.38;
+        const prof = resolveWeaponProfile(op.weaponId || 'm4a1');
+        const barrelReach =
+          prof.holdClass === 'unarmed'
+            ? 0
+            : prof.holdClass === 'pistol'
+              ? 0.62
+              : 0.96 + (op.suppressed ? 0.14 : 0);
+
+        if (barrelReach > 0) {
+          this._wallProbeDir.set(fx, Math.sin(op.curPitch) * 0.45, fz).normalize();
+          this._wallProbeOrigin.set(op.curPos.x - fx * 0.08, chestY, op.curPos.z - fz * 0.08);
+          const distCenter = worldRaycastDist(this._wallProbeOrigin, this._wallProbeDir, 0.02, barrelReach + 0.12);
+          if (distCenter < barrelReach + 0.08) {
+            targetWallObs = THREE.MathUtils.clamp((barrelReach + 0.08 - distCenter) / 0.42, 0, 1);
+          }
+        }
+
+        const beltY = op.curPos.y + 0.90 - op.crouchBlend * 0.34;
+        let minBeltDist = 0.36;
+        this._wallProbeRight.set(rx, 0, rz);
+        for (let d = 0; d < 4; d++) {
+          this._wallProbeOrigin.set(op.curPos.x, beltY, op.curPos.z);
+          if (d === 0) this._wallProbeDir.set(fx, 0, fz);
+          else if (d === 1) this._wallProbeDir.set(-fx, 0, -fz);
+          else if (d === 2) this._wallProbeDir.copy(this._wallProbeRight);
+          else this._wallProbeDir.copy(this._wallProbeRight).negate();
+          const bDist = worldRaycastDist(this._wallProbeOrigin, this._wallProbeDir, 0.02, 0.36);
+          if (bDist < minBeltDist) minBeltDist = bDist;
+        }
+        targetBeltTuck = THREE.MathUtils.clamp((0.33 - minBeltDist) / 0.16, 0, 1);
+      }
+      op.wallObstruction01 = THREE.MathUtils.damp(op.wallObstruction01, targetWallObs, 18, dt);
+      op.beltWallTuck01 = THREE.MathUtils.damp(op.beltWallTuck01, targetBeltTuck, 18, dt);
+
       // Unified grounded crouch knees, local weaponSocket shoulder mount, Point Aim cant, and 2-bone arm IK
       const pose = this._poseScratch;
       pose.crouchBlend = op.crouchBlend;
@@ -882,6 +955,8 @@ export class RemotePlayerManager {
       pose.grenadeEquipmentId = op.grenadeEquipmentId;
       pose.grenadeCharge01 = op.grenadeCharge01;
       pose.grenadeThrowStyle = op.grenadeThrowStyle;
+      pose.wallObstruction01 = op.wallObstruction01;
+      pose.beltWallTuck01 = op.beltWallTuck01;
       rig.applyCombatPose(pose);
 
       // Muzzle flash, laser & tactical light
@@ -910,6 +985,9 @@ export class RemotePlayerManager {
     this.activeHitMeshes.length = 0;
     for (const op of this.players.values()) {
       if (!op.hasInitialState || !op.alive) continue;
+      for (let i = 0; i < op.rig.beltHitMeshes.length; i++) {
+        this.activeHitMeshes.push(op.rig.beltHitMeshes[i]);
+      }
       for (let i = 0; i < op.rig.hitMeshes.length; i++) {
         this.activeHitMeshes.push(op.rig.hitMeshes[i]);
       }

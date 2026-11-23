@@ -1771,6 +1771,28 @@ export class TacticalGrenadeSystem {
     return ev;
   }
 
+  /**
+   * Immediately detonates a tactical grenade at a world position (e.g. when a physical
+   * grenade mounted on an operator's or bot's belt is shot and cooks off).
+   */
+  public detonateImmediately(
+    equipmentId: TacticalEquipmentId,
+    position: Readonly<THREE.Vector3>,
+    meta?: GrenadeRemoteAttribution,
+  ): GrenadeDetonationEvent {
+    const def = getTacticalEquipmentDef(equipmentId);
+    const pos = new THREE.Vector3(position.x, position.y, position.z);
+    return this.detonateAt(def, pos, meta);
+  }
+
+  /**
+   * Emits a crisp metallic ricochet spark burst when a smaller caliber disables
+   * a belt-mounted grenade without triggering detonation.
+   */
+  public spawnBeltDudSpark(position: Readonly<THREE.Vector3>): void {
+    this.spawnExplosionVfx(position, 0xfbbf24, 0xfff3c4, 4.5, 0.32, 0.65, 0.22, 10);
+  }
+
   private spawnExplosionVfx(
     pos: Readonly<THREE.Vector3>,
     coreHex: number,

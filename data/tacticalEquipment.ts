@@ -200,3 +200,34 @@ export function normalizeTacticalBeltSlot(value: unknown): TacticalBeltSlot {
 export function getTacticalEquipmentDef(id: unknown): TacticalEquipmentDef {
   return TACTICAL_EQUIPMENT_CATALOG[normalizeTacticalEquipmentId(id)];
 }
+
+/**
+ * Compute detonation probability [0.12 .. 0.96] when a physical grenade mounted on
+ * an operator's waist belt is struck by a bullet. Any caliber can set off a live fuse
+ * or sympathetic detonation, while heavier rifle / magnum / shotgun energies and
+ * AP / incendiary / tracer rounds scale sharply higher.
+ */
+export function computeBeltGrenadeDetonationChance(
+  impactEnergyJ: number,
+  ammoCategory?: string,
+): number {
+  const energy = Math.max(0, Number.isFinite(impactEnergyJ) ? impactEnergyJ : 550);
+  // Smooth energy curve:
+  // ~140 J (.22LR) -> ~18%, ~480 J (9mm) -> ~30%, ~1750 J (5.56) -> ~58%,
+  // ~3300 J (7.62x51 / 12ga slug) -> ~79%, ~4800+ J (.338 / .50) -> ~92%+
+  let chance = 0.14 + (1 - Math.exp(-energy / 2450)) * 0.80;
+
+  if (ammoCategory) {
+    const cat = ammoCategory.toLowerCase();
+    if (cat.includes('incendiary') || cat.includes('dragon') || cat.includes('tracer')) {
+      chance += 0.18;
+    } else if (cat.includes('ap') || cat.includes('armor') || cat.includes('slug') || cat.includes('magnum')) {
+      chance += 0.10;
+    } else if (cat.includes('subsonic') || cat.includes('hp') || cat.includes('frangible')) {
+      chance -= 0.04;
+    }
+  }
+
+  return Math.max(0.12, Math.min(0.96, chance));
+}
+

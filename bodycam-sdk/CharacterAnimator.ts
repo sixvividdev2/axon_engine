@@ -177,6 +177,32 @@ export class CharacterAnimator {
   private readonly _kickAnkleTarget = new THREE.Vector3();
   private readonly _kickPoleTarget = new THREE.Vector3();
 
+  // Zero-GC kick full-swing sweep, angled-surface slide & close-wall leg clearance buffers
+  private kickPrevBootValid = false;
+  private kickContactActive = false;
+  private kickSlideAccum = 0;
+  private kickLastImpactFrac = 1;
+  private leftWallPullback = 0;
+  private rightWallPullback = 0;
+  private beltWallTuck = 0;
+  private readonly _kickPrevBootWorld = new THREE.Vector3();
+  private readonly _kickCurrBootWorld = new THREE.Vector3();
+  private readonly _kickHipWorld = new THREE.Vector3();
+  private readonly _kickSweepDir = new THREE.Vector3();
+  private readonly _kickContactNormal = new THREE.Vector3();
+  private readonly _kickTangent = new THREE.Vector3();
+  private readonly _kickSlideOffsetWorld = new THREE.Vector3();
+  private readonly _kickClampedAnkleWorld = new THREE.Vector3();
+  private readonly _legRayOrigin = new THREE.Vector3();
+  private readonly _legRayDir = new THREE.Vector3();
+  private readonly _legWorldTarget = new THREE.Vector3();
+  private readonly _legRootForward = new THREE.Vector3();
+  private readonly _legRootRight = new THREE.Vector3();
+  private readonly _legRayHit: BodycamRaycastResult = createRaycastResult();
+  private readonly _kickHitA: BodycamRaycastResult = createRaycastResult();
+  private readonly _kickHitB: BodycamRaycastResult = createRaycastResult();
+  private readonly _meleeHorizDir = new THREE.Vector3();
+
   // Pre-allocated scratch math objects (zero GC per frame)
   private readonly _shoulderR = new THREE.Vector3();
   private readonly _shoulderL = new THREE.Vector3();
@@ -393,6 +419,11 @@ export class CharacterAnimator {
     this.combatTime = 0;
     this.hitstopTimer = 0;
     this.combatHitEvaluated = false;
+    this.kickPrevBootValid = false;
+    this.kickContactActive = false;
+    this.kickSlideAccum = 0;
+    this.kickLastImpactFrac = 1;
+    this._kickSlideOffsetWorld.set(0, 0, 0);
   }
 
   public setUnarmedGuardHeld(held: boolean): void {
@@ -491,6 +522,11 @@ export class CharacterAnimator {
     this.combatDuration = 0.58 / Math.max(0.55, speedMult);
     this.combatHitEvaluated = false;
     this.kickPlantSoundFired = false;
+    this.kickPrevBootValid = false;
+    this.kickContactActive = false;
+    this.kickSlideAccum = 0;
+    this.kickLastImpactFrac = 1;
+    this._kickSlideOffsetWorld.set(0, 0, 0);
     this.hitstopTimer = 0;
     this.comboWindowTimer = 0;
 
@@ -1003,8 +1039,8 @@ export class CharacterAnimator {
         targetCamRoll = -0.070 * kickCamEnv - 0.012 * thrustExtra;
         targetCamYaw = 0.035 * thrustExtra;
 
-        // Peak kick hit window (0.28–0.38): evaluate spherecast until solid contact or window closes
-        if (!this.combatHitEvaluated && p >= 0.28 && p <= 0.38) {
+        // Full-swing kick hit window (0.12–0.44): evaluate aimed bundle continuously through thrust arc until contact
+        if (!this.combatHitEvaluated && p >= 0.12 && p <= 0.44) {
           const hit = this.performCombatSpherecast('kick', controller, adapter, trauma);
           if (hit) {
             this.combatHitEvaluated = true;
@@ -1025,6 +1061,11 @@ export class CharacterAnimator {
 
         if (p >= 1) {
           this.combatMove = 'NONE';
+          this.kickPrevBootValid = false;
+          this.kickContactActive = false;
+          this.kickSlideAccum = 0;
+          this.kickLastImpactFrac = 1;
+          this._kickSlideOffsetWorld.set(0, 0, 0);
         }
       }
     }
@@ -1049,55 +1090,84 @@ export class CharacterAnimator {
       this._meleeDir.y = THREE.MathUtils.clamp(this._meleeDir.y, -0.73, 0.46);
       this._meleeDir.normalize();
       const originDrop = THREE.MathUtils.lerp(
-        0.24,
-        0.08,
+        0.34,
+        0.16,
         Math.min(1, Math.abs(this._meleeDir.y) * 1.4),
       );
+      // Back-stepped origin (-0.12m) ensures flush chest-to-door kicks NEVER start past the door slab
       this._meleeOrigin.set(
-        controller.position.x + this._meleeDir.x * 0.14,
+        controller.position.x - this._meleeDir.x * 0.12,
         eyeY - originDrop,
-        controller.position.z + this._meleeDir.z * 0.14,
+        controller.position.z - this._meleeDir.z * 0.12,
       );
     } else {
       this._meleeOrigin.set(
-        controller.position.x + this._meleeDir.x * 0.12,
+        controller.position.x + this._meleeDir.x * 0.08,
         eyeY - 0.04,
-        controller.position.z + this._meleeDir.z * 0.12,
+        controller.position.z + this._meleeDir.z * 0.08,
       );
     }
 
     const radius =
-      attackType === 'kick' ? 0.22 : attackType === 'bash' ? 0.16 : 0.14;
-    // Reach measured past front chest hull (Jab 0.58m, Cross 0.68m, Bash 0.85m, Kick 1.12m)
+      attackType === 'kick' ? 0.24 : attackType === 'bash' ? 0.16 : 0.14;
+    // Reach measured from origin (kick starts 0.12m behind center -> +0.42m compensates so full boot reach ~1.16m ahead)
     const reachM =
       attackType === 'kick'
-        ? 1.12 + 0.28
+        ? 1.16 + 0.36
         : attackType === 'bash'
-          ? 0.85 + 0.24
+          ? 0.85 + 0.28
           : attackType === 'cross'
-            ? 0.68 + 0.32
-            : 0.58 + 0.32;
+            ? 0.68 + 0.36
+            : 0.58 + 0.36;
 
-    const hit = this.queryMeleeSpherecast(adapter, this._meleeOrigin, this._meleeDir, radius, reachM);
+    let hit = this.queryMeleeSpherecast(adapter, this._meleeOrigin, this._meleeDir, radius, reachM);
+
+    // Secondary horizontal waist-height door/torso thrust fallback when kicking while pitched steeply up/down
+    if (!hit && attackType === 'kick' && Math.abs(this._meleeDir.y) > 0.22) {
+      this._meleeHorizDir.set(this._meleeDir.x, -0.04, this._meleeDir.z);
+      if (this._meleeHorizDir.lengthSq() > 1e-4) {
+        this._meleeHorizDir.normalize();
+        this._meleeOrigin.set(
+          controller.position.x - this._meleeHorizDir.x * 0.12,
+          controller.position.y + controller.getStepSmoothOffsetY() + 0.96 - this.crouchBlend * 0.28,
+          controller.position.z - this._meleeHorizDir.z * 0.12,
+        );
+        hit = this.queryMeleeSpherecast(adapter, this._meleeOrigin, this._meleeHorizDir, 0.24, 1.38);
+        if (hit) {
+          this._meleeDir.copy(this._meleeHorizDir);
+        }
+      }
+    }
+
     if (!hit) return false;
+    return this.dispatchMeleeHit(attackType, controller, adapter, trauma, this._meleeOrigin, this._meleeDir);
+  }
 
+  private dispatchMeleeHit(
+    attackType: BodycamMeleeAttackType,
+    controller: BodycamController,
+    adapter: IBodycamWorldAdapter,
+    trauma: Readonly<BodycamTraumaModifiers> | undefined,
+    origin: Readonly<THREE.Vector3>,
+    direction: Readonly<THREE.Vector3>,
+  ): boolean {
     const out = this._meleeBestOut;
     const hitZone = resolveHitZone(out.object, out.surface);
     const isActor = isActorHitZone(hitZone);
 
     // Well-placed center alignment check (~30° cone -> cos(30°) = 0.866)
     this._meleeHitVec.set(
-      out.pointX - this._meleeOrigin.x,
+      out.pointX - origin.x,
       0,
-      out.pointZ - this._meleeOrigin.z,
+      out.pointZ - origin.z,
     );
     let wellPlaced = true;
     if (this._meleeHitVec.lengthSq() > 1e-4) {
       this._meleeHitVec.normalize();
-      const horizDirLen = Math.hypot(this._meleeDir.x, this._meleeDir.z);
+      const horizDirLen = Math.hypot(direction.x, direction.z);
       if (horizDirLen > 1e-4) {
         const dot =
-          (this._meleeDir.x * this._meleeHitVec.x + this._meleeDir.z * this._meleeHitVec.z) /
+          (direction.x * this._meleeHitVec.x + direction.z * this._meleeHitVec.z) /
           horizDirLen;
         wellPlaced = dot >= 0.866;
       }
@@ -1106,7 +1176,7 @@ export class CharacterAnimator {
     // Shatter intact breakable window glass immediately on punch/bash/kick impact
     if (hitZone === 'glass' && out.object) {
       this._meleeEvent.point.set(out.pointX, out.pointY, out.pointZ);
-      this._meleeEvent.direction.copy(this._meleeDir);
+      this._meleeEvent.direction.copy(direction);
       const shattered = adapter.shatterBreakable?.(
         out.object,
         this._meleeEvent.point,
@@ -1126,7 +1196,16 @@ export class CharacterAnimator {
     ev.hitZone = hitZone;
     ev.object = out.object;
     ev.point.set(out.pointX, out.pointY, out.pointZ);
-    ev.direction.copy(this._meleeDir);
+    ev.direction.copy(direction);
+    // Preserve strong horizontal thrust for door kicks even when player aims steeply up/down
+    if (attackType === 'kick' && hitZone === 'door') {
+      const hx = ev.direction.x;
+      const hz = ev.direction.z;
+      const hLen = Math.hypot(hx, hz);
+      if (hLen > 1e-4) {
+        ev.direction.set(hx / hLen, THREE.MathUtils.clamp(ev.direction.y * 0.35, -0.25, 0.25), hz / hLen).normalize();
+      }
+    }
     ev.normal.set(out.normalX, out.normalY, out.normalZ);
     ev.surface = out.surface;
     ev.wellPlaced = wellPlaced;
@@ -1211,7 +1290,7 @@ export class CharacterAnimator {
         this._meleeRayOrigin.addScaledVector(this._meleeUp, Math.sin(ang) * ringR);
       }
 
-      if (adapter.raycast(this._meleeRayOrigin, direction, 0.02, maxDistance, this._meleeRayOut)) {
+      if (adapter.raycast(this._meleeRayOrigin, direction, 0.01, maxDistance, this._meleeRayOut)) {
         const effDist = i === 0 ? this._meleeRayOut.distance - 0.035 : this._meleeRayOut.distance;
         if (effDist < bestDist) {
           bestDist = effDist;
@@ -1486,7 +1565,252 @@ export class CharacterAnimator {
         THREE.MathUtils.lerp(this.skeleton.rightLeg.boot.rotation.y, bootYawY, blend),
         0,
       );
+
+      // === FULL-SWING BOOT TRAJECTORY SWEEP + PHYSICAL KICK COLLISION ARREST & ANGLED-SURFACE SLIDE ===
+      this._kickHipWorld.copy(this._hipR).applyMatrix4(this.skeleton.root.matrixWorld);
+      this._kickCurrBootWorld.copy(this._ankleR).applyMatrix4(this.skeleton.root.matrixWorld);
+
+      // 1) Physical boot trajectory sweep for full-swing kick detection (catches targets crossed mid-swing)
+      if (!this.combatHitEvaluated && p >= 0.12 && p <= 0.44) {
+        let sweptHit = false;
+        if (this.kickPrevBootValid) {
+          this._kickSweepDir.subVectors(this._kickCurrBootWorld, this._kickPrevBootWorld);
+          const segLen = this._kickSweepDir.length();
+          if (segLen > 0.015) {
+            this._kickSweepDir.divideScalar(segLen);
+            // Back up slightly behind previous boot sample and extend past toe-tip
+            this._legRayOrigin.copy(this._kickPrevBootWorld).addScaledVector(this._kickSweepDir, -0.06);
+            sweptHit = this.queryMeleeSpherecast(
+              adapter,
+              this._legRayOrigin,
+              this._kickSweepDir,
+              0.16,
+              segLen + 0.24,
+            );
+          }
+        }
+        if (!sweptHit) {
+          this._kickSweepDir.subVectors(this._kickCurrBootWorld, this._kickHipWorld);
+          const legReach = this._kickSweepDir.length();
+          if (legReach > 0.05) {
+            this._kickSweepDir.divideScalar(legReach);
+            this._legRayOrigin.copy(this._kickHipWorld).addScaledVector(this._kickSweepDir, -0.08);
+            sweptHit = this.queryMeleeSpherecast(
+              adapter,
+              this._legRayOrigin,
+              this._kickSweepDir,
+              0.18,
+              legReach + 0.26,
+            );
+          }
+        }
+        if (sweptHit) {
+          this.combatHitEvaluated = true;
+          this.dispatchMeleeHit('kick', controller, adapter, trauma, this._legRayOrigin, this._kickSweepDir);
+        }
+      }
+
+      // 2) Physical leg / boot / knee world anti-clipping during kick with angled-surface tangent slide
+      this._kickSweepDir.subVectors(this._kickCurrBootWorld, this._kickHipWorld);
+      const desiredLegDist = this._kickSweepDir.length();
+      const soleClearanceM = 0.155;
+      const hipBackstepM = 0.08;
+      let collided = false;
+      let bestHitDist = Infinity;
+      let activeHit: BodycamRaycastResult | null = null;
+
+      if (desiredLegDist > 0.04) {
+        this._kickSweepDir.divideScalar(desiredLegDist);
+        const maxProbeDist = hipBackstepM + desiredLegDist + soleClearanceM;
+
+        // Primary hip-to-ankle probe
+        this._legRayOrigin.copy(this._kickHipWorld).addScaledVector(this._kickSweepDir, -hipBackstepM);
+        if (adapter.raycast(this._legRayOrigin, this._kickSweepDir, 0.01, maxProbeDist, this._kickHitA)) {
+          bestHitDist = this._kickHitA.distance;
+          activeHit = this._kickHitA;
+          collided = true;
+        }
+        // Secondary slightly lower sole-edge probe so low curbs/door bottoms never clip boot toes
+        this._legRayOrigin.y -= 0.055;
+        if (
+          adapter.raycast(this._legRayOrigin, this._kickSweepDir, 0.01, maxProbeDist, this._kickHitB) &&
+          this._kickHitB.distance < bestHitDist
+        ) {
+          bestHitDist = this._kickHitB.distance;
+          activeHit = this._kickHitB;
+          collided = true;
+        }
+      }
+
+      if (collided && activeHit) {
+        this._kickContactNormal.set(activeHit.normalX, activeHit.normalY, activeHit.normalZ);
+        if (this._kickContactNormal.lengthSq() > 1e-4) {
+          this._kickContactNormal.normalize();
+        } else {
+          this._kickContactNormal.copy(this._kickSweepDir).negate();
+        }
+
+        // Stop boot flush outside surface with sole clearance
+        const clampedRayDist = Math.max(0.08, bestHitDist - hipBackstepM - soleClearanceM);
+        const penetrationRatio = THREE.MathUtils.clamp(
+          (desiredLegDist - clampedRayDist) / Math.max(0.12, desiredLegDist),
+          0,
+          1,
+        );
+        this._kickClampedAnkleWorld
+          .copy(this._kickHipWorld)
+          .addScaledVector(this._kickSweepDir, clampedRayDist)
+          .addScaledVector(this._kickContactNormal, 0.025);
+
+        // Angled surface glance/slide: when impact is oblique (|dot| < 0.85), slide slightly along surface tangent
+        const ndot = this._kickSweepDir.dot(this._kickContactNormal);
+        const absNdot = Math.abs(ndot);
+        if (absNdot < 0.85 && p < 0.50) {
+          this._kickTangent
+            .copy(this._kickSweepDir)
+            .addScaledVector(this._kickContactNormal, -ndot);
+          const tLen = this._kickTangent.length();
+          if (tLen > 1e-4) {
+            this._kickTangent.divideScalar(tLen);
+            const thrustMomentum = p < 0.36 ? 1.0 : 1 - smoothstep(0.36, 0.50, p);
+            const targetSlide = Math.min(0.15, (0.85 - absNdot) * 0.24 * (0.45 + penetrationRatio * 0.55) * thrustMomentum);
+            this.kickSlideAccum = THREE.MathUtils.damp(this.kickSlideAccum, targetSlide, 18, dt);
+            this._kickSlideOffsetWorld.copy(this._kickTangent).multiplyScalar(this.kickSlideAccum);
+            this._kickClampedAnkleWorld.add(this._kickSlideOffsetWorld);
+          }
+        } else {
+          this.kickSlideAccum = THREE.MathUtils.damp(this.kickSlideAccum, 0, 14, dt);
+          this._kickSlideOffsetWorld.multiplyScalar(Math.exp(-14 * dt));
+        }
+
+        // Convert clamped world ankle back to root local space
+        this.skeleton.root.worldToLocal(this._kickClampedAnkleWorld);
+        this._ankleR.copy(this._kickClampedAnkleWorld);
+
+        // Pull knee pole back proportionally so knee never punches through wall during arrest
+        const kneePull = penetrationRatio * 0.22;
+        this._kneePoleR.z += kneePull;
+        this._kneePoleR.y += penetrationRatio * 0.08;
+
+        // Subtle boot sole deflection against angled surface
+        const glanceTilt = (1 - absNdot) * 0.28 * Math.sign(this._kickContactNormal.x || 1);
+        this.skeleton.rightLeg.boot.rotation.z = THREE.MathUtils.damp(
+          this.skeleton.rightLeg.boot.rotation.z,
+          glanceTilt,
+          20,
+          dt,
+        );
+        this.kickContactActive = true;
+        this.kickLastImpactFrac = Math.min(this.kickLastImpactFrac, clampedRayDist / Math.max(0.1, desiredLegDist));
+      } else {
+        this.kickContactActive = false;
+        this.kickSlideAccum = THREE.MathUtils.damp(this.kickSlideAccum, 0, 14, dt);
+        this._kickSlideOffsetWorld.set(0, 0, 0);
+      }
+
+      // Record current resolved boot world position for next frame's trajectory sweep
+      this._kickPrevBootWorld.copy(this._ankleR).applyMatrix4(this.skeleton.root.matrixWorld);
+      this.kickPrevBootValid = true;
+    } else {
+      this.kickPrevBootValid = false;
+      this.kickContactActive = false;
+      this.kickSlideAccum = 0;
     }
+
+    // === CLOSE-WALL LEG / TOE / KNEE CLEARANCE + PELVIS BELT WALL-TUCK ===
+    // Extract root horizontal forward (-Z) and right (+X) world basis vectors (zero-GC)
+    const rootYaw = this.skeleton.root.rotation.y;
+    const sinY = Math.sin(rootYaw);
+    const cosY = Math.cos(rootYaw);
+    this._legRootForward.set(-sinY, 0, -cosY);
+    this._legRootRight.set(cosY, 0, -sinY);
+
+    const clampStandingLeg = (
+      hipLocal: THREE.Vector3,
+      ankleLocal: THREE.Vector3,
+      poleLocal: THREE.Vector3,
+      prevPullback: number,
+    ): number => {
+      // Probe forward from hip centerline at both boot-toe height and knee height
+      this._legWorldTarget.copy(ankleLocal).applyMatrix4(this.skeleton.root.matrixWorld);
+      const toeExtentForward = 0.21;
+      const forwardFromHip = Math.max(0, hipLocal.z - ankleLocal.z); // local -Z is forward
+      const requiredClearance = forwardFromHip + toeExtentForward + 0.06;
+
+      this._legRayOrigin.set(
+        this._legWorldTarget.x - this._legRootForward.x * (forwardFromHip + 0.10),
+        this._legWorldTarget.y + 0.08,
+        this._legWorldTarget.z - this._legRootForward.z * (forwardFromHip + 0.10),
+      );
+      let minPush = 0;
+      const probeDist = requiredClearance + 0.10;
+      if (adapter.raycast(this._legRayOrigin, this._legRootForward, 0.01, probeDist, this._legRayHit)) {
+        const available = this._legRayHit.distance - 0.10;
+        const overlap = requiredClearance - available;
+        if (overlap > minPush) minPush = overlap;
+      }
+
+      // Knee-height probe prevents crouching/walking knees from penetrating flush walls
+      this._legRayOrigin.y = this.skeleton.root.position.y + 0.44 - this.crouchBlend * 0.12;
+      const kneeClearance = Math.max(0.24, forwardFromHip * 0.85 + 0.18);
+      if (adapter.raycast(this._legRayOrigin, this._legRootForward, 0.01, kneeClearance + 0.10, this._legRayHit)) {
+        const available = this._legRayHit.distance - 0.10;
+        const overlap = kneeClearance - available;
+        if (overlap > minPush) minPush = overlap;
+      }
+
+      const targetPull = THREE.MathUtils.clamp(minPush, 0, 0.34);
+      const smoothPull = THREE.MathUtils.damp(
+        prevPullback,
+        targetPull,
+        targetPull > prevPullback ? 28 : 14,
+        dt,
+      );
+      if (smoothPull > 0.002) {
+        // Pull ankle backward (+Z in local root space) and tuck knee pole back/slightly outward
+        ankleLocal.z += smoothPull;
+        poleLocal.z += smoothPull * 0.95;
+      }
+      return smoothPull;
+    };
+
+    // Always clamp left stance leg; clamp right leg whenever not actively mid-kick
+    this.leftWallPullback = clampStandingLeg(
+      this._hipL,
+      this._ankleL,
+      this._kneePoleL,
+      this.leftWallPullback,
+    );
+    if (this.combatMove !== 'PUSH_KICK') {
+      this.rightWallPullback = clampStandingLeg(
+        this._hipR,
+        this._ankleR,
+        this._kneePoleR,
+        this.rightWallPullback,
+      );
+    } else {
+      this.rightWallPullback = THREE.MathUtils.damp(this.rightWallPullback, 0, 16, dt);
+    }
+
+    // 4-way short waist-height probe for 1P belt, holster & belt-grenade wall-tuck
+    const beltY = this.skeleton.root.position.y + 0.90 - this.crouchBlend * 0.36;
+    let minBeltClear = 0.36;
+    for (let d = 0; d < 4; d++) {
+      this._legRayOrigin.set(this.skeleton.root.position.x, beltY, this.skeleton.root.position.z);
+      if (d === 0) this._legRayDir.copy(this._legRootForward);
+      else if (d === 1) this._legRayDir.copy(this._legRootForward).negate();
+      else if (d === 2) this._legRayDir.copy(this._legRootRight);
+      else this._legRayDir.copy(this._legRootRight).negate();
+
+      if (adapter.raycast(this._legRayOrigin, this._legRayDir, 0.02, 0.36, this._legRayHit)) {
+        if (this._legRayHit.distance < minBeltClear) {
+          minBeltClear = this._legRayHit.distance;
+        }
+      }
+    }
+    const targetBeltTuck = THREE.MathUtils.clamp((0.33 - minBeltClear) / 0.16, 0, 1);
+    this.beltWallTuck = THREE.MathUtils.damp(this.beltWallTuck, targetBeltTuck, 20, dt);
+    this.skeleton.setBeltWallTuck(this.beltWallTuck);
 
     const legL = this.skeleton.leftLeg;
     const legR = this.skeleton.rightLeg;

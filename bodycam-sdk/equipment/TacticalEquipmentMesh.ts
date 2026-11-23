@@ -43,44 +43,44 @@ export function getBeltSlotTransforms(
     case 'front_left':
       return [
         {
-          position: [-0.098 * w, 0.024, -0.114 * d],
+          position: [-0.088 * w, 0.024, -0.098 * d],
           rotation: [0.16, 0.34, 0.1],
         },
         {
-          position: [-0.158 * w, 0.02, -0.088 * d],
+          position: [-0.142 * w, 0.02, -0.076 * d],
           rotation: [0.12, 0.68, 0.14],
         },
       ];
     case 'left_hip':
       return [
         {
-          position: [-0.168 * w, 0.026, -0.064 * d],
+          position: [-0.148 * w, 0.026, -0.056 * d],
           rotation: [0.06, 1.15, 0.12],
         },
         {
-          position: [-0.162 * w, 0.022, 0.068 * d],
+          position: [-0.144 * w, 0.022, 0.058 * d],
           rotation: [-0.08, 1.95, 0.1],
         },
       ];
     case 'right_hip':
       return [
         {
-          position: [0.104 * w, 0.024, -0.112 * d],
+          position: [0.092 * w, 0.024, -0.098 * d],
           rotation: [0.14, -0.36, -0.1],
         },
         {
-          position: [0.162 * w, 0.024, -0.072 * d],
+          position: [0.144 * w, 0.024, -0.064 * d],
           rotation: [0.08, -0.98, -0.12],
         },
       ];
     case 'rear_belt':
       return [
         {
-          position: [-0.068 * w, 0.032, 0.116 * d],
+          position: [-0.062 * w, 0.032, 0.102 * d],
           rotation: [-0.14, Math.PI + 0.18, 0.08],
         },
         {
-          position: [0.068 * w, 0.032, 0.116 * d],
+          position: [0.062 * w, 0.032, 0.102 * d],
           rotation: [-0.14, Math.PI - 0.18, -0.08],
         },
       ];
