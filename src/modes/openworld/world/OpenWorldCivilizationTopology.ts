@@ -77,7 +77,8 @@ export type OpenWorldSiteKind =
   | 'house_bungalow'
   | 'house_homestead'
   | 'barn'
-  | 'checkpoint';
+  | 'checkpoint'
+  | 'camp_outpost';
 
 export interface OpenWorldSiteDef {
   readonly id: string;
@@ -837,6 +838,96 @@ export const OPENWORLD_SITE_DEFS: readonly OpenWorldSiteDef[] = [
     yaw: 1.58,
     padRadiusM: 16,
     variantSeed: 1104,
+  },
+
+  // === 8 ROADSIDE MILITIA / LOGGING FIELD CAMPS & AMBUSH OUTPOSTS ===
+  {
+    id: 'camp_coastal_watch',
+    name: 'Coastal Highway Recon Camp',
+    settlementName: 'Coastal Approach',
+    kind: 'camp_outpost',
+    x: -472,
+    z: 972,
+    yaw: 1.45,
+    padRadiusM: 14,
+    variantSeed: 1201,
+  },
+  {
+    id: 'camp_south_bridge_east',
+    name: 'South Bridge Overlook Camp',
+    settlementName: 'Valley Crossing',
+    kind: 'camp_outpost',
+    x: 22,
+    z: 608,
+    yaw: 3.05,
+    padRadiusM: 14,
+    variantSeed: 1202,
+  },
+  {
+    id: 'camp_west_timber_cut',
+    name: 'West Pine Logging Camp',
+    settlementName: 'West Pine Trail',
+    kind: 'camp_outpost',
+    x: -726,
+    z: 338,
+    yaw: -1.45,
+    padRadiusM: 14,
+    variantSeed: 1203,
+  },
+  {
+    id: 'camp_central_rail_overlook',
+    name: 'Route 41 Ambush Bivouac',
+    settlementName: 'Timberline Corridor',
+    kind: 'camp_outpost',
+    x: -178,
+    z: 355,
+    yaw: -1.25,
+    padRadiusM: 14,
+    variantSeed: 1204,
+  },
+  {
+    id: 'camp_east_valley_timber',
+    name: 'East Valley Timber Post',
+    settlementName: 'East Timberline',
+    kind: 'camp_outpost',
+    x: 304,
+    z: 58,
+    yaw: -1.55,
+    padRadiusM: 14,
+    variantSeed: 1205,
+  },
+  {
+    id: 'camp_quarry_staging',
+    name: 'Quarry Rim Staging Camp',
+    settlementName: 'Highland Quarry',
+    kind: 'camp_outpost',
+    x: 575,
+    z: -454,
+    yaw: 0.32,
+    padRadiusM: 14,
+    variantSeed: 1206,
+  },
+  {
+    id: 'camp_highland_ambush',
+    name: 'Highland Trail Outpost',
+    settlementName: 'Highland Overlook',
+    kind: 'camp_outpost',
+    x: 95,
+    z: -756,
+    yaw: 3.08,
+    padRadiusM: 14,
+    variantSeed: 1207,
+  },
+  {
+    id: 'camp_alpine_bivouac',
+    name: 'Alpine Relay Field Camp',
+    settlementName: 'Alpine Relay Ridge',
+    kind: 'camp_outpost',
+    x: 525,
+    z: -1068,
+    yaw: 3.12,
+    padRadiusM: 14,
+    variantSeed: 1208,
   },
 ] as const;
 

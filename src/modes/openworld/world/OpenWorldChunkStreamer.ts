@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import type { BodycamInteriorSample, BodycamSurfaceMaterial } from '../../../../bodycam-sdk/types';
 import type { GraphicsQualityProfile } from '../../../../data/graphicsQuality';
 import { OpenWorldArchitectureBuilder } from './OpenWorldArchitectureBuilder';
+import { MACRO_OCCLUDER_LAYER } from './OpenWorldAtmosphere';
 import {
   FOB_GUARD_TOWER_DECK_HEIGHT_M,
   type FobCompoundId,
@@ -16,6 +17,11 @@ import {
 } from './OpenWorldAtmosphericFogShader';
 import { FoliageAnchorPoint, OpenWorldFoliageBuilder } from './OpenWorldFoliageBuilder';
 import {
+  isEligibleOccluderObb,
+  type OpenWorldOcclusionCuller,
+} from './OpenWorldOcclusionCuller';
+import {
+  getBakedOpenWorldSites,
   hasOverheadClearanceAgainstObbs,
   IndoorVolume,
   isOnCivilizationClearance,
@@ -63,13 +69,20 @@ interface StreamedChunkRecord {
   readonly key: string;
   readonly cx: number;
   readonly cz: number;
+  readonly centerX: number;
+  readonly centerZ: number;
   readonly lod: ChunkLodTier;
   readonly group: THREE.Group;
+  readonly bounds: THREE.Box3;
   readonly terrainGeo: THREE.BufferGeometry;
   readonly ownedGeometries: THREE.BufferGeometry[];
   readonly instancedMeshes: THREE.InstancedMesh[];
   readonly batchedMeshes: THREE.BatchedMesh[];
+  readonly microMeshes: THREE.Object3D[];
+  readonly shadowCasterMeshes: THREE.Object3D[];
   readonly solidObbs: SolidObb[];
+  readonly occluderObbs: SolidObb[];
+  readonly occludableBatches: Array<{ obj: THREE.Object3D; worldBox: THREE.Box3; isMicro: boolean }>;
   readonly walkDecks: WalkDeck[];
   readonly indoorVolumes: IndoorVolume[];
   readonly treeRoosts: FoliageAnchorPoint[];
@@ -87,12 +100,27 @@ interface PendingChunkSpec {
   readonly priority: number;
 }
 
+interface AmbientSmokePuff {
+  readonly baseX: number;
+  readonly baseY: number;
+  readonly baseZ: number;
+  readonly phase: number;
+  readonly riseSpeed: number;
+  readonly maxHeightM: number;
+  readonly driftAngle: number;
+  readonly baseScale: number;
+}
+
 export interface StreamerStats {
   centerChunkX: number;
   centerChunkZ: number;
   activeChunkCount: number;
   midChunkCount: number;
   totalLoadedChunks: number;
+  visibleChunkCount: number;
+  culledBehindChunkCount: number;
+  occludedChunkCount: number;
+  occludedObjectCount: number;
   activeInstanceCount: number;
   activeBatchedMeshCount: number;
   disposedChunkCount: number;
@@ -107,6 +135,10 @@ const HLOD_TERRAIN_SEGS = 64;
 const _sample = createTerrainSample();
 const _dummy = new THREE.Object3D();
 const _color = new THREE.Color();
+const _cullFrustum = new THREE.Frustum();
+const _projScreenMatrix = new THREE.Matrix4();
+const _paddedBox = new THREE.Box3();
+const _smokeDummy = new THREE.Object3D();
 
 function createProceduralTerrainTexture(): THREE.CanvasTexture | null {
   if (typeof document === 'undefined') return null;
@@ -271,6 +303,56 @@ function buildGroundedConiferCanopyGeo(): THREE.BufferGeometry {
 }
 
 /**
+ * Compact 4-sided 2-tier conifer silhouette for 5x5 mid-range shells and 4km horizon forest canopy.
+ * Only 16 triangles per tree with outward normals for FrontSide hardware backface culling.
+ */
+function buildMidConiferGeo(): THREE.BufferGeometry {
+  const tiers = [
+    { y0: 0.45, y1: 5.6, r0: 2.25, r1: 0.58 },
+    { y0: 4.5, y1: 9.9, r0: 1.48, r1: 0.05 },
+  ];
+  const radial = 4;
+  const positions: number[] = [];
+  const normals: number[] = [];
+  const indices: number[] = [];
+
+  let baseIndex = 0;
+  for (const tier of tiers) {
+    const dy = tier.y1 - tier.y0;
+    const dr = tier.r0 - tier.r1;
+    const invLen = 1 / Math.hypot(dy, dr);
+    const ny = dr * invLen;
+    const nr = dy * invLen;
+
+    for (let i = 0; i <= radial; i++) {
+      const a = (i / radial) * Math.PI * 2;
+      const ca = Math.cos(a);
+      const sa = Math.sin(a);
+      positions.push(ca * tier.r0, tier.y0, sa * tier.r0);
+      normals.push(ca * nr, ny, sa * nr);
+      positions.push(ca * tier.r1, tier.y1, sa * tier.r1);
+      normals.push(ca * nr, ny, sa * nr);
+    }
+
+    for (let i = 0; i < radial; i++) {
+      const a = baseIndex + i * 2;
+      const b = a + 1;
+      const c = a + 2;
+      const d = a + 3;
+      indices.push(a, c, b, b, c, d);
+    }
+    baseIndex += (radial + 1) * 2;
+  }
+
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  geo.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
+  geo.setIndex(indices);
+  geo.computeBoundingSphere();
+  return geo;
+}
+
+/**
  * Merges composite box parts into a compact indexed BufferGeometry with identical
  * `position` + `normal` attributes for zero-draw-call `THREE.BatchedMesh` heterogeneous prop packing.
  */
@@ -340,6 +422,8 @@ export class OpenWorldChunkStreamer {
   private readonly trunkMat: THREE.MeshStandardMaterial;
   private readonly canopyGeo: THREE.BufferGeometry;
   private readonly canopyMat: THREE.MeshStandardMaterial;
+  private readonly midTreeGeo: THREE.BufferGeometry;
+  private readonly midTreeMat: THREE.MeshStandardMaterial;
   private readonly boulderGeo: THREE.DodecahedronGeometry;
   private readonly boulderMat: THREE.MeshStandardMaterial;
   private readonly scrubGeo: THREE.ConeGeometry;
@@ -349,14 +433,35 @@ export class OpenWorldChunkStreamer {
   private readonly midBuildingGeo: THREE.BoxGeometry;
   private readonly midBuildingMat: THREE.MeshStandardMaterial;
 
+  // 1-draw-call ambient rising smoke plumes anchored to contested checkpoints & militia camps
+  private readonly smokeGeo: THREE.OctahedronGeometry;
+  private readonly smokeMat: THREE.MeshBasicMaterial;
+  private ambientSmokeMesh: THREE.InstancedMesh | null = null;
+  private readonly smokePuffs: AmbientSmokePuff[] = [];
+  private smokeClockSec = 0;
+
   // Shared heterogeneous static prop library for per-chunk `THREE.BatchedMesh` (1 draw call / chunk)
   private readonly batchedPropGeos: THREE.BufferGeometry[];
   private readonly batchedPropMat: THREE.MeshStandardMaterial;
   private readonly batchedPropTotalVerts: number;
   private readonly batchedPropTotalIndices: number;
 
-  // Horizon proxy disposable resources
+  // Horizon proxy disposable resources & occlusion metadata
   private readonly horizonDisposables: Array<{ dispose(): void }> = [];
+  private readonly landmarkOccluderAabbs: Array<{
+    minX: number;
+    minY: number;
+    minZ: number;
+    maxX: number;
+    maxY: number;
+    maxZ: number;
+  }> = [];
+  private readonly horizonOccludables: Array<{
+    obj: THREE.Object3D;
+    box: THREE.Box3;
+    fobId?: FobCompoundId;
+  }> = [];
+  private readonly horizonFullScreenTargets: THREE.Object3D[] = [];
 
   private readonly atmoFogUniforms?: AtmoFogSharedUniforms;
   private readonly pendingQueue: PendingChunkSpec[] = [];
@@ -365,6 +470,10 @@ export class OpenWorldChunkStreamer {
   private lastCenterCz = -999;
   private disposedChunkCount = 0;
   private activeInstanceCount = 0;
+  private visibleChunkCount = 0;
+  private culledBehindChunkCount = 0;
+  private occludedChunkCount = 0;
+  private occludedObjectCount = 0;
   private propDensityScale = 1.0;
   private shadowsEnabled = true;
 
@@ -383,18 +492,20 @@ export class OpenWorldChunkStreamer {
     this.rootGroup.add(this.horizonGroup);
     this.rootGroup.add(this.chunksGroup);
 
-    // Procedural terrain grain texture & shared PBR terrain materials
+    // Procedural terrain grain texture & shared PBR terrain materials (strict FrontSide backface culling)
     this.terrainTexture = createProceduralTerrainTexture();
     this.activeTerrainMat = new THREE.MeshStandardMaterial({
       vertexColors: true,
       map: this.terrainTexture,
       roughness: 0.92,
       metalness: 0.02,
+      side: THREE.FrontSide,
     });
     this.midTerrainMat = new THREE.MeshStandardMaterial({
       vertexColors: true,
       roughness: 0.95,
       metalness: 0.0,
+      side: THREE.FrontSide,
       polygonOffset: true,
       polygonOffsetFactor: 1,
       polygonOffsetUnits: 2,
@@ -403,35 +514,83 @@ export class OpenWorldChunkStreamer {
       vertexColors: true,
       roughness: 0.97,
       metalness: 0.0,
+      side: THREE.FrontSide,
       polygonOffset: true,
       polygonOffsetFactor: 2,
       polygonOffsetUnits: 4,
     });
 
-    // Shared bottom-center instanced prop geometries
+    // Shared bottom-center instanced prop geometries (all solid 3D meshes strictly FrontSide)
     this.trunkGeo = new THREE.CylinderGeometry(0.18, 0.34, 3.6, 6);
     this.trunkGeo.translate(0, 1.8, 0);
-    this.trunkMat = new THREE.MeshStandardMaterial({ color: 0x4b382a, roughness: 0.94, metalness: 0.0 });
+    this.trunkMat = new THREE.MeshStandardMaterial({
+      color: 0x4b382a,
+      roughness: 0.94,
+      metalness: 0.0,
+      side: THREE.FrontSide,
+    });
 
     this.canopyGeo = buildGroundedConiferCanopyGeo();
-    this.canopyMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.88, metalness: 0.0 });
+    this.canopyMat = new THREE.MeshStandardMaterial({
+      color: 0xffffff,
+      roughness: 0.88,
+      metalness: 0.0,
+      side: THREE.FrontSide,
+    });
     this.foliageBuilder.applyWindToConiferMaterial(this.canopyGeo, this.canopyMat);
+
+    this.midTreeGeo = buildMidConiferGeo();
+    this.midTreeMat = new THREE.MeshStandardMaterial({
+      color: 0xffffff,
+      roughness: 0.92,
+      metalness: 0.0,
+      side: THREE.FrontSide,
+    });
 
     this.boulderGeo = new THREE.DodecahedronGeometry(1.0, 0);
     this.boulderGeo.translate(0, 0.55, 0);
-    this.boulderMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.9, metalness: 0.04 });
+    this.boulderMat = new THREE.MeshStandardMaterial({
+      color: 0xffffff,
+      roughness: 0.9,
+      metalness: 0.04,
+      side: THREE.FrontSide,
+    });
 
     this.scrubGeo = new THREE.ConeGeometry(0.75, 1.4, 5);
     this.scrubGeo.translate(0, 0.7, 0);
-    this.scrubMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.92, metalness: 0.0 });
+    this.scrubMat = new THREE.MeshStandardMaterial({
+      color: 0xffffff,
+      roughness: 0.92,
+      metalness: 0.0,
+      side: THREE.FrontSide,
+    });
 
     this.containerGeo = new THREE.BoxGeometry(2.5, 2.6, 6.1);
     this.containerGeo.translate(0, 1.3, 0);
-    this.containerMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.62, metalness: 0.38 });
+    this.containerMat = new THREE.MeshStandardMaterial({
+      color: 0xffffff,
+      roughness: 0.62,
+      metalness: 0.38,
+      side: THREE.FrontSide,
+    });
 
     this.midBuildingGeo = new THREE.BoxGeometry(10, 6.5, 14);
     this.midBuildingGeo.translate(0, 3.25, 0);
-    this.midBuildingMat = new THREE.MeshStandardMaterial({ color: 0x676d74, roughness: 0.84, metalness: 0.14 });
+    this.midBuildingMat = new THREE.MeshStandardMaterial({
+      color: 0x676d74,
+      roughness: 0.84,
+      metalness: 0.14,
+      side: THREE.FrontSide,
+    });
+
+    this.smokeGeo = new THREE.OctahedronGeometry(1.0, 1);
+    this.smokeMat = new THREE.MeshBasicMaterial({
+      color: 0xb0b8be,
+      transparent: true,
+      opacity: 0.24,
+      depthWrite: false,
+      side: THREE.FrontSide,
+    });
 
     // 5 heterogeneous composite static props packed into 1 THREE.BatchedMesh per active chunk:
     // 0: Timber supply crate stack, 1: Twin fuel drum pallet, 2: Tiered sandbag emplacement,
@@ -473,6 +632,7 @@ export class OpenWorldChunkStreamer {
       color: 0xffffff,
       roughness: 0.82,
       metalness: 0.22,
+      side: THREE.FrontSide,
     });
 
     if (this.atmoFogUniforms) {
@@ -481,6 +641,7 @@ export class OpenWorldChunkStreamer {
       applyAtmosphericHeightFog(this.hlodTerrainMat, this.atmoFogUniforms);
       applyAtmosphericHeightFog(this.trunkMat, this.atmoFogUniforms);
       applyAtmosphericHeightFog(this.canopyMat, this.atmoFogUniforms);
+      applyAtmosphericHeightFog(this.midTreeMat, this.atmoFogUniforms);
       applyAtmosphericHeightFog(this.boulderMat, this.atmoFogUniforms);
       applyAtmosphericHeightFog(this.scrubMat, this.atmoFogUniforms);
       applyAtmosphericHeightFog(this.containerMat, this.atmoFogUniforms);
@@ -520,6 +681,7 @@ export class OpenWorldChunkStreamer {
     const hlodMesh = new THREE.Mesh(hlodGeo, this.hlodTerrainMat);
     hlodMesh.receiveShadow = false;
     hlodMesh.castShadow = false;
+    hlodMesh.layers.enable(MACRO_OCCLUDER_LAYER);
     this.horizonGroup.add(hlodMesh);
     this.horizonDisposables.push(hlodGeo);
 
@@ -530,10 +692,12 @@ export class OpenWorldChunkStreamer {
       color: 0x16384c,
       roughness: 0.24,
       metalness: 0.35,
+      side: THREE.FrontSide,
     });
     const seaMesh = new THREE.Mesh(seaGeo, seaMat);
     seaMesh.position.set(0, SEA_LEVEL_M, 1560);
     this.horizonGroup.add(seaMesh);
+    this.horizonFullScreenTargets.push(seaMesh);
     this.horizonDisposables.push(seaGeo, seaMat);
 
     // 3. Alpine Hydroelectric Reservoir Water Surface (north of Dam)
@@ -543,25 +707,53 @@ export class OpenWorldChunkStreamer {
       color: 0x1a465c,
       roughness: 0.22,
       metalness: 0.38,
+      side: THREE.FrontSide,
     });
     const resMesh = new THREE.Mesh(resGeo, resMat);
     resMesh.scale.set(1.05, 1, 0.62);
     resMesh.position.set(180, RESERVOIR_LEVEL_M, -1620);
     this.horizonGroup.add(resMesh);
+    this.horizonFullScreenTargets.push(resMesh);
     this.horizonDisposables.push(resGeo, resMat);
 
     // 4. Composite 3–12 Part Vertical Landmarks (visible across 4km for heli flight & optics)
-    const concreteMat = new THREE.MeshStandardMaterial({ color: 0x7d807e, roughness: 0.86, metalness: 0.05 });
-    const darkConcreteMat = new THREE.MeshStandardMaterial({ color: 0x4b4f52, roughness: 0.88, metalness: 0.08 });
-    const craneOrangeMat = new THREE.MeshStandardMaterial({ color: 0xb94d24, roughness: 0.52, metalness: 0.48 });
-    const steelMat = new THREE.MeshStandardMaterial({ color: 0x5c6670, roughness: 0.42, metalness: 0.68 });
-    const dishWhiteMat = new THREE.MeshStandardMaterial({ color: 0xd6dbe0, roughness: 0.48, metalness: 0.22 });
+    const concreteMat = new THREE.MeshStandardMaterial({
+      color: 0x7d807e,
+      roughness: 0.86,
+      metalness: 0.05,
+      side: THREE.FrontSide,
+    });
+    const darkConcreteMat = new THREE.MeshStandardMaterial({
+      color: 0x4b4f52,
+      roughness: 0.88,
+      metalness: 0.08,
+      side: THREE.FrontSide,
+    });
+    const craneOrangeMat = new THREE.MeshStandardMaterial({
+      color: 0xb94d24,
+      roughness: 0.52,
+      metalness: 0.48,
+      side: THREE.FrontSide,
+    });
+    const steelMat = new THREE.MeshStandardMaterial({
+      color: 0x5c6670,
+      roughness: 0.42,
+      metalness: 0.68,
+      side: THREE.FrontSide,
+    });
+    const dishWhiteMat = new THREE.MeshStandardMaterial({
+      color: 0xd6dbe0,
+      roughness: 0.48,
+      metalness: 0.22,
+      side: THREE.FrontSide,
+    });
     const alphaBeaconMat = new THREE.MeshStandardMaterial({
       color: 0x38bdf8,
       emissive: 0x0c4a6e,
       emissiveIntensity: 0.9,
       roughness: 0.3,
       metalness: 0.2,
+      side: THREE.FrontSide,
     });
     const bravoBeaconMat = new THREE.MeshStandardMaterial({
       color: 0xf59e0b,
@@ -569,6 +761,7 @@ export class OpenWorldChunkStreamer {
       emissiveIntensity: 0.9,
       roughness: 0.3,
       metalness: 0.2,
+      side: THREE.FrontSide,
     });
     if (this.atmoFogUniforms) {
       applyAtmosphericHeightFog(seaMat, this.atmoFogUniforms);
@@ -736,11 +929,170 @@ export class OpenWorldChunkStreamer {
         this.fobHorizonGroups.set(lm.id, group);
       }
 
+      if (lm.kind === 'dam') {
+        this.landmarkOccluderAabbs.push(
+          {
+            minX: lm.worldX - 110,
+            minY: baseH - 12,
+            minZ: lm.worldZ - 29,
+            maxX: lm.worldX + 110,
+            maxY: baseH + 40,
+            maxZ: lm.worldZ - 7,
+          },
+          {
+            minX: lm.worldX - 85,
+            minY: baseH - 3,
+            minZ: lm.worldZ - 1,
+            maxX: lm.worldX - 11,
+            maxY: baseH + 19,
+            maxZ: lm.worldZ + 25,
+          },
+        );
+      } else if (lm.kind === 'port') {
+        this.landmarkOccluderAabbs.push({
+          minX: lm.worldX - 43,
+          minY: baseH + 1,
+          minZ: lm.worldZ - 36,
+          maxX: lm.worldX + 15,
+          maxY: baseH + 14,
+          maxZ: lm.worldZ - 12,
+        });
+      } else if (lm.kind === 'quarry') {
+        this.landmarkOccluderAabbs.push({
+          minX: lm.worldX - 22,
+          minY: baseH,
+          minZ: lm.worldZ - 17,
+          maxX: lm.worldX + 22,
+          maxY: baseH + 10,
+          maxZ: lm.worldZ + 17,
+        });
+      } else if (lm.kind === 'railyard') {
+        this.landmarkOccluderAabbs.push({
+          minX: lm.worldX - 26,
+          minY: baseH,
+          minZ: lm.worldZ - 24,
+          maxX: lm.worldX + 26,
+          maxY: baseH + 11,
+          maxZ: lm.worldZ - 4,
+        });
+      }
+
+      group.traverse((obj) => {
+        if (obj instanceof THREE.Mesh && obj.material !== alphaBeaconMat && obj.material !== bravoBeaconMat) {
+          obj.layers.enable(MACRO_OCCLUDER_LAYER);
+        }
+      });
       this.horizonGroup.add(group);
+      group.updateMatrixWorld(true);
+      const lmBox = new THREE.Box3().setFromObject(group);
+      if (!lmBox.isEmpty()) {
+        this.horizonOccludables.push({
+          obj: group,
+          box: lmBox,
+          fobId: isFobCompoundId(lm.id) ? lm.id : undefined,
+        });
+      }
     }
 
     // 5. Persistent Steel-Truss River Bridges + Regional Water Towers & Guyed Radio Masts
     this.archBuilder.populateHorizonCivilization(this.horizonGroup, this.horizonDisposables);
+
+    // 6. 4km Horizon Forest Canopy Belt (1 InstancedMesh draw call painting far valleys & alpine ridges)
+    const hRand = mulberry32(414199);
+    const horizonTrees: Array<{ wx: number; wy: number; wz: number; scale: number; yaw: number; tint: number }> = [];
+    const maxHorizonTrees = 960;
+    for (let i = 0; i < 2200 && horizonTrees.length < maxHorizonTrees; i++) {
+      const wx = (hRand() - 0.5) * (WORLD_SIZE_M - 160);
+      const wz = (hRand() - 0.5) * (WORLD_SIZE_M - 160);
+      sampleOpenWorldTerrain(wx, wz, _sample);
+      if (_sample.isWater || _sample.isRoad || _sample.isSitePad || _sample.isQuarryPit || _sample.slope > 0.44) {
+        continue;
+      }
+      if (isOnCivilizationClearance(wx, wz, 8.0)) continue;
+      let nearLm = false;
+      for (let k = 0; k < OPENWORLD_LANDMARKS.length; k++) {
+        const lm = OPENWORLD_LANDMARKS[k];
+        if (Math.hypot(wx - lm.worldX, wz - lm.worldZ) < lm.padRadiusM * 0.72) {
+          nearLm = true;
+          break;
+        }
+      }
+      if (nearLm) continue;
+
+      let prob = 0;
+      if (_sample.biome === 'temperate_conifer_valley') prob = 0.76;
+      else if (_sample.biome === 'alpine_ridge_dam' && _sample.height < 328) prob = 0.42;
+      else if (_sample.biome === 'highland_steppe_quarry') prob = 0.16;
+      else if (_sample.biome === 'coastal_port_marsh' && _sample.height > 5.0) prob = 0.12;
+      if (hRand() > prob) continue;
+
+      horizonTrees.push({
+        wx,
+        wy: _sample.height - 1.2,
+        wz,
+        scale: 1.15 + hRand() * 0.62,
+        yaw: hRand() * Math.PI * 2,
+        tint: hRand(),
+      });
+    }
+    if (horizonTrees.length > 0) {
+      const horizonForest = new THREE.InstancedMesh(this.midTreeGeo, this.midTreeMat, horizonTrees.length);
+      horizonForest.name = 'horizon_forest_canopy';
+      horizonForest.castShadow = false;
+      horizonForest.receiveShadow = false;
+      horizonForest.layers.enable(MACRO_OCCLUDER_LAYER);
+      for (let i = 0; i < horizonTrees.length; i++) {
+        const t = horizonTrees[i];
+        _dummy.position.set(t.wx, t.wy, t.wz);
+        _dummy.rotation.set(0, t.yaw, 0);
+        _dummy.scale.set(t.scale, t.scale * (0.9 + t.tint * 0.25), t.scale);
+        _dummy.updateMatrix();
+        horizonForest.setMatrixAt(i, _dummy.matrix);
+        _color.setRGB(0.1 + t.tint * 0.06, 0.21 + t.tint * 0.1, 0.12 + t.tint * 0.05);
+        horizonForest.setColorAt(i, _color);
+      }
+      horizonForest.instanceMatrix.needsUpdate = true;
+      if (horizonForest.instanceColor) horizonForest.instanceColor.needsUpdate = true;
+      horizonForest.computeBoundingSphere();
+      this.horizonGroup.add(horizonForest);
+      this.horizonFullScreenTargets.push(horizonForest);
+      this.horizonDisposables.push(horizonForest);
+    }
+
+    // 7. Ambient Rising Smoke Plumes at Contested Roadblocks & Militia Field Camps (1 InstancedMesh draw call)
+    const sites = getBakedOpenWorldSites();
+    this.smokePuffs.length = 0;
+    const smokeSites = sites.filter((s) => s.kind === 'checkpoint' || s.kind === 'camp_outpost');
+    const puffsPerSite = 6;
+    for (let sIdx = 0; sIdx < smokeSites.length; sIdx++) {
+      const s = smokeSites[sIdx];
+      const baseX = s.x + Math.cos(s.yaw) * 4.2;
+      const baseZ = s.z - Math.sin(s.yaw) * 4.2;
+      const baseY = s.groundY + 1.1;
+      for (let p = 0; p < puffsPerSite; p++) {
+        this.smokePuffs.push({
+          baseX,
+          baseY,
+          baseZ,
+          phase: (p / puffsPerSite) + (sIdx * 0.13) % 1,
+          riseSpeed: 0.14 + (p % 3) * 0.025,
+          maxHeightM: 22 + (sIdx % 3) * 5,
+          driftAngle: 0.55 + (sIdx % 4) * 0.18,
+          baseScale: 0.75 + (p % 3) * 0.22,
+        });
+      }
+    }
+    if (this.smokePuffs.length > 0) {
+      const smokeMesh = new THREE.InstancedMesh(this.smokeGeo, this.smokeMat, this.smokePuffs.length);
+      smokeMesh.name = 'openworld_ambient_smoke';
+      smokeMesh.castShadow = false;
+      smokeMesh.receiveShadow = false;
+      smokeMesh.frustumCulled = false;
+      this.ambientSmokeMesh = smokeMesh;
+      this.horizonGroup.add(smokeMesh);
+      this.horizonFullScreenTargets.push(smokeMesh);
+      this.updateAmbientSmoke(0.016);
+    }
   }
 
   public applyQualityProfile(profile: GraphicsQualityProfile, rebuildExisting = false): void {
@@ -794,6 +1146,7 @@ export class OpenWorldChunkStreamer {
       this.midTerrainMat,
       this.trunkMat,
       this.canopyMat,
+      this.midTreeMat,
       this.boulderMat,
       this.scrubMat,
       this.containerMat,
@@ -987,18 +1340,33 @@ export class OpenWorldChunkStreamer {
     }
 
     const terrainGeo = createTerrainChunkGeometry(cx, cz, segs, heightsBuf);
+    terrainGeo.computeBoundingBox();
+    const tbb = terrainGeo.boundingBox;
+    const minY = tbb ? tbb.min.y - 2.0 : -10;
+    const maxY = tbb ? tbb.max.y + 34.0 : 120;
+    const halfChunk = CHUNK_SIZE_M * 0.5;
+    const bounds = new THREE.Box3(
+      new THREE.Vector3(centerX - halfChunk, minY, centerZ - halfChunk),
+      new THREE.Vector3(centerX + halfChunk, maxY, centerZ + halfChunk),
+    );
+
     const terrainMesh = new THREE.Mesh(
       terrainGeo,
       lod === 'active' ? this.activeTerrainMat : this.midTerrainMat,
     );
     terrainMesh.receiveShadow = this.shadowsEnabled && lod === 'active';
     terrainMesh.castShadow = false;
+    terrainMesh.layers.enable(MACRO_OCCLUDER_LAYER);
     group.add(terrainMesh);
 
     const ownedGeometries: THREE.BufferGeometry[] = [terrainGeo];
     const instancedMeshes: THREE.InstancedMesh[] = [];
     const batchedMeshes: THREE.BatchedMesh[] = [];
+    const microMeshes: THREE.Object3D[] = [];
+    const shadowCasterMeshes: THREE.Object3D[] = [];
     const solidObbs: SolidObb[] = [];
+    const occluderObbs: SolidObb[] = [];
+    const occludableBatches: Array<{ obj: THREE.Object3D; worldBox: THREE.Box3; isMicro: boolean }> = [];
     const walkDecks: WalkDeck[] = [];
     const indoorVolumes: IndoorVolume[] = [];
     const treeRoosts: FoliageAnchorPoint[] = [];
@@ -1018,6 +1386,7 @@ export class OpenWorldChunkStreamer {
         solidObbs,
         walkDecks,
         indoorVolumes,
+        shadowCasterMeshes,
       );
       instanceCount += archRes.instanceCount;
       const fastSampleScratch = { height: 0, slope: 0 };
@@ -1033,6 +1402,9 @@ export class OpenWorldChunkStreamer {
         group,
         instancedMeshes,
         batchedMeshes,
+        microMeshes,
+        shadowCasterMeshes,
+        occludableBatches,
         treeRoosts,
         collider,
         fastSampleScratch,
@@ -1045,10 +1417,17 @@ export class OpenWorldChunkStreamer {
         group,
         instancedMeshes,
         fastHeightSlope,
+        microMeshes,
       );
       instanceCount += foliageRes.instanceCount;
       logAnchors = foliageRes.logAnchors;
       rockAnchors = foliageRes.rockAnchors;
+
+      for (let i = 0; i < solidObbs.length; i++) {
+        if (isEligibleOccluderObb(solidObbs[i])) {
+          occluderObbs.push(solidObbs[i]);
+        }
+      }
     } else {
       instanceCount = this.archBuilder.populateMidChunk(
         cx,
@@ -1059,19 +1438,34 @@ export class OpenWorldChunkStreamer {
         ownedGeometries,
         instancedMeshes,
       );
+      instanceCount += this.populateMidChunkTrees(
+        cx,
+        cz,
+        centerX,
+        centerZ,
+        group,
+        instancedMeshes,
+      );
     }
 
     return {
       key,
       cx,
       cz,
+      centerX,
+      centerZ,
       lod,
       group,
+      bounds,
       terrainGeo,
       ownedGeometries,
       instancedMeshes,
       batchedMeshes,
+      microMeshes,
+      shadowCasterMeshes,
       solidObbs,
+      occluderObbs,
+      occludableBatches,
       walkDecks,
       indoorVolumes,
       treeRoosts,
@@ -1082,6 +1476,76 @@ export class OpenWorldChunkStreamer {
     };
   }
 
+  /**
+   * Populates a single 1-draw-call `InstancedMesh` of low-poly 2-tier conifer silhouettes
+   * across each `5 × 5` mid-range chunk so mid-distance valleys and hillsides stay richly forested.
+   */
+  private populateMidChunkTrees(
+    cx: number,
+    cz: number,
+    centerX: number,
+    centerZ: number,
+    group: THREE.Group,
+    outMeshes: THREE.InstancedMesh[],
+  ): number {
+    const rand = mulberry32(chunkHash(cx, cz, 73));
+    const placements: Array<{ lx: number; y: number; lz: number; scale: number; yaw: number; tint: number }> = [];
+    const attempts = Math.round(78 * this.propDensityScale);
+
+    for (let i = 0; i < attempts; i++) {
+      const lx = (rand() - 0.5) * (CHUNK_SIZE_M - 10);
+      const lz = (rand() - 0.5) * (CHUNK_SIZE_M - 10);
+      const wx = centerX + lx;
+      const wz = centerZ + lz;
+      const h = evaluateOpenWorldHeight(wx, wz);
+      sampleOpenWorldTerrainFromHeight(wx, wz, h, 0.14, _sample);
+
+      if (_sample.isWater || _sample.isRoad || _sample.isSitePad || _sample.isQuarryPit) continue;
+      if (isOnCivilizationClearance(wx, wz, 5.2)) continue;
+
+      let prob = 0;
+      if (_sample.biome === 'temperate_conifer_valley') prob = 0.88;
+      else if (_sample.biome === 'alpine_ridge_dam' && _sample.height < 332) prob = 0.44;
+      else if (_sample.biome === 'highland_steppe_quarry') prob = 0.22;
+      else if (_sample.biome === 'coastal_port_marsh' && _sample.height > 4.8) prob = 0.16;
+
+      if (rand() <= prob) {
+        placements.push({
+          lx,
+          y: h - 0.25,
+          lz,
+          scale: 0.92 + rand() * 0.42,
+          yaw: rand() * Math.PI * 2,
+          tint: rand(),
+        });
+      }
+    }
+
+    if (placements.length === 0) return 0;
+    const mesh = new THREE.InstancedMesh(this.midTreeGeo, this.midTreeMat, placements.length);
+    mesh.name = `mid_conifers_${cx}_${cz}`;
+    mesh.castShadow = false;
+    mesh.receiveShadow = false;
+    mesh.layers.enable(MACRO_OCCLUDER_LAYER);
+
+    for (let i = 0; i < placements.length; i++) {
+      const p = placements[i];
+      _dummy.position.set(p.lx, p.y, p.lz);
+      _dummy.rotation.set(0, p.yaw, 0);
+      _dummy.scale.set(p.scale, p.scale * (0.92 + p.tint * 0.22), p.scale);
+      _dummy.updateMatrix();
+      mesh.setMatrixAt(i, _dummy.matrix);
+      _color.setRGB(0.11 + p.tint * 0.07, 0.22 + p.tint * 0.11, 0.12 + p.tint * 0.06);
+      mesh.setColorAt(i, _color);
+    }
+    mesh.instanceMatrix.needsUpdate = true;
+    if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+    mesh.computeBoundingSphere();
+    group.add(mesh);
+    outMeshes.push(mesh);
+    return placements.length;
+  }
+
   private populateActiveChunkProps(
     cx: number,
     cz: number,
@@ -1090,6 +1554,9 @@ export class OpenWorldChunkStreamer {
     group: THREE.Group,
     outMeshes: THREE.InstancedMesh[],
     outBatchedMeshes: THREE.BatchedMesh[],
+    outMicroMeshes: THREE.Object3D[],
+    outShadowCasters: THREE.Object3D[],
+    outOccludableBatches: Array<{ obj: THREE.Object3D; worldBox: THREE.Box3; isMicro: boolean }>,
     outTreeRoosts: FoliageAnchorPoint[],
     collider: ActiveHeightfieldCollider | null,
     hsScratch: { height: number; slope: number },
@@ -1121,8 +1588,9 @@ export class OpenWorldChunkStreamer {
       return false;
     };
 
-    // 1. Conifer & Pine Forest / Alpine Timberline Trees
-    const treeAttempts = Math.round(54 * this.propDensityScale);
+    // 1. Clustered Conifer Groves & Alpine Timberline Forests (~2.5x denser with 0 extra draw calls)
+    const halfBound = CHUNK_SIZE_M * 0.5 - 4;
+    const treeAttempts = Math.round(92 * this.propDensityScale);
     for (let i = 0; i < treeAttempts; i++) {
       const lx = (rand() - 0.5) * (CHUNK_SIZE_M - 10);
       const lz = (rand() - 0.5) * (CHUNK_SIZE_M - 10);
@@ -1134,22 +1602,57 @@ export class OpenWorldChunkStreamer {
       if (isNearLandmark(wx, wz) || isOnCivilizationClearance(wx, wz, 3.8)) continue;
 
       let spawnChance = 0.0;
-      if (_sample.biome === 'temperate_conifer_valley') spawnChance = 0.88;
-      else if (_sample.biome === 'highland_steppe_quarry') spawnChance = 0.24;
-      else if (_sample.biome === 'alpine_ridge_dam' && _sample.height < 332) spawnChance = 0.42;
-      else if (_sample.biome === 'coastal_port_marsh' && _sample.height > 4.5) spawnChance = 0.18;
+      let clusterCount = 0;
+      if (_sample.biome === 'temperate_conifer_valley') {
+        spawnChance = 0.92;
+        clusterCount = 2;
+      } else if (_sample.biome === 'highland_steppe_quarry') {
+        spawnChance = 0.28;
+        clusterCount = 1;
+      } else if (_sample.biome === 'alpine_ridge_dam' && _sample.height < 332) {
+        spawnChance = 0.48;
+        clusterCount = 1;
+      } else if (_sample.biome === 'coastal_port_marsh' && _sample.height > 4.5) {
+        spawnChance = 0.22;
+        clusterCount = 1;
+      }
 
       if (rand() <= spawnChance) {
+        const baseBiome = _sample.biome;
         treePlacements.push({
           lx,
           y: _sample.height - 0.15,
           lz,
-          scale: 0.85 + rand() * 0.35, // ±15%+ organic scale variation
+          scale: 0.85 + rand() * 0.38,
           yaw: rand() * Math.PI * 2,
           tint: rand(),
         });
-        if (_sample.biome === 'temperate_conifer_valley' && outTreeRoosts.length < 14) {
+        if (baseBiome === 'temperate_conifer_valley' && outTreeRoosts.length < 18) {
           outTreeRoosts.push({ x: wx, y: _sample.height, z: wz });
+        }
+
+        // Organic satellite grove trees around primary pine for dense woodland silhouettes
+        for (let sat = 0; sat < clusterCount; sat++) {
+          const satA = rand() * Math.PI * 2;
+          const satR = 4.6 + rand() * 6.4;
+          const slx = lx + Math.cos(satA) * satR;
+          const slz = lz + Math.sin(satA) * satR;
+          if (Math.abs(slx) > halfBound || Math.abs(slz) > halfBound) continue;
+          const swx = centerX + slx;
+          const swz = centerZ + slz;
+          sampleFast(swx, swz);
+          if (_sample.isWater || _sample.isRoad || _sample.isSitePad || _sample.isQuarryPit || _sample.slope > 0.44) {
+            continue;
+          }
+          if (isNearLandmark(swx, swz) || isOnCivilizationClearance(swx, swz, 3.8)) continue;
+          treePlacements.push({
+            lx: slx,
+            y: _sample.height - 0.15,
+            lz: slz,
+            scale: 0.72 + rand() * 0.44,
+            yaw: rand() * Math.PI * 2,
+            tint: rand(),
+          });
         }
       }
     }
@@ -1185,8 +1688,8 @@ export class OpenWorldChunkStreamer {
       }
     }
 
-    // 3. Coastal Marsh Reeds & Steppe Scrub Tufts
-    const scrubAttempts = Math.round(40 * this.propDensityScale);
+    // 3. Coastal Marsh Reeds, Steppe Scrub Tufts & Roadside Hedgerow Bushes
+    const scrubAttempts = Math.round(74 * this.propDensityScale);
     for (let i = 0; i < scrubAttempts; i++) {
       const lx = (rand() - 0.5) * (CHUNK_SIZE_M - 8);
       const lz = (rand() - 0.5) * (CHUNK_SIZE_M - 8);
@@ -1196,14 +1699,14 @@ export class OpenWorldChunkStreamer {
       if (_sample.isWater || _sample.isRoad || _sample.isSitePad || _sample.slope > 0.5 || isNearLandmark(wx, wz) || isOnCivilizationClearance(wx, wz, 2.2)) continue;
       if (_sample.biome === 'alpine_ridge_dam' && _sample.height > 340) continue;
 
-      if (rand() <= 0.65) {
+      if (rand() <= 0.72) {
         const isMarsh = _sample.biome === 'coastal_port_marsh';
         const isSteppe = _sample.biome === 'highland_steppe_quarry';
         scrubPlacements.push({
           lx,
           y: _sample.height - 0.08,
           lz,
-          scale: 0.75 + rand() * 0.55,
+          scale: 0.78 + rand() * 0.62,
           yaw: rand() * Math.PI * 2,
           r: isSteppe ? 0.46 : isMarsh ? 0.34 : 0.22,
           g: isSteppe ? 0.42 : isMarsh ? 0.41 : 0.36,
@@ -1236,7 +1739,7 @@ export class OpenWorldChunkStreamer {
 
     let total = 0;
 
-    // Emit front-packed InstancedMesh batches (only if count > 0)
+    // Emit front-packed InstancedMesh batches (only if count > 0) + tight world AABBs for occlusion culling
     if (treePlacements.length > 0) {
       const count = treePlacements.length;
       const trunks = new THREE.InstancedMesh(this.trunkGeo, this.trunkMat, count);
@@ -1244,15 +1747,28 @@ export class OpenWorldChunkStreamer {
       trunks.castShadow = false;
       canopies.castShadow = this.shadowsEnabled;
       canopies.receiveShadow = this.shadowsEnabled;
+      canopies.layers.enable(MACRO_OCCLUDER_LAYER);
 
+      const treeBox = new THREE.Box3();
       for (let i = 0; i < count; i++) {
         const p = treePlacements[i];
         _dummy.position.set(p.lx, p.y, p.lz);
         _dummy.rotation.set(0, p.yaw, 0);
-        _dummy.scale.set(p.scale, p.scale * (0.92 + p.tint * 0.22), p.scale);
+        const sy = p.scale * (0.92 + p.tint * 0.22);
+        _dummy.scale.set(p.scale, sy, p.scale);
         _dummy.updateMatrix();
         trunks.setMatrixAt(i, _dummy.matrix);
         canopies.setMatrixAt(i, _dummy.matrix);
+
+        const wx = centerX + p.lx;
+        const wz = centerZ + p.lz;
+        const rad = 2.4 * p.scale;
+        treeBox.min.x = Math.min(treeBox.min.x, wx - rad);
+        treeBox.min.y = Math.min(treeBox.min.y, p.y);
+        treeBox.min.z = Math.min(treeBox.min.z, wz - rad);
+        treeBox.max.x = Math.max(treeBox.max.x, wx + rad);
+        treeBox.max.y = Math.max(treeBox.max.y, p.y + 10.2 * sy);
+        treeBox.max.z = Math.max(treeBox.max.z, wz + rad);
 
         _color.setRGB(0.12 + p.tint * 0.08, 0.24 + p.tint * 0.12, 0.13 + p.tint * 0.06);
         canopies.setColorAt(i, _color);
@@ -1264,6 +1780,11 @@ export class OpenWorldChunkStreamer {
       canopies.computeBoundingSphere();
       group.add(trunks, canopies);
       outMeshes.push(trunks, canopies);
+      outShadowCasters.push(canopies);
+      outOccludableBatches.push(
+        { obj: trunks, worldBox: treeBox, isMicro: false },
+        { obj: canopies, worldBox: treeBox, isMicro: false },
+      );
       total += count * 2;
     }
 
@@ -1272,6 +1793,7 @@ export class OpenWorldChunkStreamer {
       const rocks = new THREE.InstancedMesh(this.boulderGeo, this.boulderMat, count);
       rocks.castShadow = false;
       rocks.receiveShadow = false;
+      const rockBox = new THREE.Box3();
       for (let i = 0; i < count; i++) {
         const p = boulderPlacements[i];
         _dummy.position.set(p.lx, p.y, p.lz);
@@ -1282,18 +1804,30 @@ export class OpenWorldChunkStreamer {
         const shade = 0.34 + p.tint * 0.18;
         _color.setRGB(shade, shade * 0.99, shade * 0.95);
         rocks.setColorAt(i, _color);
+
+        const wx = centerX + p.lx;
+        const wz = centerZ + p.lz;
+        const rad = Math.max(p.sx, p.sz) * 1.15;
+        rockBox.min.x = Math.min(rockBox.min.x, wx - rad);
+        rockBox.min.y = Math.min(rockBox.min.y, p.y - 0.5);
+        rockBox.min.z = Math.min(rockBox.min.z, wz - rad);
+        rockBox.max.x = Math.max(rockBox.max.x, wx + rad);
+        rockBox.max.y = Math.max(rockBox.max.y, p.y + p.sy * 1.65);
+        rockBox.max.z = Math.max(rockBox.max.z, wz + rad);
       }
       rocks.instanceMatrix.needsUpdate = true;
       if (rocks.instanceColor) rocks.instanceColor.needsUpdate = true;
       rocks.computeBoundingSphere();
       group.add(rocks);
       outMeshes.push(rocks);
+      outOccludableBatches.push({ obj: rocks, worldBox: rockBox, isMicro: false });
       total += count;
     }
 
     if (scrubPlacements.length > 0) {
       const count = scrubPlacements.length;
       const scrubs = new THREE.InstancedMesh(this.scrubGeo, this.scrubMat, count);
+      const scrubBox = new THREE.Box3();
       for (let i = 0; i < count; i++) {
         const p = scrubPlacements[i];
         _dummy.position.set(p.lx, p.y, p.lz);
@@ -1303,12 +1837,24 @@ export class OpenWorldChunkStreamer {
         scrubs.setMatrixAt(i, _dummy.matrix);
         _color.setRGB(p.r, p.g, p.b);
         scrubs.setColorAt(i, _color);
+
+        const wx = centerX + p.lx;
+        const wz = centerZ + p.lz;
+        const rad = p.scale * 0.9;
+        scrubBox.min.x = Math.min(scrubBox.min.x, wx - rad);
+        scrubBox.min.y = Math.min(scrubBox.min.y, p.y);
+        scrubBox.min.z = Math.min(scrubBox.min.z, wz - rad);
+        scrubBox.max.x = Math.max(scrubBox.max.x, wx + rad);
+        scrubBox.max.y = Math.max(scrubBox.max.y, p.y + p.scale * 1.5);
+        scrubBox.max.z = Math.max(scrubBox.max.z, wz + rad);
       }
       scrubs.instanceMatrix.needsUpdate = true;
       if (scrubs.instanceColor) scrubs.instanceColor.needsUpdate = true;
       scrubs.computeBoundingSphere();
       group.add(scrubs);
       outMeshes.push(scrubs);
+      outMicroMeshes.push(scrubs);
+      outOccludableBatches.push({ obj: scrubs, worldBox: scrubBox, isMicro: true });
       total += count;
     }
 
@@ -1317,7 +1863,9 @@ export class OpenWorldChunkStreamer {
       const containers = new THREE.InstancedMesh(this.containerGeo, this.containerMat, count);
       containers.castShadow = this.shadowsEnabled;
       containers.receiveShadow = this.shadowsEnabled;
+      containers.layers.enable(MACRO_OCCLUDER_LAYER);
       const palette = [0x2f536e, 0x823626, 0x3b4d38, 0x5c574d];
+      const containerBox = new THREE.Box3();
       for (let i = 0; i < count; i++) {
         const p = containerPlacements[i];
         _dummy.position.set(p.lx, p.y, p.lz);
@@ -1327,12 +1875,23 @@ export class OpenWorldChunkStreamer {
         containers.setMatrixAt(i, _dummy.matrix);
         _color.setHex(palette[Math.floor(p.tint * palette.length) % palette.length]);
         containers.setColorAt(i, _color);
+
+        const wx = centerX + p.lx;
+        const wz = centerZ + p.lz;
+        containerBox.min.x = Math.min(containerBox.min.x, wx - 3.3);
+        containerBox.min.y = Math.min(containerBox.min.y, p.y);
+        containerBox.min.z = Math.min(containerBox.min.z, wz - 3.3);
+        containerBox.max.x = Math.max(containerBox.max.x, wx + 3.3);
+        containerBox.max.y = Math.max(containerBox.max.y, p.y + 2.8);
+        containerBox.max.z = Math.max(containerBox.max.z, wz + 3.3);
       }
       containers.instanceMatrix.needsUpdate = true;
       if (containers.instanceColor) containers.instanceColor.needsUpdate = true;
       containers.computeBoundingSphere();
       group.add(containers);
       outMeshes.push(containers);
+      outShadowCasters.push(containers);
+      outOccludableBatches.push({ obj: containers, worldBox: containerBox, isMicro: false });
       total += count;
     }
 
@@ -1346,7 +1905,7 @@ export class OpenWorldChunkStreamer {
       colorHex: number;
     }> = [];
     const propPalette = [0x6e5a42, 0x3b4d3f, 0x8f846b, 0x4b5563, 0x7c4534];
-    const propAttempts = Math.round(14 * this.propDensityScale);
+    const propAttempts = Math.round(32 * this.propDensityScale);
     for (let i = 0; i < propAttempts; i++) {
       const lx = (rand() - 0.5) * (CHUNK_SIZE_M - 22);
       const lz = (rand() - 0.5) * (CHUNK_SIZE_M - 22);
@@ -1355,7 +1914,7 @@ export class OpenWorldChunkStreamer {
       sampleFast(wx, wz);
       if (_sample.isWater || _sample.isRoad || _sample.isSitePad || _sample.slope > 0.22) continue;
       if (isNearLandmark(wx, wz) || isOnCivilizationClearance(wx, wz, 4.0)) continue;
-      if (rand() > 0.55) continue;
+      if (rand() > 0.58) continue;
 
       const kindIdx = Math.floor(rand() * this.batchedPropGeos.length) % this.batchedPropGeos.length;
       const colorHex = propPalette[(kindIdx + Math.floor(rand() * 2)) % propPalette.length];
@@ -1384,6 +1943,7 @@ export class OpenWorldChunkStreamer {
         geoIds.push(bm.addGeometry(this.batchedPropGeos[g]));
       }
 
+      const propBox = new THREE.Box3();
       for (let i = 0; i < batchedPlacements.length; i++) {
         const p = batchedPlacements[i];
         const instId = bm.addInstance(geoIds[p.kindIdx]);
@@ -1394,15 +1954,227 @@ export class OpenWorldChunkStreamer {
         bm.setMatrixAt(instId, _dummy.matrix);
         _color.setHex(p.colorHex);
         bm.setColorAt(instId, _color);
+
+        const wx = centerX + p.lx;
+        const wz = centerZ + p.lz;
+        propBox.min.x = Math.min(propBox.min.x, wx - 1.6);
+        propBox.min.y = Math.min(propBox.min.y, p.y);
+        propBox.min.z = Math.min(propBox.min.z, wz - 1.6);
+        propBox.max.x = Math.max(propBox.max.x, wx + 1.6);
+        propBox.max.y = Math.max(propBox.max.y, p.y + 1.6);
+        propBox.max.z = Math.max(propBox.max.z, wz + 1.6);
       }
 
       bm.computeBoundingSphere();
       group.add(bm);
       outBatchedMeshes.push(bm);
+      outMicroMeshes.push(bm);
+      outShadowCasters.push(bm);
+      outOccludableBatches.push({ obj: bm, worldBox: propBox, isMicro: true });
       total += batchedPlacements.length;
     }
 
     return total;
+  }
+
+  /**
+   * Ensures chunks inside the directional shadow frustum (`<= 115m`) are temporarily enabled
+   * before a shadow-map render pass so structures/trees behind the player still cast shadows into view.
+   */
+  public prepareForShadowPass(playerX: number, playerZ: number): void {
+    const halfChunk = CHUNK_SIZE_M * 0.5;
+    for (const rec of this.loadedChunks.values()) {
+      if (rec.lod !== 'active') continue;
+      const dx = Math.max(0, Math.abs(playerX - rec.centerX) - halfChunk);
+      const dz = Math.max(0, Math.abs(playerZ - rec.centerZ) - halfChunk);
+      const nearDist = Math.hypot(dx, dz);
+      if (nearDist <= 115.0) {
+        rec.group.visible = true;
+        const cast = this.shadowsEnabled;
+        for (let i = 0; i < rec.shadowCasterMeshes.length; i++) {
+          rec.shadowCasterMeshes[i].castShadow = cast;
+        }
+      }
+    }
+  }
+
+  /**
+   * Populates the conservative software Hi-Z occlusion buffer with nearby large solid structures
+   * (FOB perimeter blast walls, concrete buildings, houses, barns, gas stations, and major vertical
+   * landmarks like the Hydroelectric Dam, Port Warehouse, Quarry Bunker, and Railyard Depot).
+   */
+  public prepareOcclusionCuller(
+    culler: OpenWorldOcclusionCuller,
+    camera: THREE.PerspectiveCamera,
+    camX: number,
+    camY: number,
+    camZ: number,
+  ): void {
+    culler.beginFrame(camera, camX, camY, camZ);
+
+    // 1. Submit pre-filtered large solid structural OBBs from nearby active chunks
+    for (let i = 0; i < this.activeChunks.length; i++) {
+      const rec = this.activeChunks[i];
+      const dx = rec.centerX - camX;
+      const dz = rec.centerZ - camZ;
+      if (dx * dx + dz * dz > 340 * 340) continue;
+      const obbs = rec.occluderObbs;
+      for (let j = 0; j < obbs.length; j++) {
+        culler.addOccluderObb(obbs[j]);
+      }
+    }
+
+    // 2. Submit massive opaque vertical landmark hulls (Dam wall, Port Warehouse, Quarry Bunker, Railyard Depot)
+    for (let i = 0; i < this.landmarkOccluderAabbs.length; i++) {
+      const b = this.landmarkOccluderAabbs[i];
+      culler.addOccluderAabb(b.minX, b.minY, b.minZ, b.maxX, b.maxY, b.maxZ);
+    }
+
+    culler.finalizeOccluders();
+  }
+
+  /**
+   * Zero-GC camera frustum + behind-the-player + conservative software occlusion culling,
+   * micro-foliage distance culling (`> 140m`), and shadow-caster radius gating (`<= 105m`).
+   * - Always keeps chunks within `22m` 360° safety halo visible so rapid 180° turns never reveal holes.
+   * - Expands each chunk's world AABB by `+18m` XZ turn padding for seamless peripheral visibility.
+   * - When `keepShadowHalo` is true (on 15Hz shadow-refresh frames), keeps active chunks within `<= 105m`
+   *   visible so objects behind the player still cast directional shadows into the player's field of view.
+   * - When `culler` is supplied, hides entire chunks, distant prop batches, and horizon landmarks
+   *   completely blocked by large solid structures (buildings, FOB blast walls, Dam/Port/Quarry/Railyard).
+   */
+  public applyCameraCullingAndLods(
+    camera: THREE.PerspectiveCamera,
+    playerX: number,
+    playerZ: number,
+    keepShadowHalo = false,
+    culler?: OpenWorldOcclusionCuller,
+  ): { visibleChunks: number; culledChunks: number; occludedChunks: number; occludedObjects: number } {
+    camera.updateMatrixWorld();
+    _projScreenMatrix.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+    _cullFrustum.setFromProjectionMatrix(_projScreenMatrix);
+
+    const halfChunk = CHUNK_SIZE_M * 0.5;
+    let visibleChunks = 0;
+    let culledChunks = 0;
+    let occludedChunks = 0;
+    let occludedObjects = 0;
+
+    for (const rec of this.loadedChunks.values()) {
+      const dx = Math.max(0, Math.abs(playerX - rec.centerX) - halfChunk);
+      const dz = Math.max(0, Math.abs(playerZ - rec.centerZ) - halfChunk);
+      const nearDist = Math.hypot(dx, dz);
+
+      _paddedBox.min.set(rec.bounds.min.x - 18, rec.bounds.min.y - 4, rec.bounds.min.z - 18);
+      _paddedBox.max.set(rec.bounds.max.x + 18, rec.bounds.max.y + 8, rec.bounds.max.z + 18);
+
+      const inSafetyHalo = nearDist <= 22.0;
+      const inShadowRange = keepShadowHalo && rec.lod === 'active' && nearDist <= 105.0;
+      const inFrustum = inSafetyHalo || inShadowRange || _cullFrustum.intersectsBox(_paddedBox);
+
+      let occluded = false;
+      if (inFrustum && culler && !inSafetyHalo && !inShadowRange) {
+        occluded = culler.isBoxOccluded(rec.bounds, 22.0);
+      }
+
+      const visible = inFrustum && !occluded;
+      rec.group.visible = visible;
+      if (visible) {
+        visibleChunks++;
+        if (rec.lod === 'active') {
+          const showMicro = nearDist <= 140.0;
+          for (let i = 0; i < rec.microMeshes.length; i++) {
+            rec.microMeshes[i].visible = showMicro;
+          }
+          // Per-batch occlusion culling for non-occluder prop/foliage batches inside visible active chunks
+          if (culler && !inShadowRange) {
+            for (let i = 0; i < rec.occludableBatches.length; i++) {
+              const batch = rec.occludableBatches[i];
+              if (batch.isMicro && !showMicro) continue;
+              const batchOccluded = culler.isBoxOccluded(batch.worldBox, 16.0);
+              batch.obj.visible = !batchOccluded;
+              if (batchOccluded) occludedObjects++;
+            }
+          } else {
+            for (let i = 0; i < rec.occludableBatches.length; i++) {
+              const batch = rec.occludableBatches[i];
+              if (!batch.isMicro) batch.obj.visible = true;
+            }
+          }
+          const castShadow = this.shadowsEnabled && nearDist <= 105.0;
+          for (let i = 0; i < rec.shadowCasterMeshes.length; i++) {
+            rec.shadowCasterMeshes[i].castShadow = castShadow;
+          }
+        }
+      } else if (occluded) {
+        occludedChunks++;
+        culledChunks++;
+      } else {
+        culledChunks++;
+      }
+    }
+
+    // Horizon landmark occlusion culling (Dam, Port, Quarry, Railyard, distant FOB silhouettes)
+    for (let i = 0; i < this.horizonOccludables.length; i++) {
+      const item = this.horizonOccludables[i];
+      let baseVisible = true;
+      if (item.fobId) {
+        const spec = getFobCompoundSpec(item.fobId);
+        const fobKey = chunkKey(worldToChunkCoord(spec.worldX), worldToChunkCoord(spec.worldZ));
+        const rec = this.loadedChunks.get(fobKey);
+        baseVisible = !(rec && rec.lod === 'active');
+      }
+      if (!baseVisible) {
+        item.obj.visible = false;
+        continue;
+      }
+      const lmInFrustum = _cullFrustum.intersectsBox(item.box);
+      const lmOccluded = Boolean(lmInFrustum && culler && culler.isBoxOccluded(item.box, 24.0));
+      item.obj.visible = lmInFrustum && !lmOccluded;
+      if (lmOccluded) occludedObjects++;
+    }
+
+    // Full-screen indoor wall occlusion: when every viewport pixel is blocked closer than 45m,
+    // safely hide full-theater horizon forest, distant water sheets, and rising smoke plumes.
+    const fullScreenOccluded = Boolean(culler && culler.isScreenFullyOccludedBeyond(camera, 45.0));
+    for (let i = 0; i < this.horizonFullScreenTargets.length; i++) {
+      this.horizonFullScreenTargets[i].visible = !fullScreenOccluded;
+      if (fullScreenOccluded) occludedObjects++;
+    }
+
+    this.visibleChunkCount = visibleChunks;
+    this.culledBehindChunkCount = culledChunks;
+    this.occludedChunkCount = occludedChunks;
+    this.occludedObjectCount = occludedObjects;
+    return { visibleChunks, culledChunks, occludedChunks, occludedObjects };
+  }
+
+  /**
+   * Steps 1-draw-call rising ambient smoke plumes above contested checkpoints & militia field camps.
+   */
+  public updateAmbientSmoke(dt: number): void {
+    const mesh = this.ambientSmokeMesh;
+    if (!mesh || this.smokePuffs.length === 0) return;
+    this.smokeClockSec += Math.min(0.05, Math.max(0, dt));
+    const tClock = this.smokeClockSec;
+
+    for (let i = 0; i < this.smokePuffs.length; i++) {
+      const p = this.smokePuffs[i];
+      const u = (p.phase + tClock * p.riseSpeed) % 1.0;
+      const drift = u * 9.5;
+      const sx = p.baseX + Math.cos(p.driftAngle) * drift + Math.sin(tClock * 0.7 + i) * 0.65;
+      const sy = p.baseY + u * p.maxHeightM;
+      const sz = p.baseZ + Math.sin(p.driftAngle) * drift + Math.cos(tClock * 0.6 + i) * 0.65;
+      const env = Math.sin(u * Math.PI);
+      const scale = Math.max(0.08, p.baseScale * (0.7 + u * 2.4) * (0.35 + env * 0.85));
+
+      _smokeDummy.position.set(sx, sy, sz);
+      _smokeDummy.rotation.set(tClock * 0.25 + i, tClock * 0.18 + i * 0.5, 0);
+      _smokeDummy.scale.set(scale, scale * 0.78, scale);
+      _smokeDummy.updateMatrix();
+      mesh.setMatrixAt(i, _smokeDummy.matrix);
+    }
+    mesh.instanceMatrix.needsUpdate = true;
   }
 
   /**
@@ -1420,6 +2192,8 @@ export class OpenWorldChunkStreamer {
     wetness01: number,
     playerX: number,
     playerZ: number,
+    camForwardX?: number,
+    camForwardZ?: number,
   ): void {
     this.foliageBuilder.update(
       elapsedSec,
@@ -1429,6 +2203,8 @@ export class OpenWorldChunkStreamer {
       playerX,
       playerZ,
       (x, z) => this.sampleTerrainHeightOnly(x, z),
+      camForwardX,
+      camForwardZ,
     );
   }
 
@@ -1659,6 +2435,10 @@ export class OpenWorldChunkStreamer {
       activeChunkCount,
       midChunkCount,
       totalLoadedChunks: this.loadedChunks.size,
+      visibleChunkCount: this.visibleChunkCount || this.loadedChunks.size,
+      culledBehindChunkCount: this.culledBehindChunkCount,
+      occludedChunkCount: this.occludedChunkCount,
+      occludedObjectCount: this.occludedObjectCount,
       activeInstanceCount: this.activeInstanceCount,
       activeBatchedMeshCount,
       disposedChunkCount: this.disposedChunkCount,
@@ -1702,6 +2482,12 @@ export class OpenWorldChunkStreamer {
     }
     this.horizonDisposables.length = 0;
 
+    if (this.ambientSmokeMesh) {
+      this.ambientSmokeMesh.dispose();
+      this.ambientSmokeMesh = null;
+    }
+    this.smokePuffs.length = 0;
+
     this.archBuilder.dispose();
     this.foliageBuilder.dispose();
 
@@ -1713,6 +2499,8 @@ export class OpenWorldChunkStreamer {
     this.trunkMat.dispose();
     this.canopyGeo.dispose();
     this.canopyMat.dispose();
+    this.midTreeGeo.dispose();
+    this.midTreeMat.dispose();
     this.boulderGeo.dispose();
     this.boulderMat.dispose();
     this.scrubGeo.dispose();
@@ -1721,6 +2509,8 @@ export class OpenWorldChunkStreamer {
     this.containerMat.dispose();
     this.midBuildingGeo.dispose();
     this.midBuildingMat.dispose();
+    this.smokeGeo.dispose();
+    this.smokeMat.dispose();
     for (const g of this.batchedPropGeos) {
       g.dispose();
     }

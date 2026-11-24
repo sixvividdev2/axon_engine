@@ -350,12 +350,13 @@ export class OpenWorldFoliageBuilder {
   private readonly stumpGeo: THREE.BufferGeometry;
   private readonly stumpMat: THREE.MeshStandardMaterial;
 
-  // Deterministic near-player grass ring state (zero-GC, 15x15 = 225 cells max, ~26m radius)
-  private readonly nearRingGridRadius = 7;
-  private readonly nearRingCellM = 3.8;
+  // Deterministic near-player grass ring state (zero-GC, forward-biased cone + 10m 360° safety halo)
+  private readonly nearRingGridRadius = 9;
+  private readonly nearRingCellM = 3.2;
   private readonly nearRingCapacity: number;
   private lastNearCellX = 999999;
   private lastNearCellZ = 999999;
+  private lastNearYawSector = 999999;
 
   constructor(
     scene: THREE.Scene,
@@ -414,12 +415,13 @@ export class OpenWorldFoliageBuilder {
       { swayScale: 0.14 },
     );
 
-    // Static Mineral & Woody Ground Clutter
+    // Static Mineral & Woody Ground Clutter (explicit FrontSide backface culling on closed 3D meshes)
     this.rockGeo = buildFieldRockGeo();
     this.rockMat = new THREE.MeshStandardMaterial({
       color: 0xffffff,
       roughness: 0.91,
       metalness: 0.03,
+      side: THREE.FrontSide,
     });
 
     this.logGeo = buildFallenLogGeo();
@@ -427,6 +429,7 @@ export class OpenWorldFoliageBuilder {
       color: 0xffffff,
       roughness: 0.95,
       metalness: 0.0,
+      side: THREE.FrontSide,
     });
 
     this.stickGeo = buildStickBranchGeo();
@@ -434,6 +437,7 @@ export class OpenWorldFoliageBuilder {
       color: 0xffffff,
       roughness: 0.94,
       metalness: 0.0,
+      side: THREE.FrontSide,
     });
 
     this.stumpGeo = buildStumpGeo();
@@ -441,6 +445,7 @@ export class OpenWorldFoliageBuilder {
       color: 0xffffff,
       roughness: 0.93,
       metalness: 0.0,
+      side: THREE.FrontSide,
     });
 
     if (atmoFogUniforms) {
@@ -454,14 +459,15 @@ export class OpenWorldFoliageBuilder {
       applyAtmosphericHeightFog(this.stumpMat, atmoFogUniforms);
     }
 
-    // Near-player dense micro-grass ring (1 draw call)
+    // Near-player dense micro-grass ring (1 draw call, tight world bounding sphere for frustum culling)
     const side = this.nearRingGridRadius * 2 + 1;
     this.nearRingCapacity = side * side;
     this.nearGrassMesh = new THREE.InstancedMesh(this.grassGeo, this.grassMat, this.nearRingCapacity);
     this.nearGrassMesh.name = 'openworld_near_grass_ring';
     this.nearGrassMesh.castShadow = false;
     this.nearGrassMesh.receiveShadow = false;
-    this.nearGrassMesh.frustumCulled = false;
+    this.nearGrassMesh.frustumCulled = true;
+    this.nearGrassMesh.boundingSphere = new THREE.Sphere(new THREE.Vector3(), this.nearRingGridRadius * this.nearRingCellM + 2.5);
     this.nearGrassMesh.count = 0;
     scene.add(this.nearGrassMesh);
   }
@@ -502,7 +508,8 @@ export class OpenWorldFoliageBuilder {
 
   /**
    * Advances GPU wind & wetness shader uniforms and refreshes the near-player dense micro-grass skirt
-   * whenever the operator crosses a 3.2m world cell. Zero per-frame heap allocations.
+   * whenever the operator crosses a 3.2m world cell or rotates into a new 30° yaw sector.
+   * Zero per-frame heap allocations.
    */
   public update(
     elapsedSec: number,
@@ -512,6 +519,8 @@ export class OpenWorldFoliageBuilder {
     playerX: number,
     playerZ: number,
     sampleGroundHeight: (x: number, z: number) => number,
+    camForwardX?: number,
+    camForwardZ?: number,
   ): void {
     this.windUniforms.uTime.value = elapsedSec;
     this.windUniforms.uWindStrength.value = THREE.MathUtils.clamp(
@@ -524,21 +533,53 @@ export class OpenWorldFoliageBuilder {
 
     const cellX = Math.floor(playerX / this.nearRingCellM);
     const cellZ = Math.floor(playerZ / this.nearRingCellM);
-    if (cellX !== this.lastNearCellX || cellZ !== this.lastNearCellZ) {
-      this.rebuildNearGrassRing(cellX, cellZ, sampleGroundHeight);
+    let fwdLen = 0;
+    let fwdX = 0;
+    let fwdZ = 0;
+    let yawSector = 0;
+    if (camForwardX !== undefined && camForwardZ !== undefined) {
+      fwdLen = Math.hypot(camForwardX, camForwardZ);
+      if (fwdLen > 0.05) {
+        fwdX = camForwardX / fwdLen;
+        fwdZ = camForwardZ / fwdLen;
+        yawSector = Math.round(Math.atan2(fwdX, fwdZ) / (Math.PI / 6));
+      }
+    }
+
+    if (
+      cellX !== this.lastNearCellX ||
+      cellZ !== this.lastNearCellZ ||
+      (fwdLen > 0.05 && yawSector !== this.lastNearYawSector)
+    ) {
+      this.rebuildNearGrassRing(
+        cellX,
+        cellZ,
+        yawSector,
+        fwdLen > 0.05,
+        fwdX,
+        fwdZ,
+        sampleGroundHeight,
+      );
     }
   }
 
   private rebuildNearGrassRing(
     centerCellX: number,
     centerCellZ: number,
+    yawSector: number,
+    useForwardCone: boolean,
+    fwdX: number,
+    fwdZ: number,
     sampleGroundHeight: (x: number, z: number) => number,
   ): void {
     this.lastNearCellX = centerCellX;
     this.lastNearCellZ = centerCellZ;
+    this.lastNearYawSector = yawSector;
     const rad = this.nearRingGridRadius;
     const step = this.nearRingCellM;
-    const maxDistSq = (rad * step) * (rad * step);
+    const maxRadius = rad * step;
+    const maxDistSq = maxRadius * maxRadius;
+    const safetyHaloSq = 10.0 * 10.0; // 360° 10m halo prevents pop-in on fast mouse flicks
     const centerWx = (centerCellX + 0.5) * step;
     const centerWz = (centerCellZ + 0.5) * step;
 
@@ -552,6 +593,7 @@ export class OpenWorldFoliageBuilder {
     }
 
     let count = 0;
+    let sumY = 0;
     for (let dz = -rad; dz <= rad; dz++) {
       const iz = centerCellZ + dz;
       for (let dx = -rad; dx <= rad; dx++) {
@@ -562,8 +604,17 @@ export class OpenWorldFoliageBuilder {
 
         const wx = (ix + 0.12 + h0 * 0.76) * step;
         const wz = (iz + 0.12 + h1 * 0.76) * step;
-        const distSq = (wx - centerWx) * (wx - centerWx) + (wz - centerWz) * (wz - centerWz);
+        const rx = wx - centerWx;
+        const rz = wz - centerWz;
+        const distSq = rx * rx + rz * rz;
         if (distSq > maxDistSq) continue;
+
+        // Beyond 10m safety halo, emit grass strictly inside forward-facing hemisphere/cone
+        if (useForwardCone && distSq > safetyHaloSq) {
+          const dot = (rx * fwdX + rz * fwdZ) / Math.sqrt(distSq);
+          if (dot < -0.18) continue;
+        }
+
         if (isNearMajorLandmark(wx, wz) || isOnCivilizationClearance(wx, wz, 2.1)) continue;
 
         // Fast bilinear heightfield lookup (avoids 3x analytical FBM evaluations per cell)
@@ -587,12 +638,12 @@ export class OpenWorldFoliageBuilder {
         // Biome density gating (Conifer Valley & Marsh densest, Alpine sparse)
         const chance =
           _sample.biome === 'temperate_conifer_valley'
-            ? 0.86
+            ? 0.88
             : _sample.biome === 'coastal_port_marsh'
-              ? 0.72
+              ? 0.74
               : _sample.biome === 'highland_steppe_quarry'
-                ? 0.68
-                : 0.25;
+                ? 0.7
+                : 0.28;
         if (h2 > chance) continue;
 
         const scale = 0.85 + h0 * 0.75;
@@ -601,6 +652,7 @@ export class OpenWorldFoliageBuilder {
         _dummy.scale.set(scale, scale * (0.85 + h2 * 0.45), scale);
         _dummy.updateMatrix();
         this.nearGrassMesh.setMatrixAt(count, _dummy.matrix);
+        sumY += y;
 
         if (_sample.biome === 'highland_steppe_quarry') {
           _color.setRGB(0.45 + h0 * 0.1, 0.41 + h1 * 0.08, 0.21 + h2 * 0.05);
@@ -617,6 +669,12 @@ export class OpenWorldFoliageBuilder {
     }
 
     this.nearGrassMesh.count = count;
+    const avgY = count > 0 ? sumY / count : sampleGroundHeight(centerWx, centerWz);
+    if (!this.nearGrassMesh.boundingSphere) {
+      this.nearGrassMesh.boundingSphere = new THREE.Sphere();
+    }
+    this.nearGrassMesh.boundingSphere.center.set(centerWx, avgY, centerWz);
+    this.nearGrassMesh.boundingSphere.radius = maxRadius + 2.5;
     this.nearGrassMesh.instanceMatrix.needsUpdate = true;
     if (this.nearGrassMesh.instanceColor) {
       this.nearGrassMesh.instanceColor.needsUpdate = true;
@@ -635,6 +693,7 @@ export class OpenWorldFoliageBuilder {
     group: THREE.Group,
     outMeshes: THREE.InstancedMesh[],
     fastHeightSlope?: (wx: number, wz: number, out: { height: number; slope: number }) => void,
+    outMicroMeshes?: THREE.Object3D[],
   ): ChunkFoliageBuildResult {
     const rand = mulberry32(chunkHash(cx, cz, 719));
     const hsScratch = { height: 0, slope: 0 };
@@ -659,14 +718,14 @@ export class OpenWorldFoliageBuilder {
     const stumpList: Array<{ lx: number; y: number; lz: number; s: number; yaw: number; tint: number }> = [];
 
     const dScale = this.densityScale;
-    const grassAttempts = Math.round(150 * dScale);
-    const fernAttempts = Math.round(88 * dScale);
-    const rushAttempts = Math.round(95 * dScale);
-    const brushAttempts = Math.round(56 * dScale);
-    const rockAttempts = Math.round(64 * dScale);
-    const logAttempts = Math.round(24 * dScale);
+    const grassAttempts = Math.round(165 * dScale);
+    const fernAttempts = Math.round(124 * dScale);
+    const rushAttempts = Math.round(105 * dScale);
+    const brushAttempts = Math.round(82 * dScale);
+    const rockAttempts = Math.round(68 * dScale);
+    const logAttempts = Math.round(28 * dScale);
     const stickAttempts = Math.round(68 * dScale);
-    const stumpAttempts = Math.round(16 * dScale);
+    const stumpAttempts = Math.round(18 * dScale);
 
     // 1. Mid-range Chunk Grass Tufts (fills out hills/clearings beyond the 35m near-player skirt)
     for (let i = 0; i < grassAttempts; i++) {
@@ -971,6 +1030,7 @@ export class OpenWorldFoliageBuilder {
       mesh.computeBoundingSphere();
       group.add(mesh);
       outMeshes.push(mesh);
+      outMicroMeshes?.push(mesh);
       total += grassList.length;
     }
 
@@ -992,6 +1052,7 @@ export class OpenWorldFoliageBuilder {
       mesh.computeBoundingSphere();
       group.add(mesh);
       outMeshes.push(mesh);
+      outMicroMeshes?.push(mesh);
       total += fernList.length;
     }
 
@@ -1013,6 +1074,7 @@ export class OpenWorldFoliageBuilder {
       mesh.computeBoundingSphere();
       group.add(mesh);
       outMeshes.push(mesh);
+      outMicroMeshes?.push(mesh);
       total += rushList.length;
     }
 
@@ -1033,6 +1095,7 @@ export class OpenWorldFoliageBuilder {
       mesh.computeBoundingSphere();
       group.add(mesh);
       outMeshes.push(mesh);
+      outMicroMeshes?.push(mesh);
       total += brushList.length;
     }
 
@@ -1055,6 +1118,7 @@ export class OpenWorldFoliageBuilder {
       mesh.computeBoundingSphere();
       group.add(mesh);
       outMeshes.push(mesh);
+      outMicroMeshes?.push(mesh);
       total += rockList.length;
     }
 
@@ -1098,6 +1162,7 @@ export class OpenWorldFoliageBuilder {
       mesh.computeBoundingSphere();
       group.add(mesh);
       outMeshes.push(mesh);
+      outMicroMeshes?.push(mesh);
       total += stickList.length;
     }
 
@@ -1120,6 +1185,7 @@ export class OpenWorldFoliageBuilder {
       mesh.computeBoundingSphere();
       group.add(mesh);
       outMeshes.push(mesh);
+      outMicroMeshes?.push(mesh);
       total += stumpList.length;
     }
 

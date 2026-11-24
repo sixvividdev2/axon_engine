@@ -112,6 +112,7 @@ import { AtmosphereTelemetry, OpenWorldAtmosphere } from './OpenWorldAtmosphere'
 import { OpenWorldAmbienceAudio } from './OpenWorldAmbienceAudio';
 import { OpenWorldBodycamAdapter } from './OpenWorldBodycamAdapter';
 import { OpenWorldChunkStreamer, StreamerStats } from './OpenWorldChunkStreamer';
+import { OpenWorldOcclusionCuller } from './OpenWorldOcclusionCuller';
 import {
   createObbRaycastHit,
   getBakedHorizonTowers,
@@ -271,6 +272,8 @@ const _muzzleDir = new THREE.Vector3();
 const _flashTargetPos = new THREE.Vector3();
 const _whipVel = new THREE.Vector2();
 const _aiLosHitScratch = createObbRaycastHit();
+const _cullFrustum = new THREE.Frustum();
+const _cullProjScreen = new THREE.Matrix4();
 
 const RENDER_PREFS_STORAGE_KEY = 'axon_openworld_render_prefs_v1';
 
@@ -609,6 +612,7 @@ export class OpenWorldSessionEngine {
 
   private readonly atmosphere: OpenWorldAtmosphere;
   private readonly streamer: OpenWorldChunkStreamer;
+  private readonly occlusionCuller = new OpenWorldOcclusionCuller();
   private readonly sectorManager: OpenWorldSectorManager;
   private readonly logisticsEconomy: OpenWorldLogisticsEconomy;
   private readonly convoyDirector: OpenWorldConvoyDirector;
@@ -3001,6 +3005,21 @@ export class OpenWorldSessionEngine {
     const windSpeedMps = baseWindMps + altitudeWindBoost + gust01 * 3.8;
     const wetness01 = atmoTel.weather === 'mountain_rain' ? 0.92 : atmoTel.weather === 'coastal_fog' ? 0.35 : 0.0;
 
+    this.camera.updateMatrixWorld();
+    this.camera.getWorldPosition(_camPos);
+    this.camera.getWorldDirection(_lookDir);
+    _cullProjScreen.multiplyMatrices(this.camera.projectionMatrix, this.camera.matrixWorldInverse);
+    _cullFrustum.setFromProjectionMatrix(_cullProjScreen);
+
+    // Populate conservative software Hi-Z occlusion depth buffer from large solid structures & landmarks
+    this.streamer.prepareOcclusionCuller(
+      this.occlusionCuller,
+      this.camera,
+      _camPos.x,
+      _camPos.y,
+      _camPos.z,
+    );
+
     this.audio.setWindWeather(windSpeedMps, gust01, atmoTel.weather === 'mountain_rain' ? 0.85 : 0);
     this.streamer.updateFoliageWindAndGrass(
       this.elapsedSec,
@@ -3009,7 +3028,10 @@ export class OpenWorldSessionEngine {
       wetness01,
       px,
       pz,
+      _lookDir.x,
+      _lookDir.z,
     );
+    this.streamer.updateAmbientSmoke(dt);
 
     // Update Spatial Ambience Engine (Wind/Foliage + Water/Marsh beds, Night Owls, Proximity-Ducked Crickets)
     this.ambienceAudio.update({
@@ -3047,11 +3069,12 @@ export class OpenWorldSessionEngine {
       flashlightOn: this.flashlightOn,
       nearbyLogs: this.streamer.getActiveLogAnchors(),
       nearbyRocks: this.streamer.getActiveRockAnchors(),
+      occlusionCuller: this.occlusionCuller,
+      sampleIndoorAt: (x, y, z, out) => this.streamer.sampleIndoorAt(x, y, z, out),
       onWolfBitePlayer: (ev) => this.handleWolfBitePlayer(ev),
     });
 
-    // Update Phase 3 Tactical AI Squads (vision scaled by Atmosphere + Flashlight + Neutral aim/breach warnings)
-    this.camera.getWorldDirection(_lookDir);
+    // Update Phase 3 Tactical AI Squads (vision scaled by Atmosphere + Flashlight + 3-tier LOD, frustum & occlusion culling)
     this.aiDirector.update(
       dt,
       px,
@@ -3069,6 +3092,8 @@ export class OpenWorldSessionEngine {
         playerAimDirX: _lookDir.x,
         playerAimDirY: _lookDir.y,
         playerAimDirZ: _lookDir.z,
+        frustum: _cullFrustum,
+        occlusionCuller: this.occlusionCuller,
         onNeutralWarning: () => {
           this.audio.playTacticalSwitchClick(true);
         },
@@ -3252,10 +3277,21 @@ export class OpenWorldSessionEngine {
       this.flashlight.intensity = 0;
     }
 
-    // Refresh directional shadow map on 30Hz cadence (halves shadow depth pass cost)
-    if (this.renderer.shadowMap.enabled && this.atmosphere.consumeShadowUpdateNeeded(dt)) {
+    // Delta-triggered directional shadow map refresh (<= 15Hz when moving / sun shifting)
+    const shadowUpdated =
+      this.renderer.shadowMap.enabled && this.atmosphere.consumeShadowUpdateNeeded(dt, px, pz);
+    if (shadowUpdated) {
       this.renderer.shadowMap.needsUpdate = true;
     }
+
+    // Camera frustum + behind-player + conservative occlusion culling (preserves <= 105m shadow-caster halo on shadow-refresh frames)
+    this.streamer.applyCameraCullingAndLods(
+      this.camera,
+      px,
+      pz,
+      shadowUpdated,
+      this.occlusionCuller,
+    );
 
     // Final output pass (branches ONLY after identical unified simulation step)
     const renderStart = performance.now();

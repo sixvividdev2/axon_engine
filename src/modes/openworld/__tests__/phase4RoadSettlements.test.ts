@@ -87,10 +87,11 @@ describe('Open World Phase 4 — Road Network, Enterable Settlements & Roadside 
 
     expect(segments.length).toBeGreaterThan(220);
     expect(bridges).toHaveLength(3);
-    expect(sites.length).toBe(35);
+    expect(sites.length).toBe(43);
     expect(sites.filter((s) => s.kind === 'gas_station')).toHaveLength(4);
     expect(sites.filter((s) => s.kind === 'checkpoint')).toHaveLength(5);
     expect(sites.filter((s) => s.kind === 'barn')).toHaveLength(5);
+    expect(sites.filter((s) => s.kind === 'camp_outpost')).toHaveLength(8);
     expect(
       sites.filter(
         (s) =>

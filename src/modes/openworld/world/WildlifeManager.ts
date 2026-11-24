@@ -1,11 +1,21 @@
 import * as THREE from 'three';
+import type { BodycamInteriorSample } from '../../../../bodycam-sdk/types';
 import { OpenWorldAmbienceAudio, isHourInWindow } from './OpenWorldAmbienceAudio';
-import { isOnCivilizationClearance } from './OpenWorldCivilizationTopology';
+import {
+  createRoadQueryResult,
+  createSitePadQueryResult,
+  getBakedOpenWorldSites,
+  isOnCivilizationClearance,
+  queryRoadNetwork,
+  querySitePad,
+} from './OpenWorldCivilizationTopology';
 import { isInsideFobCompound } from './OpenWorldFobLayout';
 import { FoliageAnchorPoint } from './OpenWorldFoliageBuilder';
+import type { OpenWorldOcclusionCuller } from './OpenWorldOcclusionCuller';
 import {
   createTerrainSample,
   createWaterProximitySample,
+  OPENWORLD_LANDMARKS,
   queryWaterProximity,
   sampleOpenWorldTerrain,
   SEA_LEVEL_M,
@@ -78,6 +88,8 @@ export interface WildlifeUpdateContext {
   flashlightOn: boolean;
   nearbyLogs?: ReadonlyArray<FoliageAnchorPoint>;
   nearbyRocks?: ReadonlyArray<FoliageAnchorPoint>;
+  occlusionCuller?: OpenWorldOcclusionCuller;
+  sampleIndoorAt?: (x: number, y: number, z: number, out: BodycamInteriorSample) => void;
   onWolfBitePlayer?: (ev: WolfBitePlayerEvent) => void;
 }
 
@@ -239,6 +251,7 @@ interface ButterflyInstanceState {
 interface InsectInstanceState {
   active: boolean;
   isSpider: boolean;
+  habitat: 'wilderness' | 'building';
   x: number;
   y: number;
   z: number;
@@ -265,8 +278,182 @@ export interface DynamicSpawnAuditEntry {
 // Zero-GC scratch helpers
 const _terrain = createTerrainSample();
 const _water = createWaterProximitySample();
+const _habitatTerrain = createTerrainSample();
+const _habitatRoad = createRoadQueryResult();
+const _habitatPad = createSitePadQueryResult();
+const _indoorScratch: BodycamInteriorSample = { isIndoor: false, material: 'outdoor' };
 const _dummy = new THREE.Object3D();
 const _color = new THREE.Color();
+
+export type InsectHabitatKind = 'wilderness' | 'building' | 'forbidden';
+
+// Minimum clearances keeping deer strictly in deep wilderness away from civilization
+const DEER_MIN_ROAD_DIST_M = 65;
+const DEER_MIN_SITE_DIST_M = 95;
+const DEER_MIN_LANDMARK_DIST_M = 140;
+
+// Sparse caps so insects appear primarily in wilderness and only occasionally inside/around buildings
+const MAX_BUILDING_SPIDERS = 2;
+const MAX_BUILDING_ANTS = 5;
+const BUILDING_SPIDER_SPAWN_CHANCE = 0.34;
+const BUILDING_ANT_TRAIL_SPAWN_CHANCE = 0.24;
+
+/**
+ * Returns true ONLY for deep wilderness terrain suitable for deer herds:
+ * temperate conifer forests, wild highland steppe (outside quarry pits), or lower alpine timberline,
+ * strictly well away from paved/dirt roads (`>= 65m`), settlements/camps/houses (`>= 95m`),
+ * FOB compounds, and major industrial landmarks (`>= 140m`).
+ */
+export function isDeerWildernessHabitat(wx: number, wz: number): boolean {
+  if (isInsideFobCompound(wx, wz)) return false;
+
+  sampleOpenWorldTerrain(wx, wz, _habitatTerrain);
+  if (
+    _habitatTerrain.isWater ||
+    _habitatTerrain.isRoad ||
+    _habitatTerrain.isSitePad ||
+    _habitatTerrain.isQuarryPit ||
+    _habitatTerrain.slope > 0.36
+  ) {
+    return false;
+  }
+
+  const validBiome =
+    _habitatTerrain.biome === 'temperate_conifer_valley' ||
+    _habitatTerrain.biome === 'highland_steppe_quarry' ||
+    (_habitatTerrain.biome === 'alpine_ridge_dam' && _habitatTerrain.height < 245);
+  if (!validBiome) return false;
+
+  queryRoadNetwork(wx, wz, _habitatRoad);
+  if (_habitatRoad.tier !== 'none' && _habitatRoad.distanceM < DEER_MIN_ROAD_DIST_M) {
+    return false;
+  }
+
+  querySitePad(wx, wz, _habitatPad);
+  if (_habitatPad.onPad || _habitatPad.blend > 0.01) {
+    return false;
+  }
+
+  const sites = getBakedOpenWorldSites();
+  const minSiteSq = DEER_MIN_SITE_DIST_M * DEER_MIN_SITE_DIST_M;
+  for (let i = 0; i < sites.length; i++) {
+    const s = sites[i];
+    const dx = wx - s.x;
+    const dz = wz - s.z;
+    if (dx * dx + dz * dz < minSiteSq) {
+      return false;
+    }
+  }
+
+  for (let i = 0; i < OPENWORLD_LANDMARKS.length; i++) {
+    const lm = OPENWORLD_LANDMARKS[i];
+    const minD = Math.max(DEER_MIN_LANDMARK_DIST_M, lm.padRadiusM + 65);
+    const dx = wx - lm.worldX;
+    const dz = wz - lm.worldZ;
+    if (dx * dx + dz * dz < minD * minD) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+/**
+ * Classifies an insect candidate position into:
+ * - `'wilderness'`: natural forest floor, marsh bank, wild steppe grass/logs/rocks well off roads & pads
+ * - `'building'`: inside enterable houses/barns/cabins/homesteads/camp structures or right along their walls
+ * - `'forbidden'`: highways, roads, shoulders, bridges, open forecourts/tarmac, FOB courtyards, water, high alpine rock/snow
+ */
+export function classifyInsectHabitat(
+  wx: number,
+  wy: number,
+  wz: number,
+  indoorSample?: Pick<BodycamInteriorSample, 'isIndoor' | 'material'> | null,
+): InsectHabitatKind {
+  // 1. Enterable civilian building interior (exclude military FOB compound interiors/courtyards)
+  if (indoorSample?.isIndoor && !isInsideFobCompound(wx, wz)) {
+    return 'building';
+  }
+
+  // Reject concrete military FOB compounds on open tarmac/courtyards
+  if (isInsideFobCompound(wx, wz)) {
+    return 'forbidden';
+  }
+
+  // Reject all roadways, shoulders, bridges, and immediate roadside gravel
+  queryRoadNetwork(wx, wz, _habitatRoad);
+  if (
+    _habitatRoad.onRoad ||
+    _habitatRoad.onShoulder ||
+    _habitatRoad.onBridge ||
+    (_habitatRoad.tier !== 'none' &&
+      _habitatRoad.distanceM <= _habitatRoad.halfWidthM + _habitatRoad.shoulderM + 5.0)
+  ) {
+    return 'forbidden';
+  }
+
+  // Check proximity to rustic/residential building footprints (houses, barns, camp outposts)
+  const sites = getBakedOpenWorldSites();
+  for (let i = 0; i < sites.length; i++) {
+    const s = sites[i];
+    const dx = wx - s.x;
+    const dz = wz - s.z;
+    const distSq = dx * dx + dz * dz;
+    const isRuralBuilding =
+      s.kind === 'house_cabin' ||
+      s.kind === 'house_bungalow' ||
+      s.kind === 'house_homestead' ||
+      s.kind === 'barn' ||
+      s.kind === 'camp_outpost';
+    if (isRuralBuilding && distSq <= 7.8 * 7.8 && wy >= s.groundY - 0.6) {
+      return 'building';
+    }
+    // Keep open gas station forecourts, checkpoint concrete, and outer parking pads insect-free
+    const padLimit = s.padRadiusM + 3.0;
+    if (distSq <= padLimit * padLimit) {
+      return 'forbidden';
+    }
+  }
+
+  querySitePad(wx, wz, _habitatPad);
+  if (_habitatPad.onPad || _habitatPad.blend > 0.12) {
+    return 'forbidden';
+  }
+
+  // Keep major industrial landmarks (Dam concrete, Port tarmac, Quarry pit, Railyard apron) insect-free
+  for (let i = 0; i < OPENWORLD_LANDMARKS.length; i++) {
+    const lm = OPENWORLD_LANDMARKS[i];
+    const excl = lm.padRadiusM * 0.85;
+    const dx = wx - lm.worldX;
+    const dz = wz - lm.worldZ;
+    if (dx * dx + dz * dz < excl * excl) {
+      return 'forbidden';
+    }
+  }
+
+  sampleOpenWorldTerrain(wx, wz, _habitatTerrain);
+  if (
+    _habitatTerrain.isWater ||
+    _habitatTerrain.isRoad ||
+    _habitatTerrain.isSitePad ||
+    _habitatTerrain.isQuarryPit ||
+    _habitatTerrain.slope > 0.48 ||
+    _habitatTerrain.height > 265
+  ) {
+    return 'forbidden';
+  }
+
+  if (
+    _habitatTerrain.biome === 'temperate_conifer_valley' ||
+    _habitatTerrain.biome === 'coastal_port_marsh' ||
+    _habitatTerrain.biome === 'highland_steppe_quarry' ||
+    (_habitatTerrain.biome === 'alpine_ridge_dam' && _habitatTerrain.height < 245)
+  ) {
+    return 'wilderness';
+  }
+
+  return 'forbidden';
+}
 
 // Spread-out macro-fauna budgets & 50% reduced ground insect pools
 const MAX_WOLF_PACKS = 3;
@@ -558,9 +745,14 @@ export class WildlifeManager {
   private butterflyRepopAccum = 0;
   private insectRepopAccum = 0;
   private readonly recentDynamicSpawns: DynamicSpawnAuditEntry[] = [];
-  private readonly antTrailCenters: Array<{ x: number; z: number; active: boolean }> = [
-    { x: 0, z: 0, active: false },
-    { x: 0, z: 0, active: false },
+  private readonly antTrailCenters: Array<{
+    x: number;
+    z: number;
+    active: boolean;
+    habitat: 'wilderness' | 'building';
+  }> = [
+    { x: 0, z: 0, active: false, habitat: 'wilderness' },
+    { x: 0, z: 0, active: false, habitat: 'wilderness' },
   ];
 
   constructor(
@@ -575,21 +767,52 @@ export class WildlifeManager {
     this.isSoftwareGl = isSoftwareGl;
     this.rootGroup.name = 'openworld_wildlife_root';
 
-    // Shared PBR fauna materials (varied roughness & organic desaturated palettes)
-    this.wolfAlphaMat = new THREE.MeshStandardMaterial({ color: 0x3a3d40, roughness: 0.92, metalness: 0.0 });
-    this.wolfBetaMat = new THREE.MeshStandardMaterial({ color: 0x565a5e, roughness: 0.9, metalness: 0.0 });
-    this.wolfDarkMat = new THREE.MeshStandardMaterial({ color: 0x222427, roughness: 0.85, metalness: 0.0 });
+    // Shared PBR fauna materials (varied roughness, organic desaturated palettes, strict FrontSide backface culling)
+    this.wolfAlphaMat = new THREE.MeshStandardMaterial({
+      color: 0x3a3d40,
+      roughness: 0.92,
+      metalness: 0.0,
+      side: THREE.FrontSide,
+    });
+    this.wolfBetaMat = new THREE.MeshStandardMaterial({
+      color: 0x565a5e,
+      roughness: 0.9,
+      metalness: 0.0,
+      side: THREE.FrontSide,
+    });
+    this.wolfDarkMat = new THREE.MeshStandardMaterial({
+      color: 0x222427,
+      roughness: 0.85,
+      metalness: 0.0,
+      side: THREE.FrontSide,
+    });
     this.wolfEyeMat = new THREE.MeshStandardMaterial({
       color: 0xe6b84c,
       emissive: 0x8f6b18,
       emissiveIntensity: 0.75,
       roughness: 0.25,
       metalness: 0.1,
+      side: THREE.FrontSide,
     });
-    this.deerCoatMat = new THREE.MeshStandardMaterial({ color: 0x7c5c3e, roughness: 0.88, metalness: 0.0 });
-    this.deerBellyMat = new THREE.MeshStandardMaterial({ color: 0xd4cab8, roughness: 0.92, metalness: 0.0 });
-    this.deerAntlerMat = new THREE.MeshStandardMaterial({ color: 0xb8ad98, roughness: 0.72, metalness: 0.04 });
-    this.hitboxMat = new THREE.MeshBasicMaterial({ visible: false });
+    this.deerCoatMat = new THREE.MeshStandardMaterial({
+      color: 0x7c5c3e,
+      roughness: 0.88,
+      metalness: 0.0,
+      side: THREE.FrontSide,
+    });
+    this.deerBellyMat = new THREE.MeshStandardMaterial({
+      color: 0xd4cab8,
+      roughness: 0.92,
+      metalness: 0.0,
+      side: THREE.FrontSide,
+    });
+    this.deerAntlerMat = new THREE.MeshStandardMaterial({
+      color: 0xb8ad98,
+      roughness: 0.72,
+      metalness: 0.04,
+      side: THREE.FrontSide,
+    });
+    this.hitboxMat = new THREE.MeshBasicMaterial({ visible: false, side: THREE.FrontSide });
     this.sharedMats.push(
       this.wolfAlphaMat,
       this.wolfBetaMat,
@@ -603,7 +826,12 @@ export class WildlifeManager {
 
     // 1. Frogs InstancedMesh
     const frogGeo = buildFrogGeometry();
-    const frogMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.42, metalness: 0.05 });
+    const frogMat = new THREE.MeshStandardMaterial({
+      color: 0xffffff,
+      roughness: 0.42,
+      metalness: 0.05,
+      side: THREE.FrontSide,
+    });
     this.sharedGeos.push(frogGeo);
     this.sharedMats.push(frogMat);
     this.frogMesh = new THREE.InstancedMesh(frogGeo, frogMat, FROG_POOL_SIZE);
@@ -696,7 +924,12 @@ export class WildlifeManager {
     // 3. Spiders & Ants InstancedMeshes with GPU leg-scuttle vertex animation
     const insectTimeU = this.insectTimeUniform;
     const makeInsectMat = (hex: number, key: string) => {
-      const m = new THREE.MeshStandardMaterial({ color: hex, roughness: 0.52, metalness: 0.08 });
+      const m = new THREE.MeshStandardMaterial({
+        color: hex,
+        roughness: 0.52,
+        metalness: 0.08,
+        side: THREE.FrontSide,
+      });
       m.customProgramCacheKey = () => key;
       m.onBeforeCompile = (shader) => {
         shader.uniforms.uInsectTime = insectTimeU;
@@ -745,6 +978,7 @@ export class WildlifeManager {
       this.spiders.push({
         active: false,
         isSpider: true,
+        habitat: 'wilderness',
         x: 0,
         y: 0,
         z: 0,
@@ -762,6 +996,7 @@ export class WildlifeManager {
       this.ants.push({
         active: false,
         isSpider: false,
+        habitat: 'wilderness',
         x: 0,
         y: 0,
         z: 0,
@@ -783,6 +1018,7 @@ export class WildlifeManager {
       color: 0x2a241b,
       roughness: 0.45,
       metalness: 0.02,
+      side: THREE.FrontSide,
       polygonOffset: true,
       polygonOffsetFactor: -2,
       polygonOffsetUnits: -2,
@@ -1643,10 +1879,10 @@ export class WildlifeManager {
   private trySpawnDeerHerdNear(ctx: WildlifeUpdateContext): void {
     const px = ctx.playerX;
     const pz = ctx.playerZ;
-    for (let attempt = 0; attempt < 16; attempt++) {
+    for (let attempt = 0; attempt < 24; attempt++) {
       // Bias behind player's wide FOV, or allow distant ridge-occluded valleys
       const angle =
-        attempt < 12
+        attempt < 18
           ? this.sampleRearBlindSpotAngle(ctx.playerYawRad)
           : Math.random() * Math.PI * 2;
       const dist =
@@ -1654,21 +1890,9 @@ export class WildlifeManager {
         Math.random() * (DEER_SPAWN_MAX_DIST_M - DEER_SPAWN_MIN_DIST_M);
       const wx = px + Math.cos(angle) * dist;
       const wz = pz + Math.sin(angle) * dist;
-      sampleOpenWorldTerrain(wx, wz, _terrain);
-      if (
-        _terrain.isWater ||
-        _terrain.isRoad ||
-        _terrain.isSitePad ||
-        _terrain.isQuarryPit ||
-        _terrain.slope > 0.36 ||
-        isOnCivilizationClearance(wx, wz, 18)
-      ) {
-        continue;
-      }
-      if (
-        _terrain.biome !== 'temperate_conifer_valley' &&
-        _terrain.biome !== 'highland_steppe_quarry'
-      ) {
+
+      // Strictly focus deer into deep wilderness well away from roads, settlements, FOBs & landmarks
+      if (!isDeerWildernessHabitat(wx, wz)) {
         continue;
       }
 
@@ -1807,8 +2031,10 @@ export class WildlifeManager {
         }
       } else if (herd.state === 'BOLT' && herd.stateTimer <= 0) {
         herd.state = 'GRAZE';
-        herd.homeX = leader.x;
-        herd.homeZ = leader.z;
+        if (isDeerWildernessHabitat(leader.x, leader.z)) {
+          herd.homeX = leader.x;
+          herd.homeZ = leader.z;
+        }
         herd.stateTimer = 14;
       }
 
@@ -1825,10 +2051,19 @@ export class WildlifeManager {
         let targetVz = 0;
         if (herd.state === 'BOLT') {
           const speed = 8.4 + (i % 3) * 0.45;
+          // Steer bolting deer away from roadways/settlements if they approach civilization
+          const nextProbeX = d.x + herd.boltDirX * 14;
+          const nextProbeZ = d.z + herd.boltDirZ * 14;
+          if (isOnCivilizationClearance(nextProbeX, nextProbeZ, 28)) {
+            const tmpX = -herd.boltDirZ;
+            const tmpZ = herd.boltDirX;
+            herd.boltDirX = tmpX;
+            herd.boltDirZ = tmpZ;
+          }
           targetVx = herd.boltDirX * speed;
           targetVz = herd.boltDirZ * speed;
         } else if (herd.state === 'GRAZE') {
-          // Gentle herd cohesion wander around home clearing
+          // Gentle herd cohesion wander around wilderness clearing
           const driftA = ctx.elapsedSec * 0.14 + i * 2.1;
           const tx = herd.homeX + Math.cos(driftA) * 8.5;
           const tz = herd.homeZ + Math.sin(driftA) * 8.5;
@@ -1854,31 +2089,42 @@ export class WildlifeManager {
           d.yaw += wrapAngleDiff(desiredYaw, d.yaw) * Math.min(1, dt * 7.5);
         }
 
-        // Articulated bounding gait + ear twitch + white flagging tail
-        d.gaitPhase += dt * (speed > 3 ? 13.5 : speed * 4.2);
-        d.earTwitchPhase += dt * 3.1;
-        const targetGraze = herd.state === 'GRAZE' && speed < 0.5 ? 1.0 : 0.0;
-        d.grazeBlend += (targetGraze - d.grazeBlend) * Math.min(1, dt * 3.5);
+        const dDistPlayer = Math.hypot(d.x - ctx.playerX, d.z - ctx.playerZ);
+        const deerBehind =
+          dDistPlayer > 14.0 && this.computePlayerForwardDot(d.x, d.z, ctx) < HIDDEN_REAR_DOT_MAX;
+        const deerOccluded =
+          !deerBehind &&
+          dDistPlayer > 14.0 &&
+          Boolean(ctx.occlusionCuller?.isSphereOccluded(d.x, d.y + 0.95, d.z, 1.35, 14.0));
+        const deerHidden = deerBehind || deerOccluded;
+        d.rig.root.visible = !d.harvested && !deerHidden;
 
-        const swing = Math.min(1, speed / 4.5) * 0.65;
         const bound = herd.state === 'BOLT' ? Math.max(0, Math.sin(d.gaitPhase)) * 0.28 : 0;
         d.rig.root.position.set(d.x, d.y + bound, d.z);
         d.rig.root.rotation.y = d.yaw;
 
-        // 4-leg bounding animation
-        const fSwing = Math.sin(d.gaitPhase) * swing;
-        const bSwing = Math.sin(d.gaitPhase + (herd.state === 'BOLT' ? 0.55 : Math.PI)) * swing;
-        d.rig.legFL.rotation.x = fSwing;
-        d.rig.legFR.rotation.x = herd.state === 'BOLT' ? fSwing * 0.92 : -fSwing;
-        d.rig.legBL.rotation.x = bSwing;
-        d.rig.legBR.rotation.x = herd.state === 'BOLT' ? bSwing * 0.92 : -bSwing;
+        if (!deerHidden) {
+          // Articulated bounding gait + ear twitch + white flagging tail
+          d.gaitPhase += dt * (speed > 3 ? 13.5 : speed * 4.2);
+          d.earTwitchPhase += dt * 3.1;
+          const targetGraze = herd.state === 'GRAZE' && speed < 0.5 ? 1.0 : 0.0;
+          d.grazeBlend += (targetGraze - d.grazeBlend) * Math.min(1, dt * 3.5);
 
-        // Grazing head bow vs Alert head-high + ear twitch + white flag tail
-        d.rig.neckPivot.rotation.x = d.grazeBlend * 1.05;
-        const twitch = Math.sin(d.earTwitchPhase * 2.7) > 0.88 ? 0.28 : 0;
-        d.rig.earL.rotation.z = 0.45 + twitch;
-        d.rig.earR.rotation.z = -0.45 - twitch * 0.7;
-        d.rig.tailPivot.rotation.x = herd.state === 'BOLT' ? 1.35 : 0.08;
+          const swing = Math.min(1, speed / 4.5) * 0.65;
+          const fSwing = Math.sin(d.gaitPhase) * swing;
+          const bSwing = Math.sin(d.gaitPhase + (herd.state === 'BOLT' ? 0.55 : Math.PI)) * swing;
+          d.rig.legFL.rotation.x = fSwing;
+          d.rig.legFR.rotation.x = herd.state === 'BOLT' ? fSwing * 0.92 : -fSwing;
+          d.rig.legBL.rotation.x = bSwing;
+          d.rig.legBR.rotation.x = herd.state === 'BOLT' ? bSwing * 0.92 : -bSwing;
+
+          // Grazing head bow vs Alert head-high + ear twitch + white flag tail
+          d.rig.neckPivot.rotation.x = d.grazeBlend * 1.05;
+          const twitch = Math.sin(d.earTwitchPhase * 2.7) > 0.88 ? 0.28 : 0;
+          d.rig.earL.rotation.z = 0.45 + twitch;
+          d.rig.earR.rotation.z = -0.45 - twitch * 0.7;
+          d.rig.tailPivot.rotation.x = herd.state === 'BOLT' ? 1.35 : 0.08;
+        }
 
         // Subtle hoof-step audio when bolting near player
         d.hoofCooldown = Math.max(0, d.hoofCooldown - dt);
@@ -2217,21 +2463,34 @@ export class WildlifeManager {
           w.yaw += wrapAngleDiff(faceYaw, w.yaw) * Math.min(1, dt * 6.0);
         }
 
-        // Procedural 4-leg gait + jaw snap + head-tilt howl animation
-        w.gaitPhase += dt * (speed > 4 ? 13.0 : speed * 3.8);
-        const legAmp = Math.min(0.72, speed * 0.11);
+        // Behind-player & occlusion visual culling (> 14m safety halo): hide rig & skip skeletal writes while keeping AI active
+        const wDistPlayer = Math.hypot(w.x - ctx.playerX, w.z - ctx.playerZ);
+        const wolfBehind =
+          wDistPlayer > 14.0 && this.computePlayerForwardDot(w.x, w.z, ctx) < HIDDEN_REAR_DOT_MAX;
+        const wolfOccluded =
+          !wolfBehind &&
+          wDistPlayer > 14.0 &&
+          Boolean(ctx.occlusionCuller?.isSphereOccluded(w.x, w.y + 0.65, w.z, 1.05, 14.0));
+        const wolfHidden = wolfBehind || wolfOccluded;
+        w.rig.root.visible = !w.harvested && !wolfHidden;
         w.rig.root.position.set(w.x, w.y, w.z);
         w.rig.root.rotation.y = w.yaw;
-        w.rig.legFL.rotation.x = Math.sin(w.gaitPhase) * legAmp;
-        w.rig.legFR.rotation.x = Math.sin(w.gaitPhase + Math.PI) * legAmp;
-        w.rig.legBL.rotation.x = Math.sin(w.gaitPhase + Math.PI * 0.85) * legAmp;
-        w.rig.legBR.rotation.x = Math.sin(w.gaitPhase - Math.PI * 0.15) * legAmp;
 
-        const targetNeckPitch = w.howlTimer > 0 ? -0.78 : pack.state === 'STALK' ? 0.25 : 0.0;
-        w.rig.neckPivot.rotation.x += (targetNeckPitch - w.rig.neckPivot.rotation.x) * Math.min(1, dt * 6.0);
-        const targetJaw = w.lungeTimer > 0 ? 0.72 : jawOpen;
-        w.rig.jawPivot.rotation.x += (targetJaw - w.rig.jawPivot.rotation.x) * Math.min(1, dt * 10.0);
-        w.rig.tailPivot.rotation.y = Math.sin(ctx.elapsedSec * 4.0 + i) * 0.22;
+        if (!wolfHidden) {
+          // Procedural 4-leg gait + jaw snap + head-tilt howl animation
+          w.gaitPhase += dt * (speed > 4 ? 13.0 : speed * 3.8);
+          const legAmp = Math.min(0.72, speed * 0.11);
+          w.rig.legFL.rotation.x = Math.sin(w.gaitPhase) * legAmp;
+          w.rig.legFR.rotation.x = Math.sin(w.gaitPhase + Math.PI) * legAmp;
+          w.rig.legBL.rotation.x = Math.sin(w.gaitPhase + Math.PI * 0.85) * legAmp;
+          w.rig.legBR.rotation.x = Math.sin(w.gaitPhase - Math.PI * 0.15) * legAmp;
+
+          const targetNeckPitch = w.howlTimer > 0 ? -0.78 : pack.state === 'STALK' ? 0.25 : 0.0;
+          w.rig.neckPivot.rotation.x += (targetNeckPitch - w.rig.neckPivot.rotation.x) * Math.min(1, dt * 6.0);
+          const targetJaw = w.lungeTimer > 0 ? 0.72 : jawOpen;
+          w.rig.jawPivot.rotation.x += (targetJaw - w.rig.jawPivot.rotation.x) * Math.min(1, dt * 10.0);
+          w.rig.tailPivot.rotation.y = Math.sin(ctx.elapsedSec * 4.0 + i) * 0.22;
+        }
       }
     }
   }
@@ -2528,7 +2787,14 @@ export class WildlifeManager {
     const allowRepop = this.insectRepopAccum >= 0.45;
     if (allowRepop) this.insectRepopAccum = 0;
 
-    // 1. Solitary Spiders (50% reduced pool = 7, strictly outside player FOV & spread out)
+    // 1. Solitary Spiders (50% reduced pool = 7, wilderness primary + occasional sparse building interiors)
+    let activeBuildingSpiders = 0;
+    for (let i = 0; i < this.spiders.length; i++) {
+      if (this.spiders[i].active && this.spiders[i].habitat === 'building') {
+        activeBuildingSpiders++;
+      }
+    }
+
     let spiderCount = 0;
     let spidersSpawned = 0;
     for (let i = 0; i < this.spiders.length; i++) {
@@ -2538,6 +2804,7 @@ export class WildlifeManager {
         continue;
       }
       if (s.active && Math.hypot(s.x - ctx.playerX, s.z - ctx.playerZ) > 14.5) {
+        if (s.habitat === 'building') activeBuildingSpiders = Math.max(0, activeBuildingSpiders - 1);
         s.active = false;
       }
       if (!s.active && allowRepop && spidersSpawned < 2) {
@@ -2546,15 +2813,15 @@ export class WildlifeManager {
         let sx = ctx.playerX + Math.cos(angle) * radius;
         let sz = ctx.playerZ + Math.sin(angle) * radius;
 
-        // Bias toward nearby fallen logs or rocks ONLY if behind player's view frustum
-        if (ctx.nearbyLogs && ctx.nearbyLogs.length > 0 && Math.random() < 0.45) {
+        // Strongly bias wilderness spiders toward nearby fallen logs or rocks behind player's view
+        if (ctx.nearbyLogs && ctx.nearbyLogs.length > 0 && Math.random() < 0.55) {
           const pick = ctx.nearbyLogs[i % ctx.nearbyLogs.length];
           const d = Math.hypot(pick.x - ctx.playerX, pick.z - ctx.playerZ);
           if (d >= 6.2 && d <= 12.2 && this.isHiddenFromPlayerView(pick.x, pick.y, pick.z, ctx, 0.15, false)) {
             sx = pick.x + (Math.random() - 0.5) * 1.4;
             sz = pick.z + (Math.random() - 0.5) * 1.4;
           }
-        } else if (ctx.nearbyRocks && ctx.nearbyRocks.length > 0 && Math.random() < 0.35) {
+        } else if (ctx.nearbyRocks && ctx.nearbyRocks.length > 0 && Math.random() < 0.42) {
           const pick = ctx.nearbyRocks[i % ctx.nearbyRocks.length];
           const d = Math.hypot(pick.x - ctx.playerX, pick.z - ctx.playerZ);
           if (d >= 6.2 && d <= 12.2 && this.isHiddenFromPlayerView(pick.x, pick.y, pick.z, ctx, 0.15, false)) {
@@ -2568,8 +2835,20 @@ export class WildlifeManager {
           Math.hypot(sx - ctx.playerX, sz - ctx.playerZ) <= 12.5 &&
           this.isHiddenFromPlayerView(sx, sy, sz, ctx, 0.15, false)
         ) {
-          sampleOpenWorldTerrain(sx, sz, _terrain);
-          if (!_terrain.isWater && _terrain.height < 300) {
+          if (ctx.sampleIndoorAt) {
+            ctx.sampleIndoorAt(sx, sy + 0.5, sz, _indoorScratch);
+          } else {
+            _indoorScratch.isIndoor = false;
+            _indoorScratch.material = 'outdoor';
+          }
+          const habitat = classifyInsectHabitat(sx, sy, sz, _indoorScratch);
+          const habitatAllowed =
+            habitat === 'wilderness' ||
+            (habitat === 'building' &&
+              activeBuildingSpiders < MAX_BUILDING_SPIDERS &&
+              Math.random() < BUILDING_SPIDER_SPAWN_CHANCE);
+
+          if (habitatAllowed) {
             let crowded = false;
             for (let j = 0; j < this.spiders.length; j++) {
               const other = this.spiders[j];
@@ -2580,6 +2859,8 @@ export class WildlifeManager {
             }
             if (!crowded) {
               s.active = true;
+              s.habitat = habitat as 'wilderness' | 'building';
+              if (s.habitat === 'building') activeBuildingSpiders++;
               s.x = sx;
               s.z = sz;
               s.y = sy;
@@ -2600,8 +2881,15 @@ export class WildlifeManager {
         s.turnTimer = 0.7 + Math.random() * 2.2;
         s.yaw += (Math.random() - 0.5) * 1.9;
       }
-      s.x += Math.sin(s.yaw) * s.speed * dt;
-      s.z += Math.cos(s.yaw) * s.speed * dt;
+      const nextSx = s.x + Math.sin(s.yaw) * s.speed * dt;
+      const nextSz = s.z + Math.cos(s.yaw) * s.speed * dt;
+      // Keep wandering wilderness spiders off paved roads/tarmac
+      if (s.habitat === 'wilderness' && isOnCivilizationClearance(nextSx, nextSz, 2.5)) {
+        s.yaw += Math.PI * 0.75;
+      } else {
+        s.x = nextSx;
+        s.z = nextSz;
+      }
       s.y = this.sampleGroundHeight(s.x, s.z);
 
       _dummy.position.set(s.x, s.y + 0.005, s.z);
@@ -2614,12 +2902,19 @@ export class WildlifeManager {
     this.spiderMesh.count = spiderCount;
     if (spiderCount > 0) this.spiderMesh.instanceMatrix.needsUpdate = true;
 
-    // 2. Ants (50% reduced pool = 18 across 2 widely spaced rear-arc pheromone trails)
-    // Refresh expired ant trail centers strictly behind player FOV
+    // 2. Ants (50% reduced pool = 18 across 2 widely spaced rear-arc pheromone trails;
+    //    focused in wilderness and only occasionally inside/around rural buildings)
     if (allowRepop) {
+      let activeBuildingTrails = 0;
+      for (let tIdx = 0; tIdx < this.antTrailCenters.length; tIdx++) {
+        if (this.antTrailCenters[tIdx].active && this.antTrailCenters[tIdx].habitat === 'building') {
+          activeBuildingTrails++;
+        }
+      }
       for (let tIdx = 0; tIdx < this.antTrailCenters.length; tIdx++) {
         const tc = this.antTrailCenters[tIdx];
         if (tc.active && Math.hypot(tc.x - ctx.playerX, tc.z - ctx.playerZ) > 13.0) {
+          if (tc.habitat === 'building') activeBuildingTrails = Math.max(0, activeBuildingTrails - 1);
           tc.active = false;
         }
         if (!tc.active) {
@@ -2632,15 +2927,33 @@ export class WildlifeManager {
           const farFromOther =
             !other.active || Math.hypot(other.x - cx, other.z - cz) >= ANT_TRAIL_MIN_SEPARATION_M;
           if (farFromOther && this.isHiddenFromPlayerView(cx, cy, cz, ctx, 0.12, false)) {
-            sampleOpenWorldTerrain(cx, cz, _terrain);
-            if (!_terrain.isWater && _terrain.height < 280) {
+            if (ctx.sampleIndoorAt) {
+              ctx.sampleIndoorAt(cx, cy + 0.5, cz, _indoorScratch);
+            } else {
+              _indoorScratch.isIndoor = false;
+              _indoorScratch.material = 'outdoor';
+            }
+            const habitat = classifyInsectHabitat(cx, cy, cz, _indoorScratch);
+            const allowed =
+              habitat === 'wilderness' ||
+              (habitat === 'building' &&
+                activeBuildingTrails < 1 &&
+                Math.random() < BUILDING_ANT_TRAIL_SPAWN_CHANCE);
+            if (allowed) {
               tc.x = cx;
               tc.z = cz;
+              tc.habitat = habitat as 'wilderness' | 'building';
               tc.active = true;
+              if (tc.habitat === 'building') activeBuildingTrails++;
             }
           }
         }
       }
+    }
+
+    let activeBuildingAnts = 0;
+    for (let i = 0; i < this.ants.length; i++) {
+      if (this.ants[i].active && this.ants[i].habitat === 'building') activeBuildingAnts++;
     }
 
     let antCount = 0;
@@ -2652,12 +2965,13 @@ export class WildlifeManager {
         continue;
       }
       if (a.active && Math.hypot(a.x - ctx.playerX, a.z - ctx.playerZ) > 14.5) {
+        if (a.habitat === 'building') activeBuildingAnts = Math.max(0, activeBuildingAnts - 1);
         a.active = false;
       }
       if (!a.active && allowRepop && antsSpawned < 3) {
         const trailIdx = i % this.antTrailCenters.length;
         const tc = this.antTrailCenters[trailIdx];
-        if (tc.active) {
+        if (tc.active && (tc.habitat === 'wilderness' || activeBuildingAnts < MAX_BUILDING_ANTS)) {
           const angle = (i / ANT_POOL_SIZE) * Math.PI * 2;
           const r = 1.2 + (trailIdx % 2) * 0.5;
           const ax = tc.x + Math.cos(angle) * r;
@@ -2665,6 +2979,8 @@ export class WildlifeManager {
           const ay = this.sampleGroundHeight(ax, az);
           if (this.isHiddenFromPlayerView(ax, ay, az, ctx, 0.1, false)) {
             a.active = true;
+            a.habitat = tc.habitat;
+            if (a.habitat === 'building') activeBuildingAnts++;
             a.trailCenterX = tc.x;
             a.trailCenterZ = tc.z;
             a.trailAngle = angle;

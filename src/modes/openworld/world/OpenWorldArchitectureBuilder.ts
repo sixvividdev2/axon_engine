@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import type { BodycamSurfaceMaterial } from '../../../../bodycam-sdk/types';
 import type { GraphicsQualityProfile } from '../../../../data/graphicsQuality';
+import { MACRO_OCCLUDER_LAYER } from './OpenWorldAtmosphere';
 import {
   applyAtmosphericHeightFog,
   type AtmoFogSharedUniforms,
@@ -646,6 +647,7 @@ class ChunkGeometryBatcher {
     ownedGeometries: THREE.BufferGeometry[],
     castShadow: boolean,
     receiveShadow: boolean,
+    outShadowCasters?: THREE.Object3D[],
   ): number {
     let meshCount = 0;
     for (const [key, bucket] of this.buckets) {
@@ -663,6 +665,10 @@ class ChunkGeometryBatcher {
         key === 'emissiveCanopy' || key === 'emissiveFlood' || key === 'emissiveBeacon';
       mesh.castShadow = castShadow && !isEmissive;
       mesh.receiveShadow = receiveShadow && !isEmissive;
+      if (!isEmissive) {
+        mesh.layers.enable(MACRO_OCCLUDER_LAYER);
+        outShadowCasters?.push(mesh);
+      }
       group.add(mesh);
       ownedGeometries.push(geo);
       meshCount++;
@@ -937,7 +943,7 @@ export class OpenWorldArchitectureBuilder {
       if (t) this.textures.push(t);
     }
 
-    // Shared architectural PBR materials (vertexColors enabled for zero-draw-call facade tinting)
+    // Shared architectural PBR materials (explicit FrontSide backface culling + vertexColors)
     this.archMaterials = {
       concrete: new THREE.MeshStandardMaterial({
         color: 0xffffff,
@@ -945,6 +951,7 @@ export class OpenWorldArchitectureBuilder {
         vertexColors: true,
         roughness: 0.88,
         metalness: 0.04,
+        side: THREE.FrontSide,
       }),
       concreteDark: new THREE.MeshStandardMaterial({
         color: 0xffffff,
@@ -952,6 +959,7 @@ export class OpenWorldArchitectureBuilder {
         vertexColors: true,
         roughness: 0.9,
         metalness: 0.06,
+        side: THREE.FrontSide,
       }),
       wallSiding: new THREE.MeshStandardMaterial({
         color: 0xffffff,
@@ -959,6 +967,7 @@ export class OpenWorldArchitectureBuilder {
         vertexColors: true,
         roughness: 0.86,
         metalness: 0.02,
+        side: THREE.FrontSide,
       }),
       barnWood: new THREE.MeshStandardMaterial({
         color: 0xffffff,
@@ -966,6 +975,7 @@ export class OpenWorldArchitectureBuilder {
         vertexColors: true,
         roughness: 0.92,
         metalness: 0.02,
+        side: THREE.FrontSide,
       }),
       roofMetal: new THREE.MeshStandardMaterial({
         color: 0xffffff,
@@ -973,24 +983,28 @@ export class OpenWorldArchitectureBuilder {
         vertexColors: true,
         roughness: 0.62,
         metalness: 0.42,
+        side: THREE.FrontSide,
       }),
       steel: new THREE.MeshStandardMaterial({
         color: 0xffffff,
         vertexColors: true,
         roughness: 0.46,
         metalness: 0.68,
+        side: THREE.FrontSide,
       }),
       woodTrim: new THREE.MeshStandardMaterial({
         color: 0xffffff,
         vertexColors: true,
         roughness: 0.88,
         metalness: 0.02,
+        side: THREE.FrontSide,
       }),
       fasciaTint: new THREE.MeshStandardMaterial({
         color: 0xffffff,
         vertexColors: true,
         roughness: 0.52,
         metalness: 0.25,
+        side: THREE.FrontSide,
       }),
       emissiveCanopy: new THREE.MeshStandardMaterial({
         color: 0xd8e8f2,
@@ -998,6 +1012,7 @@ export class OpenWorldArchitectureBuilder {
         emissiveIntensity: 0.15,
         roughness: 0.35,
         metalness: 0.1,
+        side: THREE.FrontSide,
       }),
       emissiveFlood: new THREE.MeshStandardMaterial({
         color: 0xffe4b8,
@@ -1005,6 +1020,7 @@ export class OpenWorldArchitectureBuilder {
         emissiveIntensity: 0.15,
         roughness: 0.35,
         metalness: 0.1,
+        side: THREE.FrontSide,
       }),
       emissiveBeacon: new THREE.MeshStandardMaterial({
         color: 0xd92626,
@@ -1012,6 +1028,7 @@ export class OpenWorldArchitectureBuilder {
         emissiveIntensity: 0.4,
         roughness: 0.25,
         metalness: 0.1,
+        side: THREE.FrontSide,
       }),
     };
 
@@ -1021,6 +1038,7 @@ export class OpenWorldArchitectureBuilder {
       map: hwTex,
       roughness: 0.9,
       metalness: 0.03,
+      side: THREE.FrontSide,
       polygonOffset: true,
       polygonOffsetFactor: -2,
       polygonOffsetUnits: -2,
@@ -1030,6 +1048,7 @@ export class OpenWorldArchitectureBuilder {
       map: spurTex,
       roughness: 0.91,
       metalness: 0.02,
+      side: THREE.FrontSide,
       polygonOffset: true,
       polygonOffsetFactor: -2,
       polygonOffsetUnits: -2,
@@ -1039,6 +1058,7 @@ export class OpenWorldArchitectureBuilder {
       map: dirtTex,
       roughness: 0.96,
       metalness: 0.0,
+      side: THREE.FrontSide,
       polygonOffset: true,
       polygonOffsetFactor: -1,
       polygonOffsetUnits: -1,
@@ -1047,26 +1067,30 @@ export class OpenWorldArchitectureBuilder {
       color: 0x3b3f44,
       roughness: 0.95,
       metalness: 0.0,
+      side: THREE.FrontSide,
       polygonOffset: true,
       polygonOffsetFactor: -2,
       polygonOffsetUnits: -2,
     });
 
-    // Instanced roadside hardware materials
+    // Instanced roadside hardware materials (explicit FrontSide backface culling)
     this.vehicleBodyMat = new THREE.MeshStandardMaterial({
       color: 0xffffff,
       roughness: 0.56,
       metalness: 0.42,
+      side: THREE.FrontSide,
     });
     this.vehicleTrimMat = new THREE.MeshStandardMaterial({
       color: 0x1e2227,
       roughness: 0.72,
       metalness: 0.24,
+      side: THREE.FrontSide,
     });
     this.streetlightPoleMat = new THREE.MeshStandardMaterial({
       color: 0x5c646b,
       roughness: 0.48,
       metalness: 0.62,
+      side: THREE.FrontSide,
     });
     this.streetlightEmissiveMat = new THREE.MeshStandardMaterial({
       color: 0xffe4b8,
@@ -1074,11 +1098,13 @@ export class OpenWorldArchitectureBuilder {
       emissiveIntensity: 0.1,
       roughness: 0.3,
       metalness: 0.1,
+      side: THREE.FrontSide,
     });
     this.utilityPoleMat = new THREE.MeshStandardMaterial({
       color: 0x4b3b2e,
       roughness: 0.94,
       metalness: 0.02,
+      side: THREE.FrontSide,
     });
     this.powerLineMat = new THREE.LineBasicMaterial({
       color: 0x1b1e22,
@@ -1089,28 +1115,33 @@ export class OpenWorldArchitectureBuilder {
       color: 0x879098,
       roughness: 0.46,
       metalness: 0.66,
+      side: THREE.FrontSide,
     });
     this.barrierMat = new THREE.MeshStandardMaterial({
       color: 0x8d908e,
       map: concTex,
       roughness: 0.88,
       metalness: 0.04,
+      side: THREE.FrontSide,
     });
     this.signPostMat = new THREE.MeshStandardMaterial({
       color: 0x676f77,
       roughness: 0.5,
       metalness: 0.62,
+      side: THREE.FrontSide,
     });
     this.signBoardMat = new THREE.MeshStandardMaterial({
       color: 0xffffff,
       map: signTex,
       roughness: 0.42,
       metalness: 0.15,
+      side: THREE.FrontSide,
     });
     this.midSiteMat = new THREE.MeshStandardMaterial({
       color: 0xffffff,
       roughness: 0.86,
       metalness: 0.08,
+      side: THREE.FrontSide,
     });
 
     if (atmoFogUniforms) {
@@ -1464,6 +1495,7 @@ export class OpenWorldArchitectureBuilder {
     outObbs: SolidObb[],
     outDecks: WalkDeck[],
     outIndoor: IndoorVolume[],
+    outShadowCasters?: THREE.Object3D[],
   ): ChunkArchitectureOutput {
     let instanceCount = 0;
     let meshCount = 0;
@@ -1583,6 +1615,7 @@ export class OpenWorldArchitectureBuilder {
       ownedGeometries,
       this.shadowsEnabled,
       this.shadowsEnabled,
+      outShadowCasters,
     );
 
     // 4. Roadside Hardware along paved segments owned by this chunk (Guardrails, Utility Poles + Power Lines, Signs, Streetlights, Abandoned Cars)
@@ -1599,6 +1632,7 @@ export class OpenWorldArchitectureBuilder {
       ownedGeometries,
       instancedMeshes,
       outObbs,
+      outShadowCasters,
     );
 
     return { instanceCount, meshCount };
@@ -1655,6 +1689,11 @@ export class OpenWorldArchitectureBuilder {
         sy = 0.72;
         sz = 0.65;
         hex = 0x6f7372;
+      } else if (s.kind === 'camp_outpost') {
+        sx = 0.76;
+        sy = 0.68;
+        sz = 0.76;
+        hex = 0x565e45;
       } else if (s.kind === 'house_cabin') {
         sx = 0.85;
         sy = 0.88;
@@ -1675,6 +1714,7 @@ export class OpenWorldArchitectureBuilder {
 
     if (placements.length === 0) return 0;
     const inst = new THREE.InstancedMesh(this.midSiteGeo, this.midSiteMat, placements.length);
+    inst.layers.enable(MACRO_OCCLUDER_LAYER);
     for (let i = 0; i < placements.length; i++) {
       const p = placements[i];
       _dummy.position.set(p.lx, p.y, p.lz);
@@ -2261,6 +2301,9 @@ export class OpenWorldArchitectureBuilder {
       case 'checkpoint':
         this.buildCheckpoint(site, t, batcher, outObbs, outDecks, outIndoor, lightsOut, barriersOut);
         break;
+      case 'camp_outpost':
+        this.buildCampOutpost(site, t, batcher, outObbs, outDecks, outIndoor, vehiclesOut, barriersOut);
+        break;
     }
   }
 
@@ -2422,7 +2465,7 @@ export class OpenWorldArchitectureBuilder {
       blocksPlayer: true,
     });
 
-    // 5. Interior Tactical Cover Props (Wooden Table / Supply Crates — clear of doorway sightlines)
+    // 5. Interior Tactical Cover & Micro-Clutter (Wooden Table, Stacked Supply Crate, Wall Cabinet & Rear Bench)
     this.addSolidBox(
       t,
       batcher,
@@ -2439,6 +2482,25 @@ export class OpenWorldArchitectureBuilder {
       0.40,
       0.28,
     );
+    // Supply crate cleanly inset atop front-left table (zero coplanar faces)
+    this.addSolidBox(
+      t,
+      batcher,
+      outObbs,
+      'woodTrim',
+      'wood',
+      -hx + 1.35,
+      floorTopY + 0.96 + 0.20,
+      hz - 1.55,
+      0.58,
+      0.40,
+      0.42,
+      0.38,
+      0.42,
+      0.28,
+      false,
+      true,
+    );
     this.addSolidBox(
       t,
       batcher,
@@ -2454,6 +2516,40 @@ export class OpenWorldArchitectureBuilder {
       0.48,
       0.38,
       0.26,
+    );
+    // Tall steel/timber storage locker in front-right corner (clear of front doorway)
+    this.addSolidBox(
+      t,
+      batcher,
+      outObbs,
+      'steel',
+      'metal',
+      hx - 1.15,
+      floorTopY + 0.85,
+      hz - 1.45,
+      0.76,
+      1.70,
+      0.62,
+      0.36,
+      0.40,
+      0.42,
+    );
+    // Back-left wooden chest/bench (clear of rear door & left wall)
+    this.addSolidBox(
+      t,
+      batcher,
+      outObbs,
+      'woodTrim',
+      'wood',
+      -hx + 1.05,
+      floorTopY + 0.36,
+      -hz + 1.15,
+      1.05,
+      0.72,
+      0.62,
+      0.46,
+      0.35,
+      0.24,
     );
 
     // 6. Indoor Acoustic Volume
@@ -2624,10 +2720,15 @@ export class OpenWorldArchitectureBuilder {
       batcher.addBox('steel', ac.x, t.wy + storeFloorY + storeH + 0.915, ac.z, 1.8, 0.95, 1.4, t.yaw, 0.62, 0.65, 0.67);
     }
 
-    // Interior Store Props: L-Checkout Counter, 2 Merch Shelving Aisles, Back Office Partition
+    // Interior Store Props: L-Checkout Counter + Register, Merch Shelving, Beverage Cooler, Storage Rack & Partition
     this.addSolidBox(t, batcher, outObbs, 'woodTrim', 'wood', -3.4, storeFloorY + 0.52, storeZ + 1.4, 2.8, 1.04, 0.72, 0.56, 0.44, 0.32);
+    this.addSolidBox(t, batcher, outObbs, 'steel', 'metal', -3.85, storeFloorY + 1.04 + 0.21, storeZ + 1.4, 0.54, 0.42, 0.44, 0.26, 0.28, 0.30, false, true);
     this.addSolidBox(t, batcher, outObbs, 'steel', 'metal', 1.4, storeFloorY + 0.82, storeZ + 0.6, 0.62, 1.64, 2.8, 0.62, 0.66, 0.68);
     this.addSolidBox(t, batcher, outObbs, 'steel', 'metal', 3.9, storeFloorY + 0.82, storeZ + 0.6, 0.62, 1.64, 2.8, 0.62, 0.66, 0.68);
+    // Rear beverage cooler cabinet (clear of rear window at x=2.2 and right wall)
+    this.addSolidBox(t, batcher, outObbs, 'steel', 'metal', 4.5, storeFloorY + 1.02, storeZ - shz + 0.84, 1.9, 2.04, 0.72, 0.72, 0.78, 0.82);
+    // Back storage room supply rack
+    this.addSolidBox(t, batcher, outObbs, 'woodTrim', 'wood', -4.2, storeFloorY + 0.85, storeZ - 2.65, 1.75, 1.70, 0.62, 0.46, 0.38, 0.28);
     // Back storage room partition with open pass-through
     this.addWallAlongX(t, batcher, outObbs, 'concrete', 'concrete', -shx + wt, 0.4, storeZ - 1.5, storeFloorY, storeH - 0.1, 0.18, 0.74, 0.74, 0.72, {
       kind: 'door',
@@ -2635,6 +2736,8 @@ export class OpenWorldArchitectureBuilder {
       width: 1.5,
       topH: 2.3,
     });
+    // Exterior propane cylinder exchange cage cleanly outside +X store wall
+    this.addSolidBox(t, batcher, outObbs, 'steel', 'metal', shx + 0.95, padTopY + 0.72, storeZ - 1.8, 1.2, 1.44, 1.8, 0.64, 0.68, 0.70);
 
     // Store interior acoustic volume
     const storeWorldCenter = localToWorldXZ(t, 0, storeZ);
@@ -2762,10 +2865,12 @@ export class OpenWorldArchitectureBuilder {
       blocksPlayer: true,
     });
 
-    // Interior hay bales & timber crates for tactical gunfight cover
+    // Interior hay bales, stacked upper bale, workbench & timber crates for tactical gunfight cover
     this.addSolidBox(t, batcher, outObbs, 'woodTrim', 'wood', -4.2, floorY + 0.65, 1.8, 1.9, 1.3, 1.4, 0.68, 0.58, 0.30);
+    this.addSolidBox(t, batcher, outObbs, 'woodTrim', 'wood', -4.2, floorY + 1.3 + 0.42, 1.8, 1.35, 0.84, 1.0, 0.72, 0.61, 0.32, false, true);
     this.addSolidBox(t, batcher, outObbs, 'woodTrim', 'wood', 4.1, floorY + 0.65, -1.6, 1.8, 1.3, 1.8, 0.64, 0.54, 0.28);
     this.addSolidBox(t, batcher, outObbs, 'woodTrim', 'wood', -4.0, floorY + 0.55, -2.6, 1.5, 1.1, 1.3, 0.48, 0.38, 0.26);
+    this.addSolidBox(t, batcher, outObbs, 'woodTrim', 'wood', 4.4, floorY + 0.48, 2.6, 2.1, 0.96, 0.82, 0.44, 0.34, 0.24);
 
     outIndoor.push({
       cx: t.wx,
@@ -2853,9 +2958,10 @@ export class OpenWorldArchitectureBuilder {
       sillH: 1.0,
       topH: 2.15,
     });
-    // Flat roof overhang + interior tactical desk
+    // Flat roof overhang + interior tactical desk & comms radio terminal
     this.addSolidBox(t, batcher, outObbs, 'concreteDark', 'concrete', gx, floorY + wallH + 0.16, 0, gw + 0.9, 0.32, gd + 0.9, 0.44, 0.47, 0.48);
     this.addSolidBox(t, batcher, outObbs, 'woodTrim', 'wood', gx + 1.1, floorY + 0.46, 0.9, 1.1, 0.92, 0.72, 0.46, 0.38, 0.28);
+    this.addSolidBox(t, batcher, outObbs, 'steel', 'metal', gx + 1.1, floorY + 0.92 + 0.18, 0.9, 0.56, 0.36, 0.40, 0.26, 0.30, 0.32, false, true);
 
     outIndoor.push({
       cx: shackCenter.x,
@@ -2869,10 +2975,11 @@ export class OpenWorldArchitectureBuilder {
       material: 'concrete',
     });
 
-    // Opposite HESCO / sandbag firing bastion (-6.4m X, side wings flush-butted to -5.35 without overlap)
+    // Opposite HESCO / sandbag firing bastion (-6.4m X, side wings flush-butted to -5.35 without overlap) + rear ammo crate stack
     this.addSolidBox(t, batcher, outObbs, 'concrete', 'concrete', -6.4, 0.62, 0, 2.1, 1.24, 4.4, 0.64, 0.58, 0.46);
     this.addSolidBox(t, batcher, outObbs, 'concrete', 'concrete', -4.5, 0.62, 2.2, 1.7, 1.24, 1.2, 0.64, 0.58, 0.46);
     this.addSolidBox(t, batcher, outObbs, 'concrete', 'concrete', -4.5, 0.62, -2.2, 1.7, 1.24, 1.2, 0.64, 0.58, 0.46);
+    this.addSolidBox(t, batcher, outObbs, 'woodTrim', 'wood', -8.25, 0.44, 0, 1.1, 0.88, 1.75, 0.42, 0.44, 0.30);
 
     // Striped Counterweight Boom Gate Pedestal + Overhead Gate Arm (raised 2.6m clear so operators walk freely beneath)
     this.addSolidBox(t, batcher, outObbs, 'fasciaTint', 'metal', 4.3, 0.65, 0, 0.62, 1.3, 0.62, 0.82, 0.22, 0.18);
@@ -2917,6 +3024,151 @@ export class OpenWorldArchitectureBuilder {
       lightsOut.push({ wx: lp.x, wy: t.wy, wz: lp.z, yaw: t.yaw + Math.PI * 0.5 });
     }
     void site;
+  }
+
+  /**
+   * Enterable roadside militia/logging field camp outpost:
+   * - Walk-in timber/canvas field shelter with open doorway, rear observation window & indoor wood acoustics
+   * - Front sandbag/HESCO firing barricade, stacked supply pallets, fuel drums, floodlight mast & parked utility truck
+   */
+  private buildCampOutpost(
+    site: BakedOpenWorldSite,
+    t: LocalTransform,
+    batcher: ChunkGeometryBatcher | null,
+    outObbs: SolidObb[],
+    outDecks: WalkDeck[],
+    outIndoor: IndoorVolume[],
+    vehiclesOut: Array<{ wx: number; wy: number; wz: number; yaw: number; colorHex: number }> | null,
+    barriersOut: Array<{ wx: number; wy: number; wz: number; yaw: number }> | null,
+  ): void {
+    const widthX = 6.2;
+    const depthZ = 4.6;
+    const hx = widthX * 0.5;
+    const hz = depthZ * 0.5;
+    const floorY = 0.16;
+    const wallH = 2.75;
+    const wt = 0.2;
+
+    // Olive-drab militia camp vs weathered timber logging camp tint
+    const isMilitia = site.variantSeed % 2 === 1;
+    const wr = isMilitia ? 0.36 : 0.50;
+    const wg = isMilitia ? 0.40 : 0.42;
+    const wb = isMilitia ? 0.29 : 0.32;
+
+    // 1. Foundation concrete pad (top = t.wy + 0.16) + WalkDeck
+    if (batcher) {
+      batcher.addBox('concrete', t.wx, t.wy - 0.84, t.wz, widthX + 0.3, 2.0, depthZ + 0.3, t.yaw, 0.54, 0.55, 0.52);
+    }
+    outDecks.push({
+      cx: t.wx,
+      cz: t.wz,
+      hx: hx + 0.3,
+      hz: hz + 0.35,
+      cosY: t.cosY,
+      sinY: t.sinY,
+      baseY: t.wy + floorY,
+      slopeAlongZ: 0,
+      thicknessM: 0.25,
+      surface: 'wood',
+    });
+
+    // 2. Shelter Walls (Z-walls trimmed cleanly inside X-walls so zero corner overlap)
+    this.addWallAlongX(t, batcher, outObbs, 'barnWood', 'wood', -hx, hx, hz - wt * 0.5, floorY, wallH, wt, wr, wg, wb, {
+      kind: 'door',
+      center: 0,
+      width: 1.85,
+      topH: 2.28,
+    });
+    this.addWallAlongX(t, batcher, outObbs, 'barnWood', 'wood', -hx, hx, -hz + wt * 0.5, floorY, wallH, wt, wr, wg, wb, {
+      kind: 'window',
+      center: 0,
+      width: 1.95,
+      sillH: 1.0,
+      topH: 2.15,
+    });
+    this.addWallAlongZ(t, batcher, outObbs, 'barnWood', 'wood', -hz + wt, hz - wt, -hx + wt * 0.5, floorY, wallH, wt, wr, wg, wb);
+    this.addWallAlongZ(t, batcher, outObbs, 'barnWood', 'wood', -hz + wt, hz - wt, hx - wt * 0.5, floorY, wallH, wt, wr, wg, wb);
+
+    // 3. Pitched corrugated roof + roof ballistic OBB
+    const eaveY = t.wy + floorY + wallH;
+    if (batcher) {
+      batcher.addGableRoof('roofMetal', 'barnWood', t.wx, eaveY, t.wz, widthX, depthZ, 1.35, t.yaw, 0.38, 0.41, 0.42, wr, wg, wb);
+    }
+    outObbs.push({
+      cx: t.wx,
+      cy: eaveY + 0.2,
+      cz: t.wz,
+      hx: hx + 0.3,
+      hy: 0.2,
+      hz: hz + 0.3,
+      cosY: t.cosY,
+      sinY: t.sinY,
+      surface: 'metal',
+      blocksBullets: true,
+      blocksPlayer: true,
+    });
+
+    // 4. Interior Supply Crate & Radio Desk (seated cleanly on floorY, clear of walls & doorway)
+    this.addSolidBox(t, batcher, outObbs, 'woodTrim', 'wood', -1.85, floorY + 0.42, -1.15, 1.2, 0.84, 0.85, 0.42, 0.38, 0.26);
+    this.addSolidBox(t, batcher, outObbs, 'steel', 'metal', 1.75, floorY + 0.44, -1.1, 1.3, 0.88, 0.72, 0.34, 0.38, 0.40);
+
+    outIndoor.push({
+      cx: t.wx,
+      cz: t.wz,
+      hx: hx - 0.24,
+      hz: hz - 0.24,
+      cosY: t.cosY,
+      sinY: t.sinY,
+      minY: t.wy + floorY - 0.1,
+      maxY: eaveY + 0.2,
+      material: 'wood',
+    });
+
+    // 5. Exterior Fortified Camp Cover: Sandbag Barricade, Stacked Pallets, Fuel Drums & Floodlight Mast
+    this.addSolidBox(t, batcher, outObbs, 'concrete', 'concrete', 0, 0.56, 5.4, 4.2, 1.12, 0.95, 0.62, 0.57, 0.46);
+    this.addSolidBox(t, batcher, outObbs, 'woodTrim', 'wood', -4.9, 0.55, 1.2, 1.6, 1.1, 1.4, 0.48, 0.39, 0.28);
+    this.addSolidBox(t, batcher, outObbs, 'woodTrim', 'wood', -4.9, 1.1 + 0.34, 1.2, 1.1, 0.68, 0.95, 0.38, 0.42, 0.29, false, true);
+    this.addSolidBox(t, batcher, outObbs, 'fasciaTint', 'metal', 4.8, 0.48, 0.8, 0.72, 0.96, 0.72, 0.62, 0.24, 0.20);
+    this.addSolidBox(t, batcher, outObbs, 'fasciaTint', 'metal', 5.7, 0.48, 1.45, 0.72, 0.96, 0.72, 0.28, 0.42, 0.30);
+
+    if (batcher) {
+      const flP = localToWorldXZ(t, -4.6, -3.4);
+      batcher.addBox('steel', flP.x, t.wy + 3.2, flP.z, 0.22, 6.4, 0.22, t.yaw, 0.44, 0.48, 0.52);
+      batcher.addBox('emissiveFlood', flP.x, t.wy + 6.56, flP.z, 0.86, 0.32, 0.34, t.yaw, 1, 1, 1);
+    }
+
+    if (barriersOut) {
+      for (const side of [-1, 1]) {
+        const bp = localToWorldXZ(t, side * 3.8, 5.2);
+        const by = evaluateOpenWorldHeight(bp.x, bp.z);
+        const bYaw = t.yaw + Math.PI * 0.5 + side * 0.35;
+        barriersOut.push({ wx: bp.x, wy: by, wz: bp.z, yaw: bYaw });
+        outObbs.push({
+          cx: bp.x,
+          cy: by + 0.52,
+          cz: bp.z,
+          hx: 0.35,
+          hy: 0.52,
+          hz: 1.45,
+          cosY: Math.cos(bYaw),
+          sinY: Math.sin(bYaw),
+          surface: 'concrete',
+          blocksBullets: true,
+          blocksPlayer: true,
+        });
+      }
+    }
+
+    if (vehiclesOut) {
+      const vp = localToWorldXZ(t, 5.8, -3.4);
+      vehiclesOut.push({
+        wx: vp.x,
+        wy: evaluateOpenWorldHeight(vp.x, vp.z),
+        wz: vp.z,
+        yaw: t.yaw + 0.35,
+        colorHex: VEHICLE_BODY_PALETTE[site.variantSeed % VEHICLE_BODY_PALETTE.length],
+      });
+    }
   }
 
   // ============================================================================
@@ -3678,26 +3930,31 @@ export class OpenWorldArchitectureBuilder {
       }
     }
 
-    // Station-specific interior props
+    // Station-specific interior props & micro-clutter (zero coplanar faces)
     if (opts.stationKind === 'command') {
-      // Tactical map briefing table & radio comms cabinet
+      // Tactical map briefing table + raised holo console, radio comms cabinet & supply footlocker
       this.addSolidBox(t, batcher, outObbs, 'steel', 'metal', cx + 2.2, floorY + 0.48, cz - 1.6, 2.6, 0.96, 1.3, 0.34, 0.38, 0.42);
+      this.addSolidBox(t, batcher, outObbs, 'steel', 'metal', cx + 2.2, floorY + 0.96 + 0.12, cz - 1.6, 1.8, 0.24, 0.86, 0.22, 0.28, 0.34, false, true);
       this.addSolidBox(t, batcher, outObbs, 'steel', 'metal', cx - 3.6, floorY + 1.05, cz - 2.6, 1.4, 2.1, 0.75, 0.30, 0.34, 0.36);
+      this.addSolidBox(t, batcher, outObbs, 'woodTrim', 'wood', cx + 3.5, floorY + 0.36, cz + 1.8, 1.3, 0.72, 0.74, 0.38, 0.42, 0.28);
     } else if (opts.stationKind === 'armory') {
-      // 5 Steel Player Stash Lockers along back/right interior walls + Weapon Rack + Armor Workbench
+      // 5 Steel Player Stash Lockers along back/right interior walls + Weapon Rack + Gunsmith Bench + Ammo Cases
       for (let k = 0; k < 5; k++) {
         const lx = cx - 3.2 + k * 1.45;
         this.addSolidBox(t, batcher, outObbs, 'steel', 'metal', lx, floorY + 1.05, cz - hz + 0.75, 1.15, 2.1, 0.72, 0.28, 0.34, 0.30);
       }
-      // Gunsmith workbench & armor stand
+      // Gunsmith workbench + inset ammo crate + armor plate case + weapon rack
       this.addSolidBox(t, batcher, outObbs, 'woodTrim', 'wood', cx + 1.2, floorY + 0.46, cz + 1.8, 3.2, 0.92, 0.95, 0.46, 0.36, 0.26);
+      this.addSolidBox(t, batcher, outObbs, 'woodTrim', 'wood', cx + 1.2, floorY + 0.92 + 0.22, cz + 1.8, 1.15, 0.44, 0.62, 0.34, 0.40, 0.26, false, true);
+      this.addSolidBox(t, batcher, outObbs, 'steel', 'metal', cx - 2.4, floorY + 0.38, cz + 1.9, 1.1, 0.76, 0.78, 0.30, 0.34, 0.36);
       this.addSolidBox(t, batcher, outObbs, 'steel', 'metal', cx + hx - 0.85, floorY + 0.95, cz - 0.4, 0.65, 1.9, 3.4, 0.32, 0.36, 0.38);
     } else {
-      // Barracks: 4 double bunk frames + footlockers
+      // Barracks: double bunk frames, footlockers & field briefing table
       for (const bx of [cx - 3.8, cx - 1.2, cx + 1.4]) {
         this.addSolidBox(t, batcher, outObbs, 'steel', 'metal', bx, floorY + 0.85, cz - 2.6, 1.1, 1.7, 2.1, 0.36, 0.38, 0.34);
         this.addSolidBox(t, batcher, outObbs, 'woodTrim', 'wood', bx, floorY + 0.28, cz + 2.4, 0.95, 0.56, 0.55, 0.36, 0.38, 0.26);
       }
+      this.addSolidBox(t, batcher, outObbs, 'woodTrim', 'wood', cx - 3.5, floorY + 0.44, cz + 0.2, 1.75, 0.88, 1.05, 0.48, 0.38, 0.28);
     }
 
     outIndoor.push({
@@ -3833,6 +4090,7 @@ export class OpenWorldArchitectureBuilder {
     ownedGeometries: THREE.BufferGeometry[],
     instancedMeshes: THREE.InstancedMesh[],
     outObbs: SolidObb[],
+    outShadowCasters?: THREE.Object3D[],
   ): number {
     const rand = mulberry32(chunkHash(cx, cz, 811));
     const halfChunk = CHUNK_SIZE_M * 0.5;
@@ -3933,7 +4191,7 @@ export class OpenWorldArchitectureBuilder {
         }
 
         // 5. Abandoned Civilian Cars / Pickups pulled onto highway shoulders (solid tactical cover!)
-        if (rand() < 0.14) {
+        if (rand() < 0.22) {
           const side = rand() > 0.5 ? 1 : -1;
           const vx = mx + seg.perpX * (seg.halfWidthM - 0.55) * side;
           const vz = mz + seg.perpZ * (seg.halfWidthM - 0.55) * side;
@@ -3991,6 +4249,7 @@ export class OpenWorldArchitectureBuilder {
       trims.computeBoundingSphere();
       group.add(bodies, trims);
       instancedMeshes.push(bodies, trims);
+      outShadowCasters?.push(bodies);
       totalInstances += n * 2;
     }
 
@@ -4126,6 +4385,7 @@ export class OpenWorldArchitectureBuilder {
       barriers.computeBoundingSphere();
       group.add(barriers);
       instancedMeshes.push(barriers);
+      outShadowCasters?.push(barriers);
       totalInstances += n;
     }
 

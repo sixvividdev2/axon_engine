@@ -16,6 +16,7 @@ import {
 export const OPENWORLD_DAY_CYCLE_SECONDS = 5400; // 90 minutes
 
 const OCCLUSION_SKY_LAYER = 3;
+export const MACRO_OCCLUDER_LAYER = 4;
 
 export interface AtmosphereTelemetry {
   timeOfDayHours: number; // 0..24
@@ -501,6 +502,11 @@ export class OpenWorldAtmosphere {
   private shadowUpdateAccumSec = 0;
   private lastShadowSnapX = Number.NaN;
   private lastShadowSnapZ = Number.NaN;
+  private lastShadowRenderX = Number.NaN;
+  private lastShadowRenderZ = Number.NaN;
+  private lastShadowSunX = Number.NaN;
+  private lastShadowSunY = Number.NaN;
+  private lastShadowSunZ = Number.NaN;
 
   constructor(scene: THREE.Scene, isSoftwareGl: boolean) {
     this.scene = scene;
@@ -617,7 +623,7 @@ export class OpenWorldAtmosphere {
     this.occluderBlackMat = new THREE.MeshBasicMaterial({
       color: 0x000000,
       fog: false,
-      side: THREE.DoubleSide,
+      side: THREE.FrontSide,
     });
 
     const quadGeo = new THREE.PlaneGeometry(2, 2);
@@ -680,14 +686,39 @@ export class OpenWorldAtmosphere {
   }
 
   /**
-   * Returns true when directional shadow map should re-render (~30Hz cadence or immediate snap/quality change).
+   * Returns true when directional shadow map should re-render:
+   * - Immediate on explicit dirty flag (time-of-day/quality change or teleport)
+   * - Capped at <=15Hz (0.066s) when anchor moved >= 3.0m or sun direction shifted > 0.002
+   * - Idle refresh at ~2.2Hz (0.45s) for moving nearby actors/wildlife
    */
-  public consumeShadowUpdateNeeded(dt: number): boolean {
+  public consumeShadowUpdateNeeded(dt: number, anchorX?: number, anchorZ?: number): boolean {
     if (this.isSoftwareGl || !this.sunLight.castShadow) return false;
     this.shadowUpdateAccumSec += dt;
-    if (this.shadowDirty || this.shadowUpdateAccumSec >= 0.033) {
+
+    const ax = anchorX ?? (Number.isNaN(this.lastShadowSnapX) ? 0 : this.lastShadowSnapX);
+    const az = anchorZ ?? (Number.isNaN(this.lastShadowSnapZ) ? 0 : this.lastShadowSnapZ);
+    const movedEnough =
+      Number.isNaN(this.lastShadowRenderX) ||
+      Math.hypot(ax - this.lastShadowRenderX, az - this.lastShadowRenderZ) >= 3.0;
+    const sunMoved =
+      Number.isNaN(this.lastShadowSunX) ||
+      Math.abs(_sunDir.x - this.lastShadowSunX) +
+        Math.abs(_sunDir.y - this.lastShadowSunY) +
+        Math.abs(_sunDir.z - this.lastShadowSunZ) >
+        0.002;
+
+    if (
+      this.shadowDirty ||
+      ((movedEnough || sunMoved) && this.shadowUpdateAccumSec >= 0.066) ||
+      this.shadowUpdateAccumSec >= 0.45
+    ) {
       this.shadowDirty = false;
       this.shadowUpdateAccumSec = 0;
+      this.lastShadowRenderX = ax;
+      this.lastShadowRenderZ = az;
+      this.lastShadowSunX = _sunDir.x;
+      this.lastShadowSunY = _sunDir.y;
+      this.lastShadowSunZ = _sunDir.z;
       return true;
     }
     return false;
@@ -751,7 +782,8 @@ export class OpenWorldAtmosphere {
       !this.adaptiveGodraysAllowed ||
       this.qualityId === 'performance' ||
       this.qualityId === 'balanced' ||
-      this.curOvercast >= 0.72
+      this.curOvercast >= 0.72 ||
+      _sunDir.y <= 0.02
     ) {
       this.godraysVisibleThisFrame = false;
       if (this.godrayCompositeQuad) this.godrayCompositeQuad.visible = false;
@@ -821,10 +853,10 @@ export class OpenWorldAtmosphere {
     camera.layers.set(OCCLUSION_SKY_LAYER);
     renderer.render(this.scene, camera);
 
-    // 1B: Depth-tested solid world occluders (terrain, pines, cranes, alpine dam, buildings)
+    // 1B: Depth-tested macro solid occluders only (terrain, HLOD, conifers, landmarks, buildings)
     this.skyDome.visible = false;
     this.scene.overrideMaterial = this.occluderBlackMat;
-    camera.layers.set(0);
+    camera.layers.set(MACRO_OCCLUDER_LAYER);
     renderer.render(this.scene, camera);
 
     // Restore scene render state cleanly
@@ -1042,9 +1074,15 @@ export class OpenWorldAtmosphere {
     const snapX = Math.round(anchorX / 2) * 2;
     const snapZ = Math.round(anchorZ / 2) * 2;
     if (snapX !== this.lastShadowSnapX || snapZ !== this.lastShadowSnapZ) {
+      const jumpDist =
+        Number.isNaN(this.lastShadowSnapX)
+          ? Number.POSITIVE_INFINITY
+          : Math.hypot(snapX - this.lastShadowSnapX, snapZ - this.lastShadowSnapZ);
       this.lastShadowSnapX = snapX;
       this.lastShadowSnapZ = snapZ;
-      this.shadowDirty = true;
+      if (jumpDist >= 12) {
+        this.shadowDirty = true;
+      }
     }
     this.sunLight.target.position.set(snapX, anchorY, snapZ);
     this.sunLight.position.set(

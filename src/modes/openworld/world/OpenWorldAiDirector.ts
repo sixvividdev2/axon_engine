@@ -40,6 +40,8 @@ import {
   getFobGuardTowerSpecs,
   isFobCompoundId,
 } from './OpenWorldFobLayout';
+import { getBakedOpenWorldSites } from './OpenWorldCivilizationTopology';
+import type { OpenWorldOcclusionCuller } from './OpenWorldOcclusionCuller';
 
 export type AiFactionKind = PmcFactionId | SubFactionId;
 export type AiRelationStatus = 'allied' | 'neutral' | 'hostile';
@@ -85,6 +87,8 @@ export interface AiUpdateOptions {
   playerAimDirX?: number;
   playerAimDirY?: number;
   playerAimDirZ?: number;
+  frustum?: THREE.Frustum;
+  occlusionCuller?: OpenWorldOcclusionCuller;
   onNeutralWarning?: (ev: AiNeutralWarningEvent) => void;
 }
 
@@ -93,6 +97,11 @@ export interface AiSummaryTelemetry {
   activeNearby: number;
   hostileEngaging: number;
   effectiveVisionRangeM: number;
+  lod0Count: number;
+  lod1Count: number;
+  lod2Count: number;
+  culledBehindCount: number;
+  occludedCount: number;
 }
 
 export interface AiAgentRecord {
@@ -163,6 +172,8 @@ export interface AiAgentRecord {
   headPitchOffset: number;
   headRollOffset: number;
   hitFlinchRoll: number;
+  shadowCastEnabled: boolean;
+  lodTier: 0 | 1 | 2 | 3;
 }
 
 interface FactionKitTemplate {
@@ -185,8 +196,14 @@ interface PooledAiTracer {
 }
 
 const ACTIVE_SIM_RADIUS_M = 210;
+const LOD0_MAX_DIST_M = 75;
+const LOD1_MAX_DIST_M = 160;
+const LOD2_MAX_DIST_M = 340;
+const SHADOW_CAST_MAX_DIST_M = 55;
+const BEHIND_CAMERA_SAFETY_RADIUS_M = 18;
 const BASE_AI_VISION_RANGE_M = 115;
 const MAX_AI_TRACERS = 16;
+const MAX_DISTANT_PROXIES = 128;
 const AI_RESPAWN_DELAY_SEC = 110;
 const AI_RAGDOLL_VISIBLE_SEC = 28;
 
@@ -200,6 +217,9 @@ const _velVec = new THREE.Vector3();
 const _impDir = new THREE.Vector3();
 const _muzzleWorld = new THREE.Vector3();
 const _playerGazeTarget = new THREE.Vector3();
+const _agentSphere = new THREE.Sphere(new THREE.Vector3(), 1.65);
+const _proxyDummy = new THREE.Object3D();
+const _proxyColor = new THREE.Color();
 
 const FACTION_ARMBAND_HEX: Readonly<Record<AiFactionKind, number>> = {
   pmc_alpha: 0x38bdf8,
@@ -208,6 +228,59 @@ const FACTION_ARMBAND_HEX: Readonly<Record<AiFactionKind, number>> = {
   highland_militia: 0x84cc16,
   alpine_remnant: 0xa855f7,
 };
+
+const FACTION_PROXY_HEX: Readonly<Record<AiFactionKind, number>> = {
+  pmc_alpha: 0x3a4a58,
+  pmc_bravo: 0x5c5342,
+  dockworkers_syndicate: 0x38464c,
+  highland_militia: 0x48543d,
+  alpine_remnant: 0x464854,
+};
+
+/**
+ * Compact composite standing operator silhouette (legs + torso/plate carrier + helmet + rifle)
+ * rendered in a single InstancedMesh draw call for LOD2 distant agents (160m..340m).
+ */
+function buildDistantOperatorProxyGeo(): THREE.BufferGeometry {
+  const parts: ReadonlyArray<{ x: number; y: number; z: number; sx: number; sy: number; sz: number }> = [
+    { x: -0.11, y: 0.44, z: 0, sx: 0.14, sy: 0.88, sz: 0.16 }, // Left leg
+    { x: 0.11, y: 0.44, z: 0, sx: 0.14, sy: 0.88, sz: 0.16 }, // Right leg
+    { x: 0, y: 1.18, z: 0, sx: 0.42, sy: 0.62, sz: 0.24 }, // Torso & plate carrier
+    { x: 0, y: 1.64, z: 0, sx: 0.22, sy: 0.24, sz: 0.23 }, // Helmeted head
+    { x: 0.04, y: 1.14, z: -0.22, sx: 0.08, sy: 0.1, sz: 0.68 }, // Rifle silhouette
+  ];
+  const positions: number[] = [];
+  const normals: number[] = [];
+  const indices: number[] = [];
+  const unit = new THREE.BoxGeometry(1, 1, 1);
+  const pAttr = unit.attributes.position as THREE.BufferAttribute;
+  const nAttr = unit.attributes.normal as THREE.BufferAttribute;
+  const idx = unit.index!;
+  let vOff = 0;
+
+  for (const part of parts) {
+    for (let i = 0; i < pAttr.count; i++) {
+      positions.push(
+        pAttr.getX(i) * part.sx + part.x,
+        pAttr.getY(i) * part.sy + part.y,
+        pAttr.getZ(i) * part.sz + part.z,
+      );
+      normals.push(nAttr.getX(i), nAttr.getY(i), nAttr.getZ(i));
+    }
+    for (let i = 0; i < idx.count; i++) {
+      indices.push(vOff + idx.getX(i));
+    }
+    vOff += pAttr.count;
+  }
+  unit.dispose();
+
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  geo.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
+  geo.setIndex(indices);
+  geo.computeBoundingSphere();
+  return geo;
+}
 
 const _poseScratch: TacticalCombatPose = {
   crouchBlend: 0,
@@ -584,6 +657,7 @@ export class OpenWorldAiDirector {
 
   private readonly sharedGeos: THREE.BufferGeometry[] = [];
   private readonly sharedMats: THREE.Material[] = [];
+  private distantProxyMesh: THREE.InstancedMesh | null = null;
   private readonly sampleGroundHeight: (x: number, z: number) => number;
   private readonly isLineOfSightBlocked?: (
     ax: number,
@@ -596,10 +670,16 @@ export class OpenWorldAiDirector {
 
   private activeNearbyCount = 0;
   private hostileEngagingCount = 0;
+  private lod0Count = 0;
+  private lod1Count = 0;
+  private lod2Count = 0;
+  private culledBehindCount = 0;
+  private occludedCount = 0;
   private lastVisionRangeM = BASE_AI_VISION_RANGE_M;
   private elapsedClock = 0;
   private activeHitMeshesReady = false;
   private frameParity = 0;
+  private frameTick = 0;
 
   constructor(
     scene: THREE.Scene,
@@ -804,9 +884,21 @@ export class OpenWorldAiDirector {
       headPitchOffset: 0,
       headRollOffset: 0,
       hitFlinchRoll: 0,
+      shadowCastEnabled: true,
+      lodTier: 3,
     };
     this.agents.push(rec);
     this.agentById.set(agentId, rec);
+  }
+
+  private setAgentShadowCasting(agent: AiAgentRecord, enabled: boolean): void {
+    if (agent.shadowCastEnabled === enabled) return;
+    agent.shadowCastEnabled = enabled;
+    agent.rig.root.traverse((obj) => {
+      if (obj instanceof THREE.Mesh) {
+        obj.castShadow = enabled;
+      }
+    });
   }
 
   private initSharedAssetsAndSquads(playerFaction: PmcFactionId): void {
@@ -815,9 +907,27 @@ export class OpenWorldAiDirector {
       color: 0xffb35c,
       transparent: true,
       opacity: 0.9,
+      side: THREE.FrontSide,
     });
-    this.sharedGeos.push(tracerGeo);
-    this.sharedMats.push(tracerMat);
+    const proxyGeo = buildDistantOperatorProxyGeo();
+    const proxyMat = new THREE.MeshStandardMaterial({
+      color: 0xffffff,
+      roughness: 0.86,
+      metalness: 0.12,
+      side: THREE.FrontSide,
+    });
+    this.sharedGeos.push(tracerGeo, proxyGeo);
+    this.sharedMats.push(tracerMat, proxyMat);
+
+    const proxyMesh = new THREE.InstancedMesh(proxyGeo, proxyMat, MAX_DISTANT_PROXIES);
+    proxyMesh.name = 'openworld_ai_lod2_proxies';
+    proxyMesh.count = 0;
+    proxyMesh.visible = false;
+    proxyMesh.castShadow = false;
+    proxyMesh.receiveShadow = false;
+    proxyMesh.frustumCulled = false;
+    this.distantProxyMesh = proxyMesh;
+    this.rootGroup.add(proxyMesh);
 
     // Pooled tracer beams (zero per-shot allocation)
     for (let i = 0; i < MAX_AI_TRACERS; i++) {
@@ -947,6 +1057,51 @@ export class OpenWorldAiDirector {
           homeX: lm.worldX,
           homeZ: lm.worldZ,
           patrolRadiusM: 18 + (i % 3) * 8,
+          seqIdx: seq,
+        });
+      }
+    }
+
+    // Spawn active roadside checkpoint guards & roving militia field-camp patrols across the 4km theater
+    const bakedSites = getBakedOpenWorldSites();
+    let campPatrolIdx = 0;
+    for (let sIdx = 0; sIdx < bakedSites.length; sIdx++) {
+      const site = bakedSites[sIdx];
+      const isCheckpoint = site.kind === 'checkpoint';
+      const isPatrolledCamp = site.kind === 'camp_outpost' && campPatrolIdx++ % 2 === 0;
+      if (!isCheckpoint && !isPatrolledCamp) continue;
+
+      const faction: AiFactionKind =
+        site.z > 700
+          ? 'dockworkers_syndicate'
+          : site.z < -700
+            ? 'alpine_remnant'
+            : 'highland_militia';
+      const roster = FACTION_KIT_ROSTERS[faction];
+      const squadCount = 2;
+
+      for (let m = 0; m < squadCount; m++) {
+        const kit = roster[(sIdx + m) % roster.length];
+        const sideSign = m === 0 ? -1 : 1;
+        const offsetR = isCheckpoint ? 7.5 : 10.5;
+        const wx = site.x + Math.cos(site.yaw + sideSign * 1.15) * offsetR;
+        const wz = site.z - Math.sin(site.yaw + sideSign * 1.15) * offsetR;
+        const wy = Math.max(SEA_LEVEL_M + 0.25, this.sampleGroundHeight(wx, wz));
+        const agentId = `ow_ai_${seq++}`;
+        this.spawnOperatorAgent({
+          agentId,
+          sectorId: site.id,
+          callsign: `${kit.callsignPrefix}-RD-${String(seq - 1).padStart(2, '0')}`,
+          faction,
+          role: 'patrol',
+          kit,
+          wx,
+          wy,
+          wz,
+          yaw: site.yaw + (m === 0 ? 0 : Math.PI),
+          homeX: site.x,
+          homeZ: site.z,
+          patrolRadiusM: isCheckpoint ? 11 + m * 5 : 18 + m * 7,
           seqIdx: seq,
         });
       }
@@ -1299,6 +1454,7 @@ export class OpenWorldAiDirector {
 
     this.elapsedClock += dt;
     this.frameParity = (this.frameParity + 1) & 1;
+    this.frameTick = (this.frameTick + 1) % 60;
     this.activeHitMeshes.length = 0;
     this.activeHitMeshesReady = true;
 
@@ -1312,6 +1468,14 @@ export class OpenWorldAiDirector {
 
     let activeNearby = 0;
     let hostileEngaging = 0;
+    let lod0Count = 0;
+    let lod1Count = 0;
+    let lod2Count = 0;
+    let culledBehindCount = 0;
+    let occludedCount = 0;
+    let proxyCount = 0;
+    const frustum = options?.frustum;
+    const occlusionCuller = options?.occlusionCuller;
 
     for (let i = 0; i < this.agents.length; i++) {
       const a = this.agents[i];
@@ -1323,8 +1487,19 @@ export class OpenWorldAiDirector {
 
         const distHorizDead = Math.hypot(playerX - a.x, playerZ - a.z);
         if (a.deathAgeSec < AI_RAGDOLL_VISIBLE_SEC && distHorizDead <= ACTIVE_SIM_RADIUS_M) {
-          a.rig.root.visible = true;
-          if (a.ragdoll.isActive()) {
+          _agentSphere.center.set(a.x, a.y + 0.65, a.z);
+          const deadBehind =
+            Boolean(frustum && distHorizDead > BEHIND_CAMERA_SAFETY_RADIUS_M && !frustum.intersectsSphere(_agentSphere));
+          const deadOccluded =
+            !deadBehind &&
+            Boolean(
+              occlusionCuller &&
+                distHorizDead > BEHIND_CAMERA_SAFETY_RADIUS_M &&
+                occlusionCuller.isSphereOccluded(a.x, a.y + 0.65, a.z, 1.15, BEHIND_CAMERA_SAFETY_RADIUS_M),
+            );
+          const deadHidden = deadBehind || deadOccluded;
+          a.rig.root.visible = !deadHidden;
+          if (!deadHidden && a.ragdoll.isActive()) {
             a.ragdoll.step(dt, this.ragdollWorld, (gx, gz) =>
               a.role === 'tower_sniper' ? a.postY : this.sampleGroundHeight(gx, gz),
             );
@@ -1390,27 +1565,113 @@ export class OpenWorldAiDirector {
       const dz = playerZ - a.z;
       const distHoriz = Math.hypot(dx, dz);
 
-      if (distHoriz > ACTIVE_SIM_RADIUS_M) {
+      if (distHoriz > LOD2_MAX_DIST_M) {
         a.rig.root.visible = false;
         a.rig.setWarningLaser(false);
+        a.lodTier = 3;
         continue;
       }
 
-      a.rig.root.visible = true;
-      activeNearby++;
-      for (let hmIdx = 0; hmIdx < a.rig.hitMeshes.length; hmIdx++) {
-        this.activeHitMeshes.push(a.rig.hitMeshes[hmIdx]);
+      // Camera frustum, behind-the-player & conservative occlusion culling (strict 18m 360-deg close safety bubble)
+      _agentSphere.center.set(a.x, a.y + 0.95, a.z);
+      const behindCamera = Boolean(
+        frustum && distHoriz > BEHIND_CAMERA_SAFETY_RADIUS_M && !frustum.intersectsSphere(_agentSphere),
+      );
+      const occludedByStructure =
+        !behindCamera &&
+        a.muzzleFlashTimer <= 0 &&
+        Boolean(
+          occlusionCuller &&
+            distHoriz > BEHIND_CAMERA_SAFETY_RADIUS_M &&
+            occlusionCuller.isSphereOccluded(a.x, a.y + 0.95, a.z, 1.35, BEHIND_CAMERA_SAFETY_RADIUS_M),
+        );
+
+      // LOD2 Distant Instanced Proxy band (160m..340m): 1 draw call for all far operators
+      if (distHoriz > LOD1_MAX_DIST_M) {
+        a.rig.root.visible = false;
+        a.rig.setWarningLaser(false);
+        this.setAgentShadowCasting(a, false);
+        if (behindCamera || occludedByStructure) {
+          a.lodTier = 3;
+          if (occludedByStructure) occludedCount++;
+          else culledBehindCount++;
+        } else {
+          a.lodTier = 2;
+          lod2Count++;
+          if (this.distantProxyMesh && proxyCount < MAX_DISTANT_PROXIES) {
+            _proxyDummy.position.set(a.x, a.y, a.z);
+            _proxyDummy.rotation.set(0, a.yaw, 0);
+            _proxyDummy.scale.set(1, 1, 1);
+            _proxyDummy.updateMatrix();
+            this.distantProxyMesh.setMatrixAt(proxyCount, _proxyDummy.matrix);
+            _proxyColor.setHex(FACTION_PROXY_HEX[a.faction]);
+            this.distantProxyMesh.setColorAt(proxyCount, _proxyColor);
+            proxyCount++;
+          }
+        }
+        if (distHoriz > ACTIVE_SIM_RADIUS_M) {
+          continue;
+        }
+        // Keep activeHitMeshes updated inside ACTIVE_SIM_RADIUS_M so long-range sniper hits register
+        activeNearby++;
+        for (let hmIdx = 0; hmIdx < a.rig.hitMeshes.length; hmIdx++) {
+          this.activeHitMeshes.push(a.rig.hitMeshes[hmIdx]);
+        }
+        a.rig.root.position.set(a.x, a.y, a.z);
+        a.rig.root.rotation.set(0, a.yaw, 0);
+        if (!a.alerted && (i + this.frameTick) % 3 !== 0) {
+          continue;
+        }
+      } else if (behindCamera || occludedByStructure) {
+        // Inside 160m but strictly behind camera or fully blocked by solid structure (> 18m): hide 45-mesh rig & skip IK
+        a.rig.root.visible = false;
+        a.rig.setWarningLaser(false);
+        this.setAgentShadowCasting(a, false);
+        a.lodTier = 3;
+        if (occludedByStructure) occludedCount++;
+        else culledBehindCount++;
+        activeNearby++;
+        for (let hmIdx = 0; hmIdx < a.rig.hitMeshes.length; hmIdx++) {
+          this.activeHitMeshes.push(a.rig.hitMeshes[hmIdx]);
+        }
+        if (!a.alerted && a.neutralAlertStage === 'calm' && (i + this.frameTick) % 4 !== 0) {
+          continue;
+        }
+      } else if (distHoriz > LOD0_MAX_DIST_M) {
+        // LOD1 (75m..160m): visible full rig, no shadows, no IR strobe, 20Hz staggered IK
+        a.rig.root.visible = true;
+        a.lodTier = 1;
+        lod1Count++;
+        this.setAgentShadowCasting(a, false);
+        activeNearby++;
+        for (let hmIdx = 0; hmIdx < a.rig.hitMeshes.length; hmIdx++) {
+          this.activeHitMeshes.push(a.rig.hitMeshes[hmIdx]);
+        }
+      } else {
+        // LOD0 (<= 75m): full 60Hz tactical rig, shadows strictly <= 55m
+        a.rig.root.visible = true;
+        a.lodTier = 0;
+        lod0Count++;
+        this.setAgentShadowCasting(a, distHoriz <= SHADOW_CAST_MAX_DIST_M);
+        activeNearby++;
+        for (let hmIdx = 0; hmIdx < a.rig.hitMeshes.length; hmIdx++) {
+          this.activeHitMeshes.push(a.rig.hitMeshes[hmIdx]);
+        }
       }
 
-      // Synchronize helmet IR strobe pulse for PMC friendly identification through NVGs
+      // Synchronize helmet IR strobe pulse only for close visible LOD0 PMC operators
       const isPmcAgent = a.faction === 'pmc_alpha' || a.faction === 'pmc_bravo';
       if (isPmcAgent) {
-        const strobeOn = (this.elapsedClock + i * 0.17) % 1.35 < 0.16;
-        a.rig.setIrStrobe(true, strobeOn);
+        if (a.lodTier === 0) {
+          const strobeOn = (this.elapsedClock + i * 0.17) % 1.35 < 0.16;
+          a.rig.setIrStrobe(true, strobeOn);
+        } else {
+          a.rig.setIrStrobe(false, false);
+        }
       }
 
-      // Flip helmet NVG mount down automatically during Night Ops
-      if (a.hasNvgMount && a.nvgFlipped !== isNight) {
+      // Flip helmet NVG mount down automatically during Night Ops (visible rigs only)
+      if (a.rig.root.visible && a.hasNvgMount && a.nvgFlipped !== isNight) {
         a.nvgFlipped = isNight;
         a.rig.setGearAppearance({ nvgFlipped: isNight });
       }
@@ -1799,13 +2060,19 @@ export class OpenWorldAiDirector {
       a.rig.root.position.set(a.x, a.y, a.z);
       a.rig.root.rotation.set(0, a.yaw, 0);
 
+      // Strictly skip expensive 2-bone IK + facial animation whenever rig is hidden (LOD2 or behind camera)
       const updatePoseNow =
-        distHoriz <= 55 ||
-        a.reloading ||
-        a.muzzleFlashTimer > 0 ||
-        a.alerted ||
-        a.neutralAlertStage === 'warned' ||
-        (i & 1) === this.frameParity;
+        a.rig.root.visible &&
+        (a.lodTier === 0
+          ? distHoriz <= 55 ||
+            a.reloading ||
+            a.muzzleFlashTimer > 0 ||
+            a.alerted ||
+            a.neutralAlertStage === 'warned' ||
+            (i & 1) === this.frameParity
+          : a.reloading ||
+            a.muzzleFlashTimer > 0 ||
+            (i + this.frameTick) % 3 === 0);
       if (updatePoseNow) {
         const reloadProgress = a.reloading
           ? THREE.MathUtils.clamp(a.reloadTimer / Math.max(0.1, a.reloadDuration), 0, 1)
@@ -1859,8 +2126,24 @@ export class OpenWorldAiDirector {
       }
     }
 
+    if (this.distantProxyMesh) {
+      this.distantProxyMesh.count = proxyCount;
+      this.distantProxyMesh.visible = proxyCount > 0;
+      if (proxyCount > 0) {
+        this.distantProxyMesh.instanceMatrix.needsUpdate = true;
+        if (this.distantProxyMesh.instanceColor) {
+          this.distantProxyMesh.instanceColor.needsUpdate = true;
+        }
+      }
+    }
+
     this.activeNearbyCount = activeNearby;
     this.hostileEngagingCount = hostileEngaging;
+    this.lod0Count = lod0Count;
+    this.lod1Count = lod1Count;
+    this.lod2Count = lod2Count;
+    this.culledBehindCount = culledBehindCount;
+    this.occludedCount = occludedCount;
   }
 
   /**
@@ -1911,6 +2194,11 @@ export class OpenWorldAiDirector {
       activeNearby: this.activeNearbyCount,
       hostileEngaging: this.hostileEngagingCount,
       effectiveVisionRangeM: this.lastVisionRangeM,
+      lod0Count: this.lod0Count,
+      lod1Count: this.lod1Count,
+      lod2Count: this.lod2Count,
+      culledBehindCount: this.culledBehindCount,
+      occludedCount: this.occludedCount,
     };
   }
 
@@ -1927,6 +2215,10 @@ export class OpenWorldAiDirector {
   public dispose(): void {
     if (this.rootGroup.parent) {
       this.rootGroup.parent.remove(this.rootGroup);
+    }
+    if (this.distantProxyMesh) {
+      this.distantProxyMesh.dispose();
+      this.distantProxyMesh = null;
     }
     for (let i = 0; i < this.agents.length; i++) {
       this.agents[i].ragdoll.deactivate();
