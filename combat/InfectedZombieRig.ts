@@ -689,6 +689,7 @@ export class InfectedZombieRigLibrary {
 
     // Archetype headgear accents (skewed riot helmet / respirator canister with >= 4mm facial clearance)
     if (archetype === 'quarantine_guard') {
+      headAssembly.applyHeadgearClearance('mich');
       const helmet = makeMesh(this.geoHelmetShell, mats.gearAccent, 'head');
       helmet.position.set(0, 0.110, 0.004);
       helmet.rotation.set(0.14, 0, (h & 1 ? 1 : -1) * 0.08);

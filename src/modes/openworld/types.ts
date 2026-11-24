@@ -1,5 +1,5 @@
 import type { WeaponAttachments } from '../../../data/attachments';
-import type { OperatorGearConfig, OperatorId } from '../../../bodycam-sdk/operator/OperatorTypes';
+import type { FacePresetId, OperatorGearConfig, OperatorId } from '../../../bodycam-sdk/operator/OperatorTypes';
 import type {
   CorpseTacticalLootSnapshot,
   OperatorTacticalInventory,
@@ -765,6 +765,7 @@ export interface CreateCharacterInput {
   shardMode: ShardMode;
   pmcFaction: PmcFactionId;
   bodyType: CharacterBodyType;
+  facePreset?: FacePresetId;
   activate?: boolean;
 }
 

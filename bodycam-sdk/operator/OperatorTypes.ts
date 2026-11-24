@@ -154,6 +154,112 @@ export type FaceGearId = 'open_face' | 'neck_gaiter' | 'balaclava';
 
 export type EyewearId = 'none' | 'clear_glasses' | 'tinted_visor';
 
+export type FacePresetId = 'face_01' | 'face_02' | 'face_03';
+
+export const FACE_PRESET_IDS: readonly FacePresetId[] = ['face_01', 'face_02', 'face_03'] as const;
+export const DEFAULT_FACE_PRESET_ID: FacePresetId = 'face_01';
+
+export interface FacePresetSpec {
+  readonly id: FacePresetId;
+  readonly operatorId: OperatorId;
+  readonly label: string;
+  readonly shortLabel: string;
+  readonly hairStyleLabel: string;
+  readonly summary: string;
+  readonly skinSwatchHex: string;
+  readonly hairSwatchHex: string;
+  readonly eyeSwatchHex: string;
+}
+
+export const MALE_FACE_PRESETS: readonly FacePresetSpec[] = [
+  {
+    id: 'face_01',
+    operatorId: 'MALE',
+    label: 'Face 01 · Breacher',
+    shortLabel: 'BREACHER',
+    hairStyleLabel: 'High-and-Tight Fade',
+    summary: 'Square jaw, fair-warm skin, hazel eyes, dark brown fade, light stubble.',
+    skinSwatchHex: '#c99c80',
+    hairSwatchHex: '#2a2019',
+    eyeSwatchHex: '#5d6e54',
+  },
+  {
+    id: 'face_02',
+    operatorId: 'MALE',
+    label: 'Face 02 · Recon',
+    shortLabel: 'RECON',
+    hairStyleLabel: 'Textured Short Crop',
+    summary: 'Angular cheekbones, olive-tan skin, dark brown eyes, cropped hair, heavy stubble.',
+    skinSwatchHex: '#b48364',
+    hairSwatchHex: '#1e1713',
+    eyeSwatchHex: '#4b3726',
+  },
+  {
+    id: 'face_03',
+    operatorId: 'MALE',
+    label: 'Face 03 · Heavy',
+    shortLabel: 'HEAVY',
+    hairStyleLabel: 'Crisp Buzz Fade',
+    summary: 'Broad mandible and brow, deep brown skin, dark amber eyes, crisp buzz fade.',
+    skinSwatchHex: '#7a513b',
+    hairSwatchHex: '#14100e',
+    eyeSwatchHex: '#352319',
+  },
+] as const;
+
+export const FEMALE_FACE_PRESETS: readonly FacePresetSpec[] = [
+  {
+    id: 'face_01',
+    operatorId: 'FEMALE',
+    label: 'Face 01 · Valkyrie',
+    shortLabel: 'VALKYRIE',
+    hairStyleLabel: 'Swept Tactical Cut',
+    summary: 'Defined cheekbones, fair-warm skin, blue-grey eyes, chestnut swept hair and bun.',
+    skinSwatchHex: '#cfa388',
+    hairSwatchHex: '#38261c',
+    eyeSwatchHex: '#4e6d84',
+  },
+  {
+    id: 'face_02',
+    operatorId: 'FEMALE',
+    label: 'Face 02 · Marksman',
+    shortLabel: 'MARKSMAN',
+    hairStyleLabel: 'Sleek Parted Crown',
+    summary: 'Balanced oval jaw, warm olive skin, green-hazel eyes, sleek dark crown and bun.',
+    skinSwatchHex: '#b9896b',
+    hairSwatchHex: '#211915',
+    eyeSwatchHex: '#566f53',
+  },
+  {
+    id: 'face_03',
+    operatorId: 'FEMALE',
+    label: 'Face 03 · Specialist',
+    shortLabel: 'SPECIALIST',
+    hairStyleLabel: 'Textured Close Fade',
+    summary: 'High cheekbones, rich deep brown skin, dark espresso eyes, textured close fade.',
+    skinSwatchHex: '#7e553e',
+    hairSwatchHex: '#15110f',
+    eyeSwatchHex: '#322218',
+  },
+] as const;
+
+export function getFacePresetsForOperator(operatorId: OperatorId): readonly FacePresetSpec[] {
+  return operatorId === 'FEMALE' ? FEMALE_FACE_PRESETS : MALE_FACE_PRESETS;
+}
+
+export function isFacePresetId(val: unknown): val is FacePresetId {
+  return val === 'face_01' || val === 'face_02' || val === 'face_03';
+}
+
+export function normalizeFacePresetId(val: unknown): FacePresetId {
+  return isFacePresetId(val) ? val : DEFAULT_FACE_PRESET_ID;
+}
+
+export function pickFacePresetFromSeed(seed: number): FacePresetId {
+  const idx = Math.abs(Math.floor(seed)) % FACE_PRESET_IDS.length;
+  return FACE_PRESET_IDS[idx];
+}
+
 export interface OperatorGearConfig {
   uniformId: OperatorGearUniformId;
   glovesEnabled: boolean;
@@ -163,6 +269,7 @@ export interface OperatorGearConfig {
   nvgMount: NvgMountId;
   faceGear: FaceGearId;
   eyewear: EyewearId;
+  facePreset: FacePresetId;
 }
 
 export const OPERATOR_GEAR_STORAGE_KEY = 'bfps.operator.gear.v1';
@@ -176,6 +283,7 @@ export const DEFAULT_OPERATOR_GEAR: Readonly<OperatorGearConfig> = {
   nvgMount: 'none',
   faceGear: 'neck_gaiter',
   eyewear: 'none',
+  facePreset: DEFAULT_FACE_PRESET_ID,
 };
 
 export interface GloveColorSpec {
@@ -347,6 +455,7 @@ const VALID_HELMET_COLORS = new Set<string>(HELMET_COLOR_LIST.map((h) => h.id));
 const VALID_NVG_MOUNTS = new Set<string>(['none', 'pvs7', 'arnvg']);
 const VALID_FACE_GEAR = new Set<string>(['open_face', 'neck_gaiter', 'balaclava']);
 const VALID_EYEWEAR = new Set<string>(['none', 'clear_glasses', 'tinted_visor']);
+const VALID_FACE_PRESETS = new Set<string>(FACE_PRESET_IDS);
 
 export function normalizeOperatorGearConfig(raw: unknown): OperatorGearConfig {
   const obj = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {};
@@ -382,6 +491,10 @@ export function normalizeOperatorGearConfig(raw: unknown): OperatorGearConfig {
     typeof obj.eyewear === 'string' && VALID_EYEWEAR.has(obj.eyewear)
       ? (obj.eyewear as EyewearId)
       : DEFAULT_OPERATOR_GEAR.eyewear;
+  const facePreset: FacePresetId =
+    typeof obj.facePreset === 'string' && VALID_FACE_PRESETS.has(obj.facePreset)
+      ? (obj.facePreset as FacePresetId)
+      : DEFAULT_OPERATOR_GEAR.facePreset;
 
   return {
     uniformId,
@@ -392,6 +505,7 @@ export function normalizeOperatorGearConfig(raw: unknown): OperatorGearConfig {
     nvgMount,
     faceGear,
     eyewear,
+    facePreset,
   };
 }
 

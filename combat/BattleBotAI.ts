@@ -822,7 +822,9 @@ export class BattleBotAI {
         ? 'infection'
         : resolveOperatorUniformId('battle', team);
       const rig = this.rigFactory.buildOperator('bot', id, uniformId, operatorId);
+      const botFacePresets = ['face_01', 'face_02', 'face_03'] as const;
       rig.setGearAppearance({
+        facePreset: botFacePresets[i % botFacePresets.length],
         faceGear: i % 5 === 0 ? 'balaclava' : i % 2 === 0 ? 'open_face' : 'neck_gaiter',
         eyewear: i % 6 === 0 ? 'tinted_visor' : i % 3 === 1 ? 'clear_glasses' : 'none',
       });

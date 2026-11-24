@@ -477,6 +477,7 @@ export interface GamePlayerStatePacket {
   nvgFlipped?: boolean;
   faceGear?: 'open_face' | 'neck_gaiter' | 'balaclava';
   eyewear?: 'none' | 'clear_glasses' | 'tinted_visor';
+  facePreset?: 'face_01' | 'face_02' | 'face_03';
   lean: number; // -1..1
   weaponId: string;
   att?: SyncedWeaponAttachments;
@@ -577,6 +578,7 @@ export interface GamePlayerRespawnPacket {
   nvgFlipped?: boolean;
   faceGear?: 'open_face' | 'neck_gaiter' | 'balaclava';
   eyewear?: 'none' | 'clear_glasses' | 'tinted_visor';
+  facePreset?: 'face_01' | 'face_02' | 'face_03';
   ts: number;
 }
 

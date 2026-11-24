@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { resolveWeaponProfile } from '../../../bodycam-sdk/weaponProfiles';
 import {
   DEFAULT_OPERATOR_GEAR,
+  normalizeFacePresetId,
   normalizeOperatorGearConfig,
   OperatorGearConfig,
 } from '../../../bodycam-sdk/operator/OperatorTypes';
@@ -811,6 +812,7 @@ export class CharacterRoster {
         uniformId: factionSpec.uniformId,
         helmetColor: pmcFaction === 'pmc_alpha' ? 'black' : 'olive_drab',
         gloveColor: pmcFaction === 'pmc_alpha' ? 'charcoal' : 'olive',
+        facePreset: normalizeFacePresetId(input.facePreset),
       }),
       deploymentState: 'hideout',
       lastHospitalId: factionSpec.homeHospitalId,

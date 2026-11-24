@@ -8,6 +8,7 @@ import {
   DEFAULT_OPERATOR_ID,
   EyewearId,
   FaceGearId,
+  FacePresetId,
   GLOVE_COLOR_LIST,
   HELMET_COLOR_LIST,
   HelmetTypeId,
@@ -15,10 +16,12 @@ import {
   NvgMountId,
   OPERATOR_PROFILES,
   OperatorId,
+  pickFacePresetFromSeed,
 } from '../bodycam-sdk/operator/OperatorTypes';
 import {
   buildAnatomicalHeadAssembly,
   BuiltAnatomicalHeadAssembly,
+  getSkinTonePalette,
 } from '../bodycam-sdk/character/AnatomicalHeadBuilder';
 import {
   FacialExpressionController,
@@ -170,6 +173,7 @@ export interface BuiltTacticalOperatorRig {
     nvgFlipped?: boolean;
     faceGear?: FaceGearId;
     eyewear?: EyewearId;
+    facePreset?: FacePresetId;
   }) => void;
   setFactionArmband: (colorHex: number | null) => void;
   setIrStrobe: (enabled: boolean, pulseOn?: boolean) => void;
@@ -896,7 +900,24 @@ export class TacticalOperatorRigFactory {
     upperBody.add(headGroup);
 
     const headScaleXZ = isFemale ? 0.94 : 1.0;
-    const neckSkin = makeMesh(this.geoNeck, 'skin');
+
+    // Deterministic face preset & skin tone seed per actorId so bots & remote operators show varied realistic faces
+    let actorSeedHash = 0;
+    for (let c = 0; c < actorId.length; c++) {
+      actorSeedHash = (actorSeedHash * 31 + actorId.charCodeAt(c)) >>> 0;
+    }
+    const initialFacePreset = pickFacePresetFromSeed(actorSeedHash);
+    const initialSkinPalette = getSkinTonePalette(
+      actorSeedHash,
+      isFemale ? 'female' : 'male',
+      initialFacePreset,
+    );
+    const actorSkinMat = this.track(activeBundle.skinMat.clone());
+    actorSkinMat.color.setHex(initialSkinPalette.wristHex);
+
+    const neckSkin = new THREE.Mesh(this.geoNeck, actorSkinMat);
+    neckSkin.castShadow = true;
+    neckSkin.receiveShadow = true;
     neckSkin.scale.set(isFemale ? 0.80 : 0.90, 1.02, isFemale ? 0.80 : 0.90);
     neckSkin.position.set(0, 0.022, 0.004);
 
@@ -904,19 +925,16 @@ export class TacticalOperatorRigFactory {
     neck.scale.set(isFemale ? 0.88 : 1.0, 1.0, isFemale ? 0.88 : 1.0);
     neck.position.set(0, 0.02, 0.005);
 
-    // Deterministic skin tone seed per actorId so bots & remote operators show varied realistic faces
-    let actorSeedHash = 0;
-    for (let c = 0; c < actorId.length; c++) {
-      actorSeedHash = (actorSeedHash * 31 + actorId.charCodeAt(c)) >>> 0;
-    }
     const headAssembly = buildAnatomicalHeadAssembly({
       variant: isFemale ? 'female' : 'male',
       toneSeed: actorSeedHash,
+      facePreset: initialFacePreset,
       anisotropy: 4,
       hoodMaterial: activeBundle.hoodMat,
       frameMaterial: activeBundle.knuckleMat,
       includeGearAndEyewear: true,
     });
+    headAssembly.applyHeadgearClearance('mil_tec', 'neck_gaiter');
     headAssembly.root.position.set(0, 0.028, 0);
     headAssembly.headMesh.userData = {
       combatActorType: actorType,
@@ -1382,6 +1400,7 @@ export class TacticalOperatorRigFactory {
       nvgFlipped?: boolean;
       faceGear?: FaceGearId;
       eyewear?: EyewearId;
+      facePreset?: FacePresetId;
     } | null = null;
 
     const setGearAppearance = (gear: {
@@ -1393,13 +1412,25 @@ export class TacticalOperatorRigFactory {
       nvgFlipped?: boolean;
       faceGear?: FaceGearId;
       eyewear?: EyewearId;
+      facePreset?: FacePresetId;
     }): void => {
       currentGear = { ...gear };
 
+      // 0. Face Preset & synced actor skin tone (neck + bare hands)
+      if (gear.facePreset) {
+        headAssembly.applyFacePreset(gear.facePreset);
+        const pal = getSkinTonePalette(
+          actorSeedHash,
+          isFemale ? 'female' : 'male',
+          gear.facePreset,
+        );
+        actorSkinMat.color.setHex(pal.wristHex);
+      }
+
       // 1. Gloves ON/OFF + Color
       if (gear.glovesEnabled === false) {
-        leftArmParts.glove.material = activeBundle.skinMat;
-        rightArmParts.glove.material = activeBundle.skinMat;
+        leftArmParts.glove.material = actorSkinMat;
+        rightArmParts.glove.material = actorSkinMat;
       } else if (gear.gloveColor && gear.gloveColor !== 'uniform') {
         const gSpec = GLOVE_COLOR_LIST.find((c) => c.id === gear.gloveColor);
         if (gSpec) {
@@ -1417,8 +1448,9 @@ export class TacticalOperatorRigFactory {
       }
 
       // 2. Helmet Shell (No Helmet vs MICH-2000 low-cut no mount vs Mil-Tec high-cut + mount) + Color
-      const hasHelmet = gear.helmetType !== 'none';
-      const isMich = gear.helmetType === 'mich';
+      const effectiveHelmetType: HelmetTypeId = gear.helmetType ?? 'mil_tec';
+      const hasHelmet = effectiveHelmetType !== 'none';
+      const isMich = effectiveHelmetType === 'mich';
       hasHelmetEquipped = hasHelmet;
       helmetShell.visible = hasHelmet;
       helmetRim.visible = hasHelmet;
@@ -1451,17 +1483,18 @@ export class TacticalOperatorRigFactory {
 
       // 3. Mounted NVG (locked off unless Mil-Tec) & flip-down hinge pose
       const effectiveMount: NvgMountId =
-        gear.helmetType === 'mil_tec' ? (gear.nvgMount ?? 'none') : 'none';
+        effectiveHelmetType === 'mil_tec' ? (gear.nvgMount ?? 'none') : 'none';
       nvgPivot.visible = effectiveMount !== 'none';
       pvs7Group.visible = effectiveMount === 'pvs7';
       arnvgGroup.visible = effectiveMount === 'arnvg';
       nvgPivot.rotation.x = gear.nvgFlipped && effectiveMount !== 'none' ? 0.14 : -1.28;
 
-      // 4. Face Gear & Eyewear
+      // 4. Face Gear, Eyewear & Hair/Helmet Clearance
       const faceGear: FaceGearId = gear.faceGear ?? 'neck_gaiter';
       const eyewear: EyewearId = gear.eyewear ?? 'none';
       headAssembly.applyFaceGear(faceGear);
       headAssembly.applyEyewear(eyewear);
+      headAssembly.applyHeadgearClearance(effectiveHelmetType, faceGear);
       neck.visible = faceGear !== 'open_face';
     };
 

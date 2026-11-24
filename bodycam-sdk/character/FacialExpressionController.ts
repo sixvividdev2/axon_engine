@@ -67,7 +67,7 @@ export class FacialExpressionController {
   // Scratch math objects (zero allocations in hot loop)
   private readonly _invHeadMat = new THREE.Matrix4();
   private readonly _localGaze = new THREE.Vector3();
-  private readonly _eyeMidLocal = new THREE.Vector3(0, 0.104, -0.075);
+  private readonly _eyeMidLocal = new THREE.Vector3(0, 0.1035, -0.0705);
 
   constructor(seed = 1) {
     const normSeed = Math.abs(Math.sin(seed * 12.9898) * 43758.5453) % 1;

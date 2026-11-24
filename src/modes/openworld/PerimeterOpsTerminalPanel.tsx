@@ -16,6 +16,11 @@ import {
   UserPlus,
 } from 'lucide-react';
 import { resolveWeaponProfile } from '../../../bodycam-sdk/weaponProfiles';
+import {
+  DEFAULT_FACE_PRESET_ID,
+  FacePresetId,
+  getFacePresetsForOperator,
+} from '../../../bodycam-sdk/operator/OperatorTypes';
 import { characterRoster, STARTING_CHARACTER_CASH_USD } from './CharacterRoster';
 import { useHideoutShardAdapter } from './HideoutShardAdapter';
 import {
@@ -84,6 +89,7 @@ export const PerimeterOpsTerminalPanel: React.FC<PerimeterOpsTerminalPanelProps>
   const [shardInput, setShardInput] = useState<ShardMode>('PvPvE');
   const [factionInput, setFactionInput] = useState<PmcFactionId>('pmc_alpha');
   const [bodyInput, setBodyInput] = useState<CharacterBodyType>('male');
+  const [facePresetInput, setFacePresetInput] = useState<FacePresetId>(DEFAULT_FACE_PRESET_ID);
   const [formError, setFormError] = useState<string | null>(null);
 
   const [confirmDeleteSlot, setConfirmDeleteSlot] = useState<CharacterSlotId | null>(null);
@@ -152,6 +158,9 @@ export const PerimeterOpsTerminalPanel: React.FC<PerimeterOpsTerminalPanelProps>
     setShardInput(slotNum === 2 ? 'PvE' : 'PvPvE');
     setFactionInput(slotNum === 2 ? 'pmc_bravo' : 'pmc_alpha');
     setBodyInput(slotNum === 2 ? 'female' : 'male');
+    setFacePresetInput(
+      slotNum === 2 ? 'face_02' : slotNum === 3 ? 'face_03' : DEFAULT_FACE_PRESET_ID,
+    );
     setFormError(null);
     setConfirmDeleteSlot(null);
   };
@@ -165,6 +174,7 @@ export const PerimeterOpsTerminalPanel: React.FC<PerimeterOpsTerminalPanelProps>
       shardMode: shardInput,
       pmcFaction: factionInput,
       bodyType: bodyInput,
+      facePreset: facePresetInput,
       activate: true,
     });
     if (!res.ok || !res.character) {
@@ -754,6 +764,66 @@ export const PerimeterOpsTerminalPanel: React.FC<PerimeterOpsTerminalPanelProps>
               <div className="mt-1 text-[11px] text-neutral-400">
                 Shared skeleton + gender-tuned secondary physics
               </div>
+            </div>
+          </div>
+
+          {/* Face Identity Selector (3 sculpted presets per gender) */}
+          <div className="mt-4 border-t border-white/10 pt-4">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="font-mono-tabular text-[11px] uppercase tracking-wider text-neutral-400">
+                Operator Face &amp; Hair Preset ({bodyInput === 'female' ? 'Female' : 'Male'} Roster)
+              </div>
+              <span className="font-mono-tabular text-[11px] text-neutral-500">
+                Sculpted skull/jaw profile, skin &amp; eye tone, and offset hair cut
+              </span>
+            </div>
+            <div className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-3" role="radiogroup" aria-label="Character Face Preset">
+              {getFacePresetsForOperator(bodyInput === 'female' ? 'FEMALE' : 'MALE').map((preset) => {
+                const active = facePresetInput === preset.id;
+                return (
+                  <button
+                    key={preset.id}
+                    type="button"
+                    role="radio"
+                    aria-checked={active}
+                    onClick={() => setFacePresetInput(preset.id)}
+                    className={`flex cursor-pointer flex-col gap-1 border p-3 text-left transition-colors ${
+                      active
+                        ? 'border-amber-400 bg-amber-500/15 text-amber-100'
+                        : 'border-white/10 bg-[#0d1118] text-neutral-300 hover:border-white/25 hover:text-neutral-100'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="font-mono-tabular text-xs font-semibold tracking-wide">
+                        {preset.label}
+                      </span>
+                      <span className="flex items-center gap-1">
+                        <span
+                          className="inline-block h-3 w-3 border border-white/25"
+                          style={{ backgroundColor: preset.skinSwatchHex }}
+                          title="Skin Tone"
+                        />
+                        <span
+                          className="inline-block h-3 w-3 border border-white/25"
+                          style={{ backgroundColor: preset.hairSwatchHex }}
+                          title="Hair Tone"
+                        />
+                        <span
+                          className="inline-block h-3 w-3 border border-white/25"
+                          style={{ backgroundColor: preset.eyeSwatchHex }}
+                          title="Iris Tone"
+                        />
+                      </span>
+                    </div>
+                    <div className="font-mono-tabular text-[11px] text-amber-300/85">
+                      {preset.hairStyleLabel}
+                    </div>
+                    <div className="text-[11px] leading-snug text-neutral-400">
+                      {preset.summary}
+                    </div>
+                  </button>
+                );
+              })}
             </div>
           </div>
 

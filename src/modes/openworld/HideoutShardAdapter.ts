@@ -142,7 +142,8 @@ export class HideoutShardAdapter {
         prev.helmetColor !== nextGear.helmetColor ||
         prev.nvgMount !== nextGear.nvgMount ||
         prev.faceGear !== nextGear.faceGear ||
-        prev.eyewear !== nextGear.eyewear;
+        prev.eyewear !== nextGear.eyewear ||
+        prev.facePreset !== nextGear.facePreset;
       if (changed) {
         this.roster.updateCharacterGear(active.slotId, nextGear);
       }

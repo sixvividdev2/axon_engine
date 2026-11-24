@@ -7,6 +7,7 @@ import {
 import {
   EYEWEAR_LIST,
   FACE_GEAR_LIST,
+  getFacePresetsForOperator,
   GLOVE_COLOR_LIST,
   HELMET_COLOR_LIST,
   HELMET_TYPE_LIST,
@@ -110,6 +111,8 @@ export const OperatorSelectPanel: React.FC<OperatorSelectPanelProps> = ({
     HELMET_COLOR_LIST.find((c) => c.id === gear.helmetColor) ?? HELMET_COLOR_LIST[0];
   const faceGearSpec = FACE_GEAR_LIST.find((f) => f.id === gear.faceGear) ?? FACE_GEAR_LIST[1];
   const eyewearSpec = EYEWEAR_LIST.find((e) => e.id === gear.eyewear) ?? EYEWEAR_LIST[0];
+  const facePresets = getFacePresetsForOperator(operatorId);
+  const facePresetSpec = facePresets.find((fp) => fp.id === gear.facePreset) ?? facePresets[0];
   const canMountNvg = helmetSpec.hasMount;
 
   const handleSelectOperator = (next: OperatorId) => {
@@ -149,6 +152,7 @@ export const OperatorSelectPanel: React.FC<OperatorSelectPanelProps> = ({
           {profile.role}
         </div>
         <div className="mt-1 font-mono-tabular text-[11px] text-neutral-300">
+          {facePresetSpec.shortLabel} ·{' '}
           {gear.helmetType === 'none'
             ? helmetSpec.label
             : `${helmetSpec.label} (${helmetColorSpec.label})`}{' '}
@@ -338,6 +342,50 @@ export const OperatorSelectPanel: React.FC<OperatorSelectPanelProps> = ({
 
               {activeTab === 'face' && (
                 <div className="flex flex-col gap-2.5">
+                  {/* Face Identity Preset Row (3 distinct sculpted faces per gender) */}
+                  <div className="flex flex-wrap items-center gap-2 border-b border-neutral-800/70 pb-2.5" role="radiogroup" aria-label="Face Identity">
+                    <span className="mr-1 font-mono-tabular text-[11px] uppercase tracking-wider text-neutral-400">
+                      Face
+                    </span>
+                    {facePresets.map((fp) => {
+                      const active = gear.facePreset === fp.id;
+                      return (
+                        <button
+                          key={fp.id}
+                          type="button"
+                          role="radio"
+                          aria-checked={active}
+                          onClick={() => updateGear({ facePreset: fp.id })}
+                          title={`${fp.hairStyleLabel} — ${fp.summary}`}
+                          className={`flex cursor-pointer items-center gap-2 whitespace-nowrap border px-3 py-1.5 font-mono-tabular text-[11px] transition-colors ${
+                            active
+                              ? 'border-amber-400 bg-amber-500/15 text-amber-200 font-semibold'
+                              : 'border-neutral-800 bg-neutral-950 text-neutral-300 hover:border-neutral-600 hover:text-neutral-100'
+                          }`}
+                        >
+                          <span className="flex items-center gap-0.5">
+                            <span
+                              className="inline-block h-3 w-3 border border-white/25"
+                              style={{ backgroundColor: fp.skinSwatchHex }}
+                            />
+                            <span
+                              className="inline-block h-3 w-3 border border-white/25"
+                              style={{ backgroundColor: fp.hairSwatchHex }}
+                            />
+                            <span
+                              className="inline-block h-2.5 w-2.5 border border-white/25"
+                              style={{ backgroundColor: fp.eyeSwatchHex }}
+                            />
+                          </span>
+                          <span>{fp.label}</span>
+                          <span className="hidden text-[10px] text-neutral-400 sm:inline">
+                            · {fp.hairStyleLabel}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+
                   <div className="flex flex-wrap items-center gap-4">
                     {/* Face Gear: Open Face / Neck Gaiter / Full Balaclava */}
                     <div className="flex flex-wrap items-center gap-1.5" role="radiogroup" aria-label="Face Gear">

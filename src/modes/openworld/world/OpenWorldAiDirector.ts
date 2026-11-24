@@ -752,6 +752,7 @@ export class OpenWorldAiDirector {
     rig.root.position.set(wx, wy, wz);
     rig.root.rotation.y = yaw;
 
+    const owFacePresets = ['face_01', 'face_02', 'face_03'] as const;
     rig.setGearAppearance({
       glovesEnabled: true,
       gloveColor: kit.gloveColor,
@@ -759,6 +760,7 @@ export class OpenWorldAiDirector {
       helmetColor: kit.helmetColor,
       nvgMount: kit.nvgMount,
       nvgFlipped: false,
+      facePreset: owFacePresets[Math.abs(seqIdx) % owFacePresets.length],
       faceGear:
         role === 'tower_sniper'
           ? 'balaclava'

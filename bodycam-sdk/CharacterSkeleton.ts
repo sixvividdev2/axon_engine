@@ -345,7 +345,11 @@ export class CharacterSkeleton {
       }),
     );
     const headToneSeed = operatorId === 'FEMALE' ? 0 : 1;
-    const skinPalette = getSkinTonePalette(headToneSeed, operatorId === 'FEMALE' ? 'female' : 'male');
+    const skinPalette = getSkinTonePalette(
+      headToneSeed,
+      operatorId === 'FEMALE' ? 'female' : 'male',
+      this.currentGear.facePreset,
+    );
     this.wristSkinMat = this.mat(
       new THREE.MeshStandardMaterial({
         color: skinPalette.wristHex,
@@ -902,12 +906,13 @@ export class CharacterSkeleton {
       return mesh;
     };
 
-    // Anatomical head, 15 facial morphs, independent eyeballs, oral teeth, face gear & eyewear
+    // Anatomical head, 15 facial morphs, offset hair cap, 3D brows, eyeballs, oral teeth, face gear & eyewear
     const headVariant = operatorId === 'FEMALE' ? 'female' : 'male';
     const headToneSeed = operatorId === 'FEMALE' ? 0 : 1;
     const assembly = buildAnatomicalHeadAssembly({
       variant: headVariant,
       toneSeed: headToneSeed,
+      facePreset: this.currentGear.facePreset,
       anisotropy: this.anisotropy,
       hoodMaterial: this.hoodMat,
       frameMaterial: this.knuckleMat,
@@ -918,14 +923,6 @@ export class CharacterSkeleton {
     for (let i = 0; i < assembly.allMeshes.length; i++) {
       const m = assembly.allMeshes[i];
       this.headMeshes.push({ mesh: m, visibleMat: m.material as THREE.Material });
-    }
-
-    // Tactical tied-back low bun silhouette under rear helmet rim for Female operator
-    if (operatorId === 'FEMALE') {
-      const hairBun = new THREE.Mesh(this.geo(new THREE.SphereGeometry(0.040, 12, 10)), this.knuckleMat);
-      hairBun.scale.set(0.92, 0.84, 1.12);
-      hairBun.position.set(0, 0.062, 0.104);
-      registerHeadMesh(this.headGroup, hairBun);
     }
 
     // === 1. MICH-2000 HELMET (Full-cut ballistic shell, clean brow, NO shroud/mount) ===
@@ -1279,10 +1276,20 @@ export class CharacterSkeleton {
       this.handGlovePalmMeshes[i].material = g.glovesEnabled ? this.palmLeatherMat : this.wristSkinMat;
     }
 
-    // 4. Face Gear & Eyewear
+    // 4. Face Preset, Face Gear, Eyewear & Hair/Helmet Clearance + Neck/Wrist Skin Sync
+    const headVariant = this.operatorId === 'FEMALE' ? 'female' : 'male';
+    const nextPalette = getSkinTonePalette(
+      this.operatorId === 'FEMALE' ? 0 : 1,
+      headVariant,
+      g.facePreset,
+    );
+    this.wristSkinMat.color.setHex(nextPalette.wristHex);
+
     if (this.headAssembly) {
+      this.headAssembly.applyFacePreset(g.facePreset);
       this.headAssembly.applyFaceGear(g.faceGear);
       this.headAssembly.applyEyewear(g.eyewear);
+      this.headAssembly.applyHeadgearClearance(g.helmetType, g.faceGear);
     }
     if (this.neckGaiterCollarMesh) {
       this.neckGaiterCollarMesh.visible = g.faceGear !== 'open_face';

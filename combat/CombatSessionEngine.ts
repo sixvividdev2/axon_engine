@@ -1586,6 +1586,7 @@ export class CombatSessionEngine {
       nvgFlipped: this.nvgFlipped && this.localGear.nvgMount !== 'none',
       faceGear: this.localGear.faceGear,
       eyewear: this.localGear.eyewear,
+      facePreset: this.localGear.facePreset,
       lean,
       weaponId: this.equippedWeaponId,
       att: packSyncedWeaponAttachments(this.weaponRig.getAttachments()),
@@ -5696,6 +5697,7 @@ export class CombatSessionEngine {
             nvgFlipped: this.nvgFlipped && this.localGear.nvgMount !== 'none',
             faceGear: this.localGear.faceGear,
             eyewear: this.localGear.eyewear,
+            facePreset: this.localGear.facePreset,
             ts: Date.now(),
           };
           this.mp.sendMessage(rspPkt as unknown as Record<string, unknown>);

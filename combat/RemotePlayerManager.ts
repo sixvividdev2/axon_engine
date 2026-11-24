@@ -586,9 +586,10 @@ export class RemotePlayerManager {
       pkt.nvgMount !== undefined ||
       pkt.nvgFlipped !== undefined ||
       pkt.faceGear !== undefined ||
-      pkt.eyewear !== undefined
+      pkt.eyewear !== undefined ||
+      pkt.facePreset !== undefined
     ) {
-      const nextSig = `${pkt.glovesEnabled ?? ''}|${pkt.gloveColor ?? ''}|${pkt.helmetType ?? ''}|${pkt.helmetColor ?? ''}|${pkt.nvgMount ?? ''}|${pkt.nvgFlipped ? 1 : 0}|${pkt.faceGear ?? ''}|${pkt.eyewear ?? ''}`;
+      const nextSig = `${pkt.glovesEnabled ?? ''}|${pkt.gloveColor ?? ''}|${pkt.helmetType ?? ''}|${pkt.helmetColor ?? ''}|${pkt.nvgMount ?? ''}|${pkt.nvgFlipped ? 1 : 0}|${pkt.faceGear ?? ''}|${pkt.eyewear ?? ''}|${pkt.facePreset ?? ''}`;
       if (op.gearSig !== nextSig) {
         op.gearSig = nextSig;
         op.rig.setGearAppearance({
@@ -600,6 +601,7 @@ export class RemotePlayerManager {
           nvgFlipped: pkt.nvgFlipped,
           faceGear: pkt.faceGear,
           eyewear: pkt.eyewear,
+          facePreset: pkt.facePreset,
         });
       }
     }
@@ -715,9 +717,10 @@ export class RemotePlayerManager {
       pkt.nvgMount !== undefined ||
       pkt.nvgFlipped !== undefined ||
       pkt.faceGear !== undefined ||
-      pkt.eyewear !== undefined
+      pkt.eyewear !== undefined ||
+      pkt.facePreset !== undefined
     ) {
-      const nextSig = `${pkt.glovesEnabled ?? ''}|${pkt.gloveColor ?? ''}|${pkt.helmetType ?? ''}|${pkt.helmetColor ?? ''}|${pkt.nvgMount ?? ''}|${pkt.nvgFlipped ? 1 : 0}|${pkt.faceGear ?? ''}|${pkt.eyewear ?? ''}`;
+      const nextSig = `${pkt.glovesEnabled ?? ''}|${pkt.gloveColor ?? ''}|${pkt.helmetType ?? ''}|${pkt.helmetColor ?? ''}|${pkt.nvgMount ?? ''}|${pkt.nvgFlipped ? 1 : 0}|${pkt.faceGear ?? ''}|${pkt.eyewear ?? ''}|${pkt.facePreset ?? ''}`;
       if (op.gearSig !== nextSig) {
         op.gearSig = nextSig;
         op.rig.setGearAppearance({
@@ -729,6 +732,7 @@ export class RemotePlayerManager {
           nvgFlipped: pkt.nvgFlipped,
           faceGear: pkt.faceGear,
           eyewear: pkt.eyewear,
+          facePreset: pkt.facePreset,
         });
       }
     }
