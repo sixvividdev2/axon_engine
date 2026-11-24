@@ -27,6 +27,7 @@ import {
 import { AccountSettingsModal } from './ui/AccountSettingsModal';
 import { AuthModal } from './ui/AuthModal';
 import { CombatHud, MultiplayerHudControls } from './ui/CombatHud';
+import { GameSettingsModal } from './ui/GameSettingsModal';
 import { HubTabId, MainMenuHub } from './ui/MainMenuHub';
 import { RankUpCinematic } from './ui/RankUpCinematic';
 import { SocialHubDrawer } from './ui/SocialHubDrawer';
@@ -605,6 +606,7 @@ function AppShell() {
 
       <AuthModal />
       <AccountSettingsModal />
+      <GameSettingsModal />
       <SocialHubDrawer />
       <SocialInviteToast />
     </>

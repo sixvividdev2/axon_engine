@@ -7,6 +7,7 @@ import {
   useGraphicsQuality,
 } from '../data/graphicsQuality';
 import type { ZombiesLobbySnapshot } from './ZombiesLobbyController';
+import { openGameSettings } from '../data/gameSettingsStore';
 
 interface ZombiesOutpostHudProps {
   snapshot: ZombiesLobbySnapshot;
@@ -240,6 +241,14 @@ export const ZombiesOutpostHud: React.FC<ZombiesOutpostHudProps> = ({
                   ))}
                 </div>
               </div>
+              <button
+                type="button"
+                onClick={() => openGameSettings('controls')}
+                className="flex cursor-pointer items-center justify-center gap-2 border border-white/12 bg-[#141820] px-3 py-2 text-xs font-medium text-neutral-200 transition-colors hover:border-amber-500/60 hover:text-amber-200"
+              >
+                <Sliders className="h-3.5 w-3.5 text-amber-400" />
+                <span>Game Settings &amp; Controls</span>
+              </button>
             </div>
           </div>
         </div>

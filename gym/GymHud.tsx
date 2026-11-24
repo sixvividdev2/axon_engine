@@ -3,6 +3,7 @@ import { TerminalOutcome } from '../bodycam-sdk';
 import { HeartRateIndicator } from '../ui/HeartRateIndicator';
 import { GymSnapshot } from './GymEngine';
 import { GYM_ZONE_PRESETS, GymZoneId } from './GymWorld';
+import { openGameSettings } from '../data/gameSettingsStore';
 
 interface GymHudProps {
   snapshot: GymSnapshot;
@@ -248,7 +249,7 @@ export const GymHud: React.FC<GymHudProps> = ({
           </span>
           <span className="text-neutral-600">|</span>
           <span className={snapshot.grenadeCount > 0 ? 'text-amber-300' : 'text-red-400'}>
-            {snapshot.tacticalEquipmentShortName} {snapshot.grenadeCount}/{snapshot.grenadeMax} [H]
+            {snapshot.tacticalEquipmentShortName} {snapshot.grenadeCount}/{snapshot.grenadeMax}
           </span>
           {snapshot.nvgMount !== 'none' && (
             <>
@@ -262,43 +263,17 @@ export const GymHud: React.FC<GymHudProps> = ({
                     : 'text-neutral-400'
                 }
               >
-                {snapshot.nvgMount === 'arnvg' ? 'RNVG-A P45' : 'PVS-7 P43'} [J]
+                {snapshot.nvgMount === 'arnvg' ? 'RNVG-A P45' : 'PVS-7 P43'}
                 {snapshot.nvgActive ? (snapshot.irIlluminatorOn ? ' · IR ON' : ' · ON') : ''}
               </span>
             </>
           )}
-          <span className="text-neutral-600">|</span>
-          {snapshot.isPdaOpen ? (
+          {snapshot.toggleablePumpSemi && (
             <>
-              <span className="text-emerald-300">TAC-PDA ACTIVE</span>
-              <span>LMB+Drag Pan</span>
-              <span>Wheel Zoom</span>
-              <span>R / RMB Center</span>
-              <span className="text-amber-300">M Stow PDA</span>
-            </>
-          ) : (
-            <>
-              <span>1-4 Weapons</span>
-              <span>F Bench</span>
-              <span className="text-emerald-300">M Tac Map</span>
-              {snapshot.toggleablePumpSemi && (
-                <span className="text-amber-300">
-                  Z {snapshot.spas12Mode === 'semi' ? 'Semi' : 'Pump'}
-                </span>
-              )}
-              {snapshot.hasVariableZoom && <span>Wheel/[ ] Zoom</span>}
-              {snapshot.isMagnifiedOptic && <span>N Illum</span>}
-              <span>MMB Pt-Aim</span>
-              {snapshot.hasCantedOptic && <span>B Canted</span>}
-              <span>L / Alt+L Laser</span>
-              <span>T Light</span>
-              <span>Q/E Lean</span>
-              <span>C Crouch</span>
-              <span>Space Vault</span>
-              <span>V Bash</span>
-              <span>X Kick</span>
-              <span>R Reload</span>
-              <span className="text-amber-300/90">F1 Armory &amp; SDK</span>
+              <span className="text-neutral-600">|</span>
+              <span className="text-amber-300">
+                {snapshot.spas12Mode === 'semi' ? 'Semi-Auto' : 'Pump-Action'}
+              </span>
             </>
           )}
         </div>
@@ -340,6 +315,13 @@ export const GymHud: React.FC<GymHudProps> = ({
                 >
                   F1 · Armory &amp; SDK Tuner
                 </button>
+                <button
+                  type="button"
+                  onClick={() => openGameSettings('controls')}
+                  className="cursor-pointer whitespace-nowrap shrink-0 border border-neutral-700 bg-neutral-900 px-4 py-2 font-mono-tabular text-xs font-medium uppercase tracking-wider text-neutral-100 transition-colors hover:border-amber-400/70 hover:text-amber-300"
+                >
+                  Settings &amp; Controls
+                </button>
               </div>
               <button
                 type="button"
@@ -368,55 +350,6 @@ export const GymHud: React.FC<GymHudProps> = ({
                   {z.label}
                 </button>
               ))}
-            </div>
-
-            {/* Compact controls matrix */}
-            <div className="grid grid-cols-2 gap-x-4 gap-y-1 border-t border-neutral-800 pt-2 font-mono-tabular text-[11px] text-neutral-400 sm:grid-cols-4">
-              <div>
-                <span className="text-neutral-200">WASD / Shift</span> Move &amp; Sprint
-              </div>
-              <div>
-                <span className="text-neutral-200">Space</span> Jump, Vault &amp; Mantle
-              </div>
-              <div>
-                <span className="text-neutral-200">C / Q / E</span> Crouch &amp; Lean
-              </div>
-              <div>
-                <span className="text-neutral-200">F (at Bench)</span> 42-Gun Armory
-              </div>
-              <div>
-                <span className="text-neutral-200">RMB / Shift</span> ADS &amp; Hold Breath
-              </div>
-              <div>
-                <span className="text-neutral-200">MMB / B</span> Point Aim &amp; Canted
-              </div>
-              <div>
-                <span className="text-neutral-200">L / Alt+L</span> Red / IR Laser
-              </div>
-              <div>
-                <span className="text-neutral-200">H / 5</span> Draw · RMB Pin · RMB Spoon · LMB Throw
-              </div>
-              <div>
-                <span className="text-neutral-200">T / G</span> Flashlight &amp; Supp.
-              </div>
-              <div>
-                <span className="text-neutral-200">1–4 / Z</span> Quick Swap &amp; SPAS Mode
-              </div>
-              <div>
-                <span className="text-neutral-200">R / I / Alt+T</span> Reload, Inspect &amp; Mag
-              </div>
-              <div>
-                <span className="text-neutral-200">V / X</span> Quick-Bash &amp; Push-Kick
-              </div>
-              <div>
-                <span className="text-neutral-200">Wheel / N</span> Scope Zoom &amp; Illum
-              </div>
-              <div>
-                <span className="text-neutral-200">M / Wheel / R</span> 3D Tac Map PDA
-              </div>
-              <div>
-                <span className="text-neutral-200">J / N</span> Flip NVG &amp; IR Flood
-              </div>
             </div>
           </div>
         </div>

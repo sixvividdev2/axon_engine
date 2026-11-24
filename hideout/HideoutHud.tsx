@@ -22,6 +22,7 @@ import { HubTabId } from '../ui/MainMenuHub';
 import { OpsLaptopTabId } from './HideoutOpsLaptopModal';
 import { HideoutSnapshot } from './HideoutSessionController';
 import { PMC_FACTIONS, useHideoutShardAdapter } from '../src/modes/openworld';
+import { openGameSettings } from '../data/gameSettingsStore';
 
 interface HideoutHudProps {
   snapshot: HideoutSnapshot;
@@ -367,32 +368,14 @@ export const HideoutHud: React.FC<HideoutHudProps> = ({
               </span>
             </div>
           ) : (
-            <div className="mt-0.5 flex items-center justify-end gap-2 font-mono-tabular text-xs text-neutral-400">
-              <span>LMB Jab · RMB+LMB Hook</span>
-              {snapshot.nvgActive && (
-                <>
-                  <span aria-hidden="true">·</span>
-                  <span className="text-emerald-300">
-                    {snapshot.irActive ? 'NVG + IR' : 'NVG'}
-                  </span>
-                </>
-              )}
-            </div>
+            snapshot.nvgActive && (
+              <div className="mt-0.5 flex items-center justify-end gap-2 font-mono-tabular text-xs text-neutral-400">
+                <span className="text-emerald-300">
+                  {snapshot.irActive ? 'NVG + IR' : 'NVG'}
+                </span>
+              </div>
+            )
           )}
-        </div>
-      )}
-
-      {/* Compact bottom-center PDA controls hint strip when TAC-PDA is open */}
-      {showLiveHud && snapshot.isPdaOpen && (
-        <div
-          className="fixed bottom-3 left-1/2 hidden -translate-x-1/2 items-center gap-2.5 whitespace-nowrap font-mono-tabular text-[10px] uppercase tracking-wider text-neutral-300/80 lg:flex"
-          style={{ textShadow: '0 1px 2px rgba(0,0,0,0.95)' }}
-        >
-          <span className="text-emerald-300">TAC-PDA ACTIVE</span>
-          <span>LMB+Drag Pan</span>
-          <span>Wheel Zoom</span>
-          <span>R / RMB Center</span>
-          <span className="text-amber-300">M Stow PDA</span>
         </div>
       )}
 
@@ -476,28 +459,11 @@ export const HideoutHud: React.FC<HideoutHudProps> = ({
           <button
             type="button"
             onClick={onRequestLock}
-            className="flex items-center gap-3 border border-amber-500/55 bg-[#101216]/94 px-6 py-3 text-sm font-semibold tracking-wide text-neutral-100 transition-colors hover:border-amber-400 hover:bg-[#16191f] whitespace-nowrap"
+            className="flex items-center gap-3 border border-amber-500/55 bg-[#101216]/94 px-6 py-3 text-sm font-semibold tracking-wide text-neutral-100 transition-colors hover:border-amber-400 hover:bg-[#16191f] whitespace-nowrap cursor-pointer"
           >
             <Crosshair className="h-4 w-4 text-amber-400" />
             <span>Click to Enter Hideout</span>
           </button>
-          <div className="flex items-center gap-3 text-xs text-neutral-400">
-            <span>WASD Move</span>
-            <span aria-hidden="true">·</span>
-            <span>Q/E Lean</span>
-            <span aria-hidden="true">·</span>
-            <span>F + Scroll Interact</span>
-            <span aria-hidden="true">·</span>
-            <span>V Bash</span>
-            <span aria-hidden="true">·</span>
-            <span>X Kick</span>
-            <span aria-hidden="true">·</span>
-            <span>M PDA</span>
-            <span aria-hidden="true">·</span>
-            <span>Space / 2x Spin Vault</span>
-            <span aria-hidden="true">·</span>
-            <span>ESC Menu</span>
-          </div>
         </div>
       )}
 
@@ -680,20 +646,28 @@ export const HideoutHud: React.FC<HideoutHudProps> = ({
               </div>
             </div>
 
-            {/* Account & Social Footer Actions */}
-            <div className="mt-5 flex items-center justify-between border-t border-white/10 pt-4">
+            {/* Account, Settings & Social Footer Actions */}
+            <div className="mt-5 flex items-center justify-between gap-2 border-t border-white/10 pt-4">
               <button
                 type="button"
                 onClick={() => (user ? openAccountSettings() : openAuthModal())}
-                className="flex items-center gap-2 text-xs font-medium text-neutral-300 transition-colors hover:text-neutral-100 whitespace-nowrap"
+                className="flex cursor-pointer items-center gap-2 text-xs font-medium text-neutral-300 transition-colors hover:text-neutral-100 whitespace-nowrap"
               >
                 <User className="h-3.5 w-3.5 text-neutral-400" />
                 <span>{user ? user.username : 'Sign In / Account'}</span>
               </button>
               <button
                 type="button"
+                onClick={() => openGameSettings('controls')}
+                className="flex cursor-pointer items-center gap-1.5 border border-white/12 bg-[#171a20] px-2.5 py-1 text-xs font-medium text-neutral-200 transition-colors hover:border-amber-400/70 hover:text-amber-200 whitespace-nowrap"
+              >
+                <Sliders className="h-3.5 w-3.5 text-amber-400" />
+                <span>Settings &amp; Controls</span>
+              </button>
+              <button
+                type="button"
                 onClick={() => openSocialDrawer()}
-                className="flex items-center gap-2 text-xs font-medium text-neutral-300 transition-colors hover:text-neutral-100 whitespace-nowrap"
+                className="flex cursor-pointer items-center gap-2 text-xs font-medium text-neutral-300 transition-colors hover:text-neutral-100 whitespace-nowrap"
               >
                 <Users className="h-3.5 w-3.5 text-neutral-400" />
                 <span>

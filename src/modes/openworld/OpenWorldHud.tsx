@@ -20,6 +20,7 @@ import {
   X,
 } from 'lucide-react';
 import type { BodycamLensPresetId } from '../../../bodycam-sdk';
+import { openGameSettings } from '../../../data/gameSettingsStore';
 import {
   GRAPHICS_QUALITY_ORDER,
   GRAPHICS_QUALITY_PROFILES,
@@ -397,7 +398,7 @@ export const OpenWorldHud: React.FC<OpenWorldHudProps> = ({
                     }`}
                   >
                     <MapIcon className="h-3.5 w-3.5" />
-                    <span>GPS PDA (M)</span>
+                    <span>GPS PDA</span>
                   </button>
 
                   <button
@@ -412,7 +413,7 @@ export const OpenWorldHud: React.FC<OpenWorldHudProps> = ({
                     }`}
                   >
                     <Navigation className="h-3.5 w-3.5" />
-                    <span>{snapshot.navMode === 'recon_flight' ? 'Recon Flight (V)' : 'Foot Bodycam (V)'}</span>
+                    <span>{snapshot.navMode === 'recon_flight' ? 'Recon Flight' : 'Foot Bodycam'}</span>
                   </button>
 
                   <button
@@ -425,7 +426,7 @@ export const OpenWorldHud: React.FC<OpenWorldHudProps> = ({
                     }`}
                   >
                     <Flashlight className="h-3.5 w-3.5" />
-                    <span>Light (L)</span>
+                    <span>Light</span>
                   </button>
                 </div>
               </div>
@@ -679,7 +680,7 @@ export const OpenWorldHud: React.FC<OpenWorldHudProps> = ({
                       <div className="flex flex-wrap items-center gap-1.5">
                         <span className="flex items-center gap-1 text-[11px] font-medium text-neutral-400 mr-0.5">
                           <Eye className="h-3.5 w-3.5" />
-                          <span>[N]</span>
+                          <span>NVG</span>
                         </span>
                         {NVG_OPTIONS.map((n) => (
                           <button
@@ -760,8 +761,17 @@ export const OpenWorldHud: React.FC<OpenWorldHudProps> = ({
                     </div>
 
                     <div className="flex flex-wrap items-center justify-between gap-3 border-t border-white/10 pt-2">
-                      <div className="font-mono-tabular text-[11px] text-neutral-400">
-                        [1/2] Firearms · [3] Combat Knife · [0] Empty Hands · [I] Inspect · [Tab] Rig &amp; Pack · [M] GPS PDA ({combat.pdaBatteryPct}%) · [N] NVG · [F] Interact
+                      <div className="flex items-center gap-2">
+                        <span className="font-mono-tabular text-[11px] text-neutral-400">
+                          TAC-PDA Battery {combat.pdaBatteryPct}%
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => openGameSettings('controls')}
+                          className="cursor-pointer border border-white/14 bg-[#141922] px-2.5 py-1 font-mono-tabular text-[10px] uppercase tracking-wider text-neutral-200 hover:border-amber-400/70 hover:text-amber-200 whitespace-nowrap shrink-0"
+                        >
+                          Settings &amp; Controls
+                        </button>
                       </div>
                       <div className="flex items-center gap-2">
                         <button

@@ -150,10 +150,6 @@ export const HudOverlay: React.FC<HudOverlayProps> = ({
                   CANTED
                 </span>
               )}
-              <span className="text-neutral-500 ml-1">
-                [Space] Jump/Vault · [V] Bash · [X] Kick · [MMB] Pt-Aim
-                {snapshot.hasCantedOptic ? ' · [B] Canted' : ''} · [L] Laser · [T] Light · [5/6] Med · [Alt+T] Mag
-              </span>
             </div>
           )}
         </div>
@@ -171,7 +167,7 @@ export const HudOverlay: React.FC<HudOverlayProps> = ({
               onClick={onOpenTuner}
               className="pointer-events-auto text-[11px] font-mono-tabular text-neutral-400 hover:text-neutral-200 transition-colors cursor-pointer whitespace-nowrap shrink-0"
             >
-              F1 Tuner · Tab Rig · Esc Menu
+              Optics Tuner
             </button>
           )}
         </div>

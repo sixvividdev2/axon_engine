@@ -67,16 +67,6 @@ export const MainMenu: React.FC<MainMenuProps> = ({
               New Expedition (Wake Unarmed)
             </button>
           </div>
-
-          {/* Concise Controls Reference */}
-          <div className="border-t border-neutral-800 pt-4 grid grid-cols-2 gap-x-4 gap-y-1.5 text-xs text-neutral-400">
-            <div><span className="font-mono-tabular text-neutral-200">WASD / Shift</span> · Move / Sprint</div>
-            <div><span className="font-mono-tabular text-neutral-200">Q / E / C</span> · Lean / Crouch</div>
-            <div><span className="font-mono-tabular text-neutral-200">RMB + Shift/Alt</span> · ADS / Hold Breath</div>
-            <div><span className="font-mono-tabular text-neutral-200">R / Alt+T</span> · Reload / Mag Check</div>
-            <div><span className="font-mono-tabular text-neutral-200">5 / 6</span> · Bleed / Med Quick-Use</div>
-            <div><span className="font-mono-tabular text-neutral-200">F / T / Tab</span> · Interact / Light / Rig</div>
-          </div>
         </div>
 
         {/* Right Column: Persistent IndexedDB Save Slots */}

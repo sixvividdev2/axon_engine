@@ -41,6 +41,7 @@ import {
   TacticalEquipmentId,
 } from '../data/tacticalEquipment';
 import { WeatherTimeControls } from './WeatherTimeControls';
+import { openGameSettings } from '../data/gameSettingsStore';
 
 export type HubTabId = TopLevelModeId | 'loadout' | 'operator' | 'multiplayer';
 
@@ -267,8 +268,17 @@ export const MainMenuHub: React.FC<MainMenuHubProps> = ({
             })}
           </nav>
 
-          {/* Right Account / Social Controls */}
+          {/* Right Account, Settings & Social Controls */}
           <div className="flex items-center gap-2 shrink-0">
+            <button
+              type="button"
+              onClick={() => openGameSettings('general')}
+              className="flex cursor-pointer items-center gap-1.5 whitespace-nowrap shrink-0 border border-neutral-800 bg-neutral-950/85 px-3 py-2 font-mono-tabular text-xs text-neutral-300 transition-colors hover:border-amber-400/70 hover:text-neutral-50"
+            >
+              <Settings className="h-3.5 w-3.5 text-amber-400" />
+              <span>Settings</span>
+            </button>
+
             <button
               type="button"
               onClick={() => openSocialDrawer(incomingRequests.length > 0 ? 'requests' : 'friends')}
@@ -894,11 +904,16 @@ export const MainMenuHub: React.FC<MainMenuHubProps> = ({
           )}
         </main>
 
-        {/* Bottom Controls, 4-Mode Graphics Quality & Killfeed Toggle Footer */}
+        {/* Bottom Game Settings, 4-Mode Graphics Quality & Killfeed Toggle Footer */}
         <footer className="flex flex-wrap items-center justify-between gap-3 border-t border-neutral-800/70 pt-3 font-mono-tabular text-[11px] text-neutral-400">
-          <div>
-            WASD Move · Shift Sprint · RMB ADS · MMB Point Aim · R Reload · 4 / H Grenade · M Tac
-            Map · Z Ping · F Interact · F1 Settings
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => openGameSettings('controls')}
+              className="cursor-pointer whitespace-nowrap border border-neutral-800 bg-neutral-900 px-2.5 py-1 text-[10px] uppercase tracking-wider text-neutral-300 transition-colors hover:border-amber-400/70 hover:text-amber-300"
+            >
+              Game Settings · Controls
+            </button>
           </div>
           <div className="flex flex-wrap items-center gap-3">
             <div className="flex items-center gap-1">

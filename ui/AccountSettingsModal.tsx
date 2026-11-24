@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { AlertTriangle, Check, LogOut, RotateCcw, Shield, UserCheck, X } from 'lucide-react';
+import { AlertTriangle, Check, Keyboard, LogOut, RotateCcw, Shield, UserCheck, X } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
 import {
   formatRankLabel,
@@ -11,6 +11,7 @@ import {
   xpRequiredForNextRank,
 } from '../data/progression';
 import { ApiError } from '../services/authApi';
+import { ControlsSettingsTab } from './ControlsSettingsTab';
 
 const RESET_COUNTDOWN_SEC = 5;
 
@@ -36,6 +37,7 @@ export const AccountSettingsModal: React.FC = () => {
   const [resetting, setResetting] = useState(false);
   const [resetError, setResetError] = useState<string | null>(null);
   const [resetNotice, setResetNotice] = useState<string | null>(null);
+  const [activeTab, setActiveTab] = useState<'account' | 'controls'>('account');
 
   useEffect(() => {
     if (accountSettingsOpen && user) {
@@ -43,6 +45,7 @@ export const AccountSettingsModal: React.FC = () => {
       setUsernameError(null);
       setUsernameSuccess(null);
       setResetNotice(null);
+      setActiveTab('account');
     }
   }, [accountSettingsOpen, user]);
 
@@ -171,8 +174,48 @@ export const AccountSettingsModal: React.FC = () => {
           </div>
         </div>
 
+        {/* Tabs */}
+        <div
+          className="flex items-center gap-1.5 border-b border-neutral-800 bg-[#0d1015] px-6 py-2.5"
+          role="tablist"
+          aria-label="Account Settings Tabs"
+        >
+          <button
+            type="button"
+            role="tab"
+            aria-selected={activeTab === 'account'}
+            onClick={() => setActiveTab('account')}
+            className={`flex cursor-pointer items-center gap-2 whitespace-nowrap shrink-0 border px-3.5 py-1.5 font-mono-tabular text-xs font-semibold uppercase tracking-wider transition-colors ${
+              activeTab === 'account'
+                ? 'border-amber-400 bg-amber-500/15 text-amber-300'
+                : 'border-neutral-800 bg-neutral-900 text-neutral-400 hover:border-neutral-600 hover:text-neutral-100'
+            }`}
+          >
+            <Shield className="h-3.5 w-3.5" />
+            <span>Account &amp; Career</span>
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={activeTab === 'controls'}
+            onClick={() => setActiveTab('controls')}
+            className={`flex cursor-pointer items-center gap-2 whitespace-nowrap shrink-0 border px-3.5 py-1.5 font-mono-tabular text-xs font-semibold uppercase tracking-wider transition-colors ${
+              activeTab === 'controls'
+                ? 'border-amber-400 bg-amber-500/15 text-amber-300'
+                : 'border-neutral-800 bg-neutral-900 text-neutral-400 hover:border-neutral-600 hover:text-neutral-100'
+            }`}
+          >
+            <Keyboard className="h-3.5 w-3.5" />
+            <span>Controls</span>
+          </button>
+        </div>
+
         {/* Scrollable Content */}
         <div className="flex flex-col gap-6 overflow-y-auto px-6 py-5">
+          {activeTab === 'controls' ? (
+            <ControlsSettingsTab />
+          ) : (
+            <>
           {resetNotice && (
             <div className="border border-amber-500/60 bg-amber-500/10 px-4 py-2.5 text-xs text-amber-200">
               {resetNotice}
@@ -319,6 +362,8 @@ export const AccountSettingsModal: React.FC = () => {
               </button>
             </div>
           </section>
+            </>
+          )}
         </div>
 
         {/* 5-Second Countdown Confirmation Gate */}

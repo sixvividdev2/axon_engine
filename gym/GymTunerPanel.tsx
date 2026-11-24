@@ -18,6 +18,7 @@ import {
 } from '../data/tacticalEquipment';
 import { GymSnapshot } from './GymEngine';
 import { GYM_ZONE_PRESETS, GymZoneId } from './GymWorld';
+import { ControlsSettingsTab } from '../ui/ControlsSettingsTab';
 
 interface GymTunerPanelProps {
   snapshot: GymSnapshot;
@@ -41,7 +42,7 @@ interface GymTunerPanelProps {
   onReturnToMenu: () => void;
 }
 
-type TunerTab = 'optics' | 'controller' | 'weapon_audio' | 'tactical';
+type TunerTab = 'optics' | 'controller' | 'weapon_audio' | 'tactical' | 'controls';
 
 interface SliderRowProps {
   label: string;
@@ -256,13 +257,14 @@ export const GymTunerPanel: React.FC<GymTunerPanelProps> = ({
       </div>
 
       {/* Tab Selector */}
-      <div className="grid grid-cols-4 border-b border-neutral-800 font-mono-tabular text-[10px] uppercase">
+      <div className="grid grid-cols-5 border-b border-neutral-800 font-mono-tabular text-[10px] uppercase">
         {(
           [
             ['optics', 'Optics'],
             ['controller', 'Rig'],
             ['weapon_audio', 'Weapon'],
-            ['tactical', 'Tactical Belt'],
+            ['tactical', 'Belt'],
+            ['controls', 'Controls'],
           ] as [TunerTab, string][]
         ).map(([id, label]) => (
           <button
@@ -875,6 +877,8 @@ export const GymTunerPanel: React.FC<GymTunerPanelProps> = ({
             </div>
           );
         })()}
+
+        {tab === 'controls' && <ControlsSettingsTab compact />}
       </div>
 
       {/* Footer Export & Mode Actions */}
