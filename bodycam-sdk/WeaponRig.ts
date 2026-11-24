@@ -8,6 +8,7 @@ import {
 } from '../data/attachments';
 import { IR_LAYER, VIEWMODEL_LAYER } from './BodycamPostProcess';
 import { IBodycamAudioSource } from './IBodycamAudioSource';
+import { clampSpringState, stepAnalyticalDampedSpring } from './math/SpringMath';
 import {
   BodycamRaycastResult,
   BodycamSDKConfig,
@@ -1362,11 +1363,7 @@ export class WeaponRig {
     dt: number,
     dampingRatio = 1.0,
   ): [number, number] {
-    const k = omega * omega;
-    const d = 2.0 * dampingRatio * omega;
-    const a = -k * val - d * vel;
-    const nv = vel + a * dt;
-    return [val + nv * dt, nv];
+    return stepAnalyticalDampedSpring(val, vel, 0, omega, dampingRatio, dt);
   }
 
   public updateRig(
@@ -1459,11 +1456,18 @@ export class WeaponRig {
     const driftDampPitch = THREE.MathUtils.lerp(0.86, 0.96, braceFactor);
 
     [this.recoilZ, this.recoilZVel] = this.stepSpringScalar(this.recoilZ, this.recoilZVel, recOmegaZ, dt);
+    [this.recoilZ, this.recoilZVel] = clampSpringState(this.recoilZ, this.recoilZVel, -0.02, 0.14);
     [this.recoilPitch, this.recoilPitchVel] = this.stepSpringScalar(
       this.recoilPitch,
       this.recoilPitchVel,
       recOmegaPitch,
       dt,
+    );
+    [this.recoilPitch, this.recoilPitchVel] = clampSpringState(
+      this.recoilPitch,
+      this.recoilPitchVel,
+      -0.18,
+      0.34,
     );
     [this.recoilYaw, this.recoilYawVel] = this.stepSpringScalar(
       this.recoilYaw,
@@ -1472,18 +1476,23 @@ export class WeaponRig {
       dt,
       horizDampYaw,
     );
-    if (this.recoilYaw > 0.065) {
-      this.recoilYaw = 0.065;
-      if (this.recoilYawVel > 0) this.recoilYawVel = 0;
-    } else if (this.recoilYaw < -0.065) {
-      this.recoilYaw = -0.065;
-      if (this.recoilYawVel < 0) this.recoilYawVel = 0;
-    }
+    [this.recoilYaw, this.recoilYawVel] = clampSpringState(
+      this.recoilYaw,
+      this.recoilYawVel,
+      -0.065,
+      0.065,
+    );
     [this.recoilRoll, this.recoilRollVel] = this.stepSpringScalar(
       this.recoilRoll,
       this.recoilRollVel,
       recOmegaRoll,
       dt,
+    );
+    [this.recoilRoll, this.recoilRollVel] = clampSpringState(
+      this.recoilRoll,
+      this.recoilRollVel,
+      -0.24,
+      0.24,
     );
 
     [this.muzzleDriftYaw, this.muzzleDriftYawVel] = this.stepSpringScalar(
@@ -1592,12 +1601,12 @@ export class WeaponRig {
     [this.motionPosY, this.motionPosVelY] = this.stepSpringScalar(this.motionPosY, this.motionPosVelY, posOmega * 1.06, dt, posZeta);
     [this.motionPosZ, this.motionPosVelZ] = this.stepSpringScalar(this.motionPosZ, this.motionPosVelZ, posOmega * 1.12, dt, posZeta);
 
-    this.lagYaw = THREE.MathUtils.clamp(this.lagYaw, -0.11, 0.11);
-    this.lagPitch = THREE.MathUtils.clamp(this.lagPitch, -0.10, 0.10);
-    this.lagRoll = THREE.MathUtils.clamp(this.lagRoll, -0.14, 0.14);
-    this.motionPosX = THREE.MathUtils.clamp(this.motionPosX, -0.026, 0.026);
-    this.motionPosY = THREE.MathUtils.clamp(this.motionPosY, -0.032, 0.024);
-    this.motionPosZ = THREE.MathUtils.clamp(this.motionPosZ, -0.026, 0.028);
+    [this.lagYaw, this.lagYawVel] = clampSpringState(this.lagYaw, this.lagYawVel, -0.11, 0.11);
+    [this.lagPitch, this.lagPitchVel] = clampSpringState(this.lagPitch, this.lagPitchVel, -0.10, 0.10);
+    [this.lagRoll, this.lagRollVel] = clampSpringState(this.lagRoll, this.lagRollVel, -0.14, 0.14);
+    [this.motionPosX, this.motionPosVelX] = clampSpringState(this.motionPosX, this.motionPosVelX, -0.026, 0.026);
+    [this.motionPosY, this.motionPosVelY] = clampSpringState(this.motionPosY, this.motionPosVelY, -0.032, 0.024);
+    [this.motionPosZ, this.motionPosVelZ] = clampSpringState(this.motionPosZ, this.motionPosVelZ, -0.026, 0.028);
 
     // 3. Muzzle flash decay
     if (this.flashTimer > 0) {

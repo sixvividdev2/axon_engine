@@ -609,7 +609,9 @@ export class WeatherTimeSystem {
     for (let i = 0; i < this.nightLights.length; i++) {
       const nl = this.nightLights[i];
       if (nl.light && nl.baseLightIntensity !== undefined) {
-        nl.light.intensity = nl.baseLightIntensity * lampAlpha;
+        const nextIntensity = nl.baseLightIntensity * lampAlpha;
+        nl.light.intensity = nextIntensity;
+        nl.light.visible = nextIntensity > 0.01;
       }
       if (nl.emissiveMat && nl.baseEmissiveIntensity !== undefined) {
         nl.emissiveMat.emissiveIntensity = THREE.MathUtils.lerp(0.08, nl.baseEmissiveIntensity, lampAlpha);

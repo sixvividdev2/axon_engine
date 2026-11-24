@@ -7,6 +7,11 @@ import {
 } from '../../maps/MapRegistry';
 import { BattleModeController, ModeActorSample } from '../BattleModeController';
 import { applyMatchProgression, type CareerProgressionState } from '../../data/progression';
+import {
+  clampSpringState,
+  createRaycastResult,
+  stepAnalyticalDampedSpring,
+} from '../../bodycam-sdk';
 
 beforeAll(() => {
   if (typeof globalThis.document === 'undefined') {
@@ -650,3 +655,144 @@ describe('Kill Confirmed TDM & Kill Confirmed FFA + Post-Match Progression XP & 
     map.dispose();
   });
 });
+
+describe('Conquest performance and shooting spring stability', () => {
+  it('keeps camera shake and weapon recoil springs bounded and convergent under severe lag dt', () => {
+    const dtSamples = [1 / 60, 0.05, 0.08, 0.15];
+    const springProfiles = [
+      { label: 'camShakePos', omega: 32, zeta: 0.72, impulseVel: 0.45, limit: 0.015 },
+      { label: 'camShakePitch', omega: 28, zeta: 0.72, impulseVel: 0.9, limit: 0.06 },
+      { label: 'weaponRecoilZ', omega: 28, zeta: 1.0, impulseVel: 1.4, limit: 0.085 },
+      { label: 'weaponRecoilPitch', omega: 24, zeta: 1.0, impulseVel: 2.8, limit: 0.35 },
+    ];
+
+    for (const profile of springProfiles) {
+      for (const dt of dtSamples) {
+        let value = 0;
+        let velocity = profile.impulseVel;
+        let maxAbsVal = 0;
+        let maxAbsVel = Math.abs(velocity);
+
+        for (let step = 0; step < 60; step++) {
+          const [nextVal, nextVel] = stepAnalyticalDampedSpring(
+            value,
+            velocity,
+            0,
+            profile.omega,
+            profile.zeta,
+            dt,
+          );
+          const [clampedVal, clampedVel] = clampSpringState(
+            nextVal,
+            nextVel,
+            -profile.limit,
+            profile.limit,
+          );
+          value = clampedVal;
+          velocity = clampedVel;
+
+          expect(Number.isFinite(value)).toBe(true);
+          expect(Number.isFinite(velocity)).toBe(true);
+          expect(Math.abs(value)).toBeLessThanOrEqual(profile.limit + 1e-9);
+
+          maxAbsVal = Math.max(maxAbsVal, Math.abs(value));
+          maxAbsVel = Math.max(maxAbsVel, Math.abs(velocity));
+        }
+
+        // Must never amplify velocity into an unstable explosion and must settle near 0
+        expect(maxAbsVel).toBeLessThan(profile.impulseVel * 2.0 + 1e-6);
+        expect(maxAbsVal).toBeGreaterThan(0);
+        expect(Math.abs(value)).toBeLessThan(1e-3);
+        expect(Math.abs(velocity)).toBeLessThan(1e-2);
+      }
+    }
+
+    // Clamping at hard bounds must zero outward velocity while preserving inward return velocity
+    const [pinnedVal, pinnedVel] = clampSpringState(0.09, 2.5, -0.06, 0.06);
+    expect(pinnedVal).toBe(0.06);
+    expect(pinnedVel).toBe(0);
+
+    const [returningVal, returningVel] = clampSpringState(0.09, -1.2, -0.06, 0.06);
+    expect(returningVal).toBe(0.06);
+    expect(returningVel).toBe(-1.2);
+  });
+
+  it('accelerates Volga Corridor raycasts and occlusion without losing terrain/cover accuracy or visuals', () => {
+    const map = buildMapById('volga_corridor');
+
+    // Terrain and instanced cover should remain visible in the scene while tagged for analytical raycasts
+    const coveredMeshes = map.raycastMeshes.filter((m) => m.userData?.analyticalRaycastCovered === true);
+    expect(coveredMeshes.length).toBeGreaterThanOrEqual(3);
+    for (const m of coveredMeshes) {
+      expect(m.visible).toBe(true);
+    }
+
+    // Downward raycast should hit analytical heightfield terrain with upward normal and grass surface
+    const hit = createRaycastResult();
+    const sampleX = 12;
+    const sampleZ = -8;
+    const expectedY = map.physics.getGroundHeight(sampleX, sampleZ, 12);
+    const didHit = map.physics.raycast(
+      new THREE.Vector3(sampleX, expectedY + 12, sampleZ),
+      new THREE.Vector3(0, -1, 0),
+      0.01,
+      30,
+      hit,
+    );
+    expect(didHit).toBe(true);
+    expect(hit.surface).toBe('grass');
+    expect(hit.normalY).toBeGreaterThan(0.5);
+    expect(Math.abs(hit.pointY - expectedY)).toBeLessThan(0.12);
+
+    // Line-of-sight occlusion through solid terrain vs open sky
+    const openSky = map.physics.isSegmentOccluded(
+      new THREE.Vector3(0, 28, 0),
+      new THREE.Vector3(40, 28, 0),
+    );
+    expect(openSky).toBe(false);
+
+    const throughTerrain = map.physics.isSegmentOccluded(
+      new THREE.Vector3(sampleX, expectedY + 4, sampleZ),
+      new THREE.Vector3(sampleX, expectedY - 4, sampleZ),
+    );
+    expect(throughTerrain).toBe(true);
+
+    // Daytime-off night floodlights should start with visible=false to avoid dead PBR shader cost
+    const nightLights = map.envBindings?.nightLights ?? [];
+    expect(nightLights.length).toBeGreaterThan(0);
+    for (const nl of nightLights) {
+      if (nl.light.intensity <= 0.01) {
+        expect(nl.light.visible).toBe(false);
+      }
+    }
+
+    map.dispose();
+  });
+
+  it('accelerates Timberline Compound raycasts while respecting the underground bunker cutout', () => {
+    const map = buildMapById('timberline_compound');
+
+    const hit = createRaycastResult();
+    const outerY = map.physics.getGroundHeight(35, 35, 10);
+    const outerHit = map.physics.raycast(
+      new THREE.Vector3(35, outerY + 10, 35),
+      new THREE.Vector3(0, -1, 0),
+      0.01,
+      25,
+      hit,
+    );
+    expect(outerHit).toBe(true);
+    expect(Math.abs(hit.pointY - outerY)).toBeLessThan(0.15);
+
+    // Inside the underground bunker chamber (footprint x in [42.6, 62.4], z in [-16.4, 4.4], floor at Y = -3.6),
+    // an open horizontal ray at eye height must not falsely collide with surface terrain.
+    const bunkerClear = map.physics.isSegmentOccluded(
+      new THREE.Vector3(53.5, -2.0, -8.0),
+      new THREE.Vector3(56.5, -2.0, -4.0),
+    );
+    expect(bunkerClear).toBe(false);
+
+    map.dispose();
+  });
+});
+

@@ -2542,16 +2542,7 @@ export class BattleBotAI {
     if (isLineBlockedBySmoke && isLineBlockedBySmoke(from, to)) {
       return false;
     }
-    this._tmpDir.subVectors(to, from);
-    const dist = this._tmpDir.length();
-    if (dist < 0.2) return true;
-    this._tmpDir.divideScalar(dist);
-
-    this._raycaster.set(from, this._tmpDir);
-    this._raycaster.near = 0.15;
-    this._raycaster.far = dist - 0.25;
-    const hits = this._raycaster.intersectObjects(this.map.raycastMeshes, false);
-    return hits.length === 0;
+    return !this.map.physics.isSegmentOccluded(from, to, 0.15, 0.25);
   }
 
   private spawnTracer(start: Readonly<THREE.Vector3>, end: Readonly<THREE.Vector3>): void {

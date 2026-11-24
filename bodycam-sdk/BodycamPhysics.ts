@@ -17,6 +17,10 @@ export interface PhysicsBoxCollider {
   maxZ: number;
   surface?: BodycamSurfaceMaterial;
   blocksMovement?: boolean;
+  /** When true, this box participates in fast spatial-grid analytical raycasting */
+  blocksRaycast?: boolean;
+  /** Optional visual mesh reference returned in BodycamRaycastResult.object for decals/material tags */
+  meshRef?: THREE.Object3D | null;
 }
 
 /**
@@ -199,7 +203,24 @@ export class BodycamPhysicsWorld {
   private readonly _rayHits: THREE.Intersection[] = [];
   private readonly _rayNormal = new THREE.Vector3();
   private readonly _rayNormalMat = new THREE.Matrix3();
+  private readonly _occDir = new THREE.Vector3();
   private raycastMeshes: THREE.Object3D[] = [];
+
+  // 2D XZ uniform spatial grid for ultra-fast analytical ray-AABB queries (zero per-ray allocations)
+  private static readonly GRID_CELL_SIZE = 8.0;
+  private rayBoxGridDirty = true;
+  private rayBoxGridMinX = 0;
+  private rayBoxGridMinZ = 0;
+  private rayBoxGridCols = 0;
+  private rayBoxGridRows = 0;
+  private rayBoxGridCells: Int32Array[] = [];
+  private rayBoxIndices: number[] = [];
+  private rayBoxVisitStamps: Int32Array = new Int32Array(0);
+  private rayStampCounter = 1;
+
+  private terrainRaycastEnabled = false;
+  private terrainRaycastSurface: BodycamSurfaceMaterial = 'grass';
+  private terrainRaycastMesh: THREE.Object3D | null = null;
 
   public setRaycastMeshes(meshes: THREE.Object3D[]): void {
     this.raycastMeshes = meshes;
@@ -215,12 +236,17 @@ export class BodycamPhysicsWorld {
 
   public addBox(box: PhysicsBoxCollider): void {
     this.boxes.push(box);
+    if (box.blocksRaycast) {
+      this.rayBoxGridDirty = true;
+    }
   }
 
   public disableBoxById(id: string): void {
     for (let i = 0; i < this.boxes.length; i++) {
       if (this.boxes[i].id === id) {
         this.boxes[i].blocksMovement = false;
+        this.boxes[i].blocksRaycast = false;
+        this.rayBoxGridDirty = true;
       }
     }
   }
@@ -248,12 +274,27 @@ export class BodycamPhysicsWorld {
     this.surfaceZones.length = 0;
     this.interiorZones.length = 0;
     this.raycastMeshes = [];
+    this.rayBoxGridDirty = true;
+    this.rayBoxGridCells = [];
+    this.rayBoxIndices = [];
+    this.terrainRaycastEnabled = false;
+    this.terrainRaycastMesh = null;
   }
 
   private terrainHeightSampler: ((x: number, z: number) => number) | null = null;
 
-  public setTerrainHeightSampler(fn: ((x: number, z: number) => number) | null): void {
+  public setTerrainHeightSampler(
+    fn: ((x: number, z: number) => number) | null,
+    options?: {
+      enableRaycast?: boolean;
+      surface?: BodycamSurfaceMaterial;
+      terrainMesh?: THREE.Object3D | null;
+    },
+  ): void {
     this.terrainHeightSampler = fn;
+    this.terrainRaycastEnabled = Boolean(fn && options?.enableRaycast);
+    this.terrainRaycastSurface = options?.surface ?? 'grass';
+    this.terrainRaycastMesh = options?.terrainMesh ?? null;
   }
 
   /**
@@ -746,6 +787,472 @@ export class BodycamPhysicsWorld {
     return true;
   }
 
+  private rebuildRayBoxGrid(): void {
+    this.rayBoxGridDirty = false;
+    this.rayBoxIndices.length = 0;
+
+    let minX = Infinity;
+    let maxX = -Infinity;
+    let minZ = Infinity;
+    let maxZ = -Infinity;
+
+    for (let i = 0; i < this.boxes.length; i++) {
+      const b = this.boxes[i];
+      if (!b.blocksRaycast || b.blocksMovement === false) continue;
+      this.rayBoxIndices.push(i);
+      if (b.minX < minX) minX = b.minX;
+      if (b.maxX > maxX) maxX = b.maxX;
+      if (b.minZ < minZ) minZ = b.minZ;
+      if (b.maxZ > maxZ) maxZ = b.maxZ;
+    }
+
+    if (this.rayBoxIndices.length === 0) {
+      this.rayBoxGridCols = 0;
+      this.rayBoxGridRows = 0;
+      this.rayBoxGridCells = [];
+      return;
+    }
+
+    const cellSize = BodycamPhysicsWorld.GRID_CELL_SIZE;
+    this.rayBoxGridMinX = Math.floor(minX / cellSize) * cellSize;
+    this.rayBoxGridMinZ = Math.floor(minZ / cellSize) * cellSize;
+    this.rayBoxGridCols = Math.max(1, Math.ceil((maxX - this.rayBoxGridMinX) / cellSize) + 1);
+    this.rayBoxGridRows = Math.max(1, Math.ceil((maxZ - this.rayBoxGridMinZ) / cellSize) + 1);
+
+    const totalCells = this.rayBoxGridCols * this.rayBoxGridRows;
+    const buckets: number[][] = new Array(totalCells);
+    for (let c = 0; c < totalCells; c++) buckets[c] = [];
+
+    for (let k = 0; k < this.rayBoxIndices.length; k++) {
+      const boxIdx = this.rayBoxIndices[k];
+      const b = this.boxes[boxIdx];
+      const cx0 = Math.max(0, Math.min(this.rayBoxGridCols - 1, Math.floor((b.minX - this.rayBoxGridMinX) / cellSize)));
+      const cx1 = Math.max(0, Math.min(this.rayBoxGridCols - 1, Math.floor((b.maxX - this.rayBoxGridMinX) / cellSize)));
+      const cz0 = Math.max(0, Math.min(this.rayBoxGridRows - 1, Math.floor((b.minZ - this.rayBoxGridMinZ) / cellSize)));
+      const cz1 = Math.max(0, Math.min(this.rayBoxGridRows - 1, Math.floor((b.maxZ - this.rayBoxGridMinZ) / cellSize)));
+      for (let cz = cz0; cz <= cz1; cz++) {
+        const rowOff = cz * this.rayBoxGridCols;
+        for (let cx = cx0; cx <= cx1; cx++) {
+          buckets[rowOff + cx].push(boxIdx);
+        }
+      }
+    }
+
+    this.rayBoxGridCells = new Array(totalCells);
+    for (let c = 0; c < totalCells; c++) {
+      this.rayBoxGridCells[c] = Int32Array.from(buckets[c]);
+    }
+    if (this.rayBoxVisitStamps.length < this.boxes.length) {
+      this.rayBoxVisitStamps = new Int32Array(this.boxes.length + 64);
+    }
+  }
+
+  private raycastAnalyticalBoxes(
+    ox: number,
+    oy: number,
+    oz: number,
+    dx: number,
+    dy: number,
+    dz: number,
+    near: number,
+    far: number,
+    earlyExit: boolean,
+    out: BodycamRaycastResult | null,
+  ): number {
+    if (this.rayBoxGridDirty) {
+      this.rebuildRayBoxGrid();
+    }
+    if (this.rayBoxGridCols === 0 || this.rayBoxIndices.length === 0) {
+      return Infinity;
+    }
+
+    const cellSize = BodycamPhysicsWorld.GRID_CELL_SIZE;
+    const invCell = 1.0 / cellSize;
+    const gridMinX = this.rayBoxGridMinX;
+    const gridMinZ = this.rayBoxGridMinZ;
+    const cols = this.rayBoxGridCols;
+    const rows = this.rayBoxGridRows;
+    const gridMaxX = gridMinX + cols * cellSize;
+    const gridMaxZ = gridMinZ + rows * cellSize;
+
+    const invDx = Math.abs(dx) > 1e-8 ? 1.0 / dx : Infinity;
+    const invDy = Math.abs(dy) > 1e-8 ? 1.0 / dy : Infinity;
+    const invDz = Math.abs(dz) > 1e-8 ? 1.0 / dz : Infinity;
+
+    // Clip ray segment [near, far] against 2D XZ grid bounds
+    let tEnter = near;
+    let tExit = far;
+    if (Number.isFinite(invDx)) {
+      const tx1 = (gridMinX - ox) * invDx;
+      const tx2 = (gridMaxX - ox) * invDx;
+      tEnter = Math.max(tEnter, Math.min(tx1, tx2));
+      tExit = Math.min(tExit, Math.max(tx1, tx2));
+    } else if (ox < gridMinX || ox > gridMaxX) {
+      return Infinity;
+    }
+    if (Number.isFinite(invDz)) {
+      const tz1 = (gridMinZ - oz) * invDz;
+      const tz2 = (gridMaxZ - oz) * invDz;
+      tEnter = Math.max(tEnter, Math.min(tz1, tz2));
+      tExit = Math.min(tExit, Math.max(tz1, tz2));
+    } else if (oz < gridMinZ || oz > gridMaxZ) {
+      return Infinity;
+    }
+    if (tExit < tEnter) {
+      return Infinity;
+    }
+
+    let stamp = ++this.rayStampCounter;
+    if (stamp >= 0x3fffffff) {
+      this.rayBoxVisitStamps.fill(0);
+      this.rayStampCounter = 1;
+      stamp = 1;
+    }
+
+    const startX = ox + dx * tEnter;
+    const startZ = oz + dz * tEnter;
+    let cx = Math.max(0, Math.min(cols - 1, Math.floor((startX - gridMinX) * invCell)));
+    let cz = Math.max(0, Math.min(rows - 1, Math.floor((startZ - gridMinZ) * invCell)));
+
+    const stepX = dx > 1e-8 ? 1 : dx < -1e-8 ? -1 : 0;
+    const stepZ = dz > 1e-8 ? 1 : dz < -1e-8 ? -1 : 0;
+
+    let tMaxX = Infinity;
+    let tDeltaX = Infinity;
+    if (stepX !== 0) {
+      const nextBoundaryX = gridMinX + (cx + (stepX > 0 ? 1 : 0)) * cellSize;
+      tMaxX = tEnter + (nextBoundaryX - startX) * invDx;
+      tDeltaX = Math.abs(cellSize * invDx);
+    }
+
+    let tMaxZ = Infinity;
+    let tDeltaZ = Infinity;
+    if (stepZ !== 0) {
+      const nextBoundaryZ = gridMinZ + (cz + (stepZ > 0 ? 1 : 0)) * cellSize;
+      tMaxZ = tEnter + (nextBoundaryZ - startZ) * invDz;
+      tDeltaZ = Math.abs(cellSize * invDz);
+    }
+
+    let bestT = far;
+    let hitFound = false;
+    let hitBoxIdx = -1;
+    let hitNx = 0;
+    let hitNy = 1;
+    let hitNz = 0;
+
+    const stamps = this.rayBoxVisitStamps;
+    const boxes = this.boxes;
+    const maxSteps = cols + rows + 4;
+
+    for (let iter = 0; iter < maxSteps; iter++) {
+      const cell = this.rayBoxGridCells[cz * cols + cx];
+      for (let i = 0; i < cell.length; i++) {
+        const idx = cell[i];
+        if (stamps[idx] === stamp) continue;
+        stamps[idx] = stamp;
+
+        const b = boxes[idx];
+        if (b.blocksMovement === false || !b.blocksRaycast) continue;
+
+        // Branch-minimized slab intersection with exact hit face normal
+        let tmin = near;
+        let tmax = bestT;
+        let nx = 0;
+        let ny = 0;
+        let nz = 0;
+
+        if (Number.isFinite(invDx)) {
+          const t1 = (b.minX - ox) * invDx;
+          const t2 = (b.maxX - ox) * invDx;
+          const tLo = t1 < t2 ? t1 : t2;
+          const tHi = t1 < t2 ? t2 : t1;
+          if (tLo > tmin) {
+            tmin = tLo;
+            nx = t1 < t2 ? -1 : 1;
+            ny = 0;
+            nz = 0;
+          }
+          if (tHi < tmax) tmax = tHi;
+          if (tmin > tmax) continue;
+        } else if (ox < b.minX || ox > b.maxX) {
+          continue;
+        }
+
+        if (Number.isFinite(invDy)) {
+          const t1 = (b.minY - oy) * invDy;
+          const t2 = (b.maxY - oy) * invDy;
+          const tLo = t1 < t2 ? t1 : t2;
+          const tHi = t1 < t2 ? t2 : t1;
+          if (tLo > tmin) {
+            tmin = tLo;
+            nx = 0;
+            ny = t1 < t2 ? -1 : 1;
+            nz = 0;
+          }
+          if (tHi < tmax) tmax = tHi;
+          if (tmin > tmax) continue;
+        } else if (oy < b.minY || oy > b.maxY) {
+          continue;
+        }
+
+        if (Number.isFinite(invDz)) {
+          const t1 = (b.minZ - oz) * invDz;
+          const t2 = (b.maxZ - oz) * invDz;
+          const tLo = t1 < t2 ? t1 : t2;
+          const tHi = t1 < t2 ? t2 : t1;
+          if (tLo > tmin) {
+            tmin = tLo;
+            nx = 0;
+            ny = 0;
+            nz = t1 < t2 ? -1 : 1;
+          }
+          if (tHi < tmax) tmax = tHi;
+          if (tmin > tmax) continue;
+        } else if (oz < b.minZ || oz > b.maxZ) {
+          continue;
+        }
+
+        if (tmin >= near && tmin <= bestT) {
+          if (earlyExit) {
+            return tmin;
+          }
+          bestT = tmin;
+          hitFound = true;
+          hitBoxIdx = idx;
+          if (nx === 0 && ny === 0 && nz === 0) {
+            // Origin started inside the box; point normal opposite ray direction
+            hitNx = -dx;
+            hitNy = -dy;
+            hitNz = -dz;
+          } else {
+            hitNx = nx;
+            hitNy = ny;
+            hitNz = nz;
+          }
+        }
+      }
+
+      const nextCellT = tMaxX < tMaxZ ? tMaxX : tMaxZ;
+      if (nextCellT > bestT || nextCellT > tExit) {
+        break;
+      }
+      if (tMaxX < tMaxZ) {
+        tMaxX += tDeltaX;
+        cx += stepX;
+        if (cx < 0 || cx >= cols) break;
+      } else {
+        tMaxZ += tDeltaZ;
+        cz += stepZ;
+        if (cz < 0 || cz >= rows) break;
+      }
+    }
+
+    if (hitFound && out && hitBoxIdx >= 0) {
+      const b = boxes[hitBoxIdx];
+      out.hit = true;
+      out.distance = bestT;
+      out.pointX = ox + dx * bestT;
+      out.pointY = oy + dy * bestT;
+      out.pointZ = oz + dz * bestT;
+      out.normalX = hitNx;
+      out.normalY = hitNy;
+      out.normalZ = hitNz;
+      out.surface = b.surface ?? 'concrete';
+      out.object = b.meshRef ?? null;
+      return bestT;
+    }
+
+    return hitFound ? bestT : Infinity;
+  }
+
+  private raycastAnalyticalTerrain(
+    ox: number,
+    oy: number,
+    oz: number,
+    dx: number,
+    dy: number,
+    dz: number,
+    near: number,
+    far: number,
+    earlyExit: boolean,
+    out: BodycamRaycastResult | null,
+  ): number {
+    if (!this.terrainRaycastEnabled || !this.terrainHeightSampler) {
+      return Infinity;
+    }
+    const sampler = this.terrainHeightSampler;
+    const span = far - near;
+    if (span <= 1e-4) return Infinity;
+
+    // Choose adaptive marching step proportional to ray length
+    const step = span <= 4.0 ? 0.35 : span <= 24.0 ? 0.9 : 1.6;
+    let prevT = near;
+    let prevX = ox + dx * prevT;
+    let prevY = oy + dy * prevT;
+    let prevZ = oz + dz * prevT;
+    let prevH = sampler(prevX, prevZ);
+
+    // Handle ray originating right at or below terrain heading downward
+    if (prevY <= prevH && dy < 0) {
+      if (earlyExit) return prevT;
+      if (out) {
+        this.writeTerrainHit(prevT, prevX, prevH, prevZ, sampler, out);
+      }
+      return prevT;
+    }
+
+    let t = prevT + step;
+    while (true) {
+      const curT = t < far ? t : far;
+      const cx = ox + dx * curT;
+      const cy = oy + dy * curT;
+      const cz = oz + dz * curT;
+      const ch = sampler(cx, cz);
+
+      // Ignore subterranean cutout discontinuities (e.g., Timberline underground bunker opening)
+      const isCutoutJump = Math.abs(ch - prevH) > 4.5 && (prevH < -4.5 || ch < -4.5);
+      if (!isCutoutJump && cy <= ch) {
+        if (earlyExit) {
+          return (prevT + curT) * 0.5;
+        }
+        // Binary search refinement (6 iterations -> <2.5cm precision)
+        let lo = prevT;
+        let hi = curT;
+        for (let iter = 0; iter < 6; iter++) {
+          const mid = (lo + hi) * 0.5;
+          const mx = ox + dx * mid;
+          const my = oy + dy * mid;
+          const mz = oz + dz * mid;
+          if (my <= sampler(mx, mz)) {
+            hi = mid;
+          } else {
+            lo = mid;
+          }
+        }
+        const hitX = ox + dx * hi;
+        const hitZ = oz + dz * hi;
+        const hitY = sampler(hitX, hitZ);
+        if (out) {
+          this.writeTerrainHit(hi, hitX, hitY, hitZ, sampler, out);
+        }
+        return hi;
+      }
+
+      if (curT >= far) break;
+      prevT = curT;
+      prevX = cx;
+      prevY = cy;
+      prevZ = cz;
+      prevH = ch;
+      t += step;
+    }
+
+    return Infinity;
+  }
+
+  private writeTerrainHit(
+    dist: number,
+    hx: number,
+    hy: number,
+    hz: number,
+    sampler: (x: number, z: number) => number,
+    out: BodycamRaycastResult,
+  ): void {
+    const eps = 0.25;
+    const hx1 = sampler(hx + eps, hz);
+    const hx0 = sampler(hx - eps, hz);
+    const hz1 = sampler(hx, hz + eps);
+    const hz0 = sampler(hx, hz - eps);
+    const nx = -(hx1 - hx0) / (2 * eps);
+    const nz = -(hz1 - hz0) / (2 * eps);
+    const invLen = 1.0 / Math.hypot(nx, 1.0, nz);
+
+    out.hit = true;
+    out.distance = dist;
+    out.pointX = hx;
+    out.pointY = hy;
+    out.pointZ = hz;
+    out.normalX = nx * invLen;
+    out.normalY = invLen;
+    out.normalZ = nz * invLen;
+    out.surface = this.terrainRaycastSurface;
+    out.object = this.terrainRaycastMesh;
+  }
+
+  /**
+   * Fast early-exit occlusion query for AI line-of-sight and safe-spawn checks.
+   * Tests analytical spatial-grid boxes & terrain heightfield first, then only
+   * non-analytically-covered custom meshes with immediate return on first hit.
+   */
+  public isSegmentOccluded(
+    from: Readonly<THREE.Vector3>,
+    to: Readonly<THREE.Vector3>,
+    nearMargin = 0.15,
+    farMargin = 0.25,
+  ): boolean {
+    this._occDir.subVectors(to as THREE.Vector3, from as THREE.Vector3);
+    const dist = this._occDir.length();
+    if (dist <= nearMargin + farMargin + 0.05) return false;
+    const invDist = 1.0 / dist;
+    const dx = this._occDir.x * invDist;
+    const dy = this._occDir.y * invDist;
+    const dz = this._occDir.z * invDist;
+    const far = dist - farMargin;
+
+    if (
+      this.raycastAnalyticalBoxes(
+        from.x,
+        from.y,
+        from.z,
+        dx,
+        dy,
+        dz,
+        nearMargin,
+        far,
+        true,
+        null,
+      ) <= far
+    ) {
+      return true;
+    }
+
+    if (
+      this.raycastAnalyticalTerrain(
+        from.x,
+        from.y,
+        from.z,
+        dx,
+        dy,
+        dz,
+        nearMargin,
+        far,
+        true,
+        null,
+      ) <= far
+    ) {
+      return true;
+    }
+
+    this._occDir.set(dx, dy, dz);
+    this._raycaster.set(from as THREE.Vector3, this._occDir);
+    this._raycaster.near = nearMargin;
+    this._raycaster.far = far;
+
+    const meshes = this.raycastMeshes;
+    for (let i = 0; i < meshes.length; i++) {
+      const m = meshes[i];
+      if (m.userData?.analyticalRaycastCovered) continue;
+      if (!this.isVisibleInHierarchy(m)) continue;
+      this._rayHits.length = 0;
+      this._raycaster.intersectObject(m, false, this._rayHits);
+      if (this._rayHits.length > 0) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
   public raycast(
     origin: Readonly<THREE.Vector3>,
     direction: Readonly<THREE.Vector3>,
@@ -753,46 +1260,98 @@ export class BodycamPhysicsWorld {
     far: number,
     out: BodycamRaycastResult,
   ): boolean {
+    let bestDist = far;
+    let found = false;
+
+    // 1. Ultra-fast 2D spatial-grid analytical ray-AABB pass
+    const boxDist = this.raycastAnalyticalBoxes(
+      origin.x,
+      origin.y,
+      origin.z,
+      direction.x,
+      direction.y,
+      direction.z,
+      near,
+      bestDist,
+      false,
+      out,
+    );
+    if (boxDist <= bestDist) {
+      bestDist = boxDist;
+      found = true;
+    }
+
+    // 2. Analytical continuous terrain heightfield pass
+    const terrDist = this.raycastAnalyticalTerrain(
+      origin.x,
+      origin.y,
+      origin.z,
+      direction.x,
+      direction.y,
+      direction.z,
+      near,
+      bestDist,
+      false,
+      out,
+    );
+    if (terrDist < bestDist) {
+      bestDist = terrDist;
+      found = true;
+    }
+
+    // 3. Selective Three.js mesh raycast pass ONLY for non-analytically-covered custom meshes
     this._raycaster.set(origin as THREE.Vector3, direction as THREE.Vector3);
     this._raycaster.near = near;
-    this._raycaster.far = far;
+    this._raycaster.far = bestDist;
     this._rayHits.length = 0;
-    this._raycaster.intersectObjects(this.raycastMeshes, false, this._rayHits);
+
+    const meshes = this.raycastMeshes;
+    for (let i = 0; i < meshes.length; i++) {
+      const m = meshes[i];
+      if (m.userData?.analyticalRaycastCovered) continue;
+      if (!this.isVisibleInHierarchy(m)) continue;
+      this._raycaster.intersectObject(m, false, this._rayHits);
+    }
 
     let h: THREE.Intersection | null = null;
     for (let i = 0; i < this._rayHits.length; i++) {
-      if (this.isVisibleInHierarchy(this._rayHits[i].object)) {
-        h = this._rayHits[i];
-        break;
+      const cand = this._rayHits[i];
+      if (cand.distance < bestDist) {
+        bestDist = cand.distance;
+        h = cand;
       }
     }
 
-    if (!h) {
-      out.hit = false;
-      out.distance = Infinity;
-      out.object = null;
-      return false;
+    if (h) {
+      out.hit = true;
+      out.distance = h.distance;
+      out.pointX = h.point.x;
+      out.pointY = h.point.y;
+      out.pointZ = h.point.z;
+      if (h.face) {
+        this._rayNormalMat.getNormalMatrix(h.object.matrixWorld);
+        this._rayNormal.copy(h.face.normal).applyMatrix3(this._rayNormalMat).normalize();
+        out.normalX = this._rayNormal.x;
+        out.normalY = this._rayNormal.y;
+        out.normalZ = this._rayNormal.z;
+      } else {
+        out.normalX = 0;
+        out.normalY = 1;
+        out.normalZ = 0;
+      }
+      out.surface = (h.object.userData?.surfaceMaterial as BodycamSurfaceMaterial) ?? 'concrete';
+      out.object = h.object;
+      return true;
     }
 
-    out.hit = true;
-    out.distance = h.distance;
-    out.pointX = h.point.x;
-    out.pointY = h.point.y;
-    out.pointZ = h.point.z;
-    if (h.face) {
-      this._rayNormalMat.getNormalMatrix(h.object.matrixWorld);
-      this._rayNormal.copy(h.face.normal).applyMatrix3(this._rayNormalMat).normalize();
-      out.normalX = this._rayNormal.x;
-      out.normalY = this._rayNormal.y;
-      out.normalZ = this._rayNormal.z;
-    } else {
-      out.normalX = 0;
-      out.normalY = 1;
-      out.normalZ = 0;
+    if (found) {
+      return true;
     }
-    out.surface = (h.object.userData?.surfaceMaterial as BodycamSurfaceMaterial) ?? 'concrete';
-    out.object = h.object;
-    return true;
+
+    out.hit = false;
+    out.distance = Infinity;
+    out.object = null;
+    return false;
   }
 
   /** Creates a clean `IBodycamWorldAdapter` wrapping this physics world */

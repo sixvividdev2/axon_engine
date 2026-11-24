@@ -395,6 +395,7 @@ function buildTimberlineCompound(
     mesh.castShadow = !isSoftwareGl && qProfile.castShadows && castShadow && h > 0.35;
     mesh.receiveShadow = !isSoftwareGl && qProfile.castShadows;
     mesh.userData.surfaceMaterial = surface;
+    mesh.userData.analyticalRaycastCovered = true;
     sceneGroup.add(mesh);
     raycastMeshes.push(mesh);
     physics.addBox({
@@ -406,6 +407,8 @@ function buildTimberlineCompound(
       maxZ: z + d * 0.5,
       surface,
       blocksMovement: true,
+      blocksRaycast: true,
+      meshRef: mesh,
     });
     return mesh;
   };
@@ -441,8 +444,14 @@ function buildTimberlineCompound(
   const terrainMesh = new THREE.Mesh(terrainGeo, matTerrain);
   terrainMesh.receiveShadow = !isSoftwareGl && qProfile.castShadows;
   terrainMesh.userData.surfaceMaterial = 'grass';
+  terrainMesh.userData.analyticalRaycastCovered = true;
   sceneGroup.add(terrainMesh);
   raycastMeshes.push(terrainMesh);
+  physics.setTerrainHeightSampler(samplePhysicsTerrainY, {
+    enableRaycast: true,
+    surface: 'grass',
+    terrainMesh,
+  });
 
   // === 2. OPTICAL ALPINE RIVER WATER (ZERO SHORELINE GAPS) & ANCHORED BRIDGES ===
   const waterSurfaceY = -0.35;
@@ -1335,6 +1344,8 @@ function buildTimberlineCompound(
         maxZ: t.z + r,
         surface: 'wood',
         blocksMovement: true,
+        blocksRaycast: true,
+        meshRef: trunkInst,
       });
     }
   });
@@ -1346,6 +1357,7 @@ function buildTimberlineCompound(
     inst.userData.surfaceMaterial = 'wood';
     sceneGroup.add(inst);
   }
+  trunkInst.userData.analyticalRaycastCovered = true;
   raycastMeshes.push(trunkInst);
 
   // Botanical undergrowth: dense wind-reactive grass clumps, forest ferns, and leafy shrubs
@@ -1446,11 +1458,14 @@ function buildTimberlineCompound(
       maxZ: rz + 1.2,
       surface: 'concrete',
       blocksMovement: true,
+      blocksRaycast: true,
+      meshRef: rockInst,
     });
   });
   rockInst.instanceMatrix.needsUpdate = true;
   rockInst.computeBoundingSphere();
   rockInst.userData.surfaceMaterial = 'concrete';
+  rockInst.userData.analyticalRaycastCovered = true;
   sceneGroup.add(rockInst);
   raycastMeshes.push(rockInst);
 

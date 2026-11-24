@@ -840,13 +840,20 @@ export class BattleModeController {
         // Line-of-sight check within 46m
         if (raycastMeshes && raycastMeshes.length > 0 && dist > 1.0 && dist < 46) {
           this.scratchOrigin.set(sx, sy + 1.5, sz);
-          this.scratchDir.set(dx, en.y + 1.5 - (sy + 1.5), dz).normalize();
-          this.scratchRay.set(this.scratchOrigin, this.scratchDir);
-          this.scratchRay.near = 0.25;
-          this.scratchRay.far = dist - 0.4;
-          const hits = this.scratchRay.intersectObjects(raycastMeshes as THREE.Object3D[], false);
-          if (hits.length === 0) {
-            losExposedCount += 1;
+          if (raycastMeshes === this.map.raycastMeshes && this.map.physics) {
+            this.scratchDir.set(en.x, en.y + 1.5, en.z);
+            if (!this.map.physics.isSegmentOccluded(this.scratchOrigin, this.scratchDir, 0.25, 0.4)) {
+              losExposedCount += 1;
+            }
+          } else {
+            this.scratchDir.set(dx, en.y + 1.5 - (sy + 1.5), dz).normalize();
+            this.scratchRay.set(this.scratchOrigin, this.scratchDir);
+            this.scratchRay.near = 0.25;
+            this.scratchRay.far = dist - 0.4;
+            const hits = this.scratchRay.intersectObjects(raycastMeshes as THREE.Object3D[], false);
+            if (hits.length === 0) {
+              losExposedCount += 1;
+            }
           }
         }
       }

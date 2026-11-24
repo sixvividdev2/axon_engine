@@ -1,4 +1,5 @@
 export * from './types';
+export * from './math/SpringMath';
 export * from './IBodycamAudioSource';
 export * from './weaponProfiles';
 export * from './IKSolver';

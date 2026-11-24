@@ -175,7 +175,6 @@ function buildVolgaCorridor(
   physics.boundsMaxX = 108;
   physics.boundsMinZ = -73;
   physics.boundsMaxZ = 73;
-  physics.setTerrainHeightSampler(sampleVolgaTerrainY);
 
   const sceneGroup = new THREE.Group();
   scene.add(sceneGroup);
@@ -360,9 +359,10 @@ function buildVolgaCorridor(
   ): THREE.Mesh => {
     const m = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(w, h, d)), mat);
     m.position.set(cx, cy, cz);
-    m.receiveShadow = true;
+    m.receiveShadow = !isSoftwareGl && qProfile.castShadows;
     m.castShadow = castShadow && !isSoftwareGl && qProfile.castShadows;
     m.userData.surfaceMaterial = surface;
+    m.userData.analyticalRaycastCovered = true;
     sceneGroup.add(m);
     raycastMeshes.push(m);
     physics.addBox({
@@ -374,6 +374,8 @@ function buildVolgaCorridor(
       maxZ: cz + d * 0.5,
       surface,
       blocksMovement: true,
+      blocksRaycast: true,
+      meshRef: m,
     });
     return m;
   };
@@ -389,10 +391,16 @@ function buildVolgaCorridor(
   }
   terrainGeo.computeVertexNormals();
   const terrainMesh = new THREE.Mesh(terrainGeo, matTerrain);
-  terrainMesh.receiveShadow = true;
+  terrainMesh.receiveShadow = !isSoftwareGl && qProfile.castShadows;
   terrainMesh.userData.surfaceMaterial = 'grass';
+  terrainMesh.userData.analyticalRaycastCovered = true;
   sceneGroup.add(terrainMesh);
   raycastMeshes.push(terrainMesh);
+  physics.setTerrainHeightSampler(sampleVolgaTerrainY, {
+    enableRaycast: true,
+    surface: 'grass',
+    terrainMesh,
+  });
 
   // === 2. CENTRAL MILITARY HIGHWAY (East-West along Z = 0, X from -112 to +112) ===
   const roadGeo = trackGeo(new THREE.PlaneGeometry(224, 10.6, 56, 2));
@@ -405,7 +413,7 @@ function buildVolgaCorridor(
   }
   roadGeo.computeVertexNormals();
   const roadMesh = new THREE.Mesh(roadGeo, matAsphalt);
-  roadMesh.receiveShadow = true;
+  roadMesh.receiveShadow = !isSoftwareGl && qProfile.castShadows;
   roadMesh.userData.surfaceMaterial = 'concrete';
   sceneGroup.add(roadMesh);
   raycastMeshes.push(roadMesh);
@@ -441,6 +449,7 @@ function buildVolgaCorridor(
       maxZ: cz + hd,
       surface: 'concrete',
       blocksMovement: true,
+      blocksRaycast: true,
     });
   };
 
@@ -498,6 +507,7 @@ function buildVolgaCorridor(
     bulb.position.set(baseX + dir * 9.5, groundY + 7.5, -13.5);
     sceneGroup.add(bulb);
     const pl = new THREE.PointLight(0xffdfb0, 0, 28, 1.6);
+    pl.visible = false;
     pl.position.set(baseX + dir * 8.8, groundY + 7.2, -13.0);
     sceneGroup.add(pl);
     nightLights.push({ light: pl, baseLightIntensity: 18, emissiveMat: matLampBulb, baseEmissiveIntensity: 2.4 });
@@ -554,6 +564,7 @@ function buildVolgaCorridor(
     lPole.position.set(cx, ty + 3.1, 6.2);
     sceneGroup.add(lPole);
     const pl = new THREE.PointLight(0xffd28a, 0, 22, 1.7);
+    pl.visible = false;
     pl.position.set(cx, ty + 6.0, 4.0);
     sceneGroup.add(pl);
     nightLights.push({ light: pl, baseLightIntensity: 14 });
@@ -606,6 +617,7 @@ function buildVolgaCorridor(
     sceneGroup.add(fobSign);
 
     const pl = new THREE.PointLight(0xffe0b2, 0, 22, 1.6);
+    pl.visible = false;
     pl.position.set(cx, ty + 5.5, cz);
     sceneGroup.add(pl);
     nightLights.push({ light: pl, baseLightIntensity: 13 });
@@ -681,7 +693,7 @@ function buildVolgaCorridor(
   const hescoGeo = trackGeo(new THREE.BoxGeometry(1, 1, 1));
   const hescoInst = new THREE.InstancedMesh(hescoGeo, matHesco, hescoBlocks.length);
   hescoInst.castShadow = !isSoftwareGl && qProfile.castShadows;
-  hescoInst.receiveShadow = true;
+  hescoInst.receiveShadow = !isSoftwareGl && qProfile.castShadows;
   hescoBlocks.forEach((b, i) => {
     dummy.position.set(b.x, b.y, b.z);
     dummy.rotation.set(0, b.rotY, 0);
@@ -692,6 +704,7 @@ function buildVolgaCorridor(
   hescoInst.instanceMatrix.needsUpdate = true;
   hescoInst.computeBoundingSphere();
   hescoInst.userData.surfaceMaterial = 'concrete';
+  hescoInst.userData.analyticalRaycastCovered = true;
   sceneGroup.add(hescoInst);
   raycastMeshes.push(hescoInst);
 
@@ -766,6 +779,8 @@ function buildVolgaCorridor(
         maxZ: t.z + r,
         surface: 'wood',
         blocksMovement: true,
+        blocksRaycast: true,
+        meshRef: trunkInst,
       });
     }
   });
@@ -776,6 +791,7 @@ function buildVolgaCorridor(
     inst.userData.surfaceMaterial = 'wood';
     sceneGroup.add(inst);
   }
+  trunkInst.userData.analyticalRaycastCovered = true;
   raycastMeshes.push(trunkInst);
 
   // Instanced Boulders (tactical hillside cover + natural perimeter rock shelves)
@@ -791,7 +807,7 @@ function buildVolgaCorridor(
   }
   const rockInst = new THREE.InstancedMesh(rockGeo, matRock, rockSpots.length);
   rockInst.castShadow = !isSoftwareGl && qProfile.castShadows;
-  rockInst.receiveShadow = true;
+  rockInst.receiveShadow = !isSoftwareGl && qProfile.castShadows;
   rockSpots.forEach((r, i) => {
     dummy.position.set(r.x, r.y, r.z);
     dummy.rotation.set(rand() * 0.3, r.yaw, rand() * 0.3);
@@ -808,12 +824,15 @@ function buildVolgaCorridor(
         maxZ: r.z + r.sz * 0.85,
         surface: 'concrete',
         blocksMovement: true,
+        blocksRaycast: true,
+        meshRef: rockInst,
       });
     }
   });
   rockInst.instanceMatrix.needsUpdate = true;
   rockInst.computeBoundingSphere();
   rockInst.userData.surfaceMaterial = 'concrete';
+  rockInst.userData.analyticalRaycastCovered = true;
   sceneGroup.add(rockInst);
   raycastMeshes.push(rockInst);
 

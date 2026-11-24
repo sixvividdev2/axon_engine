@@ -651,6 +651,8 @@ export function buildInstancedBirchTrees(
         maxZ: s.z + r,
         surface: 'wood',
         blocksMovement: true,
+        blocksRaycast: true,
+        meshRef: trunkInst,
       });
     }
   });
@@ -661,6 +663,9 @@ export function buildInstancedBirchTrees(
     inst.computeBoundingSphere();
     inst.userData.surfaceMaterial = 'wood';
     sceneGroup.add(inst);
+  }
+  if (addTrunkColliders) {
+    trunkInst.userData.analyticalRaycastCovered = true;
   }
   raycastMeshes.push(trunkInst);
 }

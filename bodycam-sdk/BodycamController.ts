@@ -4,6 +4,7 @@ import {
   computeSphereSweptLeanClearance,
 } from './BodycamPhysics';
 import { IBodycamAudioSource } from './IBodycamAudioSource';
+import { clampSpringState, stepAnalyticalDampedSpring } from './math/SpringMath';
 import { VaultController, VaultStateSnapshot } from './movement/VaultController';
 import {
   createVaultCandidate,
@@ -770,12 +771,7 @@ export class BodycamController {
     omega: number,
     dt: number,
   ): [number, number] {
-    const stiffness = omega * omega;
-    const damping = 2.0 * omega;
-    const accel = stiffness * (target - val) - damping * vel;
-    const nextVel = vel + accel * dt;
-    const nextVal = val + nextVel * dt;
-    return [nextVal, nextVel];
+    return stepAnalyticalDampedSpring(val, vel, target, omega, 1.0, dt);
   }
 
   private stepDampedSpring(
@@ -786,12 +782,7 @@ export class BodycamController {
     dampingRatio: number,
     dt: number,
   ): [number, number] {
-    const stiffness = omega * omega;
-    const damping = 2.0 * dampingRatio * omega;
-    const accel = stiffness * (target - val) - damping * vel;
-    const nextVel = vel + accel * dt;
-    const nextVal = val + nextVel * dt;
-    return [nextVal, nextVel];
+    return stepAnalyticalDampedSpring(val, vel, target, omega, dampingRatio, dt);
   }
 
   private stepExactCriticallyDamped(
@@ -801,12 +792,7 @@ export class BodycamController {
     omega: number,
     dt: number,
   ): [number, number] {
-    const x0 = val - target;
-    const exp = Math.exp(-omega * dt);
-    const c2 = vel + omega * x0;
-    const nextVal = target + (x0 + c2 * dt) * exp;
-    const nextVel = (vel - c2 * omega * dt) * exp;
-    return [nextVal, nextVel];
+    return stepAnalyticalDampedSpring(val, vel, target, omega, 1.0, dt);
   }
 
   public getWhipVelocity(out: THREE.Vector2): THREE.Vector2 {
@@ -1121,7 +1107,12 @@ export class BodycamController {
       0.72,
       dt,
     );
-    this.camShakePitch = THREE.MathUtils.clamp(this.camShakePitch, -0.08, 0.08);
+    [this.camShakePitch, this.camShakePitchVel] = clampSpringState(
+      this.camShakePitch,
+      this.camShakePitchVel,
+      -0.08,
+      0.08,
+    );
     [this.camShakeYaw, this.camShakeYawVel] = this.stepDampedSpring(
       this.camShakeYaw,
       this.camShakeYawVel,
@@ -1130,7 +1121,12 @@ export class BodycamController {
       0.68,
       dt,
     );
-    this.camShakeYaw = THREE.MathUtils.clamp(this.camShakeYaw, -0.06, 0.06);
+    [this.camShakeYaw, this.camShakeYawVel] = clampSpringState(
+      this.camShakeYaw,
+      this.camShakeYawVel,
+      -0.06,
+      0.06,
+    );
     [this.camShakeRoll, this.camShakeRollVel] = this.stepDampedSpring(
       this.camShakeRoll,
       this.camShakeRollVel,
@@ -1139,7 +1135,12 @@ export class BodycamController {
       0.70,
       dt,
     );
-    this.camShakeRoll = THREE.MathUtils.clamp(this.camShakeRoll, -0.05, 0.05);
+    [this.camShakeRoll, this.camShakeRollVel] = clampSpringState(
+      this.camShakeRoll,
+      this.camShakeRollVel,
+      -0.05,
+      0.05,
+    );
     [this.camShakePosX, this.camShakePosXVel] = this.stepDampedSpring(
       this.camShakePosX,
       this.camShakePosXVel,
@@ -1148,7 +1149,12 @@ export class BodycamController {
       0.72,
       dt,
     );
-    this.camShakePosX = THREE.MathUtils.clamp(this.camShakePosX, -0.012, 0.012);
+    [this.camShakePosX, this.camShakePosXVel] = clampSpringState(
+      this.camShakePosX,
+      this.camShakePosXVel,
+      -0.012,
+      0.012,
+    );
     [this.camShakePosY, this.camShakePosYVel] = this.stepDampedSpring(
       this.camShakePosY,
       this.camShakePosYVel,
@@ -1157,7 +1163,12 @@ export class BodycamController {
       0.72,
       dt,
     );
-    this.camShakePosY = THREE.MathUtils.clamp(this.camShakePosY, -0.012, 0.012);
+    [this.camShakePosY, this.camShakePosYVel] = clampSpringState(
+      this.camShakePosY,
+      this.camShakePosYVel,
+      -0.012,
+      0.012,
+    );
 
     const sinY = Math.sin(this.torsoYaw);
     const cosY = Math.cos(this.torsoYaw);
@@ -1794,8 +1805,18 @@ export class BodycamController {
       0.88,
       dt,
     );
-    this.torsoAbsorbPitch = THREE.MathUtils.clamp(this.torsoAbsorbPitch, -0.025, 0.036);
-    this.torsoAbsorbYaw = THREE.MathUtils.clamp(this.torsoAbsorbYaw, -0.030, 0.030);
+    [this.torsoAbsorbPitch, this.torsoAbsorbPitchVel] = clampSpringState(
+      this.torsoAbsorbPitch,
+      this.torsoAbsorbPitchVel,
+      -0.025,
+      0.036,
+    );
+    [this.torsoAbsorbYaw, this.torsoAbsorbYawVel] = clampSpringState(
+      this.torsoAbsorbYaw,
+      this.torsoAbsorbYawVel,
+      -0.030,
+      0.030,
+    );
 
     // 8. PRESERVED Lifecycle-Safe Procedural Breathing Sway & 7.0s Hold-Breath Reserve/Cooldown
     const gapDetected = this.lastUpdateElapsed < 0 || Math.abs(elapsed - this.lastUpdateElapsed) > 0.25;
