@@ -16,7 +16,8 @@ import {
 import { WeaponModelFactory } from '../weapons/WeaponModelFactory';
 import { resolveReloadPlatformStyle, WeaponAnimator } from '../weapons/WeaponAnimator';
 import { computeWeaponSpringTuning, WeaponRig } from '../WeaponRig';
-import { computeGeometryDrivenGripWrap } from '../CharacterSkeleton';
+import { CharacterSkeleton, computeGeometryDrivenGripWrap } from '../CharacterSkeleton';
+import { CharacterAnimator } from '../CharacterAnimator';
 import { buildAnatomicalHeadAssembly } from '../character/AnatomicalHeadBuilder';
 import { SDK_WEAPON_PROFILES } from '../weaponProfiles';
 import { resolveAiWeaponAudioProfile } from '../../src/modes/openworld/world/OpenWorldAiDirector';
@@ -422,6 +423,82 @@ describe('Pillar 4 — Infected Iris-Only Glow, Red-Eyed Runners & Legless Bleed
     });
     expect(rig.pelvisGroup.position.y).toBeLessThan(0.32);
 
+    // Verify face-down prone orientation, forward -Z facing head, trailing stumps, low crawling arms, and floor clearance
+    const getVisibleMinY = (root: THREE.Object3D): number => {
+      let minY = Infinity;
+      const box = new THREE.Box3();
+      const visit = (obj: THREE.Object3D) => {
+        if (!obj.visible) return;
+        if ((obj as THREE.Mesh).isMesh) {
+          box.setFromObject(obj);
+          if (box.min.y < minY) minY = box.min.y;
+        }
+        for (const child of obj.children) visit(child);
+      };
+      visit(root);
+      return minY;
+    };
+
+    const pelvisWorld = new THREE.Vector3();
+    const headWorld = new THREE.Vector3();
+    const stumpWorld = new THREE.Vector3();
+    const handLWorld = new THREE.Vector3();
+    const handRWorld = new THREE.Vector3();
+    const headForward = new THREE.Vector3();
+    const headQuat = new THREE.Quaternion();
+
+    for (const phase of [0, Math.PI * 0.5, Math.PI, Math.PI * 1.5]) {
+      lib.applyPose(rig, {
+        mode: 'locomote',
+        walkCycle: phase,
+        speedMps: 1.0,
+        tearPhase: 0,
+        vaultT: 0,
+        windupProgress: 0,
+        staggerRatio: 0,
+        deathProgress: 0,
+        elapsedSec: 1.5,
+        dt: 0.016,
+        variant: 'crawler',
+      });
+      rig.root.updateMatrixWorld(true);
+      rig.pelvisGroup.getWorldPosition(pelvisWorld);
+      rig.headGroup.getWorldPosition(headWorld);
+      rig.leftSeveredStumpGroup.getWorldPosition(stumpWorld);
+      rig.leftHandPivot.getWorldPosition(handLWorld);
+      rig.rightHandPivot.getWorldPosition(handRWorld);
+      rig.headGroup.getWorldQuaternion(headQuat);
+      headForward.set(0, 0, -1).applyQuaternion(headQuat);
+
+      // Head strictly forward of pelvis (-Z), facing forward, stumps trailing behind (+Z)
+      expect(headWorld.z).toBeLessThan(pelvisWorld.z - 0.35);
+      expect(stumpWorld.z).toBeGreaterThanOrEqual(pelvisWorld.z - 0.05);
+      expect(headForward.z).toBeLessThan(-0.85);
+      // Crawling hands stay low near floor (never waving overhead above head height)
+      expect(handLWorld.y).toBeLessThan(headWorld.y - 0.20);
+      expect(handRWorld.y).toBeLessThan(headWorld.y - 0.20);
+      expect(handLWorld.z).toBeLessThan(headWorld.z);
+      // Zero floor clipping on any visible mesh
+      expect(getVisibleMinY(rig.root)).toBeGreaterThan(-0.01);
+    }
+
+    // Verify flat face-down death collapse stays above floor
+    lib.applyPose(rig, {
+      mode: 'death',
+      walkCycle: 0,
+      speedMps: 0,
+      tearPhase: 0,
+      vaultT: 0,
+      windupProgress: 0,
+      staggerRatio: 0,
+      deathProgress: 1.0,
+      elapsedSec: 2.0,
+      dt: 0.016,
+      variant: 'crawler',
+    });
+    rig.root.updateMatrixWorld(true);
+    expect(getVisibleMinY(rig.root)).toBeGreaterThan(-0.02);
+
     lib.dispose();
   });
 
@@ -633,5 +710,76 @@ describe('Pillar 5 — Coupled 6-DOF Weapon Spring Physics, Platform Manual of A
     expect(slimMakarov.primaryWrapTight).toBeGreaterThan(chunkyDeagleQuad.primaryWrapTight);
     expect(slimMakarov.primaryDistTight).toBeGreaterThan(chunkyDeagleQuad.primaryDistTight);
     expect(slimMakarov.supportWrapTight).toBeGreaterThan(chunkyDeagleQuad.supportWrapTight);
+  });
+
+  it('keeps left support hand locked (<2mm drift) onto primary weapon handguards during ADS upward pitch (-30° to +68°)', () => {
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(75, 1.6, 0.03, 500);
+    const rig = new WeaponRig(scene, true);
+    const audio = new BodycamAudio();
+    const ctrl = new BodycamController(camera, rig, audio);
+    const skel = new CharacterSkeleton(4, 'infection', 'MALE');
+    scene.add(skel.root);
+    const charAnim = new CharacterAnimator(skel, rig);
+
+    const adapter = {
+      raycast: () => false,
+      getGroundHeight: () => 0,
+      getSurfaceMaterial: () => 'concrete',
+      sweepCapsule: (...args: unknown[]) => {
+        const last = args[args.length - 1] as { hit?: boolean } | undefined;
+        if (last && typeof last === 'object') {
+          last.hit = false;
+          return last;
+        }
+        return { hit: false };
+      },
+      sampleInterior: () => ({ isIndoor: false, material: 'concrete' }),
+    } as unknown as IBodycamWorldAdapter;
+
+    const adsInput = {
+      forward: false,
+      backward: false,
+      left: false,
+      right: false,
+      sprint: false,
+      crouch: false,
+      leanLeft: false,
+      leanRight: false,
+      ads: true,
+      cant: false,
+      holdBreath: false,
+    };
+
+    const handLPos = new THREE.Vector3();
+    const sockLPos = new THREE.Vector3();
+    const sockLQuat = new THREE.Quaternion();
+    const handRPos = new THREE.Vector3();
+    const sockRPos = new THREE.Vector3();
+
+    for (const wid of ['m4a1', 'hk_mp5', 'remington_m24', 'benelli_m4'] as const) {
+      const spec = SDK_WEAPON_PROFILES[wid];
+      rig.setWeaponProfile(spec, false);
+      for (const deg of [-30, 0, 25, 45, 68]) {
+        const rad = THREE.MathUtils.degToRad(deg);
+        ctrl.torsoPitch = rad;
+        (ctrl as unknown as { targetTorsoPitch: number }).targetTorsoPitch = rad;
+        ctrl.aimPitch = 0;
+        for (let i = 0; i < 30; i++) {
+          ctrl.update(0.016, i * 0.016, adsInput, adapter, spec, DEFAULT_BODYCAM_SDK_CONFIG);
+          charAnim.update(0.016, i * 0.016, ctrl, adapter, spec);
+        }
+        skel.leftArm.hand.root.getWorldPosition(handLPos);
+        rig.getLiveLeftHandSocketWorldTransform(sockLPos, sockLQuat);
+        skel.rightArm.hand.root.getWorldPosition(handRPos);
+        rig.rightHandSocketAnchor.getWorldPosition(sockRPos);
+
+        expect(handLPos.distanceTo(sockLPos)).toBeLessThan(0.002);
+        expect(handRPos.distanceTo(sockRPos)).toBeLessThan(0.002);
+      }
+    }
+
+    skel.dispose();
+    rig.dispose();
   });
 });

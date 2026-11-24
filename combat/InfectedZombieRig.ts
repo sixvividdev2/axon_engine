@@ -929,72 +929,126 @@ export class InfectedZombieRigLibrary {
     const activeVariant = input.variant ?? rig.variant;
     const isCrawler = activeVariant === 'crawler' || rig.legsSevered;
 
-    // Dedicated legless Crawler prone pose suite (ground drag, ankle-swipe windup, stagger, flat collapse)
+    // Dedicated legless Crawler prone pose suite (face-down belly crawl facing -Z, ankle-swipe, vault, stagger, flat death)
+    // NOTE: Zombie front is -Z and spine grows along +Y. Negative X rotation on pelvisGroup pitches +Y toward -Z
+    // (belly-down prone with head forward and severed stumps trailing behind at +Z), while keeping bodyPivot unrotated
+    // at y = 0 so the torso NEVER swings underground!
     if (isCrawler) {
       const wc = input.walkCycle;
       const sinW = Math.sin(wc);
       const cosW = Math.cos(wc);
       const stag = THREE.MathUtils.clamp(input.staggerRatio, 0, 1);
+      rig.pelvisGroup.rotation.order = 'YXZ';
 
       if (input.mode === 'death') {
         const t = THREE.MathUtils.clamp(input.deathProgress, 0, 1);
         const ease = 1 - Math.pow(1 - t, 2.2);
         const side = rig.deathFallSide;
-        rig.pelvisGroup.position.set(0, THREE.MathUtils.lerp(0.18, 0.11, ease), 0.18);
-        rig.bodyPivot.rotation.set(THREE.MathUtils.lerp(1.26, 1.54, ease), side * 0.14 * ease, side * 0.28 * ease);
-        rig.spineLower.rotation.set(-0.08 * (1 - ease), 0, 0);
-        rig.spineUpper.rotation.set(-0.10 * (1 - ease), 0, 0);
-        rig.neckPivot.rotation.set(THREE.MathUtils.lerp(-0.92, -0.15, ease), side * 0.35 * ease, side * 0.25 * ease);
-        rig.headGroup.rotation.set(0.15 * ease, 0, 0);
+        rig.pelvisGroup.position.set(0, THREE.MathUtils.lerp(0.175, 0.16, ease), 0.26);
+        rig.pelvisGroup.rotation.set(
+          THREE.MathUtils.lerp(-1.38, -1.48, ease),
+          side * 0.14 * ease,
+          side * 0.12 * ease,
+        );
+        rig.spineLower.rotation.set(0.18 * (1 - ease) + 0.05 * ease, 0, 0);
+        rig.spineUpper.rotation.set(0.24 * (1 - ease) + 0.06 * ease, 0, 0);
+        rig.neckPivot.rotation.set(THREE.MathUtils.lerp(0.84, 0.34, ease), side * 0.34 * ease, side * 0.16 * ease);
+        rig.headGroup.rotation.set(0.06, 0, 0);
         rig.jawPivot.rotation.x = 0.28 * ease;
-        rig.leftHip.rotation.set(0.12, 0, -0.18);
-        rig.rightHip.rotation.set(0.16, 0, 0.22);
-        rig.leftShoulder.rotation.set(0.65 * (1 - ease) + 0.35 * ease, 0, -0.78 * ease);
-        rig.leftElbow.rotation.set(-0.45, 0, 0);
-        rig.rightShoulder.rotation.set(0.72 * (1 - ease) + 0.42 * ease, 0, 0.72 * ease);
-        rig.rightElbow.rotation.set(-0.52, 0, 0);
+        // Severed stumps stay flat on top of floor behind pelvis (+Z)
+        rig.leftHip.rotation.set(-0.08 * (1 - ease) - 0.06 * ease, 0, -0.22);
+        rig.rightHip.rotation.set(-0.08 * (1 - ease) - 0.06 * ease, 0, 0.24);
+        // Arms splay forward-outward flat on top of the floor (zero floor clipping)
+        rig.leftShoulder.rotation.set(
+          THREE.MathUtils.lerp(1.52, 2.90, ease),
+          0.22,
+          -0.38 - 0.44 * ease,
+        );
+        rig.leftElbow.rotation.set(THREE.MathUtils.lerp(0.65, 0.14, ease), 0, 0);
+        rig.leftHandPivot.rotation.set(0.22, 0, 0);
+        rig.rightShoulder.rotation.set(
+          THREE.MathUtils.lerp(1.48, 2.86, ease),
+          -0.22,
+          0.38 + 0.46 * ease,
+        );
+        rig.rightElbow.rotation.set(THREE.MathUtils.lerp(0.68, 0.16, ease), 0, 0);
+        rig.rightHandPivot.rotation.set(0.22, 0, 0);
         this.stepZombieFacial(rig, input);
         return;
       }
 
-      // Prone torso slung low over the ground, head craned up to stare with glowing yellow irises
-      const moveBlend = THREE.MathUtils.clamp(input.speedMps / 0.55, 0, 1);
-      const heaveY = Math.abs(sinW) * 0.032 * moveBlend;
-      rig.pelvisGroup.position.set(sinW * 0.035 * moveBlend, 0.185 + heaveY, 0.24);
-      rig.bodyPivot.rotation.set(1.28 - stag * 0.18, sinW * 0.14 * moveBlend, cosW * 0.12 * moveBlend);
+      const moveBlend =
+        input.mode === 'vault' || input.mode === 'tear'
+          ? 0.85
+          : THREE.MathUtils.clamp(input.speedMps / 0.45, 0, 1);
+      const isVault = input.mode === 'vault';
+      const isTear = input.mode === 'tear';
+      const heaveY = Math.abs(sinW) * 0.024 * moveBlend;
+      const basePelvisY = isVault ? 0.22 + Math.sin(THREE.MathUtils.clamp(input.vaultT, 0, 1) * Math.PI) * 0.08 : 0.175;
+      rig.pelvisGroup.position.set(sinW * 0.032 * moveBlend, basePelvisY + heaveY, 0.26);
+      rig.pelvisGroup.rotation.set(
+        -1.38 + stag * 0.16 + (isTear ? 0.18 : 0),
+        sinW * 0.16 * moveBlend,
+        cosW * 0.10 * moveBlend,
+      );
 
-      // Severed stumps trail behind & wiggle slightly as crawler drags torso
-      rig.leftHip.rotation.set(0.12 + sinW * 0.12 * moveBlend, 0, -0.14);
-      rig.rightHip.rotation.set(0.12 - sinW * 0.12 * moveBlend, 0, 0.14);
+      // Severed upper thighs & exposed femur bone stumps trail horizontally behind pelvis (+Z) cleanly above floor
+      rig.leftHip.rotation.set(-0.14 + sinW * 0.07 * moveBlend, 0, -0.18);
+      rig.rightHip.rotation.set(-0.14 - sinW * 0.07 * moveBlend, 0, 0.18);
 
-      rig.spineLower.rotation.set(-0.18, -sinW * 0.14 * moveBlend, 0);
-      rig.spineUpper.rotation.set(-0.24 - stag * 0.14, -sinW * 0.18 * moveBlend, cosW * 0.09 * moveBlend);
-      const twitch = Math.sin(input.elapsedSec * 7.8 + rig.headTiltBias * 12) * 0.05;
-      rig.neckPivot.rotation.set(-0.92 + stag * 0.24, sinW * 0.1, rig.headTiltBias + twitch);
-      rig.headGroup.rotation.set(-0.12, twitch, 0);
+      // Positive +X spine extension arches chest up off floor so crawler crawls belly-down with glowing yellow eyes forward
+      rig.spineLower.rotation.set(0.18, -sinW * 0.14 * moveBlend, 0);
+      rig.spineUpper.rotation.set(
+        0.26 + stag * 0.12 + (isTear ? 0.22 : 0),
+        -sinW * 0.18 * moveBlend,
+        cosW * 0.08 * moveBlend,
+      );
+      const twitch = Math.sin(input.elapsedSec * 7.8 + rig.headTiltBias * 12) * 0.045;
+      rig.neckPivot.rotation.set(0.84 - stag * 0.18 - (isTear ? 0.16 : 0), sinW * 0.10, rig.headTiltBias + twitch);
+      rig.headGroup.rotation.set(0.08, twitch, 0);
 
       const isWindup = input.mode === 'windup' || input.windupProgress > 0.01;
       if (isWindup) {
+        // Low predatory ankle-swipe lunge: torso props up slightly, arms slash forward across player's shins
         const wp = THREE.MathUtils.clamp(input.windupProgress, 0, 1);
-        const swipe = wp < 0.5 ? -(wp / 0.5) : (wp - 0.5) / 0.5;
-        rig.spineUpper.rotation.x -= 0.22;
-        rig.jawPivot.rotation.x = 0.46 + Math.max(0, swipe) * 0.2;
-        rig.leftShoulder.rotation.set(2.55 - swipe * 0.85, 0.28, -0.25);
-        rig.leftElbow.rotation.set(-0.55 + swipe * 0.35, 0, 0);
-        rig.rightShoulder.rotation.set(2.45 + swipe * 0.72, -0.26, 0.25);
-        rig.rightElbow.rotation.set(-0.62 - swipe * 0.25, 0, 0);
+        const swipe = wp < 0.48 ? -(wp / 0.48) : (wp - 0.48) / 0.52;
+        rig.spineUpper.rotation.x += 0.20;
+        rig.jawPivot.rotation.x = 0.48 + Math.max(0, swipe) * 0.22;
+        rig.leftShoulder.rotation.set(1.55 + swipe * 0.58, 0.30, -0.34);
+        rig.leftElbow.rotation.set(0.62 - swipe * 0.28, 0, 0);
+        rig.leftHandPivot.rotation.set(0.32, 0, 0);
+        rig.rightShoulder.rotation.set(1.48 - swipe * 0.42, -0.28, 0.34);
+        rig.rightElbow.rotation.set(0.68 + swipe * 0.22, 0, 0);
+        rig.rightHandPivot.rotation.set(0.32, 0, 0);
       } else {
-        // Alternating hand-over-hand ground-clawing drag stroke
-        const lPull = sinW * moveBlend;
-        const rPull = -sinW * moveBlend;
-        rig.jawPivot.rotation.x = 0.22 + Math.max(0, sinW) * 0.16;
-        rig.leftShoulder.rotation.set(2.15 + lPull * 0.62, 0.24 + cosW * 0.16 * moveBlend, -0.22);
-        rig.leftElbow.rotation.set(-0.48 - Math.max(0, -lPull) * 0.55, 0, 0);
-        rig.leftHandPivot.rotation.set(0.65, 0, 0);
+        // Authentic alternating hand-over-hand ground-claw drag stroke:
+        // Reach forward along floor (-Z) -> plant clawed palm near floor -> pull forearm back beside ribs!
+        const lPhase = isTear ? input.tearPhase : wc;
+        const rPhase = lPhase + Math.PI;
+        const lReach = Math.sin(lPhase) * moveBlend; // +1 = reached forward, -1 = pulled back beside ribs
+        const rReach = Math.sin(rPhase) * moveBlend;
+        const lLift = Math.max(0, Math.cos(lPhase)) * moveBlend; // slight wrist lift during forward recovery swing
+        const rLift = Math.max(0, Math.cos(rPhase)) * moveBlend;
 
-        rig.rightShoulder.rotation.set(2.15 + rPull * 0.62, -0.24 - cosW * 0.16 * moveBlend, 0.22);
-        rig.rightElbow.rotation.set(-0.48 - Math.max(0, -rPull) * 0.55, 0, 0);
-        rig.rightHandPivot.rotation.set(0.65, 0, 0);
+        rig.jawPivot.rotation.x = 0.22 + Math.max(0, sinW) * 0.16;
+
+        // Parent spineUpper world pitch ≈ -0.94 rad:
+        // shoulder.rot.x = 1.92 (reach forward-down) -> 1.12 (pull back beside chest); NEVER skyward!
+        rig.leftShoulder.rotation.set(
+          1.46 + lReach * 0.44 + lLift * 0.14 + (isTear ? 0.34 : 0),
+          0.16 + lReach * 0.18,
+          -0.32 - lLift * 0.14,
+        );
+        rig.leftElbow.rotation.set(0.76 - lReach * 0.34 + lLift * 0.16, 0, 0);
+        rig.leftHandPivot.rotation.set(0.45 - lReach * 0.22, 0, 0);
+
+        rig.rightShoulder.rotation.set(
+          1.46 + rReach * 0.44 + rLift * 0.14 + (isTear ? 0.34 : 0),
+          -0.16 - rReach * 0.18,
+          0.32 + rLift * 0.14,
+        );
+        rig.rightElbow.rotation.set(0.76 - rReach * 0.34 + rLift * 0.16, 0, 0);
+        rig.rightHandPivot.rotation.set(0.45 - rReach * 0.22, 0, 0);
       }
       this.stepZombieFacial(rig, input);
       return;

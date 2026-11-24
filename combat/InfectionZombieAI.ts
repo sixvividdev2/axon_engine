@@ -1154,7 +1154,7 @@ export class InfectionZombieAI {
       const z = this.zombies[i];
       if (z.id === zombieId) {
         if (!z.alive) return false;
-        out.set(z.pos.x, z.pos.y + (z.variant === 'crawler' ? 0.44 : 1.88), z.pos.z);
+        out.set(z.pos.x, z.pos.y + (z.variant === 'crawler' ? 0.55 : 1.88), z.pos.z);
         return true;
       }
     }
@@ -1936,8 +1936,10 @@ export class InfectionZombieAI {
               }
             }
 
-            moveX += dirX * z.speed;
-            moveZ += dirZ * z.speed;
+            const crawlSurge =
+              z.variant === 'crawler' ? 0.62 + 0.68 * Math.abs(Math.sin(z.walkCycle)) : 1.0;
+            moveX += dirX * z.speed * crawlSurge;
+            moveZ += dirZ * z.speed * crawlSurge;
             const desiredYaw = Math.atan2(-dirX, -dirZ);
             let dyaw = desiredYaw - z.yaw;
             while (dyaw > Math.PI) dyaw -= Math.PI * 2;
@@ -1987,10 +1989,13 @@ export class InfectionZombieAI {
       const groundY = this.map.physics.getGroundHeight(z.pos.x, z.pos.z, z.pos.y, 0.85, 0.14);
       z.pos.y = THREE.MathUtils.damp(z.pos.y, groundY, 14, dt);
 
-      // Anatomical shamble / sprint / melee windup / hit stagger pose
+      // Anatomical shamble / sprint / crawl / melee windup / hit stagger pose
       const spd = Math.hypot(moveX, moveZ);
       z.lastSpeedMps = spd;
-      z.walkCycle += dt * Math.max(1.2, spd * 2.9);
+      z.walkCycle +=
+        z.variant === 'crawler'
+          ? dt * Math.max(2.4, spd * 4.5)
+          : dt * Math.max(1.2, spd * 2.9);
 
       const windupProgress =
         z.windupTimer > 0 ? THREE.MathUtils.clamp(1 - z.windupTimer / Math.max(0.05, scaledWindup), 0, 1) : 0;

@@ -242,6 +242,9 @@ export class CharacterAnimator {
   private readonly _rootWorldQuatInv = new THREE.Quaternion();
   private readonly _poleR = new THREE.Vector3();
   private readonly _poleL = new THREE.Vector3();
+  private readonly _scapulaDeltaRoot = new THREE.Vector3();
+  private readonly _scapulaTargetWorld = new THREE.Vector3();
+  private readonly _scapulaStartWorld = new THREE.Vector3();
   private readonly _hipL = new THREE.Vector3();
   private readonly _hipR = new THREE.Vector3();
   private readonly _ankleL = new THREE.Vector3();
@@ -842,7 +845,18 @@ export class CharacterAnimator {
     }
 
     const spinePitch = controller.getSpinePitch();
-    const clampedChestPitch = THREE.MathUtils.clamp(spinePitch * 0.08, -0.10, 0.12);
+    const isUnarmedSpec = spec.holdClass === 'unarmed';
+    const aimSightBlendEarly = isUnarmedSpec
+      ? 0
+      : Math.max(rigState.adsBlend, rigState.cantBlend, rigState.pointAimBlend);
+    const totalPitchRad = THREE.MathUtils.clamp(controller.torsoPitch + rigState.aimPitch, -0.95, 1.25);
+    const upwardPitchRad = Math.max(0, totalPitchRad);
+
+    // When aiming steeply upward in ADS/Canted/Point-Aim, avoid tilting the chest backward (+Z)
+    // away from the raised handguard so the support shoulder stays naturally under the rifle.
+    const rawChestPitch = THREE.MathUtils.clamp(spinePitch * 0.08, -0.10, 0.12);
+    const clampedChestPitch =
+      rawChestPitch > 0 ? rawChestPitch * (1 - aimSightBlendEarly * 0.85) : rawChestPitch;
     this.skeleton.spineLower.rotation.set(spineForwardPitch * 0.5, punchTorsoYaw * 0.45, leanAngle * 0.45);
     this.skeleton.spineUpper.rotation.set(
       spineForwardPitch * 0.5 + clampedChestPitch * 0.45,
@@ -853,7 +867,6 @@ export class CharacterAnimator {
 
     // Keep shoulders squared on the top-outer torso plane (zero involuntary chest-collapse protraction
     // when looking down or standing unarmed; active protraction only for ADS, Guard, Leans & Punches).
-    const isUnarmedSpec = spec.holdClass === 'unarmed';
     const guardProtract = isUnarmedSpec ? this.unarmedGuardBlend * 0.08 : 0;
     const baseProtract = isUnarmedSpec
       ? 0
@@ -866,20 +879,39 @@ export class CharacterAnimator {
             : 0.022;
     const protract = baseProtract + guardProtract;
     const clavAimWeight = isUnarmedSpec ? this.unarmedGuardBlend : 1.0;
+    const clavElevPitch = isUnarmedSpec
+      ? rigState.aimPitch
+      : THREE.MathUtils.lerp(rigState.aimPitch, totalPitchRad, 0.35 + aimSightBlendEarly * 0.65);
+    const upwardSupportFollow = isUnarmedSpec ? 0 : upwardPitchRad * (0.25 + aimSightBlendEarly * 0.75);
     // Symmetric cross-body shoulder follow when leaning Q/E so off-side arm stays ergonomic
     const leanFollowL = Math.max(0, leanSign) * 0.14;
     const leanFollowR = Math.max(0, -leanSign) * 0.14;
+
+    // Reset clavicles to canonical rest offsets each frame, plus subtle scapular elevation/protraction
+    // when pitching a primary weapon upward so the deltoid cap stays anatomically seated.
+    const restClavX = this.skeleton.profile.clavicleOffsetX;
+    this.skeleton.leftArm.clavicle.position.set(
+      -restClavX + upwardSupportFollow * 0.016,
+      0.092 + upwardSupportFollow * 0.032,
+      0.014 - upwardSupportFollow * 0.028,
+    );
+    this.skeleton.rightArm.clavicle.position.set(
+      restClavX,
+      0.092 + upwardSupportFollow * 0.016,
+      0.014 - upwardSupportFollow * 0.012,
+    );
+
     this.skeleton.leftArm.clavicle.rotation.order = 'YXZ';
     this.skeleton.rightArm.clavicle.rotation.order = 'YXZ';
     this.skeleton.leftArm.clavicle.rotation.set(
-      rigState.aimPitch * 0.14 * clavAimWeight,
-      -protract - leftClavProtract - leanFollowL + rigState.aimYaw * 0.20 * clavAimWeight,
-      -rigState.aimPitch * 0.12 * clavAimWeight,
+      clavElevPitch * 0.14 * clavAimWeight,
+      -protract - leftClavProtract - leanFollowL - upwardSupportFollow * 0.16 + rigState.aimYaw * 0.20 * clavAimWeight,
+      -clavElevPitch * 0.14 * clavAimWeight,
     );
     this.skeleton.rightArm.clavicle.rotation.set(
-      rigState.aimPitch * 0.14 * clavAimWeight,
+      clavElevPitch * 0.14 * clavAimWeight,
       protract + rightClavProtract + leanFollowR + rigState.aimYaw * 0.20 * clavAimWeight,
-      rigState.aimPitch * 0.12 * clavAimWeight,
+      clavElevPitch * 0.12 * clavAimWeight,
     );
 
     this.skeleton.root.updateMatrixWorld(true);
@@ -2712,8 +2744,10 @@ export class CharacterAnimator {
     //  - Unarmed Non-ADS Ready: natural downward-back hang by sides
     //  - Unarmed ADS Guard: pulled downward & inward tight against ribs (x: ±0.20, y: -0.45, z: +0.10 relative to chest cam)
     //  - Armed / Vault / Grenade: ergonomic flare
+    const effectiveAimPitch = THREE.MathUtils.clamp(controller.torsoPitch + rigState.aimPitch, -0.95, 1.25);
+    const upwardPoleLift = Math.max(0, effectiveAimPitch);
     this._aimPoleEuler.set(
-      rigState.aimPitch * 0.55,
+      effectiveAimPitch * 0.62,
       rigState.aimYaw * 0.70,
       -controller.getCurrentLean() * 0.85,
       'YXZ',
@@ -2747,7 +2781,11 @@ export class CharacterAnimator {
         .set(0.35 + ptW * 0.09, -0.55 + ptW * 0.14, 0.28 - ptW * 0.03)
         .applyEuler(this._aimPoleEuler)
         .add(this._shoulderR);
-      this._poleL.set(-0.35, -0.55, 0.28).applyEuler(this._aimPoleEuler).add(this._shoulderL);
+      // Tuck support elbow cleanly underneath the elevated handguard when pitching upward in ADS
+      this._poleL
+        .set(-0.35 + upwardPoleLift * 0.10, -0.55 + upwardPoleLift * 0.12, 0.28 - upwardPoleLift * 0.06)
+        .applyEuler(this._aimPoleEuler)
+        .add(this._shoulderL);
     }
     if (pdaActiveHold) {
       this._pdaPoleR.set(this._shoulderR.x + 0.30, this._shoulderR.y - 0.50, this._shoulderR.z + 0.16);
@@ -3540,6 +3578,41 @@ export class CharacterAnimator {
 
     this._lTargetRoot.copy(this.leftHandBlender.position);
     this._lQuatRoot.copy(this.leftHandBlender.quaternion);
+
+    // 3b. Pre-IK Scapular Reach Assist (Zero Sight-Line Shift):
+    //     During ADS/Canted/Point-Aim on long primary rifles pitched upward, the sight-locked
+    //     handguard socket rises above the static torso pivot. Glide the support clavicle smoothly
+    //     along the shoulder->socket vector (bounded to anatomical scapular travel) so the left palm
+    //     stays 0.0 mm locked to the handguard with a natural elbow micro-bend and zero sight drift.
+    if (
+      !isUnarmed &&
+      !leftOverridden &&
+      this.weaponRig.hasLeftHandSocket &&
+      vaultPinL < 0.05 &&
+      !pdaActiveHold &&
+      !grenadeActiveHold
+    ) {
+      this._scapulaDeltaRoot.subVectors(this._lTargetRoot, this._shoulderL);
+      const leftDist = this._scapulaDeltaRoot.length();
+      const comfortableReachL = (armL.upperLen + armL.lowerLen) * 0.965;
+      if (leftDist > comfortableReachL && leftDist > 1e-5) {
+        const glideDist = Math.min(leftDist - comfortableReachL, 0.15);
+        this._scapulaDeltaRoot.multiplyScalar(glideDist / leftDist);
+        // Shift left clavicle in chest local space so deltoid/bicep/shoulderPivot move as one unit
+        this._scapulaStartWorld.copy(this._shoulderL);
+        this._scapulaTargetWorld.copy(this._shoulderL).add(this._scapulaDeltaRoot);
+        this.skeleton.root.localToWorld(this._scapulaStartWorld);
+        this.skeleton.root.localToWorld(this._scapulaTargetWorld);
+        this.skeleton.chest.worldToLocal(this._scapulaStartWorld);
+        this.skeleton.chest.worldToLocal(this._scapulaTargetWorld);
+        armL.clavicle.position.add(this._scapulaTargetWorld.sub(this._scapulaStartWorld));
+        armL.clavicle.updateMatrixWorld(true);
+        armL.shoulderPivot.getWorldPosition(this._shoulderL);
+        this.skeleton.root.worldToLocal(this._shoulderL);
+        // Keep left elbow pole co-moving with the glided shoulder
+        this._poleL.add(this._scapulaDeltaRoot);
+      }
+    }
 
     // 4. Solve Left Arm 2-Bone IK + Forearm-Aligned Zero-Hyperextension Wrist Orientation
     solveTwoBoneIK(this._shoulderL, this._lTargetRoot, this._poleL, armL.upperLen, armL.lowerLen, this.leftArmIK);
