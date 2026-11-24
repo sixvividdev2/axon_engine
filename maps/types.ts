@@ -11,14 +11,133 @@ import type { NightLightEntry, WettableSurfaceEntry } from '../engine/world/Weat
 import type { WindShaderUniforms } from '../engine/world/WindFoliageShader';
 
 export type TopLevelModeId = 'playground' | 'battle' | 'infection';
-export type BattleRuleId = 'tdm' | 'ffa';
+export type BattleRuleId =
+  | 'tdm'
+  | 'ffa'
+  | 'conquest'
+  | 'ctf'
+  | 'koth'
+  | 'kc_tdm'
+  | 'kc_ffa';
 export type BotDifficultyId = 'recruit' | 'tactical' | 'veteran';
+
+export const ALL_BATTLE_RULES: readonly BattleRuleId[] = [
+  'tdm',
+  'ffa',
+  'conquest',
+  'ctf',
+  'koth',
+  'kc_tdm',
+  'kc_ffa',
+];
+
+export function isValidBattleRule(val: unknown): val is BattleRuleId {
+  return (
+    val === 'tdm' ||
+    val === 'ffa' ||
+    val === 'conquest' ||
+    val === 'ctf' ||
+    val === 'koth' ||
+    val === 'kc_tdm' ||
+    val === 'kc_ffa'
+  );
+}
+
+/** True for all team-based Battle rules (Team A vs Team B); false for FFA / Kill Confirmed FFA */
+export function isTeamBattleRule(rule: BattleRuleId): boolean {
+  return rule !== 'ffa' && rule !== 'kc_ffa';
+}
+
+export function isFreeForAllBattleRule(rule: BattleRuleId): boolean {
+  return rule === 'ffa' || rule === 'kc_ffa';
+}
+
+export function isKillConfirmedRule(rule: BattleRuleId): boolean {
+  return rule === 'kc_tdm' || rule === 'kc_ffa';
+}
+
+export function formatBattleRuleName(rule: BattleRuleId): string {
+  switch (rule) {
+    case 'tdm':
+      return 'Team Deathmatch';
+    case 'ffa':
+      return 'Free-For-All';
+    case 'conquest':
+      return 'Conquest';
+    case 'ctf':
+      return 'Capture the Flag';
+    case 'koth':
+      return 'King of the Hill';
+    case 'kc_tdm':
+      return 'Kill Confirmed (TDM)';
+    case 'kc_ffa':
+      return 'Kill Confirmed (FFA)';
+  }
+}
+
+export function formatBattleRuleShort(rule: BattleRuleId): string {
+  switch (rule) {
+    case 'tdm':
+      return 'TDM';
+    case 'ffa':
+      return 'FFA';
+    case 'conquest':
+      return 'CONQUEST';
+    case 'ctf':
+      return 'CTF';
+    case 'koth':
+      return 'KOTH';
+    case 'kc_tdm':
+      return 'KC · TDM';
+    case 'kc_ffa':
+      return 'KC · FFA';
+  }
+}
+
+export function getDefaultScoreLimitForRule(rule: BattleRuleId): number {
+  switch (rule) {
+    case 'tdm':
+      return 30;
+    case 'ffa':
+      return 20;
+    case 'conquest':
+      return 500;
+    case 'ctf':
+      return 3;
+    case 'koth':
+      return 150;
+    case 'kc_tdm':
+      return 30;
+    case 'kc_ffa':
+      return 20;
+  }
+}
+
+export function getDefaultMatchDurationSecForRule(rule: BattleRuleId): number {
+  switch (rule) {
+    case 'conquest':
+      return 480;
+    case 'koth':
+      return 420;
+    case 'ctf':
+      return 420;
+    case 'kc_tdm':
+    case 'kc_ffa':
+    case 'tdm':
+    case 'ffa':
+      return 480;
+  }
+}
 
 export interface BattleMatchConfig {
   mapId: string;
   rule: BattleRuleId;
   botCount: number;
   killLimit: number;
+  /** Optional mode-specific score target (territory pts, flags, hill pts, or dogtags) */
+  scoreLimit?: number;
+  /** Optional match clock duration in seconds (used by Conquest & objective modes) */
+  matchDurationSec?: number;
   difficulty: BotDifficultyId;
   primaryWeaponId: string;
   secondaryWeaponId: string;
@@ -161,6 +280,56 @@ export interface MapEnvBindings {
   nightLights?: NightLightEntry[];
 }
 
+export type ConquestPoiKind = 'fob' | 'outpost' | 'checkpoint';
+
+export interface ConquestHqDef {
+  id: string;
+  team: 'A' | 'B';
+  label: string;
+  position: [number, number, number];
+  safeRadiusM: number;
+  spawnPoints: SpawnPoint[];
+}
+
+export interface ConquestPoiDef {
+  id: string;
+  code: string;
+  label: string;
+  kind: ConquestPoiKind;
+  position: [number, number, number];
+  captureRadiusM: number;
+  /** Territory control weight earned per second while owned */
+  territoryWeight: number;
+  initialOwner?: 'A' | 'B' | null;
+  /** Forward respawn pads (used by FOBs when friendly and uncontested) */
+  spawnPoints?: SpawnPoint[];
+  /** Road heading in radians for optional checkpoint barricade orientation */
+  roadYaw?: number;
+  /** True if map already built custom checkpoint barricades so mode prop factory only adds banner/ring */
+  hasBuiltInProps?: boolean;
+}
+
+export interface CtfFlagAnchorDef {
+  team: 'A' | 'B';
+  label: string;
+  position: [number, number, number];
+}
+
+export interface KothHillDef {
+  id: string;
+  label: string;
+  position: [number, number, number];
+  radiusM: number;
+}
+
+export interface MapBattleObjectives {
+  hqA: ConquestHqDef;
+  hqB: ConquestHqDef;
+  conquestPois: ConquestPoiDef[];
+  ctfFlags: [CtfFlagAnchorDef, CtfFlagAnchorDef];
+  kothHills: KothHillDef[];
+}
+
 export interface BuiltMapInstance {
   id: string;
   name: string;
@@ -175,6 +344,8 @@ export interface BuiltMapInstance {
     playerStart: SpawnPoint;
     zombieSpawners: ZombieSpawnerDef[];
   };
+  /** Battle objective layouts for Conquest, CTF, and King of the Hill */
+  battleObjectives?: MapBattleObjectives;
   /** Optional terrain height sampler for rolling outdoor maps */
   terrainHeightAt?: (x: number, z: number) => number;
   /** Interactive barricaded zombie windows */
@@ -212,7 +383,10 @@ export interface IMapDefinition {
     | 'cqb_pripyat'
     | 'forest_compound'
     | 'korsakov_substation'
+    | 'volga_corridor'
     | 'kino_theater'
+    | 'stalingrad_depot'
+    | 'objekt_47'
     | 'locked_depot'
     | 'locked_bunker';
   build: (

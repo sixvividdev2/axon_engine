@@ -1,5 +1,5 @@
 import React from 'react';
-import { TimeOfDayStartSetting, WeatherPresetId } from '../data/multiplayer';
+import { isInfectionMapId, TimeOfDayStartSetting, WeatherPresetId } from '../data/multiplayer';
 
 export const WEATHER_PRESET_OPTIONS: ReadonlyArray<{ id: WeatherPresetId; label: string }> = [
   { id: 'auto', label: 'Auto' },
@@ -51,7 +51,7 @@ export const WeatherTimeControls: React.FC<WeatherTimeControlsProps> = ({
   onChangeWeather,
   onChangeTimeOfDay,
 }) => {
-  const isIndoorFixed = mapId === 'kino_theater';
+  const isIndoorFixed = isInfectionMapId(mapId);
   const isAutoTime = timeOfDayStart === 'auto' || timeOfDayStart === undefined;
   const numericTime = typeof timeOfDayStart === 'number' ? timeOfDayStart : 12;
 

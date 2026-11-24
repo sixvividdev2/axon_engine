@@ -9,6 +9,13 @@ import {
   FacialExpressionIntent,
 } from '../bodycam-sdk/character/FacialExpressionController';
 
+import {
+  computeCrawlerBoneMetrics,
+  CrawlerClawCycleSample,
+  createCrawlerClawCycleSample,
+  evaluateCrawlerClawCycle,
+} from './CrawlerGroundPlaneSolver';
+
 export type InfectedArchetypeId = 'quarantine_guard' | 'hazmat_tech' | 'infected_civilian';
 
 export type InfectedZombieVariant = 'walker' | 'runner' | 'crawler';
@@ -30,6 +37,12 @@ export interface InfectedPoseInput {
   gazeTargetWorld?: Readonly<THREE.Vector3> | null;
   distanceToCameraM?: number;
   isVisible?: boolean;
+  /** Solved world floor normal when CrawlerGroundPlaneSolver has oriented rig.root */
+  groundNormal?: Readonly<THREE.Vector3> | null;
+  /** Root lift offset applied to rig.root along groundNormal (m) */
+  rootLiftOffsetM?: number;
+  /** True when caller already applied root lift & floor-normal quaternion to rig.root */
+  crawlerGroundSolved?: boolean;
 }
 
 export interface BuiltInfectedZombieRig {
@@ -71,6 +84,10 @@ export interface BuiltInfectedZombieRig {
   hunchBias: number;
   deathFallSide: -1 | 1;
   heightScale: number;
+  /** Prone crawler anatomical torso bone half-height (m, scaled) */
+  crawlerBoneHeightM: number;
+  /** Bone-height-derived root lift offset along floor normal (m, scaled) */
+  crawlerRootLiftOffsetM: number;
 }
 
 interface ZombieMaterialSet {
@@ -274,6 +291,39 @@ export class InfectedZombieRigLibrary {
   private readonly exposedBoneMat: THREE.MeshStandardMaterial;
   private readonly freshSeveredBloodMat: THREE.MeshStandardMaterial;
   private readonly archetypeMats: Record<InfectedArchetypeId, ZombieMaterialSet>;
+
+  // Zero-GC scratch state for analytical 2-bone grounded crawler arm IK
+  private readonly _clawCycle: CrawlerClawCycleSample = createCrawlerClawCycleSample();
+  private readonly _unitScale = new THREE.Vector3(1, 1, 1);
+  private readonly _mPelvis = new THREE.Matrix4();
+  private readonly _mSpineLower = new THREE.Matrix4();
+  private readonly _mSpineLowerBP = new THREE.Matrix4();
+  private readonly _mSpineUpper = new THREE.Matrix4();
+  private readonly _mSpineUpperBP = new THREE.Matrix4();
+  private readonly _qSpineUpperBP = new THREE.Quaternion();
+  private readonly _qSpineUpperBPInv = new THREE.Quaternion();
+  private readonly _shoulderBP = new THREE.Vector3();
+  private readonly _targetHandBP = new THREE.Vector3();
+  private readonly _poleDirBP = new THREE.Vector3();
+  private readonly _toTarget = new THREE.Vector3();
+  private readonly _armDir = new THREE.Vector3();
+  private readonly _bendDir = new THREE.Vector3();
+  private readonly _elbowBP = new THREE.Vector3();
+  private readonly _xU = new THREE.Vector3();
+  private readonly _yU = new THREE.Vector3();
+  private readonly _zU = new THREE.Vector3();
+  private readonly _xF = new THREE.Vector3();
+  private readonly _yF = new THREE.Vector3();
+  private readonly _zF = new THREE.Vector3();
+  private readonly _xH = new THREE.Vector3();
+  private readonly _yH = new THREE.Vector3();
+  private readonly _zH = new THREE.Vector3();
+  private readonly _ikBasis = new THREE.Matrix4();
+  private readonly _qUpperBP = new THREE.Quaternion();
+  private readonly _qUpperBPInv = new THREE.Quaternion();
+  private readonly _qForeBP = new THREE.Quaternion();
+  private readonly _qForeBPInv = new THREE.Quaternion();
+  private readonly _qHandBP = new THREE.Quaternion();
 
   constructor() {
     const track = <T extends { dispose: () => void }>(res: T): T => {
@@ -834,6 +884,7 @@ export class InfectedZombieRigLibrary {
     const rightArm = buildArm(1);
     spineUpper.add(leftArm.shoulder, rightArm.shoulder);
 
+    const crawlerMetrics = computeCrawlerBoneMetrics(heightScale);
     const builtRig: BuiltInfectedZombieRig = {
       archetype,
       variant: initialVariant,
@@ -882,6 +933,8 @@ export class InfectedZombieRigLibrary {
       hunchBias: 0.16 + ((h >> 6) % 5) * 0.032,
       deathFallSide: (h & 4) === 0 ? -1 : 1,
       heightScale,
+      crawlerBoneHeightM: crawlerMetrics.boneHalfHeightM,
+      crawlerRootLiftOffsetM: crawlerMetrics.rootLiftOffsetM,
     };
     this.setZombieVariant(builtRig, initialVariant);
     return builtRig;
@@ -915,6 +968,138 @@ export class InfectedZombieRigLibrary {
   }
 
   /**
+   * Solves exact zero-GC 2-bone analytical arm IK in bodyPivot local space so crawler claws
+   * stay strictly anchored to the ground plane during the alternating pull stroke without
+   * waving in the air or clipping into the floor.
+   */
+  private solveCrawlerArmIK(
+    shoulder: THREE.Group,
+    elbow: THREE.Group,
+    handPivot: THREE.Group,
+    side: -1 | 1,
+    targetX: number,
+    targetY: number,
+    targetZ: number,
+    floorYLocal: number,
+    wristPitchRad: number,
+    elbowPoleY = 0.48,
+  ): void {
+    const L1 = 0.30; // Upper arm length (matches buildArm)
+    const L2 = 0.28; // Forearm length (matches buildArm)
+
+    // 1. Shoulder world position in unscaled bodyPivot space
+    this._shoulderBP.copy(shoulder.position).applyMatrix4(this._mSpineUpperBP);
+    this._targetHandBP.set(targetX, Math.max(floorYLocal + 0.044, targetY), targetZ);
+
+    // 2. Clamp distance inside analytical 2-bone reach envelope
+    this._toTarget.subVectors(this._targetHandBP, this._shoulderBP);
+    const rawDist = this._toTarget.length();
+    const minDist = Math.abs(L1 - L2) + 0.04;
+    const maxDist = L1 + L2 - 0.004;
+    const d = THREE.MathUtils.clamp(rawDist, minDist, maxDist);
+
+    if (rawDist > 1e-5) {
+      this._armDir.copy(this._toTarget).divideScalar(rawDist);
+    } else {
+      this._armDir.set(0, -0.35, -0.94).normalize();
+    }
+    if (rawDist > maxDist) {
+      this._targetHandBP.copy(this._shoulderBP).addScaledVector(this._armDir, maxDist);
+      if (this._targetHandBP.y < floorYLocal + 0.044) {
+        this._targetHandBP.y = floorYLocal + 0.044;
+      }
+    }
+
+    // 3. Outward-and-upward elbow pole vector (keeps elbows flared laterally & clear of floor)
+    this._poleDirBP.set(side * 0.88, elbowPoleY, 0.22).normalize();
+    this._bendDir.copy(this._poleDirBP).addScaledVector(this._armDir, -this._poleDirBP.dot(this._armDir));
+    if (this._bendDir.lengthSq() < 1e-6) {
+      this._bendDir.set(side, 0.5, 0).normalize();
+    } else {
+      this._bendDir.normalize();
+    }
+
+    // Law of cosines for elbow position in bodyPivot space
+    const cosAlpha = THREE.MathUtils.clamp((L1 * L1 + d * d - L2 * L2) / (2 * L1 * d), -1, 1);
+    const sinAlpha = Math.sqrt(Math.max(0, 1 - cosAlpha * cosAlpha));
+    this._elbowBP
+      .copy(this._shoulderBP)
+      .addScaledVector(this._armDir, L1 * cosAlpha)
+      .addScaledVector(this._bendDir, L1 * sinAlpha);
+
+    // Guarantee elbow joint clears the floor plane cleanly (elbow sphere radius = 0.046m)
+    const minElbowY = floorYLocal + 0.095;
+    if (this._elbowBP.y < minElbowY) {
+      this._elbowBP.y = minElbowY;
+      this._elbowBP.sub(this._shoulderBP).normalize().multiplyScalar(L1).add(this._shoulderBP);
+    }
+
+    // 4. Upper arm orientation in bodyPivot space (bone axis is -Y)
+    this._yU.subVectors(this._shoulderBP, this._elbowBP);
+    if (this._yU.lengthSq() < 1e-6) {
+      this._yU.set(0, 1, 0);
+    } else {
+      this._yU.normalize();
+    }
+    this._xU.crossVectors(this._yU, this._bendDir);
+    if (this._xU.lengthSq() < 1e-6) {
+      this._xU.set(0, 1, 0);
+    } else {
+      this._xU.normalize();
+    }
+    this._zU.crossVectors(this._xU, this._yU).normalize();
+    this._xU.crossVectors(this._yU, this._zU).normalize();
+    this._ikBasis.makeBasis(this._xU, this._yU, this._zU);
+    this._qUpperBP.setFromRotationMatrix(this._ikBasis);
+
+    // 5. Forearm orientation in bodyPivot space (bone axis is -Y, sharing elbow hinge axis _xU)
+    this._yF.subVectors(this._elbowBP, this._targetHandBP);
+    if (this._yF.lengthSq() < 1e-6) {
+      this._yF.copy(this._yU);
+    } else {
+      this._yF.normalize();
+    }
+    this._zF.crossVectors(this._xU, this._yF);
+    if (this._zF.lengthSq() < 1e-6) {
+      this._zF.copy(this._zU);
+    } else {
+      this._zF.normalize();
+    }
+    this._xF.crossVectors(this._yF, this._zF).normalize();
+    this._ikBasis.makeBasis(this._xF, this._yF, this._zF);
+    this._qForeBP.setFromRotationMatrix(this._ikBasis);
+
+    // 6. Grounded palm orientation: palm face (-Z) faces floor (-Y), clawed fingers (-Y) point forward (-Z)
+    const sP = Math.sin(wristPitchRad);
+    const cP = Math.cos(wristPitchRad);
+    this._yH.set(0, -sP, cP);
+    this._zH.set(0, cP, sP);
+    this._xH.crossVectors(this._yH, this._zH).normalize();
+    this._ikBasis.makeBasis(this._xH, this._yH, this._zH);
+    this._qHandBP.setFromRotationMatrix(this._ikBasis);
+
+    // 7. Write local bone quaternions (Three.js auto-syncs Euler rotation cleanly)
+    shoulder.quaternion.copy(this._qSpineUpperBPInv).multiply(this._qUpperBP);
+    this._qUpperBPInv.copy(this._qUpperBP).invert();
+    elbow.quaternion.copy(this._qUpperBPInv).multiply(this._qForeBP);
+    this._qForeBPInv.copy(this._qForeBP).invert();
+    handPivot.quaternion.copy(this._qForeBPInv).multiply(this._qHandBP);
+  }
+
+  /**
+   * Computes spineUpper's transform in unscaled bodyPivot space from current local pelvis/spine rotations.
+   */
+  private computeSpineUpperInBodyPivot(rig: BuiltInfectedZombieRig): void {
+    this._mPelvis.compose(rig.pelvisGroup.position, rig.pelvisGroup.quaternion, this._unitScale);
+    this._mSpineLower.compose(rig.spineLower.position, rig.spineLower.quaternion, this._unitScale);
+    this._mSpineLowerBP.multiplyMatrices(this._mPelvis, this._mSpineLower);
+    this._mSpineUpper.compose(rig.spineUpper.position, rig.spineUpper.quaternion, this._unitScale);
+    this._mSpineUpperBP.multiplyMatrices(this._mSpineLowerBP, this._mSpineUpper);
+    this._qSpineUpperBP.setFromRotationMatrix(this._mSpineUpperBP);
+    this._qSpineUpperBPInv.copy(this._qSpineUpperBP).invert();
+  }
+
+  /**
    * Zero-GC procedural anatomical pose evaluator covering shamble -> frantic runner sprint,
    * prone legless crawler dragging/clawing, two-handed window plank tearing, 3-stage window sill vault,
    * melee lunge windup, bullet hit stagger, and multi-joint buckling death collapse.
@@ -923,20 +1108,27 @@ export class InfectedZombieRigLibrary {
     // Reset base pivot transforms cleanly
     rig.bodyPivot.position.set(0, 0, 0);
     rig.bodyPivot.rotation.set(0, 0, 0);
+    rig.pelvisGroup.rotation.order = 'XYZ';
     rig.pelvisGroup.position.set(0, rig.restPelvisY, 0);
     rig.pelvisGroup.rotation.set(0, 0, 0);
 
     const activeVariant = input.variant ?? rig.variant;
     const isCrawler = activeVariant === 'crawler' || rig.legsSevered;
 
-    // Dedicated legless Crawler prone pose suite (face-down belly crawl facing -Z, ankle-swipe, vault, stagger, flat death)
-    // NOTE: Zombie front is -Z and spine grows along +Y. Negative X rotation on pelvisGroup pitches +Y toward -Z
-    // (belly-down prone with head forward and severed stumps trailing behind at +Z), while keeping bodyPivot unrotated
-    // at y = 0 so the torso NEVER swings underground!
+    // Dedicated legless Crawler prone pose suite (oriented strictly to ground plane by CrawlerGroundPlaneSolver):
+    // - Local +Y is floorNormal, local -Z is floor-projected forward, local +X is floor-projected right
+    // - Root transform carries bone-height lift offset along floorNormal (or bodyPivot fallback when standalone)
+    // - Grounded alternating claw-pull stroke driven by analytical 2-bone arm IK, synced to torso twist & forward velocity
     if (isCrawler) {
+      const metrics = computeCrawlerBoneMetrics(rig.heightScale);
+      const floorYLocal = metrics.floorYInBodyPivotM;
+      // When called standalone (without CrawlerGroundPlaneSolver lifting rig.root), apply the exact same
+      // bone-height lift on bodyPivot so standalone rig evaluations also maintain zero floor clipping.
+      if (!input.crawlerGroundSolved) {
+        rig.bodyPivot.position.y = metrics.rootLiftOffsetM;
+      }
+
       const wc = input.walkCycle;
-      const sinW = Math.sin(wc);
-      const cosW = Math.cos(wc);
       const stag = THREE.MathUtils.clamp(input.staggerRatio, 0, 1);
       rig.pelvisGroup.rotation.order = 'YXZ';
 
@@ -944,111 +1136,202 @@ export class InfectedZombieRigLibrary {
         const t = THREE.MathUtils.clamp(input.deathProgress, 0, 1);
         const ease = 1 - Math.pow(1 - t, 2.2);
         const side = rig.deathFallSide;
-        rig.pelvisGroup.position.set(0, THREE.MathUtils.lerp(0.175, 0.16, ease), 0.26);
+        rig.pelvisGroup.position.set(0, THREE.MathUtils.lerp(metrics.pelvisLocalBaseYM, 0.098, ease), 0.27);
         rig.pelvisGroup.rotation.set(
-          THREE.MathUtils.lerp(-1.38, -1.48, ease),
-          side * 0.14 * ease,
+          THREE.MathUtils.lerp(-1.44, -1.50, ease),
           side * 0.12 * ease,
+          side * 0.10 * ease,
         );
-        rig.spineLower.rotation.set(0.18 * (1 - ease) + 0.05 * ease, 0, 0);
-        rig.spineUpper.rotation.set(0.24 * (1 - ease) + 0.06 * ease, 0, 0);
-        rig.neckPivot.rotation.set(THREE.MathUtils.lerp(0.84, 0.34, ease), side * 0.34 * ease, side * 0.16 * ease);
+        rig.spineLower.rotation.set(0.12 * (1 - ease) + 0.04 * ease, 0, 0);
+        rig.spineUpper.rotation.set(0.16 * (1 - ease) + 0.04 * ease, 0, 0);
+        rig.neckPivot.rotation.set(
+          THREE.MathUtils.lerp(1.04, 0.36, ease),
+          side * 0.34 * ease,
+          side * 0.16 * ease,
+        );
         rig.headGroup.rotation.set(0.06, 0, 0);
         rig.jawPivot.rotation.x = 0.28 * ease;
-        // Severed stumps stay flat on top of floor behind pelvis (+Z)
-        rig.leftHip.rotation.set(-0.08 * (1 - ease) - 0.06 * ease, 0, -0.22);
-        rig.rightHip.rotation.set(-0.08 * (1 - ease) - 0.06 * ease, 0, 0.24);
-        // Arms splay forward-outward flat on top of the floor (zero floor clipping)
-        rig.leftShoulder.rotation.set(
-          THREE.MathUtils.lerp(1.52, 2.90, ease),
-          0.22,
-          -0.38 - 0.44 * ease,
+        // Severed stumps settle flat on top of floor behind pelvis (+Z)
+        rig.leftHip.rotation.set(-0.08, 0, -0.22);
+        rig.rightHip.rotation.set(-0.08, 0, 0.24);
+
+        // Splay both arms forward-outward flat on top of the floor plane via 2-bone IK (zero clipping)
+        this.computeSpineUpperInBodyPivot(rig);
+        this.solveCrawlerArmIK(
+          rig.leftShoulder,
+          rig.leftElbow,
+          rig.leftHandPivot,
+          -1,
+          -THREE.MathUtils.lerp(0.28, 0.42, ease),
+          floorYLocal + 0.052,
+          -THREE.MathUtils.lerp(0.48, 0.56, ease),
+          floorYLocal,
+          0.08,
+          0.32,
         );
-        rig.leftElbow.rotation.set(THREE.MathUtils.lerp(0.65, 0.14, ease), 0, 0);
-        rig.leftHandPivot.rotation.set(0.22, 0, 0);
-        rig.rightShoulder.rotation.set(
-          THREE.MathUtils.lerp(1.48, 2.86, ease),
-          -0.22,
-          0.38 + 0.46 * ease,
+        this.solveCrawlerArmIK(
+          rig.rightShoulder,
+          rig.rightElbow,
+          rig.rightHandPivot,
+          1,
+          THREE.MathUtils.lerp(0.28, 0.44, ease),
+          floorYLocal + 0.052,
+          -THREE.MathUtils.lerp(0.46, 0.54, ease),
+          floorYLocal,
+          0.08,
+          0.32,
         );
-        rig.rightElbow.rotation.set(THREE.MathUtils.lerp(0.68, 0.16, ease), 0, 0);
-        rig.rightHandPivot.rotation.set(0.22, 0, 0);
         this.stepZombieFacial(rig, input);
         return;
       }
 
-      const moveBlend =
-        input.mode === 'vault' || input.mode === 'tear'
-          ? 0.85
-          : THREE.MathUtils.clamp(input.speedMps / 0.45, 0, 1);
       const isVault = input.mode === 'vault';
       const isTear = input.mode === 'tear';
-      const heaveY = Math.abs(sinW) * 0.024 * moveBlend;
-      const basePelvisY = isVault ? 0.22 + Math.sin(THREE.MathUtils.clamp(input.vaultT, 0, 1) * Math.PI) * 0.08 : 0.175;
-      rig.pelvisGroup.position.set(sinW * 0.032 * moveBlend, basePelvisY + heaveY, 0.26);
+      const moveBlend =
+        isVault || isTear ? 0.88 : THREE.MathUtils.clamp(input.speedMps / 0.35, 0, 1);
+
+      // Evaluate synchronized alternating claw-pull cycle (same math driving InfectionZombieAI forward velocity)
+      const cycle = evaluateCrawlerClawCycle(isTear ? input.tearPhase : wc, moveBlend, this._clawCycle);
+
+      const basePelvisY = isVault
+        ? metrics.pelvisLocalBaseYM + 0.05 + Math.sin(THREE.MathUtils.clamp(input.vaultT, 0, 1) * Math.PI) * 0.08
+        : metrics.pelvisLocalBaseYM;
+
+      // Pelvis & spine lie low along the floor plane, twisting and surging in lockstep with the active pulling arm
+      rig.pelvisGroup.position.set(
+        -cycle.torsoTwistRad * 0.14,
+        basePelvisY + cycle.torsoHeaveY,
+        0.28 + cycle.torsoSurgeZ,
+      );
       rig.pelvisGroup.rotation.set(
-        -1.38 + stag * 0.16 + (isTear ? 0.18 : 0),
-        sinW * 0.16 * moveBlend,
-        cosW * 0.10 * moveBlend,
+        -1.44 + stag * 0.14 + (isTear ? 0.20 : 0),
+        -cycle.torsoTwistRad * 0.55,
+        cycle.torsoRollRad,
       );
 
-      // Severed upper thighs & exposed femur bone stumps trail horizontally behind pelvis (+Z) cleanly above floor
-      rig.leftHip.rotation.set(-0.14 + sinW * 0.07 * moveBlend, 0, -0.18);
-      rig.rightHip.rotation.set(-0.14 - sinW * 0.07 * moveBlend, 0, 0.18);
+      // Severed upper thighs & jagged exposed femur bone stumps drag horizontally behind pelvis (+Z) cleanly above floor
+      const stumpDrag = (cycle.left.reach01 - cycle.right.reach01) * 0.07 * moveBlend;
+      rig.leftHip.rotation.set(-0.10 + stumpDrag, 0, -0.18);
+      rig.rightHip.rotation.set(-0.10 - stumpDrag, 0, 0.18);
 
-      // Positive +X spine extension arches chest up off floor so crawler crawls belly-down with glowing yellow eyes forward
-      rig.spineLower.rotation.set(0.18, -sinW * 0.14 * moveBlend, 0);
+      // Torso counter-twists toward pulling shoulder and arches gently so glowing yellow eyes stay locked forward
+      rig.spineLower.rotation.set(0.12, cycle.torsoTwistRad * 0.65, -cycle.torsoRollRad * 0.35);
       rig.spineUpper.rotation.set(
-        0.26 + stag * 0.12 + (isTear ? 0.22 : 0),
-        -sinW * 0.18 * moveBlend,
-        cosW * 0.08 * moveBlend,
+        0.16 + stag * 0.12 + (isTear ? 0.22 : 0) + cycle.combinedPullDrive01 * 0.04,
+        cycle.torsoTwistRad * 0.90,
+        -cycle.torsoRollRad * 0.45,
       );
-      const twitch = Math.sin(input.elapsedSec * 7.8 + rig.headTiltBias * 12) * 0.045;
-      rig.neckPivot.rotation.set(0.84 - stag * 0.18 - (isTear ? 0.16 : 0), sinW * 0.10, rig.headTiltBias + twitch);
-      rig.headGroup.rotation.set(0.08, twitch, 0);
+
+      const twitch = Math.sin(input.elapsedSec * 7.8 + rig.headTiltBias * 12) * 0.042;
+      rig.neckPivot.rotation.set(
+        1.06 - stag * 0.16 - (isTear ? 0.14 : 0),
+        -cycle.torsoTwistRad * 0.45,
+        rig.headTiltBias + twitch,
+      );
+      rig.headGroup.rotation.set(0.06, twitch, 0);
 
       const isWindup = input.mode === 'windup' || input.windupProgress > 0.01;
       if (isWindup) {
-        // Low predatory ankle-swipe lunge: torso props up slightly, arms slash forward across player's shins
+        // Predatory low ankle-swipe lunge: off-hand braces on floor while primary arm slashes across shins
         const wp = THREE.MathUtils.clamp(input.windupProgress, 0, 1);
-        const swipe = wp < 0.48 ? -(wp / 0.48) : (wp - 0.48) / 0.52;
-        rig.spineUpper.rotation.x += 0.20;
-        rig.jawPivot.rotation.x = 0.48 + Math.max(0, swipe) * 0.22;
-        rig.leftShoulder.rotation.set(1.55 + swipe * 0.58, 0.30, -0.34);
-        rig.leftElbow.rotation.set(0.62 - swipe * 0.28, 0, 0);
-        rig.leftHandPivot.rotation.set(0.32, 0, 0);
-        rig.rightShoulder.rotation.set(1.48 - swipe * 0.42, -0.28, 0.34);
-        rig.rightElbow.rotation.set(0.68 + swipe * 0.22, 0, 0);
-        rig.rightHandPivot.rotation.set(0.32, 0, 0);
+        const swipe = wp < 0.45 ? wp / 0.45 : 1 - (wp - 0.45) / 0.55;
+        const strike = wp >= 0.45 ? (wp - 0.45) / 0.55 : 0;
+        rig.spineUpper.rotation.x += 0.16 * swipe;
+        rig.spineUpper.rotation.y += (strike - 0.4) * 0.28;
+        rig.jawPivot.rotation.x = 0.46 + strike * 0.24;
+
+        this.computeSpineUpperInBodyPivot(rig);
+        // Left arm slashes forward-inward at shin height
+        this.solveCrawlerArmIK(
+          rig.leftShoulder,
+          rig.leftElbow,
+          rig.leftHandPivot,
+          -1,
+          -THREE.MathUtils.lerp(0.36, 0.10, strike),
+          floorYLocal + 0.10 + swipe * 0.11,
+          -THREE.MathUtils.lerp(0.42, 0.72, strike),
+          floorYLocal,
+          0.16,
+          0.55,
+        );
+        // Right arm plants firmly on floor to anchor the slash
+        this.solveCrawlerArmIK(
+          rig.rightShoulder,
+          rig.rightElbow,
+          rig.rightHandPivot,
+          1,
+          0.27,
+          floorYLocal + 0.050,
+          -0.44,
+          floorYLocal,
+          0.04,
+          0.45,
+        );
+      } else if (isTear) {
+        // Reaching up toward lower barricaded window plank while staying grounded on pelvis
+        rig.jawPivot.rotation.x = 0.28 + cycle.combinedPullDrive01 * 0.18;
+        this.computeSpineUpperInBodyPivot(rig);
+        this.solveCrawlerArmIK(
+          rig.leftShoulder,
+          rig.leftElbow,
+          rig.leftHandPivot,
+          -1,
+          cycle.left.targetLateralX * 0.85,
+          floorYLocal + 0.22 + cycle.left.reach01 * 0.16,
+          cycle.left.targetZ - 0.04,
+          floorYLocal,
+          0.14,
+          0.52,
+        );
+        this.solveCrawlerArmIK(
+          rig.rightShoulder,
+          rig.rightElbow,
+          rig.rightHandPivot,
+          1,
+          cycle.right.targetLateralX * 0.85,
+          floorYLocal + 0.22 + cycle.right.reach01 * 0.16,
+          cycle.right.targetZ - 0.04,
+          floorYLocal,
+          0.14,
+          0.52,
+        );
       } else {
-        // Authentic alternating hand-over-hand ground-claw drag stroke:
-        // Reach forward along floor (-Z) -> plant clawed palm near floor -> pull forearm back beside ribs!
-        const lPhase = isTear ? input.tearPhase : wc;
-        const rPhase = lPhase + Math.PI;
-        const lReach = Math.sin(lPhase) * moveBlend; // +1 = reached forward, -1 = pulled back beside ribs
-        const rReach = Math.sin(rPhase) * moveBlend;
-        const lLift = Math.max(0, Math.cos(lPhase)) * moveBlend; // slight wrist lift during forward recovery swing
-        const rLift = Math.max(0, Math.cos(rPhase)) * moveBlend;
+        // Grounded alternating claw-pull locomotion:
+        // Each arm reaches far ahead (-Z), plants clawed palm flush on the floor plane, and drags
+        // forcefully backward alongside the chest while the opposite arm skims low forward to re-plant.
+        rig.jawPivot.rotation.x = 0.20 + cycle.combinedPullDrive01 * 0.16;
 
-        rig.jawPivot.rotation.x = 0.22 + Math.max(0, sinW) * 0.16;
+        this.computeSpineUpperInBodyPivot(rig);
 
-        // Parent spineUpper world pitch ≈ -0.94 rad:
-        // shoulder.rot.x = 1.92 (reach forward-down) -> 1.12 (pull back beside chest); NEVER skyward!
-        rig.leftShoulder.rotation.set(
-          1.46 + lReach * 0.44 + lLift * 0.14 + (isTear ? 0.34 : 0),
-          0.16 + lReach * 0.18,
-          -0.32 - lLift * 0.14,
+        // Slight wrist pitch: flat/clawed (0.04) during grounded pull, drooping slightly (0.14) during low recovery
+        const leftWristPitch = THREE.MathUtils.lerp(0.14, 0.04, cycle.left.contact01);
+        const rightWristPitch = THREE.MathUtils.lerp(0.14, 0.04, cycle.right.contact01);
+
+        this.solveCrawlerArmIK(
+          rig.leftShoulder,
+          rig.leftElbow,
+          rig.leftHandPivot,
+          -1,
+          cycle.left.targetLateralX,
+          floorYLocal + cycle.left.targetFloorClearanceY,
+          cycle.left.targetZ,
+          floorYLocal,
+          leftWristPitch,
+          0.46 + cycle.left.lift01 * 0.14,
         );
-        rig.leftElbow.rotation.set(0.76 - lReach * 0.34 + lLift * 0.16, 0, 0);
-        rig.leftHandPivot.rotation.set(0.45 - lReach * 0.22, 0, 0);
 
-        rig.rightShoulder.rotation.set(
-          1.46 + rReach * 0.44 + rLift * 0.14 + (isTear ? 0.34 : 0),
-          -0.16 - rReach * 0.18,
-          0.32 + rLift * 0.14,
+        this.solveCrawlerArmIK(
+          rig.rightShoulder,
+          rig.rightElbow,
+          rig.rightHandPivot,
+          1,
+          cycle.right.targetLateralX,
+          floorYLocal + cycle.right.targetFloorClearanceY,
+          cycle.right.targetZ,
+          floorYLocal,
+          rightWristPitch,
+          0.46 + cycle.right.lift01 * 0.14,
         );
-        rig.rightElbow.rotation.set(0.76 - rReach * 0.34 + rLift * 0.16, 0, 0);
-        rig.rightHandPivot.rotation.set(0.45 - rReach * 0.22, 0, 0);
       }
       this.stepZombieFacial(rig, input);
       return;

@@ -264,6 +264,8 @@ function CombatSessionView({
         : c,
     );
 
+    const localCombatant = combatants.find((c) => c.isLocalPlayer);
+    const mh = snapshot.modeHud;
     const matchInput: MatchResultInput = {
       mode: snapshot.mode,
       battleRule: snapshot.mode === 'battle' ? snapshot.battleRule : undefined,
@@ -277,6 +279,18 @@ function CombatSessionView({
       mapName: snapshot.mapName,
       matchDurationSec: snapshot.matchDurationSec,
       combatants,
+      enemyDogtags: localCombatant?.enemyDogtags ?? mh?.localEnemyTags ?? 0,
+      friendlyDogtags: localCombatant?.friendlyDogtags ?? mh?.localFriendlyTags ?? 0,
+      selfDogtagsRecovered: localCombatant?.selfDogtagsRecovered ?? mh?.localSelfTags ?? 0,
+      poiCaptures: localCombatant?.poiCaptures ?? 0,
+      territoryPoints: localCombatant?.territoryPoints ?? 0,
+      flagCaptures: localCombatant?.flagCaptures ?? 0,
+      flagReturns: localCombatant?.flagReturns ?? 0,
+      hillControlSec: localCombatant?.hillControlSec ?? 0,
+      teamScoreA: snapshot.mode === 'battle' ? snapshot.scoreA : undefined,
+      teamScoreB: snapshot.mode === 'battle' ? snapshot.scoreB : undefined,
+      teamFriendlyDogtagsA: mh?.friendlyTagsA,
+      teamFriendlyDogtagsB: mh?.friendlyTagsB,
     };
 
     if (!user) {
@@ -330,6 +344,11 @@ function CombatSessionView({
           onSelectTacticalEquipment={(id) => engine?.setTacticalEquipment(id)}
           onSelectTacticalBeltSlot={(slot) => engine?.setTacticalBeltSlot(slot)}
           onToggleTacticalMountOnBelt={(mount) => engine?.setTacticalMountOnBelt(mount)}
+          onSelectConquestLoadout={(slotId) => engine?.selectConquestLoadout(slotId)}
+          onSelectConquestSpawn={(spawnId) => engine?.selectConquestSpawn(spawnId)}
+          onConfirmConquestRedeploy={() => engine?.confirmConquestRedeploy()}
+          onCycleSpectateTarget={(dir) => engine?.cycleSpectateTarget(dir)}
+          onToggleSpectateOverview={() => engine?.toggleSpectateOverview()}
           onRematch={() => {
             committedMatchRef.current = false;
             setRankSummary(null);
@@ -435,6 +454,7 @@ function AppShell() {
               rule: st.battleRule,
               botCount: st.botsEnabled ? st.botCount : 0,
               killLimit: st.killLimit,
+              scoreLimit: st.killLimit,
               difficulty: st.botDifficulty,
               primaryWeaponId: activeLoadout.primaryWeaponId || battleConfig.primaryWeaponId,
               secondaryWeaponId: activeLoadout.secondaryWeaponId || battleConfig.secondaryWeaponId,

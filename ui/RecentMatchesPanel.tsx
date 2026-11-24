@@ -17,6 +17,7 @@ import {
   MAX_RECENT_MATCHES,
   RecentMatchRecord,
 } from '../data/progression';
+import { formatBattleRuleShort } from '../maps/types';
 
 interface RecentMatchesPanelProps {
   matches: readonly RecentMatchRecord[];
@@ -54,8 +55,9 @@ function formatModeRuleLabel(match: RecentMatchRecord): string {
     const wave = match.infectionRound && match.infectionRound > 0 ? match.infectionRound : 1;
     return `Infection · Wave ${wave}`;
   }
-  if (match.battleRule === 'ffa') return 'Battle · FFA';
-  if (match.battleRule === 'tdm') return 'Battle · TDM';
+  if (match.battleRule) {
+    return `Battle · ${formatBattleRuleShort(match.battleRule)}`;
+  }
   return 'Battle';
 }
 
@@ -489,6 +491,67 @@ export const RecentMatchesPanel: React.FC<RecentMatchesPanelProps> = ({
                     </div>
                   </div>
                 </div>
+
+                {/* Optional Mode Objective & Dogtag Telemetry */}
+                {(match.battleRule === 'kc_tdm' ||
+                  match.battleRule === 'kc_ffa' ||
+                  match.battleRule === 'conquest' ||
+                  match.battleRule === 'ctf' ||
+                  match.battleRule === 'koth') && (
+                  <div className="mt-2.5 flex flex-wrap items-center gap-x-4 gap-y-1 border-t border-neutral-800/70 pt-2 font-mono-tabular text-[11px] text-neutral-300">
+                    {(match.battleRule === 'kc_tdm' || match.battleRule === 'kc_ffa') && (
+                      <>
+                        <span>
+                          Enemy Dogtags:{' '}
+                          <strong className="text-amber-300">{match.enemyDogtags ?? 0}</strong>
+                        </span>
+                        <span>
+                          Secured Friendly Dogtags:{' '}
+                          <strong className="text-sky-300">{match.friendlyDogtags ?? 0}</strong>
+                          {(match.selfDogtagsRecovered ?? 0) > 0 && (
+                            <span className="ml-1 text-emerald-300">
+                              ({match.selfDogtagsRecovered} Own Tag)
+                            </span>
+                          )}
+                        </span>
+                      </>
+                    )}
+                    {match.battleRule === 'conquest' && (
+                      <>
+                        <span>
+                          POI Captures:{' '}
+                          <strong className="text-amber-300">{match.poiCaptures ?? 0}</strong>
+                        </span>
+                        <span>
+                          Territory Score:{' '}
+                          <strong className="text-sky-300">
+                            {Math.round(match.teamScoreA ?? 0)}–{Math.round(match.teamScoreB ?? 0)}
+                          </strong>
+                        </span>
+                      </>
+                    )}
+                    {match.battleRule === 'ctf' && (
+                      <>
+                        <span>
+                          Flag Captures:{' '}
+                          <strong className="text-amber-300">{match.flagCaptures ?? 0}</strong>
+                        </span>
+                        <span>
+                          Flag Returns:{' '}
+                          <strong className="text-sky-300">{match.flagReturns ?? 0}</strong>
+                        </span>
+                      </>
+                    )}
+                    {match.battleRule === 'koth' && (
+                      <span>
+                        Hill Control:{' '}
+                        <strong className="text-amber-300">
+                          {Math.round(match.hillControlSec ?? 0)}s
+                        </strong>
+                      </span>
+                    )}
+                  </div>
+                )}
 
                 {/* Bottom Row: Per-Weapon Elimination Stats */}
                 <div className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-1 border-t border-neutral-800/70 pt-2.5 font-mono-tabular text-xs">

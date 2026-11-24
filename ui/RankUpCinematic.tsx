@@ -3,12 +3,17 @@ import {
   Award,
   ChevronRight,
   Clock,
+  Compass,
   Crosshair,
   EyeOff,
+  Flag,
   Flame,
+  MapPin,
   Shield,
+  ShieldCheck,
   Sparkles,
   Swords,
+  Tag,
   Target,
   Trophy,
   Users,
@@ -23,6 +28,7 @@ import {
   POST_MATCH_BADGES,
   PostMatchBadgeId,
 } from '../data/progression';
+import { formatBattleRuleShort, isKillConfirmedRule } from '../maps/types';
 
 interface RankUpCinematicProps {
   summary: MatchProgressionSummary;
@@ -95,6 +101,26 @@ const BADGE_STYLE_MAP: Readonly<Record<PostMatchBadgeId, BadgeStyleSpec>> = {
     icon: Clock,
     className: 'border-purple-500/35 bg-purple-500/10 text-purple-300',
   },
+  tag_collector: {
+    icon: Tag,
+    className: 'border-amber-500/40 bg-amber-500/15 text-amber-300',
+  },
+  tag_rescuer: {
+    icon: ShieldCheck,
+    className: 'border-sky-500/40 bg-sky-500/15 text-sky-300',
+  },
+  sector_commander: {
+    icon: Compass,
+    className: 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300',
+  },
+  flag_runner: {
+    icon: Flag,
+    className: 'border-cyan-500/40 bg-cyan-500/15 text-cyan-300',
+  },
+  hill_anchor: {
+    icon: MapPin,
+    className: 'border-lime-500/40 bg-lime-500/15 text-lime-300',
+  },
 };
 
 function getBadgeTooltip(
@@ -107,6 +133,12 @@ function getBadgeTooltip(
     meleeKills: number;
     damageDealt: number;
     afkRatio?: number;
+    enemyDogtags?: number;
+    friendlyDogtags?: number;
+    selfDogtagsRecovered?: number;
+    poiCaptures?: number;
+    flagCaptures?: number;
+    hillControlSec?: number;
   },
 ): string {
   const meta = POST_MATCH_BADGES[badgeId];
@@ -127,6 +159,16 @@ function getBadgeTooltip(
       const pct = Math.round((stats.afkRatio ?? 0.5) * 100);
       return `${meta.description} (${pct}% inactive)`;
     }
+    case 'tag_collector':
+      return `${meta.description} (${stats.enemyDogtags ?? 0} enemy dogtags)`;
+    case 'tag_rescuer':
+      return `${meta.description} (${stats.friendlyDogtags ?? 0} friendly dogtags secured)`;
+    case 'sector_commander':
+      return `${meta.description} (${stats.poiCaptures ?? 0} POIs captured)`;
+    case 'flag_runner':
+      return `${meta.description} (${stats.flagCaptures ?? 0} flags captured)`;
+    case 'hill_anchor':
+      return `${meta.description} (${Math.round(stats.hillControlSec ?? 0)}s hill control)`;
   }
 }
 
@@ -450,7 +492,11 @@ export const RankUpCinematic: React.FC<RankUpCinematicProps> = ({
           <span className="text-neutral-600">·</span>
           <span className={outcomeColorClass}>{formatOutcomeLabel(summary.matchOutcome)}</span>
           <span className="text-neutral-600">·</span>
-          <span>{summary.mode}</span>
+          <span>
+            {summary.mode === 'battle' && summary.battleRule
+              ? `Battle · ${formatBattleRuleShort(summary.battleRule)}`
+              : summary.mode}
+          </span>
           {summary.mapName && (
             <>
               <span className="text-neutral-600">·</span>
@@ -618,6 +664,25 @@ export const RankUpCinematic: React.FC<RankUpCinematicProps> = ({
                 {summary.breakdown.roundBonusXp > 0 && (
                   <span>· Waves +{summary.breakdown.roundBonusXp}</span>
                 )}
+                {(summary.breakdown.enemyDogtagXp ?? 0) > 0 && (
+                  <span className="text-amber-300">
+                    · Enemy Dogtags +{summary.breakdown.enemyDogtagXp}
+                  </span>
+                )}
+                {(summary.breakdown.friendlyDogtagXp ?? 0) > 0 && (
+                  <span className="text-sky-300">
+                    ·{' '}
+                    {summary.battleRule === 'kc_ffa'
+                      ? 'Own-Tag Recovery'
+                      : 'Secured Friendly Tags'}{' '}
+                    +{summary.breakdown.friendlyDogtagXp}
+                  </span>
+                )}
+                {(summary.breakdown.objectiveXp ?? 0) > 0 && (
+                  <span className="text-emerald-300">
+                    · Objectives +{summary.breakdown.objectiveXp}
+                  </span>
+                )}
               </div>
             </div>
           </>
@@ -737,6 +802,101 @@ export const RankUpCinematic: React.FC<RankUpCinematicProps> = ({
             </section>
           )}
 
+          {summary.mode === 'battle' &&
+            summary.battleRule &&
+            summary.battleRule !== 'tdm' &&
+            summary.battleRule !== 'ffa' && (
+              <section
+                aria-label="Battle Mode Objective Summary"
+                className="border border-neutral-800 bg-neutral-900/80 px-4 py-3"
+              >
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <div className="font-mono-tabular text-[10px] font-semibold uppercase tracking-[0.2em] text-amber-400">
+                      {formatBattleRuleShort(summary.battleRule)} · Mode Breakdown
+                    </div>
+                    <div className="mt-0.5 font-mono-tabular text-xs text-neutral-300">
+                      {summary.battleRule === 'conquest' &&
+                        'Victory decided by Territory Points accumulated across FOBs, Outposts & Checkpoints.'}
+                      {summary.battleRule === 'ctf' &&
+                        'Victory decided by Enemy Flag Captures returned to a secure home base.'}
+                      {summary.battleRule === 'koth' &&
+                        'Victory decided by uncontested Hill Control points across rotating sectors.'}
+                      {summary.battleRule === 'kc_tdm' &&
+                        'Victory decided by total Enemy Dogtags collected. Secured Friendly Dogtags track separately for bonus XP.'}
+                      {summary.battleRule === 'kc_ffa' &&
+                        'Victory decided by Secured Enemy Dogtags. Recovering your own dogtag awards bonus XP without affecting win rate.'}
+                    </div>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2.5 font-mono-tabular text-xs">
+                    {summary.battleRule === 'kc_ffa' ? (
+                      <>
+                        <div className="border border-amber-500/35 bg-neutral-950/90 px-3 py-1.5 text-center">
+                          <div className="text-[9px] uppercase tracking-wider text-amber-400">
+                            Your Enemy Tags
+                          </div>
+                          <div className="text-base font-bold text-neutral-50">
+                            {summary.enemyDogtags ?? 0}
+                          </div>
+                        </div>
+                        <div className="border border-sky-500/35 bg-neutral-950/90 px-3 py-1.5 text-center">
+                          <div className="text-[9px] uppercase tracking-wider text-sky-400">
+                            Secured Friendly (Own Tag)
+                          </div>
+                          <div className="text-base font-bold text-sky-300">
+                            {summary.friendlyDogtags ?? 0}
+                          </div>
+                        </div>
+                      </>
+                    ) : (
+                      <>
+                        <div className="border border-sky-500/35 bg-neutral-950/90 px-3 py-1.5 text-center">
+                          <div className="text-[9px] uppercase tracking-wider text-sky-400">
+                            Team A{' '}
+                            {summary.battleRule === 'conquest'
+                              ? 'Territory'
+                              : summary.battleRule === 'ctf'
+                                ? 'Flags'
+                                : summary.battleRule === 'koth'
+                                  ? 'Hill Pts'
+                                  : 'Enemy Tags'}
+                          </div>
+                          <div className="text-base font-bold text-neutral-50">
+                            {Math.round(summary.teamScoreA ?? 0)}
+                          </div>
+                        </div>
+                        <div className="border border-orange-500/35 bg-neutral-950/90 px-3 py-1.5 text-center">
+                          <div className="text-[9px] uppercase tracking-wider text-orange-400">
+                            Team B{' '}
+                            {summary.battleRule === 'conquest'
+                              ? 'Territory'
+                              : summary.battleRule === 'ctf'
+                                ? 'Flags'
+                                : summary.battleRule === 'koth'
+                                  ? 'Hill Pts'
+                                  : 'Enemy Tags'}
+                          </div>
+                          <div className="text-base font-bold text-neutral-50">
+                            {Math.round(summary.teamScoreB ?? 0)}
+                          </div>
+                        </div>
+                        {summary.battleRule === 'kc_tdm' && (
+                          <div className="border border-neutral-700 bg-neutral-950/90 px-3 py-1.5 text-center">
+                            <div className="text-[9px] uppercase tracking-wider text-neutral-400">
+                              Secured Friendly Tags (A / B)
+                            </div>
+                            <div className="text-base font-bold text-sky-300">
+                              {summary.teamFriendlyDogtagsA ?? 0} / {summary.teamFriendlyDogtagsB ?? 0}
+                            </div>
+                          </div>
+                        )}
+                      </>
+                    )}
+                  </div>
+                </div>
+              </section>
+            )}
+
           {summary.leaderboard.length > 0 && (
             <section
               aria-label="End-of-Match Leaderboard and Player Strengths"
@@ -744,7 +904,7 @@ export const RankUpCinematic: React.FC<RankUpCinematicProps> = ({
             >
               <div className="flex items-center justify-between border-b border-neutral-800 px-4 py-2.5">
                 <span className="font-mono-tabular text-[11px] font-semibold uppercase tracking-[0.18em] text-neutral-300">
-                  Match Leaderboard & Player Strengths
+                  Match Leaderboard &amp; Player Strengths
                 </span>
                 <span className="font-mono-tabular text-[11px] text-neutral-500">
                   {summary.leaderboard.length}{' '}
@@ -753,12 +913,29 @@ export const RankUpCinematic: React.FC<RankUpCinematicProps> = ({
               </div>
 
               <div className="overflow-x-auto">
-                <table className="w-full min-w-[740px] border-collapse text-left">
+                <table className="w-full min-w-[780px] border-collapse text-left">
                   <thead>
                     <tr className="border-b border-neutral-800/80 bg-neutral-950/50 font-mono-tabular text-[10px] uppercase tracking-wider text-neutral-400">
                       <th className="w-10 px-3 py-2">#</th>
                       <th className="px-3 py-2">Operator</th>
                       <th className="px-3 py-2">Unit</th>
+                      {summary.battleRule && isKillConfirmedRule(summary.battleRule) && (
+                        <>
+                          <th className="px-2.5 py-2 text-right text-amber-400">Enemy Tags</th>
+                          <th className="px-2.5 py-2 text-right text-sky-400">
+                            {summary.battleRule === 'kc_ffa' ? 'Own Tags' : 'Friendly Tags'}
+                          </th>
+                        </>
+                      )}
+                      {summary.battleRule === 'conquest' && (
+                        <th className="px-2.5 py-2 text-right text-emerald-400">Captures</th>
+                      )}
+                      {summary.battleRule === 'ctf' && (
+                        <th className="px-2.5 py-2 text-right text-cyan-400">Caps / Rets</th>
+                      )}
+                      {summary.battleRule === 'koth' && (
+                        <th className="px-2.5 py-2 text-right text-lime-400">Hill Time</th>
+                      )}
                       <th className="px-2.5 py-2 text-right">K</th>
                       <th className="px-2.5 py-2 text-right">D</th>
                       <th className="px-2.5 py-2 text-right">A</th>
@@ -810,6 +987,31 @@ export const RankUpCinematic: React.FC<RankUpCinematicProps> = ({
                           <td className="px-3 py-2.5 font-mono-tabular text-[11px] uppercase tracking-wider text-neutral-400">
                             {formatUnitLabel(entry.team, summary.mode)}
                           </td>
+                          {summary.battleRule && isKillConfirmedRule(summary.battleRule) && (
+                            <>
+                              <td className="px-2.5 py-2.5 text-right font-mono-tabular text-xs font-bold text-amber-300">
+                                {entry.enemyDogtags ?? 0}
+                              </td>
+                              <td className="px-2.5 py-2.5 text-right font-mono-tabular text-xs text-sky-300">
+                                {entry.friendlyDogtags ?? 0}
+                              </td>
+                            </>
+                          )}
+                          {summary.battleRule === 'conquest' && (
+                            <td className="px-2.5 py-2.5 text-right font-mono-tabular text-xs font-semibold text-emerald-300">
+                              {entry.poiCaptures ?? 0}
+                            </td>
+                          )}
+                          {summary.battleRule === 'ctf' && (
+                            <td className="px-2.5 py-2.5 text-right font-mono-tabular text-xs font-semibold text-cyan-300">
+                              {entry.flagCaptures ?? 0} / {entry.flagReturns ?? 0}
+                            </td>
+                          )}
+                          {summary.battleRule === 'koth' && (
+                            <td className="px-2.5 py-2.5 text-right font-mono-tabular text-xs font-semibold text-lime-300">
+                              {Math.round(entry.hillControlSec ?? 0)}s
+                            </td>
+                          )}
                           <td className="px-2.5 py-2.5 text-right font-mono-tabular text-xs font-semibold text-neutral-100">
                             {entry.kills}
                           </td>

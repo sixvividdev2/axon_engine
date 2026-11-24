@@ -199,6 +199,131 @@ const MapPreviewArtwork: React.FC<{
     );
   }
 
+  if (style === 'volga_corridor') {
+    return (
+      <svg viewBox="0 0 320 130" className="h-full w-full" preserveAspectRatio="xMidYMid slice">
+        <defs>
+          <linearGradient id="volgaBg" x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0%" stopColor="#1c2720" />
+            <stop offset="55%" stopColor="#141d18" />
+            <stop offset="100%" stopColor="#0c120f" />
+          </linearGradient>
+        </defs>
+        <rect width="320" height="130" fill="url(#volgaBg)" />
+        {/* Rolling pine ridges along north/south flanks */}
+        <g fill="#25382c" opacity="0.72">
+          <ellipse cx="75" cy="18" rx="68" ry="18" />
+          <ellipse cx="235" cy="16" rx="72" ry="16" />
+          <ellipse cx="95" cy="112" rx="74" ry="16" />
+          <ellipse cx="240" cy="110" rx="68" ry="18" />
+        </g>
+        {/* Main paved frontier highway + service bypasses */}
+        <path d="M12 65 L308 65" stroke="#4b5563" strokeWidth="14" opacity="0.82" />
+        <path d="M12 65 L308 65" stroke="#eab308" strokeWidth="1" strokeDasharray="7 5" opacity="0.7" />
+        <path d="M78 65 Q160 28 242 65" fill="none" stroke="#3f4a45" strokeWidth="3.5" opacity="0.7" />
+        <path d="M78 65 Q160 102 242 65" fill="none" stroke="#3f4a45" strokeWidth="3.5" opacity="0.7" />
+        {/* Opposite-side Team HQs */}
+        <rect x="16" y="48" width="24" height="34" fill="#0c4a6e" stroke="#38bdf8" strokeWidth="1.4" />
+        <rect x="280" y="48" width="24" height="34" fill="#7f1d1d" stroke="#f87171" strokeWidth="1.4" />
+        {/* Road Checkpoints CP-1 & CP-2 */}
+        <rect x="74" y="54" width="18" height="22" fill="#27272a" stroke="#f59e0b" strokeWidth="1.1" />
+        <rect x="228" y="54" width="18" height="22" fill="#27272a" stroke="#f59e0b" strokeWidth="1.1" />
+        {/* Fortified FOBs & Central Relay Outpost */}
+        <rect x="116" y="28" width="24" height="16" fill="#1e293b" stroke="#38bdf8" strokeWidth="1.1" />
+        <rect x="180" y="84" width="24" height="16" fill="#1e293b" stroke="#f87171" strokeWidth="1.1" />
+        <circle cx="160" cy="65" r="11" fill="#292524" stroke="#fbbf24" strokeWidth="1.3" />
+        <text
+          x="20"
+          y="122"
+          fill="#a7d7b8"
+          fontSize="8.2"
+          fontFamily="IBM Plex Mono, monospace"
+          letterSpacing="1.2"
+        >
+          CONQUEST CORRIDOR · HQs · FOBs · CHECKPOINTS
+        </text>
+      </svg>
+    );
+  }
+
+  if (style === 'stalingrad_depot') {
+    return (
+      <svg viewBox="0 0 320 130" className="h-full w-full" preserveAspectRatio="xMidYMid slice">
+        <defs>
+          <linearGradient id="stalingradBg" x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0%" stopColor="#16222c" />
+            <stop offset="65%" stopColor="#0f151b" />
+            <stop offset="100%" stopColor="#090c10" />
+          </linearGradient>
+        </defs>
+        <rect width="320" height="130" fill="url(#stalingradBg)" />
+        {/* Parallel winter rail tracks */}
+        <g stroke="#64748b" strokeWidth="1.6" opacity="0.82">
+          <line x1="16" y1="40" x2="304" y2="40" />
+          <line x1="16" y1="50" x2="304" y2="50" />
+          <line x1="16" y1="74" x2="304" y2="74" />
+          <line x1="16" y1="84" x2="304" y2="84" />
+        </g>
+        {/* Steel depot roof trusses & armored railcars */}
+        <rect x="26" y="18" width="268" height="90" fill="none" stroke="#94a3b8" strokeWidth="1.2" opacity="0.6" />
+        <rect x="44" y="37" width="66" height="16" fill="#293540" stroke="#7dd3fc" strokeWidth="1.1" />
+        <rect x="144" y="37" width="76" height="16" fill="#3a2a24" stroke="#f59e0b" strokeWidth="1.1" />
+        <rect x="108" y="71" width="84" height="16" fill="#2c333a" stroke="#94a3b8" strokeWidth="1.1" />
+        {/* Signal lantern & frosted snow glow */}
+        <circle cx="256" cy="45" r="5" fill="#ef4444" opacity="0.85" />
+        <circle cx="64" cy="79" r="4" fill="#38bdf8" opacity="0.7" />
+        <text
+          x="24"
+          y="122"
+          fill="#93c5fd"
+          fontSize="8.3"
+          fontFamily="IBM Plex Mono, monospace"
+          letterSpacing="1.2"
+        >
+          STALINGRAD RAIL DEPOT · FREIGHT YARD · SHED
+        </text>
+      </svg>
+    );
+  }
+
+  if (style === 'objekt_47') {
+    return (
+      <svg viewBox="0 0 320 130" className="h-full w-full" preserveAspectRatio="xMidYMid slice">
+        <defs>
+          <radialGradient id="objektBg" cx="50%" cy="46%" r="65%">
+            <stop offset="0%" stopColor="#12382c" />
+            <stop offset="65%" stopColor="#0c1518" />
+            <stop offset="100%" stopColor="#070a0d" />
+          </radialGradient>
+        </defs>
+        <rect width="320" height="130" fill="url(#objektBg)" />
+        {/* Subterranean blast-door chambers & central reactor ring */}
+        <g stroke="#34d399" strokeWidth="1.3" fill="none" opacity="0.72">
+          <rect x="28" y="20" width="80" height="84" fill="#0d1b1a" />
+          <rect x="212" y="20" width="80" height="84" fill="#0d1b1a" />
+          <rect x="108" y="32" width="104" height="60" fill="#102521" />
+          <circle cx="160" cy="62" r="21" stroke="#10b981" strokeWidth="1.8" />
+          <circle cx="160" cy="62" r="9" fill="#059669" opacity="0.65" />
+        </g>
+        {/* Emergency red bulkhead doors */}
+        <g fill="#dc2626" opacity="0.88">
+          <rect x="105" y="54" width="5" height="16" />
+          <rect x="210" y="54" width="5" height="16" />
+        </g>
+        <text
+          x="24"
+          y="122"
+          fill="#6ee7b7"
+          fontSize="8.3"
+          fontFamily="IBM Plex Mono, monospace"
+          letterSpacing="1.2"
+        >
+          BUNKER OBJEKT-47 · REACTOR CORE · DECON
+        </text>
+      </svg>
+    );
+  }
+
   // Locked coming-soon placeholder art
   return (
     <svg viewBox="0 0 320 130" className="h-full w-full" preserveAspectRatio="xMidYMid slice">

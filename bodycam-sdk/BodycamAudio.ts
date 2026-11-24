@@ -21,6 +21,12 @@ export interface BallisticFlybyClassification {
   triggerMicroFlinch: boolean;
   flinchDeg: number;
   caliberWeight: number;
+  /** Supersonic & caliber-scaled effective acoustic flyby radius (capped at 4.5m) */
+  effectiveMaxRadiusM: number;
+  /** Distance- and velocity-scaled high-frequency crispness cutoff (Hz) */
+  hfCrispnessHz: number;
+  /** Distance- and caliber/KE-scaled low-end chest thump punch */
+  lowEndPunch: number;
 }
 
 export interface SpatialGunshotEnvelope {
@@ -49,21 +55,38 @@ export function classifyBallisticFlyby(
   const machNumber = safeSpeed / SPEED_OF_SOUND_MPS;
   const isSupersonic = safeSpeed > SPEED_OF_SOUND_MPS;
 
-  // Caliber & energy acoustic weight (0.75 for light 5.56/9mm up to 1.45 for 7.62x51 / .50 AE / .338)
+  // Caliber & kinetic energy acoustic weight:
+  // ~0.78-0.96 for 9mm / 5.56mm up to ~1.25-1.50 for 7.62x51mm / .50 AE / .338
   const calNorm = THREE.MathUtils.clamp((caliberMm - 5.0) / 7.7, 0, 1);
   const keNorm = THREE.MathUtils.clamp(Math.log10(Math.max(250, energyJ) / 250) / 1.4, 0, 1);
-  const caliberWeight = 0.78 + calNorm * 0.34 + keNorm * 0.33;
+  const caliberWeight = 0.78 + calNorm * 0.36 + keNorm * 0.36;
 
-  // Smooth inverse-distance acoustic gain from 0.2m to 4.5m
+  // Supersonic Mach cone / caliber-scaled acoustic capture radius (up to 4.5m)
+  const calRadiusNorm = THREE.MathUtils.clamp((caliberWeight - 0.78) / 0.72, 0, 1);
+  const effectiveMaxRadiusM = isSupersonic
+    ? THREE.MathUtils.clamp(3.35 + Math.min(0.65, (machNumber - 1) * 0.45) + calRadiusNorm * 0.55, 3.2, 4.5)
+    : THREE.MathUtils.clamp(2.4 + calRadiusNorm * 0.8, 2.4, 3.2);
+
+  // Smooth miss-distance attenuation from 0.2m (razor-close) to 4.5m (distant pass)
   const prox01 = THREE.MathUtils.clamp(1 - (safeDist - 0.2) / 4.3, 0, 1);
-  const gainScale = (0.24 + prox01 * prox01 * 0.88) * caliberWeight;
+  const gainScale = (0.24 + prox01 * prox01 * 0.92) * caliberWeight;
+
+  // High-frequency crispness scales smoothly with miss distance (bright at 0.2m, air-damped at 4.5m)
+  const hfCrispnessHz = isSupersonic
+    ? THREE.MathUtils.lerp(2400, 5450, Math.pow(prox01, 0.75))
+    : THREE.MathUtils.lerp(980, 1420, Math.pow(prox01, 0.8));
 
   const hasChestThump = isSupersonic && safeDist < 1.5;
+  const thumpProx01 = hasChestThump ? THREE.MathUtils.clamp(1 - safeDist / 1.5, 0.15, 1) : 0;
+  const lowEndPunch = hasChestThump
+    ? thumpProx01 * (0.72 + calNorm * 0.52 + keNorm * 0.44)
+    : 0;
+
   const triggerMicroFlinch = isSupersonic && safeDist < 1.2;
   const flinchProx01 = triggerMicroFlinch ? THREE.MathUtils.clamp(1 - safeDist / 1.2, 0, 1) : 0;
   // Strictly bounded 0.30°..0.60° involuntary micro-flinch for razor-close supersonic passes
   const flinchDeg = triggerMicroFlinch
-    ? THREE.MathUtils.clamp(0.30 + flinchProx01 * 0.22 + (caliberWeight - 0.78) * 0.14, 0.30, 0.60)
+    ? THREE.MathUtils.clamp(0.30 + flinchProx01 * 0.20 + (caliberWeight - 0.78) * 0.15, 0.30, 0.60)
     : 0;
 
   return {
@@ -74,6 +97,9 @@ export function classifyBallisticFlyby(
     triggerMicroFlinch,
     flinchDeg,
     caliberWeight,
+    effectiveMaxRadiusM,
+    hfCrispnessHz,
+    lowEndPunch,
   };
 }
 
@@ -198,6 +224,7 @@ export class BodycamAudio implements IBodycamAudioSource {
   private nvgHumGain: GainNode | null = null;
 
   private noiseBuffer: AudioBuffer | null = null;
+  private nWaveBuffer: AudioBuffer | null = null;
   private clipDrive = 4.5;
   private masterVolume = 0.85;
   private gearRattleGain = 0.75;
@@ -284,6 +311,7 @@ export class BodycamAudio implements IBodycamAudioSource {
     this.interiorWetBus = intWet;
 
     this.noiseBuffer = this.createNoiseBuffer(ctx, 2.5);
+    this.nWaveBuffer = this.createSupersonicNWaveBuffer(ctx);
     this.startWindAmbience();
     this.initialized = true;
   }
@@ -306,6 +334,39 @@ export class BodycamAudio implements IBodycamAudioSource {
     const data = buffer.getChannelData(0);
     for (let i = 0; i < length; i++) {
       data[i] = Math.random() * 2 - 1;
+    }
+    return buffer;
+  }
+
+  /**
+   * Pre-computes a crisp bipolar acoustic supersonic N-wave shockwave pulse buffer:
+   * - Instantaneous bow-shock overpressure rise (<1.2ms attack to +1.0)
+   * - Linear supersonic expansion rarefaction ramp (+1.0 -> -1.0)
+   * - Sharp tail-shock recompression edge (-1.0 -> 0 with exponential damping)
+   */
+  private createSupersonicNWaveBuffer(ctx: AudioContext): AudioBuffer {
+    const durationSec = 0.036;
+    const length = Math.max(64, Math.floor(ctx.sampleRate * durationSec));
+    const buffer = ctx.createBuffer(1, length, ctx.sampleRate);
+    const data = buffer.getChannelData(0);
+    const attackSamples = Math.max(4, Math.floor(ctx.sampleRate * 0.0009));
+    const coreSamples = Math.max(attackSamples + 8, Math.floor(ctx.sampleRate * 0.0095));
+
+    for (let i = 0; i < length; i++) {
+      if (i < attackSamples) {
+        // Ultra-fast leading bow shock rise
+        const u = i / attackSamples;
+        data[i] = u * u;
+      } else if (i < coreSamples) {
+        // Classic bipolar N-wave linear expansion (+1.0 -> -1.0)
+        const u = (i - attackSamples) / (coreSamples - attackSamples);
+        data[i] = 1.0 - 2.0 * u;
+      } else {
+        // Sharp tail shock recovery with crisp exponential wake decay (25-45ms window)
+        const u = (i - coreSamples) / Math.max(1, length - coreSamples);
+        const decay = Math.exp(-u * 6.5);
+        data[i] = -0.78 * decay * Math.cos(u * Math.PI * 1.5);
+      }
     }
     return buffer;
   }
@@ -1482,10 +1543,11 @@ export class BodycamAudio implements IBodycamAudioSource {
   /**
    * Physically accurate procedural ballistic flyby synthesizer (zero external audio files, 60+ FPS safe):
    * - Supersonic (v > 343 m/s): ultra-fast N-wave shockwave snap (<4ms attack, 25–45ms exp decay)
-   *   via crisp bipolar pulse + 1.8–5.5 kHz bandpass noise burst + near-miss (<1.5m) 120->55 Hz chest thump
-   *   + trailing Doppler wake (2.4 kHz -> 650 Hz over 90–160ms) + subtle indoor/outdoor reverb send.
+   *   via crisp bipolar N-wave pulse buffer + 1.8–5.5 kHz bandpass noise burst + near-miss (<1.5m)
+   *   120->55 Hz chest thump + trailing Doppler wake (2.4 kHz -> 650 Hz over 90–160ms) + indoor/outdoor
+   *   spatial reflection bus send.
    * - Transonic / Subsonic (v <= 343 m/s): smooth resonant air-displacement whizz/zip (1.4 kHz -> 480 Hz
-   *   over 110–180ms) with no N-wave shockwave crack.
+   *   over 110–180ms) with smooth attack/release envelopes and zero N-wave shockwave crack.
    */
   public playBallisticFlyby(params: BallisticFlybyParams): void {
     this.ensureInitialized();
@@ -1500,106 +1562,154 @@ export class BodycamAudio implements IBodycamAudioSource {
     );
 
     const ctx = this.ctx;
-    const t = ctx.currentTime;
-    const panner = this.createHRTFPanner(params.closestPos, 0.45, 28);
+    const delaySec = Math.max(0, Math.min(2.5, params.delaySec ?? 0));
+    const t = ctx.currentTime + delaySec;
+
+    // Position HRTF PannerNode at closestPos for exact left-ear / right-ear / overhead stereo imaging.
+    // Gentle panner rolloff preserves cls.gainScale's smooth 0.2m..4.5m attenuation curve without double-squashing.
+    const panner = this.createHRTFPanner(params.closestPos, 1.5, 32);
     if (!panner) return;
-    panner.rolloffFactor = 0.95;
+    panner.rolloffFactor = 0.35;
 
     this.activeFlybyVoices++;
 
-    // Route direct flyby to dry chest-mic bus + subtle spatial send to exterior/interior reverb
+    // Route direct flyby to dry chest-mic bus + environment-aware reflection tail (concrete slap indoors, echo outdoors)
     panner.connect(this.dryBus);
-    const reverbSend = ctx.createGain();
-    reverbSend.gain.setValueAtTime(cls.isSupersonic ? 0.34 : 0.14, t);
-    panner.connect(reverbSend);
-    reverbSend.connect(this.wetBus);
-    if (this.interiorWetBus) {
-      reverbSend.connect(this.interiorWetBus);
+    const calReverbBoost = THREE.MathUtils.clamp(cls.caliberWeight, 0.78, 1.5);
+    if (this.currentIndoor && this.interiorWetBus) {
+      const intSend = ctx.createGain();
+      intSend.gain.setValueAtTime((cls.isSupersonic ? 0.52 : 0.16) * calReverbBoost, t);
+      panner.connect(intSend);
+      intSend.connect(this.interiorWetBus);
+
+      const extBleed = ctx.createGain();
+      extBleed.gain.setValueAtTime((cls.isSupersonic ? 0.12 : 0.04) * calReverbBoost, t);
+      panner.connect(extBleed);
+      extBleed.connect(this.wetBus);
+    } else {
+      const extSend = ctx.createGain();
+      extSend.gain.setValueAtTime((cls.isSupersonic ? 0.38 : 0.14) * calReverbBoost, t);
+      panner.connect(extSend);
+      extSend.connect(this.wetBus);
+      if (this.interiorWetBus) {
+        const intBleed = ctx.createGain();
+        intBleed.gain.setValueAtTime((cls.isSupersonic ? 0.14 : 0.05) * calReverbBoost, t);
+        panner.connect(intBleed);
+        intBleed.connect(this.interiorWetBus);
+      }
     }
 
     if (cls.isSupersonic) {
-      // 1A. Supersonic N-Wave Shockwave Snap — bipolar high-SPL impulse (<3ms attack, 28-42ms decay)
-      const nWaveDur = 0.028 + Math.min(0.017, (cls.caliberWeight - 0.78) * 0.024);
-      const pulseOsc = ctx.createOscillator();
-      pulseOsc.type = 'sawtooth';
-      pulseOsc.frequency.setValueAtTime(2600 + (cls.machNumber - 1) * 550, t);
-      pulseOsc.frequency.exponentialRampToValueAtTime(195, t + nWaveDur);
-      const pulseGain = ctx.createGain();
-      pulseGain.gain.setValueAtTime(0.001, t);
-      pulseGain.gain.linearRampToValueAtTime(1.45 * cls.gainScale, t + 0.0022);
-      pulseGain.gain.exponentialRampToValueAtTime(0.001, t + nWaveDur);
-      pulseOsc.connect(pulseGain);
-      pulseGain.connect(panner);
-      pulseOsc.start(t);
-      pulseOsc.stop(t + nWaveDur + 0.006);
+      // 1A. Supersonic Bipolar N-Wave Shockwave Snap (<4ms attack, 25–45ms exponential decay)
+      const nWaveDecaySec = THREE.MathUtils.clamp(
+        0.026 + (cls.caliberWeight - 0.78) * 0.025,
+        0.025,
+        0.045,
+      );
+      if (this.nWaveBuffer) {
+        const nWaveSrc = ctx.createBufferSource();
+        nWaveSrc.buffer = this.nWaveBuffer;
+        // Heavier/larger caliber stretches the N-wave period (deeper crack); higher Mach sharpens it
+        const rate = THREE.MathUtils.clamp(
+          (1.12 + (cls.machNumber - 1) * 0.18) / (0.84 + (cls.caliberWeight - 0.78) * 0.42),
+          0.62,
+          1.45,
+        );
+        nWaveSrc.playbackRate.setValueAtTime(rate, t);
 
-      // 1B. Crisp 1.8–5.5 kHz Bandpass Shockwave Crack Noise Burst
+        const nWaveLp = ctx.createBiquadFilter();
+        nWaveLp.type = 'lowpass';
+        nWaveLp.frequency.setValueAtTime(cls.hfCrispnessHz * 1.45, t);
+        nWaveLp.Q.value = 0.7;
+
+        const nWaveGain = ctx.createGain();
+        nWaveGain.gain.setValueAtTime(0.001, t);
+        nWaveGain.gain.linearRampToValueAtTime(1.62 * cls.gainScale, t + 0.0018);
+        nWaveGain.gain.exponentialRampToValueAtTime(0.001, t + nWaveDecaySec);
+
+        nWaveSrc.connect(nWaveLp);
+        nWaveLp.connect(nWaveGain);
+        nWaveGain.connect(panner);
+        nWaveSrc.start(t);
+        nWaveSrc.stop(t + nWaveDecaySec + 0.012);
+      }
+
+      // 1B. Crisp 1.8–5.5 kHz Bandpass Shockwave Crack Noise Burst (<4ms attack, 25–45ms decay)
       const snapSrc = ctx.createBufferSource();
       snapSrc.buffer = this.noiseBuffer;
       const snapBp = ctx.createBiquadFilter();
       snapBp.type = 'bandpass';
-      snapBp.frequency.setValueAtTime(4600 - Math.min(1800, params.missDistM * 360), t);
-      snapBp.frequency.exponentialRampToValueAtTime(1850, t + nWaveDur + 0.012);
-      snapBp.Q.value = 1.15;
+      const snapStartHz = THREE.MathUtils.clamp(cls.hfCrispnessHz, 2200, 5500);
+      snapBp.frequency.setValueAtTime(snapStartHz, t);
+      snapBp.frequency.exponentialRampToValueAtTime(1800, t + nWaveDecaySec);
+      snapBp.Q.value = 1.1;
       const snapGain = ctx.createGain();
       snapGain.gain.setValueAtTime(0.001, t);
-      snapGain.gain.linearRampToValueAtTime(1.85 * cls.gainScale, t + 0.0025);
-      snapGain.gain.exponentialRampToValueAtTime(0.001, t + nWaveDur + 0.014);
+      snapGain.gain.linearRampToValueAtTime(1.88 * cls.gainScale, t + 0.0024);
+      snapGain.gain.exponentialRampToValueAtTime(0.001, t + nWaveDecaySec);
       snapSrc.connect(snapBp);
       snapBp.connect(snapGain);
       snapGain.connect(panner);
-      snapSrc.start(t, Math.random() * 0.9, nWaveDur + 0.03);
+      snapSrc.start(t, Math.random() * 0.9, nWaveDecaySec + 0.02);
 
-      // 1C. Razor-Close Low-Mid Chest Thump (< 1.5m: 120 Hz -> 55 Hz over 42ms)
+      // 1C. Razor-Close Low-Mid Chest Thump (< 1.5m: 120 Hz -> 55 Hz pitch drop)
       if (cls.hasChestThump) {
         const thumpOsc = ctx.createOscillator();
         thumpOsc.type = 'sine';
         thumpOsc.frequency.setValueAtTime(120, t);
         thumpOsc.frequency.exponentialRampToValueAtTime(55, t + 0.042);
         const thumpGain = ctx.createGain();
-        const proxBoost = THREE.MathUtils.clamp(1 - params.missDistM / 1.5, 0.15, 1);
         thumpGain.gain.setValueAtTime(0.001, t);
-        thumpGain.gain.linearRampToValueAtTime(0.95 * proxBoost * cls.caliberWeight, t + 0.003);
+        thumpGain.gain.linearRampToValueAtTime(1.05 * cls.lowEndPunch, t + 0.0028);
         thumpGain.gain.exponentialRampToValueAtTime(0.001, t + 0.048);
         thumpOsc.connect(thumpGain);
         thumpGain.connect(panner);
         thumpOsc.start(t);
-        thumpOsc.stop(t + 0.055);
+        thumpOsc.stop(t + 0.056);
       }
 
-      // 1D. Trailing Supersonic Doppler Wake / Whizz (2.4 kHz -> 650 Hz over 95–155ms)
-      const wakeDur = 0.095 + Math.min(0.06, (params.missDistM / 4.5) * 0.055);
+      // 1D. Trailing Supersonic Doppler Wake / Air Tear (2.4 kHz -> 650 Hz over 90–160ms)
+      const wakeDur = THREE.MathUtils.clamp(
+        0.092 + (params.missDistM / 4.5) * 0.062,
+        0.090,
+        0.160,
+      );
       const wakeSrc = ctx.createBufferSource();
       wakeSrc.buffer = this.noiseBuffer;
       const wakeBp = ctx.createBiquadFilter();
       wakeBp.type = 'bandpass';
-      wakeBp.frequency.setValueAtTime(2400, t + 0.008);
-      wakeBp.frequency.exponentialRampToValueAtTime(650, t + 0.008 + wakeDur);
+      wakeBp.frequency.setValueAtTime(2400, t + 0.006);
+      wakeBp.frequency.exponentialRampToValueAtTime(650, t + 0.006 + wakeDur);
       wakeBp.Q.value = 4.2;
       const wakeGain = ctx.createGain();
-      wakeGain.gain.setValueAtTime(0.001, t + 0.006);
-      wakeGain.gain.linearRampToValueAtTime(0.46 * cls.gainScale, t + 0.022);
-      wakeGain.gain.exponentialRampToValueAtTime(0.001, t + 0.012 + wakeDur);
+      wakeGain.gain.setValueAtTime(0.001, t + 0.005);
+      wakeGain.gain.linearRampToValueAtTime(0.48 * cls.gainScale, t + 0.020);
+      wakeGain.gain.exponentialRampToValueAtTime(0.001, t + 0.008 + wakeDur);
       wakeSrc.connect(wakeBp);
       wakeBp.connect(wakeGain);
       wakeGain.connect(panner);
-      wakeSrc.start(t + 0.006, Math.random() * 0.8, wakeDur + 0.03);
+      wakeSrc.start(t + 0.005, Math.random() * 0.8, wakeDur + 0.03);
       wakeSrc.onended = () => {
         this.activeFlybyVoices = Math.max(0, this.activeFlybyVoices - 1);
       };
     } else {
-      // 2. Transonic / Subsonic Air-Displacement Whizz / Zip (NO N-wave crack: 1.4 kHz -> 480 Hz over 115–175ms)
-      const whizzDur = 0.115 + Math.min(0.06, (params.missDistM / 4.5) * 0.055);
+      // 2. Transonic / Subsonic Air-Displacement Whizz / Zip (NO N-wave crack: 1.4 kHz -> 480 Hz over 110–180ms)
+      const whizzDur = THREE.MathUtils.clamp(
+        0.112 + (params.missDistM / 4.5) * 0.065,
+        0.110,
+        0.180,
+      );
+      const whizzAttack = THREE.MathUtils.clamp(whizzDur * 0.20, 0.020, 0.034);
       const whizzSrc = ctx.createBufferSource();
       whizzSrc.buffer = this.noiseBuffer;
       const whizzBp = ctx.createBiquadFilter();
       whizzBp.type = 'bandpass';
-      whizzBp.frequency.setValueAtTime(1400, t);
+      whizzBp.frequency.setValueAtTime(THREE.MathUtils.clamp(cls.hfCrispnessHz, 1020, 1420), t);
       whizzBp.frequency.exponentialRampToValueAtTime(480, t + whizzDur);
-      whizzBp.Q.value = 5.0;
+      whizzBp.Q.value = 4.8;
       const whizzGain = ctx.createGain();
       whizzGain.gain.setValueAtTime(0.001, t);
-      whizzGain.gain.linearRampToValueAtTime(0.58 * cls.gainScale, t + 0.014);
+      whizzGain.gain.linearRampToValueAtTime(0.60 * cls.gainScale, t + whizzAttack);
       whizzGain.gain.exponentialRampToValueAtTime(0.001, t + whizzDur);
       whizzSrc.connect(whizzBp);
       whizzBp.connect(whizzGain);
@@ -3348,6 +3458,91 @@ export class BodycamAudio implements IBodycamAudioSource {
     this.connectToOutputBuses(lg);
     latch.start(t + 0.08);
     latch.stop(t + 0.32);
+  }
+
+  /** Metallic dogtag chain clink + crisp confirmation chime for Kill Confirmed */
+  public playDogtagPickup(isFriendly: boolean, isSelfRecovery = false): void {
+    this.ensureInitialized();
+    if (!this.ctx || !this.dryBus) return;
+    const ctx = this.ctx;
+    const t = ctx.currentTime;
+
+    // 1. High-frequency steel dogtag clink double-tap (chain jingle)
+    const clinkFreqs = isFriendly ? [3180, 4220] : [2760, 3920];
+    for (let i = 0; i < clinkFreqs.length; i++) {
+      const onset = t + i * 0.028;
+      const osc = ctx.createOscillator();
+      osc.type = 'triangle';
+      osc.frequency.setValueAtTime(clinkFreqs[i], onset);
+      osc.frequency.exponentialRampToValueAtTime(clinkFreqs[i] * 0.84, onset + 0.065);
+      const gain = ctx.createGain();
+      gain.gain.setValueAtTime(0.001, onset);
+      gain.gain.linearRampToValueAtTime(0.24, onset + 0.004);
+      gain.gain.exponentialRampToValueAtTime(0.001, onset + 0.075);
+      osc.connect(gain);
+      gain.connect(this.dryBus);
+      osc.start(onset);
+      osc.stop(onset + 0.085);
+    }
+
+    // 2. Tactical confirmation tone (distinct for enemy confirm vs friendly secure vs self-tag recovery)
+    const notes = isSelfRecovery
+      ? [660, 880, 1175]
+      : isFriendly
+        ? [520, 780]
+        : [587, 880];
+    notes.forEach((hz, idx) => {
+      const onset = t + 0.045 + idx * 0.055;
+      const osc = ctx.createOscillator();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(hz, onset);
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0.001, onset);
+      g.gain.linearRampToValueAtTime(isSelfRecovery ? 0.19 : 0.15, onset + 0.008);
+      g.gain.exponentialRampToValueAtTime(0.001, onset + 0.14);
+      osc.connect(g);
+      g.connect(this.dryBus!);
+      osc.start(onset);
+      osc.stop(onset + 0.15);
+    });
+  }
+
+  /** Tactical VHF/HUD objective chime for Conquest, CTF, and KOTH state transitions */
+  public playObjectiveChime(
+    kind: 'capture' | 'contested' | 'flag_taken' | 'flag_score' | 'flag_return' | 'hill_rotate',
+  ): void {
+    this.ensureInitialized();
+    if (!this.ctx || !this.dryBus) return;
+    const ctx = this.ctx;
+    const t = ctx.currentTime;
+
+    const pattern: number[] =
+      kind === 'flag_score'
+        ? [523, 659, 784, 1046]
+        : kind === 'capture'
+          ? [440, 660, 880]
+          : kind === 'flag_return'
+            ? [587, 784]
+            : kind === 'flag_taken'
+              ? [740, 554]
+              : kind === 'contested'
+                ? [392, 349]
+                : [494, 587, 740];
+
+    pattern.forEach((hz, idx) => {
+      const onset = t + idx * 0.068;
+      const osc = ctx.createOscillator();
+      osc.type = kind === 'contested' || kind === 'flag_taken' ? 'triangle' : 'sine';
+      osc.frequency.setValueAtTime(hz, onset);
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0.001, onset);
+      g.gain.linearRampToValueAtTime(0.16, onset + 0.008);
+      g.gain.exponentialRampToValueAtTime(0.001, onset + 0.17);
+      osc.connect(g);
+      g.connect(this.dryBus!);
+      osc.start(onset);
+      osc.stop(onset + 0.18);
+    });
   }
 
   /**

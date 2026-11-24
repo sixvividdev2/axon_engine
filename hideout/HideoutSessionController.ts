@@ -273,6 +273,7 @@ export class HideoutSessionController {
   private readonly _occlRayHit: BodycamRaycastResult = createRaycastResult();
   private readonly _lookDir = new THREE.Vector3();
   private readonly _camPos = new THREE.Vector3();
+  private readonly _camRight = new THREE.Vector3();
   private readonly _camUp = new THREE.Vector3();
   private readonly _muzzlePos = new THREE.Vector3();
   private readonly _muzzleDir = new THREE.Vector3();
@@ -2850,7 +2851,21 @@ export class HideoutSessionController {
       }
 
       // Step live ballistic projectiles, tracers, sparks, grenades & target/door/electronic impacts
-      this.ballistics.update(dt, this.adapter, (ev) => this.handleBallisticImpact(ev));
+      this.camera.getWorldPosition(this._camPos);
+      this._camRight.set(1, 0, 0).applyQuaternion(this.camera.quaternion);
+      this.ballistics.update(
+        dt,
+        this.adapter,
+        (ev) => this.handleBallisticImpact(ev),
+        {
+          listenerHeadPos: this._camPos,
+          listenerRightDir: this._camRight,
+          audio: this.audio,
+          onSupersonicNearMiss: (flinchDeg, sideSign) => {
+            this.controller.applyBallisticMicroFlinch(flinchDeg, sideSign);
+          },
+        },
+      );
 
       const wasLiveGrenade = this.grenadeSystem.isLeverReleased();
       this.grenadeSystem.update(dt, this._camPos);

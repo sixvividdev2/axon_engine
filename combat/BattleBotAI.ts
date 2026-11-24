@@ -27,9 +27,12 @@ import {
   findNavPath,
   findNearestNavNode,
   InfectionPerkId,
+  isFreeForAllBattleRule,
+  isTeamBattleRule,
   NavNode,
   SpawnPoint,
 } from '../maps/types';
+import type { BattleModeController, ModeActorSample } from './BattleModeController';
 import {
   BotWeaponVisualClass,
   GameBotsSyncPacket,
@@ -79,6 +82,14 @@ export interface BattleScoreEntry {
   damageDealt: number;
   afkSeconds: number;
   alive: boolean;
+  enemyDogtags?: number;
+  friendlyDogtags?: number;
+  selfDogtagsRecovered?: number;
+  poiCaptures?: number;
+  territoryPoints?: number;
+  flagCaptures?: number;
+  flagReturns?: number;
+  hillControlSec?: number;
 }
 
 export interface BattleKillfeedEntry {
@@ -664,6 +675,7 @@ export class BattleBotAI {
   private onBotCommsCb: ((ev: BotCommsEvent) => void) | null = null;
   private onBotGrenadeCb: ((ev: BotGrenadeEvent) => void) | null = null;
   private onAssistAwardedCb: ((assisterId: string) => void) | null = null;
+  private modeController: BattleModeController | null = null;
 
   public scoreA = 0;
   public scoreB = 0;
@@ -786,7 +798,7 @@ export class BattleBotAI {
           : MALE_CALLSIGNS_A[maleCountA++ % MALE_CALLSIGNS_A.length];
         weaponId = 'glock_17';
         countA++;
-      } else if (rule === 'tdm') {
+      } else if (isTeamBattleRule(rule)) {
         // Player occupies 1 slot on Team A -> put slightly more bots on Team B so totals stay even
         const teamATotalWithPlayer = countA + 1;
         if (teamATotalWithPlayer <= countB) {
@@ -1025,28 +1037,90 @@ export class BattleBotAI {
     return physY;
   }
 
+  public setModeController(ctrl: BattleModeController | null): void {
+    this.modeController = ctrl;
+    if (ctrl && this.rule === 'conquest') {
+      for (const b of this.bots) {
+        ctrl.initBotConquestLives(b.id, 5);
+      }
+    }
+  }
+
+  public getModeActorSamples(): ModeActorSample[] {
+    const out: ModeActorSample[] = [];
+    for (let i = 0; i < this.bots.length; i++) {
+      const b = this.bots[i];
+      out.push({
+        id: b.id,
+        name: b.name,
+        team: b.team,
+        alive: b.alive,
+        x: b.pos.x,
+        y: b.pos.y,
+        z: b.pos.z,
+      });
+    }
+    return out;
+  }
+
+  public getAliveTeammateSpectateTargets(team: BattleTeamId): Array<{
+    id: string;
+    name: string;
+    pos: THREE.Vector3;
+    yaw: number;
+  }> {
+    const out: Array<{ id: string; name: string; pos: THREE.Vector3; yaw: number }> = [];
+    for (let i = 0; i < this.bots.length; i++) {
+      const b = this.bots[i];
+      if (!b.alive) continue;
+      if (isTeamBattleRule(this.rule) && b.team !== team) continue;
+      out.push({ id: b.id, name: b.name, pos: b.pos, yaw: b.yaw });
+    }
+    return out;
+  }
+
   private pickSpawnPoint(team: BattleTeamId, avoidPos: Readonly<THREE.Vector3>, seedIdx?: number): SpawnPoint {
-    const pool =
-      this.rule === 'tdm'
-        ? team === 'A'
-          ? this.map.spawnPoints.teamA
-          : this.map.spawnPoints.teamB
-        : this.map.spawnPoints.ffa;
+    let pool: SpawnPoint[];
+    if (this.rule === 'conquest' && this.modeController && (team === 'A' || team === 'B')) {
+      pool =
+        seedIdx !== undefined
+          ? this.modeController.getOpeningHqSpawns(team)
+          : this.modeController.getBotConquestSpawnCandidates(team);
+    } else if (isTeamBattleRule(this.rule)) {
+      pool = team === 'A' ? this.map.spawnPoints.teamA : this.map.spawnPoints.teamB;
+    } else {
+      pool = this.map.spawnPoints.ffa;
+    }
 
     const list = pool.length > 0 ? pool : this.map.spawnPoints.ffa;
     if (seedIdx !== undefined && seedIdx < list.length) {
       return list[seedIdx];
     }
 
-    // Choose spawn farthest from hostile actors & player
+    // Use universal Battle Spawn Protection safe-spawn scorer when modeController is attached
+    if (this.modeController && !this.coopInfectionMode) {
+      const enemies: Array<{ x: number; y: number; z: number }> = [];
+      if (isFreeForAllBattleRule(this.rule) || team !== this.localAllyTeam) {
+        enemies.push({ x: avoidPos.x, y: avoidPos.y, z: avoidPos.z });
+      }
+      for (let j = 0; j < this.bots.length; j++) {
+        const other = this.bots[j];
+        if (!other.alive) continue;
+        if (this.isHostilePair(team, other.team)) {
+          enemies.push({ x: other.pos.x, y: other.pos.y, z: other.pos.z });
+        }
+      }
+      return this.modeController.selectSafeSpawnPoint(list, enemies, this.map.raycastMeshes);
+    }
+
+    // Fallback: Choose spawn farthest from hostile actors & player
     let best = list[0];
     let bestScore = -Infinity;
     for (let i = 0; i < list.length; i++) {
       const sp = list[i];
       let minHostileDistSq = Infinity;
 
-      // Distance from player (hostile in FFA or if bot is Team B)
-      if (this.rule === 'ffa' || team === 'B') {
+      if (isFreeForAllBattleRule(this.rule) || team === 'B') {
         const dx = sp.position[0] - avoidPos.x;
         const dz = sp.position[2] - avoidPos.z;
         minHostileDistSq = Math.min(minHostileDistSq, dx * dx + dz * dz);
@@ -1058,11 +1132,10 @@ export class BattleBotAI {
         const dx = sp.position[0] - other.pos.x;
         const dz = sp.position[2] - other.pos.z;
         const dSq = dx * dx + dz * dz;
-        const isHostile = this.rule === 'ffa' || other.team !== team;
+        const isHostile = isFreeForAllBattleRule(this.rule) || other.team !== team;
         if (isHostile) {
           minHostileDistSq = Math.min(minHostileDistSq, dSq);
         } else if (dSq < 2.25) {
-          // Avoid spawning stacked directly on a teammate
           minHostileDistSq -= 25;
         }
       }
@@ -1120,6 +1193,7 @@ export class BattleBotAI {
     if (!this.coopInfectionMode) {
       const spec = this.getWeaponSpec(bot.weaponId);
       bot.magAmmoByWeapon[bot.weaponId] = spec.magCapacity;
+      this.modeController?.grantSpawnProtection(bot.id);
     }
 
     bot.ragdoll.deactivate();
@@ -1363,7 +1437,7 @@ export class BattleBotAI {
 
   private isAlliedBot(bot: BotActor): boolean {
     if (this.coopInfectionMode) return true;
-    if (this.rule === 'tdm') return bot.team === this.localAllyTeam;
+    if (isTeamBattleRule(this.rule)) return bot.team === this.localAllyTeam;
     return false;
   }
 
@@ -1420,7 +1494,7 @@ export class BattleBotAI {
    */
   public notifyPlayerPing(kind: TacticalPingKind, pos: Readonly<THREE.Vector3>, label: string): void {
     if (this.isClientReplica || !this.onBotCommsCb) return;
-    if (!this.coopInfectionMode && this.rule !== 'tdm') return;
+    if (!this.coopInfectionMode && !isTeamBattleRule(this.rule)) return;
 
     const candidates = this.bots.filter((b) => b.alive && this.isAlliedBot(b));
     if (candidates.length === 0) return;
@@ -1904,8 +1978,9 @@ export class BattleBotAI {
         appliedDamage: 0,
       };
     }
-    const resolvedTeam: BattleTeamId = attackerTeam ?? (this.rule === 'tdm' ? 'A' : 'FFA');
-    if (this.coopInfectionMode || (this.rule === 'tdm' && bot.team === resolvedTeam)) {
+    const resolvedTeam: BattleTeamId =
+      attackerTeam ?? (isTeamBattleRule(this.rule) ? 'A' : 'FFA');
+    if (this.coopInfectionMode || (isTeamBattleRule(this.rule) && bot.team === resolvedTeam)) {
       return {
         hit: false,
         botId: bot.id,
@@ -1913,6 +1988,19 @@ export class BattleBotAI {
         killed: false,
         headshot: false,
         friendlyIgnored: true,
+        appliedDamage: 0,
+      };
+    }
+
+    // Universal Battle Spawn Protection absorbs incoming damage during brief post-spawn grace window
+    if (this.modeController?.isSpawnProtected(bot.id)) {
+      return {
+        hit: false,
+        botId: bot.id,
+        botName: bot.name,
+        killed: false,
+        headshot: false,
+        friendlyIgnored: false,
         appliedDamage: 0,
       };
     }
@@ -2049,6 +2137,22 @@ export class BattleBotAI {
     if (this.rule === 'tdm') {
       if (killerTeam === 'A') this.scoreA += 1;
       else if (killerTeam === 'B') this.scoreB += 1;
+    }
+
+    if (this.modeController && !this.coopInfectionMode) {
+      this.modeController.onActorKilled({
+        victimId: victim.id,
+        victimTeam: victim.team,
+        x: victim.pos.x,
+        y: victim.pos.y,
+        z: victim.pos.z,
+      });
+      if (this.rule === 'conquest') {
+        const remaining = this.modeController.consumeBotConquestLife(victim.id);
+        if (remaining <= 0) {
+          victim.respawnTimer = 999999; // Expended all loadout lives -> spectating
+        }
+      }
     }
 
     this.pushKillfeed({
@@ -2232,7 +2336,7 @@ export class BattleBotAI {
       killerName: attackerName,
       killerTeam: attackerTeam,
       victimName: 'YOU',
-      victimTeam: this.rule === 'tdm' ? 'A' : 'FFA',
+      victimTeam: isTeamBattleRule(this.rule) ? this.localAllyTeam : 'FFA',
       headshot: false,
       weaponLabel: killerBot?.weaponLabel ?? 'CARBINE',
       timestampMs: performance.now(),
@@ -2264,11 +2368,12 @@ export class BattleBotAI {
       afkSeconds: number;
     },
   ): BattleScoreEntry[] {
+    const localObj = this.modeController?.getActorStats('player');
     const rows: BattleScoreEntry[] = [
       {
         id: 'player',
         name: 'YOU',
-        team: this.rule === 'tdm' ? 'A' : 'FFA',
+        team: isTeamBattleRule(this.rule) ? this.localAllyTeam : 'FFA',
         isPlayer: true,
         isBot: false,
         kills: playerKills,
@@ -2280,26 +2385,66 @@ export class BattleBotAI {
         damageDealt: localStats?.damageDealt ?? 0,
         afkSeconds: localStats?.afkSeconds ?? 0,
         alive: playerAlive,
+        enemyDogtags: localObj?.enemyDogtags ?? 0,
+        friendlyDogtags: localObj?.friendlyDogtags ?? 0,
+        selfDogtagsRecovered: localObj?.selfDogtagsRecovered ?? 0,
+        poiCaptures: localObj?.poiCaptures ?? 0,
+        territoryPoints: Math.round(localObj?.territoryPoints ?? 0),
+        flagCaptures: localObj?.flagCaptures ?? 0,
+        flagReturns: localObj?.flagReturns ?? 0,
+        hillControlSec: Math.round(localObj?.hillControlSec ?? 0),
       },
-      ...this.bots.map((b) => ({
-        id: b.id,
-        name: b.name,
-        team: b.team,
-        isPlayer: false,
-        isBot: true,
-        kills: b.kills,
-        deaths: b.deaths,
-        headshots: b.headshots,
-        assists: b.assists,
-        grenadeKills: b.grenadeKills,
-        meleeKills: b.meleeKills,
-        damageDealt: b.damageDealt,
-        afkSeconds: b.afkSeconds,
-        alive: b.alive,
-      })),
+      ...this.bots.map((b) => {
+        const bObj = this.modeController?.getActorStats(b.id);
+        return {
+          id: b.id,
+          name: b.name,
+          team: b.team,
+          isPlayer: false,
+          isBot: true,
+          kills: b.kills,
+          deaths: b.deaths,
+          headshots: b.headshots,
+          assists: b.assists,
+          grenadeKills: b.grenadeKills,
+          meleeKills: b.meleeKills,
+          damageDealt: b.damageDealt,
+          afkSeconds: b.afkSeconds,
+          alive: b.alive,
+          enemyDogtags: bObj?.enemyDogtags ?? 0,
+          friendlyDogtags: bObj?.friendlyDogtags ?? 0,
+          selfDogtagsRecovered: bObj?.selfDogtagsRecovered ?? 0,
+          poiCaptures: bObj?.poiCaptures ?? 0,
+          territoryPoints: Math.round(bObj?.territoryPoints ?? 0),
+          flagCaptures: bObj?.flagCaptures ?? 0,
+          flagReturns: bObj?.flagReturns ?? 0,
+          hillControlSec: Math.round(bObj?.hillControlSec ?? 0),
+        };
+      }),
     ];
 
-    rows.sort((a, b) => b.kills - a.kills || b.assists - a.assists || a.deaths - b.deaths);
+    rows.sort((a, b) => {
+      if (this.rule === 'kc_tdm' || this.rule === 'kc_ffa') {
+        const td = (b.enemyDogtags ?? 0) - (a.enemyDogtags ?? 0);
+        if (td !== 0) return td;
+      } else if (this.rule === 'conquest') {
+        const cd =
+          (b.poiCaptures ?? 0) * 100 +
+          (b.territoryPoints ?? 0) -
+          ((a.poiCaptures ?? 0) * 100 + (a.territoryPoints ?? 0));
+        if (cd !== 0) return cd;
+      } else if (this.rule === 'ctf') {
+        const fd =
+          (b.flagCaptures ?? 0) * 120 +
+          (b.flagReturns ?? 0) * 35 -
+          ((a.flagCaptures ?? 0) * 120 + (a.flagReturns ?? 0) * 35);
+        if (fd !== 0) return fd;
+      } else if (this.rule === 'koth') {
+        const hd = (b.hillControlSec ?? 0) - (a.hillControlSec ?? 0);
+        if (hd !== 0) return hd;
+      }
+      return b.kills - a.kills || b.assists - a.assists || a.deaths - b.deaths;
+    });
     return rows;
   }
 
@@ -2354,7 +2499,7 @@ export class BattleBotAI {
 
   private isHostilePair(aTeam: BattleTeamId, bTeam: BattleTeamId): boolean {
     if (this.coopInfectionMode) return false;
-    if (this.rule === 'ffa') return true;
+    if (isFreeForAllBattleRule(this.rule)) return true;
     return aTeam !== bTeam;
   }
 
@@ -3130,7 +3275,7 @@ export class BattleBotAI {
             {
               id: 'player',
               name: 'YOU',
-              team: this.coopInfectionMode || this.rule === 'tdm' ? 'A' : 'FFA',
+              team: this.coopInfectionMode || isTeamBattleRule(this.rule) ? this.localAllyTeam : 'FFA',
               pos: playerPos as THREE.Vector3,
               alive: playerAlive,
             },
@@ -3621,6 +3766,7 @@ export class BattleBotAI {
                   const basePause = this.coopInfectionMode ? activeSpec.burstPauseSec : this.diff.burstPauseSec;
                   bot.burstCooldown = basePause * (0.75 + Math.random() * 0.45);
                 }
+                this.modeController?.cancelSpawnProtection(bot.id);
                 this.fireBotRound(
                   bot,
                   targetPos,
@@ -3755,7 +3901,22 @@ export class BattleBotAI {
                 }
               } else {
                 const nodes = this.map.navGraph.nodes;
-                if (Math.random() < 0.58) {
+                // Objective Brain: Conquest POIs, CTF Flags, KOTH Hills, Kill Confirmed Dogtags
+                const objTarget = this.modeController?.getBotObjectiveTarget(
+                  bot.id,
+                  bot.team,
+                  bot.pos,
+                );
+                if (objTarget && Math.random() < Math.min(0.92, 0.58 + objTarget.priority * 0.28)) {
+                  this._tmpTarget.set(
+                    objTarget.position[0],
+                    objTarget.position[1],
+                    objTarget.position[2],
+                  );
+                  goalNode = findNearestNavNode(this.map.navGraph, this._tmpTarget);
+                }
+
+                if (!goalNode && Math.random() < 0.58) {
                   const hostileHumans = humans.filter(
                     (hm) => hm.alive && this.isHostilePair(bot.team, hm.team),
                   );

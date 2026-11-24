@@ -748,14 +748,18 @@ export class BodycamController {
 
   /**
    * Involuntary 0.3°–0.6° adrenaline micro-flinch when a supersonic round passes razor-close (< 1.2m).
-   * Feeds strictly into the fast-settling camera roll/pitch spring without shifting aimYaw/aimPitch.
+   * Feeds strictly into the fast-settling camera roll/pitch spring (omega=26/28, zeta=0.70/0.72)
+   * without shifting aimYaw or aimPitch.
    */
   public applyBallisticMicroFlinch(flinchDeg: number, sideSign = 1): void {
-    const clampedDeg = THREE.MathUtils.clamp(flinchDeg, 0.25, 0.65);
+    const clampedDeg = THREE.MathUtils.clamp(flinchDeg, 0.3, 0.6);
     const flinchRad = THREE.MathUtils.degToRad(clampedDeg);
-    const dir = sideSign >= 0 ? 1 : -1;
-    this.camShakeRollVel += dir * flinchRad * 18.0;
-    this.camShakePitchVel -= flinchRad * 9.5;
+    // Flinch slightly away from the side of the supersonic shockwave cone
+    const awayDir = sideSign >= 0 ? -1 : 1;
+    // Calibrated against spring peak factor (exp(-zeta/sqrt(1-zeta^2)*acos(zeta))/omega ~= 0.0176)
+    // so peak camera roll lands cleanly at ~0.92 * flinchDeg (0.3°–0.6°) and pitch dips ~0.42 * flinchDeg
+    this.camShakeRollVel += awayDir * flinchRad * 52.0;
+    this.camShakePitchVel -= flinchRad * 26.0;
     this.exertion = Math.min(BREATH_SWAY_CONFIG.exertionMax, this.exertion + 0.035);
   }
 

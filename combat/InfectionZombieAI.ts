@@ -19,6 +19,16 @@ import {
   InfectedZombieRigLibrary,
   InfectedZombieVariant,
 } from './InfectedZombieRig';
+import {
+  CrawlerClawCycleSample,
+  CrawlerGroundPlaneState,
+  createCrawlerClawCycleSample,
+  createCrawlerGroundPlaneState,
+  evaluateCrawlerClawCycle,
+  isCrawlerFootprintBlocked,
+  resolveCrawlerCapsuleWorldCollision,
+  solveCrawlerGroundPlane,
+} from './CrawlerGroundPlaneSolver';
 
 export const CRAWLER_BLEED_OUT_MIN_SEC = 120;
 export const CRAWLER_BLEED_OUT_MAX_SEC = 150;
@@ -139,6 +149,9 @@ interface ZombieActor {
   wasInWindup: boolean;
   lastSpeedMps: number;
 
+  // Dedicated ground-plane & oriented capsule state for Crawlers
+  crawlerGroundState: CrawlerGroundPlaneState;
+
   // Visuals
   root: THREE.Group;
   bodyPivot: THREE.Group;
@@ -228,6 +241,8 @@ export class InfectionZombieAI {
   // Shared anatomical infected zombie rig library & zero-GC pose input scratch
   private readonly rigLib: InfectedZombieRigLibrary;
   private elapsedSec = 0;
+  private readonly _clawCycle: CrawlerClawCycleSample = createCrawlerClawCycleSample();
+  private readonly _crawlResolvePos = { x: 0, z: 0 };
   private readonly _poseInput: InfectedPoseInput = {
     mode: 'locomote',
     walkCycle: 0,
@@ -243,6 +258,9 @@ export class InfectionZombieAI {
     distanceToCameraM: 0,
     isVisible: true,
     variant: 'walker',
+    groundNormal: null,
+    rootLiftOffsetM: 0,
+    crawlerGroundSolved: false,
   };
 
   constructor(
@@ -347,6 +365,61 @@ export class InfectionZombieAI {
       legsSevered: z.rig.legsSevered,
       irisGlow: z.rig.headAssembly.getIrisGlow(),
     };
+  }
+
+  /**
+   * Returns the live ground-plane solver state (floor normal, bone-height root lift,
+   * root quaternion, and floor-normal-oriented prone torso/pelvis capsule) for a crawler.
+   */
+  public getCrawlerGroundState(zombieId: string): Readonly<CrawlerGroundPlaneState> | null {
+    const z = this.zombies.find((item) => item.id === zombieId);
+    if (!z || z.variant !== 'crawler') return null;
+    return z.crawlerGroundState;
+  }
+
+  /**
+   * Updates root transform for upright zombies or solves the dedicated ground plane
+   * (floor normal alignment + bone-height root lift + oriented torso/pelvis capsule) for crawlers.
+   */
+  private applyActorRootTransform(
+    z: ZombieActor,
+    dt: number,
+    options?: { snap?: boolean; preserveY?: boolean },
+  ): void {
+    if (z.variant === 'crawler') {
+      const state = solveCrawlerGroundPlane(
+        this.map.physics,
+        z.pos.x,
+        z.pos.y,
+        z.pos.z,
+        z.yaw,
+        z.rig.heightScale,
+        dt,
+        z.crawlerGroundState,
+        {
+          terrainHeightAt: this.map.terrainHeightAt,
+          snap: options?.snap,
+        },
+      );
+      if (options?.preserveY) {
+        // Vaulting over a sill: preserve animated arc height while still applying bone-height lift
+        z.root.position.set(z.pos.x, z.pos.y + state.rootLiftOffsetM, z.pos.z);
+        z.root.rotation.set(0, z.yaw, 0);
+      } else {
+        z.pos.y = state.groundY;
+        z.root.position.copy(state.rootPosition);
+        z.root.quaternion.copy(state.rootQuaternion);
+      }
+      this._poseInput.groundNormal = state.floorNormal;
+      this._poseInput.rootLiftOffsetM = state.rootLiftOffsetM;
+      this._poseInput.crawlerGroundSolved = true;
+    } else {
+      z.root.position.copy(z.pos);
+      z.root.rotation.set(0, z.yaw, 0);
+      this._poseInput.groundNormal = null;
+      this._poseInput.rootLiftOffsetM = 0;
+      this._poseInput.crawlerGroundSolved = false;
+    }
   }
 
   public getBarrierById(barrierId: string): MapWindowBarrier | undefined {
@@ -619,6 +692,9 @@ export class InfectionZombieAI {
       if (z.variant !== nextVariant) {
         z.variant = nextVariant;
         this.rigLib.setZombieVariant(z.rig, nextVariant);
+        if (nextVariant === 'crawler') {
+          z.crawlerGroundState.initialized = false;
+        }
         hitMeshesDirty = true;
       }
       z.alive = sz.alive;
@@ -837,6 +913,7 @@ export class InfectionZombieAI {
       prevWalkStepIndex: 0,
       wasInWindup: false,
       lastSpeedMps: 0,
+      crawlerGroundState: createCrawlerGroundPlaneState(rig.heightScale),
       root,
       bodyPivot,
       rig,
@@ -858,8 +935,7 @@ export class InfectionZombieAI {
     this._poseInput.distanceToCameraM = 0;
     this._poseInput.isVisible = true;
     this._poseInput.variant = z.variant;
-    root.position.copy(z.pos);
-    root.rotation.set(0, z.yaw, 0);
+    this.applyActorRootTransform(z, 0.016, { snap: true });
     this.rigLib.applyPose(rig, this._poseInput);
     return z;
   }
@@ -943,6 +1019,8 @@ export class InfectionZombieAI {
     z.bleedDripTimer = 0.35;
     z.staggerTimer = Math.max(z.staggerTimer, 0.52);
     z.windupTimer = 0;
+    z.crawlerGroundState.initialized = false;
+    this.applyActorRootTransform(z, 0.016, { snap: true });
 
     // Arterial stump burst at knee/thigh sever height
     this._tmpAudioPos.set(z.pos.x, z.pos.y + 0.48, z.pos.z);
@@ -1154,7 +1232,15 @@ export class InfectionZombieAI {
       const z = this.zombies[i];
       if (z.id === zombieId) {
         if (!z.alive) return false;
-        out.set(z.pos.x, z.pos.y + (z.variant === 'crawler' ? 0.55 : 1.88), z.pos.z);
+        if (z.variant === 'crawler' && z.crawlerGroundState.initialized) {
+          const st = z.crawlerGroundState;
+          out
+            .copy(st.rootPosition)
+            .addScaledVector(st.floorForward, 0.28 * z.rig.heightScale)
+            .addScaledVector(st.floorNormal, 0.42 * z.rig.heightScale);
+        } else {
+          out.set(z.pos.x, z.pos.y + (z.variant === 'crawler' ? 0.48 : 1.88), z.pos.z);
+        }
         return true;
       }
     }
@@ -1237,8 +1323,19 @@ export class InfectionZombieAI {
 
   /**
    * Fast 2D walkable corridor clearance test against solid physics AABBs (used for path smoothing & whiskers).
+   * Crawlers automatically evaluate their prone torso/pelvis height envelope via isCrawlerFootprintBlocked.
    */
-  private isPointBlockedXZ(x: number, z: number, baseY: number, radius: number): boolean {
+  private isPointBlockedXZ(
+    x: number,
+    z: number,
+    baseY: number,
+    radius: number,
+    isCrawler = false,
+    heightScale = 1,
+  ): boolean {
+    if (isCrawler) {
+      return isCrawlerFootprintBlocked(this.map.physics, x, baseY, z, radius, heightScale);
+    }
     if (
       x < this.map.physics.boundsMinX + radius ||
       x > this.map.physics.boundsMaxX - radius ||
@@ -1271,6 +1368,8 @@ export class InfectionZombieAI {
     z1: number,
     baseY: number,
     radius: number,
+    isCrawler = false,
+    heightScale = 1,
   ): boolean {
     const dist = Math.hypot(x1 - x0, z1 - z0);
     if (dist < 0.25) return true;
@@ -1279,7 +1378,7 @@ export class InfectionZombieAI {
       const t = s / steps;
       const px = x0 + (x1 - x0) * t;
       const pz = z0 + (z1 - z0) * t;
-      if (this.isPointBlockedXZ(px, pz, baseY, radius)) {
+      if (this.isPointBlockedXZ(px, pz, baseY, radius, isCrawler, heightScale)) {
         return false;
       }
     }
@@ -1356,6 +1455,7 @@ export class InfectionZombieAI {
           );
           this._poseInput.isVisible = z.root.visible;
           this._poseInput.variant = z.variant;
+          this.applyActorRootTransform(z, dt);
           this.rigLib.applyPose(z.rig, this._poseInput);
           if (z.deathTimer > 3.2) {
             this.group.remove(z.root);
@@ -1377,7 +1477,10 @@ export class InfectionZombieAI {
         z.yaw += dyaw * rotAlpha;
 
         z.lastSpeedMps = spd;
-        z.walkCycle += dt * Math.max(1.2, spd * 2.9);
+        z.walkCycle +=
+          z.variant === 'crawler'
+            ? dt * Math.max(2.0, spd * 3.85)
+            : dt * Math.max(1.2, spd * 2.9);
 
         this._poseInput.walkCycle = z.walkCycle;
         this._poseInput.speedMps = spd;
@@ -1410,8 +1513,7 @@ export class InfectionZombieAI {
               : 'locomote';
           this._poseInput.windupProgress = z.netWindup ? 0.65 : 0;
         }
-        z.root.position.copy(z.pos);
-        z.root.rotation.set(0, z.yaw, 0);
+        this.applyActorRootTransform(z, dt, { preserveY: z.netEntryStage === 'vault' });
         this._poseInput.dt = dt;
         this._poseInput.gazeTargetWorld = playerPos;
         this._poseInput.distanceToCameraM = Math.hypot(
@@ -1494,6 +1596,7 @@ export class InfectionZombieAI {
         );
         this._poseInput.isVisible = z.root.visible;
         this._poseInput.variant = z.variant;
+        this.applyActorRootTransform(z, dt);
         this.rigLib.applyPose(z.rig, this._poseInput);
         if (z.deathTimer > 3.2) {
           this.group.remove(z.root);
@@ -1560,7 +1663,17 @@ export class InfectionZombieAI {
               z.tearTimer = 0.25;
             }
           } else {
-            const walkSpd = z.staggerTimer > 0 ? z.speed * 0.25 : Math.max(1.35, z.speed * 0.78);
+            const isCrawler = z.variant === 'crawler';
+            const baseApproachSpd =
+              z.staggerTimer > 0
+                ? z.speed * 0.25
+                : isCrawler
+                  ? z.speed
+                  : Math.max(1.35, z.speed * 0.78);
+            const crawlCycle = isCrawler
+              ? evaluateCrawlerClawCycle(z.walkCycle, z.staggerTimer > 0 ? 0.25 : 1.0, this._clawCycle)
+              : null;
+            const walkSpd = crawlCycle ? baseApproachSpd * crawlCycle.forwardVelocityScale : baseApproachSpd;
             const vx = (dx / dist) * walkSpd;
             const vz = (dz / dist) * walkSpd;
             z.pos.x += vx * dt;
@@ -1569,10 +1682,12 @@ export class InfectionZombieAI {
             z.yaw = Math.atan2(-dx, -dz);
 
             z.lastSpeedMps = walkSpd;
-            z.walkCycle += dt * Math.max(1.2, walkSpd * 2.9);
+            z.walkCycle += isCrawler
+              ? dt * Math.max(2.2, baseApproachSpd * 3.85)
+              : dt * Math.max(1.2, walkSpd * 2.9);
             this._poseInput.mode = z.staggerTimer > 0 ? 'stagger' : 'locomote';
             this._poseInput.walkCycle = z.walkCycle;
-            this._poseInput.speedMps = walkSpd;
+            this._poseInput.speedMps = isCrawler ? baseApproachSpd : walkSpd;
             this._poseInput.tearPhase = 0;
             this._poseInput.vaultT = 0;
             this._poseInput.windupProgress = 0;
@@ -1588,14 +1703,12 @@ export class InfectionZombieAI {
             );
             this._poseInput.isVisible = z.root.visible;
             this._poseInput.variant = z.variant;
-            z.root.position.copy(z.pos);
-            z.root.rotation.set(0, z.yaw, 0);
+            this.applyActorRootTransform(z, dt);
             this.rigLib.applyPose(z.rig, this._poseInput);
             continue;
           }
 
-          z.root.position.copy(z.pos);
-          z.root.rotation.set(0, z.yaw, 0);
+          this.applyActorRootTransform(z, dt);
           continue;
         }
 
@@ -1644,8 +1757,7 @@ export class InfectionZombieAI {
               );
               this._poseInput.isVisible = z.root.visible;
               this._poseInput.variant = z.variant;
-              z.root.position.copy(z.pos);
-              z.root.rotation.set(0, z.yaw, 0);
+              this.applyActorRootTransform(z, dt);
               this.rigLib.applyPose(z.rig, this._poseInput);
 
               if (z.tearTimer <= 0 && barrier) {
@@ -1677,14 +1789,12 @@ export class InfectionZombieAI {
               );
               this._poseInput.isVisible = z.root.visible;
               this._poseInput.variant = z.variant;
-              z.root.position.copy(z.pos);
-              z.root.rotation.set(0, z.yaw, 0);
+              this.applyActorRootTransform(z, dt);
               this.rigLib.applyPose(z.rig, this._poseInput);
             }
           }
 
-          z.root.position.copy(z.pos);
-          z.root.rotation.set(0, z.yaw, 0);
+          this.applyActorRootTransform(z, dt);
           continue;
         }
 
@@ -1733,8 +1843,7 @@ export class InfectionZombieAI {
           const faceX = z.entryPos.x - z.sillPos.x;
           const faceZ = z.entryPos.z - z.sillPos.z;
           z.yaw = Math.atan2(-faceX, -faceZ);
-          z.root.position.copy(z.pos);
-          z.root.rotation.set(0, z.yaw, 0);
+          this.applyActorRootTransform(z, dt, { preserveY: true });
 
           this._poseInput.mode = 'vault';
           this._poseInput.walkCycle = z.walkCycle;
@@ -1764,6 +1873,10 @@ export class InfectionZombieAI {
             z.lastProgressX = z.pos.x;
             z.lastProgressZ = z.pos.z;
             z.stuckTimer = 0;
+            if (z.variant === 'crawler') {
+              z.crawlerGroundState.initialized = false;
+              this.applyActorRootTransform(z, dt, { snap: true });
+            }
             this._tmpAudioPos.copy(z.entryPos);
             this.audio.playImpact(this._tmpAudioPos, 'wood');
           }
@@ -1786,6 +1899,8 @@ export class InfectionZombieAI {
         }
       }
 
+      const isCrawler = z.variant === 'crawler';
+      let crawlerActivelyMoving = false;
       if (nearestTarget) {
         const targetPos = nearestTarget.pos;
         const dxP = targetPos.x - z.pos.x;
@@ -1806,7 +1921,7 @@ export class InfectionZombieAI {
           }
         } else if (distToPlayer <= ZOMBIE_ATTACK_RANGE && dyP < 1.5 && z.attackCooldown <= 0 && z.staggerTimer <= 0) {
           z.windupTimer = scaledWindup;
-          this._tmpAudioPos.set(z.pos.x, z.pos.y + 1.5, z.pos.z);
+          this._tmpAudioPos.set(z.pos.x, z.pos.y + (isCrawler ? 0.45 : 1.5), z.pos.z);
           this.audio.playZombieVocal(this._tmpAudioPos, 'lunge', {
             pitchScale: z.voicePitchScale,
             intensity: 1.25,
@@ -1820,7 +1935,16 @@ export class InfectionZombieAI {
           const canChaseDirect =
             distToPlayer < 6.5 &&
             dyP < 0.75 &&
-            this.isWalkSegmentClear(z.pos.x, z.pos.z, targetPos.x, targetPos.z, z.pos.y, ZOMBIE_RADIUS * 0.92);
+            this.isWalkSegmentClear(
+              z.pos.x,
+              z.pos.z,
+              targetPos.x,
+              targetPos.z,
+              z.pos.y,
+              ZOMBIE_RADIUS * 0.92,
+              isCrawler,
+              z.rig.heightScale,
+            );
 
           if (!canChaseDirect) {
             z.repathTimer -= dt;
@@ -1860,6 +1984,8 @@ export class InfectionZombieAI {
                   nextWp.position[2],
                   z.pos.y,
                   ZOMBIE_RADIUS * 0.95,
+                  isCrawler,
+                  z.rig.heightScale,
                 )
               ) {
                 z.pathIndex++;
@@ -1894,6 +2020,8 @@ export class InfectionZombieAI {
               z.pos.z + dirZ * probeDist,
               z.pos.y,
               ZOMBIE_RADIUS * 0.92,
+              isCrawler,
+              z.rig.heightScale,
             );
             if (fwdBlocked || z.unstuckBoostTimer > 0) {
               const cosA = 0.78;
@@ -1908,12 +2036,16 @@ export class InfectionZombieAI {
                 z.pos.z + leftZ * probeDist,
                 z.pos.y,
                 ZOMBIE_RADIUS * 0.88,
+                isCrawler,
+                z.rig.heightScale,
               );
               const rightClear = !this.isPointBlockedXZ(
                 z.pos.x + rightX * probeDist,
                 z.pos.z + rightZ * probeDist,
                 z.pos.y,
                 ZOMBIE_RADIUS * 0.88,
+                isCrawler,
+                z.rig.heightScale,
               );
 
               if (leftClear && !rightClear) {
@@ -1936,10 +2068,19 @@ export class InfectionZombieAI {
               }
             }
 
-            const crawlSurge =
-              z.variant === 'crawler' ? 0.62 + 0.68 * Math.abs(Math.sin(z.walkCycle)) : 1.0;
-            moveX += dirX * z.speed * crawlSurge;
-            moveZ += dirZ * z.speed * crawlSurge;
+            // For crawlers, sync forward propulsion strictly to the active grounded claw-pull stroke & torso surge
+            let velScale = 1.0;
+            if (isCrawler) {
+              crawlerActivelyMoving = true;
+              const cycle = evaluateCrawlerClawCycle(z.walkCycle, 1.0, this._clawCycle);
+              // Scale slightly by floor cosine on steep ramps so ground-plane travel speed stays physically consistent
+              const slopeCos = z.crawlerGroundState.initialized
+                ? THREE.MathUtils.clamp(z.crawlerGroundState.floorNormal.y, 0.72, 1.0)
+                : 1.0;
+              velScale = cycle.forwardVelocityScale * slopeCos;
+            }
+            moveX += dirX * z.speed * velScale;
+            moveZ += dirZ * z.speed * velScale;
             const desiredYaw = Math.atan2(-dirX, -dirZ);
             let dyaw = desiredYaw - z.yaw;
             while (dyaw > Math.PI) dyaw -= Math.PI * 2;
@@ -1979,35 +2120,50 @@ export class InfectionZombieAI {
         }
       }
 
-      // Integrate position & collide with solid world boxes
+      // Integrate position & collide with solid world boxes (using floor-normal-oriented capsule for crawlers)
       const nextX = z.pos.x + moveX * dt;
       const nextZ = z.pos.z + moveZ * dt;
-      const res = this.resolveZombieXZ(nextX, z.pos.y, nextZ);
-      z.pos.x = res.x;
-      z.pos.z = res.z;
-
-      const groundY = this.map.physics.getGroundHeight(z.pos.x, z.pos.z, z.pos.y, 0.85, 0.14);
-      z.pos.y = THREE.MathUtils.damp(z.pos.y, groundY, 14, dt);
+      if (isCrawler) {
+        const res = resolveCrawlerCapsuleWorldCollision(
+          this.map.physics,
+          nextX,
+          z.pos.y,
+          nextZ,
+          z.crawlerGroundState,
+          this._crawlResolvePos,
+        );
+        z.pos.x = res.x;
+        z.pos.z = res.z;
+      } else {
+        const res = this.resolveZombieXZ(nextX, z.pos.y, nextZ);
+        z.pos.x = res.x;
+        z.pos.z = res.z;
+        const groundY = this.map.physics.getGroundHeight(z.pos.x, z.pos.z, z.pos.y, 0.85, 0.14);
+        z.pos.y = THREE.MathUtils.damp(z.pos.y, groundY, 14, dt);
+      }
 
       // Anatomical shamble / sprint / crawl / melee windup / hit stagger pose
       const spd = Math.hypot(moveX, moveZ);
       z.lastSpeedMps = spd;
-      z.walkCycle +=
-        z.variant === 'crawler'
-          ? dt * Math.max(2.4, spd * 4.5)
-          : dt * Math.max(1.2, spd * 2.9);
+      if (isCrawler) {
+        // Drive crawl cycle steadily from base crawl speed so claw-pull cadence stays crisp and synced
+        const cadenceSpd = crawlerActivelyMoving ? z.speed : Math.min(spd, z.speed);
+        z.walkCycle += dt * (crawlerActivelyMoving ? Math.max(2.3, cadenceSpd * 3.85) : cadenceSpd * 2.4);
+      } else {
+        z.walkCycle += dt * Math.max(1.2, spd * 2.9);
+      }
 
       const windupProgress =
         z.windupTimer > 0 ? THREE.MathUtils.clamp(1 - z.windupTimer / Math.max(0.05, scaledWindup), 0, 1) : 0;
       const staggerRatio = z.staggerTimer > 0 ? Math.min(1, z.staggerTimer / 0.35) : 0;
 
-      z.root.position.copy(z.pos);
-      z.root.rotation.set(0, z.yaw, 0);
+      // Solve ground plane (floor normal + bone-height root lift + oriented capsule) & apply root transform
+      this.applyActorRootTransform(z, dt);
 
       this._poseInput.mode =
         windupProgress > 0.01 ? 'windup' : staggerRatio > 0.05 ? 'stagger' : 'locomote';
       this._poseInput.walkCycle = z.walkCycle;
-      this._poseInput.speedMps = spd;
+      this._poseInput.speedMps = isCrawler && crawlerActivelyMoving ? Math.max(spd, z.speed * 0.65) : spd;
       this._poseInput.tearPhase = 0;
       this._poseInput.vaultT = 0;
       this._poseInput.windupProgress = windupProgress;
@@ -2126,7 +2282,7 @@ export class InfectionZombieAI {
             distanceM: dist,
             speedMps: z.lastSpeedMps,
             surface: z.entryStage === 'approach' ? 'wood' : 'concrete',
-            isDrag: z.lastSpeedMps < 2.25 && (stepIdx & 1) === 1,
+            isDrag: z.variant === 'crawler' || (z.lastSpeedMps < 2.25 && (stepIdx & 1) === 1),
           });
         }
       }

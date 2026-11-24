@@ -1,47 +1,27 @@
+import { BUNKER_OBJEKT_47_MAP } from './BunkerObjekt47Map';
 import { KINO_THEATER_MAP } from './KinoTheaterMap';
 import { KORSAKOV_SUBSTATION_MAP } from './KorsakovSubstationMap';
 import { PRIPYAT_BLOCK_MAP } from './PripyatBlockMap';
+import { STALINGRAD_DEPOT_MAP } from './StalingradDepotMap';
 import { TIMBERLINE_COMPOUND_MAP } from './TimberlineCompoundMap';
+import { VOLGA_CORRIDOR_MAP } from './VolgaCorridorMap';
 import { IMapDefinition } from './types';
 
 export const BATTLE_MAPS: readonly IMapDefinition[] = [
   PRIPYAT_BLOCK_MAP,
   TIMBERLINE_COMPOUND_MAP,
   KORSAKOV_SUBSTATION_MAP,
+  VOLGA_CORRIDOR_MAP,
 ];
 
 /**
  * Extensible Infection Map Registry.
- * Adding Map 2 or Map 3 later is a single entry in this array.
+ * All three Infection maps (Kino Theater, Stalingrad Rail Depot, Bunker Objekt-47) are playable.
  */
 export const ZOMBIE_MAPS: readonly IMapDefinition[] = [
   KINO_THEATER_MAP,
-  {
-    id: 'stalingrad_depot',
-    name: 'Stalingrad Rail Depot',
-    subtitle: 'Sector Locked · Coming Soon',
-    description:
-      'Frozen freight yard, bombed-out locomotive shed, and underground maintenance tunnels.',
-    mode: 'infection',
-    status: 'coming_soon',
-    environmentTags: ['Sector Locked', 'Coming Soon'],
-    accentHex: '#991b1b',
-    previewStyle: 'locked_depot',
-    build: KINO_THEATER_MAP.build,
-  },
-  {
-    id: 'objekt_47',
-    name: 'Bunker Objekt-47',
-    subtitle: 'Sector Locked · Coming Soon',
-    description:
-      'Subterranean Cold War bio-containment complex with blast doors and flooded reactor decks.',
-    mode: 'infection',
-    status: 'coming_soon',
-    environmentTags: ['Sector Locked', 'Coming Soon'],
-    accentHex: '#991b1b',
-    previewStyle: 'locked_bunker',
-    build: KINO_THEATER_MAP.build,
-  },
+  STALINGRAD_DEPOT_MAP,
+  BUNKER_OBJEKT_47_MAP,
 ];
 
 export const ALL_MAPS: readonly IMapDefinition[] = [...BATTLE_MAPS, ...ZOMBIE_MAPS];

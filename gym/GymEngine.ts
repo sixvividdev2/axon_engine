@@ -267,6 +267,7 @@ export class GymEngine {
   private readonly _benchRaycaster = new THREE.Raycaster();
   private readonly _lookDir = new THREE.Vector3();
   private readonly _fpsCamPos = new THREE.Vector3();
+  private readonly _fpsCamRight = new THREE.Vector3();
   private readonly _fpsCamQuat = new THREE.Quaternion();
   private readonly _pinBuffer: GunsmithPinProjection[] = createEmptyPinProjections();
   private readonly _runtimeConfig: BodycamSDKConfig = { ...DEFAULT_BODYCAM_SDK_CONFIG };
@@ -2386,10 +2387,24 @@ export class GymEngine {
     }
 
     // 3. Step Real-World Ballistics, Tactical Grenades & Reactive AR500 Steel Targets
-    this.ballistics.update(dt, this.adapter, (hitInfo) => {
-      this.lastHit = hitInfo;
-      this.emitSnapshot();
-    });
+    this.camera.getWorldPosition(this._fpsCamPos);
+    this._fpsCamRight.set(1, 0, 0).applyQuaternion(this.camera.quaternion);
+    this.ballistics.update(
+      dt,
+      this.adapter,
+      (hitInfo) => {
+        this.lastHit = hitInfo;
+        this.emitSnapshot();
+      },
+      {
+        listenerHeadPos: this._fpsCamPos,
+        listenerRightDir: this._fpsCamRight,
+        audio: this.audio,
+        onSupersonicNearMiss: (flinchDeg, sideSign) => {
+          this.controller.applyBallisticMicroFlinch(flinchDeg, sideSign);
+        },
+      },
+    );
     const wasLiveBefore = this.grenadeSystem.isLeverReleased();
     this.grenadeSystem.update(dt, this.camera.position);
     const launched = this.grenadeSystem.consumeLastLaunchedThrow();

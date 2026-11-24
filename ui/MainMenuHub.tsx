@@ -15,6 +15,7 @@ import {
   BattleMatchConfig,
   BattleRuleId,
   BotDifficultyId,
+  getDefaultScoreLimitForRule,
   InfectionMatchConfig,
   TopLevelModeId,
 } from '../maps/types';
@@ -56,12 +57,37 @@ interface MainMenuHubProps {
 
 const BOT_COUNTS = [4, 6, 8, 10] as const;
 const INFECTION_BOT_COUNTS = [0, 1, 2, 3] as const;
-const KILL_LIMITS = [20, 30, 40, 50] as const;
 const DIFFICULTIES: Array<{ id: BotDifficultyId; label: string }> = [
   { id: 'recruit', label: 'Recruit' },
   { id: 'tactical', label: 'Tactical' },
   { id: 'veteran', label: 'Veteran' },
 ];
+const BATTLE_RULE_OPTIONS: Array<{ id: BattleRuleId; short: string; brief: string }> = [
+  { id: 'tdm', short: 'TDM', brief: 'Team A vs Team B · First team to kill limit wins · Spawn protection active' },
+  { id: 'ffa', short: 'FFA', brief: 'Free-For-All · Every operator hostile · First to kill limit wins' },
+  { id: 'conquest', short: 'Conquest', brief: 'Capture FOBs, Outposts & Road Checkpoints · Protected HQs · 1 life per loadout · Most territory points wins' },
+  { id: 'ctf', short: 'CTF', brief: 'Capture enemy flag & return to base · Home flag must be secure to score' },
+  { id: 'koth', short: 'KOTH', brief: 'Hold rotating hills every 45s · Uncontested control scores points' },
+  { id: 'kc_tdm', short: 'KC · TDM', brief: 'Collect enemy dogtags to win · Secured friendly dogtags tracked separately (+XP)' },
+  { id: 'kc_ffa', short: 'KC · FFA', brief: 'Most secured enemy dogtags wins · Recover your own dogtag for bonus XP' },
+];
+
+function getScorePresetsForRule(rule: BattleRuleId): { label: string; values: readonly number[] } {
+  switch (rule) {
+    case 'conquest':
+      return { label: 'Territory Target', values: [300, 500, 750, 1000] };
+    case 'ctf':
+      return { label: 'Flag Limit', values: [3, 5, 7, 10] };
+    case 'koth':
+      return { label: 'Hill Target', values: [150, 250, 350, 500] };
+    case 'kc_tdm':
+      return { label: 'Tag Limit', values: [25, 40, 60, 75] };
+    case 'kc_ffa':
+      return { label: 'Tag Limit', values: [15, 25, 35, 50] };
+    default:
+      return { label: 'Kill Limit', values: [20, 30, 40, 50] };
+  }
+}
 
 export const MainMenuHub: React.FC<MainMenuHubProps> = ({
   initialTab = 'battle',
@@ -427,27 +453,29 @@ export const MainMenuHub: React.FC<MainMenuHubProps> = ({
                   </h2>
                 </div>
 
-                {/* Rule Selector: TDM vs FFA */}
-                <div className="flex items-center gap-1.5">
-                  {(
-                    [
-                      { id: 'tdm' as BattleRuleId, label: 'TDM · Team Deathmatch' },
-                      { id: 'ffa' as BattleRuleId, label: 'FFA · Free-For-All' },
-                    ]
-                  ).map((r) => {
+                {/* Battle Mode Rule Selector (All 7 Modes) */}
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {BATTLE_RULE_OPTIONS.map((r) => {
                     const active = battleConfig.rule === r.id;
                     return (
                       <button
                         key={r.id}
                         type="button"
-                        onClick={() => updateBattle({ rule: r.id })}
-                        className={`cursor-pointer whitespace-nowrap shrink-0 border px-4 py-2 font-mono-tabular text-xs font-semibold uppercase tracking-wider transition-colors ${
+                        onClick={() => {
+                          const defaultLim = getDefaultScoreLimitForRule(r.id);
+                          updateBattle({
+                            rule: r.id,
+                            killLimit: defaultLim,
+                            scoreLimit: defaultLim,
+                          });
+                        }}
+                        className={`cursor-pointer whitespace-nowrap shrink-0 border px-3 py-1.5 font-mono-tabular text-xs font-semibold uppercase tracking-wider transition-colors ${
                           active
                             ? 'border-amber-400 bg-amber-500 text-neutral-950'
                             : 'border-neutral-700 bg-neutral-950/85 text-neutral-300 hover:border-neutral-500'
                         }`}
                       >
-                        {r.label}
+                        {r.short}
                       </button>
                     );
                   })}
@@ -479,28 +507,34 @@ export const MainMenuHub: React.FC<MainMenuHubProps> = ({
                   </div>
                 </div>
 
-                {/* Kill Limit */}
-                <div>
-                  <div className="font-mono-tabular text-[10px] uppercase tracking-wider text-neutral-400">
-                    Kill Limit
-                  </div>
-                  <div className="mt-1.5 flex gap-1">
-                    {KILL_LIMITS.map((lim) => (
-                      <button
-                        key={lim}
-                        type="button"
-                        onClick={() => updateBattle({ killLimit: lim })}
-                        className={`flex-1 cursor-pointer border py-1.5 font-mono-tabular text-xs font-semibold transition-colors ${
-                          battleConfig.killLimit === lim
-                            ? 'border-amber-400 bg-amber-500/20 text-amber-300'
-                            : 'border-neutral-800 bg-neutral-900 text-neutral-400 hover:text-neutral-200'
-                        }`}
-                      >
-                        {lim}
-                      </button>
-                    ))}
-                  </div>
-                </div>
+                {/* Mode Target Limit */}
+                {(() => {
+                  const preset = getScorePresetsForRule(battleConfig.rule);
+                  const currentTarget = battleConfig.scoreLimit ?? battleConfig.killLimit;
+                  return (
+                    <div>
+                      <div className="font-mono-tabular text-[10px] uppercase tracking-wider text-neutral-400">
+                        {preset.label}
+                      </div>
+                      <div className="mt-1.5 flex gap-1">
+                        {preset.values.map((lim) => (
+                          <button
+                            key={lim}
+                            type="button"
+                            onClick={() => updateBattle({ killLimit: lim, scoreLimit: lim })}
+                            className={`flex-1 cursor-pointer border py-1.5 font-mono-tabular text-xs font-semibold transition-colors ${
+                              currentTarget === lim
+                                ? 'border-amber-400 bg-amber-500/20 text-amber-300'
+                                : 'border-neutral-800 bg-neutral-900 text-neutral-400 hover:text-neutral-200'
+                            }`}
+                          >
+                            {lim}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  );
+                })()}
 
                 {/* AI Difficulty */}
                 <div>
@@ -677,9 +711,8 @@ export const MainMenuHub: React.FC<MainMenuHubProps> = ({
 
               <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
                 <div className="font-mono-tabular text-xs text-neutral-400">
-                  {battleConfig.rule === 'tdm'
-                    ? 'Team A (Blue) vs Team B (Orange) · No Friendly Fire'
-                    : 'Free-For-All · Every Operator Hostile'}{' '}
+                  {BATTLE_RULE_OPTIONS.find((o) => o.id === battleConfig.rule)?.brief ??
+                    'Tactical Skirmish'}{' '}
                   · Gunsmith Attachments Synced
                 </div>
                 <button
@@ -687,6 +720,7 @@ export const MainMenuHub: React.FC<MainMenuHubProps> = ({
                   onClick={() =>
                     onLaunchBattle({
                       ...battleConfig,
+                      scoreLimit: battleConfig.scoreLimit ?? battleConfig.killLimit,
                       tacticalEquipmentId: tacticalSelection.equipmentId,
                       weatherPreset: battleConfig.weatherPreset ?? 'auto',
                       timeOfDayStart: battleConfig.timeOfDayStart ?? 'auto',

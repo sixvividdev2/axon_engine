@@ -4,13 +4,26 @@ import {
   isValidLobbyKillfeedPolicy,
   LobbyKillfeedPolicy,
 } from './killfeedSettings';
-import { BattleRuleId, BotDifficultyId } from '../maps/types';
+import {
+  BattleRuleId,
+  BotDifficultyId,
+  formatBattleRuleShort,
+  isValidBattleRule,
+} from '../maps/types';
 import { TacticalEquipmentId } from './tacticalEquipment';
 
 export type { LobbyKillfeedPolicy };
 export type LobbyVisibility = 'public' | 'friends_only' | 'private';
 export type LobbyModeId = 'battle' | 'infection';
-export type EventCycleModeId = 'battle_tdm' | 'battle_ffa' | 'infection';
+export type EventCycleModeId =
+  | 'battle_tdm'
+  | 'battle_ffa'
+  | 'battle_conquest'
+  | 'battle_ctf'
+  | 'battle_koth'
+  | 'battle_kc_tdm'
+  | 'battle_kc_ffa'
+  | 'infection';
 export type LobbyTeamId = 'A' | 'B';
 export type ActiveWeatherConditionId = 'clear' | 'sunny' | 'overcast' | 'rainy' | 'stormy';
 export type WeatherPresetId = 'auto' | ActiveWeatherConditionId;
@@ -196,20 +209,103 @@ function clampInt(val: unknown, min: number, max: number, fallback: number): num
   return Math.round(clampNum(val, min, max, fallback));
 }
 
+export const VALID_BATTLE_MAP_IDS: ReadonlySet<string> = new Set([
+  'pripyat_block',
+  'timberline_compound',
+  'korsakov_substation',
+  'volga_corridor',
+]);
+
+export const VALID_INFECTION_MAP_IDS: ReadonlySet<string> = new Set([
+  'kino_theater',
+  'der_lichtspielhaus',
+  'stalingrad_depot',
+  'objekt_47',
+]);
+
+export const VALID_ALL_MAP_IDS: ReadonlySet<string> = new Set([
+  ...VALID_BATTLE_MAP_IDS,
+  ...VALID_INFECTION_MAP_IDS,
+]);
+
+export function isInfectionMapId(mapId: string): boolean {
+  return VALID_INFECTION_MAP_IDS.has(mapId);
+}
+
+export function eventCycleIdToModeRule(
+  cycleId: EventCycleModeId,
+): { mode: LobbyModeId; battleRule: BattleRuleId } {
+  switch (cycleId) {
+    case 'infection':
+      return { mode: 'infection', battleRule: 'tdm' };
+    case 'battle_ffa':
+      return { mode: 'battle', battleRule: 'ffa' };
+    case 'battle_conquest':
+      return { mode: 'battle', battleRule: 'conquest' };
+    case 'battle_ctf':
+      return { mode: 'battle', battleRule: 'ctf' };
+    case 'battle_koth':
+      return { mode: 'battle', battleRule: 'koth' };
+    case 'battle_kc_tdm':
+      return { mode: 'battle', battleRule: 'kc_tdm' };
+    case 'battle_kc_ffa':
+      return { mode: 'battle', battleRule: 'kc_ffa' };
+    case 'battle_tdm':
+    default:
+      return { mode: 'battle', battleRule: 'tdm' };
+  }
+}
+
+export function modeRuleToEventCycleId(
+  mode: LobbyModeId,
+  battleRule: BattleRuleId,
+): EventCycleModeId {
+  if (mode === 'infection') return 'infection';
+  switch (battleRule) {
+    case 'ffa':
+      return 'battle_ffa';
+    case 'conquest':
+      return 'battle_conquest';
+    case 'ctf':
+      return 'battle_ctf';
+    case 'koth':
+      return 'battle_koth';
+    case 'kc_tdm':
+      return 'battle_kc_tdm';
+    case 'kc_ffa':
+      return 'battle_kc_ffa';
+    case 'tdm':
+    default:
+      return 'battle_tdm';
+  }
+}
+
 export function sanitizeSpecialEventConfig(raw: unknown): SpecialEventConfig {
   const obj = (raw && typeof raw === 'object' ? raw : {}) as Partial<SpecialEventConfig>;
   const mode: LobbyModeId = obj.mode === 'infection' ? 'infection' : 'battle';
-  const battleRule: BattleRuleId = obj.battleRule === 'ffa' ? 'ffa' : 'tdm';
-  const validMaps = new Set([
-    'pripyat_block',
-    'timberline_compound',
-    'korsakov_substation',
-    'kino_theater',
-  ]);
-  const defaultMap = mode === 'infection' ? 'kino_theater' : 'pripyat_block';
-  const mapId = typeof obj.mapId === 'string' && validMaps.has(obj.mapId) ? obj.mapId : defaultMap;
+  const battleRule: BattleRuleId = isValidBattleRule(obj.battleRule) ? obj.battleRule : 'tdm';
+  const defaultMap =
+    mode === 'infection'
+      ? 'kino_theater'
+      : battleRule === 'conquest'
+        ? 'volga_corridor'
+        : 'pripyat_block';
+  const validForMode = mode === 'infection' ? VALID_INFECTION_MAP_IDS : VALID_BATTLE_MAP_IDS;
+  const mapId =
+    typeof obj.mapId === 'string' && validForMode.has(obj.mapId)
+      ? obj.mapId
+      : defaultMap;
 
-  const validCycle = new Set<EventCycleModeId>(['battle_tdm', 'battle_ffa', 'infection']);
+  const validCycle = new Set<EventCycleModeId>([
+    'battle_tdm',
+    'battle_ffa',
+    'battle_conquest',
+    'battle_ctf',
+    'battle_koth',
+    'battle_kc_tdm',
+    'battle_kc_ffa',
+    'infection',
+  ]);
   const cyclePool = Array.isArray(obj.cyclePool)
     ? Array.from(
         new Set(obj.cyclePool.filter((c): c is EventCycleModeId => validCycle.has(c))),
@@ -320,8 +416,15 @@ export function formatMapDisplayName(mapId: string): string {
       return 'Timberline Valley';
     case 'korsakov_substation':
       return 'Korsakov Substation';
+    case 'volga_corridor':
+      return 'Volga Frontier Corridor';
     case 'kino_theater':
+    case 'der_lichtspielhaus':
       return 'Kino Theater';
+    case 'stalingrad_depot':
+      return 'Stalingrad Rail Depot';
+    case 'objekt_47':
+      return 'Bunker Objekt-47';
     default:
       return mapId;
   }
@@ -329,7 +432,7 @@ export function formatMapDisplayName(mapId: string): string {
 
 export function formatLobbyModeLabel(mode: LobbyModeId, battleRule: BattleRuleId): string {
   if (mode === 'infection') return 'INFECTION';
-  return battleRule === 'ffa' ? 'BATTLE · FFA' : 'BATTLE · TDM';
+  return `BATTLE · ${formatBattleRuleShort(battleRule)}`;
 }
 
 // === PHASE 4: 20 HZ MULTIPLAYER COMBAT SYNC PACKETS ===
@@ -996,6 +1099,86 @@ export interface GameGrenadeEventPacket {
   ts: number;
 }
 
+export interface SyncedConquestPoiState {
+  id: string;
+  owner: 'A' | 'B' | null;
+  progress: number; // -1 (B) .. +1 (A)
+  contested: boolean;
+}
+
+export interface SyncedCtfFlagState {
+  team: 'A' | 'B';
+  status: 'home' | 'carried' | 'dropped';
+  carrierId: string | null;
+  x: number;
+  y: number;
+  z: number;
+  returnTimerSec: number;
+}
+
+export interface SyncedDogtagState {
+  id: string;
+  victimId: string;
+  victimTeam: 'A' | 'B' | 'FFA';
+  x: number;
+  y: number;
+  z: number;
+}
+
+export interface GameModeStatePacket {
+  type: 'game:mode_state';
+  senderUserId?: string;
+  senderIsHost?: boolean;
+  rule: BattleRuleId;
+  scoreA: number;
+  scoreB: number;
+  friendlyTagsA?: number;
+  friendlyTagsB?: number;
+  remainingSec: number;
+  pois?: SyncedConquestPoiState[];
+  flags?: [SyncedCtfFlagState, SyncedCtfFlagState];
+  activeHillIndex?: number;
+  nextHillIndex?: number;
+  hillTimerSec?: number;
+  hillOwner?: 'A' | 'B' | null;
+  hillContested?: boolean;
+  dogtags?: SyncedDogtagState[];
+  ts: number;
+}
+
+export interface GameDogtagEventPacket {
+  type: 'game:dogtag_event';
+  senderUserId?: string;
+  senderIsHost?: boolean;
+  action: 'spawn' | 'collect';
+  tagId: string;
+  victimId: string;
+  victimTeam: 'A' | 'B' | 'FFA';
+  collectorId?: string;
+  collectorTeam?: 'A' | 'B' | 'FFA';
+  isFriendly?: boolean;
+  isSelfRecovery?: boolean;
+  x: number;
+  y: number;
+  z: number;
+  ts: number;
+}
+
+export interface GameFlagEventPacket {
+  type: 'game:flag_event';
+  senderUserId?: string;
+  senderIsHost?: boolean;
+  flagTeam: 'A' | 'B';
+  action: 'pickup' | 'drop' | 'return' | 'capture';
+  actorId?: string;
+  actorName?: string;
+  actorTeam?: 'A' | 'B' | 'FFA';
+  x: number;
+  y: number;
+  z: number;
+  ts: number;
+}
+
 export type GameSyncPacket =
   | GamePlayerStatePacket
   | GamePlayerFirePacket
@@ -1023,6 +1206,7 @@ export type GameSyncPacket =
   | GameEnvSyncPacket
   | GameGlassShatterPacket
   | GameGrenadeEventPacket
-  | GameDoorActionPacket;
-
-
+  | GameDoorActionPacket
+  | GameModeStatePacket
+  | GameDogtagEventPacket
+  | GameFlagEventPacket;

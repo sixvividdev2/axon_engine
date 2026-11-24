@@ -48,6 +48,9 @@ const HOST_ONLY_GAME_TYPES = new Set<string>([
   'game:map_interact_rejected',
   'game:match_sync',
   'game:env_sync',
+  'game:mode_state',
+  'game:dogtag_event',
+  'game:flag_event',
 ]);
 
 const ALLOWED_GAME_TYPES = new Set<string>([

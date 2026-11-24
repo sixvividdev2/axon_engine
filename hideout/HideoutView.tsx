@@ -11,7 +11,7 @@ import { formatRankLabel } from '../data/progression';
 import { getTacticalEquipmentDef } from '../data/tacticalEquipment';
 import { SaveManager } from '../engine/persistence/SaveManager';
 import { BATTLE_MAPS, ZOMBIE_MAPS } from '../maps/MapRegistry';
-import { BattleMatchConfig, InfectionMatchConfig } from '../maps/types';
+import { BattleMatchConfig, formatBattleRuleName, InfectionMatchConfig } from '../maps/types';
 import { HubTabId } from '../ui/MainMenuHub';
 import { OperatorSelectPanel } from '../ui/OperatorSelectPanel';
 import { UnifiedLoadoutWorkbench } from '../ui/UnifiedLoadoutWorkbench';
@@ -157,9 +157,9 @@ export const HideoutView: React.FC<HideoutViewProps> = ({
       mapId: mapDef.id,
       mapName: mapDef.name,
       mapSubtitle: mapDef.subtitle,
-      ruleLabel: battleConfig.rule === 'ffa' ? 'FFA · Free-For-All' : 'TDM · Team Deathmatch',
+      ruleLabel: formatBattleRuleName(battleConfig.rule),
       botCount: battleConfig.botCount,
-      killLimit: battleConfig.killLimit,
+      killLimit: battleConfig.scoreLimit ?? battleConfig.killLimit,
       difficultyLabel: diffLabel,
       weatherLabel: formatWeatherPresetLabel(battleConfig.weatherPreset),
       timeOfDayLabel: formatTimeOfDayLabel(battleConfig.timeOfDayStart),

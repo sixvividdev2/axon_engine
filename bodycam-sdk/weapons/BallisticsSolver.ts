@@ -6,7 +6,7 @@ import {
   mapSurfaceToBallisticMaterial,
 } from '../../data/ballisticMaterials';
 import { AmmoVariantDef } from '../../data/calibers';
-import { classifyBallisticFlyby } from '../BodycamAudio';
+import { classifyBallisticFlyby, SPEED_OF_SOUND_MPS } from '../BodycamAudio';
 import { IBodycamAudioSource } from '../IBodycamAudioSource';
 import {
   BodycamRaycastResult,
@@ -87,6 +87,20 @@ export function evaluateBallisticFlybyPCA(
     missDistM,
     approachingAfter,
   };
+}
+
+/**
+ * Computes supersonic / caliber-scaled acoustic flyby capture radius (capped at maxRadiusM, default 4.5m).
+ * Heavy supersonic rounds (.50 AE / 7.62mm) reach the full 4.5m shockwave cone; subsonic rounds have a tighter wake.
+ */
+export function computeBallisticFlybyRadiusM(
+  speedMs: number,
+  caliberMm = 5.56,
+  energyJ = 1600,
+  maxRadiusM = BALLISTIC_FLYBY_MAX_RADIUS_M,
+): number {
+  const cls = classifyBallisticFlyby(speedMs, 1.0, caliberMm, energyJ);
+  return Math.min(maxRadiusM, cls.effectiveMaxRadiusM);
 }
 
 function inferCaliberMmFromAmmo(ammo: AmmoVariantDef | null): number {
@@ -189,7 +203,6 @@ const MAX_DECALS = 96;
 const MAX_TRACERS = 64;
 const GRAVITY_MPS2 = 9.81;
 const AIR_DENSITY_SEA = 1.225;
-const SPEED_OF_SOUND_MPS = 340.3;
 
 export interface BallisticTrajectoryPoint {
   distanceM: number;
@@ -954,8 +967,10 @@ export class BallisticsSolver {
   }
 
   /**
-   * Direct segment PCA flyby evaluation for instant/tracer AI fire (Open World squads & Battle bots)
-   * so every incoming enemy shot passing within 4.5m triggers authentic supersonic crack/snap or subsonic whizz.
+   * Direct segment PCA flyby evaluation for instant/tracer AI & remote player fire
+   * so every incoming enemy shot passing within the supersonic/caliber-scaled radius (<= 4.5m)
+   * triggers authentic supersonic crack/snap or subsonic whizz aligned to bullet time-of-flight
+   * (producing the authentic crack-then-thump double report before the 343 m/s muzzle blast arrives).
    */
   public static triggerSegmentFlyby(
     origin: Readonly<THREE.Vector3>,
@@ -965,16 +980,22 @@ export class BallisticsSolver {
     energyJ: number,
     flybyCtx: BallisticFlybyContext,
   ): boolean {
-    const maxR = flybyCtx.maxRadiusM ?? BALLISTIC_FLYBY_MAX_RADIUS_M;
+    const baseMaxR = flybyCtx.maxRadiusM ?? BALLISTIC_FLYBY_MAX_RADIUS_M;
+    const effectiveMaxR = computeBallisticFlybyRadiusM(speedMs, caliberMm, energyJ, baseMaxR);
     const pca = evaluateBallisticFlybyPCA(
       origin,
       endPos,
       flybyCtx.listenerHeadPos,
-      maxR,
+      effectiveMaxR,
       false,
       _pcaClosest,
     );
     if (!pca.triggered) return false;
+
+    // Schedule flyby at bullet time-of-flight to closestPos for shots >= 18m away
+    // so supersonic rounds (v > 343 m/s) strictly precede the 343 m/s distant muzzle report.
+    const travelDistM = origin.distanceTo(_pcaClosest);
+    const tofDelaySec = travelDistM >= 18 ? Math.min(2.0, travelDistM / Math.max(80, speedMs)) : 0;
 
     flybyCtx.audio?.playBallisticFlyby?.({
       closestPos: _pcaClosest,
@@ -983,6 +1004,7 @@ export class BallisticsSolver {
       caliberMm,
       energyJ,
       muzzleOrigin: origin,
+      delaySec: tofDelaySec,
     });
 
     const cls = classifyBallisticFlyby(speedMs, pca.missDistM, caliberMm, energyJ);
@@ -1116,13 +1138,17 @@ export class BallisticsSolver {
   }
 
   private checkProjectileFlyby(p: PooledProjectile, flybyCtx?: BallisticFlybyContext): void {
-    if (!flybyCtx || p.isLocalPlayer || p.hasTriggeredFlyby) return;
-    const maxR = flybyCtx.maxRadiusM ?? BALLISTIC_FLYBY_MAX_RADIUS_M;
+    // Exclude local player's direct outbound rounds, but allow ricocheted rounds whistling back past the shooter
+    if (!flybyCtx || (p.isLocalPlayer && p.bounceCount === 0) || p.hasTriggeredFlyby) return;
+    const speedMs = p.vel.length();
+    const energyJ = 0.5 * p.massKg * speedMs * speedMs;
+    const baseMaxR = flybyCtx.maxRadiusM ?? BALLISTIC_FLYBY_MAX_RADIUS_M;
+    const effectiveMaxR = computeBallisticFlybyRadiusM(speedMs, p.caliberMm, energyJ, baseMaxR);
     const pca = evaluateBallisticFlybyPCA(
       p.prevPos,
       p.pos,
       flybyCtx.listenerHeadPos,
-      maxR,
+      effectiveMaxR,
       p.wasApproachingHead,
       _pcaClosest,
     );
@@ -1130,8 +1156,6 @@ export class BallisticsSolver {
     if (!pca.triggered) return;
 
     p.hasTriggeredFlyby = true;
-    const speedMs = p.vel.length();
-    const energyJ = 0.5 * p.massKg * speedMs * speedMs;
     const audio = flybyCtx.audio ?? p.audio;
     audio?.playBallisticFlyby?.({
       closestPos: _pcaClosest,
@@ -1140,6 +1164,7 @@ export class BallisticsSolver {
       caliberMm: p.caliberMm,
       energyJ,
       muzzleOrigin: p.muzzleOrigin,
+      delaySec: 0,
     });
 
     const cls = classifyBallisticFlyby(speedMs, pca.missDistM, p.caliberMm, energyJ);
@@ -1253,6 +1278,7 @@ export class BallisticsSolver {
       p.vel.copy(this._refl).multiplyScalar(nextSpeed);
       p.bouncesLeft -= 1;
       p.bounceCount += 1;
+      p.wasApproachingHead = false;
       p.penetrationPower *= retention * 0.85;
 
       this.addDecal(ev.point, this._normal, matId);

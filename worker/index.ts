@@ -1,4 +1,6 @@
 import {
+  eventCycleIdToModeRule,
+  EventCycleModeId,
   formatLobbyModeLabel,
   formatMapDisplayName,
   generateEventHashCode,
@@ -12,8 +14,10 @@ import {
   sanitizeWeatherPreset,
   SpecialEventRecord,
   TimeOfDayStartSetting,
+  VALID_ALL_MAP_IDS,
   WeatherPresetId,
 } from '../data/multiplayer';
+import { BattleRuleId, isValidBattleRule } from '../maps/types';
 import {
   applyMatchProgression,
   buildRecentMatchRecord,
@@ -136,8 +140,9 @@ function rowToSpecialEvent(row: DbSpecialEventRow): SpecialEventRecord {
 }
 
 function rowToBrowserEntry(row: DbActiveLobbyRow): LobbyBrowserEntry {
-  const mode: LobbyModeId = row.mode === 'infection' ? 'infection' : 'battle';
-  const battleRule = row.mode === 'battle_ffa' ? 'ffa' : 'tdm';
+  const parsedMode = eventCycleIdToModeRule(row.mode as EventCycleModeId);
+  const mode: LobbyModeId = parsedMode.mode;
+  const battleRule: BattleRuleId = parsedMode.battleRule;
   const visibility: LobbyVisibility =
     row.visibility === 'private' || row.visibility === 'friends_only'
       ? row.visibility
@@ -1423,7 +1428,7 @@ export default {
         const body = await readJsonBody<{
           visibility?: LobbyVisibility;
           mode?: LobbyModeId;
-          battleRule?: 'tdm' | 'ffa';
+          battleRule?: BattleRuleId;
           mapId?: string;
           maxPlayers?: number;
           botsEnabled?: boolean;
@@ -1464,17 +1469,12 @@ export default {
           : body?.mode === 'infection'
             ? 'infection'
             : 'battle';
-        const battleRule = specialEvent
+        const battleRule: BattleRuleId = specialEvent
           ? specialEvent.config.battleRule
-          : body?.battleRule === 'ffa'
-            ? 'ffa'
+          : isValidBattleRule(body?.battleRule)
+            ? body.battleRule
             : 'tdm';
-        const validMaps = new Set([
-          'pripyat_block',
-          'timberline_compound',
-          'korsakov_substation',
-          'kino_theater',
-        ]);
+        const validMaps = new Set<string>(VALID_ALL_MAP_IDS);
         const defaultMap = mode === 'infection' ? 'kino_theater' : 'pripyat_block';
         const mapId = specialEvent
           ? specialEvent.config.mapId
@@ -1497,8 +1497,8 @@ export default {
             )
           : 0;
         const killLimit = Math.max(
-          10,
-          Math.min(100, Math.round(Number(specialEvent ? specialEvent.config.killLimit : (body?.killLimit ?? 30)) || 30)),
+          3,
+          Math.min(1000, Math.round(Number(specialEvent ? specialEvent.config.killLimit : (body?.killLimit ?? 30)) || 30)),
         );
         const botDifficulty = specialEvent
           ? specialEvent.config.botDifficulty

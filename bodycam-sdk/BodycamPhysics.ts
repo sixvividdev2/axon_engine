@@ -250,6 +250,12 @@ export class BodycamPhysicsWorld {
     this.raycastMeshes = [];
   }
 
+  private terrainHeightSampler: ((x: number, z: number) => number) | null = null;
+
+  public setTerrainHeightSampler(fn: ((x: number, z: number) => number) | null): void {
+    this.terrainHeightSampler = fn;
+  }
+
   /**
    * Computes exact walkable floor height at (x, z) reachable from `referenceY`,
    * plus surface slope angle in radians (written to outSlope if provided).
@@ -262,6 +268,12 @@ export class BodycamPhysicsWorld {
     footRadius = 0.08,
   ): number {
     let bestY = this.baseFloorY;
+    if (this.terrainHeightSampler) {
+      const ty = this.terrainHeightSampler(x, z);
+      if (Number.isFinite(ty) && ty > bestY) {
+        bestY = ty;
+      }
+    }
 
     const footRSq = footRadius * footRadius;
 

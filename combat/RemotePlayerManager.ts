@@ -23,6 +23,7 @@ import {
   TacticalEquipmentId,
 } from '../data/tacticalEquipment';
 import { BattleScoreEntry, BattleTeamId } from './BattleBotAI';
+import { BattleRuleId, isFreeForAllBattleRule } from '../maps/types';
 import {
   BuiltTacticalOperatorRig,
   TacticalCombatPose,
@@ -135,7 +136,7 @@ export class RemotePlayerManager {
   private readonly localUserId: string;
   private readonly localTeam: BattleTeamId;
   private readonly mode: 'battle' | 'infection';
-  private readonly battleRule: 'tdm' | 'ffa';
+  private readonly battleRule: BattleRuleId;
   private readonly rigFactory: TacticalOperatorRigFactory;
 
   private readonly disposables: Array<{ dispose: () => void }> = [];
@@ -177,7 +178,7 @@ export class RemotePlayerManager {
     localUserId: string,
     localTeam: BattleTeamId,
     mode: 'battle' | 'infection',
-    battleRule: 'tdm' | 'ffa',
+    battleRule: BattleRuleId,
     initialMembers: LobbyMember[],
     maxAnisotropy = 4,
   ) {
@@ -206,7 +207,7 @@ export class RemotePlayerManager {
     for (const m of initialMembers) {
       if (m.userId === localUserId) continue;
       const team: BattleTeamId =
-        mode === 'infection' ? 'A' : battleRule === 'ffa' ? 'FFA' : m.team;
+        mode === 'infection' ? 'A' : isFreeForAllBattleRule(battleRule) ? 'FFA' : m.team;
       this.ensurePlayer(m.userId, m.username, team);
     }
   }
@@ -218,7 +219,7 @@ export class RemotePlayerManager {
 
   private resolveBattleTeam(rawTeam?: 'A' | 'B' | 'FFA'): BattleTeamId {
     if (this.mode === 'infection') return 'A';
-    if (this.battleRule === 'ffa') return 'FFA';
+    if (isFreeForAllBattleRule(this.battleRule)) return 'FFA';
     return rawTeam === 'B' ? 'B' : 'A';
   }
 
@@ -226,7 +227,7 @@ export class RemotePlayerManager {
     const p = this.players.get(userId);
     if (!p) return false;
     if (this.mode === 'infection') return true;
-    if (this.battleRule === 'ffa') return false;
+    if (isFreeForAllBattleRule(this.battleRule)) return false;
     return p.team === this.localTeam;
   }
 
@@ -769,7 +770,7 @@ export class RemotePlayerManager {
     for (const m of members) {
       if (m.userId === this.localUserId) continue;
       const team: BattleTeamId =
-        this.mode === 'infection' ? 'A' : this.battleRule === 'ffa' ? 'FFA' : m.team;
+        this.mode === 'infection' ? 'A' : isFreeForAllBattleRule(this.battleRule) ? 'FFA' : m.team;
       this.ensurePlayer(m.userId, m.username, team);
     }
     for (const [uid, op] of Array.from(this.players.entries())) {

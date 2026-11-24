@@ -2,7 +2,10 @@ import React, { useState } from 'react';
 import { Sliders, X } from 'lucide-react';
 import {
   DEFAULT_SPECIAL_EVENT_CONFIG,
+  eventCycleIdToModeRule,
   EventCycleModeId,
+  isInfectionMapId,
+  modeRuleToEventCycleId,
   SpecialEventConfig,
   SpecialEventRecord,
 } from '../data/multiplayer';
@@ -22,8 +25,13 @@ interface SpecialEventBuilderModalProps {
 }
 
 const CYCLE_OPTIONS: Array<{ id: EventCycleModeId; label: string }> = [
-  { id: 'battle_tdm', label: 'Battle · TDM' },
-  { id: 'battle_ffa', label: 'Battle · FFA' },
+  { id: 'battle_tdm', label: 'TDM' },
+  { id: 'battle_ffa', label: 'FFA' },
+  { id: 'battle_conquest', label: 'Conquest' },
+  { id: 'battle_ctf', label: 'CTF' },
+  { id: 'battle_koth', label: 'KOTH' },
+  { id: 'battle_kc_tdm', label: 'KC · TDM' },
+  { id: 'battle_kc_ffa', label: 'KC · FFA' },
   { id: 'infection', label: 'Infection' },
 ];
 
@@ -170,47 +178,37 @@ export const SpecialEventBuilderModal: React.FC<SpecialEventBuilderModalProps> =
 
               <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
                 <div>
-                  <div className="font-mono-tabular text-[10px] uppercase tracking-wider text-neutral-400">
+                  <label className="block font-mono-tabular text-[10px] uppercase tracking-wider text-neutral-400">
                     Starting Mode
-                  </div>
-                  <div className="mt-1.5 grid grid-cols-3 gap-1">
-                    {(
-                      [
-                        { label: 'TDM', mode: 'battle' as const, rule: 'tdm' as const },
-                        { label: 'FFA', mode: 'battle' as const, rule: 'ffa' as const },
-                        { label: 'Zombies', mode: 'infection' as const, rule: 'tdm' as const },
-                      ]
-                    ).map((opt) => {
-                      const active =
-                        cfg.mode === opt.mode &&
-                        (opt.mode === 'infection' || cfg.battleRule === opt.rule);
-                      return (
-                        <button
-                          key={opt.label}
-                          type="button"
-                          onClick={() =>
-                            patchCfg({
-                              mode: opt.mode,
-                              battleRule: opt.rule,
-                              mapId:
-                                opt.mode === 'infection'
-                                  ? 'kino_theater'
-                                  : cfg.mapId === 'kino_theater'
-                                    ? 'pripyat_block'
-                                    : cfg.mapId,
-                            })
-                          }
-                          className={`cursor-pointer border py-2 font-mono-tabular text-[11px] font-semibold uppercase ${
-                            active
-                              ? 'border-amber-400 bg-amber-500/20 text-amber-300'
-                              : 'border-neutral-800 bg-neutral-900 text-neutral-400 hover:text-neutral-200'
-                          }`}
-                        >
-                          {opt.label}
-                        </button>
-                      );
-                    })}
-                  </div>
+                  </label>
+                  <select
+                    value={modeRuleToEventCycleId(cfg.mode, cfg.battleRule)}
+                    onChange={(e) => {
+                      const mapped = eventCycleIdToModeRule(e.target.value as EventCycleModeId);
+                      patchCfg({
+                        mode: mapped.mode,
+                        battleRule: mapped.battleRule,
+                        mapId:
+                          mapped.mode === 'infection'
+                            ? isInfectionMapId(cfg.mapId)
+                              ? cfg.mapId
+                              : 'kino_theater'
+                            : isInfectionMapId(cfg.mapId)
+                              ? 'pripyat_block'
+                              : cfg.mapId,
+                      });
+                    }}
+                    className="mt-1.5 w-full cursor-pointer border border-neutral-700 bg-neutral-900 px-3 py-2 font-mono-tabular text-xs text-neutral-100 focus:border-amber-400 focus:outline-none"
+                  >
+                    <option value="battle_tdm">Battle · TDM</option>
+                    <option value="battle_ffa">Battle · FFA</option>
+                    <option value="battle_conquest">Battle · Conquest</option>
+                    <option value="battle_ctf">Battle · Capture the Flag</option>
+                    <option value="battle_koth">Battle · King of the Hill</option>
+                    <option value="battle_kc_tdm">Battle · Kill Confirmed (TDM)</option>
+                    <option value="battle_kc_ffa">Battle · Kill Confirmed (FFA)</option>
+                    <option value="infection">Infection (Zombies)</option>
+                  </select>
                 </div>
 
                 <div>
@@ -271,7 +269,7 @@ export const SpecialEventBuilderModal: React.FC<SpecialEventBuilderModalProps> =
                 </label>
 
                 {cfg.cycleModesBetweenGames && (
-                  <div className="flex items-center gap-1.5">
+                  <div className="flex flex-wrap items-center gap-1.5">
                     {CYCLE_OPTIONS.map((opt) => {
                       const active = cfg.cyclePool.includes(opt.id);
                       return (

@@ -1,6 +1,7 @@
 import { ATTACHMENTS, WEAPON_COMPAT_META } from './attachments';
 import { SDK_WEAPON_PROFILES } from '../bodycam-sdk/weaponProfiles';
 import { TACTICAL_EQUIPMENT_CATALOG } from './tacticalEquipment';
+import { BattleRuleId, isValidBattleRule } from '../maps/types';
 
 export const MAX_RANK = 100;
 export const MAX_PRESTIGE = 10;
@@ -41,6 +42,11 @@ export type PostMatchBadgeId =
   | 'most_assists'
   | 'grenadier'
   | 'assassin'
+  | 'tag_collector'
+  | 'tag_rescuer'
+  | 'sector_commander'
+  | 'flag_runner'
+  | 'hill_anchor'
   | 'coward'
   | 'afk_artist';
 
@@ -76,6 +82,31 @@ export const POST_MATCH_BADGES: Readonly<Record<PostMatchBadgeId, PostMatchBadge
     label: 'Assassin',
     description: 'Most close-quarters melee eliminations',
   },
+  tag_collector: {
+    id: 'tag_collector',
+    label: 'Tag Hunter',
+    description: 'Most enemy dogtags secured in Kill Confirmed',
+  },
+  tag_rescuer: {
+    id: 'tag_rescuer',
+    label: 'Dogtag Rescuer',
+    description: 'Most friendly or personal dogtags recovered',
+  },
+  sector_commander: {
+    id: 'sector_commander',
+    label: 'Sector Commander',
+    description: 'Most Conquest POIs captured and held',
+  },
+  flag_runner: {
+    id: 'flag_runner',
+    label: 'Flag Runner',
+    description: 'Most flags captured or returned in CTF',
+  },
+  hill_anchor: {
+    id: 'hill_anchor',
+    label: 'Hill Anchor',
+    description: 'Longest uncontested hill control time in KOTH',
+  },
   coward: {
     id: 'coward',
     label: 'Coward',
@@ -102,6 +133,15 @@ export interface CombatantMatchStats {
   meleeKills: number;
   damageDealt: number;
   afkSeconds: number;
+  /** Mode-specific objective telemetry (optional; defaults to 0) */
+  enemyDogtags?: number;
+  friendlyDogtags?: number;
+  selfDogtagsRecovered?: number;
+  poiCaptures?: number;
+  territoryPoints?: number;
+  flagCaptures?: number;
+  flagReturns?: number;
+  hillControlSec?: number;
 }
 
 export interface MatchLeaderboardEntry extends CombatantMatchStats {
@@ -127,6 +167,14 @@ export interface MatchMvpHighlight {
   grenadeKills: number;
   meleeKills: number;
   damageDealt: number;
+  enemyDogtags?: number;
+  friendlyDogtags?: number;
+  selfDogtagsRecovered?: number;
+  poiCaptures?: number;
+  territoryPoints?: number;
+  flagCaptures?: number;
+  flagReturns?: number;
+  hillControlSec?: number;
   kdRatio: number | null;
   kdDisplay: string;
   badges: PostMatchBadgeId[];
@@ -134,7 +182,7 @@ export interface MatchMvpHighlight {
 
 export interface MatchResultInput {
   mode: 'battle' | 'infection';
-  battleRule?: 'tdm' | 'ffa';
+  battleRule?: BattleRuleId;
   kills: number;
   headshots: number;
   deaths: number;
@@ -145,6 +193,20 @@ export interface MatchResultInput {
   mapName?: string;
   matchDurationSec?: number;
   combatants?: CombatantMatchStats[];
+  /** Local player objective telemetry */
+  enemyDogtags?: number;
+  friendlyDogtags?: number;
+  selfDogtagsRecovered?: number;
+  poiCaptures?: number;
+  territoryPoints?: number;
+  flagCaptures?: number;
+  flagReturns?: number;
+  hillControlSec?: number;
+  /** Team aggregate scoreboard telemetry */
+  teamScoreA?: number;
+  teamScoreB?: number;
+  teamFriendlyDogtagsA?: number;
+  teamFriendlyDogtagsB?: number;
 }
 
 export const MAX_RECENT_MATCHES = 5;
@@ -159,7 +221,7 @@ export interface RecentMatchRecord {
   id: string;
   completedAt: number;
   mode: 'battle' | 'infection';
-  battleRule?: 'tdm' | 'ffa';
+  battleRule?: BattleRuleId;
   infectionRound?: number;
   mapId?: string;
   mapName: string;
@@ -173,6 +235,16 @@ export interface RecentMatchRecord {
   cashEarned: number;
   isGuest: boolean;
   weaponStats: RecentMatchWeaponStat[];
+  enemyDogtags?: number;
+  friendlyDogtags?: number;
+  selfDogtagsRecovered?: number;
+  poiCaptures?: number;
+  territoryPoints?: number;
+  flagCaptures?: number;
+  flagReturns?: number;
+  hillControlSec?: number;
+  teamScoreA?: number;
+  teamScoreB?: number;
 }
 
 export interface GunLevelDelta {
@@ -188,11 +260,29 @@ export interface GunLevelDelta {
 export interface MatchProgressionSummary {
   isGuest: boolean;
   mode: 'battle' | 'infection';
+  battleRule?: BattleRuleId;
   mapName?: string;
   matchOutcome: 'victory' | 'defeat' | 'completed';
   matchDurationSec: number;
   mvp: MatchMvpHighlight | null;
   leaderboard: MatchLeaderboardEntry[];
+  teamScoreA?: number;
+  teamScoreB?: number;
+  teamFriendlyDogtagsA?: number;
+  teamFriendlyDogtagsB?: number;
+  enemyDogtags?: number;
+  friendlyDogtags?: number;
+  selfDogtagsRecovered?: number;
+  objectiveStats?: {
+    enemyDogtags: number;
+    friendlyDogtags: number;
+    selfDogtagsRecovered: number;
+    poiCaptures: number;
+    territoryPoints: number;
+    flagCaptures: number;
+    flagReturns: number;
+    hillControlSec: number;
+  };
   before: {
     rank: number;
     xp: number;
@@ -217,6 +307,9 @@ export interface MatchProgressionSummary {
     deathPenaltyXp: number;
     matchOutcomeXp: number;
     roundBonusXp: number;
+    enemyDogtagXp?: number;
+    friendlyDogtagXp?: number;
+    objectiveXp?: number;
     netXp: number;
     cashEarned: number;
   };
@@ -577,6 +670,18 @@ export function applyMatchProgression(
   const deaths = Math.max(0, Math.floor(input.deaths || 0));
   const infectionRound = Math.max(0, Math.floor(input.infectionRound || 0));
 
+  const enemyDogtags = Math.max(0, Math.floor(input.enemyDogtags || 0));
+  const friendlyDogtags = Math.max(0, Math.floor(input.friendlyDogtags || 0));
+  const selfDogtagsRecovered = Math.max(
+    0,
+    Math.min(friendlyDogtags, Math.floor(input.selfDogtagsRecovered || 0)),
+  );
+  const poiCaptures = Math.max(0, Math.floor(input.poiCaptures || 0));
+  const territoryPoints = Math.max(0, Math.round(input.territoryPoints || 0));
+  const flagCaptures = Math.max(0, Math.floor(input.flagCaptures || 0));
+  const flagReturns = Math.max(0, Math.floor(input.flagReturns || 0));
+  const hillControlSec = Math.max(0, Math.round(input.hillControlSec || 0));
+
   const killXp = kills * 100;
   const headshotXp = headshots * 25;
   const deathPenaltyXp = deaths * 40;
@@ -584,10 +689,40 @@ export function applyMatchProgression(
     input.outcome === 'victory' ? 350 : input.outcome === 'defeat' ? -150 : 120;
   const roundBonusXp = input.mode === 'infection' ? infectionRound * 75 : 0;
 
-  const netXp = killXp + headshotXp - deathPenaltyXp + matchOutcomeXp + roundBonusXp;
+  const enemyDogtagXp = enemyDogtags * 45;
+  // Recovering your own dogtag in Kill Confirmed FFA grants a substantial +140 XP bonus (does NOT affect win rate);
+  // securing a teammate's dogtag in KC TDM grants +65 XP (also separate from win score).
+  const otherFriendlyTags = Math.max(0, friendlyDogtags - selfDogtagsRecovered);
+  const friendlyDogtagXp =
+    selfDogtagsRecovered * 140 + otherFriendlyTags * 65;
+  const objectiveXp =
+    poiCaptures * 90 +
+    Math.round(territoryPoints * 0.45) +
+    flagCaptures * 180 +
+    flagReturns * 65 +
+    Math.round(hillControlSec * 3.5);
+
+  const netXp =
+    killXp +
+    headshotXp -
+    deathPenaltyXp +
+    matchOutcomeXp +
+    roundBonusXp +
+    enemyDogtagXp +
+    friendlyDogtagXp +
+    objectiveXp;
   const cashEarned = Math.max(
     0,
-    kills * 25 + headshots * 10 + (input.outcome === 'victory' ? 150 : 40) + infectionRound * 30,
+    kills * 25 +
+      headshots * 10 +
+      (input.outcome === 'victory' ? 150 : 40) +
+      infectionRound * 30 +
+      enemyDogtags * 15 +
+      friendlyDogtags * 20 +
+      poiCaptures * 30 +
+      flagCaptures * 60 +
+      flagReturns * 20 +
+      Math.round(hillControlSec * 1),
   );
 
   const beforeRank = Math.max(1, Math.min(MAX_RANK, career.rank));
@@ -760,11 +895,29 @@ export function applyMatchProgression(
     summary: {
       isGuest: false,
       mode: input.mode,
+      battleRule: input.mode === 'battle' ? input.battleRule : undefined,
       mapName: input.mapName,
       matchOutcome: input.outcome,
       matchDurationSec: postMatch.matchDurationSec,
       mvp: postMatch.mvp,
       leaderboard: postMatch.leaderboard,
+      teamScoreA: input.teamScoreA,
+      teamScoreB: input.teamScoreB,
+      teamFriendlyDogtagsA: input.teamFriendlyDogtagsA,
+      teamFriendlyDogtagsB: input.teamFriendlyDogtagsB,
+      enemyDogtags,
+      friendlyDogtags,
+      selfDogtagsRecovered,
+      objectiveStats: {
+        enemyDogtags,
+        friendlyDogtags,
+        selfDogtagsRecovered,
+        poiCaptures,
+        territoryPoints,
+        flagCaptures,
+        flagReturns,
+        hillControlSec,
+      },
       before: {
         rank: beforeRank,
         xp: beforeXp,
@@ -789,6 +942,9 @@ export function applyMatchProgression(
         deathPenaltyXp,
         matchOutcomeXp,
         roundBonusXp,
+        enemyDogtagXp,
+        friendlyDogtagXp,
+        objectiveXp,
         netXp,
         cashEarned,
       },
@@ -811,6 +967,17 @@ function sanitizeCombatantStats(raw: CombatantMatchStats): CombatantMatchStats {
   const meleeKills = Math.max(0, Math.min(kills, Math.floor(raw.meleeKills || 0)));
   const damageDealt = Math.max(0, Math.round(raw.damageDealt || 0));
   const afkSeconds = Math.max(0, Number(raw.afkSeconds || 0));
+  const enemyDogtags = Math.max(0, Math.floor(raw.enemyDogtags || 0));
+  const friendlyDogtags = Math.max(0, Math.floor(raw.friendlyDogtags || 0));
+  const selfDogtagsRecovered = Math.max(
+    0,
+    Math.min(friendlyDogtags, Math.floor(raw.selfDogtagsRecovered || 0)),
+  );
+  const poiCaptures = Math.max(0, Math.floor(raw.poiCaptures || 0));
+  const territoryPoints = Math.max(0, Math.round(raw.territoryPoints || 0));
+  const flagCaptures = Math.max(0, Math.floor(raw.flagCaptures || 0));
+  const flagReturns = Math.max(0, Math.floor(raw.flagReturns || 0));
+  const hillControlSec = Math.max(0, Math.round(raw.hillControlSec || 0));
   return {
     id: String(raw.id || 'unknown'),
     name: String(raw.name || 'OPERATOR'),
@@ -825,6 +992,14 @@ function sanitizeCombatantStats(raw: CombatantMatchStats): CombatantMatchStats {
     meleeKills,
     damageDealt,
     afkSeconds,
+    enemyDogtags,
+    friendlyDogtags,
+    selfDogtagsRecovered,
+    poiCaptures,
+    territoryPoints,
+    flagCaptures,
+    flagReturns,
+    hillControlSec,
   };
 }
 
@@ -923,12 +1098,23 @@ export function computePostMatchSummary(input: MatchResultInput): {
   let maxAssists = 0;
   let maxGrenadeKills = 0;
   let maxMeleeKills = 0;
+  let maxEnemyTags = 0;
+  let maxFriendlyTags = 0;
+  let maxPoiCaptures = 0;
+  let maxFlagActions = 0;
+  let maxHillSec = 0;
   for (const c of rawList) {
     if (c.kills > maxKills) maxKills = c.kills;
     if (c.headshots > maxHeadshots) maxHeadshots = c.headshots;
     if (c.assists > maxAssists) maxAssists = c.assists;
     if (c.grenadeKills > maxGrenadeKills) maxGrenadeKills = c.grenadeKills;
     if (c.meleeKills > maxMeleeKills) maxMeleeKills = c.meleeKills;
+    if ((c.enemyDogtags ?? 0) > maxEnemyTags) maxEnemyTags = c.enemyDogtags ?? 0;
+    if ((c.friendlyDogtags ?? 0) > maxFriendlyTags) maxFriendlyTags = c.friendlyDogtags ?? 0;
+    if ((c.poiCaptures ?? 0) > maxPoiCaptures) maxPoiCaptures = c.poiCaptures ?? 0;
+    const flagActs = (c.flagCaptures ?? 0) * 3 + (c.flagReturns ?? 0);
+    if (flagActs > maxFlagActions) maxFlagActions = flagActs;
+    if ((c.hillControlSec ?? 0) > maxHillSec) maxHillSec = c.hillControlSec ?? 0;
   }
 
   // 3. Identify AFK-Artist (> 50% match duration AFK) and Coward (lowest active combat contribution, NOT AFK)
@@ -938,7 +1124,14 @@ export function computePostMatchSummary(input: MatchResultInput): {
 
   for (const c of rawList) {
     const afkRatio = matchDurationSec > 0 ? Math.min(1, c.afkSeconds / matchDurationSec) : 0;
-    const combatScore = c.kills * 100 + c.assists * 45 + c.damageDealt * 0.5;
+    const combatScore =
+      c.kills * 100 +
+      c.assists * 45 +
+      c.damageDealt * 0.5 +
+      (c.enemyDogtags ?? 0) * 50 +
+      (c.poiCaptures ?? 0) * 80 +
+      (c.flagCaptures ?? 0) * 160 +
+      (c.hillControlSec ?? 0) * 4;
     if (combatScore > topCombatScore) topCombatScore = combatScore;
     if (afkRatio > 0.5) {
       afkArtistIds.add(c.id);
@@ -965,8 +1158,27 @@ export function computePostMatchSummary(input: MatchResultInput): {
     }
   }
 
-  // 4. Sort full leaderboard (Kills desc -> Assists desc -> Deaths asc -> Headshots desc -> Damage desc)
+  // 4. Sort full leaderboard by primary mode objective (Friendly Dogtags NEVER affect rank/win!)
+  const rule = input.battleRule;
+  const primaryObjectiveScore = (c: CombatantMatchStats): number => {
+    if (rule === 'kc_tdm' || rule === 'kc_ffa') {
+      return c.enemyDogtags ?? 0;
+    }
+    if (rule === 'conquest') {
+      return (c.poiCaptures ?? 0) * 120 + (c.territoryPoints ?? 0);
+    }
+    if (rule === 'ctf') {
+      return (c.flagCaptures ?? 0) * 150 + (c.flagReturns ?? 0) * 40;
+    }
+    if (rule === 'koth') {
+      return c.hillControlSec ?? 0;
+    }
+    return c.kills;
+  };
+
   const sorted = [...rawList].sort((a, b) => {
+    const objDiff = primaryObjectiveScore(b) - primaryObjectiveScore(a);
+    if (objDiff !== 0) return objDiff;
     if (b.kills !== a.kills) return b.kills - a.kills;
     if (b.assists !== a.assists) return b.assists - a.assists;
     if (a.deaths !== b.deaths) return a.deaths - b.deaths;
@@ -983,6 +1195,12 @@ export function computePostMatchSummary(input: MatchResultInput): {
     if (maxAssists > 0 && c.assists === maxAssists) badges.push('most_assists');
     if (maxGrenadeKills > 0 && c.grenadeKills === maxGrenadeKills) badges.push('grenadier');
     if (maxMeleeKills > 0 && c.meleeKills === maxMeleeKills) badges.push('assassin');
+    if (maxEnemyTags > 0 && (c.enemyDogtags ?? 0) === maxEnemyTags) badges.push('tag_collector');
+    if (maxFriendlyTags > 0 && (c.friendlyDogtags ?? 0) === maxFriendlyTags) badges.push('tag_rescuer');
+    if (maxPoiCaptures > 0 && (c.poiCaptures ?? 0) === maxPoiCaptures) badges.push('sector_commander');
+    const flagActs = (c.flagCaptures ?? 0) * 3 + (c.flagReturns ?? 0);
+    if (maxFlagActions > 0 && flagActs === maxFlagActions) badges.push('flag_runner');
+    if (maxHillSec > 0 && (c.hillControlSec ?? 0) === maxHillSec) badges.push('hill_anchor');
     if (cowardIds.has(c.id)) badges.push('coward');
     if (afkArtistIds.has(c.id)) badges.push('afk_artist');
 
@@ -1014,6 +1232,14 @@ export function computePostMatchSummary(input: MatchResultInput): {
     grenadeKills: mvpRow.grenadeKills,
     meleeKills: mvpRow.meleeKills,
     damageDealt: mvpRow.damageDealt,
+    enemyDogtags: mvpRow.enemyDogtags,
+    friendlyDogtags: mvpRow.friendlyDogtags,
+    selfDogtagsRecovered: mvpRow.selfDogtagsRecovered,
+    poiCaptures: mvpRow.poiCaptures,
+    territoryPoints: mvpRow.territoryPoints,
+    flagCaptures: mvpRow.flagCaptures,
+    flagReturns: mvpRow.flagReturns,
+    hillControlSec: mvpRow.hillControlSec,
     kdRatio: mvpRow.kdRatio,
     kdDisplay: mvpRow.kdDisplay,
     badges: [...mvpRow.badges],
@@ -1039,11 +1265,29 @@ export function buildGuestMatchSummary(input: MatchResultInput): MatchProgressio
   return {
     isGuest: true,
     mode: input.mode,
+    battleRule: input.mode === 'battle' ? input.battleRule : undefined,
     mapName: input.mapName,
     matchOutcome: input.outcome,
     matchDurationSec: postMatch.matchDurationSec,
     mvp: postMatch.mvp,
     leaderboard: postMatch.leaderboard,
+    teamScoreA: input.teamScoreA,
+    teamScoreB: input.teamScoreB,
+    teamFriendlyDogtagsA: input.teamFriendlyDogtagsA,
+    teamFriendlyDogtagsB: input.teamFriendlyDogtagsB,
+    enemyDogtags: Math.max(0, Math.floor(input.enemyDogtags || 0)),
+    friendlyDogtags: Math.max(0, Math.floor(input.friendlyDogtags || 0)),
+    selfDogtagsRecovered: Math.max(0, Math.floor(input.selfDogtagsRecovered || 0)),
+    objectiveStats: {
+      enemyDogtags: Math.max(0, Math.floor(input.enemyDogtags || 0)),
+      friendlyDogtags: Math.max(0, Math.floor(input.friendlyDogtags || 0)),
+      selfDogtagsRecovered: Math.max(0, Math.floor(input.selfDogtagsRecovered || 0)),
+      poiCaptures: Math.max(0, Math.floor(input.poiCaptures || 0)),
+      territoryPoints: Math.max(0, Math.round(input.territoryPoints || 0)),
+      flagCaptures: Math.max(0, Math.floor(input.flagCaptures || 0)),
+      flagReturns: Math.max(0, Math.floor(input.flagReturns || 0)),
+      hillControlSec: Math.max(0, Math.round(input.hillControlSec || 0)),
+    },
     before: {
       rank: 1,
       xp: 0,
@@ -1068,6 +1312,9 @@ export function buildGuestMatchSummary(input: MatchResultInput): MatchProgressio
       deathPenaltyXp: 0,
       matchOutcomeXp: 0,
       roundBonusXp: 0,
+      enemyDogtagXp: 0,
+      friendlyDogtagXp: 0,
+      objectiveXp: 0,
       netXp: 0,
       cashEarned: 0,
     },
@@ -1092,7 +1339,10 @@ const MATCH_MAP_FALLBACK_NAMES: Readonly<Record<string, string>> = {
   pripyat_block: 'Pripyat Block',
   timberline_compound: 'Timberline Valley',
   korsakov_substation: 'Korsakov Substation',
+  volga_corridor: 'Volga Frontier Corridor',
   kino_theater: 'Kino Theater',
+  stalingrad_depot: 'Stalingrad Rail Depot',
+  objekt_47: 'Bunker Objekt-47',
 };
 
 export function resolveMatchWeaponName(weaponId: string): string {
@@ -1139,13 +1389,9 @@ export function sanitizeMatchResultInput(raw: unknown): MatchResultInput | null 
         ? 'completed'
         : 'defeat';
 
-  const battleRule: 'tdm' | 'ffa' | undefined =
-    obj.mode === 'battle'
-      ? obj.battleRule === 'ffa'
-        ? 'ffa'
-        : obj.battleRule === 'tdm'
-          ? 'tdm'
-          : undefined
+  const battleRule: BattleRuleId | undefined =
+    obj.mode === 'battle' && isValidBattleRule(obj.battleRule)
+      ? obj.battleRule
       : undefined;
 
   const infectionRound =
@@ -1188,6 +1434,11 @@ export function sanitizeMatchResultInput(raw: unknown): MatchResultInput | null 
         .map(sanitizeCombatantStats)
     : undefined;
 
+  const optInt = (val: unknown, max = 100000): number | undefined =>
+    val !== undefined && Number.isFinite(Number(val))
+      ? Math.max(0, Math.min(max, Math.round(Number(val))))
+      : undefined;
+
   return {
     mode: obj.mode,
     battleRule,
@@ -1201,6 +1452,18 @@ export function sanitizeMatchResultInput(raw: unknown): MatchResultInput | null 
     mapName,
     matchDurationSec,
     combatants,
+    enemyDogtags: optInt(obj.enemyDogtags),
+    friendlyDogtags: optInt(obj.friendlyDogtags),
+    selfDogtagsRecovered: optInt(obj.selfDogtagsRecovered),
+    poiCaptures: optInt(obj.poiCaptures),
+    territoryPoints: optInt(obj.territoryPoints),
+    flagCaptures: optInt(obj.flagCaptures),
+    flagReturns: optInt(obj.flagReturns),
+    hillControlSec: optInt(obj.hillControlSec),
+    teamScoreA: optInt(obj.teamScoreA),
+    teamScoreB: optInt(obj.teamScoreB),
+    teamFriendlyDogtagsA: optInt(obj.teamFriendlyDogtagsA),
+    teamFriendlyDogtagsB: optInt(obj.teamFriendlyDogtagsB),
   };
 }
 
@@ -1261,6 +1524,16 @@ export function buildRecentMatchRecord(
     cashEarned: Math.max(0, Math.round(opts.cashEarned || 0)),
     isGuest: Boolean(opts.isGuest),
     weaponStats,
+    enemyDogtags: input.enemyDogtags,
+    friendlyDogtags: input.friendlyDogtags,
+    selfDogtagsRecovered: input.selfDogtagsRecovered,
+    poiCaptures: input.poiCaptures,
+    territoryPoints: input.territoryPoints,
+    flagCaptures: input.flagCaptures,
+    flagReturns: input.flagReturns,
+    hillControlSec: input.hillControlSec,
+    teamScoreA: input.teamScoreA,
+    teamScoreB: input.teamScoreB,
   };
 }
 
@@ -1313,13 +1586,15 @@ export function sanitizeRecentMatchRecord(raw: unknown): RecentMatchRecord | nul
         (obj.mode === 'infection' ? 'Kino Theater' : 'Combat Sector');
 
   const { kdDisplay } = formatKdDisplay(kills, deaths);
+  const optInt = (v: unknown): number | undefined =>
+    v !== undefined && Number.isFinite(Number(v)) ? Math.max(0, Math.round(Number(v))) : undefined;
 
   return {
     id,
     completedAt,
     mode: obj.mode,
     battleRule:
-      obj.mode === 'battle' && (obj.battleRule === 'tdm' || obj.battleRule === 'ffa')
+      obj.mode === 'battle' && isValidBattleRule(obj.battleRule)
         ? obj.battleRule
         : undefined,
     infectionRound:
@@ -1338,6 +1613,16 @@ export function sanitizeRecentMatchRecord(raw: unknown): RecentMatchRecord | nul
     cashEarned: Math.max(0, Math.round(Number(obj.cashEarned) || 0)),
     isGuest: Boolean(obj.isGuest),
     weaponStats,
+    enemyDogtags: optInt(obj.enemyDogtags),
+    friendlyDogtags: optInt(obj.friendlyDogtags),
+    selfDogtagsRecovered: optInt(obj.selfDogtagsRecovered),
+    poiCaptures: optInt(obj.poiCaptures),
+    territoryPoints: optInt(obj.territoryPoints),
+    flagCaptures: optInt(obj.flagCaptures),
+    flagReturns: optInt(obj.flagReturns),
+    hillControlSec: optInt(obj.hillControlSec),
+    teamScoreA: optInt(obj.teamScoreA),
+    teamScoreB: optInt(obj.teamScoreB),
   };
 }
 
@@ -1493,7 +1778,7 @@ export interface MatchSummaryExportPayload {
     completedAt: number;
     completedAtIso: string;
     mode: 'battle' | 'infection';
-    battleRule: 'tdm' | 'ffa' | null;
+    battleRule: BattleRuleId | null;
     infectionRound: number | null;
     mapId: string | null;
     mapName: string;

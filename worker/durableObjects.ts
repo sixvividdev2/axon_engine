@@ -1,4 +1,7 @@
 import {
+  eventCycleIdToModeRule,
+  formatLobbyModeLabel,
+  isInfectionMapId,
   LobbyChatMessage,
   LobbyMember,
   LobbyModeId,
@@ -6,13 +9,16 @@ import {
   LobbySettingsPatch,
   LobbyTeamId,
   LobbyVisibility,
+  modeRuleToEventCycleId,
   sanitizeSpecialEventConfig,
   sanitizeTimeOfDayStart,
   sanitizeWeatherPreset,
   SpecialEventRecord,
   TimeOfDayStartSetting,
+  VALID_ALL_MAP_IDS,
   WeatherPresetId,
 } from '../data/multiplayer';
+import { BattleRuleId, isValidBattleRule } from '../maps/types';
 import { generateId } from './crypto';
 import {
   CachedMatchState,
@@ -420,7 +426,7 @@ export class LobbyRoomDO {
           st.code,
           st.hostUserId,
           st.visibility,
-          st.mode === 'infection' ? 'infection' : st.battleRule === 'ffa' ? 'battle_ffa' : 'battle_tdm',
+          modeRuleToEventCycleId(st.mode, st.battleRule),
           st.mapId,
           st.specialEvent?.id ?? null,
           st.specialEvent?.hashCode ?? null,
@@ -456,11 +462,7 @@ export class LobbyRoomDO {
     const now = Date.now();
     const modeLabel = st.specialEvent
       ? `EVENT: ${st.specialEvent.name}`.slice(0, 32)
-      : st.mode === 'infection'
-        ? 'INFECTION'
-        : st.battleRule === 'ffa'
-          ? 'BATTLE FFA'
-          : 'BATTLE TDM';
+      : formatLobbyModeLabel(st.mode, st.battleRule);
 
     const stmts = [];
     for (const uid of ids) {
@@ -580,7 +582,7 @@ export class LobbyRoomDO {
         host: { userId: string; username: string; rank: number; prestige: number };
         visibility: LobbyVisibility;
         mode: LobbyModeId;
-        battleRule: 'tdm' | 'ffa';
+        battleRule: BattleRuleId;
         mapId: string;
         maxPlayers: number;
         botsEnabled: boolean;
@@ -598,7 +600,11 @@ export class LobbyRoomDO {
       const now = Date.now();
       const ev = body.specialEvent;
       const mode: LobbyModeId = ev ? ev.config.mode : body.mode;
-      const battleRule = ev ? ev.config.battleRule : body.battleRule;
+      const battleRule: BattleRuleId = ev
+        ? ev.config.battleRule
+        : isValidBattleRule(body.battleRule)
+          ? body.battleRule
+          : 'tdm';
       const mapId = ev ? ev.config.mapId : body.mapId;
       const rawMax = Math.round(ev ? ev.config.maxPlayers : body.maxPlayers);
       const maxPlayers =
@@ -934,24 +940,19 @@ export class LobbyRoomDO {
         const prevMode = st.mode;
         st.mode = patch.mode;
         if (st.mode === 'infection') {
-          if (st.mapId !== 'kino_theater') st.mapId = 'kino_theater';
+          if (!isInfectionMapId(st.mapId)) st.mapId = 'kino_theater';
           if (prevMode !== 'infection' && st.maxPlayers > 4) {
             st.maxPlayers = Math.max(4, st.members.length);
           }
           for (const m of st.members) m.team = 'A';
-        } else if (st.mode === 'battle' && st.mapId === 'kino_theater') {
+        } else if (st.mode === 'battle' && isInfectionMapId(st.mapId)) {
           st.mapId = 'pripyat_block';
         }
       }
-      if (patch.battleRule === 'tdm' || patch.battleRule === 'ffa') {
+      if (isValidBattleRule(patch.battleRule)) {
         st.battleRule = patch.battleRule;
       }
-      if (
-        patch.mapId === 'pripyat_block' ||
-        patch.mapId === 'timberline_compound' ||
-        patch.mapId === 'korsakov_substation' ||
-        patch.mapId === 'kino_theater'
-      ) {
+      if (typeof patch.mapId === 'string' && VALID_ALL_MAP_IDS.has(patch.mapId)) {
         st.mapId = patch.mapId;
       }
       if (typeof patch.maxPlayers === 'number') {
@@ -975,7 +976,7 @@ export class LobbyRoomDO {
         st.botsEnabled = st.botCount > 0;
       }
       if (typeof patch.killLimit === 'number') {
-        st.killLimit = Math.max(10, Math.min(100, Math.round(patch.killLimit)));
+        st.killLimit = Math.max(3, Math.min(1000, Math.round(patch.killLimit)));
       }
       if (
         patch.botDifficulty === 'recruit' ||
@@ -1140,20 +1141,19 @@ export class LobbyRoomDO {
       room.matchState = createDefaultMatchState();
       if (st.specialEvent?.config.cycleModesBetweenGames && st.specialEvent.config.cyclePool.length > 1) {
         const pool = st.specialEvent.config.cyclePool;
-        const curKey =
-          st.mode === 'infection' ? 'infection' : st.battleRule === 'ffa' ? 'battle_ffa' : 'battle_tdm';
+        const curKey = modeRuleToEventCycleId(st.mode, st.battleRule);
         const curIdx = pool.indexOf(curKey);
         const nextKey = pool[(curIdx + 1) % pool.length];
-        if (nextKey === 'infection') {
-          st.mode = 'infection';
-          st.mapId = 'kino_theater';
+        const nextCfg = eventCycleIdToModeRule(nextKey);
+        st.mode = nextCfg.mode;
+        if (nextCfg.mode === 'infection') {
+          if (!isInfectionMapId(st.mapId)) st.mapId = 'kino_theater';
         } else {
-          st.mode = 'battle';
-          st.battleRule = nextKey === 'battle_ffa' ? 'ffa' : 'tdm';
-          if (st.mapId === 'kino_theater') st.mapId = 'pripyat_block';
+          st.battleRule = nextCfg.battleRule;
+          if (isInfectionMapId(st.mapId)) st.mapId = 'pripyat_block';
         }
         this.pushSystemChat(
-          `Event cycled next game to ${nextKey === 'infection' ? 'INFECTION' : nextKey === 'battle_ffa' ? 'BATTLE · FFA' : 'BATTLE · TDM'}.`,
+          `Event cycled next game to ${formatLobbyModeLabel(st.mode, st.battleRule)}.`,
         );
       }
       st.updatedAt = Date.now();

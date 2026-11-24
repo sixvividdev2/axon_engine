@@ -48,6 +48,8 @@ export interface BallisticFlybyParams {
   energyJ?: number;
   /** Optional shooter muzzle origin for crack-then-thump separation telemetry */
   muzzleOrigin?: Readonly<THREE.Vector3>;
+  /** Optional Web Audio scheduling offset in seconds (e.g. bullet time-of-flight for hitscan/segment AI shots) */
+  delaySec?: number;
 }
 
 /**
@@ -149,5 +151,13 @@ export interface IBodycamAudioSource {
 
   /** NVG mount mechanical flip-down / stow detent click & tube high-voltage whine */
   playNvgFlipSound?(flipDown: boolean): void;
+
+  /** Metallic dogtag chain jingle + tactical confirmation chime for Kill Confirmed */
+  playDogtagPickup?(isFriendly: boolean, isSelfRecovery?: boolean): void;
+
+  /** Tactical radio/HUD chime for Conquest POI captures, CTF flag events, and KOTH hill rotations */
+  playObjectiveChime?(
+    kind: 'capture' | 'contested' | 'flag_taken' | 'flag_score' | 'flag_return' | 'hill_rotate',
+  ): void;
 }
 

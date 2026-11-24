@@ -19,13 +19,17 @@ import { useAuth } from '../context/AuthContext';
 import { useLobby } from '../context/LobbyContext';
 import { useSocial } from '../context/SocialContext';
 import {
+  eventCycleIdToModeRule,
+  EventCycleModeId,
   formatLobbyModeLabel,
   formatMapDisplayName,
+  isInfectionMapId,
   LobbyVisibility,
+  modeRuleToEventCycleId,
 } from '../data/multiplayer';
 import { formatRankLabel } from '../data/progression';
 import { BATTLE_MAPS, ZOMBIE_MAPS } from '../maps/MapRegistry';
-import { BotDifficultyId } from '../maps/types';
+import { BotDifficultyId, isTeamBattleRule } from '../maps/types';
 import {
   formatKillfeedPolicyLabel,
   LobbyKillfeedPolicy,
@@ -79,7 +83,7 @@ export const LobbyRoomView: React.FC<LobbyRoomViewProps> = ({ onOpenLoadoutWorkb
 
   const ev = lobby.specialEvent;
   const isSpecialEvent = Boolean(ev);
-  const isTdm = lobby.mode === 'battle' && lobby.battleRule === 'tdm';
+  const isTeamMode = lobby.mode === 'battle' && isTeamBattleRule(lobby.battleRule);
   const isInfection = lobby.mode === 'infection';
   const myMember = lobby.members.find((m) => m.userId === user.id);
   const availableMaps = isInfection ? ZOMBIE_MAPS : BATTLE_MAPS;
@@ -328,27 +332,21 @@ export const LobbyRoomView: React.FC<LobbyRoomViewProps> = ({ onOpenLoadoutWorkb
               </div>
               {isHost ? (
                 <select
-                  value={
-                    lobby.mode === 'infection'
-                      ? 'infection'
-                      : lobby.battleRule === 'ffa'
-                        ? 'battle_ffa'
-                        : 'battle_tdm'
-                  }
+                  value={modeRuleToEventCycleId(lobby.mode, lobby.battleRule)}
                   onChange={(e) => {
-                    const v = e.target.value;
-                    if (v === 'infection') {
+                    const mapped = eventCycleIdToModeRule(e.target.value as EventCycleModeId);
+                    if (mapped.mode === 'infection') {
                       const nextMax = Math.max(lobby.members.length, Math.min(4, lobby.maxPlayers));
                       updateSettings({
                         mode: 'infection',
-                        mapId: 'kino_theater',
+                        mapId: isInfectionMapId(lobby.mapId) ? lobby.mapId : 'kino_theater',
                         maxPlayers: Math.max(2, nextMax),
                       });
                     } else {
                       updateSettings({
                         mode: 'battle',
-                        battleRule: v === 'battle_ffa' ? 'ffa' : 'tdm',
-                        mapId: lobby.mapId === 'kino_theater' ? 'pripyat_block' : lobby.mapId,
+                        battleRule: mapped.battleRule,
+                        mapId: isInfectionMapId(lobby.mapId) ? 'pripyat_block' : lobby.mapId,
                       });
                     }
                   }}
@@ -356,7 +354,12 @@ export const LobbyRoomView: React.FC<LobbyRoomViewProps> = ({ onOpenLoadoutWorkb
                 >
                   <option value="battle_tdm">Battle · TDM</option>
                   <option value="battle_ffa">Battle · FFA</option>
-                  <option value="infection">Infection</option>
+                  <option value="battle_conquest">Battle · Conquest</option>
+                  <option value="battle_ctf">Battle · Capture the Flag</option>
+                  <option value="battle_koth">Battle · King of the Hill</option>
+                  <option value="battle_kc_tdm">Battle · Kill Confirmed (TDM)</option>
+                  <option value="battle_kc_ffa">Battle · Kill Confirmed (FFA)</option>
+                  <option value="infection">Infection (Co-op Zombies)</option>
                 </select>
               ) : (
                 <div className="mt-1 font-mono-tabular text-xs text-neutral-100">
@@ -771,7 +774,7 @@ export const LobbyRoomView: React.FC<LobbyRoomViewProps> = ({ onOpenLoadoutWorkb
 
           {/* Action CTA: Host Launch Match vs Joined Ready/Team */}
           <div className="space-y-2 border-t border-neutral-800 pt-4">
-            {isTdm && (
+            {isTeamMode && (
               <div className="grid grid-cols-2 gap-2">
                 <button
                   type="button"
@@ -844,7 +847,7 @@ export const LobbyRoomView: React.FC<LobbyRoomViewProps> = ({ onOpenLoadoutWorkb
                   className="flex items-center justify-between gap-3 border border-neutral-800/90 bg-neutral-900/65 px-3 py-2"
                 >
                   <div className="flex items-center gap-2.5 min-w-0">
-                    {isTdm && (
+                    {isTeamMode && (
                       <span
                         className={`w-8 text-center font-mono-tabular text-[10px] font-bold uppercase ${
                           m.team === 'A'

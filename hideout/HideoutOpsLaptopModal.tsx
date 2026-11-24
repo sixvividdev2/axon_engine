@@ -26,6 +26,7 @@ import {
   BattleMatchConfig,
   BattleRuleId,
   BotDifficultyId,
+  getDefaultScoreLimitForRule,
   InfectionMatchConfig,
 } from '../maps/types';
 import { MapSelector } from '../ui/MapSelector';
@@ -56,12 +57,56 @@ interface HideoutOpsLaptopModalProps {
 
 const BOT_COUNTS = [4, 6, 8, 10] as const;
 const INFECTION_BOT_COUNTS = [0, 1, 2, 3] as const;
-const KILL_LIMITS = [20, 30, 40, 50] as const;
+const BATTLE_MODE_OPTIONS: ReadonlyArray<{ id: BattleRuleId; short: string; name: string }> = [
+  { id: 'tdm', short: 'TDM', name: 'Team Deathmatch' },
+  { id: 'ffa', short: 'FFA', name: 'Free-For-All' },
+  { id: 'conquest', short: 'Conquest', name: 'Territory Control' },
+  { id: 'ctf', short: 'CTF', name: 'Capture the Flag' },
+  { id: 'koth', short: 'KOTH', name: 'King of the Hill' },
+  { id: 'kc_tdm', short: 'KC · TDM', name: 'Kill Confirmed Team' },
+  { id: 'kc_ffa', short: 'KC · FFA', name: 'Kill Confirmed FFA' },
+];
 const DIFFICULTIES: ReadonlyArray<{ id: BotDifficultyId; label: string }> = [
   { id: 'recruit', label: 'Recruit' },
   { id: 'tactical', label: 'Tactical' },
   { id: 'veteran', label: 'Veteran' },
 ];
+
+function getScoreLimitPresets(rule: BattleRuleId): { label: string; values: readonly number[] } {
+  switch (rule) {
+    case 'conquest':
+      return { label: 'Territory Target', values: [300, 500, 750, 1000] };
+    case 'ctf':
+      return { label: 'Flag Captures', values: [3, 5, 7, 10] };
+    case 'koth':
+      return { label: 'Hill Score', values: [120, 180, 250, 350] };
+    case 'kc_tdm':
+    case 'kc_ffa':
+      return { label: 'Tag Limit', values: [20, 30, 40, 50] };
+    default:
+      return { label: 'Kill Limit', values: [20, 30, 40, 50] };
+  }
+}
+
+function getBattleRuleSummary(rule: BattleRuleId): string {
+  switch (rule) {
+    case 'conquest':
+      return 'Conquest · Most Territory Controlled Wins · Protected HQs · 1 Life per Loadout · Uncontested FOB Spawns';
+    case 'ctf':
+      return 'Capture the Flag · Home Flag Required to Score · Carrier Drop & Teammate Return';
+    case 'koth':
+      return 'King of the Hill · Rotating Hills (45s) · Uncontested Control Scores';
+    case 'kc_tdm':
+      return 'Kill Confirmed TDM · Most Enemy Dogtags Wins · Friendly Dogtags Tracked Separately';
+    case 'kc_ffa':
+      return 'Kill Confirmed FFA · Most Enemy Dogtags Wins · Recover Own Tag for Bonus XP';
+    case 'ffa':
+      return 'Free-For-All · Every Operator Hostile · Spawn Protection Active';
+    case 'tdm':
+    default:
+      return 'Team A vs Team B · Friendly Fire Off · Spawn Protection Active';
+  }
+}
 
 /**
  * Diegetic Ready Room Ops Command Laptop Terminal.
@@ -283,26 +328,32 @@ export const HideoutOpsLaptopModal: React.FC<HideoutOpsLaptopModalProps> = ({
                   </p>
                 </div>
 
-                <div className="flex items-center gap-1.5">
-                  {(
-                    [
-                      { id: 'tdm' as BattleRuleId, label: 'TDM · Team Deathmatch' },
-                      { id: 'ffa' as BattleRuleId, label: 'FFA · Free-For-All' },
-                    ]
-                  ).map((r) => {
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {BATTLE_MODE_OPTIONS.map((r) => {
                     const active = battleConfig.rule === r.id;
                     return (
                       <button
                         key={r.id}
                         type="button"
-                        onClick={() => updateBattle({ rule: r.id })}
-                        className={`cursor-pointer border px-4 py-2 font-mono-tabular text-xs font-semibold transition-colors whitespace-nowrap shrink-0 ${
+                        onClick={() => {
+                          const defLimit = getDefaultScoreLimitForRule(r.id);
+                          updateBattle({
+                            rule: r.id,
+                            scoreLimit: defLimit,
+                            killLimit:
+                              r.id === 'tdm' || r.id === 'ffa' || r.id === 'kc_tdm' || r.id === 'kc_ffa'
+                                ? defLimit
+                                : battleConfig.killLimit,
+                          });
+                        }}
+                        title={r.name}
+                        className={`cursor-pointer border px-3 py-2 font-mono-tabular text-xs font-semibold transition-colors whitespace-nowrap shrink-0 ${
                           active
                             ? 'border-amber-400 bg-amber-500 text-neutral-950'
                             : 'border-white/12 bg-[#141820] text-neutral-300 hover:border-white/30'
                         }`}
                       >
-                        {r.label}
+                        {r.short}
                       </button>
                     );
                   })}
@@ -332,23 +383,51 @@ export const HideoutOpsLaptopModal: React.FC<HideoutOpsLaptopModalProps> = ({
                 </div>
 
                 <div>
-                  <div className="font-mono-tabular text-[11px] text-neutral-400">Kill Limit</div>
-                  <div className="mt-1.5 flex gap-1">
-                    {KILL_LIMITS.map((lim) => (
-                      <button
-                        key={lim}
-                        type="button"
-                        onClick={() => updateBattle({ killLimit: lim })}
-                        className={`flex-1 cursor-pointer border py-1.5 font-mono-tabular text-xs font-semibold transition-colors ${
-                          battleConfig.killLimit === lim
-                            ? 'border-amber-400 bg-amber-500/20 text-amber-200'
-                            : 'border-white/10 bg-[#161b23] text-neutral-400 hover:text-neutral-200'
-                        }`}
-                      >
-                        {lim}
-                      </button>
-                    ))}
-                  </div>
+                  {(() => {
+                    const preset = getScoreLimitPresets(battleConfig.rule);
+                    const activeVal =
+                      battleConfig.scoreLimit ??
+                      (battleConfig.rule === 'tdm' ||
+                      battleConfig.rule === 'ffa' ||
+                      battleConfig.rule === 'kc_tdm' ||
+                      battleConfig.rule === 'kc_ffa'
+                        ? battleConfig.killLimit
+                        : getDefaultScoreLimitForRule(battleConfig.rule));
+                    return (
+                      <>
+                        <div className="font-mono-tabular text-[11px] text-neutral-400">
+                          {preset.label}
+                        </div>
+                        <div className="mt-1.5 flex gap-1">
+                          {preset.values.map((lim) => (
+                            <button
+                              key={lim}
+                              type="button"
+                              onClick={() =>
+                                updateBattle({
+                                  scoreLimit: lim,
+                                  killLimit:
+                                    battleConfig.rule === 'tdm' ||
+                                    battleConfig.rule === 'ffa' ||
+                                    battleConfig.rule === 'kc_tdm' ||
+                                    battleConfig.rule === 'kc_ffa'
+                                      ? lim
+                                      : battleConfig.killLimit,
+                                })
+                              }
+                              className={`flex-1 cursor-pointer border py-1.5 font-mono-tabular text-xs font-semibold transition-colors ${
+                                activeVal === lim
+                                  ? 'border-amber-400 bg-amber-500/20 text-amber-200'
+                                  : 'border-white/10 bg-[#161b23] text-neutral-400 hover:text-neutral-200'
+                              }`}
+                            >
+                              {lim}
+                            </button>
+                          ))}
+                        </div>
+                      </>
+                    );
+                  })()}
                 </div>
 
                 <div>
@@ -519,10 +598,7 @@ export const HideoutOpsLaptopModal: React.FC<HideoutOpsLaptopModalProps> = ({
               {/* Deploy Footer */}
               <div className="flex flex-wrap items-center justify-between gap-4 border-t border-white/10 pt-4">
                 <div className="font-mono-tabular text-xs text-neutral-400">
-                  {battleConfig.rule === 'tdm'
-                    ? 'Team A vs Team B · Friendly Fire Off'
-                    : 'Free-For-All · Every Operator Hostile'}{' '}
-                  · Gunsmith Attachments Synced
+                  {getBattleRuleSummary(battleConfig.rule)}
                 </div>
                 <button
                   type="button"

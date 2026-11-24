@@ -4,8 +4,15 @@ import {
   BodycamLensPresetId,
   BodycamSDKConfig,
   LENS_PRESETS,
+  resolveWeaponProfile,
 } from '../bodycam-sdk';
 import { CombatSessionSnapshot } from '../combat/CombatSessionEngine';
+import {
+  formatBattleRuleName,
+  formatBattleRuleShort,
+  isKillConfirmedRule,
+  isTeamBattleRule,
+} from '../maps/types';
 import { openGameSettings } from '../data/gameSettingsStore';
 import {
   GRAPHICS_QUALITY_ORDER,
@@ -64,8 +71,20 @@ interface CombatHudProps {
   onSelectTacticalEquipment: (id: TacticalEquipmentId) => void;
   onSelectTacticalBeltSlot: (slot: TacticalBeltSlot) => void;
   onToggleTacticalMountOnBelt: (mount: boolean) => void;
+  onSelectConquestLoadout?: (slotId: string) => void;
+  onSelectConquestSpawn?: (spawnId: string) => void;
+  onConfirmConquestRedeploy?: () => void;
+  onCycleSpectateTarget?: (dir: 1 | -1) => void;
+  onToggleSpectateOverview?: () => void;
   onRematch: () => void;
   onReturnToMenu: (tab?: 'battle' | 'infection') => void;
+}
+
+function formatMatchClock(totalSec: number): string {
+  const s = Math.max(0, Math.ceil(totalSec));
+  const m = Math.floor(s / 60);
+  const rem = s % 60;
+  return `${m}:${String(rem).padStart(2, '0')}`;
 }
 
 function formatRecTimestamp(elapsedSec: number): string {
@@ -91,6 +110,11 @@ export const CombatHud: React.FC<CombatHudProps> = ({
   onSelectTacticalEquipment,
   onSelectTacticalBeltSlot,
   onToggleTacticalMountOnBelt,
+  onSelectConquestLoadout,
+  onSelectConquestSpawn,
+  onConfirmConquestRedeploy,
+  onCycleSpectateTarget,
+  onToggleSpectateOverview,
   onRematch,
   onReturnToMenu,
 }) => {
@@ -124,10 +148,22 @@ export const CombatHud: React.FC<CombatHudProps> = ({
         ? 'RAW REC'
         : 'AXON REC';
 
+  const modeHud = snapshot.modeHud;
+  const conquestRedeployOpen =
+    isBattle &&
+    Boolean(modeHud?.conquestAwaitingRedeploy) &&
+    snapshot.matchOutcome === 'active';
+  const conquestSpectatingActive =
+    isBattle &&
+    Boolean(modeHud?.conquestSpectating) &&
+    snapshot.matchOutcome === 'active';
+
   const paused =
     !snapshot.pointerLocked &&
     !snapshot.tunerOpen &&
     !snapshot.gameOver &&
+    !conquestRedeployOpen &&
+    !conquestSpectatingActive &&
     snapshot.matchOutcome === 'active';
 
   return (
@@ -343,87 +379,443 @@ export const CombatHud: React.FC<CombatHudProps> = ({
       {/* === BATTLE HUD ELEMENTS === */}
       {isBattle && (
         <>
-          {/* Top-Center Score Bar */}
+          {/* Top-Center Mode Score & Objective Strip */}
           <AnimatePresence>
             {showMatchHud && (
-              <div className="fixed top-4 left-1/2 -translate-x-1/2">
+              <div className="fixed top-4 left-1/2 flex -translate-x-1/2 flex-col items-center gap-1.5">
                 <motion.div
                   key="hud-battle-score"
                   initial={{ opacity: 0, y: -20 }}
                   animate={{ opacity: 1, y: 0 }}
                   exit={{ opacity: 0, y: -20 }}
                   transition={HUD_SLIDE_TRANSITION}
-                  className="flex items-center gap-4 border border-neutral-800/90 bg-neutral-950/88 px-4 py-1.5 font-mono-tabular text-xs text-neutral-100"
+                  className="flex flex-col items-center gap-1 border border-neutral-800/90 bg-[#0d1015]/92 px-4 py-1.5 font-mono-tabular text-xs text-neutral-100"
                 >
-                  {snapshot.battleRule === 'tdm' ? (
-                    <>
-                      <div className="flex items-center gap-2">
-                        <span className="text-[10px] uppercase tracking-wider text-sky-400">TEAM A</span>
-                        <span className="font-display text-lg font-bold text-sky-300">
-                          {snapshot.scoreA}
-                        </span>
+                  <div className="flex items-center gap-4">
+                    {isTeamBattleRule(snapshot.battleRule) ? (
+                      <>
+                        <div className="flex items-center gap-2">
+                          <span className="text-[10px] uppercase tracking-wider text-sky-400">
+                            TEAM A
+                          </span>
+                          <span className="font-display text-lg font-bold text-sky-300">
+                            {Math.round(snapshot.scoreA)}
+                          </span>
+                        </div>
+                        <div className="flex flex-col items-center leading-tight">
+                          <span className="text-[9px] font-semibold uppercase tracking-[0.16em] text-amber-400">
+                            {formatBattleRuleShort(snapshot.battleRule)}
+                          </span>
+                          <span className="text-[10px] text-neutral-400">
+                            {modeHud && modeHud.remainingSec > 0
+                              ? `${formatMatchClock(modeHud.remainingSec)} · / ${modeHud.scoreLimit}`
+                              : `LIMIT ${modeHud?.scoreLimit ?? snapshot.killLimit}`}
+                          </span>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <span className="font-display text-lg font-bold text-orange-400">
+                            {Math.round(snapshot.scoreB)}
+                          </span>
+                          <span className="text-[10px] uppercase tracking-wider text-orange-400">
+                            TEAM B
+                          </span>
+                        </div>
+                      </>
+                    ) : (
+                      <>
+                        <div className="flex items-center gap-2">
+                          <span className="text-[10px] uppercase tracking-wider text-amber-400">
+                            {snapshot.battleRule === 'kc_ffa' ? 'ENEMY TAGS' : 'YOU'}
+                          </span>
+                          <span className="font-display text-lg font-bold text-neutral-50">
+                            {snapshot.battleRule === 'kc_ffa'
+                              ? (modeHud?.localEnemyTags ?? 0)
+                              : snapshot.playerKills}
+                          </span>
+                        </div>
+                        <div className="flex flex-col items-center leading-tight">
+                          <span className="text-[9px] font-semibold uppercase tracking-[0.16em] text-amber-400">
+                            {formatBattleRuleShort(snapshot.battleRule)}
+                          </span>
+                          <span className="text-[10px] text-neutral-400">
+                            LIMIT {modeHud?.scoreLimit ?? snapshot.killLimit}
+                          </span>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <span className="text-[10px] uppercase tracking-wider text-neutral-400">
+                            LEADER ({snapshot.ffaLeaderName})
+                          </span>
+                          <span className="font-display text-lg font-bold text-amber-300">
+                            {snapshot.ffaLeaderKills}
+                          </span>
+                        </div>
+                      </>
+                    )}
+                  </div>
+
+                  {/* Conquest POI Status Row & Loadout Lives */}
+                  {snapshot.battleRule === 'conquest' && modeHud && (
+                    <div className="flex flex-wrap items-center justify-center gap-1.5 border-t border-neutral-800/90 pt-1">
+                      {modeHud.conquestPois.map((poi) => {
+                        const ownerCls = poi.contested
+                          ? 'border-amber-400/90 bg-amber-950/60 text-amber-200'
+                          : poi.owner === 'A'
+                            ? 'border-sky-500/80 bg-sky-950/55 text-sky-200'
+                            : poi.owner === 'B'
+                              ? 'border-orange-500/80 bg-orange-950/55 text-orange-200'
+                              : 'border-neutral-700 bg-neutral-900/80 text-neutral-300';
+                        const fillPct = Math.round(Math.abs(poi.progress) * 100);
+                        const barColor = poi.progress >= 0 ? 'bg-sky-400' : 'bg-orange-400';
+                        return (
+                          <div
+                            key={poi.id}
+                            className={`flex min-w-[54px] flex-col items-center border px-1.5 py-0.5 text-[9px] uppercase ${ownerCls}`}
+                          >
+                            <span className="font-semibold tracking-wider">
+                              {poi.code}
+                              {poi.contested ? ' !' : ''}
+                            </span>
+                            <div className="mt-0.5 h-1 w-full bg-neutral-950/80">
+                              <div
+                                className={`h-full ${barColor}`}
+                                style={{ width: `${fillPct}%` }}
+                              />
+                            </div>
+                          </div>
+                        );
+                      })}
+                      <div className="ml-1 border border-neutral-700 bg-neutral-900 px-2 py-0.5 text-[9px] font-semibold uppercase tracking-wider text-amber-300">
+                        LOADOUTS {modeHud.conquestRemainingLives}/{modeHud.conquestTotalLives}
                       </div>
-                      <span className="text-[10px] text-neutral-500">
-                        LIMIT {snapshot.killLimit}
+                    </div>
+                  )}
+
+                  {/* CTF Flag Status Row */}
+                  {snapshot.battleRule === 'ctf' && modeHud?.ctfFlags && (
+                    <div className="flex items-center gap-3 border-t border-neutral-800/90 pt-1 text-[10px] uppercase">
+                      {modeHud.ctfFlags.map((flag) => (
+                        <div
+                          key={flag.team}
+                          className={`flex items-center gap-1.5 border px-2 py-0.5 ${
+                            flag.team === 'A'
+                              ? 'border-sky-500/50 bg-sky-950/35 text-sky-200'
+                              : 'border-orange-500/50 bg-orange-950/35 text-orange-200'
+                          }`}
+                        >
+                          <span className="font-semibold">FLAG {flag.team}:</span>
+                          <span
+                            className={
+                              flag.status === 'home'
+                                ? 'text-emerald-300'
+                                : flag.status === 'carried'
+                                  ? 'text-amber-300'
+                                  : 'text-red-300'
+                            }
+                          >
+                            {flag.status === 'home'
+                              ? 'HOME'
+                              : flag.status === 'carried'
+                                ? `TAKEN (${flag.carrierName ?? 'OP'})`
+                                : `DROPPED ${Math.ceil(flag.returnTimerSec)}s`}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {/* KOTH Active Hill & Rotation Preview */}
+                  {snapshot.battleRule === 'koth' && modeHud?.koth && (
+                    <div className="flex flex-wrap items-center justify-center gap-2 border-t border-neutral-800/90 pt-1 text-[10px] uppercase">
+                      <span
+                        className={`border px-2 py-0.5 font-semibold ${
+                          modeHud.koth.contested
+                            ? 'border-amber-400/80 bg-amber-950/50 text-amber-200'
+                            : modeHud.koth.owner === 'A'
+                              ? 'border-sky-500/70 bg-sky-950/50 text-sky-200'
+                              : modeHud.koth.owner === 'B'
+                                ? 'border-orange-500/70 bg-orange-950/50 text-orange-200'
+                                : 'border-neutral-700 bg-neutral-900 text-neutral-200'
+                        }`}
+                      >
+                        HILL: {modeHud.koth.activeHillLabel}
+                        {modeHud.koth.contested
+                          ? ' · CONTESTED'
+                          : modeHud.koth.owner
+                            ? ` · TEAM ${modeHud.koth.owner}`
+                            : ' · OPEN'}
                       </span>
-                      <div className="flex items-center gap-2">
-                        <span className="font-display text-lg font-bold text-orange-400">
-                          {snapshot.scoreB}
-                        </span>
-                        <span className="text-[10px] uppercase tracking-wider text-orange-400">
-                          TEAM B
-                        </span>
-                      </div>
-                    </>
-                  ) : (
-                    <>
-                      <div className="flex items-center gap-2">
-                        <span className="text-[10px] uppercase tracking-wider text-amber-400">YOU</span>
-                        <span className="font-display text-lg font-bold text-neutral-50">
-                          {snapshot.playerKills}
-                        </span>
-                      </div>
-                      <span className="text-[10px] text-neutral-500">
-                        LIMIT {snapshot.killLimit}
+                      <span className="text-neutral-300">
+                        ROTATE {Math.ceil(modeHud.koth.hillTimerSec)}s
                       </span>
-                      <div className="flex items-center gap-2">
-                        <span className="text-[10px] uppercase tracking-wider text-neutral-400">
-                          LEADER ({snapshot.ffaLeaderName})
+                      {modeHud.koth.previewActive && (
+                        <span className="text-amber-300">
+                          NEXT: {modeHud.koth.nextHillLabel}
                         </span>
-                        <span className="font-display text-lg font-bold text-amber-300">
-                          {snapshot.ffaLeaderKills}
-                        </span>
-                      </div>
-                    </>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Kill Confirmed Separate Friendly Dogtags Tracker */}
+                  {isKillConfirmedRule(snapshot.battleRule) && modeHud && (
+                    <div className="flex flex-wrap items-center justify-center gap-3 border-t border-neutral-800/90 pt-1 text-[10px] uppercase">
+                      {snapshot.battleRule === 'kc_tdm' ? (
+                        <>
+                          <span className="text-amber-300">
+                            YOUR ENEMY TAGS: {modeHud.localEnemyTags}
+                          </span>
+                          <span className="text-sky-300">
+                            SECURED FRIENDLY TAGS: YOU {modeHud.localFriendlyTags} · TEAM A{' '}
+                            {modeHud.friendlyTagsA} / B {modeHud.friendlyTagsB}
+                          </span>
+                        </>
+                      ) : (
+                        <>
+                          <span className="text-sky-300">
+                            SECURED FRIENDLY (OWN TAGS): {modeHud.localFriendlyTags} (+XP ONLY)
+                          </span>
+                          <span className="text-neutral-400">
+                            TAGS IN FIELD: {modeHud.activeDogtagCount}
+                          </span>
+                        </>
+                      )}
+                    </div>
                   )}
                 </motion.div>
+
+                {/* Active Objective / Standing-In-Sector Status */}
+                {modeHud?.localStandingInObjective && (
+                  <div className="border border-amber-400/70 bg-[#0d1015]/92 px-3 py-0.5 font-mono-tabular text-[10px] font-semibold uppercase tracking-wider text-amber-200">
+                    {modeHud.localStandingInObjective}
+                  </div>
+                )}
+
+                {/* Spawn Protection Active Indicator */}
+                {snapshot.playerAlive && snapshot.spawnProtectionRemainingSec > 0.05 && (
+                  <div className="border border-emerald-500/75 bg-emerald-950/85 px-3 py-0.5 font-mono-tabular text-[10px] font-semibold uppercase tracking-wider text-emerald-200">
+                    SPAWN PROTECTION · {snapshot.spawnProtectionRemainingSec.toFixed(1)}s · ATTACKING CANCELS
+                  </div>
+                )}
               </div>
+            )}
+          </AnimatePresence>
+
+          {/* Conquest Tactical Redeploy Screen (Choose Unused Loadout + HQ / Uncontested Friendly FOB) */}
+          <AnimatePresence>
+            {conquestRedeployOpen && modeHud && (
+              <motion.div
+                key="hud-conquest-redeploy"
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                transition={MODAL_TRANSITION}
+                className="pointer-events-auto fixed inset-0 z-30 flex items-center justify-center bg-neutral-950/76 p-5"
+              >
+                <div className="w-full max-w-3xl border border-neutral-700 bg-[#0d1015] p-5 text-neutral-100">
+                  <div className="flex flex-wrap items-start justify-between gap-3 border-b border-neutral-800 pb-3">
+                    <div>
+                      <div className="font-mono-tabular text-[10px] font-semibold uppercase tracking-[0.2em] text-amber-400">
+                        Conquest Tactical Redeploy · 1 Life Per Loadout
+                      </div>
+                      <h2 className="mt-0.5 font-display text-2xl font-bold uppercase tracking-wider text-neutral-50">
+                        Select Unused Loadout &amp; Deployment Point
+                      </h2>
+                    </div>
+                    <div className="border border-amber-500/45 bg-neutral-950 px-3 py-1.5 text-right font-mono-tabular">
+                      <div className="text-[9px] uppercase tracking-wider text-neutral-400">
+                        Remaining Loadouts
+                      </div>
+                      <div className="text-base font-bold text-amber-300">
+                        {modeHud.conquestRemainingLives} / {modeHud.conquestTotalLives}
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="mt-4 grid grid-cols-1 gap-4 md:grid-cols-2">
+                    {/* Left: Custom Loadout Slots */}
+                    <div>
+                      <div className="mb-2 font-mono-tabular text-[10px] font-semibold uppercase tracking-[0.18em] text-neutral-400">
+                        1 · Unused Loadouts
+                      </div>
+                      <div className="flex flex-col gap-1.5">
+                        {modeHud.conquestLoadouts.map((slot) => {
+                          const pName = resolveWeaponProfile(slot.primaryWeaponId).name;
+                          const sName = resolveWeaponProfile(slot.secondaryWeaponId).name;
+                          return (
+                            <button
+                              key={slot.id}
+                              type="button"
+                              disabled={slot.expended}
+                              onClick={() => onSelectConquestLoadout?.(slot.id)}
+                              className={`flex items-center justify-between border px-3 py-2 text-left font-mono-tabular transition-colors ${
+                                slot.expended
+                                  ? 'cursor-not-allowed border-neutral-800 bg-neutral-950/60 text-neutral-600 line-through'
+                                  : slot.active
+                                    ? 'cursor-pointer border-amber-400 bg-amber-500/15 text-neutral-50'
+                                    : 'cursor-pointer border-neutral-800 bg-neutral-900/90 text-neutral-200 hover:border-neutral-600'
+                              }`}
+                            >
+                              <div>
+                                <div className="text-xs font-semibold uppercase">{slot.name}</div>
+                                <div className="text-[10px] text-neutral-400">
+                                  {pName} · {sName}
+                                </div>
+                              </div>
+                              <span
+                                className={`text-[10px] font-semibold uppercase tracking-wider ${
+                                  slot.expended
+                                    ? 'text-red-500/80'
+                                    : slot.active
+                                      ? 'text-amber-300'
+                                      : 'text-emerald-400'
+                                }`}
+                              >
+                                {slot.expended ? 'EXPENDED' : slot.active ? 'SELECTED' : 'READY'}
+                              </span>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+
+                    {/* Right: Team HQ & Uncontested Friendly FOBs */}
+                    <div>
+                      <div className="mb-2 font-mono-tabular text-[10px] font-semibold uppercase tracking-[0.18em] text-neutral-400">
+                        2 · Spawn Location (HQ or Uncontested Friendly FOB)
+                      </div>
+                      <div className="flex flex-col gap-1.5">
+                        {modeHud.conquestSpawnOptions.map((opt) => {
+                          const selected = modeHud.conquestSelectedSpawnId === opt.id && opt.available;
+                          return (
+                            <button
+                              key={opt.id}
+                              type="button"
+                              disabled={!opt.available}
+                              onClick={() => onSelectConquestSpawn?.(opt.id)}
+                              className={`flex items-center justify-between border px-3 py-2 text-left font-mono-tabular transition-colors ${
+                                !opt.available
+                                  ? 'cursor-not-allowed border-red-900/60 bg-red-950/20 text-neutral-500'
+                                  : selected
+                                    ? 'cursor-pointer border-sky-400 bg-sky-500/15 text-neutral-50'
+                                    : 'cursor-pointer border-neutral-800 bg-neutral-900/90 text-neutral-200 hover:border-neutral-600'
+                              }`}
+                            >
+                              <div>
+                                <div className="text-xs font-semibold uppercase">
+                                  [{opt.code}] {opt.label}
+                                </div>
+                                <div className="text-[10px] text-neutral-400">
+                                  {opt.kind === 'hq'
+                                    ? 'Protected Team HQ · Always Safe'
+                                    : opt.available
+                                      ? 'Friendly Controlled FOB · Safe Spawn'
+                                      : opt.reason ?? 'Unavailable'}
+                                </div>
+                              </div>
+                              <span
+                                className={`text-[10px] font-semibold uppercase tracking-wider ${
+                                  !opt.available
+                                    ? 'text-red-400'
+                                    : selected
+                                      ? 'text-sky-300'
+                                      : 'text-emerald-400'
+                                }`}
+                              >
+                                {!opt.available ? 'BLOCKED' : selected ? 'SELECTED' : 'SAFE'}
+                              </span>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="mt-5 flex flex-wrap items-center justify-between gap-3 border-t border-neutral-800 pt-3">
+                    <button
+                      type="button"
+                      onClick={() =>
+                        multiplayerSession
+                          ? multiplayerSession.onLeaveMatch()
+                          : onReturnToMenu('battle')
+                      }
+                      className="cursor-pointer border border-neutral-700 bg-neutral-950 px-4 py-2 font-mono-tabular text-xs uppercase tracking-wider text-neutral-400 transition-colors hover:border-neutral-500 hover:text-neutral-200"
+                    >
+                      Leave Match
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => onConfirmConquestRedeploy?.()}
+                      className="cursor-pointer bg-amber-500 px-6 py-2.5 font-display text-sm font-bold uppercase tracking-wider text-neutral-950 transition-colors hover:bg-amber-400"
+                    >
+                      Deploy Operator
+                    </button>
+                  </div>
+                </div>
+              </motion.div>
             )}
           </AnimatePresence>
 
           {/* Respawn / Eliminated Spectating Banner */}
           <AnimatePresence>
-            {!snapshot.playerAlive && snapshot.matchOutcome === 'active' && (
-              snapshot.spectating ? (
-                <div className="fixed bottom-16 left-1/2 -translate-x-1/2">
+            {!snapshot.playerAlive && !conquestRedeployOpen && snapshot.matchOutcome === 'active' && (
+              snapshot.spectating || conquestSpectatingActive ? (
+                <div className="pointer-events-auto fixed bottom-10 left-1/2 -translate-x-1/2">
                   <motion.div
                     key="hud-battle-spectating"
                     initial={{ opacity: 0, y: 16 }}
                     animate={{ opacity: 1, y: 0 }}
                     exit={{ opacity: 0, y: 16 }}
                     transition={HUD_SLIDE_TRANSITION}
-                    className="border border-amber-500/70 bg-neutral-950/92 px-6 py-3 text-center"
+                    className="border border-amber-500/70 bg-[#0d1015]/95 px-5 py-3 text-center"
                   >
                     <div className="font-mono-tabular text-[10px] uppercase tracking-[0.2em] text-amber-400">
-                      Eliminated · Spectating
+                      {conquestSpectatingActive
+                        ? 'All Loadouts Expended · Spectating Match'
+                        : 'Eliminated · Spectating'}
                     </div>
                     <div className="mt-0.5 font-display text-xl font-bold uppercase tracking-wider text-neutral-50">
-                      {snapshot.spectatingTargetName
-                        ? `Watching ${snapshot.spectatingTargetName}`
-                        : 'Awaiting Round Conclusion'}
+                      {snapshot.spectateOverview
+                        ? 'Tactical Sector Overview'
+                        : snapshot.spectatingTargetName
+                          ? `Watching ${snapshot.spectatingTargetName}`
+                          : 'Awaiting Match Conclusion'}
                     </div>
-                    <div className="mt-0.5 font-mono-tabular text-[10px] text-neutral-400">
-                      Click / Space to cycle operator camera · Esc for menu
+                    <div className="mt-2.5 flex flex-wrap items-center justify-center gap-2 font-mono-tabular text-[11px]">
+                      <button
+                        type="button"
+                        onClick={() => onCycleSpectateTarget?.(-1)}
+                        className="cursor-pointer border border-neutral-700 bg-neutral-900 px-3 py-1 uppercase tracking-wider text-neutral-200 hover:border-amber-400 hover:text-amber-300"
+                      >
+                        Prev
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => onCycleSpectateTarget?.(1)}
+                        className="cursor-pointer border border-neutral-700 bg-neutral-900 px-3 py-1 uppercase tracking-wider text-neutral-200 hover:border-amber-400 hover:text-amber-300"
+                      >
+                        Next
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => onToggleSpectateOverview?.()}
+                        className={`cursor-pointer border px-3 py-1 uppercase tracking-wider ${
+                          snapshot.spectateOverview
+                            ? 'border-sky-400 bg-sky-500/20 text-sky-200'
+                            : 'border-neutral-700 bg-neutral-900 text-neutral-200 hover:border-sky-400'
+                        }`}
+                      >
+                        {snapshot.spectateOverview ? 'Follow Operator' : 'Aerial Overview'}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          multiplayerSession
+                            ? multiplayerSession.onLeaveMatch()
+                            : onReturnToMenu('battle')
+                        }
+                        className="cursor-pointer border border-red-900/80 bg-red-950/40 px-3 py-1 uppercase tracking-wider text-red-200 hover:bg-red-900/60"
+                      >
+                        Leave Match
+                      </button>
                     </div>
                   </motion.div>
                 </div>
@@ -452,7 +844,7 @@ export const CombatHud: React.FC<CombatHudProps> = ({
           {/* Hold-Tab Live Scoreboard */}
           <AnimatePresence>
             {snapshot.scoreboardOpen && snapshot.matchOutcome === 'active' && (
-              <div className="fixed top-1/2 left-1/2 w-full max-w-xl -translate-x-1/2 -translate-y-1/2">
+              <div className="fixed top-1/2 left-1/2 w-full max-w-2xl -translate-x-1/2 -translate-y-1/2">
                 <motion.div
                   key="hud-battle-scoreboard"
                   initial={{ opacity: 0, scale: 0.96, y: 10 }}
@@ -463,19 +855,29 @@ export const CombatHud: React.FC<CombatHudProps> = ({
                 >
                   <div className="flex items-center justify-between border-b border-neutral-800 pb-2">
                     <span className="font-display text-lg font-bold uppercase tracking-wider text-neutral-50">
-                      {snapshot.battleRule === 'tdm' ? 'Team Deathmatch' : 'Free-For-All'} ·{' '}
-                      {snapshot.mapName}
+                      {formatBattleRuleName(snapshot.battleRule)} · {snapshot.mapName}
                     </span>
                     <span className="font-mono-tabular text-xs text-neutral-400">
-                      Limit {snapshot.killLimit}
+                      Target {modeHud?.scoreLimit ?? snapshot.killLimit}
                     </span>
                   </div>
                   <div className="mt-2.5 flex flex-col gap-1 font-mono-tabular text-xs">
                     <div className="grid grid-cols-12 px-2 py-1 text-[10px] uppercase tracking-wider text-neutral-500">
-                      <span className="col-span-5">Operator</span>
-                      <span className="col-span-3">Unit</span>
-                      <span className="col-span-2 text-right">Kills</span>
-                      <span className="col-span-2 text-right">Deaths</span>
+                      <span className="col-span-4">Operator</span>
+                      <span className="col-span-2">Unit</span>
+                      <span className="col-span-3 text-right text-amber-400">
+                        {isKillConfirmedRule(snapshot.battleRule)
+                          ? 'Enemy / Friendly Tags'
+                          : snapshot.battleRule === 'conquest'
+                            ? 'Captures'
+                            : snapshot.battleRule === 'ctf'
+                              ? 'Caps / Rets'
+                              : snapshot.battleRule === 'koth'
+                                ? 'Hill Time'
+                                : 'Score'}
+                      </span>
+                      <span className="col-span-1 text-right">K</span>
+                      <span className="col-span-2 text-right">D</span>
                     </div>
                     {snapshot.scoreboard.map((row) => (
                       <div
@@ -486,9 +888,9 @@ export const CombatHud: React.FC<CombatHudProps> = ({
                             : 'bg-neutral-900/75 text-neutral-200'
                         }`}
                       >
-                        <span className="col-span-5 font-semibold">{row.name}</span>
+                        <span className="col-span-4 truncate font-semibold">{row.name}</span>
                         <span
-                          className={`col-span-3 text-[11px] ${
+                          className={`col-span-2 text-[11px] ${
                             row.team === 'A'
                               ? 'text-sky-400'
                               : row.team === 'B'
@@ -498,7 +900,18 @@ export const CombatHud: React.FC<CombatHudProps> = ({
                         >
                           {row.team === 'FFA' ? 'SOLO' : `TEAM ${row.team}`}
                         </span>
-                        <span className="col-span-2 text-right font-semibold">{row.kills}</span>
+                        <span className="col-span-3 text-right font-semibold text-amber-300">
+                          {isKillConfirmedRule(snapshot.battleRule)
+                            ? `${row.enemyDogtags ?? 0} / ${row.friendlyDogtags ?? 0}`
+                            : snapshot.battleRule === 'conquest'
+                              ? `${row.poiCaptures ?? 0}`
+                              : snapshot.battleRule === 'ctf'
+                                ? `${row.flagCaptures ?? 0} / ${row.flagReturns ?? 0}`
+                                : snapshot.battleRule === 'koth'
+                                  ? `${Math.round(row.hillControlSec ?? 0)}s`
+                                  : `${row.kills}`}
+                        </span>
+                        <span className="col-span-1 text-right font-semibold">{row.kills}</span>
                         <span className="col-span-2 text-right text-neutral-400">{row.deaths}</span>
                       </div>
                     ))}
@@ -1076,7 +1489,7 @@ export const CombatHud: React.FC<CombatHudProps> = ({
               >
                 {isInfection
                   ? `Infection · Round ${snapshot.roundState.round}`
-                  : `${snapshot.battleRule === 'tdm' ? 'Team Deathmatch' : 'Free-For-All'} · ${snapshot.mapName}`}
+                  : `${formatBattleRuleName(snapshot.battleRule)} · ${snapshot.mapName}`}
               </div>
               <h2 className="mt-1 font-display text-3xl font-bold uppercase tracking-wide text-neutral-50">
                 {snapshot.mapName}
@@ -1599,17 +2012,29 @@ export const CombatHud: React.FC<CombatHudProps> = ({
                 {snapshot.matchOutcome === 'victory' ? 'VICTORY' : 'DEFEAT'}
               </h2>
 
-              <div className="mt-3 flex items-center gap-6 border-y border-neutral-800 py-2.5 font-mono-tabular text-xs text-neutral-300">
-                {snapshot.battleRule === 'tdm' ? (
+              <div className="mt-3 flex flex-wrap items-center gap-6 border-y border-neutral-800 py-2.5 font-mono-tabular text-xs text-neutral-300">
+                {isTeamBattleRule(snapshot.battleRule) ? (
                   <span>
-                    Team A <strong className="text-sky-300">{snapshot.scoreA}</strong> — Team B{' '}
-                    <strong className="text-orange-400">{snapshot.scoreB}</strong>
+                    Team A <strong className="text-sky-300">{Math.round(snapshot.scoreA)}</strong> — Team B{' '}
+                    <strong className="text-orange-400">{Math.round(snapshot.scoreB)}</strong>
                   </span>
                 ) : (
                   <span>
                     Leader: <strong className="text-amber-300">{snapshot.ffaLeaderName}</strong> (
                     {snapshot.ffaLeaderKills})
                   </span>
+                )}
+                {isKillConfirmedRule(snapshot.battleRule) && modeHud && (
+                  <>
+                    <span>
+                      Your Enemy Tags:{' '}
+                      <strong className="text-amber-300">{modeHud.localEnemyTags}</strong>
+                    </span>
+                    <span>
+                      Secured Friendly:{' '}
+                      <strong className="text-sky-300">{modeHud.localFriendlyTags}</strong>
+                    </span>
+                  </>
                 )}
                 <span>
                   Your K/D:{' '}

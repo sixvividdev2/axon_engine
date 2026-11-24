@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import {
+  BallisticFlybyContext,
   BallisticsSolver,
   BallisticImpactEvent,
   BodycamAudio,
@@ -81,11 +82,17 @@ export class GymBallistics {
     dt: number,
     adapter: IBodycamWorldAdapter,
     onHit?: (info: GymBallisticHitInfo) => void,
+    flybyCtx?: BallisticFlybyContext,
   ): void {
     const clampedDt = Math.min(dt, 0.05);
-    this.solver.update(clampedDt, adapter, (ev) => {
-      this.handleSolverImpact(ev, onHit);
-    });
+    this.solver.update(
+      clampedDt,
+      adapter,
+      (ev) => {
+        this.handleSolverImpact(ev, onHit);
+      },
+      flybyCtx,
+    );
   }
 
   private handleSolverImpact(

@@ -80,9 +80,13 @@ import { WeatherTimeSystem } from '../engine/world/WeatherTimeSystem';
 import { getMapDefinitionById } from '../maps/MapRegistry';
 import {
   BattleMatchConfig,
+  BattleRuleId,
   BuiltMapInstance,
+  getDefaultScoreLimitForRule,
   InfectionMatchConfig,
   InfectionPerkId,
+  isFreeForAllBattleRule,
+  isTeamBattleRule,
   MapInteractable,
 } from '../maps/types';
 import {
@@ -98,8 +102,10 @@ import {
   GameBotFirePacket,
   GameBotHitPlayerPacket,
   GameBotsSyncPacket,
+  GameDogtagEventPacket,
   GameDoorActionPacket,
   GameEnvSyncPacket,
+  GameFlagEventPacket,
   GameGlassShatterPacket,
   GameGrenadeEventKind,
   GameGrenadeEventPacket,
@@ -107,6 +113,7 @@ import {
   GameMapInteractRejectedPacket,
   GameMapInteractRequestPacket,
   GameMatchSyncPacket,
+  GameModeStatePacket,
   GamePlayerFirePacket,
   GamePlayerHitPacket,
   GamePlayerKillPacket,
@@ -142,6 +149,11 @@ import {
 } from './BattleBotAI';
 import { InfectionHumanTarget, InfectionZombieAI, ZombieRoundState } from './InfectionZombieAI';
 import { RemotePlayerManager } from './RemotePlayerManager';
+import {
+  BattleModeController,
+  BattleModeHudSnapshot,
+  ModeActorSample,
+} from './BattleModeController';
 
 export type CombatSessionMode = 'battle' | 'infection';
 
@@ -270,10 +282,14 @@ export interface CombatSessionSnapshot {
   flashlightOn: boolean;
 
   // Battle-specific state
-  battleRule: 'tdm' | 'ffa';
+  battleRule: BattleRuleId;
+  localBattleTeam: 'A' | 'B' | 'FFA';
   killLimit: number;
   scoreA: number;
   scoreB: number;
+  modeHud: BattleModeHudSnapshot | null;
+  spawnProtectionRemainingSec: number;
+  spectateOverview: boolean;
   playerKills: number;
   playerDeaths: number;
   playerHeadshots: number;
@@ -411,6 +427,14 @@ export class CombatSessionEngine {
 
   private readonly botAI: BattleBotAI | null = null;
   private readonly zombieAI: InfectionZombieAI | null = null;
+  private modeController: BattleModeController | null = null;
+  private readonly modeSceneGroup = new THREE.Group();
+  private modeSyncAccum = 0;
+  private spectateOverview = false;
+  private readonly _modeActorsBuf: ModeActorSample[] = [];
+  private readonly _spawnLosOrigin = new THREE.Vector3();
+  private readonly _spawnLosDir = new THREE.Vector3();
+  private readonly _spawnLosHit: BodycamRaycastResult = createRaycastResult();
   private squadComms: SquadCommsMessage[] = [];
   private nextSquadCommsId = 1;
   private readonly mp: MultiplayerSessionBridge | null = null;
@@ -592,6 +616,8 @@ export class CombatSessionEngine {
   private readonly _grenadeThrowOrigin = new THREE.Vector3();
   private readonly _tmpCamPos = new THREE.Vector3();
   private readonly _tmpCamRight = new THREE.Vector3();
+  private readonly _tmpFlybyOrigin = new THREE.Vector3();
+  private readonly _tmpFlybyEnd = new THREE.Vector3();
   private readonly _grenadeThrowDir = new THREE.Vector3();
   private readonly _grenadePlayerVel = new THREE.Vector3();
   private readonly _whipVel = new THREE.Vector2();
@@ -683,9 +709,13 @@ export class CombatSessionEngine {
     const maxAnisotropy = Math.min(8, this.renderer.capabilities.getMaxAnisotropy() || 4);
 
     if (this.mp) {
-      const rule = params.mode === 'battle' ? params.battleConfig.rule : 'tdm';
+      const rule: BattleRuleId = params.mode === 'battle' ? params.battleConfig.rule : 'tdm';
       this.localBattleTeam =
-        params.mode === 'infection' ? 'A' : rule === 'ffa' ? 'FFA' : this.mp.localTeam;
+        params.mode === 'infection'
+          ? 'A'
+          : isFreeForAllBattleRule(rule)
+            ? 'FFA'
+            : this.mp.localTeam;
       this.localUniformId = resolveOperatorUniformId(params.mode, this.localBattleTeam);
 
       if (evCfg) {
@@ -712,7 +742,9 @@ export class CombatSessionEngine {
       });
     } else {
       this.localBattleTeam =
-        params.mode === 'battle' && params.battleConfig.rule === 'ffa' ? 'FFA' : 'A';
+        params.mode === 'battle' && isFreeForAllBattleRule(params.battleConfig.rule)
+          ? 'FFA'
+          : 'A';
       this.localUniformId = resolveOperatorUniformId(params.mode, this.localBattleTeam);
     }
 
@@ -722,6 +754,8 @@ export class CombatSessionEngine {
 
     // Instantiate mode AI systems, applying Special Event AI/Zombie tuning, vaulting adapter & Client Replica flag
     if (params.mode === 'battle') {
+      this.scene.add(this.modeSceneGroup);
+      this.modeController = this.createBattleModeController(params.battleConfig, isClientReplica);
       this.botAI = new BattleBotAI(
         this.scene,
         this.map,
@@ -740,6 +774,7 @@ export class CombatSessionEngine {
           localAllyTeam: this.localBattleTeam,
         },
       );
+      this.botAI.setModeController(this.modeController);
       this.botAI.setBotCommsListener((ev) => this.handleLocalBotComms(ev));
       this.botAI.setBotGrenadeListener((ev) => this.handleHostBotGrenadeEvent(ev));
       this.botAI.setAssistListener((assisterId) => {
@@ -1417,18 +1452,335 @@ export class CombatSessionEngine {
     }
   }
 
+  private getLocalModeActorId(): string {
+    return this.mp ? this.mp.localUserId : 'player';
+  }
+
+  private createBattleModeController(
+    battleConfig: BattleMatchConfig,
+    isClientReplica: boolean,
+  ): BattleModeController {
+    const loadoutState = loadoutStore.getState();
+    const activeSlot = loadoutStore.getActiveSlot();
+    const conquestLoadouts = loadoutState.slots.map((s) => ({
+      id: s.id,
+      name: s.name,
+      primaryWeaponId: s.primaryWeaponId,
+      secondaryWeaponId: s.secondaryWeaponId,
+    }));
+    const rule = battleConfig.rule;
+    const scoreLimit =
+      battleConfig.scoreLimit ??
+      (rule === 'tdm' || rule === 'ffa' || rule === 'kc_tdm' || rule === 'kc_ffa'
+        ? battleConfig.killLimit
+        : getDefaultScoreLimitForRule(rule));
+    const localActorId = this.getLocalModeActorId();
+
+    return new BattleModeController({
+      rule,
+      map: this.map,
+      sceneGroup: this.modeSceneGroup,
+      localPlayerTeam: this.localBattleTeam,
+      localPlayerId: localActorId,
+      scoreLimit,
+      matchDurationSec: battleConfig.matchDurationSec,
+      isAuthority: !isClientReplica,
+      conquestLoadouts,
+      activeLoadoutId: activeSlot.id,
+      callbacks: {
+        onObjectiveBanner: (text) => {
+          this.showToast(text, 2.8);
+        },
+        onAudioChime: (kind) => {
+          this.audio.playObjectiveChime(kind);
+        },
+        onDogtagAudio: (isFriendly, isSelfRecovery) => {
+          this.audio.playDogtagPickup(isFriendly, isSelfRecovery);
+        },
+        onDogtagSpawned: (ev) => {
+          if (this.mp && this.isMpHost) {
+            const pkt: GameDogtagEventPacket = {
+              type: 'game:dogtag_event',
+              action: 'spawn',
+              tagId: ev.tagId,
+              victimId: ev.victimId,
+              victimTeam: ev.victimTeam,
+              x: Number(ev.x.toFixed(2)),
+              y: Number(ev.y.toFixed(2)),
+              z: Number(ev.z.toFixed(2)),
+              ts: Date.now(),
+            };
+            this.mp.sendMessage(pkt as unknown as Record<string, unknown>);
+          }
+        },
+        onDogtagCollected: (ev) => {
+          if (this.mp && this.isMpHost) {
+            const pkt: GameDogtagEventPacket = {
+              type: 'game:dogtag_event',
+              action: 'collect',
+              tagId: ev.tagId,
+              victimId: ev.victimId,
+              victimTeam: ev.victimTeam,
+              collectorId: ev.collectorId,
+              collectorTeam: ev.collectorTeam,
+              isFriendly: ev.isFriendly,
+              isSelfRecovery: ev.isSelfRecovery,
+              x: Number(ev.x.toFixed(2)),
+              y: Number(ev.y.toFixed(2)),
+              z: Number(ev.z.toFixed(2)),
+              ts: Date.now(),
+            };
+            this.mp.sendMessage(pkt as unknown as Record<string, unknown>);
+          }
+        },
+        onFlagEvent: (ev) => {
+          if (this.mp && this.isMpHost) {
+            const pkt: GameFlagEventPacket = {
+              type: 'game:flag_event',
+              flagTeam: ev.flagTeam,
+              action: ev.action,
+              actorId: ev.actorId,
+              actorName: ev.actorName,
+              actorTeam: ev.actorTeam,
+              x: Number(ev.x.toFixed(2)),
+              y: Number(ev.y.toFixed(2)),
+              z: Number(ev.z.toFixed(2)),
+              ts: Date.now(),
+            };
+            this.mp.sendMessage(pkt as unknown as Record<string, unknown>);
+          }
+        },
+        onMatchVictory: (winner) => {
+          if (this.matchOutcome !== 'active') return;
+          if (winner.winnerTeam === 'DRAW') {
+            this.matchOutcome = 'defeat';
+          } else if (isFreeForAllBattleRule(rule)) {
+            this.matchOutcome = winner.winnerActorId === localActorId ? 'victory' : 'defeat';
+          } else {
+            this.matchOutcome = winner.winnerTeam === this.localBattleTeam ? 'victory' : 'defeat';
+          }
+          this.isFiring = false;
+          if (document.pointerLockElement === this.renderer.domElement) {
+            document.exitPointerLock();
+          }
+          this.showToast(winner.reason, 4.2);
+          this.emitSnapshot();
+        },
+      },
+    });
+  }
+
+  private collectModeActors(): readonly ModeActorSample[] {
+    const buf = this._modeActorsBuf;
+    buf.length = 0;
+    const localId = this.getLocalModeActorId();
+    buf.push({
+      id: localId,
+      name: this.mp?.localUsername ?? 'YOU',
+      team: this.localBattleTeam,
+      alive: this.playerAlive,
+      x: this.controller.position.x,
+      y: this.controller.position.y,
+      z: this.controller.position.z,
+      isLocalPlayer: true,
+    });
+    if (this.remotePlayers) {
+      const remotes = this.remotePlayers.getAliveHumanTargets();
+      for (let i = 0; i < remotes.length; i++) {
+        const r = remotes[i];
+        buf.push({
+          id: r.id,
+          name: r.name,
+          team: r.team,
+          alive: r.alive,
+          x: r.pos.x,
+          y: r.pos.y,
+          z: r.pos.z,
+        });
+      }
+    }
+    if (this.botAI) {
+      const botSamples = this.botAI.getModeActorSamples();
+      for (let i = 0; i < botSamples.length; i++) {
+        buf.push(botSamples[i]);
+      }
+    }
+    return buf;
+  }
+
+  private isSpawnLineOccluded(
+    ax: number,
+    ay: number,
+    az: number,
+    bx: number,
+    by: number,
+    bz: number,
+  ): boolean {
+    const dx = bx - ax;
+    const dy = by - ay;
+    const dz = bz - az;
+    const dist = Math.hypot(dx, dy, dz);
+    if (dist < 0.25) return false;
+    this._spawnLosOrigin.set(ax, ay, az);
+    this._spawnLosDir.set(dx / dist, dy / dist, dz / dist);
+    return this.adapter.raycast(
+      this._spawnLosOrigin,
+      this._spawnLosDir,
+      0.2,
+      dist - 0.2,
+      this._spawnLosHit,
+    );
+  }
+
+  private applyCustomLoadoutSlot(slotId: string): void {
+    const state = loadoutStore.getState();
+    const slotIdx = state.slots.findIndex((s) => s.id === slotId);
+    if (slotIdx < 0) return;
+    const slot = state.slots[slotIdx];
+
+    for (const [wId, build] of Object.entries(slot.weaponBuilds)) {
+      this.attachmentsByWeapon[wId] = normalizeWeaponAttachments(wId, {
+        ...build.attachments,
+        selectedAmmoId: build.ammoVariantId,
+        zeroDistanceM: build.zeroDistanceM,
+        zeroElevationMrad: build.zeroElevationMrad,
+      });
+    }
+
+    const pId = slot.primaryWeaponId || 'm4a1';
+    const sId = slot.secondaryWeaponId || 'glock_17';
+    this.weaponSlots = [pId, sId];
+    this.initWeaponAmmo(pId, -1);
+    this.initWeaponAmmo(sId, -1);
+    this.tacticalEquipmentId = slot.tacticalEquipmentId;
+    this.tacticalBeltSlot = slot.tacticalBeltSlot;
+    this.tacticalMountOnBelt = slot.mountOnBelt;
+    this.grenadeCount = getTacticalEquipmentDef(this.tacticalEquipmentId).maxCarry;
+    this.syncBeltEquipmentMesh();
+    this.equipSlot(0, true);
+  }
+
+  public selectConquestLoadout(slotId: string): void {
+    if (!this.modeController) return;
+    this.modeController.selectConquestLoadout(slotId);
+    this.emitSnapshot();
+  }
+
+  public selectConquestSpawn(spawnId: string): void {
+    if (!this.modeController) return;
+    this.modeController.selectConquestSpawn(spawnId);
+    this.emitSnapshot();
+  }
+
+  public confirmConquestRedeploy(): void {
+    if (this.params.mode !== 'battle' || !this.modeController || this.matchOutcome !== 'active') {
+      return;
+    }
+    const localId = this.getLocalModeActorId();
+    const livingEnemies = this.collectModeActors().filter(
+      (a) => a.alive && a.id !== localId && a.team !== this.localBattleTeam,
+    );
+    const res = this.modeController.confirmConquestRedeploy(livingEnemies, this.map.raycastMeshes);
+    if (!res) {
+      this.showToast('Selected spawn unavailable — pick HQ or uncontested FOB', 3.0);
+      this.emitSnapshot();
+      return;
+    }
+
+    this.applyCustomLoadoutSlot(res.loadout.id);
+    this.playerAlive = true;
+    this.spectating = false;
+    this.spectateOverview = false;
+    this.spectatingTargetName = null;
+    this.hp = this.maxHp;
+    this.respawnTimerSec = 0;
+    this.flashBlindAlpha = 0;
+
+    const sp = res.spawnPoint;
+    const groundY = this.adapter.getGroundHeight(sp.position[0], sp.position[2], sp.position[1]);
+    this.playerRagdoll.deactivate();
+    this.skeleton.setFirstPersonHeadShadowOnly(true);
+    this.skeleton.enableArmViewmodelLayer();
+    this.skeleton.applyCanonicalRestPose();
+    this.animator.setSecondaryRagdollDecay(false);
+    this.animator.resetSecondaryPhysics();
+    this.controller.snapTo(sp.position[0], groundY, sp.position[2], sp.yaw, 0);
+    this.modeController.grantSpawnProtection(this.getLocalModeActorId());
+    this.syncNvgRuntime();
+    this.showToast(`Deployed · ${res.loadout.name}`, 2.4);
+
+    if (this.mp) {
+      const rspPkt: GamePlayerRespawnPacket = {
+        type: 'game:respawn',
+        x: Number(this.controller.position.x.toFixed(3)),
+        y: Number(this.controller.position.y.toFixed(3)),
+        z: Number(this.controller.position.z.toFixed(3)),
+        yaw: Number(this.controller.aimYaw.toFixed(4)),
+        hp: this.maxHp,
+        maxHp: this.maxHp,
+        uniformId: this.localUniformId,
+        operatorId: this.localOperatorId,
+        glovesEnabled: this.localGear.glovesEnabled,
+        gloveColor: this.localGear.gloveColor,
+        helmetType: this.localGear.helmetType,
+        helmetColor: this.localGear.helmetColor,
+        nvgMount: this.localGear.nvgMount,
+        nvgFlipped: this.nvgFlipped && this.localGear.nvgMount !== 'none',
+        faceGear: this.localGear.faceGear,
+        eyewear: this.localGear.eyewear,
+        facePreset: this.localGear.facePreset,
+        ts: Date.now(),
+      };
+      this.mp.sendMessage(rspPkt as unknown as Record<string, unknown>);
+    }
+
+    this.requestLock();
+    this.emitSnapshot();
+  }
+
+  public cycleSpectateTarget(dir: 1 | -1): void {
+    this.spectateOverview = false;
+    this.spectateTargetIdx = Math.max(0, this.spectateTargetIdx + dir);
+    this.emitSnapshot();
+  }
+
+  public toggleSpectateOverview(): void {
+    this.spectateOverview = !this.spectateOverview;
+    this.emitSnapshot();
+  }
+
   private spawnPlayerAtStart(): void {
     let sp = this.map.spawnPoints.playerStart;
     if (this.params.mode === 'battle') {
-      const pool =
-        this.params.battleConfig.rule === 'tdm'
-          ? this.localBattleTeam === 'B'
-            ? this.map.spawnPoints.teamB
-            : this.map.spawnPoints.teamA
-          : this.map.spawnPoints.ffa;
-      if (pool.length > 0) {
-        sp = pool[Math.floor(Math.random() * pool.length)];
+      const rule = this.params.battleConfig.rule;
+      let pool = isTeamBattleRule(rule)
+        ? this.localBattleTeam === 'B'
+          ? this.map.spawnPoints.teamB
+          : this.map.spawnPoints.teamA
+        : this.map.spawnPoints.ffa;
+      if (rule === 'conquest' && this.modeController) {
+        const hqPool = this.modeController.getOpeningHqSpawns(
+          this.localBattleTeam === 'B' ? 'B' : 'A',
+        );
+        if (hqPool.length > 0) pool = hqPool;
       }
+      if (pool.length > 0) {
+        if (this.modeController) {
+          const localId = this.getLocalModeActorId();
+          const teamRule = isTeamBattleRule(rule);
+          const livingEnemies = this.collectModeActors().filter(
+            (a) => a.alive && a.id !== localId && (!teamRule || a.team !== this.localBattleTeam),
+          );
+          sp = this.modeController.selectSafeSpawnPoint(
+            pool,
+            livingEnemies,
+            this.map.raycastMeshes,
+          );
+        } else {
+          sp = pool[Math.floor(Math.random() * pool.length)];
+        }
+      }
+      this.modeController?.grantSpawnProtection(this.getLocalModeActorId());
     }
     const groundY = this.adapter.getGroundHeight(sp.position[0], sp.position[2], sp.position[1]);
     this.playerRagdoll.deactivate();
@@ -1444,7 +1796,7 @@ export class CombatSessionEngine {
     this.remotePlayers?.syncRosterMembers(members);
     if (this.mp) {
       const me = members.find((m) => m.userId === this.mp!.localUserId);
-      if (me && this.params.mode === 'battle' && this.params.battleConfig.rule === 'tdm') {
+      if (me && this.params.mode === 'battle' && isTeamBattleRule(this.params.battleConfig.rule)) {
         const nextTeam: BattleTeamId = me.team === 'B' ? 'B' : 'A';
         if (nextTeam !== this.localBattleTeam) {
           this.localBattleTeam = nextTeam;
@@ -1701,7 +2053,21 @@ export class CombatSessionEngine {
     }
 
     if (type === 'game:fire') {
-      this.remotePlayers.applyFirePacket(raw as unknown as GamePlayerFirePacket);
+      const pkt = raw as unknown as GamePlayerFirePacket;
+      this.remotePlayers.applyFirePacket(pkt);
+      if (pkt.senderUserId && pkt.senderUserId !== this.mp.localUserId) {
+        this._tmpFlybyOrigin.set(pkt.ox, pkt.oy, pkt.oz);
+        this._tmpFlybyEnd.set(pkt.dx, pkt.dy, pkt.dz);
+        if (this._tmpFlybyEnd.lengthSq() > 1e-6) {
+          this._tmpFlybyEnd.normalize().multiplyScalar(140).add(this._tmpFlybyOrigin);
+          this.triggerRemoteSegmentFlyby(
+            this._tmpFlybyOrigin,
+            this._tmpFlybyEnd,
+            pkt.caliberId,
+            Boolean(pkt.suppressed),
+          );
+        }
+      }
       return;
     }
 
@@ -1787,16 +2153,16 @@ export class CombatSessionEngine {
       const attackerTeam: BattleTeamId =
         this.params.mode === 'infection'
           ? 'A'
-          : this.params.battleConfig.rule === 'ffa'
+          : isFreeForAllBattleRule(this.params.battleConfig.rule)
             ? 'FFA'
             : pkt.senderTeam === 'B'
               ? 'B'
               : 'A';
-      // Enforce no friendly fire in TDM & co-op Infection
+      // Enforce no friendly fire in Team Battle modes & co-op Infection
       if (
         this.params.mode === 'infection' ||
         (this.params.mode === 'battle' &&
-          this.params.battleConfig.rule === 'tdm' &&
+          isTeamBattleRule(this.params.battleConfig.rule) &&
           attackerTeam === this.localBattleTeam)
       ) {
         return;
@@ -1878,6 +2244,29 @@ export class CombatSessionEngine {
         pkt.ez,
         Boolean(pkt.sup),
       );
+      this._tmpFlybyOrigin.set(pkt.ox, pkt.oy, pkt.oz);
+      this._tmpFlybyEnd.set(pkt.ex, pkt.ey, pkt.ez);
+      this.triggerRemoteSegmentFlyby(
+        this._tmpFlybyOrigin,
+        this._tmpFlybyEnd,
+        pkt.caliberId,
+        Boolean(pkt.sup),
+      );
+      return;
+    }
+
+    if (type === 'game:mode_state' && this.modeController && !this.isMpHost) {
+      this.modeController.applySyncPacket(raw as unknown as GameModeStatePacket);
+      return;
+    }
+
+    if (type === 'game:dogtag_event' && this.modeController && !this.isMpHost) {
+      this.modeController.applyDogtagEventPacket(raw as unknown as GameDogtagEventPacket);
+      return;
+    }
+
+    if (type === 'game:flag_event' && this.modeController && !this.isMpHost) {
+      this.modeController.applyFlagEventPacket(raw as unknown as GameFlagEventPacket);
       return;
     }
 
@@ -1885,7 +2274,7 @@ export class CombatSessionEngine {
       const pkt = raw as unknown as GameBotCommsPacket;
       if (!pkt.senderIsHost) return;
       if (this.params.mode === 'battle') {
-        if (this.params.battleConfig.rule === 'ffa') return;
+        if (isFreeForAllBattleRule(this.params.battleConfig.rule)) return;
         if (pkt.team !== this.localBattleTeam) return;
       }
       this.pushSquadComms(pkt.callsign, pkt.category, pkt.text);
@@ -1919,7 +2308,7 @@ export class CombatSessionEngine {
       if (this.params.mode === 'infection') return;
       const pkt = raw as unknown as GameBotDamagePacket;
       const attackerTeam: BattleTeamId =
-        this.params.mode === 'battle' && this.params.battleConfig.rule === 'ffa'
+        this.params.mode === 'battle' && isFreeForAllBattleRule(this.params.battleConfig.rule)
           ? 'FFA'
           : pkt.senderTeam === 'B'
             ? 'B'
@@ -2402,6 +2791,23 @@ export class CombatSessionEngine {
   }
 
   private applyKillEvent(pkt: GamePlayerKillPacket): void {
+    if (
+      this.params.mode === 'battle' &&
+      this.modeController &&
+      this.isMpHost &&
+      !pkt.victimUserId.startsWith('bot_') &&
+      pkt.victimUserId !== this.mp?.localUserId
+    ) {
+      if (this.remotePlayers?.getPlayerHeadPosition(pkt.victimUserId, this._tmpImpactPoint)) {
+        this.modeController.onActorKilled({
+          victimId: pkt.victimUserId,
+          victimTeam: pkt.victimTeam,
+          x: this._tmpImpactPoint.x,
+          y: Math.max(0, this._tmpImpactPoint.y - 1.5),
+          z: this._tmpImpactPoint.z,
+        });
+      }
+    }
     this.remotePlayers?.markPlayerDead(pkt.victimUserId);
 
     this.pushMpKillfeed({
@@ -2549,6 +2955,9 @@ export class CombatSessionEngine {
     this.weaponKills = {};
     this.matchOutcome = 'active';
     this.playerAlive = true;
+    this.spectating = false;
+    this.spectateOverview = false;
+    this.spectatingTargetName = null;
     this.respawnTimerSec = 0;
     this.hp = this.maxHp;
     this.damageFlash = 0;
@@ -2560,6 +2969,14 @@ export class CombatSessionEngine {
       this.initWeaponAmmo(wId, -1);
     }
     this.equipSlot(0, true);
+    if (this.modeController) {
+      this.modeController.dispose();
+      this.modeController = this.createBattleModeController(
+        this.params.battleConfig,
+        Boolean(this.mp && !this.isMpHost),
+      );
+      this.botAI.setModeController(this.modeController);
+    }
     this.spawnPlayerAtStart();
     this.botAI.resetMatch(this.controller.position);
     this.ballistics.clearEffects();
@@ -2603,6 +3020,82 @@ export class CombatSessionEngine {
       this.grenadeCount,
       this.tacticalMountOnBelt,
     );
+  }
+
+  private triggerRemoteSegmentFlyby(
+    origin: Readonly<THREE.Vector3>,
+    end: Readonly<THREE.Vector3>,
+    caliberId?: string,
+    suppressed = false,
+  ): void {
+    this.camera.getWorldPosition(this._tmpCamPos);
+    this._tmpCamRight.set(1, 0, 0).applyQuaternion(this.camera.quaternion);
+
+    const cal = (caliberId ?? '556x45').toLowerCase();
+    const isSub =
+      cal.includes('9x18') ||
+      cal.includes('45') ||
+      (cal.includes('9x19') && suppressed);
+    const isShotgun = cal.includes('12g');
+    const is50Ae = cal.includes('50ae') || cal.includes('50_ae') || cal.includes('50');
+    const is338 = cal.includes('338');
+    const is762x51 = cal.includes('762x51') || cal.includes('762x54') || cal.includes('308');
+    const is762 = is762x51 || cal.includes('762');
+
+    const speedMs = isSub
+      ? 305
+      : isShotgun
+        ? 338
+        : is50Ae
+          ? 470
+          : cal.includes('9x19')
+            ? 385
+            : is338
+              ? 910
+              : is762x51
+                ? 840
+                : is762
+                  ? 735
+                  : 880;
+    const calMm = is50Ae
+      ? 12.7
+      : is338
+        ? 8.6
+        : cal.includes('45')
+          ? 11.43
+          : cal.includes('9x')
+            ? 9.0
+            : isShotgun
+              ? 8.4
+              : is762
+                ? 7.62
+                : 5.56;
+    const energyJ = is338
+      ? 4900
+      : is762x51
+        ? 3300
+        : is50Ae
+          ? 2150
+          : is762
+            ? 2100
+            : cal.includes('9x18')
+              ? 310
+              : cal.includes('9x')
+                ? 480
+                : isShotgun
+                  ? 420
+                  : 1750;
+
+    BallisticsSolver.triggerSegmentFlyby(origin, end, speedMs, calMm, energyJ, {
+      listenerHeadPos: this._tmpCamPos,
+      listenerRightDir: this._tmpCamRight,
+      audio: this.audio,
+      onSupersonicNearMiss: (flinchDeg: number, sideSign: number) => {
+        if (this.playerAlive) {
+          this.controller.applyBallisticMicroFlinch(flinchDeg, sideSign);
+        }
+      },
+    });
   }
 
   private estimateEnergyFromWeaponOrDamage(
@@ -3154,7 +3647,7 @@ export class CombatSessionEngine {
         if (!botInfo || !botInfo.alive) return;
         if (
           this.params.mode === 'battle' &&
-          this.params.battleConfig.rule === 'tdm' &&
+          isTeamBattleRule(this.params.battleConfig.rule) &&
           botInfo.team === this.localBattleTeam
         ) {
           return;
@@ -3212,7 +3705,7 @@ export class CombatSessionEngine {
       if (this.mp && !this.isMpHost) {
         const info = this.botAI.getBotInfo(botId);
         if (!info || !info.alive) return;
-        if (this.params.mode === 'battle' && this.params.battleConfig.rule === 'tdm' && info.team === this.localBattleTeam) {
+        if (this.params.mode === 'battle' && isTeamBattleRule(this.params.battleConfig.rule) && info.team === this.localBattleTeam) {
           return;
         }
         const headshot = hitZone === 'head';
@@ -3657,7 +4150,7 @@ export class CombatSessionEngine {
       if (ud?.hitZone === 'belt_grenade') {
         const botInfo = this.botAI.getBotInfo(botId);
         if (!botInfo || !botInfo.alive) return;
-        if (this.params.mode === 'battle' && this.params.battleConfig.rule === 'tdm' && botInfo.team === this.localBattleTeam) {
+        if (this.params.mode === 'battle' && isTeamBattleRule(this.params.battleConfig.rule) && botInfo.team === this.localBattleTeam) {
           return;
         }
         const preferredEq = isTacticalEquipmentId(ud.beltGrenadeEquipmentId)
@@ -3706,7 +4199,7 @@ export class CombatSessionEngine {
       if (this.mp && !this.isMpHost) {
         const info = this.botAI.getBotInfo(botId);
         if (!info || !info.alive) return;
-        if (this.params.mode === 'battle' && this.params.battleConfig.rule === 'tdm' && info.team === this.localBattleTeam) {
+        if (this.params.mode === 'battle' && isTeamBattleRule(this.params.battleConfig.rule) && info.team === this.localBattleTeam) {
           return;
         }
         this.hitmarkerTimer = 0.22;
@@ -3783,6 +4276,12 @@ export class CombatSessionEngine {
     attackerId?: string,
   ): void {
     if (!this.playerAlive || this.gameOver || this.matchOutcome !== 'active') return;
+    if (
+      this.params.mode === 'battle' &&
+      this.modeController?.isSpawnProtected(this.getLocalModeActorId())
+    ) {
+      return;
+    }
     this.hp = Math.max(0, this.hp - damage);
     this.timeSinceDamageSec = 0;
     this.damageFlash = Math.min(1.0, this.damageFlash + 0.65);
@@ -3836,7 +4335,34 @@ export class CombatSessionEngine {
           this.botAI.recordPlayerDeath(attackerLabel, attackerTeam, attackerId, 'bullet', recentIds);
         }
 
-        if (!this.playerRespawnEnabled) {
+        this.modeController?.onActorKilled({
+          victimId: this.getLocalModeActorId(),
+          victimTeam: this.localBattleTeam,
+          x: this.controller.position.x,
+          y: this.controller.position.y,
+          z: this.controller.position.z,
+        });
+
+        if (this.params.battleConfig.rule === 'conquest' && this.modeController) {
+          const cqRes = this.modeController.onLocalPlayerDeathConquest();
+          this.respawnTimerSec = 0;
+          if (document.pointerLockElement === this.renderer.domElement) {
+            document.exitPointerLock();
+          }
+          if (cqRes.enteringSpectator) {
+            this.spectating = true;
+            this.showToast(
+              `Eliminated by ${attackerLabel} · All Loadouts Expended — Spectating`,
+              4.5,
+            );
+          } else {
+            this.spectating = false;
+            this.showToast(
+              `Eliminated by ${attackerLabel} · Choose next Loadout & Spawn (${cqRes.remainingLives} left)`,
+              3.8,
+            );
+          }
+        } else if (!this.playerRespawnEnabled) {
           this.livesRemaining = Math.max(0, this.livesRemaining - 1);
           if (this.livesRemaining <= 0) {
             this.spectating = true;
@@ -3897,11 +4423,15 @@ export class CombatSessionEngine {
 
   private checkBattleVictory(): void {
     if (this.params.mode !== 'battle' || !this.botAI || this.matchOutcome !== 'active') return;
+    const rule = this.params.battleConfig.rule;
+    // Objective & Kill Confirmed modes resolve victory exclusively through BattleModeController
+    if (rule !== 'tdm' && rule !== 'ffa') return;
+
     const limit = this.params.battleConfig.killLimit;
     const totalA = this.botAI.scoreA + this.mpScoreA;
     const totalB = this.botAI.scoreB + this.mpScoreB;
 
-    if (this.params.battleConfig.rule === 'tdm') {
+    if (rule === 'tdm') {
       const myScore = this.localBattleTeam === 'B' ? totalB : totalA;
       const enemyScore = this.localBattleTeam === 'B' ? totalA : totalB;
       if (myScore >= limit) {
@@ -4461,6 +4991,7 @@ export class CombatSessionEngine {
       if (punch) {
         this.semiTriggerConsumed = true;
         this.stamina = Math.max(0, this.stamina - 0.05);
+        this.modeController?.cancelSpawnProtection(this.getLocalModeActorId());
       }
       return;
     }
@@ -4470,6 +5001,7 @@ export class CombatSessionEngine {
       if (this.animator.triggerKnifeSlash(this.controller)) {
         this.semiTriggerConsumed = true;
         this.stamina = Math.max(0, this.stamina - 0.04);
+        this.modeController?.cancelSpawnProtection(this.getLocalModeActorId());
       }
       return;
     }
@@ -4530,6 +5062,7 @@ export class CombatSessionEngine {
       audio: this.audio,
     });
 
+    this.modeController?.cancelSpawnProtection(this.getLocalModeActorId());
     this.weaponRig.triggerFire(suppressed, remaining);
     if (!suppressed) {
       this.postProcess.triggerNvgFlashSpike(0.55);
@@ -5147,7 +5680,7 @@ export class CombatSessionEngine {
           if (
             this.params.mode === 'infection' ||
             (this.params.mode === 'battle' &&
-              this.params.battleConfig.rule === 'tdm' &&
+              isTeamBattleRule(this.params.battleConfig.rule) &&
               info.team === this.localBattleTeam)
           ) {
             continue;
@@ -5271,7 +5804,7 @@ export class CombatSessionEngine {
 
     this.audio.playTacticalPing(kind);
     // Allied AI bots acknowledge and respond to the player's tactical ping
-    if (this.params.mode === 'infection' || (this.params.mode === 'battle' && this.params.battleConfig.rule === 'tdm')) {
+    if (this.params.mode === 'infection' || (this.params.mode === 'battle' && isTeamBattleRule(this.params.battleConfig.rule))) {
       this.botAI?.notifyPlayerPing(kind, pingPos, label);
     }
 
@@ -5311,7 +5844,7 @@ export class CombatSessionEngine {
   }
 
   private handleLocalBotComms(ev: BotCommsEvent): void {
-    if (this.params.mode === 'battle' && this.params.battleConfig.rule === 'ffa') return;
+    if (this.params.mode === 'battle' && isFreeForAllBattleRule(this.params.battleConfig.rule)) return;
 
     // Broadcast to multiplayer clients first if host (clients filter by their own team)
     if (this.mp && this.isMpHost) {
@@ -5363,7 +5896,7 @@ export class CombatSessionEngine {
 
     // Visibility rules: FFA hides opponent pings; Battle TDM only shows teammates; Infection shows all squadmates
     if (this.params.mode === 'battle') {
-      if (this.params.battleConfig.rule === 'ffa') return;
+      if (isFreeForAllBattleRule(this.params.battleConfig.rule)) return;
       if (pkt.senderTeam && pkt.senderTeam !== this.localBattleTeam) return;
     }
 
@@ -5658,11 +6191,13 @@ export class CombatSessionEngine {
       this.flashBlindAlpha = Math.max(0, this.flashBlindAlpha - dt * 0.42);
     }
 
-    // Battle respawn countdown (only if not eliminated/spectating)
+    // Battle respawn countdown (skipped during Conquest loadout/FOB redeploy & spectating)
     if (
       this.params.mode === 'battle' &&
       !this.playerAlive &&
       !this.spectating &&
+      !this.modeController?.isLocalAwaitingRedeploy() &&
+      !this.modeController?.isLocalSpectating() &&
       this.matchOutcome === 'active'
     ) {
       this.respawnTimerSec -= dt;
@@ -5772,9 +6307,15 @@ export class CombatSessionEngine {
     this.input.sprint = !suppBusy && !pdaBusy && this.shiftHeld && !firearmAdsBlocking;
     this.input.holdBreath = !suppBusy && !pdaBusy && this.input.ads && (this.shiftHeld || this.altHeld);
 
-    // In multiplayer, world stays live continuously even when Esc pause overlay is open
+    // In multiplayer or Conquest Redeploy/Spectate, world stays live continuously even when pointer lock is released
+    const conquestOverlayActive =
+      this.params.mode === 'battle' &&
+      Boolean(
+        this.modeController?.isLocalAwaitingRedeploy() ||
+          this.modeController?.isLocalSpectating(),
+      );
     const simActive =
-      (this.mp ? true : this.pointerLocked && !this.tunerOpen) &&
+      (this.mp || conquestOverlayActive ? !this.tunerOpen : this.pointerLocked && !this.tunerOpen) &&
       !this.gameOver &&
       this.matchOutcome === 'active';
 
@@ -5843,17 +6384,42 @@ export class CombatSessionEngine {
         this.playerRagdoll.step(dt, this.map.physics, this.map.terrainHeightAt);
         this.playerRagdoll.syncToSkeleton(this.skeleton);
       }
-      if (this.spectating && this.remotePlayers) {
-        const targets = this.remotePlayers.getAliveSpectateTargets();
-        if (targets.length > 0) {
-          const t = targets[this.spectateTargetIdx % targets.length];
-          this.spectatingTargetName = t.username;
-          const backX = Math.sin(t.yaw) * 2.6;
-          const backZ = Math.cos(t.yaw) * 2.6;
-          this.camera.position.set(t.pos.x + backX, t.pos.y + 2.15, t.pos.z + backZ);
+      if (this.spectating || this.modeController?.isLocalSpectating()) {
+        const remoteTargets = this.remotePlayers?.getAliveSpectateTargets() ?? [];
+        const botTargets =
+          this.params.mode === 'battle' && this.botAI
+            ? this.botAI.getAliveTeammateSpectateTargets(this.localBattleTeam)
+            : [];
+        const allTargets = [
+          ...remoteTargets.map((t) => ({ name: t.username, pos: t.pos, yaw: t.yaw })),
+          ...botTargets.map((b) => ({ name: b.name, pos: b.pos, yaw: b.yaw })),
+        ];
+        if (!this.spectateOverview && allTargets.length > 0) {
+          const idx =
+            ((this.spectateTargetIdx % allTargets.length) + allTargets.length) % allTargets.length;
+          const t = allTargets[idx];
+          this.spectatingTargetName = t.name;
+          const backX = Math.sin(t.yaw) * 2.8;
+          const backZ = Math.cos(t.yaw) * 2.8;
+          this.camera.position.set(t.pos.x + backX, t.pos.y + 2.25, t.pos.z + backZ);
           this.camera.lookAt(t.pos.x, t.pos.y + 1.45, t.pos.z);
         } else {
-          this.spectatingTargetName = null;
+          this.spectatingTargetName = allTargets.length > 0 ? 'TACTICAL OVERVIEW' : 'AWAITING MATCH END';
+          const cx = (this.map.physics.boundsMinX + this.map.physics.boundsMaxX) * 0.5;
+          const cz = (this.map.physics.boundsMinZ + this.map.physics.boundsMaxZ) * 0.5;
+          const span = Math.max(
+            26,
+            Math.min(
+              72,
+              Math.max(
+                this.map.physics.boundsMaxX - this.map.physics.boundsMinX,
+                this.map.physics.boundsMaxZ - this.map.physics.boundsMinZ,
+              ) * 0.36,
+            ),
+          );
+          const orbit = this.elapsedSec * 0.14;
+          this.camera.position.set(cx + Math.cos(orbit) * span, 28, cz + Math.sin(orbit) * span);
+          this.camera.lookAt(cx, 2, cz);
         }
       } else if (this.playerRagdoll.isActive()) {
         this.playerRagdoll.getNodePosition(0, this._ragdollPelvisWorld);
@@ -5996,6 +6562,7 @@ export class CombatSessionEngine {
     this.grenadeSystem.update(dt, this._grenadeThrowOrigin);
     const launched = this.grenadeSystem.consumeLastLaunchedThrow();
     if (launched) {
+      this.modeController?.cancelSpawnProtection(this.getLocalModeActorId());
       this.grenadeCount = Math.max(0, this.grenadeCount - 1);
       this.syncBeltEquipmentMesh();
       this.audio.playGearRattle('weapon_swap', 0.65);
@@ -6034,13 +6601,7 @@ export class CombatSessionEngine {
         end: Readonly<THREE.Vector3>,
         meta?: { weaponId: string; caliberId: string; suppressed: boolean },
       ) => {
-        const cal = (meta?.caliberId ?? '556x45').toLowerCase();
-        const isSub = cal.includes('9x18') || cal.includes('45') || (cal.includes('9x19') && Boolean(meta?.suppressed));
-        const isShotgun = cal.includes('12g');
-        const speedMs = isSub ? 305 : isShotgun ? 340 : cal.includes('9x19') ? 385 : cal.includes('762') ? 820 : 880;
-        const calMm = cal.includes('50') ? 12.7 : cal.includes('9x') ? 9.0 : cal.includes('762') ? 7.62 : 5.56;
-        const energyJ = cal.includes('762') ? 2800 : cal.includes('9x') ? 480 : 1750;
-        BallisticsSolver.triggerSegmentFlyby(origin, end, speedMs, calMm, energyJ, battleFlybyCtx);
+        this.triggerRemoteSegmentFlyby(origin, end, meta?.caliberId, Boolean(meta?.suppressed));
         if (this.mp && this.isMpHost) {
           const firePkt: GameBotFirePacket = {
             type: 'game:bot_fire',
@@ -6107,6 +6668,9 @@ export class CombatSessionEngine {
           (a, b) => this.grenadeSystem.isLineBlockedBySmoke(a, b),
           () => this.grenadeSystem.getActiveSmokeClouds(),
         );
+        if (this.modeController) {
+          this.modeController.update(dt, this.collectModeActors());
+        }
         this.checkBattleVictory();
       } else if (this.params.mode === 'infection' && this.zombieAI) {
         const allyBotTargets = this.botAI ? this.botAI.getAliveAllyTargets() : [];
@@ -6326,6 +6890,15 @@ export class CombatSessionEngine {
             );
           }
         }
+        if (this.modeController) {
+          this.modeSyncAccum += dt;
+          if (this.modeSyncAccum >= 0.2) {
+            this.modeSyncAccum = 0;
+            this.mp.sendMessage(
+              this.modeController.exportSyncPacket() as unknown as Record<string, unknown>,
+            );
+          }
+        }
       }
     }
 
@@ -6451,21 +7024,38 @@ export class CombatSessionEngine {
         ].sort((a, b) => b.kills - a.kills || b.assists - a.assists || a.deaths - b.deaths)
       : botBoard;
 
-    const combatants: CombatantMatchStats[] = mergedScoreboard.map((row) => ({
-      id: row.id,
-      name: row.name,
-      team: row.team,
-      isLocalPlayer: row.isPlayer,
-      isBot: row.isBot,
-      kills: row.kills,
-      deaths: row.deaths,
-      headshots: row.headshots,
-      assists: row.assists,
-      grenadeKills: row.grenadeKills,
-      meleeKills: row.meleeKills,
-      damageDealt: row.damageDealt,
-      afkSeconds: row.afkSeconds,
-    }));
+    const modeHud = this.modeController?.getHudSnapshot() ?? null;
+    const activeRule: BattleRuleId =
+      this.params.mode === 'battle' ? this.params.battleConfig.rule : 'tdm';
+    const localActorId = this.getLocalModeActorId();
+
+    const combatants: CombatantMatchStats[] = mergedScoreboard.map((row) => {
+      const lookupId = row.isPlayer ? localActorId : row.id;
+      const modeStats = this.modeController?.getActorStats(lookupId);
+      return {
+        id: row.id,
+        name: row.name,
+        team: row.team,
+        isLocalPlayer: row.isPlayer,
+        isBot: row.isBot,
+        kills: row.kills,
+        deaths: row.deaths,
+        headshots: row.headshots,
+        assists: row.assists,
+        grenadeKills: row.grenadeKills,
+        meleeKills: row.meleeKills,
+        damageDealt: row.damageDealt,
+        afkSeconds: row.afkSeconds,
+        enemyDogtags: modeStats?.enemyDogtags ?? row.enemyDogtags,
+        friendlyDogtags: modeStats?.friendlyDogtags ?? row.friendlyDogtags,
+        selfDogtagsRecovered: modeStats?.selfDogtagsRecovered ?? row.selfDogtagsRecovered,
+        poiCaptures: modeStats?.poiCaptures ?? row.poiCaptures,
+        territoryPoints: modeStats?.territoryPoints ?? row.territoryPoints,
+        flagCaptures: modeStats?.flagCaptures ?? row.flagCaptures,
+        flagReturns: modeStats?.flagReturns ?? row.flagReturns,
+        hillControlSec: modeStats?.hillControlSec ?? row.hillControlSec,
+      };
+    });
 
     const mergedKillfeed = [...this.mpKillfeed, ...(this.botAI?.getKillfeed() ?? [])]
       .sort((a, b) => b.timestampMs - a.timestampMs)
@@ -6479,6 +7069,25 @@ export class CombatSessionEngine {
         ffaLeaderName = r.name;
       }
     }
+    if (activeRule === 'kc_ffa' && this.modeController) {
+      let bestTags = -1;
+      for (const c of combatants) {
+        const tags = c.enemyDogtags ?? 0;
+        if (tags > bestTags) {
+          bestTags = tags;
+          ffaLeaderName = c.name;
+          ffaLeaderKills = tags;
+        }
+      }
+    }
+
+    const useModeScore = activeRule !== 'tdm' && activeRule !== 'ffa' && this.modeController !== null;
+    const scoreA = useModeScore
+      ? Math.round(this.modeController!.scoreA)
+      : (this.botAI?.scoreA ?? 0) + this.mpScoreA;
+    const scoreB = useModeScore
+      ? Math.round(this.modeController!.scoreB)
+      : (this.botAI?.scoreB ?? 0) + this.mpScoreB;
 
     return {
       mode: this.params.mode,
@@ -6523,10 +7132,19 @@ export class CombatSessionEngine {
       laserOn: this.weaponRig.laserOn && derived.hasLaser,
       flashlightOn: this.flashlightOn && derived.hasFlashlight,
 
-      battleRule: this.params.mode === 'battle' ? this.params.battleConfig.rule : 'tdm',
-      killLimit: this.params.mode === 'battle' ? this.params.battleConfig.killLimit : 0,
-      scoreA: (this.botAI?.scoreA ?? 0) + this.mpScoreA,
-      scoreB: (this.botAI?.scoreB ?? 0) + this.mpScoreB,
+      battleRule: activeRule,
+      localBattleTeam: this.localBattleTeam,
+      killLimit:
+        this.params.mode === 'battle'
+          ? (this.modeController?.scoreLimit ?? this.params.battleConfig.killLimit)
+          : 0,
+      scoreA,
+      scoreB,
+      modeHud,
+      spawnProtectionRemainingSec: Number(
+        (this.modeController?.getSpawnProtectionRemaining(localActorId) ?? 0).toFixed(2),
+      ),
+      spectateOverview: this.spectateOverview,
       playerKills: this.playerKills,
       playerDeaths: this.playerDeaths,
       playerHeadshots: this.playerHeadshots,
@@ -6879,6 +7497,9 @@ export class CombatSessionEngine {
       document.exitPointerLock();
     }
     this.remotePlayers?.dispose();
+    this.modeController?.dispose();
+    this.modeController = null;
+    this.scene.remove(this.modeSceneGroup);
     this.botAI?.dispose();
     this.zombieAI?.dispose();
     this.grenadeSystem.dispose();

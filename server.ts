@@ -6,10 +6,12 @@ import os from 'os';
 import path from 'path';
 import { WebSocket, WebSocketServer } from 'ws';
 import {
+  eventCycleIdToModeRule,
   formatLobbyModeLabel,
   formatMapDisplayName,
   generateEventHashCode,
   generateLobbyCode,
+  isInfectionMapId,
   LobbyBrowserEntry,
   LobbyChatMessage,
   LobbyMember,
@@ -18,11 +20,14 @@ import {
   LobbySettingsPatch,
   LobbyTeamId,
   LobbyVisibility,
+  modeRuleToEventCycleId,
   sanitizeSpecialEventConfig,
   sanitizeTimeOfDayStart,
   sanitizeWeatherPreset,
   SpecialEventRecord,
+  VALID_ALL_MAP_IDS,
 } from './data/multiplayer';
+import { BattleRuleId, isValidBattleRule } from './maps/types';
 import {
   appendRecentMatch,
   applyMatchProgression,
@@ -276,11 +281,7 @@ function recordLocalRecentPlayers(st: LobbyRoomState): void {
   const now = Date.now();
   const modeLabel = st.specialEvent
     ? `EVENT: ${st.specialEvent.name}`.slice(0, 32)
-    : st.mode === 'infection'
-      ? 'INFECTION'
-      : st.battleRule === 'ffa'
-        ? 'BATTLE FFA'
-        : 'BATTLE TDM';
+    : formatLobbyModeLabel(st.mode, st.battleRule);
 
   for (const uid of ids) {
     for (const peerId of ids) {
@@ -1385,17 +1386,12 @@ async function startServer() {
       : req.body?.mode === 'infection'
         ? 'infection'
         : 'battle';
-    const battleRule = specialEvent
+    const battleRule: BattleRuleId = specialEvent
       ? specialEvent.config.battleRule
-      : req.body?.battleRule === 'ffa'
-        ? 'ffa'
+      : isValidBattleRule(req.body?.battleRule)
+        ? req.body.battleRule
         : 'tdm';
-    const validMaps = new Set([
-      'pripyat_block',
-      'timberline_compound',
-      'korsakov_substation',
-      'kino_theater',
-    ]);
+    const validMaps = new Set<string>(VALID_ALL_MAP_IDS);
     const defaultMap = mode === 'infection' ? 'kino_theater' : 'pripyat_block';
     const mapId = specialEvent
       ? specialEvent.config.mapId
@@ -1428,9 +1424,9 @@ async function startServer() {
         )
       : 0;
     const killLimit = Math.max(
-      10,
+      3,
       Math.min(
-        100,
+        1000,
         Math.round(Number(specialEvent ? specialEvent.config.killLimit : (req.body?.killLimit ?? 30)) || 30),
       ),
     );
@@ -1861,24 +1857,19 @@ async function startServer() {
                 const prevMode = st.mode;
                 st.mode = patch.mode;
                 if (st.mode === 'infection') {
-                  if (st.mapId !== 'kino_theater') st.mapId = 'kino_theater';
+                  if (!isInfectionMapId(st.mapId)) st.mapId = 'kino_theater';
                   if (prevMode !== 'infection' && st.maxPlayers > 4) {
                     st.maxPlayers = Math.max(4, st.members.length);
                   }
                   for (const m of st.members) m.team = 'A';
-                } else if (st.mode === 'battle' && st.mapId === 'kino_theater') {
+                } else if (st.mode === 'battle' && isInfectionMapId(st.mapId)) {
                   st.mapId = 'pripyat_block';
                 }
               }
-              if (patch.battleRule === 'tdm' || patch.battleRule === 'ffa') {
+              if (isValidBattleRule(patch.battleRule)) {
                 st.battleRule = patch.battleRule;
               }
-              if (
-                patch.mapId === 'pripyat_block' ||
-                patch.mapId === 'timberline_compound' ||
-                patch.mapId === 'korsakov_substation' ||
-                patch.mapId === 'kino_theater'
-              ) {
+              if (typeof patch.mapId === 'string' && VALID_ALL_MAP_IDS.has(patch.mapId)) {
                 st.mapId = patch.mapId;
               }
               if (typeof patch.maxPlayers === 'number') {
@@ -1902,7 +1893,7 @@ async function startServer() {
                 st.botsEnabled = st.botCount > 0;
               }
               if (typeof patch.killLimit === 'number') {
-                st.killLimit = Math.max(10, Math.min(100, Math.round(patch.killLimit)));
+                st.killLimit = Math.max(3, Math.min(1000, Math.round(patch.killLimit)));
               }
               if (
                 patch.botDifficulty === 'recruit' ||
@@ -2064,25 +2055,20 @@ async function startServer() {
                 st.specialEvent.config.cyclePool.length > 1
               ) {
                 const pool = st.specialEvent.config.cyclePool;
-                const curKey =
-                  st.mode === 'infection'
-                    ? 'infection'
-                    : st.battleRule === 'ffa'
-                      ? 'battle_ffa'
-                      : 'battle_tdm';
+                const curKey = modeRuleToEventCycleId(st.mode, st.battleRule);
                 const curIdx = pool.indexOf(curKey);
                 const nextKey = pool[(curIdx + 1) % pool.length];
-                if (nextKey === 'infection') {
-                  st.mode = 'infection';
-                  st.mapId = 'kino_theater';
+                const nextCfg = eventCycleIdToModeRule(nextKey);
+                st.mode = nextCfg.mode;
+                if (nextCfg.mode === 'infection') {
+                  if (!isInfectionMapId(st.mapId)) st.mapId = 'kino_theater';
                 } else {
-                  st.mode = 'battle';
-                  st.battleRule = nextKey === 'battle_ffa' ? 'ffa' : 'tdm';
-                  if (st.mapId === 'kino_theater') st.mapId = 'pripyat_block';
+                  st.battleRule = nextCfg.battleRule;
+                  if (isInfectionMapId(st.mapId)) st.mapId = 'pripyat_block';
                 }
                 pushLobbySystemChat(
                   room,
-                  `Event cycled next game to ${nextKey === 'infection' ? 'INFECTION' : nextKey === 'battle_ffa' ? 'BATTLE · FFA' : 'BATTLE · TDM'}.`,
+                  `Event cycled next game to ${formatLobbyModeLabel(st.mode, st.battleRule)}.`,
                 );
               }
               st.updatedAt = Date.now();

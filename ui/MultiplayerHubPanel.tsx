@@ -16,11 +16,15 @@ import {
 } from 'lucide-react';
 import { useLobby } from '../context/LobbyContext';
 import {
+  eventCycleIdToModeRule,
+  EventCycleModeId,
   formatLobbyModeLabel,
   formatMapDisplayName,
+  isInfectionMapId,
   LobbyBrowserEntry,
   LobbyModeId,
   LobbyVisibility,
+  modeRuleToEventCycleId,
   SpecialEventRecord,
 } from '../data/multiplayer';
 import { BATTLE_MAPS, ZOMBIE_MAPS } from '../maps/MapRegistry';
@@ -286,30 +290,29 @@ export const MultiplayerHubPanel: React.FC<MultiplayerHubPanelProps> = ({
                   Game Mode
                 </label>
                 <select
-                  value={
-                    mode === 'infection'
-                      ? 'infection'
-                      : battleRule === 'ffa'
-                        ? 'battle_ffa'
-                        : 'battle_tdm'
-                  }
+                  value={modeRuleToEventCycleId(mode, battleRule)}
                   onChange={(e) => {
-                    const v = e.target.value;
-                    if (v === 'infection') {
+                    const mapped = eventCycleIdToModeRule(e.target.value as EventCycleModeId);
+                    if (mapped.mode === 'infection') {
                       setMode('infection');
-                      setMapId('kino_theater');
+                      if (!isInfectionMapId(mapId)) setMapId('kino_theater');
                       setMaxPlayers(4);
                       setBotCount((c) => Math.min(c, 3));
                     } else {
                       setMode('battle');
-                      setBattleRule(v === 'battle_ffa' ? 'ffa' : 'tdm');
-                      if (mapId === 'kino_theater') setMapId('pripyat_block');
+                      setBattleRule(mapped.battleRule);
+                      if (isInfectionMapId(mapId)) setMapId('pripyat_block');
                     }
                   }}
                   className="mt-1 w-full cursor-pointer border border-neutral-700 bg-neutral-900 px-2.5 py-2 font-mono-tabular text-xs text-neutral-100"
                 >
                   <option value="battle_tdm">Battle · TDM</option>
                   <option value="battle_ffa">Battle · FFA</option>
+                  <option value="battle_conquest">Battle · Conquest</option>
+                  <option value="battle_ctf">Battle · Capture the Flag</option>
+                  <option value="battle_koth">Battle · King of the Hill</option>
+                  <option value="battle_kc_tdm">Battle · Kill Confirmed (TDM)</option>
+                  <option value="battle_kc_ffa">Battle · Kill Confirmed (FFA)</option>
                   <option value="infection">Infection (Co-op Zombies)</option>
                 </select>
               </div>
