@@ -51,6 +51,7 @@ export interface ConquestPoiHudState {
   owner: 'A' | 'B' | null;
   progress: number; // -1 (Team B) .. +1 (Team A)
   contested: boolean;
+  underAttack: boolean;
   position: [number, number, number];
   captureRadiusM: number;
   territoryWeight: number;
@@ -118,6 +119,12 @@ export interface BattleModeHudSnapshot {
   conquestSelectedSpawnId: string;
   conquestAwaitingRedeploy: boolean;
   conquestSpectating: boolean;
+  conquestTerritoryRateA: number;
+  conquestTerritoryRateB: number;
+  conquestTeamRemainingLivesA: number;
+  conquestTeamRemainingLivesB: number;
+  conquestTeamActiveCountA: number;
+  conquestTeamActiveCountB: number;
   ctfFlags: [CtfFlagHudState, CtfFlagHudState] | null;
   koth: KothHudState | null;
   localStandingInObjective: string | null;
@@ -174,11 +181,22 @@ interface InternalPoiRuntime {
   owner: 'A' | 'B' | null;
   progress: number; // -1 (B) .. +1 (A)
   contested: boolean;
+  underAttack: boolean;
+  underAttackTimerSec: number;
   countA: number;
   countB: number;
   bannerMat?: THREE.MeshStandardMaterial;
   ringMat?: THREE.MeshBasicMaterial;
   flagMesh?: THREE.Mesh;
+}
+
+export interface ConquestParticipantAttrition {
+  id: string;
+  team: 'A' | 'B' | 'FFA';
+  remainingLives: number;
+  totalLives: number;
+  alive: boolean;
+  eliminated: boolean;
 }
 
 interface InternalFlagRuntime {
@@ -242,6 +260,7 @@ const KOTH_HILL_DURATION_SEC = 45;
 const KOTH_PREVIEW_SEC = 10;
 const SPAWN_PROTECTION_DEFAULT_SEC = 2.5;
 const CONQUEST_CAPTURE_TIME_SEC = 6.5;
+const CONQUEST_UNDER_ATTACK_LOCK_SEC = 6.0;
 
 const COLOR_TEAM_A = 0x38bdf8;
 const COLOR_TEAM_B = 0xf87171;
@@ -274,6 +293,9 @@ export class BattleModeController {
   public friendlyTagsB = 0;
   public remainingSec: number;
   private matchEnded = false;
+  private matchWinnerTeam: 'A' | 'B' | 'FFA' | 'DRAW' | undefined;
+  private matchWinnerActorId: string | undefined;
+  private matchWinnerReason: string | undefined;
 
   // Per-actor stats
   private readonly actorStats = new Map<string, ActorObjectiveStats>();
@@ -284,7 +306,13 @@ export class BattleModeController {
   private conquestSelectedSpawnId = 'hq';
   private conquestAwaitingRedeploy = false;
   private conquestSpectating = false;
-  private readonly botLives = new Map<string, number>();
+  private readonly participantLives = new Map<string, ConquestParticipantAttrition>();
+  private territoryRateA = 0;
+  private territoryRateB = 0;
+  private syncedTeamRemainingLivesA: number | null = null;
+  private syncedTeamRemainingLivesB: number | null = null;
+  private syncedTeamActiveCountA: number | null = null;
+  private syncedTeamActiveCountB: number | null = null;
 
   // CTF state
   private flags: [InternalFlagRuntime, InternalFlagRuntime] | null = null;
@@ -364,8 +392,16 @@ export class BattleModeController {
       this.conquestLoadouts[0].active = true;
     }
 
-    // Build ONLY the 3D props needed for the active Battle mode
+    // Register the local player in the unified Conquest participant attrition table
     if (this.rule === 'conquest') {
+      this.participantLives.set(this.localPlayerId, {
+        id: this.localPlayerId,
+        team: this.localTeam,
+        remainingLives: this.conquestLoadouts.length,
+        totalLives: this.conquestLoadouts.length,
+        alive: true,
+        eliminated: false,
+      });
       this.initConquest();
     } else if (this.rule === 'ctf') {
       this.initCtf();
@@ -541,6 +577,8 @@ export class BattleModeController {
         owner: initialOwner,
         progress: initialProgress,
         contested: false,
+        underAttack: false,
+        underAttackTimerSec: 0,
         countA: 0,
         countB: 0,
         bannerMat,
@@ -871,14 +909,14 @@ export class BattleModeController {
           available: false,
           reason: poi.owner === null ? 'Unclaimed' : 'Enemy Controlled',
         });
-      } else if (poi.contested) {
+      } else if (poi.contested || poi.underAttack) {
         options.push({
           id: poi.def.id,
           code: poi.def.code,
           label: poi.def.label,
           kind: 'fob',
           available: false,
-          reason: 'Under Attack (Contested)',
+          reason: poi.contested ? 'Under Attack (Contested)' : 'Under Enemy Attack (Locked)',
         });
       } else {
         options.push({
@@ -894,8 +932,32 @@ export class BattleModeController {
   }
 
   /**
-   * Returns valid spawn pads for a team in Conquest ONLY from Team HQ or a friendly, UNCONTESTED FOB.
-   * Rejects any contested or non-friendly FOB.
+   * Reports hostile fire, explosions, or casualties near a Conquest POI so any friendly FOB
+   * actively under enemy attack is immediately locked against respawns.
+   */
+  public reportConquestAttack(
+    x: number,
+    z: number,
+    attackerTeam?: 'A' | 'B' | 'FFA',
+  ): void {
+    if (this.rule !== 'conquest') return;
+    for (let i = 0; i < this.pois.length; i++) {
+      const poi = this.pois[i];
+      if (!poi.owner) continue;
+      if (attackerTeam && attackerTeam !== 'FFA' && attackerTeam === poi.owner) continue;
+      const defenseR = poi.def.captureRadiusM + 8.0;
+      const dx = x - poi.def.position[0];
+      const dz = z - poi.def.position[2];
+      if (dx * dx + dz * dz <= defenseR * defenseR) {
+        poi.underAttackTimerSec = CONQUEST_UNDER_ATTACK_LOCK_SEC;
+        poi.underAttack = true;
+      }
+    }
+  }
+
+  /**
+   * Returns valid spawn pads for a team in Conquest ONLY from Team HQ or a friendly, UNCONTESTED,
+   * NOT-UNDER-ATTACK FOB. Rejects any contested, under-attack, or non-friendly FOB.
    */
   public resolveConquestSpawnCandidates(team: 'A' | 'B', requestedSpawnId?: string): SpawnPoint[] {
     const hqSpawns = this.getOpeningHqSpawns(team);
@@ -908,6 +970,7 @@ export class BattleModeController {
       poi.def.kind === 'fob' &&
       poi.owner === team &&
       !poi.contested &&
+      !poi.underAttack &&
       poi.def.spawnPoints &&
       poi.def.spawnPoints.length > 0
     ) {
@@ -919,7 +982,17 @@ export class BattleModeController {
   public isConquestSpawnAvailable(team: 'A' | 'B', spawnId: string): boolean {
     if (spawnId === 'hq') return true;
     const poi = this.pois.find((p) => p.def.id === spawnId);
-    return Boolean(poi && poi.def.kind === 'fob' && poi.owner === team && !poi.contested);
+    return Boolean(
+      poi &&
+        poi.def.kind === 'fob' &&
+        poi.owner === team &&
+        !poi.contested &&
+        !poi.underAttack,
+    );
+  }
+
+  public getConquestTotalLoadouts(): number {
+    return Math.max(1, this.conquestLoadouts.length);
   }
 
   /**
@@ -939,6 +1012,13 @@ export class BattleModeController {
     }
 
     const remaining = this.conquestLoadouts.filter((l) => !l.expended);
+    const entry = this.participantLives.get(this.localPlayerId);
+    if (entry) {
+      entry.remainingLives = remaining.length;
+      entry.alive = false;
+      entry.eliminated = remaining.length === 0;
+    }
+
     if (remaining.length === 0) {
       this.conquestAwaitingRedeploy = false;
       this.conquestSpectating = true;
@@ -950,7 +1030,7 @@ export class BattleModeController {
     this.conquestAwaitingRedeploy = true;
     this.conquestSpectating = false;
 
-    // Ensure selected spawn is still valid (fall back to HQ if chosen FOB is now contested)
+    // Ensure selected spawn is still valid (fall back to HQ if chosen FOB is now contested or under attack)
     const team = this.localTeam === 'B' ? 'B' : 'A';
     if (!this.isConquestSpawnAvailable(team, this.conquestSelectedSpawnId)) {
       this.conquestSelectedSpawnId = 'hq';
@@ -982,7 +1062,7 @@ export class BattleModeController {
   public confirmConquestRedeploy(
     livingEnemies: ReadonlyArray<{ x: number; y: number; z: number }>,
     raycastMeshes?: readonly THREE.Object3D[],
-  ): { loadout: ConquestLoadoutSlotState; spawnPoint: SpawnPoint } | null {
+  ): { loadout: ConquestLoadoutSlotState; spawnPoint: SpawnPoint; redirectedToHq?: boolean } | null {
     if (this.conquestSpectating) return null;
     const chosenLoadout =
       this.conquestLoadouts.find((l) => l.active && !l.expended) ??
@@ -997,13 +1077,19 @@ export class BattleModeController {
     }
 
     const team = this.localTeam === 'B' ? 'B' : 'A';
+    let redirectedToHq = false;
     if (!this.isConquestSpawnAvailable(team, this.conquestSelectedSpawnId)) {
       this.conquestSelectedSpawnId = 'hq';
+      redirectedToHq = true;
     }
     const candidates = this.resolveConquestSpawnCandidates(team, this.conquestSelectedSpawnId);
     const spawnPoint = this.selectSafeSpawnPoint(candidates, livingEnemies, raycastMeshes);
     this.conquestAwaitingRedeploy = false;
-    return { loadout: { ...chosenLoadout }, spawnPoint };
+    const entry = this.participantLives.get(this.localPlayerId);
+    if (entry) {
+      entry.alive = true;
+    }
+    return { loadout: { ...chosenLoadout }, spawnPoint, redirectedToHq };
   }
 
   public isLocalSpectating(): boolean {
@@ -1014,26 +1100,117 @@ export class BattleModeController {
     return this.rule === 'conquest' && this.conquestAwaitingRedeploy;
   }
 
-  /** Finite loadout lives for AI bots in Conquest (default 5 per bot) */
-  public initBotConquestLives(botId: string, lives = 5): void {
-    this.botLives.set(botId, Math.max(1, Math.floor(lives)));
+  /** Unified 1-life-per-loadout registration for all Battle participants (humans & bots) */
+  public registerConquestParticipant(
+    actorId: string,
+    team: 'A' | 'B' | 'FFA',
+    lives = this.getConquestTotalLoadouts(),
+  ): void {
+    const total = Math.max(1, Math.floor(lives));
+    this.participantLives.set(actorId, {
+      id: actorId,
+      team,
+      remainingLives: total,
+      totalLives: total,
+      alive: true,
+      eliminated: false,
+    });
   }
 
-  public consumeBotConquestLife(botId: string): number {
+  /** Consume 1 loadout life when any non-local Battle participant dies in Conquest */
+  public consumeConquestParticipantLife(
+    actorId: string,
+    team: 'A' | 'B' | 'FFA' = 'A',
+  ): number {
     if (this.rule !== 'conquest') return 99;
-    const cur = this.botLives.get(botId) ?? 5;
-    const next = Math.max(0, cur - 1);
-    this.botLives.set(botId, next);
-    return next;
+    let entry = this.participantLives.get(actorId);
+    if (!entry) {
+      const total = this.getConquestTotalLoadouts();
+      entry = {
+        id: actorId,
+        team,
+        remainingLives: total,
+        totalLives: total,
+        alive: true,
+        eliminated: false,
+      };
+      this.participantLives.set(actorId, entry);
+    }
+    entry.remainingLives = Math.max(0, entry.remainingLives - 1);
+    entry.alive = false;
+    entry.eliminated = entry.remainingLives <= 0;
+    return entry.remainingLives;
+  }
+
+  public onConquestParticipantRespawn(actorId: string): boolean {
+    if (this.rule !== 'conquest') return true;
+    const entry = this.participantLives.get(actorId);
+    if (!entry) return true;
+    if (entry.eliminated || entry.remainingLives <= 0) {
+      entry.alive = false;
+      entry.eliminated = true;
+      return false;
+    }
+    entry.alive = true;
+    return true;
+  }
+
+  public getConquestParticipantAttrition(actorId: string): ConquestParticipantAttrition | null {
+    const entry = this.participantLives.get(actorId);
+    return entry ? { ...entry } : null;
+  }
+
+  public getConquestTeamAttrition(): {
+    remainingLivesA: number;
+    remainingLivesB: number;
+    activeCountA: number;
+    activeCountB: number;
+  } {
+    if (!this.isAuthority && this.syncedTeamRemainingLivesA !== null && this.syncedTeamRemainingLivesB !== null) {
+      return {
+        remainingLivesA: this.syncedTeamRemainingLivesA,
+        remainingLivesB: this.syncedTeamRemainingLivesB,
+        activeCountA: this.syncedTeamActiveCountA ?? 0,
+        activeCountB: this.syncedTeamActiveCountB ?? 0,
+      };
+    }
+    let remainingLivesA = 0;
+    let remainingLivesB = 0;
+    let activeCountA = 0;
+    let activeCountB = 0;
+    for (const p of this.participantLives.values()) {
+      if (p.team === 'A') {
+        remainingLivesA += p.remainingLives;
+        if (!p.eliminated) activeCountA++;
+      } else if (p.team === 'B') {
+        remainingLivesB += p.remainingLives;
+        if (!p.eliminated) activeCountB++;
+      }
+    }
+    return { remainingLivesA, remainingLivesB, activeCountA, activeCountB };
+  }
+
+  /** Finite loadout lives for AI bots in Conquest (matches player loadout count by default) */
+  public initBotConquestLives(
+    botId: string,
+    lives = this.getConquestTotalLoadouts(),
+    team: 'A' | 'B' | 'FFA' = 'A',
+  ): void {
+    this.registerConquestParticipant(botId, team, lives);
+  }
+
+  public consumeBotConquestLife(botId: string, team: 'A' | 'B' | 'FFA' = 'A'): number {
+    return this.consumeConquestParticipantLife(botId, team);
   }
 
   public getBotConquestSpawnCandidates(team: 'A' | 'B'): SpawnPoint[] {
-    // Prefer an uncontested friendly FOB closer to the frontline, else fall back to Team HQ
+    // Prefer an uncontested, not-under-attack friendly FOB closer to the frontline, else fall back to Team HQ
     const friendlyFobs = this.pois.filter(
       (p) =>
         p.def.kind === 'fob' &&
         p.owner === team &&
         !p.contested &&
+        !p.underAttack &&
         p.def.spawnPoints &&
         p.def.spawnPoints.length > 0,
     );
@@ -1056,6 +1233,12 @@ export class BattleModeController {
     z: number;
   }): void {
     this.recordCrossfireHeat(ev.x, ev.y, ev.z, 9.0);
+    if (this.rule === 'conquest') {
+      // Combat casualties near a friendly FOB immediately lock it as under enemy attack
+      const attackerTeam: 'A' | 'B' | 'FFA' =
+        ev.victimTeam === 'A' ? 'B' : ev.victimTeam === 'B' ? 'A' : 'FFA';
+      this.reportConquestAttack(ev.x, ev.z, attackerTeam);
+    }
 
     // Drop carried CTF flag on death
     if (this.rule === 'ctf' && this.flags) {
@@ -1277,6 +1460,27 @@ export class BattleModeController {
   }
 
   private updateConquest(dt: number, actors: readonly ModeActorSample[]): void {
+    // Keep unified participant attrition table synced with all active battle participants
+    for (let a = 0; a < actors.length; a++) {
+      const act = actors[a];
+      let entry = this.participantLives.get(act.id);
+      if (!entry) {
+        const total = this.getConquestTotalLoadouts();
+        entry = {
+          id: act.id,
+          team: act.team,
+          remainingLives: total,
+          totalLives: total,
+          alive: act.alive,
+          eliminated: false,
+        };
+        this.participantLives.set(act.id, entry);
+      } else {
+        entry.team = act.team;
+        entry.alive = act.alive;
+      }
+    }
+
     let territoryRateA = 0;
     let territoryRateB = 0;
 
@@ -1305,6 +1509,9 @@ export class BattleModeController {
       poi.countB = countB;
       const wasContested = poi.contested;
       poi.contested = countA > 0 && countB > 0;
+      if (poi.underAttackTimerSec > 0) {
+        poi.underAttackTimerSec = Math.max(0, poi.underAttackTimerSec - dt);
+      }
 
       if (localInside) {
         this.localStandingInObjective = `${poi.def.code} · ${poi.def.label}`;
@@ -1323,6 +1530,7 @@ export class BattleModeController {
               poi.progress = 1;
               if (poi.owner !== 'A') {
                 poi.owner = 'A';
+                poi.underAttackTimerSec = 0;
                 this.onPoiCaptured(poi, 'A', actors);
               }
             } else if (poi.progress > 0 && poi.owner === 'B') {
@@ -1335,6 +1543,7 @@ export class BattleModeController {
               poi.progress = -1;
               if (poi.owner !== 'B') {
                 poi.owner = 'B';
+                poi.underAttackTimerSec = 0;
                 this.onPoiCaptured(poi, 'B', actors);
               }
             } else if (poi.progress < 0 && poi.owner === 'A') {
@@ -1345,6 +1554,10 @@ export class BattleModeController {
           this.callbacks.onAudioChime?.('contested');
         }
 
+        const enemyInsideOwned =
+          (poi.owner === 'A' && countB > 0) || (poi.owner === 'B' && countA > 0);
+        poi.underAttack = Boolean(poi.owner && (enemyInsideOwned || poi.underAttackTimerSec > 0));
+
         // Accumulate Territory Points continuously from owned land
         if (poi.owner === 'A') {
           territoryRateA += poi.def.territoryWeight;
@@ -1354,13 +1567,14 @@ export class BattleModeController {
       }
 
       // Visual flagpole & capture ring updates
-      const colorHex = poi.contested
-        ? COLOR_CONTESTED
-        : poi.owner === 'A'
-          ? COLOR_TEAM_A
-          : poi.owner === 'B'
-            ? COLOR_TEAM_B
-            : COLOR_NEUTRAL;
+      const colorHex =
+        poi.contested || (poi.def.kind === 'fob' && poi.underAttack)
+          ? COLOR_CONTESTED
+          : poi.owner === 'A'
+            ? COLOR_TEAM_A
+            : poi.owner === 'B'
+              ? COLOR_TEAM_B
+              : COLOR_NEUTRAL;
       if (poi.bannerMat) {
         poi.bannerMat.color.setHex(colorHex);
         poi.bannerMat.emissive.setHex(colorHex);
@@ -1374,15 +1588,19 @@ export class BattleModeController {
       }
     }
 
-    // Ensure local player's selected FOB is invalidated immediately if it becomes contested
+    // Ensure local player's selected FOB is invalidated immediately if it becomes contested or under enemy attack
     if (this.conquestAwaitingRedeploy && this.conquestSelectedSpawnId !== 'hq') {
       const team = this.localTeam === 'B' ? 'B' : 'A';
       if (!this.isConquestSpawnAvailable(team, this.conquestSelectedSpawnId)) {
         this.conquestSelectedSpawnId = 'hq';
+        this.emitBanner('FOB UNDER ATTACK · SPAWN LOCKED — FALLBACK TO HQ', 'info');
       }
     }
 
     if (this.isAuthority) {
+      this.territoryRateA = territoryRateA;
+      this.territoryRateB = territoryRateB;
+
       const prevA = Math.floor(this.scoreA);
       const prevB = Math.floor(this.scoreB);
       this.scoreA += territoryRateA * dt;
@@ -1407,8 +1625,25 @@ export class BattleModeController {
 
       if (this.scoreA >= this.scoreLimit) {
         this.triggerMatchEnd('A', undefined, 'Most Territory Controlled');
+        return;
       } else if (this.scoreB >= this.scoreLimit) {
         this.triggerMatchEnd('B', undefined, 'Most Territory Controlled');
+        return;
+      }
+
+      // Total-attrition deadlock safeguard: if every participant on both teams has expended
+      // all loadouts and neither team holds any territory generating points, decide now by Territory Points.
+      if (this.participantLives.size >= 2 && territoryRateA === 0 && territoryRateB === 0) {
+        let anyActiveOrLiving = false;
+        for (const p of this.participantLives.values()) {
+          if (p.alive || (!p.eliminated && p.remainingLives > 0)) {
+            anyActiveOrLiving = true;
+            break;
+          }
+        }
+        if (!anyActiveOrLiving) {
+          this.resolveTimeLimitWinner(actors);
+        }
       }
     }
   }
@@ -1785,6 +2020,9 @@ export class BattleModeController {
   ): void {
     if (this.matchEnded) return;
     this.matchEnded = true;
+    this.matchWinnerTeam = winnerTeam;
+    this.matchWinnerActorId = winnerActorId;
+    this.matchWinnerReason = reason;
     this.callbacks.onMatchVictory?.({ winnerTeam, winnerActorId, reason });
   }
 
@@ -1900,8 +2138,11 @@ export class BattleModeController {
             owner: p.owner,
             progress: Number(p.progress.toFixed(3)),
             contested: p.contested,
+            underAttack: p.underAttack,
           }))
         : undefined;
+
+    const attrition = this.rule === 'conquest' ? this.getConquestTeamAttrition() : null;
 
     const flags: [SyncedCtfFlagState, SyncedCtfFlagState] | undefined =
       this.rule === 'ctf' && this.flags
@@ -1949,6 +2190,12 @@ export class BattleModeController {
       friendlyTagsB: this.friendlyTagsB,
       remainingSec: Math.round(this.remainingSec),
       pois,
+      territoryRateA: this.rule === 'conquest' ? Number(this.territoryRateA.toFixed(2)) : undefined,
+      territoryRateB: this.rule === 'conquest' ? Number(this.territoryRateB.toFixed(2)) : undefined,
+      teamRemainingLivesA: attrition?.remainingLivesA,
+      teamRemainingLivesB: attrition?.remainingLivesB,
+      teamActiveCountA: attrition?.activeCountA,
+      teamActiveCountB: attrition?.activeCountB,
       flags,
       activeHillIndex: this.rule === 'koth' ? this.activeHillIndex : undefined,
       nextHillIndex:
@@ -1959,6 +2206,10 @@ export class BattleModeController {
       hillOwner: this.rule === 'koth' ? this.hillOwner : undefined,
       hillContested: this.rule === 'koth' ? this.hillContested : undefined,
       dogtags,
+      matchEnded: this.matchEnded || undefined,
+      winnerTeam: this.matchWinnerTeam,
+      winnerActorId: this.matchWinnerActorId,
+      winnerReason: this.matchWinnerReason,
       ts: Date.now(),
     };
   }
@@ -1978,6 +2229,29 @@ export class BattleModeController {
           local.owner = sp.owner;
           local.progress = sp.progress;
           local.contested = sp.contested;
+          local.underAttack = Boolean(sp.underAttack ?? sp.contested);
+        }
+      }
+      if (typeof pkt.territoryRateA === 'number') this.territoryRateA = pkt.territoryRateA;
+      if (typeof pkt.territoryRateB === 'number') this.territoryRateB = pkt.territoryRateB;
+      if (typeof pkt.teamRemainingLivesA === 'number') {
+        this.syncedTeamRemainingLivesA = pkt.teamRemainingLivesA;
+      }
+      if (typeof pkt.teamRemainingLivesB === 'number') {
+        this.syncedTeamRemainingLivesB = pkt.teamRemainingLivesB;
+      }
+      if (typeof pkt.teamActiveCountA === 'number') {
+        this.syncedTeamActiveCountA = pkt.teamActiveCountA;
+      }
+      if (typeof pkt.teamActiveCountB === 'number') {
+        this.syncedTeamActiveCountB = pkt.teamActiveCountB;
+      }
+      // Invalidate local selected FOB immediately on client if host reports it under attack
+      if (this.conquestAwaitingRedeploy && this.conquestSelectedSpawnId !== 'hq') {
+        const team = this.localTeam === 'B' ? 'B' : 'A';
+        if (!this.isConquestSpawnAvailable(team, this.conquestSelectedSpawnId)) {
+          this.conquestSelectedSpawnId = 'hq';
+          this.emitBanner('FOB UNDER ATTACK · SPAWN LOCKED — FALLBACK TO HQ', 'info');
         }
       }
     }
@@ -2016,6 +2290,14 @@ export class BattleModeController {
           this.spawnDogtag(d.victimId, d.victimTeam, d.x, d.y, d.z, d.id);
         }
       }
+    }
+
+    if (pkt.matchEnded && !this.matchEnded && pkt.winnerTeam) {
+      this.triggerMatchEnd(
+        pkt.winnerTeam,
+        pkt.winnerActorId,
+        pkt.winnerReason ?? 'Match Completed',
+      );
     }
   }
 
@@ -2097,6 +2379,8 @@ export class BattleModeController {
           ]
         : null;
 
+    const teamAttrition = this.getConquestTeamAttrition();
+
     return {
       rule: this.rule,
       scoreA: Math.floor(this.scoreA),
@@ -2117,11 +2401,12 @@ export class BattleModeController {
         owner: p.owner,
         progress: p.progress,
         contested: p.contested,
+        underAttack: p.underAttack,
         position: p.def.position,
         captureRadiusM: p.def.captureRadiusM,
         territoryWeight: p.def.territoryWeight,
-        canSpawnA: p.def.kind === 'fob' && p.owner === 'A' && !p.contested,
-        canSpawnB: p.def.kind === 'fob' && p.owner === 'B' && !p.contested,
+        canSpawnA: p.def.kind === 'fob' && p.owner === 'A' && !p.contested && !p.underAttack,
+        canSpawnB: p.def.kind === 'fob' && p.owner === 'B' && !p.contested && !p.underAttack,
       })),
       conquestLoadouts: this.conquestLoadouts.map((l) => ({ ...l })),
       conquestRemainingLives: remainingLives,
@@ -2131,6 +2416,12 @@ export class BattleModeController {
       conquestSelectedSpawnId: this.conquestSelectedSpawnId,
       conquestAwaitingRedeploy: this.conquestAwaitingRedeploy,
       conquestSpectating: this.conquestSpectating,
+      conquestTerritoryRateA: Number(this.territoryRateA.toFixed(1)),
+      conquestTerritoryRateB: Number(this.territoryRateB.toFixed(1)),
+      conquestTeamRemainingLivesA: teamAttrition.remainingLivesA,
+      conquestTeamRemainingLivesB: teamAttrition.remainingLivesB,
+      conquestTeamActiveCountA: teamAttrition.activeCountA,
+      conquestTeamActiveCountB: teamAttrition.activeCountB,
       ctfFlags,
       koth,
       localStandingInObjective: this.localStandingInObjective,

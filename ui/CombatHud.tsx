@@ -453,11 +453,12 @@ export const CombatHud: React.FC<CombatHudProps> = ({
                     )}
                   </div>
 
-                  {/* Conquest POI Status Row & Loadout Lives */}
+                  {/* Conquest POI Status Row, Territory Rate & Loadout Attrition */}
                   {snapshot.battleRule === 'conquest' && modeHud && (
                     <div className="flex flex-wrap items-center justify-center gap-1.5 border-t border-neutral-800/90 pt-1">
                       {modeHud.conquestPois.map((poi) => {
-                        const ownerCls = poi.contested
+                        const lockedAlert = poi.contested || (poi.kind === 'fob' && poi.underAttack);
+                        const ownerCls = lockedAlert
                           ? 'border-amber-400/90 bg-amber-950/60 text-amber-200'
                           : poi.owner === 'A'
                             ? 'border-sky-500/80 bg-sky-950/55 text-sky-200'
@@ -473,7 +474,7 @@ export const CombatHud: React.FC<CombatHudProps> = ({
                           >
                             <span className="font-semibold tracking-wider">
                               {poi.code}
-                              {poi.contested ? ' !' : ''}
+                              {poi.contested ? ' !' : poi.kind === 'fob' && poi.underAttack ? ' ATK' : ''}
                             </span>
                             <div className="mt-0.5 h-1 w-full bg-neutral-950/80">
                               <div
@@ -484,8 +485,20 @@ export const CombatHud: React.FC<CombatHudProps> = ({
                           </div>
                         );
                       })}
-                      <div className="ml-1 border border-neutral-700 bg-neutral-900 px-2 py-0.5 text-[9px] font-semibold uppercase tracking-wider text-amber-300">
+                      {(modeHud.conquestTerritoryRateA > 0 || modeHud.conquestTerritoryRateB > 0) && (
+                        <div className="border border-neutral-800 bg-neutral-950/90 px-1.5 py-0.5 text-[9px] uppercase tracking-wider text-neutral-300">
+                          <span className="text-sky-400">+{modeHud.conquestTerritoryRateA.toFixed(1)}/s</span>
+                          {' · '}
+                          <span className="text-orange-400">+{modeHud.conquestTerritoryRateB.toFixed(1)}/s</span>
+                        </div>
+                      )}
+                      <div className="ml-0.5 border border-neutral-700 bg-neutral-900 px-2 py-0.5 text-[9px] font-semibold uppercase tracking-wider text-amber-300">
                         LOADOUTS {modeHud.conquestRemainingLives}/{modeHud.conquestTotalLives}
+                      </div>
+                      <div className="border border-neutral-800 bg-neutral-950/90 px-1.5 py-0.5 text-[9px] uppercase tracking-wider text-neutral-400">
+                        RES <span className="text-sky-400">{modeHud.conquestTeamRemainingLivesA}</span>
+                        /
+                        <span className="text-orange-400">{modeHud.conquestTeamRemainingLivesB}</span>
                       </div>
                     </div>
                   )}
@@ -888,7 +901,22 @@ export const CombatHud: React.FC<CombatHudProps> = ({
                             : 'bg-neutral-900/75 text-neutral-200'
                         }`}
                       >
-                        <span className="col-span-4 truncate font-semibold">{row.name}</span>
+                        <span className="col-span-4 truncate font-semibold">
+                          {row.name}
+                          {snapshot.battleRule === 'conquest' && (
+                            <span
+                              className={`ml-1.5 text-[9px] uppercase ${
+                                row.conquestEliminated ? 'text-red-400' : 'text-neutral-400'
+                              }`}
+                            >
+                              {row.conquestEliminated
+                                ? 'OUT'
+                                : row.conquestLivesRemaining !== undefined
+                                  ? `[${row.conquestLivesRemaining}L]`
+                                  : ''}
+                            </span>
+                          )}
+                        </span>
                         <span
                           className={`col-span-2 text-[11px] ${
                             row.team === 'A'
@@ -904,7 +932,7 @@ export const CombatHud: React.FC<CombatHudProps> = ({
                           {isKillConfirmedRule(snapshot.battleRule)
                             ? `${row.enemyDogtags ?? 0} / ${row.friendlyDogtags ?? 0}`
                             : snapshot.battleRule === 'conquest'
-                              ? `${row.poiCaptures ?? 0}`
+                              ? `${row.poiCaptures ?? 0} · ${Math.round(row.territoryPoints ?? 0)}pt`
                               : snapshot.battleRule === 'ctf'
                                 ? `${row.flagCaptures ?? 0} / ${row.flagReturns ?? 0}`
                                 : snapshot.battleRule === 'koth'

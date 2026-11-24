@@ -260,6 +260,97 @@ describe('Conquest Battle Mode: Territory Win, Protected HQs, 1-Life-Per-Loadout
     ctrl.dispose();
     map.dispose();
   });
+
+  it('locks friendly FOB spawns on lone enemy intrusion OR active enemy fire and enforces 1-life-per-loadout attrition for bots and remote participants', () => {
+    const map = buildMapById('volga_corridor');
+    const group = new THREE.Group();
+
+    const hostCtrl = new BattleModeController({
+      rule: 'conquest',
+      map,
+      sceneGroup: group,
+      localPlayerTeam: 'A',
+      localPlayerId: 'local',
+      scoreLimit: 500,
+      conquestLoadouts: makeTestLoadouts(), // 3 loadouts -> 3 lives for every participant
+      activeLoadoutId: 'slot-1',
+    });
+
+    const fobA = map.battleObjectives!.conquestPois.find((p) => p.kind === 'fob')!;
+    const [fx, fy, fz] = fobA.position;
+
+    // Capture FOB-A for Team A
+    for (let i = 0; i < 80; i++) {
+      hostCtrl.update(0.1, [
+        { id: 'local', name: 'YOU', team: 'A', alive: true, x: fx, y: fy, z: fz, isLocalPlayer: true },
+      ]);
+    }
+    expect(hostCtrl.isConquestSpawnAvailable('A', fobA.id)).toBe(true);
+
+    // Case 1: Lone enemy enters FOB-A (0 friendlies inside -> contested is false, but underAttack MUST lock spawn!)
+    hostCtrl.update(0.1, [
+      { id: 'b1', name: 'BRAVO-1', team: 'B', alive: true, x: fx, y: fy, z: fz },
+    ]);
+    expect(hostCtrl.isConquestSpawnAvailable('A', fobA.id)).toBe(false);
+    const hudIntrusion = hostCtrl.getHudSnapshot();
+    expect(hudIntrusion.conquestPois.find((p) => p.id === fobA.id)?.underAttack).toBe(true);
+
+    // Enemy leaves -> FOB clears immediately once no fire timer is active
+    hostCtrl.update(0.1, [
+      { id: 'b1', name: 'BRAVO-1', team: 'B', alive: true, x: 95, y: 0, z: 0 },
+    ]);
+    expect(hostCtrl.isConquestSpawnAvailable('A', fobA.id)).toBe(true);
+
+    // Case 2: Hostile gunfire/grenade strikes near friendly FOB-A -> locks spawn for 6s window
+    hostCtrl.reportConquestAttack(fx + 2, fz - 2, 'B');
+    hostCtrl.update(0.1, [
+      { id: 'local', name: 'YOU', team: 'A', alive: true, x: -92, y: 0, z: 0, isLocalPlayer: true },
+    ]);
+    expect(hostCtrl.isConquestSpawnAvailable('A', fobA.id)).toBe(false);
+
+    // After 6.2s without further enemy attack, FOB-A unlocks again
+    for (let i = 0; i < 62; i++) {
+      hostCtrl.update(0.1, [
+        { id: 'local', name: 'YOU', team: 'A', alive: true, x: -92, y: 0, z: 0, isLocalPlayer: true },
+      ]);
+    }
+    expect(hostCtrl.isConquestSpawnAvailable('A', fobA.id)).toBe(true);
+
+    // Case 3: Unified 1-life-per-loadout attrition across bots AND remote human participants
+    hostCtrl.initBotConquestLives('bot_0', 3, 'A');
+    hostCtrl.registerConquestParticipant('remote_b1', 'B', 3);
+    expect(hostCtrl.consumeBotConquestLife('bot_0', 'A')).toBe(2);
+    expect(hostCtrl.onConquestParticipantRespawn('bot_0')).toBe(true);
+    expect(hostCtrl.consumeBotConquestLife('bot_0', 'A')).toBe(1);
+    expect(hostCtrl.consumeBotConquestLife('bot_0', 'A')).toBe(0);
+    expect(hostCtrl.onConquestParticipantRespawn('bot_0')).toBe(false);
+
+    expect(hostCtrl.consumeConquestParticipantLife('remote_b1', 'B')).toBe(2);
+    expect(hostCtrl.consumeConquestParticipantLife('remote_b1', 'B')).toBe(1);
+    expect(hostCtrl.consumeConquestParticipantLife('remote_b1', 'B')).toBe(0);
+    expect(hostCtrl.onConquestParticipantRespawn('remote_b1')).toBe(false);
+    expect(hostCtrl.getConquestParticipantAttrition('remote_b1')?.eliminated).toBe(true);
+
+    // Case 4: Host-to-client sync packet replicates FOB under-attack lock & team reserves
+    hostCtrl.reportConquestAttack(fx, fz, 'B');
+    const pkt = hostCtrl.exportSyncPacket();
+    const clientCtrl = new BattleModeController({
+      rule: 'conquest',
+      map,
+      sceneGroup: new THREE.Group(),
+      localPlayerTeam: 'A',
+      localPlayerId: 'client_a',
+      isAuthority: false,
+      conquestLoadouts: makeTestLoadouts(),
+    });
+    clientCtrl.applySyncPacket(pkt);
+    expect(clientCtrl.isConquestSpawnAvailable('A', fobA.id)).toBe(false);
+    expect(clientCtrl.getHudSnapshot().conquestTeamRemainingLivesA).toBe(pkt.teamRemainingLivesA);
+
+    clientCtrl.dispose();
+    hostCtrl.dispose();
+    map.dispose();
+  });
 });
 
 describe('Universal Battle Spawn Protection & Safe-Spawn Scorer', () => {

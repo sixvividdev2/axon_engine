@@ -1104,6 +1104,7 @@ export interface SyncedConquestPoiState {
   owner: 'A' | 'B' | null;
   progress: number; // -1 (B) .. +1 (A)
   contested: boolean;
+  underAttack?: boolean;
 }
 
 export interface SyncedCtfFlagState {
@@ -1136,6 +1137,12 @@ export interface GameModeStatePacket {
   friendlyTagsB?: number;
   remainingSec: number;
   pois?: SyncedConquestPoiState[];
+  territoryRateA?: number;
+  territoryRateB?: number;
+  teamRemainingLivesA?: number;
+  teamRemainingLivesB?: number;
+  teamActiveCountA?: number;
+  teamActiveCountB?: number;
   flags?: [SyncedCtfFlagState, SyncedCtfFlagState];
   activeHillIndex?: number;
   nextHillIndex?: number;
@@ -1143,6 +1150,10 @@ export interface GameModeStatePacket {
   hillOwner?: 'A' | 'B' | null;
   hillContested?: boolean;
   dogtags?: SyncedDogtagState[];
+  matchEnded?: boolean;
+  winnerTeam?: 'A' | 'B' | 'FFA' | 'DRAW';
+  winnerActorId?: string;
+  winnerReason?: string;
   ts: number;
 }
 

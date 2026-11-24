@@ -90,6 +90,8 @@ export interface BattleScoreEntry {
   flagCaptures?: number;
   flagReturns?: number;
   hillControlSec?: number;
+  conquestLivesRemaining?: number;
+  conquestEliminated?: boolean;
 }
 
 export interface BattleKillfeedEntry {
@@ -216,6 +218,8 @@ export interface BattleBotTuningOptions {
   worldAdapter?: IBodycamWorldAdapter;
   /** Allied team ID for Battle TDM comms filtering (defaults to 'A') */
   localAllyTeam?: BattleTeamId;
+  /** Optional BattleModeController attached immediately so Conquest bots open at Team HQ */
+  modeController?: BattleModeController | null;
 }
 
 interface DifficultyParams {
@@ -526,6 +530,9 @@ interface BotActor {
   recentAttackers: Map<string, number>;
   respawnTimer: number;
   deathTimer: number;
+  conquestEliminated: boolean;
+  conquestLoadoutIndex: number;
+  conquestLoadoutRoster: string[];
 
   // Shared Infection Economy, Weapon Slots, Finite Ammo & Perks
   points: number;
@@ -752,6 +759,7 @@ export class BattleBotAI {
     );
     this.aiRespawnEnabled = tuning?.aiRespawnEnabled ?? true;
     this.isClientReplica = Boolean(tuning?.isClientReplica);
+    this.modeController = tuning?.modeController ?? null;
 
     scene.add(this.group);
 
@@ -908,6 +916,20 @@ export class BattleBotAI {
         recentAttackers: new Map<string, number>(),
         respawnTimer: 0,
         deathTimer: 0,
+        conquestEliminated: false,
+        conquestLoadoutIndex: 0,
+        conquestLoadoutRoster: (() => {
+          const basePool =
+            team === 'B'
+              ? ['akm_762', 'aks74u', 'hk_mp5', 'remington_870', 'm4a1']
+              : ['m4a1', 'hk416', 'hk_mp5', 'remington_870', 'akm_762'];
+          const roster: string[] = [initSpec.id];
+          for (let r = 0; r < basePool.length; r++) {
+            const candidate = basePool[(i + r) % basePool.length];
+            if (!roster.includes(candidate)) roster.push(candidate);
+          }
+          return roster;
+        })(),
         points: this.coopInfectionMode ? 500 : 0,
         weaponSlots: [initSpec.id],
         activeSlotIndex: 0,
@@ -995,6 +1017,13 @@ export class BattleBotAI {
       };
 
       this.bots.push(bot);
+      if (this.modeController && this.rule === 'conquest') {
+        this.modeController.initBotConquestLives(
+          bot.id,
+          this.modeController.getConquestTotalLoadouts(),
+          bot.team,
+        );
+      }
       this.spawnBot(bot, new THREE.Vector3(0, 0, 0), i);
       bot.lastProgressX = bot.pos.x;
       bot.lastProgressZ = bot.pos.z;
@@ -1040,8 +1069,11 @@ export class BattleBotAI {
   public setModeController(ctrl: BattleModeController | null): void {
     this.modeController = ctrl;
     if (ctrl && this.rule === 'conquest') {
+      const totalLives = ctrl.getConquestTotalLoadouts();
       for (const b of this.bots) {
-        ctrl.initBotConquestLives(b.id, 5);
+        b.conquestEliminated = false;
+        b.conquestLoadoutIndex = 0;
+        ctrl.initBotConquestLives(b.id, totalLives, b.team);
       }
     }
   }
@@ -1150,6 +1182,27 @@ export class BattleBotAI {
   }
 
   private spawnBot(bot: BotActor, playerPos: Readonly<THREE.Vector3>, seedIdx?: number): void {
+    if (this.rule === 'conquest' && bot.conquestEliminated) {
+      bot.alive = false;
+      bot.respawnTimer = Number.POSITIVE_INFINITY;
+      return;
+    }
+    if (this.rule === 'conquest' && seedIdx === undefined && this.modeController) {
+      if (!this.modeController.onConquestParticipantRespawn(bot.id)) {
+        bot.conquestEliminated = true;
+        bot.alive = false;
+        bot.respawnTimer = Number.POSITIVE_INFINITY;
+        return;
+      }
+      if (bot.conquestLoadoutRoster.length > 0) {
+        const nextWeaponId =
+          bot.conquestLoadoutRoster[bot.conquestLoadoutIndex % bot.conquestLoadoutRoster.length];
+        if (nextWeaponId && nextWeaponId !== bot.weaponId) {
+          this.applyBotActiveWeapon(bot, nextWeaponId);
+        }
+      }
+    }
+
     const sp = this.pickSpawnPoint(bot.team, playerPos, seedIdx);
     const jitterX = (Math.random() - 0.5) * 0.8;
     const jitterZ = (Math.random() - 0.5) * 0.8;
@@ -1362,6 +1415,18 @@ export class BattleBotAI {
       b.damageDealt = 0;
       b.afkSeconds = 0;
       b.recentAttackers.clear();
+      b.conquestEliminated = false;
+      b.conquestLoadoutIndex = 0;
+      if (this.rule === 'conquest' && this.modeController) {
+        this.modeController.initBotConquestLives(
+          b.id,
+          this.modeController.getConquestTotalLoadouts(),
+          b.team,
+        );
+        if (b.conquestLoadoutRoster[0] && b.conquestLoadoutRoster[0] !== b.weaponId) {
+          this.applyBotActiveWeapon(b, b.conquestLoadoutRoster[0]);
+        }
+      }
       if (this.coopInfectionMode) {
         const pistolSpec = this.getWeaponSpec('glock_17');
         b.points = 500;
@@ -2148,9 +2213,12 @@ export class BattleBotAI {
         z: victim.pos.z,
       });
       if (this.rule === 'conquest') {
-        const remaining = this.modeController.consumeBotConquestLife(victim.id);
+        const remaining = this.modeController.consumeBotConquestLife(victim.id, victim.team);
         if (remaining <= 0) {
-          victim.respawnTimer = 999999; // Expended all loadout lives -> spectating
+          victim.conquestEliminated = true;
+          victim.respawnTimer = Number.POSITIVE_INFINITY; // Expended all loadout lives -> spectating
+        } else {
+          victim.conquestLoadoutIndex += 1;
         }
       }
     }
@@ -2369,6 +2437,7 @@ export class BattleBotAI {
     },
   ): BattleScoreEntry[] {
     const localObj = this.modeController?.getActorStats('player');
+    const localAttr = this.modeController?.getConquestParticipantAttrition('player');
     const rows: BattleScoreEntry[] = [
       {
         id: 'player',
@@ -2393,9 +2462,12 @@ export class BattleBotAI {
         flagCaptures: localObj?.flagCaptures ?? 0,
         flagReturns: localObj?.flagReturns ?? 0,
         hillControlSec: Math.round(localObj?.hillControlSec ?? 0),
+        conquestLivesRemaining: localAttr?.remainingLives,
+        conquestEliminated: localAttr?.eliminated,
       },
       ...this.bots.map((b) => {
         const bObj = this.modeController?.getActorStats(b.id);
+        const bAttr = this.modeController?.getConquestParticipantAttrition(b.id);
         return {
           id: b.id,
           name: b.name,
@@ -2419,6 +2491,8 @@ export class BattleBotAI {
           flagCaptures: bObj?.flagCaptures ?? 0,
           flagReturns: bObj?.flagReturns ?? 0,
           hillControlSec: Math.round(bObj?.hillControlSec ?? 0),
+          conquestLivesRemaining: bAttr?.remainingLives,
+          conquestEliminated: b.conquestEliminated || Boolean(bAttr?.eliminated),
         };
       }),
     ];
@@ -3301,7 +3375,7 @@ export class BattleBotAI {
           bot.rig.rightArm,
         );
 
-        if (this.aiRespawnEnabled) {
+        if (this.aiRespawnEnabled && !(this.rule === 'conquest' && bot.conquestEliminated)) {
           bot.respawnTimer -= dt;
           if (bot.respawnTimer <= 0) {
             this.spawnBot(bot, playerPos);

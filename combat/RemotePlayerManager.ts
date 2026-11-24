@@ -1071,7 +1071,7 @@ export class RemotePlayerManager {
     return rows;
   }
 
-  public getAliveSpectateTargets(): Array<{
+  public getAliveSpectateTargets(teamFilter?: BattleTeamId): Array<{
     userId: string;
     username: string;
     pos: THREE.Vector3;
@@ -1087,6 +1087,9 @@ export class RemotePlayerManager {
     }> = [];
     for (const op of this.players.values()) {
       if (op.hasInitialState && op.alive) {
+        if (teamFilter && teamFilter !== 'FFA' && op.team !== teamFilter) {
+          continue;
+        }
         out.push({
           userId: op.userId,
           username: op.username,

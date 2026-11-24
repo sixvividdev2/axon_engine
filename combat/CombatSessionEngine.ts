@@ -772,9 +772,9 @@ export class CombatSessionEngine {
           maxAnisotropy,
           worldAdapter: this.adapter,
           localAllyTeam: this.localBattleTeam,
+          modeController: this.modeController,
         },
       );
-      this.botAI.setModeController(this.modeController);
       this.botAI.setBotCommsListener((ev) => this.handleLocalBotComms(ev));
       this.botAI.setBotGrenadeListener((ev) => this.handleHostBotGrenadeEvent(ev));
       this.botAI.setAssistListener((assisterId) => {
@@ -1668,7 +1668,10 @@ export class CombatSessionEngine {
 
   public selectConquestSpawn(spawnId: string): void {
     if (!this.modeController) return;
-    this.modeController.selectConquestSpawn(spawnId);
+    const accepted = this.modeController.selectConquestSpawn(spawnId);
+    if (!accepted) {
+      this.showToast('FOB spawn locked — sector is under enemy attack or not controlled', 2.6);
+    }
     this.emitSnapshot();
   }
 
@@ -1682,7 +1685,7 @@ export class CombatSessionEngine {
     );
     const res = this.modeController.confirmConquestRedeploy(livingEnemies, this.map.raycastMeshes);
     if (!res) {
-      this.showToast('Selected spawn unavailable — pick HQ or uncontested FOB', 3.0);
+      this.showToast('All loadouts expended — Spectating Squad until match end', 3.2);
       this.emitSnapshot();
       return;
     }
@@ -1707,7 +1710,12 @@ export class CombatSessionEngine {
     this.controller.snapTo(sp.position[0], groundY, sp.position[2], sp.yaw, 0);
     this.modeController.grantSpawnProtection(this.getLocalModeActorId());
     this.syncNvgRuntime();
-    this.showToast(`Deployed · ${res.loadout.name}`, 2.4);
+    this.showToast(
+      res.redirectedToHq
+        ? `FOB Under Attack · Deployed at Team HQ (${res.loadout.name})`
+        : `Deployed · ${res.loadout.name}`,
+      2.6,
+    );
 
     if (this.mp) {
       const rspPkt: GamePlayerRespawnPacket = {
@@ -2072,7 +2080,21 @@ export class CombatSessionEngine {
     }
 
     if (type === 'game:respawn') {
-      this.remotePlayers.applyRespawnPacket(raw as unknown as GamePlayerRespawnPacket);
+      const rspPkt = raw as unknown as GamePlayerRespawnPacket;
+      if (
+        this.params.mode === 'battle' &&
+        this.params.battleConfig.rule === 'conquest' &&
+        this.modeController &&
+        rspPkt.senderUserId
+      ) {
+        if (!this.modeController.onConquestParticipantRespawn(rspPkt.senderUserId)) {
+          return;
+        }
+        this.modeController.grantSpawnProtection(rspPkt.senderUserId);
+      } else if (this.params.mode === 'battle' && this.modeController && rspPkt.senderUserId) {
+        this.modeController.grantSpawnProtection(rspPkt.senderUserId);
+      }
+      this.remotePlayers.applyRespawnPacket(rspPkt);
       return;
     }
 
@@ -2794,11 +2816,10 @@ export class CombatSessionEngine {
     if (
       this.params.mode === 'battle' &&
       this.modeController &&
-      this.isMpHost &&
       !pkt.victimUserId.startsWith('bot_') &&
       pkt.victimUserId !== this.mp?.localUserId
     ) {
-      if (this.remotePlayers?.getPlayerHeadPosition(pkt.victimUserId, this._tmpImpactPoint)) {
+      if (this.isMpHost && this.remotePlayers?.getPlayerHeadPosition(pkt.victimUserId, this._tmpImpactPoint)) {
         this.modeController.onActorKilled({
           victimId: pkt.victimUserId,
           victimTeam: pkt.victimTeam,
@@ -2806,6 +2827,9 @@ export class CombatSessionEngine {
           y: Math.max(0, this._tmpImpactPoint.y - 1.5),
           z: this._tmpImpactPoint.z,
         });
+      }
+      if (this.params.battleConfig.rule === 'conquest') {
+        this.modeController.consumeConquestParticipantLife(pkt.victimUserId, pkt.victimTeam);
       }
     }
     this.remotePlayers?.markPlayerDead(pkt.victimUserId);
@@ -3467,6 +3491,9 @@ export class CombatSessionEngine {
         const attackerLabel = ev.sourceIsBot ? (ev.sourceName ?? ev.def.killfeedLabel) : ev.def.killfeedLabel;
         const attackerTeam: BattleTeamId = ev.sourceIsBot ? (ev.sourceTeam ?? 'B') : this.localBattleTeam;
         const attackerId = ev.sourceIsBot ? ev.sourceId : undefined;
+        if (this.params.mode === 'battle' && this.params.battleConfig.rule === 'conquest' && this.modeController) {
+          this.modeController.reportConquestAttack(ev.position.x, ev.position.z, attackerTeam);
+        }
 
         if (ev.kind === 'flash') {
           this.camera.getWorldDirection(this._grenadeThrowDir);
@@ -3542,6 +3569,14 @@ export class CombatSessionEngine {
   private handleBallisticImpact(ev: Readonly<BallisticImpactEvent>): void {
     const obj = ev.object;
     const ud = obj?.userData;
+
+    if (
+      this.params.mode === 'battle' &&
+      this.params.battleConfig.rule === 'conquest' &&
+      this.modeController
+    ) {
+      this.modeController.reportConquestAttack(ev.point.x, ev.point.z, this.localBattleTeam);
+    }
 
     if (ud?.combatActorType === 'remote_player' && this.mp && this.remotePlayers) {
       const targetUserId = String(ud.actorId);
@@ -6385,7 +6420,11 @@ export class CombatSessionEngine {
         this.playerRagdoll.syncToSkeleton(this.skeleton);
       }
       if (this.spectating || this.modeController?.isLocalSpectating()) {
-        const remoteTargets = this.remotePlayers?.getAliveSpectateTargets() ?? [];
+        const spectateTeamFilter =
+          this.params.mode === 'battle' && isTeamBattleRule(this.params.battleConfig.rule)
+            ? this.localBattleTeam
+            : undefined;
+        const remoteTargets = this.remotePlayers?.getAliveSpectateTargets(spectateTeamFilter) ?? [];
         const botTargets =
           this.params.mode === 'battle' && this.botAI
             ? this.botAI.getAliveTeammateSpectateTargets(this.localBattleTeam)
@@ -6602,6 +6641,14 @@ export class CombatSessionEngine {
         meta?: { weaponId: string; caliberId: string; suppressed: boolean },
       ) => {
         this.triggerRemoteSegmentFlyby(origin, end, meta?.caliberId, Boolean(meta?.suppressed));
+        if (
+          this.params.mode === 'battle' &&
+          this.params.battleConfig.rule === 'conquest' &&
+          this.modeController
+        ) {
+          const shooterAttr = this.modeController.getConquestParticipantAttrition(botId);
+          this.modeController.reportConquestAttack(end.x, end.z, shooterAttr?.team);
+        }
         if (this.mp && this.isMpHost) {
           const firePkt: GameBotFirePacket = {
             type: 'game:bot_fire',
@@ -7029,6 +7076,28 @@ export class CombatSessionEngine {
       this.params.mode === 'battle' ? this.params.battleConfig.rule : 'tdm';
     const localActorId = this.getLocalModeActorId();
 
+    const enrichedScoreboard: BattleScoreEntry[] = mergedScoreboard.map((row) => {
+      const lookupId = row.isPlayer ? localActorId : row.id;
+      const modeStats = this.modeController?.getActorStats(lookupId);
+      const attrition =
+        activeRule === 'conquest'
+          ? this.modeController?.getConquestParticipantAttrition(lookupId)
+          : null;
+      return {
+        ...row,
+        enemyDogtags: modeStats?.enemyDogtags ?? row.enemyDogtags,
+        friendlyDogtags: modeStats?.friendlyDogtags ?? row.friendlyDogtags,
+        selfDogtagsRecovered: modeStats?.selfDogtagsRecovered ?? row.selfDogtagsRecovered,
+        poiCaptures: modeStats?.poiCaptures ?? row.poiCaptures,
+        territoryPoints: modeStats ? Math.round(modeStats.territoryPoints) : row.territoryPoints,
+        flagCaptures: modeStats?.flagCaptures ?? row.flagCaptures,
+        flagReturns: modeStats?.flagReturns ?? row.flagReturns,
+        hillControlSec: modeStats ? Math.round(modeStats.hillControlSec) : row.hillControlSec,
+        conquestLivesRemaining: attrition?.remainingLives ?? row.conquestLivesRemaining,
+        conquestEliminated: attrition?.eliminated ?? row.conquestEliminated,
+      };
+    });
+
     const combatants: CombatantMatchStats[] = mergedScoreboard.map((row) => {
       const lookupId = row.isPlayer ? localActorId : row.id;
       const modeStats = this.modeController?.getActorStats(lookupId);
@@ -7160,7 +7229,7 @@ export class CombatSessionEngine {
       respawnTimerSec: Math.max(0, this.respawnTimerSec),
       matchOutcome: this.matchOutcome,
       killfeed: mergedKillfeed,
-      scoreboard: mergedScoreboard,
+      scoreboard: enrichedScoreboard,
       combatants,
 
       roundState: this.zombieAI?.getRoundState() ?? {
