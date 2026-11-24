@@ -813,17 +813,17 @@ export class ZombiesLobbyController {
         const targetProf = resolveWeaponProfile(slotWeaponId);
         const verb = this.equippedWeaponId === 'unarmed' ? 'Equip' : 'Swap with';
         this.activePrompt = {
-          key: 'E',
+          key: 'F',
           targetLabel: 'Field Weapon Rack',
-          options: [{ id: 'gun_rack', label: `${verb} ${targetProf.name}`, hint: 'E / F' }],
+          options: [{ id: 'gun_rack', label: `${verb} ${targetProf.name}` }],
           selectedIndex: 0,
         };
       } else {
         const heldProf = resolveWeaponProfile(this.equippedWeaponId);
         this.activePrompt = {
-          key: 'E',
+          key: 'F',
           targetLabel: 'Field Weapon Rack',
-          options: [{ id: 'gun_rack', label: `Mount ${heldProf.name} on Rack`, hint: 'E / F' }],
+          options: [{ id: 'gun_rack', label: `Mount ${heldProf.name} on Rack` }],
           selectedIndex: 0,
         };
       }
@@ -832,9 +832,9 @@ export class ZombiesLobbyController {
 
     if (matched.kind === 'outpost_ops_board') {
       this.activePrompt = {
-        key: 'E',
+        key: 'F',
         targetLabel: 'Zombies Operations Map Board',
-        options: [{ id: 'open_ops', label: 'Select Map, Difficulty & Deploy', hint: 'E / F' }],
+        options: [{ id: 'open_ops', label: 'Select Map, Difficulty & Deploy' }],
         selectedIndex: 0,
       };
       return;
@@ -842,9 +842,9 @@ export class ZombiesLobbyController {
 
     if (matched.kind === 'outpost_field_radio') {
       this.activePrompt = {
-        key: 'E',
+        key: 'F',
         targetLabel: 'Tactical Field Radio',
-        options: [{ id: 'open_ops', label: 'Quarantine Briefing & Squad Dispatch', hint: 'E / F' }],
+        options: [{ id: 'open_ops', label: 'Quarantine Briefing & Squad Dispatch' }],
         selectedIndex: 0,
       };
       return;
@@ -852,9 +852,9 @@ export class ZombiesLobbyController {
 
     if (matched.kind === 'outpost_ammo_crate') {
       this.activePrompt = {
-        key: 'E',
+        key: 'F',
         targetLabel: 'Military Ordnance Crate',
-        options: [{ id: 'resupply', label: 'Resupply Ammunition & Gear', hint: 'E / F' }],
+        options: [{ id: 'resupply', label: 'Resupply Ammunition & Gear' }],
         selectedIndex: 0,
       };
       return;
@@ -862,12 +862,12 @@ export class ZombiesLobbyController {
 
     if (matched.kind === 'outpost_equip_bench') {
       const opts: HideoutPromptOption[] = [
-        { id: 'gunsmith', label: 'Field Gunsmith & Loadout', hint: 'E / F' },
+        { id: 'gunsmith', label: 'Field Gunsmith & Loadout' },
         { id: 'operator_gear', label: 'Operator Gear & Rig' },
       ];
       this.selectedOptionIndex = THREE.MathUtils.clamp(this.selectedOptionIndex, 0, opts.length - 1);
       this.activePrompt = {
-        key: 'E',
+        key: 'F',
         targetLabel: 'Field Medical & Equipment Bench',
         options: opts,
         selectedIndex: this.selectedOptionIndex,
@@ -877,9 +877,9 @@ export class ZombiesLobbyController {
 
     if (matched.kind === 'outpost_return_airlock') {
       this.activePrompt = {
-        key: 'E',
+        key: 'F',
         targetLabel: 'Armored Transport · Return Airlock',
-        options: [{ id: 'return_hideout', label: 'Board Transport → Return to Hideout', hint: 'E / F' }],
+        options: [{ id: 'return_hideout', label: 'Board Transport → Return to Hideout' }],
         selectedIndex: 0,
       };
     }
@@ -1018,10 +1018,6 @@ export class ZombiesLobbyController {
         this.input.leanLeft = true;
         break;
       case 'KeyE':
-        if (!e.repeat && this.activeMeta) {
-          this.executeSelectedInteract();
-          break;
-        }
         this.input.leanRight = true;
         break;
       case 'KeyF':

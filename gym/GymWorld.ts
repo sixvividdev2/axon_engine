@@ -1062,7 +1062,7 @@ export function buildGymWorld(
     woodAlbedo: textures.woodAlbedo,
     woodRoughness: textures.woodRoughness,
   });
-  addFloorPlaque('GUNSMITHING BENCH', 'LOOK + [E]: MODIFY FIREARM', 3.15, 16.55, '#e0a938');
+  addFloorPlaque('GUNSMITHING BENCH', 'LOOK + [F]: MODIFY FIREARM', 3.15, 16.55, '#e0a938');
 
   physics.setRaycastMeshes(raycastMeshes);
 

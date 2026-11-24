@@ -149,8 +149,10 @@ export const OperatorSelectPanel: React.FC<OperatorSelectPanelProps> = ({
           {profile.role}
         </div>
         <div className="mt-1 font-mono-tabular text-[11px] text-neutral-300">
-          {helmetSpec.label} ({helmetColorSpec.label}) ·{' '}
-          {faceGearSpec.shortLabel} · {eyewearSpec.shortLabel} ·{' '}
+          {gear.helmetType === 'none'
+            ? helmetSpec.label
+            : `${helmetSpec.label} (${helmetColorSpec.label})`}{' '}
+          · {faceGearSpec.shortLabel} · {eyewearSpec.shortLabel} ·{' '}
           {gear.nvgMount === 'none' ? 'No NVG' : `${nvgSpec.shortLabel} (${nvgSpec.phosphorLabel})`} ·{' '}
           {gear.glovesEnabled ? `Gloves: ${gloveColorSpec.label}` : 'Bare Hands'}
         </div>
@@ -536,17 +538,21 @@ export const OperatorSelectPanel: React.FC<OperatorSelectPanelProps> = ({
                         Finish
                       </span>
                       {HELMET_COLOR_LIST.map((c) => {
-                        const active = gear.helmetColor === c.id;
+                        const helmetDisabled = gear.helmetType === 'none';
+                        const active = !helmetDisabled && gear.helmetColor === c.id;
                         return (
                           <button
                             key={c.id}
                             type="button"
+                            disabled={helmetDisabled}
                             onClick={() => updateGear({ helmetColor: c.id })}
-                            title={c.label}
-                            className={`flex cursor-pointer items-center gap-1.5 whitespace-nowrap border px-2.5 py-1.5 font-mono-tabular text-[11px] transition-colors ${
-                              active
-                                ? 'border-amber-400 bg-neutral-900 text-neutral-100'
-                                : 'border-neutral-800 bg-neutral-950 text-neutral-400 hover:border-neutral-600 hover:text-neutral-200'
+                            title={helmetDisabled ? 'Select a helmet to choose finish' : c.label}
+                            className={`flex items-center gap-1.5 whitespace-nowrap border px-2.5 py-1.5 font-mono-tabular text-[11px] transition-colors ${
+                              helmetDisabled
+                                ? 'cursor-not-allowed border-neutral-800/60 bg-neutral-950/60 text-neutral-600'
+                                : active
+                                  ? 'cursor-pointer border-amber-400 bg-neutral-900 text-neutral-100'
+                                  : 'cursor-pointer border-neutral-800 bg-neutral-950 text-neutral-400 hover:border-neutral-600 hover:text-neutral-200'
                             }`}
                           >
                             <span
@@ -560,43 +566,75 @@ export const OperatorSelectPanel: React.FC<OperatorSelectPanelProps> = ({
                     </div>
                   </div>
 
-                  {/* NVG Shroud Mount Row */}
-                  <div className="flex flex-wrap items-center gap-2 border-t border-neutral-800/70 pt-2">
-                    <span className="mr-1 font-mono-tabular text-[11px] uppercase tracking-wider text-neutral-400">
-                      NVG Mount
-                    </span>
-                    {NVG_MOUNT_LIST.map((nvg) => {
-                      const active = gear.nvgMount === nvg.id;
-                      const locked = nvg.id !== 'none' && !canMountNvg;
-                      return (
-                        <button
-                          key={nvg.id}
-                          type="button"
-                          disabled={locked}
-                          onClick={() => updateGear({ nvgMount: nvg.id })}
-                          title={locked ? 'Requires Mil-Tec Helmet with Wilcox Shroud' : nvg.summary}
-                          className={`whitespace-nowrap border px-3 py-1.5 font-mono-tabular text-[11px] transition-colors ${
-                            locked
-                              ? 'cursor-not-allowed border-neutral-800/50 bg-neutral-950/50 text-neutral-600'
-                              : active
-                                ? 'cursor-pointer border-amber-400 bg-amber-500/15 text-amber-200'
-                                : 'cursor-pointer border-neutral-800 bg-neutral-950 text-neutral-400 hover:border-neutral-600 hover:text-neutral-200'
-                          }`}
-                        >
-                          {nvg.label}
-                          {nvg.id !== 'none' ? ` · ${nvg.phosphorLabel}` : ''}
-                        </button>
-                      );
-                    })}
-                    {!canMountNvg ? (
-                      <span className="font-mono-tabular text-[11px] text-neutral-500">
-                        MICH has no shroud — select Mil-Tec to mount NVGs
+                  {/* Tactical Visor / Eyewear + NVG Shroud Mount Row */}
+                  <div className="flex flex-wrap items-center gap-4 border-t border-neutral-800/70 pt-2">
+                    <div className="flex flex-wrap items-center gap-1.5" role="radiogroup" aria-label="Helmet Visor">
+                      <span className="mr-1 font-mono-tabular text-[11px] uppercase tracking-wider text-neutral-400">
+                        Visor
                       </span>
-                    ) : (
-                      <span className="font-mono-tabular text-[11px] text-neutral-400">
-                        In-Game: [J] Flip NVG · [N] IR Illuminator
+                      {EYEWEAR_LIST.map((ew) => {
+                        const active = gear.eyewear === ew.id;
+                        return (
+                          <button
+                            key={ew.id}
+                            type="button"
+                            role="radio"
+                            aria-checked={active}
+                            onClick={() => updateGear({ eyewear: ew.id })}
+                            title={ew.summary}
+                            className={`cursor-pointer whitespace-nowrap border px-2.5 py-1.5 font-mono-tabular text-[11px] transition-colors ${
+                              active
+                                ? 'border-amber-400 bg-amber-500/15 text-amber-200'
+                                : 'border-neutral-800 bg-neutral-950 text-neutral-400 hover:border-neutral-600 hover:text-neutral-200'
+                            }`}
+                          >
+                            {ew.label}
+                          </button>
+                        );
+                      })}
+                    </div>
+
+                    <div className="hidden h-6 w-px bg-neutral-800 sm:block" />
+
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      <span className="mr-1 font-mono-tabular text-[11px] uppercase tracking-wider text-neutral-400">
+                        NVG Mount
                       </span>
-                    )}
+                      {NVG_MOUNT_LIST.map((nvg) => {
+                        const active = gear.nvgMount === nvg.id;
+                        const locked = nvg.id !== 'none' && !canMountNvg;
+                        return (
+                          <button
+                            key={nvg.id}
+                            type="button"
+                            disabled={locked}
+                            onClick={() => updateGear({ nvgMount: nvg.id })}
+                            title={locked ? 'Requires Mil-Tec Helmet with Wilcox Shroud' : nvg.summary}
+                            className={`whitespace-nowrap border px-3 py-1.5 font-mono-tabular text-[11px] transition-colors ${
+                              locked
+                                ? 'cursor-not-allowed border-neutral-800/50 bg-neutral-950/50 text-neutral-600'
+                                : active
+                                  ? 'cursor-pointer border-amber-400 bg-amber-500/15 text-amber-200'
+                                  : 'cursor-pointer border-neutral-800 bg-neutral-950 text-neutral-400 hover:border-neutral-600 hover:text-neutral-200'
+                            }`}
+                          >
+                            {nvg.label}
+                            {nvg.id !== 'none' ? ` · ${nvg.phosphorLabel}` : ''}
+                          </button>
+                        );
+                      })}
+                      {!canMountNvg ? (
+                        <span className="font-mono-tabular text-[11px] text-neutral-500">
+                          {gear.helmetType === 'none'
+                            ? 'No helmet selected — equip Mil-Tec to mount NVGs'
+                            : 'MICH has no shroud — select Mil-Tec to mount NVGs'}
+                        </span>
+                      ) : (
+                        <span className="font-mono-tabular text-[11px] text-neutral-400">
+                          In-Game: [J] Flip NVG · [N] IR Illuminator
+                        </span>
+                      )}
+                    </div>
                   </div>
                 </div>
               )}

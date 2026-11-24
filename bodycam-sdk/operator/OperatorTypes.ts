@@ -138,7 +138,7 @@ export type GloveColorId =
   | 'crimson'
   | 'uniform';
 
-export type HelmetTypeId = 'mich' | 'mil_tec';
+export type HelmetTypeId = 'none' | 'mich' | 'mil_tec';
 
 export type HelmetColorId =
   | 'black'
@@ -209,6 +209,13 @@ export interface HelmetTypeSpec {
 }
 
 export const HELMET_TYPE_LIST: readonly HelmetTypeSpec[] = [
+  {
+    id: 'none',
+    label: 'No Helmet',
+    shortLabel: 'NO HELMET',
+    hasMount: false,
+    summary: 'Unarmored bare head with natural hair, unobstructed face gear, and no NVG mount.',
+  },
   {
     id: 'mich',
     label: 'MICH-2000',
@@ -335,7 +342,7 @@ export const EYEWEAR_LIST: readonly EyewearSpec[] = [
 
 const VALID_UNIFORMS = new Set<string>(['team_a', 'team_b', 'ffa', 'infection']);
 const VALID_GLOVE_COLORS = new Set<string>(GLOVE_COLOR_LIST.map((g) => g.id));
-const VALID_HELMET_TYPES = new Set<string>(['mich', 'mil_tec']);
+const VALID_HELMET_TYPES = new Set<string>(['none', 'mich', 'mil_tec']);
 const VALID_HELMET_COLORS = new Set<string>(HELMET_COLOR_LIST.map((h) => h.id));
 const VALID_NVG_MOUNTS = new Set<string>(['none', 'pvs7', 'arnvg']);
 const VALID_FACE_GEAR = new Set<string>(['open_face', 'neck_gaiter', 'balaclava']);

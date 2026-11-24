@@ -178,7 +178,7 @@ export const GymHud: React.FC<GymHudProps> = ({
       {/* Gunsmithing Bench Interaction Prompt */}
       {pointerLocked && lookingAtBench && !gunsmithOpen && (
         <div className="fixed top-1/2 left-1/2 -translate-x-1/2 translate-y-12 border border-amber-400/80 bg-neutral-950/92 px-4 py-1.5 font-mono-tabular text-xs font-medium uppercase tracking-wider text-amber-200">
-          [E] Open Gunsmithing Bench
+          [F] Open Gunsmithing Bench
         </div>
       )}
 
@@ -279,7 +279,7 @@ export const GymHud: React.FC<GymHudProps> = ({
           ) : (
             <>
               <span>1-4 Weapons</span>
-              <span>E Bench</span>
+              <span>F Bench</span>
               <span className="text-emerald-300">M Tac Map</span>
               {snapshot.toggleablePumpSemi && (
                 <span className="text-amber-300">
@@ -291,7 +291,7 @@ export const GymHud: React.FC<GymHudProps> = ({
               <span>MMB Pt-Aim</span>
               {snapshot.hasCantedOptic && <span>B Canted</span>}
               <span>L / Alt+L Laser</span>
-              <span>F / T Light</span>
+              <span>T Light</span>
               <span>Q/E Lean</span>
               <span>C Crouch</span>
               <span>Space Vault</span>
@@ -382,7 +382,7 @@ export const GymHud: React.FC<GymHudProps> = ({
                 <span className="text-neutral-200">C / Q / E</span> Crouch &amp; Lean
               </div>
               <div>
-                <span className="text-neutral-200">E (at Bench)</span> 42-Gun Armory
+                <span className="text-neutral-200">F (at Bench)</span> 42-Gun Armory
               </div>
               <div>
                 <span className="text-neutral-200">RMB / Shift</span> ADS &amp; Hold Breath
@@ -397,7 +397,7 @@ export const GymHud: React.FC<GymHudProps> = ({
                 <span className="text-neutral-200">H / 5</span> Draw · RMB Pin · RMB Spoon · LMB Throw
               </div>
               <div>
-                <span className="text-neutral-200">F / T / G</span> Flashlight &amp; Supp.
+                <span className="text-neutral-200">T / G</span> Flashlight &amp; Supp.
               </div>
               <div>
                 <span className="text-neutral-200">1–4 / Z</span> Quick Swap &amp; SPAS Mode

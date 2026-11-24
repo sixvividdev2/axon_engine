@@ -471,7 +471,7 @@ export interface GamePlayerStatePacket {
   operatorId?: OperatorId;
   glovesEnabled?: boolean;
   gloveColor?: string;
-  helmetType?: 'mich' | 'mil_tec';
+  helmetType?: 'none' | 'mich' | 'mil_tec';
   helmetColor?: string;
   nvgMount?: 'none' | 'pvs7' | 'arnvg';
   nvgFlipped?: boolean;
@@ -571,7 +571,7 @@ export interface GamePlayerRespawnPacket {
   operatorId?: OperatorId;
   glovesEnabled?: boolean;
   gloveColor?: string;
-  helmetType?: 'mich' | 'mil_tec';
+  helmetType?: 'none' | 'mich' | 'mil_tec';
   helmetColor?: string;
   nvgMount?: 'none' | 'pvs7' | 'arnvg';
   nvgFlipped?: boolean;

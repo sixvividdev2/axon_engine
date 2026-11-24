@@ -1348,7 +1348,7 @@ export class GymEngine {
     const derived = this.weaponRig.getDerivedStats();
     if (!prof.supportsLaser || !derived.hasLaser) {
       this.weaponRig.laserOn = false;
-      this.showToast('Mount Perst-4 Laser or PEQ Combo on Gunsmith Bench [E]');
+      this.showToast('Mount Perst-4 Laser or PEQ Combo on Gunsmith Bench [F]');
       this.emitSnapshot();
       return;
     }
@@ -1367,7 +1367,7 @@ export class GymEngine {
     const prof = this.getWeaponProfile();
     const derived = this.weaponRig.getDerivedStats();
     if (!prof.supportsLaser || !derived.hasLaser) {
-      this.showToast('Mount Perst-4 Laser or PEQ Combo on Gunsmith Bench [E]');
+      this.showToast('Mount Perst-4 Laser or PEQ Combo on Gunsmith Bench [F]');
       return;
     }
     const next = this.weaponRig.laserMode === 'visible_red' ? 'ir_green' : 'visible_red';
@@ -1385,7 +1385,7 @@ export class GymEngine {
       this.flashlightOn = false;
       this.weaponRig.flashlight.visible = false;
       this.weaponRig.flashlight.intensity = 0;
-      this.showToast('Mount WML Light or PEQ Combo on Gunsmith Bench [E]');
+      this.showToast('Mount WML Light or PEQ Combo on Gunsmith Bench [F]');
       this.emitSnapshot();
       return;
     }
@@ -1928,7 +1928,7 @@ export class GymEngine {
 
   private readonly onKeyDown = (e: KeyboardEvent): void => {
     if (this.world.gunsmithBench.isOpen()) {
-      if (e.code === 'Escape' || (e.code === 'KeyE' && !e.repeat)) {
+      if (e.code === 'Escape' || (e.code === 'KeyF' && !e.repeat)) {
         e.preventDefault();
         this.closeGunsmith();
       }
@@ -1978,15 +1978,15 @@ export class GymEngine {
         this.input.leanLeft = true;
         break;
       case 'KeyE':
-        if (!e.repeat && this.lookingAtBench) {
-          this.openGunsmith();
-        } else {
-          this.input.leanRight = true;
-        }
+        this.input.leanRight = true;
         break;
       case 'KeyF':
         if (!e.repeat) {
-          this.toggleFlashlight();
+          if (this.lookingAtBench) {
+            this.openGunsmith();
+          } else {
+            this.toggleFlashlight();
+          }
         }
         break;
       case 'KeyM':

@@ -415,10 +415,10 @@ export class TacticalOperatorRigFactory {
     this.geoHead = this.track(new THREE.SphereGeometry(0.11, 10, 8));
     this.geoBalaclava = this.track(new THREE.CylinderGeometry(0.103, 0.096, 0.118, 10));
     this.geoHelmetShell = this.track(
-      new THREE.SphereGeometry(0.134, 12, 8, 0, Math.PI * 2, 0, Math.PI * 0.62),
+      new THREE.SphereGeometry(0.108, 16, 10, 0, Math.PI * 2, 0, Math.PI * 0.52),
     );
-    this.geoHelmetRim = this.track(new THREE.CylinderGeometry(0.133, 0.136, 0.03, 12));
-    this.geoHelmetBand = this.track(new THREE.CylinderGeometry(0.138, 0.138, 0.032, 12));
+    this.geoHelmetRim = this.track(new THREE.CylinderGeometry(0.106, 0.109, 0.022, 14));
+    this.geoHelmetBand = this.track(new THREE.CylinderGeometry(0.110, 0.110, 0.024, 14));
     this.geoNvgShroud = this.track(new THREE.BoxGeometry(0.05, 0.054, 0.028));
     this.geoNvgArm = this.track(new THREE.BoxGeometry(0.022, 0.022, 0.044));
     this.geoNvgPvs7Body = this.track(new THREE.BoxGeometry(0.088, 0.044, 0.082));
@@ -950,23 +950,30 @@ export class TacticalOperatorRigFactory {
     };
 
     const helmetShell = makeMesh(this.geoHelmetShell, 'helmet', 'head', 'metal');
-    helmetShell.scale.set(headScaleXZ, 0.96, 1.06 * headScaleXZ);
-    helmetShell.position.set(0, 0.152, 0.005);
+    helmetShell.name = 'rig_helmet_shell';
+    helmetShell.scale.set(headScaleXZ, 0.98, 1.07 * headScaleXZ);
+    helmetShell.position.set(0, 0.156, 0.005);
+    helmetShell.rotation.x = 0.15;
 
     const helmetRim = makeMesh(this.geoHelmetRim, 'helmet', 'head', 'metal');
+    helmetRim.name = 'rig_helmet_rim';
     helmetRim.scale.set(headScaleXZ, 1.0, 1.06 * headScaleXZ);
-    helmetRim.position.set(0, 0.172, 0.005);
+    helmetRim.position.set(0, 0.154, 0.005);
+    helmetRim.rotation.x = 0.15;
 
     const helmetBand = makeMesh(this.geoHelmetBand, 'iffTrim');
+    helmetBand.name = 'rig_helmet_band';
     helmetBand.scale.set(1.022 * headScaleXZ, 1.0, 1.082 * headScaleXZ);
-    helmetBand.position.set(0, 0.182, 0.005);
+    helmetBand.position.set(0, 0.165, 0.005);
+    helmetBand.rotation.x = 0.15;
 
     const nvgShroud = makeMesh(this.geoNvgShroud, 'hardware');
-    nvgShroud.position.set(0, 0.216, -0.128 * headScaleXZ);
+    nvgShroud.name = 'rig_nvg_shroud';
+    nvgShroud.position.set(0, 0.203, -0.108 * headScaleXZ);
 
     // Lightweight 3rd-person articulating NVG pivot (PVS-7 bi-ocular & RNVG-A dual-tube pods)
     const nvgPivot = new THREE.Group();
-    nvgPivot.position.set(0, 0.216, -0.132 * headScaleXZ);
+    nvgPivot.position.set(0, 0.203, -0.114 * headScaleXZ);
     nvgPivot.rotation.x = -1.28;
     nvgPivot.visible = false;
 
@@ -997,12 +1004,13 @@ export class TacticalOperatorRigFactory {
     nvgPivot.add(arnvgGroup);
 
     const earL = makeMesh(this.geoEarPro, 'hardware');
-    earL.position.set(-0.118 * headScaleXZ, 0.128, 0.01);
+    earL.position.set(-0.095 * headScaleXZ, 0.124, 0.008);
     const earR = makeMesh(this.geoEarPro, 'hardware');
-    earR.position.set(0.118 * headScaleXZ, 0.128, 0.01);
+    earR.position.set(0.095 * headScaleXZ, 0.124, 0.008);
 
     const irStrobeHousing = makeMesh(this.geoIrStrobeHousing, 'hardware');
-    irStrobeHousing.position.set(0, 0.278, 0.025 * headScaleXZ);
+    irStrobeHousing.name = 'rig_ir_strobe_housing';
+    irStrobeHousing.position.set(0, 0.256, 0.025 * headScaleXZ);
     const irStrobeMat = new THREE.MeshBasicMaterial({
       color: 0xd9f99d,
       transparent: true,
@@ -1010,7 +1018,7 @@ export class TacticalOperatorRigFactory {
       toneMapped: false,
     });
     const irStrobeEmitter = new THREE.Mesh(this.geoIrStrobeEmitter, irStrobeMat);
-    irStrobeEmitter.position.set(0, 0.289, 0.025 * headScaleXZ);
+    irStrobeEmitter.position.set(0, 0.267, 0.025 * headScaleXZ);
     irStrobeEmitter.layers.set(IR_LAYER);
     irStrobeEmitter.visible = false;
 
@@ -1211,8 +1219,9 @@ export class TacticalOperatorRigFactory {
       }
     };
 
+    let hasHelmetEquipped = true;
     const setIrStrobe = (enabled: boolean, pulseOn = true): void => {
-      irStrobeEmitter.visible = enabled && pulseOn;
+      irStrobeEmitter.visible = enabled && pulseOn && hasHelmetEquipped;
     };
 
     const setWarningLaser = (active: boolean, lengthM = 24): void => {
@@ -1407,13 +1416,22 @@ export class TacticalOperatorRigFactory {
         rightArmParts.glove.material = activeBundle.gloveMat;
       }
 
-      // 2. Helmet Shell (MICH-2000 low-cut no mount vs Mil-Tec high-cut + mount) + Color
+      // 2. Helmet Shell (No Helmet vs MICH-2000 low-cut no mount vs Mil-Tec high-cut + mount) + Color
+      const hasHelmet = gear.helmetType !== 'none';
       const isMich = gear.helmetType === 'mich';
-      helmetShell.scale.set(headScaleXZ, isMich ? 1.07 : 0.96, 1.06 * headScaleXZ);
-      helmetRim.position.y = isMich ? 0.156 : 0.172;
-      earL.visible = !isMich;
-      earR.visible = !isMich;
-      nvgShroud.visible = !isMich;
+      hasHelmetEquipped = hasHelmet;
+      helmetShell.visible = hasHelmet;
+      helmetRim.visible = hasHelmet;
+      helmetBand.visible = hasHelmet;
+      irStrobeHousing.visible = hasHelmet;
+      if (!hasHelmet) {
+        irStrobeEmitter.visible = false;
+      }
+      helmetShell.scale.set(headScaleXZ, isMich ? 1.04 : 0.98, 1.07 * headScaleXZ);
+      helmetRim.position.y = isMich ? 0.148 : 0.154;
+      earL.visible = hasHelmet && !isMich;
+      earR.visible = hasHelmet && !isMich;
+      nvgShroud.visible = hasHelmet && !isMich;
 
       if (gear.helmetColor && gear.helmetColor !== 'uniform') {
         const hSpec = HELMET_COLOR_LIST.find((c) => c.id === gear.helmetColor);
@@ -1431,8 +1449,9 @@ export class TacticalOperatorRigFactory {
         helmetRim.material = activeBundle.helmetMat;
       }
 
-      // 3. Mounted NVG (locked off on MICH) & flip-down hinge pose
-      const effectiveMount: NvgMountId = isMich ? 'none' : (gear.nvgMount ?? 'none');
+      // 3. Mounted NVG (locked off unless Mil-Tec) & flip-down hinge pose
+      const effectiveMount: NvgMountId =
+        gear.helmetType === 'mil_tec' ? (gear.nvgMount ?? 'none') : 'none';
       nvgPivot.visible = effectiveMount !== 'none';
       pvs7Group.visible = effectiveMount === 'pvs7';
       arnvgGroup.visible = effectiveMount === 'arnvg';

@@ -540,7 +540,7 @@ export class HideoutAirlockBay {
     this.group.add(this.strobeLight);
 
     // ------------------------------------------------------------------------
-    // 5. AIRLOCK OVERRIDE SWITCH CONSOLES (Exterior + Interior, [E] / [F])
+    // 5. AIRLOCK OVERRIDE SWITCH CONSOLES (Exterior + Interior, [F])
     // ------------------------------------------------------------------------
     const proxyMat = trackMat(new THREE.MeshBasicMaterial({ visible: false }));
     const buildOverrideConsole = (x: number, z: number, facingNorth: boolean): void => {
@@ -580,7 +580,7 @@ export class HideoutAirlockBay {
         surface: 'metal',
       });
 
-      // Invisible generous raycast proxy for [E] / [F] interaction
+      // Invisible generous raycast proxy for [F] interaction
       const proxy = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(0.85, 1.25, 0.75)), proxyMat);
       proxy.position.set(x, 1.25, z);
       const meta: HideoutInteractableMeta = {

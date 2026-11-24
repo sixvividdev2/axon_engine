@@ -11,6 +11,7 @@ import {
   DEFAULT_BODYCAM_SDK_CONFIG,
   FACIAL_MORPH_TARGET_NAMES,
   FacialExpressionController,
+  HELMET_TYPE_LIST,
   OPERATOR_STORAGE_KEY,
   OperatorAssetLoader,
   OperatorSelectionStore,
@@ -2500,7 +2501,171 @@ describe('Phase 12 — Anatomical Faces, 15 Morph Targets, Eyeball Gaze LOD, Sta
     expect(previewSrc).toContain('deck.position.y = -0.005');
     expect(previewSrc).toContain('ring.position.y = 0.003');
   });
+
+  it('supports No Helmet (none) across locker config, 1P/3P rigs, IR strobe gating, and multiplayer sanitization', () => {
+    expect(HELMET_TYPE_LIST.some((h) => h.id === 'none')).toBe(true);
+
+    const noHelmetGear = normalizeOperatorGearConfig({
+      helmetType: 'none',
+      nvgMount: 'arnvg',
+      faceGear: 'open_face',
+      eyewear: 'tinted_visor',
+    });
+    expect(noHelmetGear.helmetType).toBe('none');
+    expect(noHelmetGear.nvgMount).toBe('none');
+
+    for (const opId of ['MALE', 'FEMALE'] as const) {
+      const skel = new CharacterSkeleton(1, 'team_a', opId, true, noHelmetGear);
+      expect(skel.headGroup.getObjectByName('helmet_mich')!.visible).toBe(false);
+      expect(skel.headGroup.getObjectByName('helmet_mil_tec')!.visible).toBe(false);
+      skel.setIrStrobe(true);
+      expect(skel.headGroup.getObjectByName('ir_strobe_housing')!.visible).toBe(false);
+      expect(validateOperatorRig(skel.root, opId, 'STRICT').valid).toBe(true);
+      skel.dispose();
+    }
+
+    const opFactory = new TacticalOperatorRigFactory(1);
+    const bareRig = opFactory.buildOperator('bot', 'op_no_helmet', 'team_a', 'MALE');
+    bareRig.setGearAppearance(noHelmetGear);
+    bareRig.setIrStrobe(true, true);
+    expect(bareRig.headGroup.getObjectByName('rig_helmet_shell')!.visible).toBe(false);
+    expect(bareRig.headGroup.getObjectByName('rig_helmet_rim')!.visible).toBe(false);
+    expect(bareRig.headGroup.getObjectByName('rig_helmet_band')!.visible).toBe(false);
+    expect(bareRig.headGroup.getObjectByName('rig_ir_strobe_housing')!.visible).toBe(false);
+    expect(bareRig.headGroup.getObjectByName('rig_nvg_shroud')!.visible).toBe(false);
+    opFactory.dispose();
+
+    const roomState: LobbyRoomState = {
+      code: 'TST003',
+      hostUserId: 'host_1',
+      hostUsername: 'HOST',
+      visibility: 'private',
+      mode: 'battle',
+      battleRule: 'tdm',
+      mapId: 'timberline_compound',
+      maxPlayers: 8,
+      botsEnabled: true,
+      botCount: 4,
+      killLimit: 30,
+      botDifficulty: 'tactical',
+      status: 'in_match',
+      matchSequence: 1,
+      specialEvent: null,
+      members: [
+        {
+          userId: 'host_1',
+          username: 'HOST',
+          team: 'A',
+          ready: true,
+          isHost: true,
+          rank: 1,
+          prestige: 0,
+          connected: true,
+          joinedAt: Date.now(),
+        },
+        {
+          userId: 'peer_2',
+          username: 'PEER',
+          team: 'B',
+          ready: true,
+          isHost: false,
+          rank: 1,
+          prestige: 0,
+          connected: true,
+          joinedAt: Date.now(),
+        },
+      ],
+      chat: [],
+      updatedAt: Date.now(),
+    };
+    const matchState = createDefaultMatchState();
+    const packet = validateAndSanitizeGameMessage(
+      {
+        type: 'game:state',
+        x: 0,
+        y: 0,
+        z: 0,
+        yaw: 0,
+        pitch: 0,
+        weaponId: 'm4a1',
+        hp: 100,
+        maxHp: 100,
+        alive: true,
+        helmetType: 'none',
+        nvgMount: 'arnvg',
+      },
+      roomState,
+      matchState,
+      { userId: 'peer_2', username: 'PEER' },
+    );
+    expect(packet).toBeTruthy();
+    expect(packet!.payload.helmetType).toBe('none');
+    expect(packet!.payload.nvgMount).toBe('none');
+  });
+
+  it('builds contoured polycarbonate ballistic visors with MeshPhysicalMaterial clearcoat and upright helmet brow clearance', () => {
+    const skel = new CharacterSkeleton(1, 'team_a', 'MALE', true, {
+      helmetType: 'mich',
+      eyewear: 'tinted_visor',
+    });
+    const asm = skel.getHeadAssembly()!;
+    let physicalVisorCount = 0;
+    asm.eyewearGroups.tintedVisor.traverse((obj) => {
+      if ((obj as THREE.Mesh).isMesh) {
+        const mat = (obj as THREE.Mesh).material as THREE.MeshPhysicalMaterial;
+        if (mat && mat.isMeshPhysicalMaterial && mat.transparent) {
+          expect(mat.clearcoat).toBeGreaterThanOrEqual(0.95);
+          expect(mat.depthWrite).toBe(true);
+          physicalVisorCount += 1;
+        }
+      }
+    });
+    expect(physicalVisorCount).toBeGreaterThan(0);
+    // Helmets sit slightly pitched back to expose brow & eyes cleanly (positive rotation.x)
+    const michShell = skel.headGroup.getObjectByName('helmet_mich_shell')!;
+    const fastShell = skel.headGroup.getObjectByName('helmet_mil_tec_shell')!;
+    expect(michShell.rotation.x).toBeGreaterThan(0.05);
+    expect(fastShell.rotation.x).toBeGreaterThan(0.05);
+    skel.dispose();
+
+    const zLib = new InfectedZombieRigLibrary();
+    const guard = zLib.buildZombie('z_guard_visor', 'quarantine_guard');
+    let guardPhysicalVisors = 0;
+    guard.headGroup.traverse((obj) => {
+      if ((obj as THREE.Mesh).isMesh) {
+        const mat = (obj as THREE.Mesh).material as THREE.MeshPhysicalMaterial;
+        if (mat && mat.isMeshPhysicalMaterial && mat.transparent) {
+          expect(mat.clearcoat).toBeGreaterThanOrEqual(0.95);
+          expect(mat.depthWrite).toBe(true);
+          guardPhysicalVisors += 1;
+        }
+      }
+    });
+    expect(guardPhysicalVisors).toBeGreaterThan(0);
+    zLib.dispose();
+  });
+
+  it('enforces [F] as the sole interact key and UI prompt across Hideout, Zombies Outpost, and Gym', () => {
+    const hideoutCtrl = readFileSync(resolve(process.cwd(), 'hideout/HideoutSessionController.ts'), 'utf8');
+    const zombiesCtrl = readFileSync(resolve(process.cwd(), 'hideout/ZombiesLobbyController.ts'), 'utf8');
+    const gymHud = readFileSync(resolve(process.cwd(), 'gym/GymHud.tsx'), 'utf8');
+    const gymWorld = readFileSync(resolve(process.cwd(), 'gym/GymWorld.ts'), 'utf8');
+    const gymEngine = readFileSync(resolve(process.cwd(), 'gym/GymEngine.ts'), 'utf8');
+
+    expect(hideoutCtrl).not.toMatch(/key:\s*'E'/);
+    expect(zombiesCtrl).not.toMatch(/key:\s*'E'/);
+    expect(zombiesCtrl).not.toContain('E / F');
+    expect(gymHud).toContain('[F] Open Gunsmithing Bench');
+    expect(gymHud).not.toContain('[E]');
+    expect(gymWorld).toContain('LOOK + [F]: MODIFY FIREARM');
+    expect(gymWorld).not.toContain('[E]');
+    expect(gymEngine).not.toContain('Gunsmith Bench [E]');
+    expect(gymEngine).not.toMatch(/case 'KeyE':(?:(?!\bbreak;)[\s\S])*?(openGunsmith|executeSelectedInteract)/);
+    expect(hideoutCtrl).not.toMatch(/case 'KeyE':(?:(?!\bbreak;)[\s\S])*?(openGunsmith|executeSelectedInteract)/);
+    expect(zombiesCtrl).not.toMatch(/case 'KeyE':(?:(?!\bbreak;)[\s\S])*?(openGunsmith|executeSelectedInteract)/);
+  });
 });
+
 
 
 

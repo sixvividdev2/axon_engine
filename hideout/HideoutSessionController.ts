@@ -85,7 +85,7 @@ export interface HideoutPromptOption {
 }
 
 export interface HideoutPromptState {
-  key: 'F' | 'E';
+  key: 'F';
   targetLabel?: string;
   options: HideoutPromptOption[];
   selectedIndex: number;
@@ -2115,13 +2115,12 @@ export class HideoutSessionController {
     if (meta.kind === 'airlock_override') {
       this.selectedOptionIndex = 0;
       this.activePrompt = {
-        key: 'E',
+        key: 'F',
         targetLabel: 'Bio-Containment Airlock Override',
         options: [
           {
             id: 'enter_zombies_outpost',
             label: 'Cycle Airlock → Quarantine Outpost',
-            hint: 'E / F',
           },
         ],
         selectedIndex: 0,
@@ -2349,16 +2348,7 @@ export class HideoutSessionController {
         this.input.leanLeft = true;
         break;
       case 'KeyE':
-        if (
-          !e.repeat &&
-          !this.pdaDevice.isBlockingWeaponActions() &&
-          this.activeTarget?.source === 'prop' &&
-          this.activeTarget.meta.kind === 'airlock_override'
-        ) {
-          this.executeSelectedInteract();
-          break;
-        }
-        // Pure lean right everywhere else — zero interference with [F] interactions!
+        // Pure lean right everywhere — zero interference with [F] interactions!
         this.input.leanRight = true;
         break;
       case 'KeyF':

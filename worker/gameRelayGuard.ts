@@ -271,14 +271,18 @@ export function validateAndSanitizeGameMessage(
     if (typeof parsed.gloveColor === 'string') {
       safePayload.gloveColor = parsed.gloveColor.slice(0, 24);
     }
-    if (parsed.helmetType === 'mich' || parsed.helmetType === 'mil_tec') {
+    if (
+      parsed.helmetType === 'none' ||
+      parsed.helmetType === 'mich' ||
+      parsed.helmetType === 'mil_tec'
+    ) {
       safePayload.helmetType = parsed.helmetType;
     }
     if (typeof parsed.helmetColor === 'string') {
       safePayload.helmetColor = parsed.helmetColor.slice(0, 24);
     }
     if (parsed.nvgMount === 'none' || parsed.nvgMount === 'pvs7' || parsed.nvgMount === 'arnvg') {
-      safePayload.nvgMount = parsed.helmetType === 'mich' ? 'none' : parsed.nvgMount;
+      safePayload.nvgMount = parsed.helmetType === 'mil_tec' ? parsed.nvgMount : 'none';
     }
     if (typeof parsed.nvgFlipped === 'boolean') {
       safePayload.nvgFlipped = parsed.nvgFlipped;
@@ -473,6 +477,19 @@ export function validateAndSanitizeGameMessage(
       VALID_UNIFORM_IDS.has(parsed.uniformId as OperatorUniformId)
     ) {
       safePayload.uniformId = parsed.uniformId;
+    }
+    if (
+      parsed.helmetType === 'none' ||
+      parsed.helmetType === 'mich' ||
+      parsed.helmetType === 'mil_tec'
+    ) {
+      safePayload.helmetType = parsed.helmetType;
+    }
+    if (typeof parsed.helmetColor === 'string') {
+      safePayload.helmetColor = parsed.helmetColor.slice(0, 24);
+    }
+    if (parsed.nvgMount === 'none' || parsed.nvgMount === 'pvs7' || parsed.nvgMount === 'arnvg') {
+      safePayload.nvgMount = parsed.helmetType === 'mil_tec' ? parsed.nvgMount : 'none';
     }
     if (
       parsed.faceGear === 'open_face' ||

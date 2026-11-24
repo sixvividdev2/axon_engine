@@ -199,6 +199,7 @@ export class CharacterSkeleton {
   private arnvgMountGroup: THREE.Group | null = null;
   private nvgFlippedDown = false;
   private neckGaiterCollarMesh: THREE.Mesh | null = null;
+  private irStrobeHousingMesh: THREE.Mesh | null = null;
   private headAssembly: BuiltAnatomicalHeadAssembly | null = null;
   private readonly facialController: FacialExpressionController;
   private readonly _facialInputScratch: FacialExpressionInput = {
@@ -934,37 +935,38 @@ export class CharacterSkeleton {
     this.michHelmetGroup = michGroup;
 
     const michShell = new THREE.Mesh(
-      this.geo(new THREE.SphereGeometry(0.120, 18, 12, 0, Math.PI * 2, 0, Math.PI * 0.67)),
+      this.geo(new THREE.SphereGeometry(0.106, 20, 14, 0, Math.PI * 2, 0, Math.PI * 0.54)),
       this.helmetMat,
     );
-    michShell.scale.set(0.97 * scaleX, 1.04, 1.08);
-    michShell.position.set(0, 0.112, 0.004);
-    michShell.rotation.x = -0.07;
+    michShell.name = 'helmet_mich_shell';
+    michShell.scale.set(0.94 * scaleX, 1.00, 1.08);
+    michShell.position.set(0, 0.128, 0.004);
+    michShell.rotation.x = 0.16;
     registerHeadMesh(michGroup, michShell);
 
     // Full-cut side ear-flares characteristic of MICH-2000
     for (const side of [-1, 1]) {
       const earFlare = new THREE.Mesh(
-        this.geo(new THREE.CylinderGeometry(0.046, 0.052, 0.062, 10, 1, false, 0, Math.PI)),
+        this.geo(new THREE.CylinderGeometry(0.040, 0.046, 0.056, 10, 1, false, 0, Math.PI)),
         this.helmetMat,
       );
       earFlare.rotation.y = side > 0 ? 0 : Math.PI;
       earFlare.rotation.z = -side * 0.14;
       earFlare.scale.set(0.52, 1.0, 1.25);
-      earFlare.position.set(side * 0.096 * scaleX, 0.088, 0.006);
+      earFlare.position.set(side * 0.088 * scaleX, 0.095, 0.008);
       registerHeadMesh(michGroup, earFlare);
 
-      const chinStrap = new THREE.Mesh(this.geo(new THREE.BoxGeometry(0.009, 0.064, 0.012)), this.knuckleMat);
-      chinStrap.position.set(side * 0.088 * scaleX, 0.056, -0.022);
+      const chinStrap = new THREE.Mesh(this.geo(new THREE.BoxGeometry(0.008, 0.058, 0.011)), this.knuckleMat);
+      chinStrap.position.set(side * 0.080 * scaleX, 0.062, -0.018);
       chinStrap.rotation.z = side * 0.18;
       registerHeadMesh(michGroup, chinStrap);
     }
 
     // Subtle matte brim trim band
-    const michBrim = new THREE.Mesh(this.geo(new THREE.TorusGeometry(0.115, 0.006, 6, 20)), this.knuckleMat);
-    michBrim.rotation.x = Math.PI * 0.5 - 0.07;
-    michBrim.scale.set(0.96 * scaleX, 1.07, 1.0);
-    michBrim.position.set(0, 0.124, 0.002);
+    const michBrim = new THREE.Mesh(this.geo(new THREE.TorusGeometry(0.103, 0.0055, 6, 22)), this.knuckleMat);
+    michBrim.rotation.x = Math.PI * 0.5 + 0.16;
+    michBrim.scale.set(0.93 * scaleX, 1.07, 1.0);
+    michBrim.position.set(0, 0.125, 0.004);
     registerHeadMesh(michGroup, michBrim);
 
     // === 2. MIL-TEC HIGH-CUT HELMET (ARC rails, ear-pro, counterweight, Wilcox NVG shroud) ===
@@ -974,45 +976,46 @@ export class CharacterSkeleton {
     this.milTecHelmetGroup = milTecGroup;
 
     const fastShell = new THREE.Mesh(
-      this.geo(new THREE.SphereGeometry(0.117, 18, 12, 0, Math.PI * 2, 0, Math.PI * 0.60)),
+      this.geo(new THREE.SphereGeometry(0.104, 20, 14, 0, Math.PI * 2, 0, Math.PI * 0.50)),
       this.helmetMat,
     );
-    fastShell.scale.set(0.95 * scaleX, 1.02, 1.06);
-    fastShell.position.set(0, 0.115, 0.002);
-    fastShell.rotation.x = -0.10;
+    fastShell.name = 'helmet_mil_tec_shell';
+    fastShell.scale.set(0.92 * scaleX, 0.98, 1.06);
+    fastShell.position.set(0, 0.130, 0.002);
+    fastShell.rotation.x = 0.16;
     registerHeadMesh(milTecGroup, fastShell);
 
     // Front Wilcox L4G24 NVG shroud baseplate + dove-tail socket
-    const nvgShroud = new THREE.Mesh(this.geo(new THREE.BoxGeometry(0.044, 0.052, 0.022)), this.hardwareMat);
-    nvgShroud.position.set(0, 0.168, -0.112);
-    nvgShroud.rotation.x = -0.22;
+    const nvgShroud = new THREE.Mesh(this.geo(new THREE.BoxGeometry(0.040, 0.046, 0.020)), this.hardwareMat);
+    nvgShroud.position.set(0, 0.175, -0.103);
+    nvgShroud.rotation.x = -0.18;
     registerHeadMesh(milTecGroup, nvgShroud);
 
-    const shroudPlate = new THREE.Mesh(this.geo(new THREE.BoxGeometry(0.032, 0.036, 0.012)), this.nvgAluminumMat);
-    shroudPlate.position.set(0, 0.169, -0.121);
-    shroudPlate.rotation.x = -0.22;
+    const shroudPlate = new THREE.Mesh(this.geo(new THREE.BoxGeometry(0.028, 0.032, 0.011)), this.nvgAluminumMat);
+    shroudPlate.position.set(0, 0.176, -0.111);
+    shroudPlate.rotation.x = -0.18;
     registerHeadMesh(milTecGroup, shroudPlate);
 
     // Side ARC accessory rails & Peltor ComTac ear-pro cups
     for (const side of [-1, 1]) {
-      const arcRail = new THREE.Mesh(this.geo(new THREE.BoxGeometry(0.014, 0.028, 0.105)), this.knuckleMat);
-      arcRail.position.set(side * 0.104 * scaleX, 0.132, -0.006);
+      const arcRail = new THREE.Mesh(this.geo(new THREE.BoxGeometry(0.012, 0.024, 0.098)), this.knuckleMat);
+      arcRail.position.set(side * 0.092 * scaleX, 0.140, -0.006);
       arcRail.rotation.z = -side * 0.12;
       registerHeadMesh(milTecGroup, arcRail);
 
-      const earCup = new THREE.Mesh(this.geo(new THREE.CylinderGeometry(0.032, 0.035, 0.028, 12)), this.knuckleMat);
+      const earCup = new THREE.Mesh(this.geo(new THREE.CylinderGeometry(0.029, 0.032, 0.026, 12)), this.knuckleMat);
       earCup.rotation.z = Math.PI * 0.5;
-      earCup.position.set(side * 0.102 * scaleX, 0.084, 0.004);
+      earCup.position.set(side * 0.090 * scaleX, 0.096, 0.004);
       registerHeadMesh(milTecGroup, earCup);
     }
 
     // Rear helmet battery pack / counterweight + IFF strobe patch
-    const counterWeight = new THREE.Mesh(this.geo(new THREE.BoxGeometry(0.072, 0.044, 0.030)), this.pouchMat);
-    counterWeight.position.set(0, 0.124, 0.112);
+    const counterWeight = new THREE.Mesh(this.geo(new THREE.BoxGeometry(0.068, 0.040, 0.026)), this.pouchMat);
+    counterWeight.position.set(0, 0.118, 0.104);
     registerHeadMesh(milTecGroup, counterWeight);
 
-    const rearIff = new THREE.Mesh(this.geo(new THREE.BoxGeometry(0.056, 0.022, 0.008)), this.iffTrimMat);
-    rearIff.position.set(0, 0.168, 0.106);
+    const rearIff = new THREE.Mesh(this.geo(new THREE.BoxGeometry(0.052, 0.020, 0.008)), this.iffTrimMat);
+    rearIff.position.set(0, 0.158, 0.100);
     registerHeadMesh(milTecGroup, rearIff);
 
     // Helmet crown IR IFF strobe housing (Layer 0) + blinking NVG-only IR emitter (IR_LAYER = 2)
@@ -1020,14 +1023,16 @@ export class CharacterSkeleton {
       this.geo(new THREE.BoxGeometry(0.026, 0.013, 0.036)),
       this.irStrobeHousingMat,
     );
-    strobeHousing.position.set(0, 0.222, 0.030);
+    strobeHousing.name = 'ir_strobe_housing';
+    strobeHousing.position.set(0, 0.228, 0.025);
     registerHeadMesh(this.headGroup, strobeHousing);
+    this.irStrobeHousingMesh = strobeHousing;
 
     const strobeEmitter = new THREE.Mesh(
       this.geo(new THREE.SphereGeometry(0.011, 8, 6)),
       this.irStrobeEmitterMat,
     );
-    strobeEmitter.position.set(0, 0.233, 0.030);
+    strobeEmitter.position.set(0, 0.238, 0.025);
     strobeEmitter.layers.set(IR_LAYER);
     strobeEmitter.visible = false;
     this.headGroup.add(strobeEmitter);
@@ -1036,7 +1041,7 @@ export class CharacterSkeleton {
     // === ARTICULATING NVG PIVOT ARM (child of Mil-Tec helmet shroud) ===
     const nvgPivot = new THREE.Group();
     nvgPivot.name = 'nvg_mount_pivot';
-    nvgPivot.position.set(0, 0.165, -0.126);
+    nvgPivot.position.set(0, 0.174, -0.116);
     milTecGroup.add(nvgPivot);
     this.nvgPivotGroup = nvgPivot;
 
@@ -1196,12 +1201,20 @@ export class CharacterSkeleton {
     const g = this.currentGear;
     const preset = TACTICAL_UNIFORM_PRESETS[this.currentUniformId] ?? TACTICAL_UNIFORM_PRESETS.infection;
 
-    // 1. Helmet model & color
+    // 1. Helmet model, strobe visibility & color
     if (this.michHelmetGroup) {
       this.michHelmetGroup.visible = g.helmetType === 'mich';
     }
     if (this.milTecHelmetGroup) {
       this.milTecHelmetGroup.visible = g.helmetType === 'mil_tec';
+    }
+    if (this.irStrobeHousingMesh) {
+      this.irStrobeHousingMesh.visible = g.helmetType !== 'none';
+    }
+    if (g.helmetType === 'none') {
+      for (let i = 0; i < this.irStrobeEmitterMeshes.length; i++) {
+        this.irStrobeEmitterMeshes[i].visible = false;
+      }
     }
     const hSpec = HELMET_COLOR_MAP[g.helmetColor];
     this.helmetMat.color.setHex(
@@ -1649,7 +1662,8 @@ export class CharacterSkeleton {
   }
 
   public setIrStrobe(enabled: boolean, pulseOn = true): void {
-    const show = enabled && pulseOn && !this.headShadowOnly;
+    const show =
+      enabled && pulseOn && !this.headShadowOnly && this.currentGear.helmetType !== 'none';
     for (let i = 0; i < this.irStrobeEmitterMeshes.length; i++) {
       this.irStrobeEmitterMeshes[i].visible = show;
       if (!this.headShadowOnly) {

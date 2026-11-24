@@ -617,7 +617,71 @@ export function getSharedSkinTextures(
   ctx.quadraticCurveTo(cx, mouthY + H * 0.002, cx + W * 0.034, mouthY);
   ctx.stroke();
 
-  // Jaw / beard stubble or zombie blood & veins
+  // Realistic cropped tactical scalp hair & tapered hairline for human operators (visible when No Helmet is chosen)
+  if (variant !== 'zombie') {
+    const hairDark = palette.browHex;
+    // Draw scalp & rear nape coverage with curved hairline across forehead and temples
+    if (typeof ctx.save === 'function') ctx.save();
+    ctx.beginPath();
+    ctx.moveTo(0, 0);
+    ctx.lineTo(W, 0);
+    ctx.lineTo(W, H * 0.68);
+    // Right nape behind ear -> temple -> forehead hairline -> left temple -> left nape
+    ctx.bezierCurveTo(W * 0.88, H * 0.64, W * 0.80, H * 0.56, W * 0.74, H * 0.44);
+    ctx.quadraticCurveTo(W * 0.67, H * 0.35, W * 0.62, H * 0.34);
+    ctx.quadraticCurveTo(cx, H * (variant === 'female' ? 0.32 : 0.345), W * 0.38, H * 0.34);
+    ctx.quadraticCurveTo(W * 0.33, H * 0.35, W * 0.26, H * 0.44);
+    ctx.bezierCurveTo(W * 0.20, H * 0.56, W * 0.12, H * 0.64, 0, H * 0.68);
+    ctx.closePath();
+
+    const hairGrad = ctx.createLinearGradient(0, 0, 0, H * 0.66);
+    hairGrad.addColorStop(0, hairDark);
+    hairGrad.addColorStop(0.55, hairDark);
+    hairGrad.addColorStop(1, palette.shadowHex);
+    ctx.globalAlpha = variant === 'female' ? 0.94 : 0.86;
+    ctx.fillStyle = hairGrad;
+    ctx.fill();
+
+    // Fine directional hair strand texture clipped inside scalp path
+    if (typeof ctx.clip === 'function') ctx.clip();
+    const hairRand = seededRand(variant === 'female' ? 617 : 509 + Math.floor(toneSeed) * 19);
+    for (let i = 0; i < 1800; i++) {
+      const hx = hairRand() * W;
+      const hy = hairRand() * H * 0.66;
+      const len = 6 + hairRand() * 14;
+      ctx.globalAlpha = 0.14 + hairRand() * 0.22;
+      ctx.strokeStyle = i % 3 === 0 ? '#0d0b0a' : hairDark;
+      ctx.lineWidth = 1.1;
+      ctx.beginPath();
+      ctx.moveTo(hx, hy);
+      ctx.lineTo(hx + (hairRand() - 0.5) * 4, hy + len);
+      ctx.stroke();
+    }
+    if (typeof ctx.restore === 'function') ctx.restore();
+
+    // Sideburns taper in front of ears
+    ctx.globalAlpha = variant === 'female' ? 0.55 : 0.48;
+    ctx.fillStyle = hairDark;
+    for (const side of [-1, 1]) {
+      const sx = cx + side * W * 0.235;
+      ctx.beginPath();
+      ctx.ellipse(sx, H * 0.485, W * 0.015, H * 0.042, side * 0.08, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // Matte hair roughness on scalp so hair does not reflect like skin
+    rctx.fillStyle = 'rgb(228,228,228)';
+    rctx.beginPath();
+    rctx.moveTo(0, 0);
+    rctx.lineTo(W, 0);
+    rctx.lineTo(W, H * 0.64);
+    rctx.quadraticCurveTo(W * 0.72, H * 0.36, cx, H * 0.34);
+    rctx.quadraticCurveTo(W * 0.28, H * 0.36, 0, H * 0.64);
+    rctx.closePath();
+    rctx.fill();
+  }
+
+  // Subtle organic skin pore noise & combat grime across face
   const rand = seededRand(variant === 'zombie' ? 991 : 401 + Math.floor(toneSeed) * 37);
   if (variant === 'male' && palette.stubbleAlpha > 0) {
     ctx.globalAlpha = palette.stubbleAlpha;
@@ -1026,93 +1090,290 @@ export function buildAnatomicalHeadAssembly(
     root.add(balaclavaGroup);
     allMeshes.push(balaLowerMask, balaNoseBridge, balaHoodCrown, balaRearNape);
 
-    // 3. Clear Ballistic Glasses
-    // NOTE: Keep `depthWrite: true` and use `renderOrder: 6` so opaque eyeballs (renderOrder 1)
-    // and facial skin (renderOrder 0) render cleanly before the lens while satisfying strict
-    // `headGroup` depthWrite invariants when headShadowOnly = false!
+    // Helper: sculpted double-curved polycarbonate visor / eye-pro shield geometry
+    const createCurvedVisorShieldGeo = (opts: {
+      scaleX: number;
+      rx: number;
+      rz: number;
+      zCenter: number;
+      azSpan: number;
+      yTop: number;
+      yBotCheek: number;
+      yBotNose: number;
+      browForwardBow: number;
+      cheekForwardBow: number;
+      segU?: number;
+      segV?: number;
+    }): THREE.BufferGeometry => {
+      const segU = opts.segU ?? 28;
+      const segV = opts.segV ?? 12;
+      const positions: number[] = [];
+      const uvs: number[] = [];
+      const indices: number[] = [];
+
+      for (let iv = 0; iv <= segV; iv++) {
+        const vFrac = iv / segV; // 0 = bottom edge, 1 = top brow edge
+        for (let iu = 0; iu <= segU; iu++) {
+          const uFrac = iu / segU; // 0..1 left to right
+          const az = (uFrac - 0.5) * 2 * opts.azSpan; // -azSpan .. +azSpan
+          const absU = Math.abs(az) / opts.azSpan;
+
+          // Contoured lower cut: subtle upward arch over the nose bridge, deeper sweep over cheeks
+          const noseArch = Math.exp(-Math.pow(absU / 0.24, 2));
+          const cornerSweep = Math.pow(absU, 2.2) * 0.008;
+          const yBot = THREE.MathUtils.lerp(opts.yBotCheek, opts.yBotNose, noseArch) + cornerSweep;
+          const yTopCurve = opts.yTop - Math.pow(absU, 2.1) * 0.006;
+          const y = THREE.MathUtils.lerp(yBot, yTopCurve, vFrac);
+
+          // Double-axis dome curvature (convex vertical arc + wraparound horizontal cylinder)
+          const domeProfile = Math.sin(vFrac * Math.PI);
+          const tiltZ = THREE.MathUtils.lerp(opts.cheekForwardBow, opts.browForwardBow, vFrac);
+          const radialBoost = domeProfile * 0.0045 + tiltZ;
+
+          const x = Math.sin(az) * (opts.rx + radialBoost * 0.4) * opts.scaleX;
+          const z = opts.zCenter - Math.cos(az) * (opts.rz + radialBoost);
+
+          positions.push(x, y, z);
+          uvs.push(uFrac, vFrac);
+        }
+      }
+
+      for (let iv = 0; iv < segV; iv++) {
+        for (let iu = 0; iu < segU; iu++) {
+          const a = iv * (segU + 1) + iu;
+          const b = a + 1;
+          const c = a + (segU + 1);
+          const d = c + 1;
+          indices.push(a, b, d, a, d, c);
+        }
+      }
+
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+      geo.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+      geo.setIndex(indices);
+      geo.computeVertexNormals();
+      return geo;
+    };
+
+    const createCurvedBrowRimGeo = (opts: {
+      scaleX: number;
+      rx: number;
+      rz: number;
+      zCenter: number;
+      azSpan: number;
+      yHeight: number;
+      thickness: number;
+      forwardTilt: number;
+    }): THREE.TubeGeometry => {
+      const pts: THREE.Vector3[] = [];
+      const steps = 16;
+      for (let i = 0; i <= steps; i++) {
+        const t = i / steps;
+        const az = (t - 0.5) * 2 * opts.azSpan;
+        const absU = Math.abs(az) / opts.azSpan;
+        const x = Math.sin(az) * opts.rx * opts.scaleX;
+        const y = opts.yHeight - Math.pow(absU, 2.1) * 0.006;
+        const z = opts.zCenter - Math.cos(az) * (opts.rz + opts.forwardTilt);
+        pts.push(new THREE.Vector3(x, y, z));
+      }
+      const curve = new THREE.CatmullRomCurve3(pts);
+      return new THREE.TubeGeometry(curve, 24, opts.thickness, 8, false);
+    };
+
+    // 3. Clear Ballistic Glasses (curved ANSI Z87+ wraparound shield + contoured frame)
     const clearLensMat = trackMat(
-      new THREE.MeshStandardMaterial({
-        color: 0xdbeafe,
-        roughness: 0.08,
-        metalness: 0.15,
+      new THREE.MeshPhysicalMaterial({
+        color: 0xe2f1ff,
+        roughness: 0.05,
+        metalness: 0.04,
+        clearcoat: 1.0,
+        clearcoatRoughness: 0.03,
+        reflectivity: 0.92,
+        ior: 1.52,
+        envMapIntensity: 1.5,
         transparent: true,
-        opacity: 0.26,
+        opacity: 0.28,
         depthWrite: true,
+        side: THREE.DoubleSide,
       }),
     );
 
-    const topRim = new THREE.Mesh(
-      trackGeo(new THREE.BoxGeometry(0.128 * scaleX, 0.007, 0.018)),
+    const clearBrowRim = new THREE.Mesh(
+      trackGeo(
+        createCurvedBrowRimGeo({
+          scaleX,
+          rx: 0.080,
+          rz: 0.082,
+          zCenter: -0.019,
+          azSpan: 0.94,
+          yHeight: 0.119,
+          thickness: 0.0036,
+          forwardTilt: 0.003,
+        }),
+      ),
       frameMaterial,
     );
-    topRim.position.set(0, 0.118, -0.097);
 
     const clearLens = new THREE.Mesh(
-      trackGeo(new THREE.CylinderGeometry(0.068 * scaleX, 0.068 * scaleX, 0.028, 18, 1, false, Math.PI * 0.72, Math.PI * 0.56)),
+      trackGeo(
+        createCurvedVisorShieldGeo({
+          scaleX,
+          rx: 0.079,
+          rz: 0.081,
+          zCenter: -0.019,
+          azSpan: 0.92,
+          yTop: 0.118,
+          yBotCheek: 0.091,
+          yBotNose: 0.099,
+          browForwardBow: 0.003,
+          cheekForwardBow: 0.0,
+        }),
+      ),
       clearLensMat,
     );
-    clearLens.scale.set(1.0, 1.0, 0.58);
-    clearLens.position.set(0, 0.104, -0.061);
     clearLens.renderOrder = 6;
 
     const nosePad = new THREE.Mesh(
-      trackGeo(new THREE.BoxGeometry(0.012, 0.012, 0.010)),
+      trackGeo(new THREE.BoxGeometry(0.011, 0.011, 0.009)),
       frameMaterial,
     );
-    nosePad.position.set(0, 0.095, -0.100);
+    nosePad.position.set(0, 0.098, -0.098);
 
     for (const side of [-1, 1]) {
       const templeArm = new THREE.Mesh(
-        trackGeo(new THREE.BoxGeometry(0.005, 0.006, 0.092)),
+        trackGeo(new THREE.BoxGeometry(0.0045, 0.0055, 0.088)),
         frameMaterial,
       );
-      templeArm.position.set(side * 0.066 * scaleX, 0.114, -0.048);
+      templeArm.position.set(side * 0.068 * scaleX, 0.113, -0.032);
+      templeArm.rotation.y = -side * 0.06;
       clearGlassesGroup.add(templeArm);
       allMeshes.push(templeArm);
     }
 
-    clearGlassesGroup.add(topRim, clearLens, nosePad);
+    clearGlassesGroup.add(clearBrowRim, clearLens, nosePad);
     root.add(clearGlassesGroup);
-    allMeshes.push(topRim, clearLens, nosePad);
+    allMeshes.push(clearBrowRim, clearLens, nosePad);
 
-    // 4. Tinted Ballistic Visor (smoke polycarbonate wraparound shield)
+    // 4. Tinted Ballistic Visor (sculpted double-curved polycarbonate helmet/tactical shield + rubber gasket + side pivot mounts)
     const tintedVisorMat = trackMat(
-      new THREE.MeshStandardMaterial({
-        color: 0x151d24,
-        roughness: 0.12,
-        metalness: 0.78,
+      new THREE.MeshPhysicalMaterial({
+        color: 0x0e1722,
+        roughness: 0.06,
+        metalness: 0.18,
+        clearcoat: 1.0,
+        clearcoatRoughness: 0.04,
+        reflectivity: 0.96,
+        ior: 1.54,
+        envMapIntensity: 1.85,
         transparent: true,
-        opacity: 0.86,
+        opacity: 0.72,
         depthWrite: true,
+        side: THREE.DoubleSide,
       }),
     );
-    const visorBrow = new THREE.Mesh(
-      trackGeo(new THREE.BoxGeometry(0.136 * scaleX, 0.008, 0.022)),
-      frameMaterial,
-    );
-    visorBrow.position.set(0, 0.121, -0.099);
 
+    const visorGasketMat = trackMat(
+      new THREE.MeshStandardMaterial({
+        color: 0x15181d,
+        roughness: 0.82,
+        metalness: 0.08,
+      }),
+    );
+
+    const visorHardwareMat = trackMat(
+      new THREE.MeshStandardMaterial({
+        color: 0x262c35,
+        roughness: 0.34,
+        metalness: 0.78,
+      }),
+    );
+
+    // Molded top brow rubber gasket + reinforced upper carrier bar
+    const visorBrowSeal = new THREE.Mesh(
+      trackGeo(
+        createCurvedBrowRimGeo({
+          scaleX,
+          rx: 0.088,
+          rz: 0.090,
+          zCenter: -0.017,
+          azSpan: 1.08,
+          yHeight: 0.132,
+          thickness: 0.0052,
+          forwardTilt: 0.005,
+        }),
+      ),
+      visorGasketMat,
+    );
+
+    // Thin lower beveled gasket trim along bottom contour of visor
+    const lowerRimPts: THREE.Vector3[] = [];
+    for (let i = 0; i <= 18; i++) {
+      const uFrac = i / 18;
+      const az = (uFrac - 0.5) * 2 * 1.05;
+      const absU = Math.abs(az) / 1.05;
+      const noseArch = Math.exp(-Math.pow(absU / 0.24, 2));
+      const cornerSweep = Math.pow(absU, 2.2) * 0.008;
+      const y = THREE.MathUtils.lerp(0.080, 0.092, noseArch) + cornerSweep;
+      const x = Math.sin(az) * 0.087 * scaleX;
+      const z = -0.017 - Math.cos(az) * 0.089;
+      lowerRimPts.push(new THREE.Vector3(x, y, z));
+    }
+    const visorLowerTrim = new THREE.Mesh(
+      trackGeo(new THREE.TubeGeometry(new THREE.CatmullRomCurve3(lowerRimPts), 24, 0.0024, 6, false)),
+      visorGasketMat,
+    );
+
+    // Double-curved wraparound polycarbonate ballistic shield
     const visorShield = new THREE.Mesh(
-      trackGeo(new THREE.CylinderGeometry(0.072 * scaleX, 0.071 * scaleX, 0.036, 20, 1, false, Math.PI * 0.68, Math.PI * 0.64)),
+      trackGeo(
+        createCurvedVisorShieldGeo({
+          scaleX,
+          rx: 0.087,
+          rz: 0.089,
+          zCenter: -0.017,
+          azSpan: 1.05,
+          yTop: 0.132,
+          yBotCheek: 0.080,
+          yBotNose: 0.092,
+          browForwardBow: 0.005,
+          cheekForwardBow: 0.0,
+        }),
+      ),
       tintedVisorMat,
     );
-    visorShield.scale.set(1.0, 1.0, 0.60);
-    visorShield.position.set(0, 0.105, -0.060);
     visorShield.renderOrder = 6;
 
+    // Anodized side pivot hinges & retention arms connecting visor cleanly to helmet rails / temples
     for (const side of [-1, 1]) {
-      const visorArm = new THREE.Mesh(
-        trackGeo(new THREE.BoxGeometry(0.006, 0.010, 0.088)),
+      const hingeDisc = new THREE.Mesh(
+        trackGeo(new THREE.CylinderGeometry(0.011, 0.011, 0.009, 14)),
+        visorHardwareMat,
+      );
+      hingeDisc.rotation.z = Math.PI * 0.5;
+      hingeDisc.position.set(side * 0.079 * scaleX, 0.114, -0.044);
+
+      const hingeBolt = new THREE.Mesh(
+        trackGeo(new THREE.CylinderGeometry(0.0045, 0.0045, 0.011, 6)),
         frameMaterial,
       );
-      visorArm.position.set(side * 0.070 * scaleX, 0.114, -0.045);
-      tintedVisorGroup.add(visorArm);
-      allMeshes.push(visorArm);
+      hingeBolt.rotation.z = Math.PI * 0.5;
+      hingeBolt.position.set(side * 0.080 * scaleX, 0.114, -0.044);
+
+      const railBracket = new THREE.Mesh(
+        trackGeo(new THREE.BoxGeometry(0.008, 0.015, 0.052)),
+        visorHardwareMat,
+      );
+      railBracket.position.set(side * 0.079 * scaleX, 0.116, -0.020);
+      railBracket.rotation.y = -side * 0.08;
+
+      tintedVisorGroup.add(hingeDisc, hingeBolt, railBracket);
+      allMeshes.push(hingeDisc, hingeBolt, railBracket);
     }
 
-    tintedVisorGroup.add(visorBrow, visorShield);
+    tintedVisorGroup.add(visorBrowSeal, visorLowerTrim, visorShield);
     root.add(tintedVisorGroup);
-    allMeshes.push(visorBrow, visorShield);
+    allMeshes.push(visorBrowSeal, visorLowerTrim, visorShield);
   }
 
   for (const m of allMeshes) {

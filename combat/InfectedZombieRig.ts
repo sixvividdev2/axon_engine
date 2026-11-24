@@ -236,7 +236,9 @@ export class InfectedZombieRigLibrary {
 
   private readonly geoNeck: THREE.CylinderGeometry;
   private readonly geoHelmetShell: THREE.SphereGeometry;
-  private readonly geoVisor: THREE.BoxGeometry;
+  private readonly geoVisor: THREE.BufferGeometry;
+  private readonly geoVisorTrim: THREE.BufferGeometry;
+  private readonly geoVisorPivot: THREE.CylinderGeometry;
   private readonly geoRespirator: THREE.CylinderGeometry;
 
   private readonly geoShoulderCap: THREE.SphereGeometry;
@@ -276,9 +278,67 @@ export class InfectedZombieRigLibrary {
     // Neck & Archetype Headgear geometries (skull, face, eyes, jaw, and teeth use AnatomicalHeadBuilder)
     this.geoNeck = track(new THREE.CylinderGeometry(0.050, 0.064, 0.12, 8));
     this.geoHelmetShell = track(
-      new THREE.SphereGeometry(0.118, 14, 10, 0, Math.PI * 2, 0, Math.PI * 0.56),
+      new THREE.SphereGeometry(0.110, 14, 10, 0, Math.PI * 2, 0, Math.PI * 0.54),
     );
-    this.geoVisor = track(new THREE.BoxGeometry(0.175, 0.056, 0.024));
+
+    // Sculpted double-curved polycarbonate riot visor shield (replaces flat BoxGeometry)
+    const segU = 22;
+    const segV = 10;
+    const vPos: number[] = [];
+    const vUvs: number[] = [];
+    const vIdx: number[] = [];
+    const azSpan = 1.06;
+    for (let iv = 0; iv <= segV; iv++) {
+      const vf = iv / segV;
+      for (let iu = 0; iu <= segU; iu++) {
+        const uf = iu / segU;
+        const az = (uf - 0.5) * 2 * azSpan;
+        const absU = Math.abs(az) / azSpan;
+        const noseArch = Math.exp(-Math.pow(absU / 0.25, 2));
+        const yBot = THREE.MathUtils.lerp(-0.036, -0.024, noseArch) + Math.pow(absU, 2.2) * 0.008;
+        const yTop = 0.026 - Math.pow(absU, 2.0) * 0.006;
+        const y = THREE.MathUtils.lerp(yBot, yTop, vf);
+        const bow = Math.sin(vf * Math.PI) * 0.006 + vf * 0.008;
+        const x = Math.sin(az) * (0.095 + bow * 0.35);
+        const z = 0.088 - Math.cos(az) * (0.096 + bow);
+        vPos.push(x, y, z);
+        vUvs.push(uf, vf);
+      }
+    }
+    for (let iv = 0; iv < segV; iv++) {
+      for (let iu = 0; iu < segU; iu++) {
+        const a = iv * (segU + 1) + iu;
+        const b = a + 1;
+        const c = a + (segU + 1);
+        const d = c + 1;
+        vIdx.push(a, b, d, a, d, c);
+      }
+    }
+    const visorGeo = new THREE.BufferGeometry();
+    visorGeo.setAttribute('position', new THREE.Float32BufferAttribute(vPos, 3));
+    visorGeo.setAttribute('uv', new THREE.Float32BufferAttribute(vUvs, 2));
+    visorGeo.setIndex(vIdx);
+    visorGeo.computeVertexNormals();
+    this.geoVisor = track(visorGeo);
+
+    const browPts: THREE.Vector3[] = [];
+    for (let i = 0; i <= 14; i++) {
+      const uf = i / 14;
+      const az = (uf - 0.5) * 2 * azSpan;
+      const absU = Math.abs(az) / azSpan;
+      browPts.push(
+        new THREE.Vector3(
+          Math.sin(az) * 0.096,
+          0.026 - Math.pow(absU, 2.0) * 0.006,
+          0.088 - Math.cos(az) * 0.104,
+        ),
+      );
+    }
+    this.geoVisorTrim = track(
+      new THREE.TubeGeometry(new THREE.CatmullRomCurve3(browPts), 18, 0.0045, 6, false),
+    );
+    this.geoVisorPivot = track(new THREE.CylinderGeometry(0.011, 0.011, 0.010, 10));
+    this.geoVisorPivot.rotateZ(Math.PI * 0.5);
     this.geoRespirator = track(new THREE.CylinderGeometry(0.038, 0.044, 0.062, 8));
 
     // 2-Segment Articulated Arms + Clawed Hands
@@ -337,12 +397,17 @@ export class InfectedZombieRigLibrary {
       }),
     );
     const sharedVisor = track(
-      new THREE.MeshStandardMaterial({
-        color: 0x26323a,
-        roughness: 0.22,
-        metalness: 0.42,
+      new THREE.MeshPhysicalMaterial({
+        color: 0x1a2630,
+        roughness: 0.09,
+        metalness: 0.16,
+        clearcoat: 1.0,
+        clearcoatRoughness: 0.06,
+        reflectivity: 0.92,
         transparent: true,
-        opacity: 0.62,
+        opacity: 0.68,
+        depthWrite: true,
+        side: THREE.DoubleSide,
       }),
     );
 
@@ -625,12 +690,20 @@ export class InfectedZombieRigLibrary {
     // Archetype headgear accents (skewed riot helmet / respirator canister with >= 4mm facial clearance)
     if (archetype === 'quarantine_guard') {
       const helmet = makeMesh(this.geoHelmetShell, mats.gearAccent, 'head');
-      helmet.position.set(0, 0.088, 0.002);
-      helmet.rotation.set(-0.08, 0, (h & 1 ? 1 : -1) * 0.09);
+      helmet.position.set(0, 0.110, 0.004);
+      helmet.rotation.set(0.14, 0, (h & 1 ? 1 : -1) * 0.08);
       const visor = makeMesh(this.geoVisor, mats.visorMat);
-      visor.position.set(0, 0.105, -0.108);
-      visor.rotation.x = -0.35;
-      headGroup.add(helmet, visor);
+      visor.position.set(0, 0.102, -0.094);
+      visor.rotation.x = -0.18;
+      visor.renderOrder = 6;
+      const visorTrim = makeMesh(this.geoVisorTrim, mats.gearAccent);
+      visorTrim.position.copy(visor.position);
+      visorTrim.rotation.copy(visor.rotation);
+      const pivotL = makeMesh(this.geoVisorPivot, mats.gearAccent);
+      pivotL.position.set(-0.088, 0.118, -0.032);
+      const pivotR = makeMesh(this.geoVisorPivot, mats.gearAccent);
+      pivotR.position.set(0.088, 0.118, -0.032);
+      headGroup.add(helmet, visor, visorTrim, pivotL, pivotR);
     } else if (archetype === 'hazmat_tech') {
       // Torn respirator hanging crooked off lower cheek
       const resp = makeMesh(this.geoRespirator, mats.gearAccent);
