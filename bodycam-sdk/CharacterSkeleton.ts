@@ -69,6 +69,36 @@ export interface HandPoseDynamicOptions {
   leverReleased?: boolean;
 }
 
+/**
+ * Pure geometry-driven grip & handguard finger-wrap resolver:
+ * Derives anatomical phalanx tightness scalars from actual pistol-grip width/depth
+ * (`0.024m` slim Makarov -> `0.036m` wide Desert Eagle) and support handguard radius
+ * (`0.014m` slim rail -> `0.034m` wide quad-rail) so fingers never clip or float.
+ */
+export function computeGeometryDrivenGripWrap(
+  gripWidthM: number,
+  gripDepthM: number,
+  supportRadiusM: number,
+): {
+  girthNorm: number;
+  primaryWrapTight: number;
+  primaryDistTight: number;
+  supportWrapTight: number;
+} {
+  const girthNorm = THREE.MathUtils.clamp(
+    ((gripWidthM - 0.024) / 0.014) * 0.6 + ((gripDepthM - 0.038) / 0.016) * 0.4,
+    0,
+    1,
+  );
+  const supportNorm = THREE.MathUtils.clamp((supportRadiusM - 0.014) / 0.020, 0, 1);
+  return {
+    girthNorm,
+    primaryWrapTight: THREE.MathUtils.lerp(1.14, 0.78, girthNorm),
+    primaryDistTight: THREE.MathUtils.lerp(1.18, 0.72, girthNorm),
+    supportWrapTight: THREE.MathUtils.lerp(1.14, 0.76, supportNorm),
+  };
+}
+
 export interface ArticulatedFinger {
   proximal: THREE.Group;
   middle: THREE.Group;
@@ -2302,14 +2332,14 @@ export class CharacterSkeleton {
       // Geometry-driven right-hand wrap: tighter around slim grips (Makarov 0.024m), wider open arc on chunky grips (Deagle 0.036m)
       const gripW = profile ? profile.gripWidthM : 0.029;
       const gripD = profile ? profile.gripDepthM : 0.044;
-      const girthNorm = THREE.MathUtils.clamp(
-        ((gripW - 0.024) / 0.014) * 0.6 + ((gripD - 0.038) / 0.016) * 0.4,
-        0,
-        1,
+      const suppR = profile ? profile.supportRadiusM : 0.024;
+      const { girthNorm, primaryWrapTight, primaryDistTight } = computeGeometryDrivenGripWrap(
+        gripW,
+        gripD,
+        suppR,
       );
-      // Slimmer grip = slightly higher proximal/mid wrap without clipping through frame
-      const gripTight = THREE.MathUtils.lerp(1.12, 0.80, girthNorm) * scale;
-      const gripDistTight = THREE.MathUtils.lerp(1.16, 0.74, girthNorm) * scale;
+      const gripTight = primaryWrapTight * scale;
+      const gripDistTight = primaryDistTight * scale;
 
       setFinger(hand.middle, 34 * gripTight, 49 * gripTight, 30 * gripDistTight);
       setFinger(hand.ring, 37 * gripTight, 52 * gripTight, 33 * gripDistTight);
@@ -2421,8 +2451,12 @@ export class CharacterSkeleton {
             ? 'angled_grip'
             : (profile?.supportStyle ?? 'handguard');
       const suppR = profile ? profile.supportRadiusM : 0.026;
-      const rNorm = THREE.MathUtils.clamp((suppR - 0.014) / 0.020, 0, 1);
-      const wrapScale = THREE.MathUtils.lerp(1.12, 0.78, rNorm) * scale;
+      const { supportWrapTight } = computeGeometryDrivenGripWrap(
+        profile?.gripWidthM ?? 0.029,
+        profile?.gripDepthM ?? 0.044,
+        suppR,
+      );
+      const wrapScale = supportWrapTight * scale;
 
       if (style === 'vertical_grip') {
         setFinger(hand.index, 72 * wrapScale, 86 * wrapScale, 52 * wrapScale);

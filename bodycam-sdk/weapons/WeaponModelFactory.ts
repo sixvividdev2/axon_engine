@@ -1635,45 +1635,119 @@ export class WeaponModelFactory {
     // PLATFORM 6: HK MP5 ROLLER SMG ('MP5RollerSMG')
     // =========================================================================
     } else if (style === 'MP5RollerSMG') {
-      adsEyeReliefM = 0.22;
-      muzzleBasePos.set(0, 0.024, -0.415);
+      adsEyeReliefM = 0.21;
+      muzzleBasePos.set(0, 0.024, -0.422);
       suppressorExtraLenM = 0.152;
 
-      const receiver = new THREE.Mesh(buildBeveledBox(track, 0.034, 0.048, 0.218, 0.0016, 2), fin.receiver);
-      receiver.position.set(0, 0.012, -0.105);
-      const upperSpine = new THREE.Mesh(track(new THREE.CylinderGeometry(0.0145, 0.0145, 0.218, 14)), fin.receiver);
+      // 1. Stamped fluted steel upper receiver + longitudinal reinforcement ribs + magwell housing
+      const receiver = new THREE.Mesh(buildBeveledBox(track, 0.032, 0.038, 0.216, 0.0018, 2), fin.receiver);
+      receiver.position.set(0, 0.015, -0.106);
+      const upperSpine = new THREE.Mesh(track(new THREE.CylinderGeometry(0.0152, 0.0152, 0.220, 16)), fin.receiver);
       upperSpine.rotation.x = Math.PI * 0.5;
-      upperSpine.position.set(0, 0.034, -0.105);
-      const cockTube = new THREE.Mesh(track(new THREE.CylinderGeometry(0.012, 0.012, 0.185, 14)), fin.receiver);
+      upperSpine.position.set(0, 0.0335, -0.106);
+      // Iconic MP5 stamped side guide rails for A3 collapsible stock arms
+      const railChannelL = new THREE.Mesh(track(new THREE.BoxGeometry(0.0032, 0.0085, 0.206)), mats.gunmetal);
+      railChannelL.position.set(-0.0168, 0.011, -0.100);
+      const railChannelR = railChannelL.clone();
+      railChannelR.position.x = 0.0168;
+      // Flared stamped steel magwell collar + paddle release lever
+      const magWellHousing = new THREE.Mesh(buildBeveledBox(track, 0.029, 0.034, 0.050, 0.0014, 1), fin.receiver);
+      magWellHousing.position.set(0, -0.014, -0.132);
+      const magPaddle = new THREE.Mesh(track(new THREE.BoxGeometry(0.006, 0.018, 0.007)), mats.anodized);
+      magPaddle.position.set(0, -0.025, -0.102);
+      magPaddle.rotation.x = 0.25;
+      // Polymer Navy lower trigger housing
+      const triggerHousing = new THREE.Mesh(buildBeveledBox(track, 0.029, 0.026, 0.104, 0.0016, 1), mats.wornPolymer);
+      triggerHousing.position.set(0, -0.010, -0.048);
+
+      // 2. Tubular cocking tube with left-side charging slot & upward H&K slap locking notch
+      const cockTube = new THREE.Mesh(track(new THREE.CylinderGeometry(0.0124, 0.0124, 0.194, 16)), fin.receiver);
       cockTube.rotation.x = Math.PI * 0.5;
-      cockTube.position.set(0, 0.040, -0.275);
-      const handguard = new THREE.Mesh(buildBeveledBox(track, 0.038, 0.034, 0.155, 0.0024, 2), mats.wornPolymer);
-      handguard.position.set(0, 0.008, -0.270);
+      cockTube.position.set(0, 0.0375, -0.284);
+      const cockTubeCap = new THREE.Mesh(track(new THREE.CylinderGeometry(0.0126, 0.0126, 0.010, 14)), mats.gunmetal);
+      cockTubeCap.rotation.x = Math.PI * 0.5;
+      cockTubeCap.position.set(0, 0.0375, -0.382);
+      // Dark recessed left-side cocking channel + angled top locking notch for H&K slap
+      const cockSlot = new THREE.Mesh(track(new THREE.BoxGeometry(0.003, 0.0055, 0.115)), mats.anodized);
+      cockSlot.position.set(-0.0118, 0.0395, -0.305);
+      const cockNotch = new THREE.Mesh(track(new THREE.BoxGeometry(0.0032, 0.009, 0.010)), mats.anodized);
+      cockNotch.position.set(-0.0118, 0.0445, -0.252);
+      cockNotch.rotation.x = 0.28;
+
+      // 3. Wide contoured "Tropical" MP5 polymer handguard (rounded triangular cross-section + venting ribs)
+      const hgGroup = new THREE.Group();
+      hgGroup.name = 'mp5TropicalHandguard';
+      const hgLower = new THREE.Mesh(track(new THREE.CylinderGeometry(0.0185, 0.0225, 0.168, 14)), mats.wornPolymer);
+      hgLower.rotation.x = Math.PI * 0.5;
+      hgLower.scale.set(0.96, 1.0, 0.86);
+      hgLower.position.set(0, 0.007, -0.278);
+      const hgFlankL = new THREE.Mesh(buildBeveledBox(track, 0.010, 0.025, 0.162, 0.0022, 2), mats.wornPolymer);
+      hgFlankL.position.set(-0.0155, 0.016, -0.278);
+      hgFlankL.rotation.z = -0.26;
+      const hgFlankR = hgFlankL.clone();
+      hgFlankR.position.x = 0.0155;
+      hgFlankR.rotation.z = 0.26;
+      const hgPin = new THREE.Mesh(track(new THREE.CylinderGeometry(0.0032, 0.0032, 0.038, 10)), mats.gunmetal);
+      hgPin.rotation.z = Math.PI * 0.5;
+      hgPin.position.set(0, 0.010, -0.354);
+      hgGroup.add(hgLower, hgFlankL, hgFlankR, hgPin);
+
+      // 4. Cold-hammer-forged barrel + iconic MP5 3-lug suppressor adapter muzzle
       const barrel = buildHollowBarrel(track, mats, {
-        outerRadiusFront: 0.009,
-        outerRadiusRear: 0.0095,
-        length: 0.125,
-        boreRadius: 0.0046,
+        outerRadiusFront: 0.0086,
+        outerRadiusRear: 0.0096,
+        length: 0.132,
+        boreRadius: 0.0045,
         material: fin.barrel,
         includeThreads: true,
       });
-      barrel.position.set(0, 0.024, -0.352);
-      // A3 Collapsible Wireframe Stock
-      const sCap = new THREE.Mesh(buildBeveledBox(track, 0.036, 0.052, 0.022, 0.0014, 1), fin.receiver);
-      sCap.position.set(0, 0.012, 0.012);
-      const sArmL = new THREE.Mesh(track(new THREE.BoxGeometry(0.006, 0.010, 0.195)), mats.gunmetal);
-      sArmL.position.set(-0.017, 0.006, 0.112);
+      barrel.position.set(0, 0.024, -0.358);
+      for (let lugIdx = 0; lugIdx < 3; lugIdx++) {
+        const ang = (lugIdx * Math.PI * 2) / 3 + Math.PI / 6;
+        const lug = new THREE.Mesh(track(new THREE.BoxGeometry(0.0032, 0.0032, 0.010)), mats.gunmetal);
+        lug.position.set(
+          Math.cos(ang) * 0.0094,
+          0.024 + Math.sin(ang) * 0.0094,
+          -0.402,
+        );
+        lug.rotation.z = ang;
+        group.add(lug);
+      }
+
+      // 5. A3 Collapsible Steel Stock (endcap, dual telescoping arms, curved ribbed buttpad)
+      const sCap = new THREE.Mesh(buildBeveledBox(track, 0.036, 0.050, 0.024, 0.0018, 2), fin.receiver);
+      sCap.position.set(0, 0.014, 0.012);
+      const sArmL = new THREE.Mesh(track(new THREE.BoxGeometry(0.0055, 0.0095, 0.198)), mats.gunmetal);
+      sArmL.position.set(-0.0172, 0.011, 0.114);
       const sArmR = sArmL.clone();
-      sArmR.position.x = 0.017;
-      const sPad = new THREE.Mesh(buildBeveledBox(track, 0.034, 0.082, 0.016, 0.0016, 1), mats.wornPolymer);
-      sPad.position.set(0, -0.010, 0.212);
-      group.add(receiver, upperSpine, cockTube, handguard, barrel, sCap, sArmL, sArmR, sPad);
+      sArmR.position.x = 0.0172;
+      const sPad = new THREE.Mesh(buildBeveledBox(track, 0.033, 0.088, 0.018, 0.0024, 2), mats.wornPolymer);
+      sPad.position.set(0, -0.010, 0.214);
+      group.add(
+        receiver,
+        upperSpine,
+        railChannelL,
+        railChannelR,
+        magWellHousing,
+        magPaddle,
+        triggerHousing,
+        cockTube,
+        cockTubeCap,
+        cockSlot,
+        cockNotch,
+        hgGroup,
+        barrel,
+        sCap,
+        sArmL,
+        sArmR,
+        sPad,
+      );
 
       const mp5Grip = buildGripAssembly(track, mats, {
-        width: 0.026,
-        height: 0.092,
-        depth: 0.036,
-        rakeRad: 0.33,
+        width: 0.027,
+        height: 0.094,
+        depth: 0.037,
+        rakeRad: 0.34,
         pos: [0, -0.054, -0.020],
         coreMat: mats.wornPolymer,
         includeBackstrapSwell: true,
@@ -1682,83 +1756,144 @@ export class WeaponModelFactory {
       handPoseProfile.gripWidthM = mp5Grip.widthM;
       handPoseProfile.gripDepthM = mp5Grip.depthM;
       handPoseProfile.gripAngleRad = mp5Grip.rakeRad;
-      handPoseProfile.supportRadiusM = 0.020;
-      handPoseProfile.baseSupportRadiusM = 0.020;
+      handPoseProfile.supportRadiusM = 0.0215;
+      handPoseProfile.baseSupportRadiusM = 0.0215;
       handPoseProfile.supportStyle = 'handguard_cradle';
       handPoseProfile.baseSupportStyle = 'handguard_cradle';
 
       addTrigger(-0.016, -0.068, 0.014, mats.wornPolymer);
-      addThumbSelector(-0.018, -0.006, -0.044, mats.wornPolymer);
+      addThumbSelector(-0.0165, -0.006, -0.044, mats.wornPolymer);
 
+      // Bolt carrier + left-side folding charging handle (angled forward, supports authentic H&K Slap!)
       const boltGroup = new THREE.Group();
       boltGroup.name = 'boltCarrierGroup';
       slideBaseZ = 0;
-      slideTravelZ = 0.048;
-      const carrier = new THREE.Mesh(track(new THREE.BoxGeometry(0.008, 0.014, 0.052)), fin.bolt);
-      carrier.position.set(0.016, 0.024, -0.105);
-      const chKnob = new THREE.Mesh(track(new THREE.CylinderGeometry(0.0045, 0.0045, 0.024, 8)), mats.wornPolymer);
+      slideTravelZ = 0.058;
+      const carrier = new THREE.Mesh(track(new THREE.BoxGeometry(0.008, 0.014, 0.054)), fin.bolt);
+      carrier.position.set(0.0155, 0.024, -0.105);
+      const chStem = new THREE.Mesh(track(new THREE.CylinderGeometry(0.0032, 0.0036, 0.018, 8)), mats.gunmetal);
+      chStem.rotation.z = Math.PI * 0.5;
+      chStem.position.set(-0.018, 0.041, -0.348);
+      const chKnob = new THREE.Mesh(track(new THREE.CylinderGeometry(0.0046, 0.0042, 0.022, 10)), mats.wornPolymer);
       chKnob.rotation.z = Math.PI * 0.5;
-      chKnob.position.set(-0.022, 0.044, -0.345);
-      boltGroup.add(carrier, chKnob);
+      chKnob.rotation.y = 0.24;
+      chKnob.position.set(-0.027, 0.043, -0.352);
+      boltGroup.add(carrier, chStem, chKnob);
       group.add(boltGroup);
       slideOrBolt = boltGroup;
 
-      // Curved 30rd 9mm magazine
+      // Iconic curved 30rd steel 9x19mm MP5 magazine with floorplate lip
       const magGroup = new THREE.Group();
-      const ms1 = new THREE.Mesh(buildBeveledBox(track, 0.020, 0.074, 0.034, 0.0012, 1), mats.gunmetal);
-      ms1.position.set(0, 0.028, 0);
-      const ms2 = new THREE.Mesh(buildBeveledBox(track, 0.020, 0.088, 0.034, 0.0012, 1), mats.gunmetal);
-      ms2.position.set(0, -0.044, -0.010);
-      ms2.rotation.x = -0.22;
+      const ms1 = new THREE.Mesh(buildBeveledBox(track, 0.0205, 0.072, 0.034, 0.0012, 1), mats.gunmetal);
+      ms1.position.set(0, 0.030, 0);
+      const ms2 = new THREE.Mesh(buildBeveledBox(track, 0.0205, 0.092, 0.034, 0.0012, 1), mats.gunmetal);
+      ms2.position.set(0, -0.044, -0.011);
+      ms2.rotation.x = -0.24;
+      const magFloor = new THREE.Mesh(buildBeveledBox(track, 0.023, 0.007, 0.038, 0.0008, 1), mats.anodized);
+      magFloor.position.set(0, -0.089, -0.022);
+      magFloor.rotation.x = -0.24;
       const r9 = makeBrassTopCartridge(track, mats, 0.0044, 0.026);
       r9.position.set(0, 0.066, 0);
-      magGroup.add(ms1, ms2, r9);
-      magazineHomePos.set(0, -0.072, -0.132);
+      magGroup.add(ms1, ms2, magFloor, r9);
+      magazineHomePos.set(0, -0.074, -0.132);
       magazineHomeQuat.identity();
-      magazineEjectAxis.set(0, -0.96, -0.25).normalize();
+      magazineEjectAxis.set(0, -0.95, -0.28).normalize();
       magGroup.position.copy(magazineHomePos);
       group.add(magGroup);
       magazine = magGroup;
 
-      // Authentic Open V-Notch / Aperture H&K MP5 Rotating Diopter Drum (clear unobstructed sight picture!)
+      // 6. AUTHENTIC OPEN-TOP V-NOTCH H&K ROTARY DRUM REAR SIGHT (Matching G3/MP5 Reference!)
+      //    Zero closed rear ring — wide U/V cradle looking straight through onto the hooded front ring & post.
       const diopterGroup = new THREE.Group();
-      const diopterBase = new THREE.Mesh(buildBeveledBox(track, 0.019, 0.008, 0.022, 0.0009, 1), mats.gunmetal);
-      diopterBase.position.set(0, 0.047, -0.028);
-      // Lower drum pedestal below sight line
-      const diopterLower = new THREE.Mesh(track(new THREE.CylinderGeometry(0.0085, 0.009, 0.006, 14)), mats.gunmetal);
-      diopterLower.position.set(0, 0.049, -0.028);
-      // Open V-notch / aperture ring + flanking protective castle ears (NEVER blocks center sight line!)
-      const diopterRing = new THREE.Mesh(track(new THREE.TorusGeometry(0.0052, 0.0015, 8, 16)), mats.anodized);
-      diopterRing.position.set(0, 0.055, -0.028);
-      const earL = new THREE.Mesh(buildBeveledBox(track, 0.0032, 0.012, 0.014, 0.0006, 1), mats.gunmetal);
-      earL.position.set(-0.0082, 0.055, -0.028);
-      const earR = earL.clone();
-      earR.position.x = 0.0082;
-      diopterGroup.add(diopterBase, diopterLower, diopterRing, earL, earR);
+      diopterGroup.name = 'mp5RearVNotchDrum';
+      const sightZ = -0.028;
+      const sightLineY = 0.0568;
 
-      const fTower = new THREE.Mesh(buildBeveledBox(track, 0.014, 0.026, 0.018, 0.001, 1), mats.gunmetal);
-      fTower.position.set(0, 0.036, -0.365);
-      const fHood = new THREE.Mesh(track(new THREE.TorusGeometry(0.0086, 0.0019, 8, 16)), mats.anodized);
-      fHood.position.set(0, 0.055, -0.365);
-      // Matte dark steel hooded front post
-      const fPost = new THREE.Mesh(track(new THREE.BoxGeometry(0.0020, 0.009, 0.0026)), mats.anodized);
-      fPost.position.set(0, 0.0525, -0.365);
-      group.add(diopterGroup, fTower, fHood, fPost);
+      // Welded rectangular base housing sitting flush atop stamped upper spine
+      const rearBase = new THREE.Mesh(buildBeveledBox(track, 0.022, 0.0085, 0.024, 0.0010, 1), mats.gunmetal);
+      rearBase.position.set(0, 0.0445, sightZ);
+      // Lower saddle bridge below the V-notch trough (keeps central optical corridor 100% open)
+      const rearSaddle = new THREE.Mesh(buildBeveledBox(track, 0.018, 0.0046, 0.018, 0.0007, 1), mats.anodized);
+      rearSaddle.position.set(0, 0.0496, sightZ);
+
+      // Angled cylindrical rotary drum body split into left/right V-notch cheeks with open top valley
+      const drumCoreLow = new THREE.Mesh(track(new THREE.CylinderGeometry(0.0086, 0.0092, 0.0055, 16)), mats.anodized);
+      drumCoreLow.position.set(0, 0.0504, sightZ - 0.0015);
+      drumCoreLow.rotation.x = 0.20;
+
+      // Left & right angled V-notch drum cheeks (forming a crisp open-top V-notch centered at x=0, y=0.0544..0.0588)
+      const notchCheekL = new THREE.Mesh(buildBeveledBox(track, 0.0052, 0.0074, 0.0088, 0.0005, 1), mats.anodized);
+      notchCheekL.position.set(-0.0049, 0.0550, sightZ - 0.0022);
+      notchCheekL.rotation.z = 0.42;
+      notchCheekL.rotation.x = 0.16;
+      const notchCheekR = new THREE.Mesh(buildBeveledBox(track, 0.0052, 0.0074, 0.0088, 0.0005, 1), mats.anodized);
+      notchCheekR.position.set(0.0049, 0.0550, sightZ - 0.0022);
+      notchCheekR.rotation.z = -0.42;
+      notchCheekR.rotation.x = 0.16;
+
+      // Curved/tapered protective castle side ears flanking the rotary drum (distinctive H&K profile)
+      const earBaseL = new THREE.Mesh(buildBeveledBox(track, 0.0034, 0.0145, 0.017, 0.0008, 1), mats.gunmetal);
+      earBaseL.position.set(-0.0096, 0.0548, sightZ);
+      earBaseL.rotation.z = -0.06;
+      const earTipL = new THREE.Mesh(buildBeveledBox(track, 0.0030, 0.0062, 0.014, 0.0007, 1), mats.gunmetal);
+      earTipL.position.set(-0.0088, 0.0612, sightZ - 0.0005);
+      earTipL.rotation.z = -0.22;
+
+      const earBaseR = new THREE.Mesh(buildBeveledBox(track, 0.0034, 0.0145, 0.017, 0.0008, 1), mats.gunmetal);
+      earBaseR.position.set(0.0096, 0.0548, sightZ);
+      earBaseR.rotation.z = 0.06;
+      const earTipR = new THREE.Mesh(buildBeveledBox(track, 0.0030, 0.0062, 0.014, 0.0007, 1), mats.gunmetal);
+      earTipR.position.set(0.0088, 0.0612, sightZ - 0.0005);
+      earTipR.rotation.z = 0.22;
+
+      diopterGroup.add(
+        rearBase,
+        rearSaddle,
+        drumCoreLow,
+        notchCheekL,
+        notchCheekR,
+        earBaseL,
+        earTipL,
+        earBaseR,
+        earTipR,
+      );
+
+      // 7. Authentic MP5 Front Sight Triple-Frame Tower + Slim Circular Hood + Crisp Needle Front Post
+      const frontSightZ = -0.372;
+      const fTower = new THREE.Mesh(buildBeveledBox(track, 0.0135, 0.025, 0.020, 0.0011, 1), mats.gunmetal);
+      fTower.position.set(0, 0.0365, frontSightZ);
+      const fCollar = new THREE.Mesh(track(new THREE.CylinderGeometry(0.0112, 0.0116, 0.022, 14)), mats.gunmetal);
+      fCollar.rotation.x = Math.PI * 0.5;
+      fCollar.position.set(0, 0.024, frontSightZ);
+      // Slim circular protective hood ring centered precisely on sightLineY (never obscures target!)
+      const fHood = new THREE.Mesh(track(new THREE.TorusGeometry(0.0088, 0.00115, 10, 24)), mats.anodized);
+      fHood.name = 'mp5FrontSightHood';
+      fHood.position.set(0, sightLineY, frontSightZ);
+      // Sharp centered vertical front sight post rising from hood base to exact center of the ring
+      const fPost = new THREE.Mesh(track(new THREE.BoxGeometry(0.0014, 0.0086, 0.0022)), mats.anodized);
+      fPost.name = 'mp5FrontSightPost';
+      fPost.position.set(0, sightLineY - 0.0043, frontSightZ);
+      // Subtle front sling eyelet on left of triple frame
+      const fSlingLoop = new THREE.Mesh(track(new THREE.TorusGeometry(0.0052, 0.0011, 6, 12)), mats.gunmetal);
+      fSlingLoop.position.set(-0.011, 0.024, frontSightZ);
+      fSlingLoop.rotation.y = Math.PI * 0.5;
+
+      group.add(diopterGroup, fTower, fCollar, fHood, fPost, fSlingLoop);
       ironSightRearUp = diopterGroup;
 
-      ironSightAnchorPos.set(0, 0.055, -0.028);
+      ironSightAnchorPos.set(0, sightLineY, sightZ);
       sightAnchor.position.copy(ironSightAnchorPos);
-      ejectionPortSocket.position.set(0.020, 0.024, -0.105);
-      opticMountSocket.position.set(0, 0.046, -0.095);
+      ejectionPortSocket.position.set(0.0195, 0.024, -0.105);
+      opticMountSocket.position.set(0, 0.048, -0.095);
       muzzleMountSocket.position.copy(muzzleBasePos);
       suppressorGripSocket.position.set(muzzleBasePos.x, muzzleBasePos.y, muzzleBasePos.z - 0.075);
-      tacticalMountSocket.position.set(0.019, 0.012, -0.310);
-      pressurePadSocket.position.set(-0.018, 0.016, -0.280);
-      foregripMountSocket.position.set(0, -0.009, -0.270);
-      flashlightSocket.position.set(-0.026, 0.012, -0.365);
-      laserSocket.position.set(0.026, 0.014, -0.355);
+      tacticalMountSocket.position.set(0.019, 0.014, -0.314);
+      pressurePadSocket.position.set(-0.0185, 0.018, -0.282);
+      foregripMountSocket.position.set(0, -0.010, -0.278);
+      flashlightSocket.position.set(-0.025, 0.014, -0.368);
+      laserSocket.position.set(0.025, 0.015, -0.358);
       magWellSocket.position.copy(magazineHomePos);
-      boltRackSocket.position.set(-0.024, 0.044, -0.345);
+      boltRackSocket.position.set(-0.027, 0.043, -0.352);
 
     // =========================================================================
     // PLATFORM 7: FN P90 BULLPUP PDW ('P90Bullpup')

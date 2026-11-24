@@ -265,6 +265,7 @@ const _moveVec = new THREE.Vector3();
 const _worldUp = new THREE.Vector3(0, 1, 0);
 const _euler = new THREE.Euler(0, 0, 0, 'YXZ');
 const _camPos = new THREE.Vector3();
+const _camRight = new THREE.Vector3();
 const _lookDir = new THREE.Vector3();
 const _camUp = new THREE.Vector3();
 const _muzzlePos = new THREE.Vector3();
@@ -3075,6 +3076,18 @@ export class OpenWorldSessionEngine {
     });
 
     // Update Phase 3 Tactical AI Squads (vision scaled by Atmosphere + Flashlight + 3-tier LOD, frustum & occlusion culling)
+    this.camera.getWorldPosition(_camPos);
+    const camRight = _camRight.set(1, 0, 0).applyQuaternion(this.camera.quaternion);
+    const flybyCtx = {
+      listenerHeadPos: _camPos,
+      listenerRightDir: camRight,
+      audio: this.audio,
+      onSupersonicNearMiss: (flinchDeg: number, sideSign: number) => {
+        if (this.navMode === 'foot' && this.playerHp > 0) {
+          this.controller.applyBallisticMicroFlinch(flinchDeg, sideSign);
+        }
+      },
+    };
     this.aiDirector.update(
       dt,
       px,
@@ -3096,6 +3109,28 @@ export class OpenWorldSessionEngine {
         occlusionCuller: this.occlusionCuller,
         onNeutralWarning: () => {
           this.audio.playTacticalSwitchClick(true);
+        },
+        onAiGunshot: (shotEv) => {
+          this.audio.playWeaponCue('fire', {
+            position: shotEv.muzzlePos,
+            weightClass: shotEv.weightClass,
+            caliberId: shotEv.caliberId,
+            suppressed: shotEv.suppressed,
+            isSubsonic: shotEv.isSubsonic,
+            intensity: shotEv.isAmbientDistant ? 0.82 : 0.96,
+            maxAudibleDistanceM: 650,
+            speedOfSoundDelay: true,
+          });
+          if (!shotEv.isAmbientDistant && this.navMode === 'foot') {
+            BallisticsSolver.triggerSegmentFlyby(
+              shotEv.muzzlePos,
+              shotEv.targetEndPos,
+              shotEv.muzzleVelocityMs,
+              shotEv.caliberMm,
+              shotEv.energyJ,
+              flybyCtx,
+            );
+          }
         },
       },
     );
@@ -3128,11 +3163,14 @@ export class OpenWorldSessionEngine {
           turret.muzzleFlashTimer = 0.08;
           turret.muzzleFlashMesh.visible = true;
           this.aiDirector.applyTurretDamage(target.agentId, 46, turret.worldX, turret.worldZ);
-          if (Math.hypot(px - turret.worldX, pz - turret.worldZ) < 240) {
+          if (Math.hypot(px - turret.worldX, pz - turret.worldZ) <= 650) {
             this.audio.playWeaponCue('fire', {
               position: _muzzlePos.set(turret.worldX, turret.worldY, turret.worldZ),
               weightClass: 'heavy_rifle',
+              caliberId: '762x51',
               suppressed: false,
+              maxAudibleDistanceM: 650,
+              speedOfSoundDelay: true,
             });
           }
         }
@@ -3246,8 +3284,13 @@ export class OpenWorldSessionEngine {
       this.activeInteractable = null;
     }
 
-    // Step ballistic projectiles & grenades
-    this.ballistics.update(dt, this.bodycamAdapter, (ev) => this.handleBallisticImpact(ev));
+    // Step ballistic projectiles & grenades (with PCA supersonic/subsonic flyby acoustics)
+    this.ballistics.update(
+      dt,
+      this.bodycamAdapter,
+      (ev) => this.handleBallisticImpact(ev),
+      flybyCtx,
+    );
     if (this.navMode === 'foot') {
       this.camera.getWorldPosition(_camPos);
       const wasLive = this.grenadeSystem.isLeverReleased();

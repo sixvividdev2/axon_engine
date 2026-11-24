@@ -693,6 +693,7 @@ export interface SyncedZombieState {
   stagger: boolean;
   enteringWindow: boolean;
   entryStage?: 'approach' | 'tear' | 'vault' | 'pursue';
+  variant?: 'walker' | 'runner' | 'crawler';
   spawnerId: string | null;
   entryPos: [number, number, number] | null;
 }
@@ -710,6 +711,7 @@ export interface GameZombieSpawnPacket {
   z: number;
   yaw: number;
   entryPos: [number, number, number];
+  variant?: 'walker' | 'runner' | 'crawler';
   round: number;
   zombiesRemaining: number;
   ts: number;

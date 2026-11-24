@@ -107,6 +107,48 @@ export interface WeaponSyncedHandlingSnapshot {
   progress: number;
 }
 
+export type ReloadPlatformStyle =
+  | 'mp5_hk_slap'
+  | 'ar_bolt_catch'
+  | 'ak_rock_lock'
+  | 'pistol_cant'
+  | 'tubular_shotgun'
+  | 'standard';
+
+export function resolveReloadPlatformStyle(
+  visualStyle: string | undefined,
+  weightClass: 'pistol' | 'carbine' | 'heavy_rifle',
+  startedFromEmpty: boolean,
+): ReloadPlatformStyle {
+  if (visualStyle === 'MP5RollerSMG') {
+    return startedFromEmpty ? 'mp5_hk_slap' : 'standard';
+  }
+  if (
+    startedFromEmpty &&
+    (visualStyle === 'carbine_ar' ||
+      visualStyle === 'ARCarbine' ||
+      visualStyle === 'PistonCarbine' ||
+      visualStyle === 'AR10_HeavyDMR')
+  ) {
+    return 'ar_bolt_catch';
+  }
+  if (
+    visualStyle === 'carbine_ak' ||
+    visualStyle === 'rifle_ak' ||
+    visualStyle === 'AKStamped' ||
+    visualStyle === 'SovietDMR'
+  ) {
+    return 'ak_rock_lock';
+  }
+  if (weightClass === 'pistol') {
+    return 'pistol_cant';
+  }
+  if (visualStyle === 'ShotgunTactical' || visualStyle === 'shotgun') {
+    return 'tubular_shotgun';
+  }
+  return 'standard';
+}
+
 export interface WeaponPoseUpdateInput {
   dt: number;
   elapsed: number;
@@ -151,6 +193,10 @@ export interface WeaponPoseUpdateInput {
   sightMisalignRoll: number;
   lagYaw: number;
   lagPitch: number;
+  lagRoll?: number;
+  motionPosX?: number;
+  motionPosY?: number;
+  motionPosZ?: number;
   camWorldPos: Readonly<THREE.Vector3>;
   camWorldQuat: Readonly<THREE.Quaternion>;
   shoulderAnchor: THREE.Object3D;
@@ -353,12 +399,15 @@ export class WeaponAnimator {
   private reloadCueOutFired = false;
   private reloadCueInFired = false;
   private reloadCueRackFired = false;
+  private reloadCueHkLockFired = false;
   private reloadStartedFromEmpty = false;
   private magCheckOutFired = false;
   private magCheckInFired = false;
   private magazineDetachedInHand = false;
   private magCheckPullM = 0;
   private inspectLeftHandSlideZ = 0;
+  private readonly _mechPosImpulse = new THREE.Vector3();
+  private readonly _mechRotImpulse = new THREE.Vector3();
 
   // Shell-by-shell tubular shotgun reload state machine
   private tubularPhase: TubularReloadPhase = 'NONE';
@@ -656,15 +705,51 @@ export class WeaponAnimator {
     return this.tubularShellInHand;
   }
 
-  public isArBoltCatchSlap(): boolean {
-    if (this.action !== 'RELOAD' || !this.reloadStartedFromEmpty) return false;
-    const style = this.assembly?.visualStyle;
-    return (
-      style === 'carbine_ar' ||
-      style === 'ARCarbine' ||
-      style === 'PistonCarbine' ||
-      style === 'AR10_HeavyDMR'
+  public getReloadPlatformStyle(): ReloadPlatformStyle {
+    if (this.tubularPhase !== 'NONE') return 'tubular_shotgun';
+    return resolveReloadPlatformStyle(
+      this.assembly?.visualStyle,
+      this.weightClass,
+      this.reloadStartedFromEmpty,
     );
+  }
+
+  public isArBoltCatchSlap(): boolean {
+    return this.action === 'RELOAD' && this.getReloadPlatformStyle() === 'ar_bolt_catch';
+  }
+
+  public isMp5HkSlap(): boolean {
+    return this.action === 'RELOAD' && this.getReloadPlatformStyle() === 'mp5_hk_slap';
+  }
+
+  /**
+   * Drains accumulated mechanical action impulses (H&K slap jolt, mag baseplate palm-tap,
+   * AR bolt-catch slap, shotgun pump extraction/lockup) into the coupled WeaponRig spring solver.
+   */
+  public consumeMechanicalSpringImpulse(outPos: THREE.Vector3, outRot: THREE.Vector3): boolean {
+    const has =
+      this._mechPosImpulse.lengthSq() > 1e-8 || this._mechRotImpulse.lengthSq() > 1e-8;
+    outPos.copy(this._mechPosImpulse);
+    outRot.copy(this._mechRotImpulse);
+    this._mechPosImpulse.set(0, 0, 0);
+    this._mechRotImpulse.set(0, 0, 0);
+    return has;
+  }
+
+  private pushMechanicalImpulse(
+    px: number,
+    py: number,
+    pz: number,
+    pitchVel: number,
+    yawVel: number,
+    rollVel: number,
+  ): void {
+    this._mechPosImpulse.x += px;
+    this._mechPosImpulse.y += py;
+    this._mechPosImpulse.z += pz;
+    this._mechRotImpulse.x += pitchVel;
+    this._mechRotImpulse.y += yawVel;
+    this._mechRotImpulse.z += rollVel;
   }
 
   public isSuppressorActionActive(): boolean {
@@ -930,6 +1015,7 @@ export class WeaponAnimator {
     this.reloadCueOutFired = false;
     this.reloadCueInFired = false;
     this.reloadCueRackFired = false;
+    this.reloadCueHkLockFired = false;
     this.reloadStartedFromEmpty = this.isBoltLockedOpen;
     this.magazineDetachedInHand = false;
   }
@@ -1381,43 +1467,94 @@ export class WeaponAnimator {
       const p = this.getActionProgress();
 
       if (this.action === 'RELOAD') {
-        if (!this.reloadCueOutFired && p >= 0.16) {
+        const platformStyle = this.getReloadPlatformStyle();
+        const isHkSlap = platformStyle === 'mp5_hk_slap';
+        const arBoltCatch = platformStyle === 'ar_bolt_catch';
+        const isPistol = platformStyle === 'pistol_cant';
+        const isAk = platformStyle === 'ak_rock_lock';
+
+        // MP5 empty reload Phase 0 (0.00..0.14): lock cocking handle back and up into H&K detent notch
+        if (isHkSlap) {
+          if (p < 0.14) {
+            this.manualBoltPull01 = smoothstep(0.02, 0.12, p);
+          } else if (p < 0.75) {
+            this.manualBoltPull01 = 1.0;
+          }
+          if (!this.reloadCueHkLockFired && p >= 0.10) {
+            this.reloadCueHkLockFired = true;
+            this.isBoltLockedOpen = true;
+            this.emitCue('rack', 0.85);
+            this.pushMechanicalImpulse(0, 0.015, 0.045, 0.08, 0.04, 0.10);
+          }
+        }
+
+        const outBeat = isHkSlap ? 0.21 : 0.16;
+        if (!this.reloadCueOutFired && p >= outBeat) {
           this.reloadCueOutFired = true;
           this.magazineDetachedInHand = true;
           this.emitCue('mag_out', 1.0);
+          this.pushMechanicalImpulse(0, -0.022, 0.01, -0.05, 0, -0.04);
         }
         if (!this.reloadCueInFired && p >= 0.63) {
           this.reloadCueInFired = true;
           this.magazineDetachedInHand = false;
           this.restoreMagazineHome();
-          this.magSeatImpulseVel += 0.24;
-          this.emitCue('mag_in', 1.05);
+          // Crisp upward baseplate palm-tap impulse on pistols & firm magwell seat jolt on rifles
+          const tapBoost = isPistol ? 0.34 : isAk ? 0.28 : 0.24;
+          this.magSeatImpulseVel += tapBoost;
+          this.pushMechanicalImpulse(
+            0,
+            isPistol ? 0.095 : 0.068,
+            -0.018,
+            isPistol ? 0.18 : 0.12,
+            0,
+            isAk ? 0.14 : 0.06,
+          );
+          this.emitCue('mag_in', isPistol ? 1.12 : 1.05);
         }
-        const arBoltCatch = this.isArBoltCatchSlap();
-        if (!this.reloadCueRackFired && p >= 0.72) {
+        if (!this.reloadCueRackFired && p >= (isHkSlap ? 0.75 : 0.72)) {
           this.reloadCueRackFired = true;
-          if (arBoltCatch) {
+          if (isHkSlap) {
+            // Authentic H&K Slap: violent downward palm strike pops cocking handle out of detent notch!
+            this.isBoltLockedOpen = false;
+            this.manualBoltPull01 = 0;
+            this.magSeatImpulseVel -= 0.24;
+            this.pushMechanicalImpulse(0.032, -0.145, -0.055, -0.26, 0.08, -0.28);
+            this.emitCue('bolt_lock', 1.18);
+          } else if (arBoltCatch) {
             // AR-15/AR-10/HK416 empty bolt-catch paddle slap releases carrier instantaneously
             this.isBoltLockedOpen = false;
             this.magSeatImpulseVel += 0.12;
-            this.emitCue('bolt_lock', 1.0);
+            this.pushMechanicalImpulse(0.055, -0.02, -0.035, -0.09, -0.14, -0.16);
+            this.emitCue('bolt_lock', 1.04);
           } else {
+            this.pushMechanicalImpulse(0, -0.025, 0.055, 0.07, 0.05, 0.08);
             this.emitCue('rack', 1.0);
           }
         }
-        // Physical charging-handle / slide rack movement (p: 0.70 -> 0.86)
-        if (!arBoltCatch && p >= 0.70 && p <= 0.86) {
+        // Asymmetric physical charging-handle / slide rack movement (p: 0.70 -> 0.86)
+        if (!arBoltCatch && !isHkSlap && p >= 0.70 && p <= 0.86) {
           const r = (p - 0.70) / 0.16;
-          if (r < 0.55) {
-            this.manualBoltPull01 = smoothstep(0.0, 0.55, r);
+          if (r < 0.50) {
+            // Anticipation -> crisp rearward pull to mechanical stop
+            const pull = Math.pow(smoothstep(0.0, 0.50, r), 0.85);
+            this.manualBoltPull01 = pull;
+          } else if (r < 0.62) {
+            // Brief tactile dwell at mechanical rear stop
+            this.manualBoltPull01 = 1.0;
           } else {
-            // Release empty slide/bolt lockback cleanly as carrier slams forward into battery!
+            // Violent spring-driven snap forward into battery
             this.isBoltLockedOpen = false;
-            this.manualBoltPull01 = 1 - smoothstep(0.55, 1.0, r);
+            this.manualBoltPull01 = 1 - Math.pow(smoothstep(0.62, 1.0, r), 1.35);
           }
+        } else if (isHkSlap && p >= 0.75 && p <= 0.81) {
+          // Ultra-fast roller-delayed bolt slam home after the H&K palm slap
+          const slam = smoothstep(0.75, 0.81, p);
+          this.manualBoltPull01 = 1 - slam;
         }
         if (p >= 1.0) {
           this.isBoltLockedOpen = false;
+          this.reloadCueHkLockFired = false;
           this.restoreMagazineHome();
           this.action = 'NONE';
           this.actionTime = 0;
@@ -1760,28 +1897,30 @@ export class WeaponAnimator {
       if (t >= 0.33) {
         this.pumpCycleTimer = -1;
         this.pumpEjectPending = false;
-      } else if (t > 0.04) {
-        if (t < 0.16) {
-          // Stage 1: sharp rearward extraction
-          pump01 = Math.max(pump01, smoothstep(0.04, 0.16, t));
-          if (!this.pumpRackBackCueFired && t >= 0.06) {
+      } else if (t > 0.035) {
+        if (t < 0.15) {
+          // Stage 1: sharp asymmetric rearward extraction + receiver counter-pull impulse
+          pump01 = Math.max(pump01, Math.pow(smoothstep(0.035, 0.15, t), 0.82));
+          if (!this.pumpRackBackCueFired && t >= 0.055) {
             this.pumpRackBackCueFired = true;
-            this.emitCue('rack', 0.9);
+            this.pushMechanicalImpulse(0, 0.018, 0.085, 0.11, 0, -0.09);
+            this.emitCue('rack', 0.92);
           }
-        } else if (t < 0.20) {
-          // Apex dwell + spent hull ejection
+        } else if (t < 0.195) {
+          // Apex mechanical stop dwell + spent hull ejection
           pump01 = 1;
           if (this.pumpEjectPending) {
             this.pumpEjectPending = false;
             this.spawnCasingAndSmoke(this.pumpCycleSuppressed);
           }
         } else {
-          // Stage 2: decisive forward chamber lockup
-          pump01 = Math.max(pump01, 1 - smoothstep(0.20, 0.33, t));
-          if (!this.pumpRackFwdCueFired && t >= 0.24) {
+          // Stage 2: decisive forward chamber lockup + forward-downward spring jolt
+          pump01 = Math.max(pump01, 1 - Math.pow(smoothstep(0.195, 0.325, t), 1.25));
+          if (!this.pumpRackFwdCueFired && t >= 0.235) {
             this.pumpRackFwdCueFired = true;
-            this.magSeatImpulseVel += 0.10;
-            this.emitCue('bolt_lock', 0.92);
+            this.magSeatImpulseVel += 0.11;
+            this.pushMechanicalImpulse(0, -0.028, -0.095, -0.13, 0, 0.08);
+            this.emitCue('bolt_lock', 0.96);
           }
         }
       }
@@ -2075,7 +2214,7 @@ export class WeaponAnimator {
     // --- MATHEMATICALLY EXACT ADS ALIGNMENT (`sightAnchor` SOLVER + BODYCAM FREE-AIM LEAD) ---
     // Goal: place `sightAnchor` along the led sightline at `-eyeRelief` with subtle rear cheek-pivot
     // parallax (`0.025m` magnified scope / `0.06m` iron & reflex) that settles cleanly to dead-center.
-    const eyeRelief = this.assembly ? this.assembly.adsEyeReliefM : 0.23;
+    const eyeRelief = Math.max(0.175, this.assembly ? this.assembly.adsEyeReliefM : 0.23);
     const sightLocal = this.assembly ? this.assembly.sightAnchor.position : this._tmpVecB.set(0, 0.055, -0.05);
     const adsRearPivot = this.assembly?.scopeLensMaterial ? 0.025 : 0.06;
     this._tmpVecA
@@ -2223,17 +2362,33 @@ export class WeaponAnimator {
     // --- RELOAD / MAG_CHECK / INSPECT POSE-GRAPH STATES ---
     if (this.action === 'RELOAD' && input.isFirearm) {
       const p = this.getActionProgress();
+      const platformStyle = this.getReloadPlatformStyle();
       const env = smoothstep(0.0, 0.14, p) * (1 - smoothstep(0.86, 1.0, p));
       const rackTilt = smoothstep(0.66, 0.75, p) * (1 - smoothstep(0.82, 0.90, p));
+      // Platform-specific reload presentation angles:
+      //  - Pistols: ~30° inward cant exposing grip magwell cleanly along grip-rake axis
+      //  - MP5 H&K Slap: opens left cocking tube clearly at start (detent lock) & slap window (p ~ 0.75)
+      //  - AR-15: ~28° cant exposing magwell & left bolt-catch paddle
+      //  - AK: ~32° cant emphasizing front-lug rock-and-lock mag swap
+      const baseCantRad =
+        platformStyle === 'pistol_cant'
+          ? THREE.MathUtils.degToRad(30)
+          : platformStyle === 'mp5_hk_slap'
+            ? THREE.MathUtils.degToRad(24) - rackTilt * 0.22
+            : platformStyle === 'ar_bolt_catch'
+              ? THREE.MathUtils.degToRad(28)
+              : platformStyle === 'ak_rock_lock'
+                ? THREE.MathUtils.degToRad(32)
+                : 0.46;
       this._actionPos.set(
-        this._hipPos.x - 0.045 * env,
-        this._hipPos.y - 0.025 * env + rackTilt * 0.02,
-        this._hipPos.z + 0.045 * env,
+        this._hipPos.x - (platformStyle === 'pistol_cant' ? 0.035 : 0.045) * env,
+        this._hipPos.y - 0.022 * env + rackTilt * 0.022,
+        this._hipPos.z + (platformStyle === 'pistol_cant' ? 0.032 : 0.045) * env,
       );
       this._tmpEuler.set(
-        0.24 * env - 0.08 * rackTilt,
-        0.28 * env + 0.12 * rackTilt,
-        0.46 * env + 0.14 * rackTilt,
+        (platformStyle === 'pistol_cant' ? 0.28 : 0.24) * env - 0.08 * rackTilt,
+        (platformStyle === 'mp5_hk_slap' ? 0.34 : 0.28) * env + 0.12 * rackTilt,
+        baseCantRad * env + 0.12 * rackTilt,
         'YXZ',
       );
       this._actionQuat.copy(this._hipQuat).multiply(this._addQuat.setFromEuler(this._tmpEuler));
@@ -2551,9 +2706,22 @@ export class WeaponAnimator {
     // Axial rearward recoil kickback straight along the bore from muzzle into hands/shoulder
     this._tmpVecB.set(0, 0, input.recoilZ).applyQuaternion(this.dampedBaseQuat);
 
+    // Coupled 6-DOF mass-tuned spring-damper motion offsets (camera turn drag, footstep cadence, landing compression, mechanical jolts)
+    const springPosScale = THREE.MathUtils.lerp(1.0, 0.34, aimStab);
+    const springPosX = (input.motionPosX ?? 0) * springPosScale;
+    const springPosY = (input.motionPosY ?? 0) * springPosScale;
+    const springPosZ = (input.motionPosZ ?? 0) * THREE.MathUtils.lerp(1.0, 0.42, aimStab);
+
+    // Subtle organic figure-eight breath cadence (coupled smoothly with weapon weight & cheek-weld)
+    const fig8Amp = 0.0024 * breathScale * opticRotScale;
+    const fig8X = Math.sin(input.elapsed * 0.85) * fig8Amp;
+    const fig8Y = Math.sin(input.elapsed * 1.70) * fig8Amp * 0.55;
+
     input.weaponPivot.position.set(
       this.dampedBasePos.x +
         walkSwingX +
+        springPosX +
+        fig8X +
         input.breathX * 0.28 * breathScale +
         misPosX +
         this.eyeBoxLagX * eyeLagScale +
@@ -2562,13 +2730,15 @@ export class WeaponAnimator {
       this.dampedBasePos.y +
         walkSwingY +
         settleY +
+        springPosY +
+        fig8Y +
         input.breathY * 0.28 * breathScale +
         misPosY +
         this.eyeBoxLagY * eyeLagScale +
         this.magSeatImpulseY +
         this._tmpVecA.y +
         this._tmpVecB.y,
-      this.dampedBasePos.z + this._tmpVecA.z + this._tmpVecB.z,
+      this.dampedBasePos.z + springPosZ + this._tmpVecA.z + this._tmpVecB.z,
     );
 
     // ADS & Canted rotational kinematics (keeps projected 3D reticle + physical bore coupled under motion)
@@ -2580,6 +2750,8 @@ export class WeaponAnimator {
       THREE.MathUtils.clamp(input.lagPitch * 0.22 * massRotScale, -0.022, 0.022) *
       aimBlend *
       opticRotScale;
+    const coupledLagRoll =
+      (input.lagRoll ?? 0) * THREE.MathUtils.lerp(0.85, 0.30, aimStab) * opticRotScale;
     const adsLagRoll =
       THREE.MathUtils.clamp(input.lagYaw * 0.32 * massRotScale, -0.036, 0.036) *
       aimBlend *
@@ -2602,7 +2774,7 @@ export class WeaponAnimator {
         adsStridePitch +
         breathPitch,
       muzzleRecYaw + input.sightMisalignYaw + adsLagYaw + adsStrideYaw + breathYaw,
-      muzzleRecRoll + input.sightMisalignRoll + adsLagRoll + adsStrideRoll,
+      muzzleRecRoll + input.sightMisalignRoll + adsLagRoll + coupledLagRoll + adsStrideRoll,
       'YXZ',
     );
     this._addQuat.setFromEuler(this._tmpEuler);

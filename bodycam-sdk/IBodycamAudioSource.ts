@@ -29,13 +29,32 @@ export interface BodycamWeaponCueOptions {
   isSubsonic?: boolean;
   muzzleComp?: boolean;
   intensity?: number;
+  /** Optional override for maximum audible distance (defaults to 650m for unsuppressed outdoor reports) */
+  maxAudibleDistanceM?: number;
+  /** Enable physically accurate speed-of-sound propagation delay (distance / 343s) for distant reports */
+  speedOfSoundDelay?: boolean;
+}
+
+export interface BallisticFlybyParams {
+  /** World-space Point of Closest Approach (PCA) along the projectile trajectory */
+  closestPos: Readonly<THREE.Vector3>;
+  /** Instantaneous projectile speed in m/s at closest approach */
+  speedMs: number;
+  /** Perpendicular miss distance from listener head in meters */
+  missDistM: number;
+  /** Nominal bullet diameter in mm (e.g. 5.56, 7.62, 9.0, 12.7) */
+  caliberMm?: number;
+  /** Instantaneous kinetic energy in Joules */
+  energyJ?: number;
+  /** Optional shooter muzzle origin for crack-then-thump separation telemetry */
+  muzzleOrigin?: Readonly<THREE.Vector3>;
 }
 
 /**
  * Portable audio source contract for the Bodycam SDK.
  * Allows any host game engine (or the built-in `BodycamAudio` synthesizer)
  * to fulfill surface-aware footsteps, gear rattle, vault/mantle foley, melee/kick impacts,
- * mechanical weapon cues, ricochets, glass shatters, and diegetic hold-breath cues.
+ * mechanical weapon cues, ricochets, ballistic flybys, glass shatters, and diegetic hold-breath cues.
  */
 export interface IBodycamAudioSource {
   updateListener(
@@ -68,6 +87,9 @@ export interface IBodycamAudioSource {
     speedMps: number,
     surface: BodycamSurfaceMaterial,
   ): void;
+
+  /** Physically accurate supersonic N-wave crack/snap + Doppler wake or subsonic air-displacement whizz */
+  playBallisticFlyby?(params: BallisticFlybyParams): void;
 
   /** Air whip / fabric snap whoosh on jab, cross, rifle bash, or tactical push-kick */
   playMeleeWhoosh?(attackType: BodycamMeleeAttackType): void;

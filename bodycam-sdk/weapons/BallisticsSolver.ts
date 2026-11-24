@@ -6,6 +6,7 @@ import {
   mapSurfaceToBallisticMaterial,
 } from '../../data/ballisticMaterials';
 import { AmmoVariantDef } from '../../data/calibers';
+import { classifyBallisticFlyby } from '../BodycamAudio';
 import { IBodycamAudioSource } from '../IBodycamAudioSource';
 import {
   BodycamRaycastResult,
@@ -15,6 +16,92 @@ import {
 } from '../types';
 
 export type TerminalOutcome = 'ricochet' | 'fragment' | 'penetrate' | 'stop';
+
+export const BALLISTIC_FLYBY_MAX_RADIUS_M = 4.5;
+
+export interface BallisticFlybyPcaResult {
+  triggered: boolean;
+  t: number;
+  missDistM: number;
+  approachingAfter: boolean;
+}
+
+export interface BallisticFlybyContext {
+  listenerHeadPos: Readonly<THREE.Vector3>;
+  /** Optional listener right-vector (world space) used to determine left/right micro-flinch roll sign */
+  listenerRightDir?: Readonly<THREE.Vector3>;
+  audio?: IBodycamAudioSource;
+  maxRadiusM?: number;
+  onSupersonicNearMiss?: (
+    flinchDeg: number,
+    sideSign: number,
+    speedMs: number,
+    missDistM: number,
+  ) => void;
+}
+
+const _pcaD = new THREE.Vector3();
+const _pcaToHead = new THREE.Vector3();
+const _pcaClosest = new THREE.Vector3();
+const _pcaOffset = new THREE.Vector3();
+
+/**
+ * Zero-GC Point of Closest Approach (PCA) projection of listenerHeadPos onto segment [prevPos, currPos].
+ * Triggers when the projectile passes closest approach (0 < t < 1, or transitions approaching -> receding)
+ * and perpendicular miss distance r <= maxRadiusM (default 4.5m).
+ */
+export function evaluateBallisticFlybyPCA(
+  prevPos: Readonly<THREE.Vector3>,
+  currPos: Readonly<THREE.Vector3>,
+  headPos: Readonly<THREE.Vector3>,
+  maxRadiusM = BALLISTIC_FLYBY_MAX_RADIUS_M,
+  wasApproaching = false,
+  outClosestPos: THREE.Vector3 = _pcaClosest,
+): BallisticFlybyPcaResult {
+  _pcaD.subVectors(currPos, prevPos);
+  const dLenSq = _pcaD.lengthSq();
+  if (dLenSq < 1e-8) {
+    outClosestPos.copy(currPos);
+    return {
+      triggered: false,
+      t: 0,
+      missDistM: headPos.distanceTo(currPos),
+      approachingAfter: false,
+    };
+  }
+
+  _pcaToHead.subVectors(headPos, prevPos);
+  const rawT = _pcaToHead.dot(_pcaD) / dLenSq;
+  const t = THREE.MathUtils.clamp(rawT, 0, 1);
+  outClosestPos.copy(prevPos).addScaledVector(_pcaD, t);
+  const missDistM = headPos.distanceTo(outClosestPos);
+
+  // If rawT >= 1, head is still ahead of currPos (projectile approaching); if rawT < 1, projectile passed PCA
+  const approachingAfter = rawT >= 1.0;
+  const passedPCA = (rawT > 0 && rawT < 1) || (wasApproaching && rawT <= 0);
+  const triggered = passedPCA && missDistM <= maxRadiusM;
+
+  return {
+    triggered,
+    t,
+    missDistM,
+    approachingAfter,
+  };
+}
+
+function inferCaliberMmFromAmmo(ammo: AmmoVariantDef | null): number {
+  if (!ammo) return 5.56;
+  const id = `${ammo.caliberId} ${ammo.id}`.toLowerCase();
+  if (id.includes('50') || id.includes('127')) return 12.7;
+  if (id.includes('12g') || id.includes('buck')) return 8.4;
+  if (id.includes('338') || id.includes('858')) return 8.6;
+  if (id.includes('45')) return 11.43;
+  if (id.includes('9x')) return 9.0;
+  if (id.includes('762') || id.includes('308') || id.includes('300')) return 7.62;
+  if (id.includes('545')) return 5.45;
+  if (id.includes('57')) return 5.7;
+  return 5.56;
+}
 
 export interface BallisticImpactEvent {
   outcome: TerminalOutcome;
@@ -46,12 +133,17 @@ export interface BallisticShotParams {
   attachmentVelocityMult?: number;
   weaponSpreadMOA?: number;
   audio?: IBodycamAudioSource;
+  /** True for local player's own shots (excluded from incoming flyby audio); false for AI / remote players */
+  isLocalPlayer?: boolean;
+  /** Optional explicit nominal projectile caliber in mm for flyby acoustic weight */
+  caliberMm?: number;
 }
 
 interface PooledProjectile {
   active: boolean;
   pos: THREE.Vector3;
   prevPos: THREE.Vector3;
+  muzzleOrigin: THREE.Vector3;
   vel: THREE.Vector3;
   massKg: number;
   bc: number;
@@ -64,6 +156,10 @@ interface PooledProjectile {
   bouncesLeft: number;
   bounceCount: number;
   isFragment: boolean;
+  isLocalPlayer: boolean;
+  hasTriggeredFlyby: boolean;
+  wasApproachingHead: boolean;
+  caliberMm: number;
   audio: IBodycamAudioSource | undefined;
 }
 
@@ -715,6 +811,7 @@ export class BallisticsSolver {
         active: false,
         pos: new THREE.Vector3(),
         prevPos: new THREE.Vector3(),
+        muzzleOrigin: new THREE.Vector3(),
         vel: new THREE.Vector3(),
         massKg: 0.008,
         bc: 0.25,
@@ -727,6 +824,10 @@ export class BallisticsSolver {
         bouncesLeft: 2,
         bounceCount: 0,
         isFragment: false,
+        isLocalPlayer: true,
+        hasTriggeredFlyby: false,
+        wasApproachingHead: false,
+        caliberMm: 5.56,
         audio: undefined,
       });
     }
@@ -828,6 +929,7 @@ export class BallisticsSolver {
       slot.active = true;
       slot.pos.copy(params.origin);
       slot.prevPos.copy(params.origin);
+      slot.muzzleOrigin.copy(params.origin);
       slot.vel.copy(this._stepDir).multiplyScalar(muzzleVel);
       slot.massKg = massKg;
       slot.bc = ammo.ballisticCoefficient;
@@ -840,6 +942,10 @@ export class BallisticsSolver {
       slot.bouncesLeft = pelletCount > 1 ? 1 : 2;
       slot.bounceCount = 0;
       slot.isFragment = false;
+      slot.isLocalPlayer = params.isLocalPlayer ?? true;
+      slot.hasTriggeredFlyby = false;
+      slot.wasApproachingHead = false;
+      slot.caliberMm = params.caliberMm ?? inferCaliberMmFromAmmo(ammo);
       slot.audio = params.audio;
       spawned++;
     }
@@ -847,14 +953,59 @@ export class BallisticsSolver {
     return spawned;
   }
 
+  /**
+   * Direct segment PCA flyby evaluation for instant/tracer AI fire (Open World squads & Battle bots)
+   * so every incoming enemy shot passing within 4.5m triggers authentic supersonic crack/snap or subsonic whizz.
+   */
+  public static triggerSegmentFlyby(
+    origin: Readonly<THREE.Vector3>,
+    endPos: Readonly<THREE.Vector3>,
+    speedMs: number,
+    caliberMm: number,
+    energyJ: number,
+    flybyCtx: BallisticFlybyContext,
+  ): boolean {
+    const maxR = flybyCtx.maxRadiusM ?? BALLISTIC_FLYBY_MAX_RADIUS_M;
+    const pca = evaluateBallisticFlybyPCA(
+      origin,
+      endPos,
+      flybyCtx.listenerHeadPos,
+      maxR,
+      false,
+      _pcaClosest,
+    );
+    if (!pca.triggered) return false;
+
+    flybyCtx.audio?.playBallisticFlyby?.({
+      closestPos: _pcaClosest,
+      speedMs,
+      missDistM: pca.missDistM,
+      caliberMm,
+      energyJ,
+      muzzleOrigin: origin,
+    });
+
+    const cls = classifyBallisticFlyby(speedMs, pca.missDistM, caliberMm, energyJ);
+    if (cls.triggerMicroFlinch && flybyCtx.onSupersonicNearMiss) {
+      let sideSign = 1;
+      if (flybyCtx.listenerRightDir) {
+        _pcaOffset.subVectors(_pcaClosest, flybyCtx.listenerHeadPos);
+        sideSign = _pcaOffset.dot(flybyCtx.listenerRightDir) >= 0 ? 1 : -1;
+      }
+      flybyCtx.onSupersonicNearMiss(cls.flinchDeg, sideSign, speedMs, pca.missDistM);
+    }
+    return true;
+  }
+
   public update(
     dt: number,
     world: IBodycamWorldAdapter,
     onImpact?: (event: Readonly<BallisticImpactEvent>) => void,
+    flybyCtx?: BallisticFlybyContext,
   ): void {
     if (dt <= 0) return;
 
-    // 1. Step live projectiles with RK2 G1 aerodynamic drag + swept raycast
+    // 1. Step live projectiles with RK2 G1 aerodynamic drag + swept raycast + PCA flyby detection
     for (let i = 0; i < MAX_PROJECTILES; i++) {
       const p = this.projectiles[i];
       if (!p.active || !p.ammo) continue;
@@ -886,12 +1037,14 @@ export class BallisticsSolver {
         p.pos.set(this._rayHit.pointX, this._rayHit.pointY, this._rayHit.pointZ);
         p.vel.addScaledVector(this._accel2, dt * (this._rayHit.distance / stepDist));
         p.distanceTraveled += this._rayHit.distance;
+        this.checkProjectileFlyby(p, flybyCtx);
         this.spawnTracer(p.prevPos, p.pos, p.isFragment);
         this.resolveImpact(p, this._rayHit, world, onImpact);
       } else {
         p.pos.add(this._stepDelta);
         p.vel.addScaledVector(this._accel2, dt);
         p.distanceTraveled += stepDist;
+        this.checkProjectileFlyby(p, flybyCtx);
         if (p.vel.lengthSq() < 2500) {
           // < 50 m/s spent round
           p.active = false;
@@ -960,6 +1113,44 @@ export class BallisticsSolver {
       this.sparkInstanced.setMatrixAt(i, this._sparkMatrix);
     }
     this.sparkInstanced.instanceMatrix.needsUpdate = true;
+  }
+
+  private checkProjectileFlyby(p: PooledProjectile, flybyCtx?: BallisticFlybyContext): void {
+    if (!flybyCtx || p.isLocalPlayer || p.hasTriggeredFlyby) return;
+    const maxR = flybyCtx.maxRadiusM ?? BALLISTIC_FLYBY_MAX_RADIUS_M;
+    const pca = evaluateBallisticFlybyPCA(
+      p.prevPos,
+      p.pos,
+      flybyCtx.listenerHeadPos,
+      maxR,
+      p.wasApproachingHead,
+      _pcaClosest,
+    );
+    p.wasApproachingHead = pca.approachingAfter;
+    if (!pca.triggered) return;
+
+    p.hasTriggeredFlyby = true;
+    const speedMs = p.vel.length();
+    const energyJ = 0.5 * p.massKg * speedMs * speedMs;
+    const audio = flybyCtx.audio ?? p.audio;
+    audio?.playBallisticFlyby?.({
+      closestPos: _pcaClosest,
+      speedMs,
+      missDistM: pca.missDistM,
+      caliberMm: p.caliberMm,
+      energyJ,
+      muzzleOrigin: p.muzzleOrigin,
+    });
+
+    const cls = classifyBallisticFlyby(speedMs, pca.missDistM, p.caliberMm, energyJ);
+    if (cls.triggerMicroFlinch && flybyCtx.onSupersonicNearMiss) {
+      let sideSign = 1;
+      if (flybyCtx.listenerRightDir) {
+        _pcaOffset.subVectors(_pcaClosest, flybyCtx.listenerHeadPos);
+        sideSign = _pcaOffset.dot(flybyCtx.listenerRightDir) >= 0 ? 1 : -1;
+      }
+      flybyCtx.onSupersonicNearMiss(cls.flinchDeg, sideSign, speedMs, pca.missDistM);
+    }
   }
 
   private computeAccel(vel: Readonly<THREE.Vector3>, bc: number, out: THREE.Vector3): void {

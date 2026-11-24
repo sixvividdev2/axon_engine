@@ -17,13 +17,32 @@ import {
   BuiltInfectedZombieRig,
   InfectedPoseInput,
   InfectedZombieRigLibrary,
+  InfectedZombieVariant,
 } from './InfectedZombieRig';
+
+export const CRAWLER_BLEED_OUT_MIN_SEC = 120;
+export const CRAWLER_BLEED_OUT_MAX_SEC = 150;
+
+/**
+ * Deterministic variant selector for Infected waves:
+ *  - Rare red-eyed Runners sprint aggressively (~6% Round 1, scaling ~10% -> 22% Round 2+)
+ *  - Natural legless Crawlers (~4% Round 1, scaling ~8% -> 14% Round 2+)
+ *  - Standard glowing-yellow-iris Walkers form the core horde
+ */
+export function computeZombieSpawnVariant(round: number, roll = Math.random()): InfectedZombieVariant {
+  const runnerChance = round <= 1 ? 0.06 : Math.min(0.22, 0.10 + (round - 2) * 0.025);
+  const crawlerChance = round <= 1 ? 0.04 : Math.min(0.14, 0.08 + (round - 2) * 0.012);
+  if (roll < runnerChance) return 'runner';
+  if (roll < runnerChance + crawlerChance) return 'crawler';
+  return 'walker';
+}
 
 export interface ZombieDamageResult {
   hit: boolean;
   killed: boolean;
   headshot: boolean;
   pointsAwarded: number;
+  convertedToCrawler?: boolean;
 }
 
 export interface ZombieRoundState {
@@ -45,6 +64,7 @@ export interface ZombieTargetDescriptor {
   pos: THREE.Vector3;
   enteringWindow: boolean;
   entryStage: ZombieEntryStage;
+  variant: InfectedZombieVariant;
 }
 
 export type ZombieEntryStage = 'approach' | 'tear' | 'vault' | 'pursue';
@@ -60,10 +80,14 @@ export interface InfectionZombieTuningOptions {
 
 interface ZombieActor {
   id: string;
+  variant: InfectedZombieVariant;
   alive: boolean;
   hp: number;
   maxHp: number;
   speed: number;
+  legDamageAccum: number;
+  bleedOutRemainingSec: number;
+  bleedDripTimer: number;
   pos: THREE.Vector3;
   netPos: THREE.Vector3;
   yaw: number;
@@ -218,6 +242,7 @@ export class InfectionZombieAI {
     gazeTargetWorld: null,
     distanceToCameraM: 0,
     isVisible: true,
+    variant: 'walker',
   };
 
   constructor(
@@ -294,9 +319,34 @@ export class InfectionZombieAI {
         pos: z.pos,
         enteringWindow: z.enteringWindow,
         entryStage: z.entryStage,
+        variant: z.variant,
       });
     }
     return this.targetScratch;
+  }
+
+  public getZombieActorSummary(zombieId: string): {
+    variant: InfectedZombieVariant;
+    hp: number;
+    maxHp: number;
+    speed: number;
+    alive: boolean;
+    bleedOutRemainingSec: number;
+    legsSevered: boolean;
+    irisGlow: 'none' | 'yellow' | 'red';
+  } | null {
+    const z = this.zombies.find((item) => item.id === zombieId);
+    if (!z) return null;
+    return {
+      variant: z.variant,
+      hp: z.hp,
+      maxHp: z.maxHp,
+      speed: z.speed,
+      alive: z.alive,
+      bleedOutRemainingSec: z.bleedOutRemainingSec,
+      legsSevered: z.rig.legsSevered,
+      irisGlow: z.rig.headAssembly.getIrisGlow(),
+    };
   }
 
   public getBarrierById(barrierId: string): MapWindowBarrier | undefined {
@@ -395,7 +445,7 @@ export class InfectionZombieAI {
           }
         }
         z.repathTimer = 0.05;
-        z.speed = this.computeZombieSpeedForRound(this.round);
+        z.speed = this.computeZombieSpeedForRound(this.round, z.variant);
         const match = /^zombie_(\d+)$/.exec(z.id);
         if (match) {
           this.nextZombieUid = Math.max(this.nextZombieUid, Number(match[1]) + 1);
@@ -436,6 +486,7 @@ export class InfectionZombieAI {
         enteringWindow: z.enteringWindow,
         entryStage: z.entryStage,
         spawnerId: z.spawnerId,
+        variant: z.variant,
         entryPos: z.enteringWindow
           ? [
               Number(z.entryPos.x.toFixed(3)),
@@ -474,10 +525,11 @@ export class InfectionZombieAI {
       this.syncedRemaining = pkt.zombiesRemaining;
     }
 
+    const variant: InfectedZombieVariant = pkt.variant ?? 'walker';
     const z = this.createZombieActor(
       pkt.zombieId,
       pkt.maxHp,
-      this.computeZombieSpeedForRound(pkt.round || this.round),
+      this.computeZombieSpeedForRound(pkt.round || this.round, variant),
       pkt.x,
       pkt.y,
       pkt.z,
@@ -485,6 +537,7 @@ export class InfectionZombieAI {
       true,
       pkt.entryPos,
       pkt.spawnerId,
+      variant,
     );
     z.hasNetState = true;
     z.netPos.set(pkt.x, pkt.y, pkt.z);
@@ -542,11 +595,12 @@ export class InfectionZombieAI {
     for (const sz of pkt.zombies) {
       seenIds.add(sz.id);
       let z = this.zombies.find((item) => item.id === sz.id);
+      const nextVariant: InfectedZombieVariant = sz.variant ?? 'walker';
       if (!z) {
         z = this.createZombieActor(
           sz.id,
           sz.maxHp,
-          2.4,
+          this.computeZombieSpeedForRound(this.round, nextVariant),
           sz.x,
           sz.y,
           sz.z,
@@ -554,11 +608,17 @@ export class InfectionZombieAI {
           Boolean(sz.enteringWindow),
           sz.entryPos ?? undefined,
           sz.spawnerId ?? null,
+          nextVariant,
         );
         z.hasNetState = true;
         z.netPos.set(sz.x, sz.y, sz.z);
         z.netYaw = sz.yaw;
         this.zombies.push(z);
+        hitMeshesDirty = true;
+      }
+      if (z.variant !== nextVariant) {
+        z.variant = nextVariant;
+        this.rigLib.setZombieVariant(z.rig, nextVariant);
         hitMeshesDirty = true;
       }
       z.alive = sz.alive;
@@ -645,7 +705,13 @@ export class InfectionZombieAI {
     return Math.max(20, Math.round(100 * Math.pow(1.22, round - 1) * this.zombieHealthMult));
   }
 
-  private computeZombieSpeedForRound(round: number): number {
+  private computeZombieSpeedForRound(
+    round: number,
+    variant: InfectedZombieVariant = 'walker',
+  ): number {
+    if (variant === 'crawler') {
+      return (0.98 + Math.random() * 0.24) * this.zombieMoveSpeedMult;
+    }
     let base: number;
     if (round <= 2) {
       base = 1.7 + (round - 1) * 0.25;
@@ -654,7 +720,8 @@ export class InfectionZombieAI {
     } else {
       base = Math.min(4.3, 3.35 + (round - 5) * 0.18);
     }
-    return base * this.zombieMoveSpeedMult * (0.88 + Math.random() * 0.24);
+    const variantMult = variant === 'runner' ? 1.48 : 1.0;
+    return Math.min(5.6, base * variantMult) * this.zombieMoveSpeedMult * (0.90 + Math.random() * 0.20);
   }
 
   private pickActiveSpawner(anchorPositions: ReadonlyArray<Readonly<THREE.Vector3>>): ZombieSpawnerDef | null {
@@ -687,8 +754,9 @@ export class InfectionZombieAI {
     enteringWindow: boolean,
     entryPos?: [number, number, number],
     spawnerId: string | null = null,
+    variant: InfectedZombieVariant = 'walker',
   ): ZombieActor {
-    const rig = this.rigLib.buildZombie(id);
+    const rig = this.rigLib.buildZombie(id, undefined, variant);
     const { root, bodyPivot } = rig;
     this.group.add(root);
 
@@ -709,12 +777,19 @@ export class InfectionZombieAI {
           (outerVec.z + entryVec.z) * 0.5,
         );
 
+    const isCrawler = variant === 'crawler';
     const z: ZombieActor = {
       id,
+      variant,
       alive: true,
       hp: maxHp,
       maxHp,
       speed,
+      legDamageAccum: 0,
+      bleedOutRemainingSec: isCrawler
+        ? CRAWLER_BLEED_OUT_MIN_SEC + Math.random() * (CRAWLER_BLEED_OUT_MAX_SEC - CRAWLER_BLEED_OUT_MIN_SEC)
+        : 0,
+      bleedDripTimer: isCrawler ? 0.45 : 0,
       pos: new THREE.Vector3(sx, sy, sz),
       netPos: new THREE.Vector3(sx, sy, sz),
       yaw,
@@ -750,7 +825,12 @@ export class InfectionZombieAI {
       attackCooldown: 0.4,
       deathTimer: 0,
       dying: false,
-      voicePitchScale: 0.80 + Math.random() * 0.42,
+      voicePitchScale:
+        variant === 'runner'
+          ? 1.08 + Math.random() * 0.26
+          : variant === 'crawler'
+            ? 0.72 + Math.random() * 0.22
+            : 0.80 + Math.random() * 0.42,
       vocalCooldownSec: 0.8 + Math.random() * 3.8,
       snarlCooldownSec: 0.25 + Math.random() * 0.9,
       hurtAudioCooldownSec: 0,
@@ -777,6 +857,7 @@ export class InfectionZombieAI {
     this._poseInput.gazeTargetWorld = null;
     this._poseInput.distanceToCameraM = 0;
     this._poseInput.isVisible = true;
+    this._poseInput.variant = z.variant;
     root.position.copy(z.pos);
     root.rotation.set(0, z.yaw, 0);
     this.rigLib.applyPose(rig, this._poseInput);
@@ -791,8 +872,10 @@ export class InfectionZombieAI {
     if (!spawner) return;
 
     const id = `zombie_${this.nextZombieUid++}`;
-    const maxHp = this.computeZombieHpForRound(this.round);
-    const speed = this.computeZombieSpeedForRound(this.round);
+    const variant = computeZombieSpawnVariant(this.round);
+    const baseHp = this.computeZombieHpForRound(this.round);
+    const maxHp = variant === 'runner' ? Math.round(baseHp * 0.85) : variant === 'crawler' ? Math.round(baseHp * 0.62) : baseHp;
+    const speed = this.computeZombieSpeedForRound(this.round, variant);
     // Face directly from deep hallway toward window (mesh front is -Z)
     const targetX = spawner.windowOuterPos ? spawner.windowOuterPos[0] : spawner.entryPos[0];
     const targetZ = spawner.windowOuterPos ? spawner.windowOuterPos[2] : spawner.entryPos[2];
@@ -808,16 +891,17 @@ export class InfectionZombieAI {
       true,
       spawner.entryPos,
       spawner.id,
+      variant,
     );
 
     this.zombies.push(z);
     this.toSpawnThisRound = Math.max(0, this.toSpawnThisRound - 1);
     this.rebuildActiveHitMeshes();
 
-    this._tmpAudioPos.set(spawner.spawnPos[0], spawner.spawnPos[1] + 1.5, spawner.spawnPos[2]);
-    this.audio.playZombieVocal(this._tmpAudioPos, 'moan', {
+    this._tmpAudioPos.set(spawner.spawnPos[0], spawner.spawnPos[1] + (variant === 'crawler' ? 0.45 : 1.5), spawner.spawnPos[2]);
+    this.audio.playZombieVocal(this._tmpAudioPos, variant === 'runner' ? 'snarl' : 'moan', {
       pitchScale: z.voicePitchScale,
-      intensity: 0.82,
+      intensity: variant === 'runner' ? 1.05 : 0.82,
     });
 
     onZombieSpawn?.({
@@ -825,6 +909,7 @@ export class InfectionZombieAI {
       zombieId: id,
       spawnerId: spawner.id,
       zoneId: spawner.zoneId,
+      variant,
       maxHp,
       x: Number(spawner.spawnPos[0].toFixed(3)),
       y: Number(spawner.spawnPos[1].toFixed(3)),
@@ -839,6 +924,34 @@ export class InfectionZombieAI {
       zombiesRemaining: Math.max(0, this.totalThisRound - this.killedThisRound),
       ts: Date.now(),
     });
+  }
+
+  /**
+   * Severs a zombie's legs mid-combat, converting it into a live bleeding Crawler
+   * with glowing yellow irises, protruding femur bone stumps, slow crawl speed,
+   * and a ~2-minute slow bleed-out timer (120–150s) so creating a crawler intentionally
+   * buys strategic breathing room between rounds.
+   */
+  private convertToCrawler(z: ZombieActor, minSurviveHpFrac = 0.25): void {
+    if (!z.alive || z.variant === 'crawler') return;
+    z.variant = 'crawler';
+    this.rigLib.setZombieVariant(z.rig, 'crawler');
+    z.speed = Math.min(z.speed, 1.12 * this.zombieMoveSpeedMult);
+    z.hp = Math.max(z.hp, Math.max(18, Math.round(z.maxHp * minSurviveHpFrac)));
+    z.bleedOutRemainingSec =
+      CRAWLER_BLEED_OUT_MIN_SEC + Math.random() * (CRAWLER_BLEED_OUT_MAX_SEC - CRAWLER_BLEED_OUT_MIN_SEC);
+    z.bleedDripTimer = 0.35;
+    z.staggerTimer = Math.max(z.staggerTimer, 0.52);
+    z.windupTimer = 0;
+
+    // Arterial stump burst at knee/thigh sever height
+    this._tmpAudioPos.set(z.pos.x, z.pos.y + 0.48, z.pos.z);
+    this.spawnBloodBurst(this._tmpAudioPos, 11);
+    this.audio.playZombieVocal(this._tmpAudioPos, 'hurt', {
+      pitchScale: z.voicePitchScale * 0.9,
+      intensity: 1.2,
+    });
+    this.rebuildActiveHitMeshes();
   }
 
   private spawnBloodBurst(point: Readonly<THREE.Vector3>, count: number): void {
@@ -869,14 +982,31 @@ export class InfectionZombieAI {
     }
 
     const headshot = hitZone === 'head';
-    const mult = headshot ? 2.6 : hitZone === 'limb' ? 0.7 : 1.0;
+    const isLegHit =
+      hitZone === 'leg' ||
+      hitZone === 'leftLeg' ||
+      hitZone === 'rightLeg' ||
+      (hitZone === 'limb' && impactPoint.y - z.pos.y < 0.96);
+    const mult = headshot ? 2.6 : hitZone === 'limb' || isLegHit ? 0.72 : 1.0;
     const dmg = Math.max(10, baseDamage * mult);
     z.hp -= dmg;
-    z.staggerTimer = Math.max(z.staggerTimer, headshot ? 0.28 : 0.14);
+    z.staggerTimer = Math.max(z.staggerTimer, headshot ? 0.28 : isLegHit ? 0.24 : 0.14);
     z.knockbackVelX += impactDir.x * (headshot ? 2.2 : 1.2);
     z.knockbackVelZ += impactDir.z * (headshot ? 2.2 : 1.2);
 
-    this.spawnBloodBurst(impactPoint, headshot ? 9 : 5);
+    this.spawnBloodBurst(impactPoint, headshot ? 9 : isLegHit ? 7 : 5);
+
+    // Leg-shot dismemberment: concentrated lower-leg fire severs legs into a live bleeding crawler
+    let convertedToCrawler = false;
+    if (isLegHit && z.variant !== 'crawler') {
+      z.legDamageAccum += dmg;
+      const severThreshold = Math.max(32, z.maxHp * 0.34);
+      const isMassiveOverkill = z.hp < -z.maxHp * 0.75;
+      if (z.legDamageAccum >= severThreshold && !isMassiveOverkill) {
+        this.convertToCrawler(z, 0.28);
+        convertedToCrawler = true;
+      }
+    }
 
     if (z.hp <= 0) {
       this.killZombie(z);
@@ -885,12 +1015,13 @@ export class InfectionZombieAI {
         killed: true,
         headshot,
         pointsAwarded: headshot ? 100 : 60,
+        convertedToCrawler: false,
       };
     }
 
-    if (z.hurtAudioCooldownSec <= 0) {
+    if (!convertedToCrawler && z.hurtAudioCooldownSec <= 0) {
       z.hurtAudioCooldownSec = 0.28;
-      this._tmpAudioPos.set(z.pos.x, z.pos.y + 1.5, z.pos.z);
+      this._tmpAudioPos.set(z.pos.x, z.pos.y + (z.variant === 'crawler' ? 0.45 : 1.5), z.pos.z);
       this.audio.playZombieVocal(this._tmpAudioPos, 'hurt', { pitchScale: z.voicePitchScale });
     }
 
@@ -898,7 +1029,8 @@ export class InfectionZombieAI {
       hit: true,
       killed: false,
       headshot,
-      pointsAwarded: 10,
+      pointsAwarded: convertedToCrawler ? 30 : 10,
+      convertedToCrawler,
     };
   }
 
@@ -988,8 +1120,22 @@ export class InfectionZombieAI {
       const kb = kind === 'frag' ? 5.6 * falloff + 1.4 : 1.1;
       z.knockbackVelX += (dx / horiz) * kb;
       z.knockbackVelZ += (dz / horiz) * kb;
-      this._tmpAudioPos.set(z.pos.x, z.pos.y + 1.05, z.pos.z);
+      this._tmpAudioPos.set(z.pos.x, z.pos.y + (z.variant === 'crawler' ? 0.35 : 1.05), z.pos.z);
       this.spawnBloodBurst(this._tmpAudioPos, kind === 'frag' ? 8 : 4);
+
+      // Frag grenades frequently blow off zombie legs on mid/outer blast rings, creating live crawlers!
+      if (kind === 'frag' && z.variant !== 'crawler') {
+        const isGroundLevelBlast = origin.y <= z.pos.y + 1.35;
+        const severRoll = Math.random();
+        const shouldSever =
+          (falloff < 0.82 && z.hp > -z.maxHp * 0.45 && severRoll < (isGroundLevelBlast ? 0.68 : 0.5)) ||
+          (z.hp > 0 && falloff >= 0.32 && severRoll < 0.65);
+        if (shouldSever) {
+          this.convertToCrawler(z, 0.28);
+          pointsAwarded += 25;
+          continue;
+        }
+      }
 
       if (z.hp <= 0) {
         this.killZombie(z);
@@ -1008,7 +1154,7 @@ export class InfectionZombieAI {
       const z = this.zombies[i];
       if (z.id === zombieId) {
         if (!z.alive) return false;
-        out.set(z.pos.x, z.pos.y + 1.88, z.pos.z);
+        out.set(z.pos.x, z.pos.y + (z.variant === 'crawler' ? 0.44 : 1.88), z.pos.z);
         return true;
       }
     }
@@ -1209,6 +1355,7 @@ export class InfectionZombieAI {
             z.pos.z - playerPos.z,
           );
           this._poseInput.isVisible = z.root.visible;
+          this._poseInput.variant = z.variant;
           this.rigLib.applyPose(z.rig, this._poseInput);
           if (z.deathTimer > 3.2) {
             this.group.remove(z.root);
@@ -1273,6 +1420,7 @@ export class InfectionZombieAI {
           z.pos.z - playerPos.z,
         );
         this._poseInput.isVisible = z.root.visible;
+        this._poseInput.variant = z.variant;
         this.rigLib.applyPose(z.rig, this._poseInput);
       }
       this.updateSpatialZombieAudio(dt, playerPos);
@@ -1345,12 +1493,31 @@ export class InfectionZombieAI {
           z.pos.z - playerPos.z,
         );
         this._poseInput.isVisible = z.root.visible;
+        this._poseInput.variant = z.variant;
         this.rigLib.applyPose(z.rig, this._poseInput);
         if (z.deathTimer > 3.2) {
           this.group.remove(z.root);
           this.zombies.splice(i, 1);
         }
         continue;
+      }
+
+      // Crawler slow arterial bleed-out (~2 minutes) with periodic stump blood drips
+      if (z.variant === 'crawler' && z.bleedOutRemainingSec > 0) {
+        z.bleedOutRemainingSec -= dt;
+        z.bleedDripTimer -= dt;
+        if (z.bleedDripTimer <= 0) {
+          z.bleedDripTimer = 0.55 + Math.random() * 0.35;
+          const backX = Math.sin(z.yaw) * 0.32;
+          const backZ = Math.cos(z.yaw) * 0.32;
+          this._tmpAudioPos.set(z.pos.x + backX, z.pos.y + 0.16, z.pos.z + backZ);
+          this.spawnBloodBurst(this._tmpAudioPos, 1);
+        }
+        if (z.bleedOutRemainingSec <= 0) {
+          z.hp = 0;
+          this.killZombie(z);
+          continue;
+        }
       }
 
       if (z.attackCooldown > 0) z.attackCooldown = Math.max(0, z.attackCooldown - dt);
@@ -1420,6 +1587,7 @@ export class InfectionZombieAI {
               z.pos.z - playerPos.z,
             );
             this._poseInput.isVisible = z.root.visible;
+            this._poseInput.variant = z.variant;
             z.root.position.copy(z.pos);
             z.root.rotation.set(0, z.yaw, 0);
             this.rigLib.applyPose(z.rig, this._poseInput);
@@ -1475,6 +1643,7 @@ export class InfectionZombieAI {
                 z.pos.z - playerPos.z,
               );
               this._poseInput.isVisible = z.root.visible;
+              this._poseInput.variant = z.variant;
               z.root.position.copy(z.pos);
               z.root.rotation.set(0, z.yaw, 0);
               this.rigLib.applyPose(z.rig, this._poseInput);
@@ -1507,6 +1676,7 @@ export class InfectionZombieAI {
                 z.pos.z - playerPos.z,
               );
               this._poseInput.isVisible = z.root.visible;
+              this._poseInput.variant = z.variant;
               z.root.position.copy(z.pos);
               z.root.rotation.set(0, z.yaw, 0);
               this.rigLib.applyPose(z.rig, this._poseInput);
@@ -1583,6 +1753,7 @@ export class InfectionZombieAI {
             z.pos.z - playerPos.z,
           );
           this._poseInput.isVisible = z.root.visible;
+          this._poseInput.variant = z.variant;
           this.rigLib.applyPose(z.rig, this._poseInput);
 
           if (z.vaultT >= 1) {
@@ -1846,6 +2017,7 @@ export class InfectionZombieAI {
         z.pos.z - playerPos.z,
       );
       this._poseInput.isVisible = z.root.visible;
+      this._poseInput.variant = z.variant;
       this.rigLib.applyPose(z.rig, this._poseInput);
     }
 

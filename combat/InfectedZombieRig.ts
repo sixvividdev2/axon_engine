@@ -11,10 +11,13 @@ import {
 
 export type InfectedArchetypeId = 'quarantine_guard' | 'hazmat_tech' | 'infected_civilian';
 
+export type InfectedZombieVariant = 'walker' | 'runner' | 'crawler';
+
 export type InfectedPoseMode = 'locomote' | 'tear' | 'vault' | 'windup' | 'stagger' | 'death';
 
 export interface InfectedPoseInput {
   mode: InfectedPoseMode;
+  variant?: InfectedZombieVariant;
   walkCycle: number;
   speedMps: number;
   tearPhase: number;
@@ -31,6 +34,8 @@ export interface InfectedPoseInput {
 
 export interface BuiltInfectedZombieRig {
   archetype: InfectedArchetypeId;
+  variant: InfectedZombieVariant;
+  legsSevered: boolean;
   root: THREE.Group;
   bodyPivot: THREE.Group;
   pelvisGroup: THREE.Group;
@@ -45,9 +50,14 @@ export interface BuiltInfectedZombieRig {
   leftHip: THREE.Group;
   leftKnee: THREE.Group;
   leftAnkle: THREE.Group;
+  leftLowerLegGroup: THREE.Group;
+  leftSeveredStumpGroup: THREE.Group;
   rightHip: THREE.Group;
   rightKnee: THREE.Group;
   rightAnkle: THREE.Group;
+  rightLowerLegGroup: THREE.Group;
+  rightSeveredStumpGroup: THREE.Group;
+  legHitMeshes: THREE.Mesh[];
   leftShoulder: THREE.Group;
   leftElbow: THREE.Group;
   leftHandPivot: THREE.Group;
@@ -250,6 +260,10 @@ export class InfectedZombieRigLibrary {
   private readonly geoBandageWrap: THREE.CylinderGeometry;
 
   private readonly geoThigh: THREE.CylinderGeometry;
+  private readonly geoThighUpperStump: THREE.CylinderGeometry;
+  private readonly geoSeveredFleshCap: THREE.CylinderGeometry;
+  private readonly geoExposedFemur: THREE.CylinderGeometry;
+  private readonly geoBoneShard: THREE.ConeGeometry;
   private readonly geoKneeCap: THREE.SphereGeometry;
   private readonly geoShin: THREE.CylinderGeometry;
   private readonly geoBootSole: THREE.BoxGeometry;
@@ -257,6 +271,8 @@ export class InfectedZombieRigLibrary {
   private readonly geoBootShaft: THREE.CylinderGeometry;
   private readonly geoBootToe: THREE.SphereGeometry;
 
+  private readonly exposedBoneMat: THREE.MeshStandardMaterial;
+  private readonly freshSeveredBloodMat: THREE.MeshStandardMaterial;
   private readonly archetypeMats: Record<InfectedArchetypeId, ZombieMaterialSet>;
 
   constructor() {
@@ -352,6 +368,11 @@ export class InfectedZombieRigLibrary {
 
     // 2-Segment Articulated Legs + Grounded Boots
     this.geoThigh = track(new THREE.CylinderGeometry(0.082, 0.066, 0.41, 8));
+    // Severed legless crawler stumps + protruding jagged femur bone shards
+    this.geoThighUpperStump = track(new THREE.CylinderGeometry(0.082, 0.072, 0.20, 8));
+    this.geoSeveredFleshCap = track(new THREE.CylinderGeometry(0.072, 0.064, 0.032, 8));
+    this.geoExposedFemur = track(new THREE.CylinderGeometry(0.022, 0.014, 0.14, 7));
+    this.geoBoneShard = track(new THREE.ConeGeometry(0.013, 0.065, 5));
     this.geoKneeCap = track(new THREE.SphereGeometry(0.062, 8, 6));
     this.geoShin = track(new THREE.CylinderGeometry(0.062, 0.048, 0.40, 8));
     this.geoBootSole = track(new THREE.BoxGeometry(0.098, 0.024, 0.255));
@@ -418,6 +439,20 @@ export class InfectedZombieRigLibrary {
         metalness: 0.18,
       }),
     );
+    this.exposedBoneMat = track(
+      new THREE.MeshStandardMaterial({
+        color: 0xd8ccb4,
+        roughness: 0.56,
+        metalness: 0.04,
+      }),
+    );
+    this.freshSeveredBloodMat = track(
+      new THREE.MeshStandardMaterial({
+        color: 0x6b0909,
+        roughness: 0.24,
+        metalness: 0.06,
+      }),
+    );
     const hazmatGearMat = track(
       new THREE.MeshStandardMaterial({
         color: 0x222629,
@@ -479,7 +514,11 @@ export class InfectedZombieRigLibrary {
     };
   }
 
-  public buildZombie(actorId: string, forcedArchetype?: InfectedArchetypeId): BuiltInfectedZombieRig {
+  public buildZombie(
+    actorId: string,
+    forcedArchetype?: InfectedArchetypeId,
+    initialVariant: InfectedZombieVariant = 'walker',
+  ): BuiltInfectedZombieRig {
     const h = hashString(actorId);
     const archetypes: readonly InfectedArchetypeId[] = [
       'quarantine_guard',
@@ -489,12 +528,14 @@ export class InfectedZombieRigLibrary {
     const archetype = forcedArchetype ?? archetypes[h % archetypes.length];
     const mats = this.archetypeMats[archetype];
     const hitMeshes: THREE.Mesh[] = [];
+    const legHitMeshes: THREE.Mesh[] = [];
 
     const makeMesh = (
       geo: THREE.BufferGeometry,
       mat: THREE.Material,
       hitZone?: 'head' | 'thorax' | 'limb',
       castShadow = false,
+      isLegMesh = false,
     ): THREE.Mesh => {
       const m = new THREE.Mesh(geo, mat);
       m.castShadow = castShadow;
@@ -504,9 +545,11 @@ export class InfectedZombieRigLibrary {
           combatActorType: 'zombie',
           actorId,
           hitZone,
+          isLeg: isLegMesh,
           surfaceMaterial: 'wood',
         };
         hitMeshes.push(m);
+        if (isLegMesh) legHitMeshes.push(m);
       }
       return m;
     };
@@ -536,18 +579,43 @@ export class InfectedZombieRigLibrary {
     beltMesh.position.set(0, 0.06, 0);
     pelvisGroup.add(pelvisMesh, beltMesh);
 
-    // === ARTICULATED 2-SEGMENT LEGS + BOOTS ===
+    // === ARTICULATED 2-SEGMENT LEGS + BOOTS + TOGGLEABLE SEVERED CRAWLER BONE STUMPS ===
     const buildLeg = (side: -1 | 1) => {
       const hip = new THREE.Group();
       hip.position.set(side * 0.105, -0.02, 0);
 
-      const thigh = makeMesh(this.geoThigh, mats.clothesPants, 'limb', true);
+      // Severed leg stump assembly (shown ONLY when legs are blown/shot off into a Crawler!)
+      const severedStumpGroup = new THREE.Group();
+      severedStumpGroup.name = side < 0 ? 'crawlerStumpL' : 'crawlerStumpR';
+      severedStumpGroup.visible = false;
+      const upperStump = makeMesh(this.geoThighUpperStump, mats.clothesPants, undefined, false);
+      upperStump.position.set(0, -0.085, 0);
+      const fleshCap = makeMesh(this.geoSeveredFleshCap, this.freshSeveredBloodMat, undefined, false);
+      fleshCap.position.set(0, -0.172, 0);
+      const femur = makeMesh(this.geoExposedFemur, this.exposedBoneMat, undefined, false);
+      femur.name = side < 0 ? 'exposedFemurL' : 'exposedFemurR';
+      femur.position.set(side * 0.008, -0.228, -0.006);
+      femur.rotation.set(0.08, 0, side * 0.09);
+      const shardA = makeMesh(this.geoBoneShard, this.exposedBoneMat, undefined, false);
+      shardA.position.set(side * 0.014, -0.305, -0.010);
+      shardA.rotation.set(Math.PI + 0.16, 0, side * 0.14);
+      const bloodEnd = makeMesh(this.geoSeveredFleshCap, this.freshSeveredBloodMat, undefined, false);
+      bloodEnd.scale.set(0.32, 0.45, 0.32);
+      bloodEnd.position.set(side * 0.006, -0.188, -0.004);
+      severedStumpGroup.add(upperStump, fleshCap, femur, shardA, bloodEnd);
+      hip.add(severedStumpGroup);
+
+      // Intact leg group (hidden cleanly upon Crawler dismemberment)
+      const lowerLegGroup = new THREE.Group();
+      hip.add(lowerLegGroup);
+
+      const thigh = makeMesh(this.geoThigh, mats.clothesPants, 'limb', true, true);
       thigh.position.set(0, -thighLen * 0.5, 0);
-      hip.add(thigh);
+      lowerLegGroup.add(thigh);
 
       const knee = new THREE.Group();
       knee.position.set(0, -thighLen, 0);
-      hip.add(knee);
+      lowerLegGroup.add(knee);
 
       const kneeCap = makeMesh(
         this.geoKneeCap,
@@ -556,7 +624,7 @@ export class InfectedZombieRigLibrary {
       kneeCap.scale.set(0.95, 0.95, 0.72);
       kneeCap.position.set(0, 0, -0.025);
 
-      const shin = makeMesh(this.geoShin, mats.clothesPants, 'limb');
+      const shin = makeMesh(this.geoShin, mats.clothesPants, 'limb', false, true);
       shin.position.set(0, -shinLen * 0.5, 0);
       knee.add(kneeCap, shin);
 
@@ -576,7 +644,7 @@ export class InfectedZombieRigLibrary {
       toe.position.set(0, -ankleHeight + 0.036, -0.145);
       ankle.add(sole, vamp, shaft, toe);
 
-      return { hip, knee, ankle };
+      return { hip, knee, ankle, lowerLegGroup, severedStumpGroup };
     };
 
     const leftLeg = buildLeg(-1);
@@ -666,6 +734,7 @@ export class InfectedZombieRigLibrary {
     const headAssembly = buildAnatomicalHeadAssembly({
       variant: 'zombie',
       toneSeed: h,
+      irisGlowMode: initialVariant === 'runner' ? 'red' : 'yellow',
       anisotropy: 2,
       hoodMaterial: mats.skin,
       frameMaterial: mats.gearAccent,
@@ -765,8 +834,10 @@ export class InfectedZombieRigLibrary {
     const rightArm = buildArm(1);
     spineUpper.add(leftArm.shoulder, rightArm.shoulder);
 
-    return {
+    const builtRig: BuiltInfectedZombieRig = {
       archetype,
+      variant: initialVariant,
+      legsSevered: false,
       root,
       bodyPivot,
       pelvisGroup,
@@ -790,9 +861,14 @@ export class InfectedZombieRigLibrary {
       leftHip: leftLeg.hip,
       leftKnee: leftLeg.knee,
       leftAnkle: leftLeg.ankle,
+      leftLowerLegGroup: leftLeg.lowerLegGroup,
+      leftSeveredStumpGroup: leftLeg.severedStumpGroup,
       rightHip: rightLeg.hip,
       rightKnee: rightLeg.knee,
       rightAnkle: rightLeg.ankle,
+      rightLowerLegGroup: rightLeg.lowerLegGroup,
+      rightSeveredStumpGroup: rightLeg.severedStumpGroup,
+      legHitMeshes,
       leftShoulder: leftArm.shoulder,
       leftElbow: leftArm.elbow,
       leftHandPivot: leftArm.handPivot,
@@ -807,12 +883,41 @@ export class InfectedZombieRigLibrary {
       deathFallSide: (h & 4) === 0 ? -1 : 1,
       heightScale,
     };
+    this.setZombieVariant(builtRig, initialVariant);
+    return builtRig;
   }
 
   /**
-   * Zero-GC procedural anatomical pose evaluator covering shamble -> frantic sprint blend,
-   * two-handed window plank tearing, 3-stage window sill climb/vault, melee lunge windup,
-   * bullet hit stagger, and multi-joint buckling death collapse.
+   * Applies Infected variant visuals (zero allocations):
+   * - walker: yellow glowing irises, intact legs
+   * - runner: rare red glowing irises, intact legs
+   * - crawler: yellow glowing irises, lower legs hidden, bleeding severed thigh stumps + protruding femur bones visible
+   */
+  public setZombieVariant(rig: BuiltInfectedZombieRig, variant: InfectedZombieVariant): void {
+    rig.variant = variant;
+    const isCrawler = variant === 'crawler';
+    rig.legsSevered = isCrawler;
+    rig.headAssembly.applyIrisGlow(variant === 'runner' ? 'red' : 'yellow');
+
+    rig.leftLowerLegGroup.visible = !isCrawler;
+    rig.rightLowerLegGroup.visible = !isCrawler;
+    rig.leftSeveredStumpGroup.visible = isCrawler;
+    rig.rightSeveredStumpGroup.visible = isCrawler;
+
+    // Exclude severed lower-leg hit meshes from raycasting once dismembered
+    if (isCrawler) {
+      for (let i = rig.hitMeshes.length - 1; i >= 0; i--) {
+        if (rig.legHitMeshes.includes(rig.hitMeshes[i])) {
+          rig.hitMeshes.splice(i, 1);
+        }
+      }
+    }
+  }
+
+  /**
+   * Zero-GC procedural anatomical pose evaluator covering shamble -> frantic runner sprint,
+   * prone legless crawler dragging/clawing, two-handed window plank tearing, 3-stage window sill vault,
+   * melee lunge windup, bullet hit stagger, and multi-joint buckling death collapse.
    */
   public applyPose(rig: BuiltInfectedZombieRig, input: Readonly<InfectedPoseInput>): void {
     // Reset base pivot transforms cleanly
@@ -820,6 +925,80 @@ export class InfectedZombieRigLibrary {
     rig.bodyPivot.rotation.set(0, 0, 0);
     rig.pelvisGroup.position.set(0, rig.restPelvisY, 0);
     rig.pelvisGroup.rotation.set(0, 0, 0);
+
+    const activeVariant = input.variant ?? rig.variant;
+    const isCrawler = activeVariant === 'crawler' || rig.legsSevered;
+
+    // Dedicated legless Crawler prone pose suite (ground drag, ankle-swipe windup, stagger, flat collapse)
+    if (isCrawler) {
+      const wc = input.walkCycle;
+      const sinW = Math.sin(wc);
+      const cosW = Math.cos(wc);
+      const stag = THREE.MathUtils.clamp(input.staggerRatio, 0, 1);
+
+      if (input.mode === 'death') {
+        const t = THREE.MathUtils.clamp(input.deathProgress, 0, 1);
+        const ease = 1 - Math.pow(1 - t, 2.2);
+        const side = rig.deathFallSide;
+        rig.pelvisGroup.position.set(0, THREE.MathUtils.lerp(0.18, 0.11, ease), 0.18);
+        rig.bodyPivot.rotation.set(THREE.MathUtils.lerp(1.26, 1.54, ease), side * 0.14 * ease, side * 0.28 * ease);
+        rig.spineLower.rotation.set(-0.08 * (1 - ease), 0, 0);
+        rig.spineUpper.rotation.set(-0.10 * (1 - ease), 0, 0);
+        rig.neckPivot.rotation.set(THREE.MathUtils.lerp(-0.92, -0.15, ease), side * 0.35 * ease, side * 0.25 * ease);
+        rig.headGroup.rotation.set(0.15 * ease, 0, 0);
+        rig.jawPivot.rotation.x = 0.28 * ease;
+        rig.leftHip.rotation.set(0.12, 0, -0.18);
+        rig.rightHip.rotation.set(0.16, 0, 0.22);
+        rig.leftShoulder.rotation.set(0.65 * (1 - ease) + 0.35 * ease, 0, -0.78 * ease);
+        rig.leftElbow.rotation.set(-0.45, 0, 0);
+        rig.rightShoulder.rotation.set(0.72 * (1 - ease) + 0.42 * ease, 0, 0.72 * ease);
+        rig.rightElbow.rotation.set(-0.52, 0, 0);
+        this.stepZombieFacial(rig, input);
+        return;
+      }
+
+      // Prone torso slung low over the ground, head craned up to stare with glowing yellow irises
+      const moveBlend = THREE.MathUtils.clamp(input.speedMps / 0.55, 0, 1);
+      const heaveY = Math.abs(sinW) * 0.032 * moveBlend;
+      rig.pelvisGroup.position.set(sinW * 0.035 * moveBlend, 0.185 + heaveY, 0.24);
+      rig.bodyPivot.rotation.set(1.28 - stag * 0.18, sinW * 0.14 * moveBlend, cosW * 0.12 * moveBlend);
+
+      // Severed stumps trail behind & wiggle slightly as crawler drags torso
+      rig.leftHip.rotation.set(0.12 + sinW * 0.12 * moveBlend, 0, -0.14);
+      rig.rightHip.rotation.set(0.12 - sinW * 0.12 * moveBlend, 0, 0.14);
+
+      rig.spineLower.rotation.set(-0.18, -sinW * 0.14 * moveBlend, 0);
+      rig.spineUpper.rotation.set(-0.24 - stag * 0.14, -sinW * 0.18 * moveBlend, cosW * 0.09 * moveBlend);
+      const twitch = Math.sin(input.elapsedSec * 7.8 + rig.headTiltBias * 12) * 0.05;
+      rig.neckPivot.rotation.set(-0.92 + stag * 0.24, sinW * 0.1, rig.headTiltBias + twitch);
+      rig.headGroup.rotation.set(-0.12, twitch, 0);
+
+      const isWindup = input.mode === 'windup' || input.windupProgress > 0.01;
+      if (isWindup) {
+        const wp = THREE.MathUtils.clamp(input.windupProgress, 0, 1);
+        const swipe = wp < 0.5 ? -(wp / 0.5) : (wp - 0.5) / 0.5;
+        rig.spineUpper.rotation.x -= 0.22;
+        rig.jawPivot.rotation.x = 0.46 + Math.max(0, swipe) * 0.2;
+        rig.leftShoulder.rotation.set(2.55 - swipe * 0.85, 0.28, -0.25);
+        rig.leftElbow.rotation.set(-0.55 + swipe * 0.35, 0, 0);
+        rig.rightShoulder.rotation.set(2.45 + swipe * 0.72, -0.26, 0.25);
+        rig.rightElbow.rotation.set(-0.62 - swipe * 0.25, 0, 0);
+      } else {
+        // Alternating hand-over-hand ground-clawing drag stroke
+        const lPull = sinW * moveBlend;
+        const rPull = -sinW * moveBlend;
+        rig.jawPivot.rotation.x = 0.22 + Math.max(0, sinW) * 0.16;
+        rig.leftShoulder.rotation.set(2.15 + lPull * 0.62, 0.24 + cosW * 0.16 * moveBlend, -0.22);
+        rig.leftElbow.rotation.set(-0.48 - Math.max(0, -lPull) * 0.55, 0, 0);
+        rig.leftHandPivot.rotation.set(0.65, 0, 0);
+
+        rig.rightShoulder.rotation.set(2.15 + rPull * 0.62, -0.24 - cosW * 0.16 * moveBlend, 0.22);
+        rig.rightElbow.rotation.set(-0.48 - Math.max(0, -rPull) * 0.55, 0, 0);
+        rig.rightHandPivot.rotation.set(0.65, 0, 0);
+      }
+      this.stepZombieFacial(rig, input);
+      return;
+    }
 
     if (input.mode === 'death') {
       const t = THREE.MathUtils.clamp(input.deathProgress, 0, 1);

@@ -590,6 +590,8 @@ export class CombatSessionEngine {
   private readonly _muzzlePos = new THREE.Vector3();
   private readonly _muzzleDir = new THREE.Vector3();
   private readonly _grenadeThrowOrigin = new THREE.Vector3();
+  private readonly _tmpCamPos = new THREE.Vector3();
+  private readonly _tmpCamRight = new THREE.Vector3();
   private readonly _grenadeThrowDir = new THREE.Vector3();
   private readonly _grenadePlayerVel = new THREE.Vector3();
   private readonly _whipVel = new THREE.Vector2();
@@ -5965,8 +5967,25 @@ export class CombatSessionEngine {
       }
     }
 
-    // Step BallisticsSolver & Tactical Grenade Physics
-    this.ballistics.update(dt, this.adapter, (ev) => this.handleBallisticImpact(ev));
+    // Step BallisticsSolver (with PCA supersonic crack / subsonic whizz flyby detection) & Tactical Grenade Physics
+    this.camera.getWorldPosition(this._tmpCamPos);
+    const camRightVec = this._tmpCamRight.set(1, 0, 0).applyQuaternion(this.camera.quaternion);
+    const battleFlybyCtx = {
+      listenerHeadPos: this._tmpCamPos,
+      listenerRightDir: camRightVec,
+      audio: this.audio,
+      onSupersonicNearMiss: (flinchDeg: number, sideSign: number) => {
+        if (this.playerAlive) {
+          this.controller.applyBallisticMicroFlinch(flinchDeg, sideSign);
+        }
+      },
+    };
+    this.ballistics.update(
+      dt,
+      this.adapter,
+      (ev) => this.handleBallisticImpact(ev),
+      battleFlybyCtx,
+    );
     this._grenadeThrowOrigin.set(
       this.controller.position.x,
       this.controller.position.y + 1.28,
@@ -6009,31 +6028,37 @@ export class CombatSessionEngine {
         },
         ...remoteHumans,
       ];
-      const onHostBotFire =
-        this.mp && this.isMpHost
-          ? (
-              botId: string,
-              origin: Readonly<THREE.Vector3>,
-              end: Readonly<THREE.Vector3>,
-              meta?: { weaponId: string; caliberId: string; suppressed: boolean },
-            ) => {
-              const firePkt: GameBotFirePacket = {
-                type: 'game:bot_fire',
-                botId,
-                ox: Number(origin.x.toFixed(3)),
-                oy: Number(origin.y.toFixed(3)),
-                oz: Number(origin.z.toFixed(3)),
-                ex: Number(end.x.toFixed(3)),
-                ey: Number(end.y.toFixed(3)),
-                ez: Number(end.z.toFixed(3)),
-                weaponId: meta?.weaponId,
-                caliberId: meta?.caliberId,
-                sup: meta?.suppressed,
-                ts: Date.now(),
-              };
-              this.mp!.sendMessage(firePkt as unknown as Record<string, unknown>);
-            }
-          : undefined;
+      const onHostBotFire = (
+        botId: string,
+        origin: Readonly<THREE.Vector3>,
+        end: Readonly<THREE.Vector3>,
+        meta?: { weaponId: string; caliberId: string; suppressed: boolean },
+      ) => {
+        const cal = (meta?.caliberId ?? '556x45').toLowerCase();
+        const isSub = cal.includes('9x18') || cal.includes('45') || (cal.includes('9x19') && Boolean(meta?.suppressed));
+        const isShotgun = cal.includes('12g');
+        const speedMs = isSub ? 305 : isShotgun ? 340 : cal.includes('9x19') ? 385 : cal.includes('762') ? 820 : 880;
+        const calMm = cal.includes('50') ? 12.7 : cal.includes('9x') ? 9.0 : cal.includes('762') ? 7.62 : 5.56;
+        const energyJ = cal.includes('762') ? 2800 : cal.includes('9x') ? 480 : 1750;
+        BallisticsSolver.triggerSegmentFlyby(origin, end, speedMs, calMm, energyJ, battleFlybyCtx);
+        if (this.mp && this.isMpHost) {
+          const firePkt: GameBotFirePacket = {
+            type: 'game:bot_fire',
+            botId,
+            ox: Number(origin.x.toFixed(3)),
+            oy: Number(origin.y.toFixed(3)),
+            oz: Number(origin.z.toFixed(3)),
+            ex: Number(end.x.toFixed(3)),
+            ey: Number(end.y.toFixed(3)),
+            ez: Number(end.z.toFixed(3)),
+            weaponId: meta?.weaponId,
+            caliberId: meta?.caliberId,
+            sup: meta?.suppressed,
+            ts: Date.now(),
+          };
+          this.mp.sendMessage(firePkt as unknown as Record<string, unknown>);
+        }
+      };
 
       if (this.params.mode === 'battle' && this.botAI) {
         this.botAI.update(

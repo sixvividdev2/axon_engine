@@ -746,6 +746,19 @@ export class BodycamController {
     );
   }
 
+  /**
+   * Involuntary 0.3°–0.6° adrenaline micro-flinch when a supersonic round passes razor-close (< 1.2m).
+   * Feeds strictly into the fast-settling camera roll/pitch spring without shifting aimYaw/aimPitch.
+   */
+  public applyBallisticMicroFlinch(flinchDeg: number, sideSign = 1): void {
+    const clampedDeg = THREE.MathUtils.clamp(flinchDeg, 0.25, 0.65);
+    const flinchRad = THREE.MathUtils.degToRad(clampedDeg);
+    const dir = sideSign >= 0 ? 1 : -1;
+    this.camShakeRollVel += dir * flinchRad * 18.0;
+    this.camShakePitchVel -= flinchRad * 9.5;
+    this.exertion = Math.min(BREATH_SWAY_CONFIG.exertionMax, this.exertion + 0.035);
+  }
+
   private stepCriticallyDamped(
     val: number,
     vel: number,

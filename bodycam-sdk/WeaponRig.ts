@@ -51,6 +51,32 @@ export interface ReadOnlyWeaponRigState {
   laserOn: boolean;
 }
 
+export interface WeaponSpringTuning {
+  posOmega: number;
+  posZeta: number;
+  rotOmega: number;
+  rotZeta: number;
+  counterTiltGain: number;
+}
+
+/**
+ * Pure mass-tuned coupled 6-DOF spring-damper parameters:
+ *  - Pistols / light SMGs (massFactor ~0.62..0.85): crisp high-omega snap & quick settle
+ *  - Carbines / ARs / AKs (massFactor ~0.95..1.15): balanced tactical momentum & subtle overshoot
+ *  - Shotguns / heavy DMRs / Desert Eagle (massFactor ~1.18..1.55): heavier inertia & deliberate settle
+ */
+export function computeWeaponSpringTuning(massFactor: number): WeaponSpringTuning {
+  const m = THREE.MathUtils.clamp(massFactor, 0.55, 1.65);
+  const weightNorm = THREE.MathUtils.clamp((m - 0.62) / 0.90, 0, 1);
+  return {
+    posOmega: THREE.MathUtils.lerp(20.5, 13.0, weightNorm),
+    posZeta: THREE.MathUtils.lerp(0.76, 0.64, weightNorm),
+    rotOmega: THREE.MathUtils.lerp(21.0, 12.6, weightNorm),
+    rotZeta: THREE.MathUtils.lerp(0.74, 0.60, weightNorm),
+    counterTiltGain: THREE.MathUtils.lerp(0.46, 0.72, weightNorm),
+  };
+}
+
 const RIGHT_SHOULDER_LOCAL = new THREE.Vector3(0.18, -0.22, -0.08);
 
 /**
@@ -145,9 +171,25 @@ export class WeaponRig {
   private sightMisalignRollVel = 0;
   private rapidFireHeat = 0;
 
-  // Weapon lag inertia, wall pullback, ADS, Tactical Cant, & Sprint blends
+  // Coupled 6-DOF mass-tuned spring-damper weapon & hand physics (positionSpring + rotationSpring)
   private lagYaw = 0;
+  private lagYawVel = 0;
   private lagPitch = 0;
+  private lagPitchVel = 0;
+  private lagRoll = 0;
+  private lagRollVel = 0;
+  private motionPosX = 0;
+  private motionPosY = 0;
+  private motionPosZ = 0;
+  private motionPosVelX = 0;
+  private motionPosVelY = 0;
+  private motionPosVelZ = 0;
+  private prevStrideStepIdx = 0;
+  private prevVerticalMotionOffset = 0;
+  private readonly _mechImpulsePos = new THREE.Vector3();
+  private readonly _mechImpulseRot = new THREE.Vector3();
+
+  // Wall pullback, ADS, Tactical Cant, & Sprint blends
   private pullbackRatio = 0;
   private adsBlend = 0;
   private cantBlend = 0;
@@ -787,11 +829,64 @@ export class WeaponRig {
     return THREE.MathUtils.clamp(0.55 + m * 0.18, 0.72, 1.48);
   }
 
+  public getMassHandlingFactorPublic(): number {
+    return this.getMassHandlingFactor();
+  }
+
+  public getCoupledSpringSnapshot(): {
+    lagYaw: number;
+    lagPitch: number;
+    lagRoll: number;
+    motionPosX: number;
+    motionPosY: number;
+    motionPosZ: number;
+  } {
+    return {
+      lagYaw: this.lagYaw,
+      lagPitch: this.lagPitch,
+      lagRoll: this.lagRoll,
+      motionPosX: this.motionPosX,
+      motionPosY: this.motionPosY,
+      motionPosZ: this.motionPosZ,
+    };
+  }
+
   public addInertia(dyaw: number, dpitch: number, configInertiaScale = 1.0): void {
     const massScale = this.getMassHandlingFactor() * configInertiaScale;
-    const maxLag = 0.085 * Math.min(1.45, massScale);
-    this.lagYaw = THREE.MathUtils.clamp(this.lagYaw + dyaw * massScale, -maxLag, maxLag);
-    this.lagPitch = THREE.MathUtils.clamp(this.lagPitch + dpitch * massScale, -maxLag, maxLag);
+    const tuning = computeWeaponSpringTuning(this.getMassHandlingFactor());
+    const maxLag = 0.088 * Math.min(1.45, massScale);
+    const maxVel = 1.65 * Math.min(1.5, massScale);
+
+    // Direct micro-deflection + spring velocity impulse so fast camera flicks exhibit
+    // natural barrel lag, counter-tilt roll, and weight-proportional micro-overshoot on stop
+    this.lagYaw = THREE.MathUtils.clamp(this.lagYaw + dyaw * massScale * 0.62, -maxLag, maxLag);
+    this.lagPitch = THREE.MathUtils.clamp(this.lagPitch + dpitch * massScale * 0.62, -maxLag, maxLag);
+    this.lagYawVel = THREE.MathUtils.clamp(
+      this.lagYawVel + dyaw * massScale * tuning.rotOmega * 0.42,
+      -maxVel,
+      maxVel,
+    );
+    this.lagPitchVel = THREE.MathUtils.clamp(
+      this.lagPitchVel + dpitch * massScale * tuning.rotOmega * 0.42,
+      -maxVel,
+      maxVel,
+    );
+    this.lagRollVel = THREE.MathUtils.clamp(
+      this.lagRollVel + dyaw * massScale * tuning.rotOmega * tuning.counterTiltGain,
+      -maxVel * 1.15,
+      maxVel * 1.15,
+    );
+    // Subtle lateral translational drag coupled to angular sweep
+    this.motionPosVelX = THREE.MathUtils.clamp(
+      this.motionPosVelX - dyaw * massScale * 0.19,
+      -0.38,
+      0.38,
+    );
+    this.motionPosVelY = THREE.MathUtils.clamp(
+      this.motionPosVelY - dpitch * massScale * 0.14,
+      -0.32,
+      0.32,
+    );
   }
 
   public applyWeaponRecoil(
@@ -1446,9 +1541,63 @@ export class WeaponRig {
       0.80,
     );
 
-    const lagDamp = THREE.MathUtils.clamp(14 / Math.sqrt(massFactor), 8.5, 16);
-    this.lagYaw = THREE.MathUtils.damp(this.lagYaw, 0, lagDamp, dt);
-    this.lagPitch = THREE.MathUtils.damp(this.lagPitch, 0, lagDamp, dt);
+    // 2b. Coupled 6-DOF mass-tuned weapon & hand spring-damper solver
+    //     Integrates camera-turn inertia/counter-tilt, footstep cadence impulses, hard-landing
+    //     compression, and mechanical action counter-jolts (H&K slap, mag tap, pump cycle).
+    const springTuning = computeWeaponSpringTuning(massFactor);
+    const adsTighten = THREE.MathUtils.lerp(1.0, 1.24, this.lastCheekWeld);
+    const rotOmega = springTuning.rotOmega * adsTighten;
+    const rotZeta = THREE.MathUtils.lerp(springTuning.rotZeta, Math.min(0.92, springTuning.rotZeta + 0.16), this.lastCheekWeld);
+    const posOmega = springTuning.posOmega * adsTighten;
+    const posZeta = THREE.MathUtils.lerp(springTuning.posZeta, Math.min(0.94, springTuning.posZeta + 0.15), this.lastCheekWeld);
+
+    // Footstep cadence impulse on stride half-cycle edge
+    const phaseNow = bobPhase !== undefined ? bobPhase : strideProgress * Math.PI;
+    const stepIdx = Math.floor(phaseNow / Math.PI);
+    if (isMoving && stepIdx !== this.prevStrideStepIdx) {
+      const footSign = (stepIdx & 1) === 0 ? 1 : -1;
+      const cadenceGain = (isSprinting ? 1.55 : 0.72) * THREE.MathUtils.lerp(1.0, 0.28, this.lastCheekWeld);
+      this.motionPosVelY -= 0.095 * cadenceGain * Math.sqrt(massFactor);
+      this.motionPosVelX += footSign * 0.042 * cadenceGain;
+      this.lagRollVel += footSign * 0.18 * cadenceGain;
+      this.lagPitchVel -= 0.08 * cadenceGain;
+    }
+    this.prevStrideStepIdx = stepIdx;
+
+    // Hard-landing vertical compression impulse coupled into weapon spring
+    const vertDelta = verticalMotionOffset - this.prevVerticalMotionOffset;
+    if (vertDelta < -0.014) {
+      const impactMag = Math.min(1.8, (-vertDelta - 0.014) * 28) * Math.sqrt(massFactor);
+      this.motionPosVelY -= 0.28 * impactMag;
+      this.lagPitchVel -= 0.34 * impactMag;
+      this.lagRollVel += 0.12 * impactMag;
+    }
+    this.prevVerticalMotionOffset = verticalMotionOffset;
+
+    // Drain physical mechanical counter-impulses from WeaponAnimator (H&K slap, mag baseplate tap, AR slap, pump stroke)
+    if (this.weaponAnimator.consumeMechanicalSpringImpulse(this._mechImpulsePos, this._mechImpulseRot)) {
+      const invMass = 1 / Math.sqrt(Math.max(0.55, massFactor));
+      this.motionPosVelX += this._mechImpulsePos.x * invMass;
+      this.motionPosVelY += this._mechImpulsePos.y * invMass;
+      this.motionPosVelZ += this._mechImpulsePos.z * invMass;
+      this.lagPitchVel += this._mechImpulseRot.x * invMass;
+      this.lagYawVel += this._mechImpulseRot.y * invMass;
+      this.lagRollVel += this._mechImpulseRot.z * invMass;
+    }
+
+    [this.lagYaw, this.lagYawVel] = this.stepSpringScalar(this.lagYaw, this.lagYawVel, rotOmega, dt, rotZeta);
+    [this.lagPitch, this.lagPitchVel] = this.stepSpringScalar(this.lagPitch, this.lagPitchVel, rotOmega * 1.04, dt, rotZeta);
+    [this.lagRoll, this.lagRollVel] = this.stepSpringScalar(this.lagRoll, this.lagRollVel, rotOmega * 0.92, dt, rotZeta);
+    [this.motionPosX, this.motionPosVelX] = this.stepSpringScalar(this.motionPosX, this.motionPosVelX, posOmega, dt, posZeta);
+    [this.motionPosY, this.motionPosVelY] = this.stepSpringScalar(this.motionPosY, this.motionPosVelY, posOmega * 1.06, dt, posZeta);
+    [this.motionPosZ, this.motionPosVelZ] = this.stepSpringScalar(this.motionPosZ, this.motionPosVelZ, posOmega * 1.12, dt, posZeta);
+
+    this.lagYaw = THREE.MathUtils.clamp(this.lagYaw, -0.11, 0.11);
+    this.lagPitch = THREE.MathUtils.clamp(this.lagPitch, -0.10, 0.10);
+    this.lagRoll = THREE.MathUtils.clamp(this.lagRoll, -0.14, 0.14);
+    this.motionPosX = THREE.MathUtils.clamp(this.motionPosX, -0.026, 0.026);
+    this.motionPosY = THREE.MathUtils.clamp(this.motionPosY, -0.032, 0.024);
+    this.motionPosZ = THREE.MathUtils.clamp(this.motionPosZ, -0.026, 0.028);
 
     // 3. Muzzle flash decay
     if (this.flashTimer > 0) {
@@ -1632,6 +1781,10 @@ export class WeaponRig {
     pIn.sightMisalignRoll = this.sightMisalignRoll;
     pIn.lagYaw = this.lagYaw;
     pIn.lagPitch = this.lagPitch;
+    pIn.lagRoll = this.lagRoll;
+    pIn.motionPosX = this.motionPosX;
+    pIn.motionPosY = this.motionPosY;
+    pIn.motionPosZ = this.motionPosZ;
     pIn.camWorldPos = camWorldPos;
     pIn.camWorldQuat = camWorldQuat;
     pIn.weaponRootPitchRad = weaponRootPitchRad;

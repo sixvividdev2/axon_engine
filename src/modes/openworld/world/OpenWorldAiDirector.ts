@@ -17,7 +17,8 @@ import {
   TacticalCombatPose,
   TacticalOperatorRigFactory,
 } from '../../../../combat/TacticalOperatorRig';
-import { normalizeWeaponAttachments, WeaponAttachments } from '../../../../data/attachments';
+import { getOwnedSuppressorDef, normalizeWeaponAttachments, WeaponAttachments } from '../../../../data/attachments';
+import { getDefaultAmmoVariant, resolveBaseCaliberId } from '../../../../data/calibers';
 import { TacticalEquipmentId } from '../../../../data/tacticalEquipment';
 import {
   getStandingTier,
@@ -82,6 +83,75 @@ export interface AiNeutralWarningEvent {
   message: string;
 }
 
+export interface AiWeaponAudioProfile {
+  weightClass: 'pistol' | 'carbine' | 'heavy_rifle';
+  caliberId: string;
+  caliberMm: number;
+  muzzleVelocityMs: number;
+  energyJ: number;
+  isSubsonic: boolean;
+  suppressed: boolean;
+}
+
+export interface AiGunshotEvent {
+  agentId: string;
+  weaponId: string;
+  muzzlePos: Readonly<THREE.Vector3>;
+  targetEndPos: Readonly<THREE.Vector3>;
+  weightClass: 'pistol' | 'carbine' | 'heavy_rifle';
+  caliberId: string;
+  caliberMm: number;
+  muzzleVelocityMs: number;
+  energyJ: number;
+  suppressed: boolean;
+  isSubsonic: boolean;
+  distanceM: number;
+  isAmbientDistant?: boolean;
+}
+
+export function resolveAiWeaponAudioProfile(
+  weaponId: string,
+  suppressed: boolean,
+): AiWeaponAudioProfile {
+  const prof = resolveWeaponProfile(weaponId);
+  const caliberId = resolveBaseCaliberId(weaponId);
+  const ammo = getDefaultAmmoVariant(caliberId);
+  const v = ammo.baseVelocityMs;
+  const massKg = ammo.bulletMassGrams * 0.001;
+  const energyJ = 0.5 * massKg * v * v;
+  const calLower = caliberId.toLowerCase();
+  const caliberMm =
+    calLower.includes('50') || calLower.includes('127')
+      ? 12.7
+      : calLower.includes('12g')
+        ? 8.4
+        : calLower.includes('338')
+          ? 8.6
+          : calLower.includes('45')
+            ? 11.43
+            : calLower.includes('9x')
+              ? 9.0
+              : calLower.includes('762') || calLower.includes('308') || calLower.includes('300')
+                ? 7.62
+                : calLower.includes('545')
+                  ? 5.45
+                  : calLower.includes('57')
+                    ? 5.7
+                    : 5.56;
+  return {
+    weightClass:
+      prof.weightClass === 'carbine' || prof.weightClass === 'heavy_rifle'
+        ? prof.weightClass
+        : 'pistol',
+    caliberId,
+    caliberMm,
+    muzzleVelocityMs: v,
+    energyJ,
+    isSubsonic: v <= 343,
+    suppressed,
+  };
+}
+
 export interface AiUpdateOptions {
   playerAds?: boolean;
   playerAimDirX?: number;
@@ -90,6 +160,7 @@ export interface AiUpdateOptions {
   frustum?: THREE.Frustum;
   occlusionCuller?: OpenWorldOcclusionCuller;
   onNeutralWarning?: (ev: AiNeutralWarningEvent) => void;
+  onAiGunshot?: (ev: AiGunshotEvent) => void;
 }
 
 export interface AiSummaryTelemetry {
@@ -118,6 +189,7 @@ export interface AiAgentRecord {
   readonly visionRangeOverrideM?: number;
   readonly operatorId: OperatorId;
   readonly weaponId: string;
+  readonly suppressed: boolean;
   readonly homeX: number;
   readonly homeZ: number;
   readonly patrolRadiusM: number;
@@ -216,6 +288,9 @@ const _spawnPos = new THREE.Vector3();
 const _velVec = new THREE.Vector3();
 const _impDir = new THREE.Vector3();
 const _muzzleWorld = new THREE.Vector3();
+const _shotEndWorld = new THREE.Vector3();
+const _ambientMuzzleWorld = new THREE.Vector3();
+const _ambientEndWorld = new THREE.Vector3();
 const _playerGazeTarget = new THREE.Vector3();
 const _agentSphere = new THREE.Sphere(new THREE.Vector3(), 1.65);
 const _proxyDummy = new THREE.Object3D();
@@ -680,6 +755,7 @@ export class OpenWorldAiDirector {
   private activeHitMeshesReady = false;
   private frameParity = 0;
   private frameTick = 0;
+  private ambientFirefightCooldownSec = 3.2;
 
   constructor(
     scene: THREE.Scene,
@@ -818,6 +894,7 @@ export class OpenWorldAiDirector {
 
     const prof = resolveWeaponProfile(kit.weaponId);
     const magCap = Math.max(5, Math.min(30, prof.magCapacity));
+    const isSuppressed = Boolean(getOwnedSuppressorDef(normalizedAtt));
 
     const rec: AiAgentRecord = {
       id: agentId,
@@ -833,6 +910,7 @@ export class OpenWorldAiDirector {
       visionRangeOverrideM,
       operatorId: kit.operatorId,
       weaponId: kit.weaponId,
+      suppressed: isSuppressed,
       homeX,
       homeZ,
       patrolRadiusM,
@@ -1455,6 +1533,7 @@ export class OpenWorldAiDirector {
     }
 
     this.elapsedClock += dt;
+    this.ambientFirefightCooldownSec = Math.max(0, this.ambientFirefightCooldownSec - dt);
     this.frameParity = (this.frameParity + 1) & 1;
     this.frameTick = (this.frameTick + 1) % 60;
     this.activeHitMeshes.length = 0;
@@ -1571,6 +1650,37 @@ export class OpenWorldAiDirector {
         a.rig.root.visible = false;
         a.rig.setWarningLaser(false);
         a.lodTier = 3;
+        // Ambient distant firefight audio (300..650m muffled skirmishes across the 4km Open World)
+        if (
+          options?.onAiGunshot &&
+          distHoriz <= 650 &&
+          this.ambientFirefightCooldownSec <= 0 &&
+          a.role !== 'gate_guard'
+        ) {
+          this.ambientFirefightCooldownSec = 2.6 + ((i * 17 + this.frameTick) % 9) * 0.45;
+          const audioProf = resolveAiWeaponAudioProfile(a.weaponId, a.suppressed);
+          _ambientMuzzleWorld.set(a.x, a.y + 1.48, a.z);
+          _ambientEndWorld.set(
+            a.x - Math.sin(a.yaw) * 45,
+            a.y + 1.42,
+            a.z - Math.cos(a.yaw) * 45,
+          );
+          options.onAiGunshot({
+            agentId: a.id,
+            weaponId: a.weaponId,
+            muzzlePos: _ambientMuzzleWorld,
+            targetEndPos: _ambientEndWorld,
+            weightClass: audioProf.weightClass,
+            caliberId: audioProf.caliberId,
+            caliberMm: audioProf.caliberMm,
+            muzzleVelocityMs: audioProf.muzzleVelocityMs,
+            energyJ: audioProf.energyJ,
+            suppressed: audioProf.suppressed,
+            isSubsonic: audioProf.isSubsonic,
+            distanceM: distHoriz,
+            isAmbientDistant: true,
+          });
+        }
         continue;
       }
 
@@ -1914,14 +2024,46 @@ export class OpenWorldAiDirector {
           a.rig.muzzleFlash.getWorldPosition(_muzzleWorld);
           const spread = a.role === 'tower_sniper' ? 0.35 + distHoriz * 0.014 : 0.55 + distHoriz * 0.025;
           const missOffset = Math.sin(a.walkCycle * 11.7 + this.elapsedClock * 3.1 + i) * 0.5 * spread;
+          // Extend shot segment slightly past player plane so PCA flyby triggers cleanly on near-misses!
+          const aimX = playerX + missOffset;
+          const aimY = playerY - 0.14;
+          const aimZ = playerZ - missOffset * 0.6;
           this.spawnAiTracer(
             _muzzleWorld.x,
             _muzzleWorld.y,
             _muzzleWorld.z,
-            playerX + missOffset,
-            playerY - 0.18,
-            playerZ - missOffset * 0.6,
+            aimX,
+            aimY,
+            aimZ,
           );
+
+          if (options?.onAiGunshot) {
+            const audioProf = resolveAiWeaponAudioProfile(a.weaponId, a.suppressed);
+            const segDx = aimX - _muzzleWorld.x;
+            const segDy = aimY - _muzzleWorld.y;
+            const segDz = aimZ - _muzzleWorld.z;
+            const segLen = Math.max(0.5, Math.hypot(segDx, segDy, segDz));
+            const overshoot = segLen + 8.0;
+            _shotEndWorld.set(
+              _muzzleWorld.x + (segDx / segLen) * overshoot,
+              _muzzleWorld.y + (segDy / segLen) * overshoot,
+              _muzzleWorld.z + (segDz / segLen) * overshoot,
+            );
+            options.onAiGunshot({
+              agentId: a.id,
+              weaponId: a.weaponId,
+              muzzlePos: _muzzleWorld,
+              targetEndPos: _shotEndWorld,
+              weightClass: audioProf.weightClass,
+              caliberId: audioProf.caliberId,
+              caliberMm: audioProf.caliberMm,
+              muzzleVelocityMs: audioProf.muzzleVelocityMs,
+              energyJ: audioProf.energyJ,
+              suppressed: audioProf.suppressed,
+              isSubsonic: audioProf.isSubsonic,
+              distanceM: distHoriz,
+            });
+          }
 
           const hitChance =
             a.role === 'tower_sniper'

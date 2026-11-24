@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import {
+  BallisticFlybyParams,
   BodycamBreathCueKind,
   BodycamGearRattleKind,
   BodycamWeaponAudioCue,
@@ -7,6 +8,141 @@ import {
   IBodycamAudioSource,
 } from './IBodycamAudioSource';
 import { BodycamMeleeAttackType, BodycamSurfaceMaterial } from './types';
+
+export const SPEED_OF_SOUND_MPS = 343;
+export const OPEN_WORLD_SHARP_GUNSHOT_RANGE_M = 300;
+export const OPEN_WORLD_MAX_GUNSHOT_RANGE_M = 650;
+
+export interface BallisticFlybyClassification {
+  isSupersonic: boolean;
+  machNumber: number;
+  gainScale: number;
+  hasChestThump: boolean;
+  triggerMicroFlinch: boolean;
+  flinchDeg: number;
+  caliberWeight: number;
+}
+
+export interface SpatialGunshotEnvelope {
+  audible: boolean;
+  distanceM: number;
+  delaySec: number;
+  gainScale: number;
+  lowpassHz: number;
+  reverbWetGain: number;
+  isDistantMuffled: boolean;
+  pannerMaxDistM: number;
+}
+
+/**
+ * Classifies an incoming projectile flyby by instantaneous Mach speed, miss distance, and caliber/KE.
+ * Pure helper shared by BodycamAudio synthesis, BallisticsSolver micro-flinch gating, and unit tests.
+ */
+export function classifyBallisticFlyby(
+  speedMs: number,
+  missDistM: number,
+  caliberMm = 5.56,
+  energyJ = 1600,
+): BallisticFlybyClassification {
+  const safeSpeed = Math.max(0, speedMs);
+  const safeDist = Math.max(0.15, missDistM);
+  const machNumber = safeSpeed / SPEED_OF_SOUND_MPS;
+  const isSupersonic = safeSpeed > SPEED_OF_SOUND_MPS;
+
+  // Caliber & energy acoustic weight (0.75 for light 5.56/9mm up to 1.45 for 7.62x51 / .50 AE / .338)
+  const calNorm = THREE.MathUtils.clamp((caliberMm - 5.0) / 7.7, 0, 1);
+  const keNorm = THREE.MathUtils.clamp(Math.log10(Math.max(250, energyJ) / 250) / 1.4, 0, 1);
+  const caliberWeight = 0.78 + calNorm * 0.34 + keNorm * 0.33;
+
+  // Smooth inverse-distance acoustic gain from 0.2m to 4.5m
+  const prox01 = THREE.MathUtils.clamp(1 - (safeDist - 0.2) / 4.3, 0, 1);
+  const gainScale = (0.24 + prox01 * prox01 * 0.88) * caliberWeight;
+
+  const hasChestThump = isSupersonic && safeDist < 1.5;
+  const triggerMicroFlinch = isSupersonic && safeDist < 1.2;
+  const flinchProx01 = triggerMicroFlinch ? THREE.MathUtils.clamp(1 - safeDist / 1.2, 0, 1) : 0;
+  // Strictly bounded 0.30°..0.60° involuntary micro-flinch for razor-close supersonic passes
+  const flinchDeg = triggerMicroFlinch
+    ? THREE.MathUtils.clamp(0.30 + flinchProx01 * 0.22 + (caliberWeight - 0.78) * 0.14, 0.30, 0.60)
+    : 0;
+
+  return {
+    isSupersonic,
+    machNumber,
+    gainScale,
+    hasChestThump,
+    triggerMicroFlinch,
+    flinchDeg,
+    caliberWeight,
+  };
+}
+
+/**
+ * Computes long-range atmospheric gunshot attenuation, speed-of-sound propagation delay,
+ * sharp-crack (<300m) vs distant-muffled (300..650m) low-pass filtering, and valley tail reverb.
+ */
+export function computeSpatialGunshotEnvelope(
+  distanceM: number,
+  suppressed: boolean,
+  isSubsonic: boolean,
+  maxAudibleOverrideM?: number,
+  enableSpeedOfSoundDelay = true,
+): SpatialGunshotEnvelope {
+  const safeDist = Math.max(0, distanceM);
+  const defaultMax = suppressed && isSubsonic ? 115 : suppressed ? 260 : OPEN_WORLD_MAX_GUNSHOT_RANGE_M;
+  const maxAudibleM = maxAudibleOverrideM ?? defaultMax;
+
+  if (safeDist > maxAudibleM) {
+    return {
+      audible: false,
+      distanceM: safeDist,
+      delaySec: 0,
+      gainScale: 0,
+      lowpassHz: 700,
+      reverbWetGain: 0,
+      isDistantMuffled: true,
+      pannerMaxDistM: maxAudibleM,
+    };
+  }
+
+  const sharpCutoffM = suppressed ? Math.min(120, maxAudibleM * 0.5) : OPEN_WORLD_SHARP_GUNSHOT_RANGE_M;
+  const isDistantMuffled = safeDist > sharpCutoffM;
+
+  // Authentic speed-of-sound propagation delay (distance / 343s) for shots >= 18m away
+  const delaySec =
+    enableSpeedOfSoundDelay && safeDist >= 18 ? Math.min(2.2, safeDist / SPEED_OF_SOUND_MPS) : 0;
+
+  let lowpassHz: number;
+  let gainScale: number;
+  let reverbWetGain: number;
+
+  if (safeDist <= sharpCutoffM) {
+    // 0..300m: crisp sharp tactical crack with gentle air absorption
+    const t = sharpCutoffM > 1 ? safeDist / sharpCutoffM : 0;
+    lowpassHz = THREE.MathUtils.lerp(18000, suppressed ? 2600 : 4800, t * t);
+    gainScale = THREE.MathUtils.lerp(1.0, 0.44, Math.pow(t, 0.85));
+    reverbWetGain = THREE.MathUtils.lerp(0.28, 0.72, t);
+  } else {
+    // 300..650m: muffled rolling distant firefights fading smoothly to silence at 650m
+    const span = Math.max(1, maxAudibleM - sharpCutoffM);
+    const t = THREE.MathUtils.clamp((safeDist - sharpCutoffM) / span, 0, 1);
+    const smoothFade = (1 - t) * (1 - t);
+    lowpassHz = THREE.MathUtils.lerp(suppressed ? 2400 : 4400, 820, Math.pow(t, 0.72));
+    gainScale = Math.max(0.035, 0.44 * smoothFade);
+    reverbWetGain = THREE.MathUtils.lerp(0.76, 1.15, t) * (0.35 + 0.65 * smoothFade);
+  }
+
+  return {
+    audible: true,
+    distanceM: safeDist,
+    delaySec,
+    gainScale,
+    lowpassHz,
+    reverbWetGain,
+    isDistantMuffled,
+    pannerMaxDistM: maxAudibleM,
+  };
+}
 
 export type ZombieVocalKind = 'moan' | 'groan' | 'snarl' | 'lunge' | 'hurt' | 'death';
 
@@ -69,6 +205,8 @@ export class BodycamAudio implements IBodycamAudioSource {
   private readonly listenerPos = new THREE.Vector3();
   private activeZombieVocals = 0;
   private activeZombieSteps = 0;
+  private activeFlybyVoices = 0;
+  private activeDistantGunshots = 0;
 
   public ensureInitialized(): void {
     if (this.initialized) {
@@ -1195,89 +1333,281 @@ export class BodycamAudio implements IBodycamAudioSource {
     weightClass: 'pistol' | 'carbine' | 'heavy_rifle',
     suppressed: boolean,
     isSubsonic = false,
+    options?: {
+      caliberId?: string;
+      intensity?: number;
+      maxAudibleDistanceM?: number;
+      speedOfSoundDelay?: boolean;
+    },
   ): void {
     this.ensureInitialized();
     if (!this.ctx || !this.noiseBuffer || !this.dryBus || !this.wetBus) return;
-    const ctx = this.ctx;
-    const t = ctx.currentTime;
 
-    const panner = this.createHRTFPanner(pos, 1.5, isSubsonic && suppressed ? 45 : 160);
+    const distM = pos.distanceTo(this.listenerPos);
+    const isLocalShot = distM < 2.2;
+    const env = computeSpatialGunshotEnvelope(
+      distM,
+      suppressed,
+      isSubsonic,
+      options?.maxAudibleDistanceM,
+      options?.speedOfSoundDelay !== false && !isLocalShot,
+    );
+    if (!env.audible) return;
+
+    // Voice-budget distant AI/remote firefights so heavy Open World skirmishes stay locked at 60+ FPS
+    if (!isLocalShot && distM > 22) {
+      if (this.activeDistantGunshots >= 14) return;
+      this.activeDistantGunshots++;
+    }
+
+    const ctx = this.ctx;
+    const t = ctx.currentTime + env.delaySec;
+    const intensity = THREE.MathUtils.clamp(options?.intensity ?? 1.0, 0.25, 1.5);
+    const scale = env.gainScale * intensity;
+
+    // Atmospheric distance absorption low-pass filter (crisp <=300m, muffled 300..650m)
+    const airLp = ctx.createBiquadFilter();
+    airLp.type = 'lowpass';
+    airLp.frequency.setValueAtTime(isLocalShot ? 21000 : env.lowpassHz, t);
+    airLp.Q.value = 0.65;
+
+    const panner = this.createHRTFPanner(
+      pos,
+      isLocalShot ? 1.5 : 14.0,
+      Math.max(160, env.pannerMaxDistM),
+    );
     if (!panner) return;
+    panner.rolloffFactor = isLocalShot ? 1.15 : 0.68;
+
+    airLp.connect(panner);
     panner.connect(this.dryBus);
-    panner.connect(this.wetBus);
-    if (this.interiorWetBus) {
+
+    // Distance-scaled exterior tail reverb send for rolling Open World firefights
+    const wetSend = ctx.createGain();
+    wetSend.gain.setValueAtTime(isLocalShot ? 0.85 : env.reverbWetGain, t);
+    panner.connect(wetSend);
+    wetSend.connect(this.wetBus);
+    if (this.interiorWetBus && distM < 120) {
       panner.connect(this.interiorWetBus);
     }
 
     const heavy = weightClass === 'heavy_rifle';
     const rifle = weightClass === 'carbine' || heavy;
     const subSupp = suppressed && isSubsonic;
+    const calId = options?.caliberId ?? '';
+    const isShotgun = calId.includes('12g') || calId.includes('buck');
+    const isSmg9 = calId.includes('9x19') || calId.includes('9x18') || calId.includes('45acp');
+    const pitchMult = isShotgun ? 0.78 : isSmg9 ? 1.14 : heavy ? 0.88 : rifle ? 1.0 : 1.18;
 
     // 1. Sub-bass pressure punch (saturates the WaveShaper chest mic when loud!)
     const thumpOsc = ctx.createOscillator();
     thumpOsc.type = 'triangle';
     thumpOsc.frequency.setValueAtTime(
-      subSupp ? 115 : suppressed ? 130 : heavy ? 112 : rifle ? 140 : 162,
+      (subSupp ? 115 : suppressed ? 130 : heavy ? 112 : rifle ? 140 : 162) * pitchMult,
       t,
     );
-    thumpOsc.frequency.exponentialRampToValueAtTime(32, t + (subSupp ? 0.045 : suppressed ? 0.07 : 0.15));
+    thumpOsc.frequency.exponentialRampToValueAtTime(
+      isShotgun ? 28 : 32,
+      t + (subSupp ? 0.045 : suppressed ? 0.07 : env.isDistantMuffled ? 0.22 : 0.15),
+    );
 
     const thumpGain = ctx.createGain();
     thumpGain.gain.setValueAtTime(
-      subSupp ? 0.24 : suppressed ? 0.62 : heavy ? 2.8 : rifle ? 2.3 : 1.75,
+      (subSupp ? 0.24 : suppressed ? 0.62 : isShotgun ? 3.2 : heavy ? 2.8 : rifle ? 2.3 : 1.75) * scale,
       t,
     );
-    thumpGain.gain.exponentialRampToValueAtTime(0.001, t + (subSupp ? 0.055 : suppressed ? 0.08 : 0.19));
+    thumpGain.gain.exponentialRampToValueAtTime(
+      0.001,
+      t + (subSupp ? 0.055 : suppressed ? 0.08 : env.isDistantMuffled ? 0.28 : 0.19),
+    );
     thumpOsc.connect(thumpGain);
-    thumpGain.connect(panner);
+    thumpGain.connect(airLp);
     thumpOsc.start(t);
-    thumpOsc.stop(t + 0.21);
+    thumpOsc.stop(t + (env.isDistantMuffled ? 0.30 : 0.21));
 
-    // 2. Muzzle blast crack (suppressed subsonic has no supersonic flight crack)
+    // 2. Muzzle blast crack (sharp <=300m, rolling muffled boom 300..650m)
     const blast = ctx.createBufferSource();
     blast.buffer = this.noiseBuffer;
     const bp = ctx.createBiquadFilter();
-    bp.type = suppressed ? 'lowpass' : 'bandpass';
+    bp.type = suppressed || env.isDistantMuffled ? 'lowpass' : 'bandpass';
     bp.frequency.setValueAtTime(
-      subSupp ? 520 : suppressed ? 950 : heavy ? 1480 : rifle ? 1720 : 1980,
+      (subSupp ? 520 : suppressed ? 950 : heavy ? 1480 : rifle ? 1720 : 1980) * pitchMult,
       t,
     );
     bp.frequency.exponentialRampToValueAtTime(
-      subSupp ? 140 : suppressed ? 240 : 360,
-      t + (subSupp ? 0.055 : suppressed ? 0.09 : 0.26),
+      subSupp ? 140 : suppressed ? 240 : env.isDistantMuffled ? 190 : 360,
+      t + (subSupp ? 0.055 : suppressed ? 0.09 : env.isDistantMuffled ? 0.42 : 0.26),
     );
-    bp.Q.value = 0.7;
+    bp.Q.value = env.isDistantMuffled ? 0.55 : 0.72;
 
     const blastGain = ctx.createGain();
     blastGain.gain.setValueAtTime(
-      subSupp ? 0.22 : suppressed ? 0.50 : heavy ? 3.1 : rifle ? 2.65 : 2.05,
+      (subSupp ? 0.22 : suppressed ? 0.50 : isShotgun ? 3.35 : heavy ? 3.1 : rifle ? 2.65 : 2.05) * scale,
       t,
     );
-    blastGain.gain.exponentialRampToValueAtTime(
-      0.001,
-      t + (subSupp ? 0.07 : suppressed ? 0.11 : heavy ? 0.34 : 0.25),
-    );
+    const blastDur = subSupp ? 0.07 : suppressed ? 0.11 : env.isDistantMuffled ? 0.48 : heavy ? 0.34 : 0.25;
+    blastGain.gain.exponentialRampToValueAtTime(0.001, t + blastDur);
     blast.connect(bp);
     bp.connect(blastGain);
-    blastGain.connect(panner);
-    blast.start(t);
-    blast.stop(t + 0.38);
+    blastGain.connect(airLp);
+    blast.start(t, Math.random() * 0.5);
+    blast.stop(t + blastDur + 0.04);
 
-    // 3. Mechanical bolt carrier / firing-pin snap
-    const boltOsc = ctx.createOscillator();
-    boltOsc.type = 'square';
-    boltOsc.frequency.setValueAtTime(heavy ? 2100 : 2500, t + 0.012);
-    boltOsc.frequency.exponentialRampToValueAtTime(720, t + 0.044);
-    const boltGain = ctx.createGain();
-    boltGain.gain.setValueAtTime(subSupp ? 0.22 : 0.18, t + 0.012);
-    boltGain.gain.exponentialRampToValueAtTime(0.001, t + 0.05);
-    boltOsc.connect(boltGain);
-    boltGain.connect(panner);
-    boltOsc.start(t + 0.012);
-    boltOsc.stop(t + 0.056);
+    if (!isLocalShot && distM > 22) {
+      blast.onended = () => {
+        this.activeDistantGunshots = Math.max(0, this.activeDistantGunshots - 1);
+      };
+    }
 
-    if (!suppressed) {
+    // 3. Mechanical bolt carrier / firing-pin snap (audible only up close <= 35m)
+    if (distM <= 35) {
+      const boltOsc = ctx.createOscillator();
+      boltOsc.type = 'square';
+      boltOsc.frequency.setValueAtTime((heavy ? 2100 : 2500) * pitchMult, t + 0.012);
+      boltOsc.frequency.exponentialRampToValueAtTime(720, t + 0.044);
+      const boltGain = ctx.createGain();
+      boltGain.gain.setValueAtTime((subSupp ? 0.22 : 0.18) * scale, t + 0.012);
+      boltGain.gain.exponentialRampToValueAtTime(0.001, t + 0.05);
+      boltOsc.connect(boltGain);
+      boltGain.connect(airLp);
+      boltOsc.start(t + 0.012);
+      boltOsc.stop(t + 0.056);
+    }
+
+    if (!suppressed && distM < 45) {
       this.duckAmbientWind(1.0, 0.01);
+    }
+  }
+
+  /**
+   * Physically accurate procedural ballistic flyby synthesizer (zero external audio files, 60+ FPS safe):
+   * - Supersonic (v > 343 m/s): ultra-fast N-wave shockwave snap (<4ms attack, 25–45ms exp decay)
+   *   via crisp bipolar pulse + 1.8–5.5 kHz bandpass noise burst + near-miss (<1.5m) 120->55 Hz chest thump
+   *   + trailing Doppler wake (2.4 kHz -> 650 Hz over 90–160ms) + subtle indoor/outdoor reverb send.
+   * - Transonic / Subsonic (v <= 343 m/s): smooth resonant air-displacement whizz/zip (1.4 kHz -> 480 Hz
+   *   over 110–180ms) with no N-wave shockwave crack.
+   */
+  public playBallisticFlyby(params: BallisticFlybyParams): void {
+    this.ensureInitialized();
+    if (!this.ctx || !this.noiseBuffer || !this.dryBus || !this.wetBus) return;
+    if (this.activeFlybyVoices >= 8) return;
+
+    const cls = classifyBallisticFlyby(
+      params.speedMs,
+      params.missDistM,
+      params.caliberMm ?? 5.56,
+      params.energyJ ?? 1600,
+    );
+
+    const ctx = this.ctx;
+    const t = ctx.currentTime;
+    const panner = this.createHRTFPanner(params.closestPos, 0.45, 28);
+    if (!panner) return;
+    panner.rolloffFactor = 0.95;
+
+    this.activeFlybyVoices++;
+
+    // Route direct flyby to dry chest-mic bus + subtle spatial send to exterior/interior reverb
+    panner.connect(this.dryBus);
+    const reverbSend = ctx.createGain();
+    reverbSend.gain.setValueAtTime(cls.isSupersonic ? 0.34 : 0.14, t);
+    panner.connect(reverbSend);
+    reverbSend.connect(this.wetBus);
+    if (this.interiorWetBus) {
+      reverbSend.connect(this.interiorWetBus);
+    }
+
+    if (cls.isSupersonic) {
+      // 1A. Supersonic N-Wave Shockwave Snap — bipolar high-SPL impulse (<3ms attack, 28-42ms decay)
+      const nWaveDur = 0.028 + Math.min(0.017, (cls.caliberWeight - 0.78) * 0.024);
+      const pulseOsc = ctx.createOscillator();
+      pulseOsc.type = 'sawtooth';
+      pulseOsc.frequency.setValueAtTime(2600 + (cls.machNumber - 1) * 550, t);
+      pulseOsc.frequency.exponentialRampToValueAtTime(195, t + nWaveDur);
+      const pulseGain = ctx.createGain();
+      pulseGain.gain.setValueAtTime(0.001, t);
+      pulseGain.gain.linearRampToValueAtTime(1.45 * cls.gainScale, t + 0.0022);
+      pulseGain.gain.exponentialRampToValueAtTime(0.001, t + nWaveDur);
+      pulseOsc.connect(pulseGain);
+      pulseGain.connect(panner);
+      pulseOsc.start(t);
+      pulseOsc.stop(t + nWaveDur + 0.006);
+
+      // 1B. Crisp 1.8–5.5 kHz Bandpass Shockwave Crack Noise Burst
+      const snapSrc = ctx.createBufferSource();
+      snapSrc.buffer = this.noiseBuffer;
+      const snapBp = ctx.createBiquadFilter();
+      snapBp.type = 'bandpass';
+      snapBp.frequency.setValueAtTime(4600 - Math.min(1800, params.missDistM * 360), t);
+      snapBp.frequency.exponentialRampToValueAtTime(1850, t + nWaveDur + 0.012);
+      snapBp.Q.value = 1.15;
+      const snapGain = ctx.createGain();
+      snapGain.gain.setValueAtTime(0.001, t);
+      snapGain.gain.linearRampToValueAtTime(1.85 * cls.gainScale, t + 0.0025);
+      snapGain.gain.exponentialRampToValueAtTime(0.001, t + nWaveDur + 0.014);
+      snapSrc.connect(snapBp);
+      snapBp.connect(snapGain);
+      snapGain.connect(panner);
+      snapSrc.start(t, Math.random() * 0.9, nWaveDur + 0.03);
+
+      // 1C. Razor-Close Low-Mid Chest Thump (< 1.5m: 120 Hz -> 55 Hz over 42ms)
+      if (cls.hasChestThump) {
+        const thumpOsc = ctx.createOscillator();
+        thumpOsc.type = 'sine';
+        thumpOsc.frequency.setValueAtTime(120, t);
+        thumpOsc.frequency.exponentialRampToValueAtTime(55, t + 0.042);
+        const thumpGain = ctx.createGain();
+        const proxBoost = THREE.MathUtils.clamp(1 - params.missDistM / 1.5, 0.15, 1);
+        thumpGain.gain.setValueAtTime(0.001, t);
+        thumpGain.gain.linearRampToValueAtTime(0.95 * proxBoost * cls.caliberWeight, t + 0.003);
+        thumpGain.gain.exponentialRampToValueAtTime(0.001, t + 0.048);
+        thumpOsc.connect(thumpGain);
+        thumpGain.connect(panner);
+        thumpOsc.start(t);
+        thumpOsc.stop(t + 0.055);
+      }
+
+      // 1D. Trailing Supersonic Doppler Wake / Whizz (2.4 kHz -> 650 Hz over 95–155ms)
+      const wakeDur = 0.095 + Math.min(0.06, (params.missDistM / 4.5) * 0.055);
+      const wakeSrc = ctx.createBufferSource();
+      wakeSrc.buffer = this.noiseBuffer;
+      const wakeBp = ctx.createBiquadFilter();
+      wakeBp.type = 'bandpass';
+      wakeBp.frequency.setValueAtTime(2400, t + 0.008);
+      wakeBp.frequency.exponentialRampToValueAtTime(650, t + 0.008 + wakeDur);
+      wakeBp.Q.value = 4.2;
+      const wakeGain = ctx.createGain();
+      wakeGain.gain.setValueAtTime(0.001, t + 0.006);
+      wakeGain.gain.linearRampToValueAtTime(0.46 * cls.gainScale, t + 0.022);
+      wakeGain.gain.exponentialRampToValueAtTime(0.001, t + 0.012 + wakeDur);
+      wakeSrc.connect(wakeBp);
+      wakeBp.connect(wakeGain);
+      wakeGain.connect(panner);
+      wakeSrc.start(t + 0.006, Math.random() * 0.8, wakeDur + 0.03);
+      wakeSrc.onended = () => {
+        this.activeFlybyVoices = Math.max(0, this.activeFlybyVoices - 1);
+      };
+    } else {
+      // 2. Transonic / Subsonic Air-Displacement Whizz / Zip (NO N-wave crack: 1.4 kHz -> 480 Hz over 115–175ms)
+      const whizzDur = 0.115 + Math.min(0.06, (params.missDistM / 4.5) * 0.055);
+      const whizzSrc = ctx.createBufferSource();
+      whizzSrc.buffer = this.noiseBuffer;
+      const whizzBp = ctx.createBiquadFilter();
+      whizzBp.type = 'bandpass';
+      whizzBp.frequency.setValueAtTime(1400, t);
+      whizzBp.frequency.exponentialRampToValueAtTime(480, t + whizzDur);
+      whizzBp.Q.value = 5.0;
+      const whizzGain = ctx.createGain();
+      whizzGain.gain.setValueAtTime(0.001, t);
+      whizzGain.gain.linearRampToValueAtTime(0.58 * cls.gainScale, t + 0.014);
+      whizzGain.gain.exponentialRampToValueAtTime(0.001, t + whizzDur);
+      whizzSrc.connect(whizzBp);
+      whizzBp.connect(whizzGain);
+      whizzGain.connect(panner);
+      whizzSrc.start(t, Math.random() * 1.1, whizzDur + 0.03);
+      whizzSrc.onended = () => {
+        this.activeFlybyVoices = Math.max(0, this.activeFlybyVoices - 1);
+      };
     }
   }
 
@@ -1460,14 +1790,20 @@ export class BodycamAudio implements IBodycamAudioSource {
    */
   public playWeaponCue(cue: BodycamWeaponAudioCue, options?: BodycamWeaponCueOptions): void {
     if (cue === 'fire') {
-      const pos = options?.position ?? new THREE.Vector3();
+      const pos = options?.position ?? this.listenerPos;
       this.playGunshot(
         pos,
         options?.weightClass ?? 'carbine',
         Boolean(options?.suppressed),
         Boolean(options?.isSubsonic),
+        {
+          caliberId: options?.caliberId,
+          intensity: options?.intensity,
+          maxAudibleDistanceM: options?.maxAudibleDistanceM,
+          speedOfSoundDelay: options?.speedOfSoundDelay,
+        },
       );
-      if (options?.muzzleComp && !options?.suppressed && this.ctx && this.dryBus && this.noiseBuffer) {
+      if (options?.muzzleComp && !options?.suppressed && this.ctx && this.dryBus && this.noiseBuffer && pos.distanceTo(this.listenerPos) < 28) {
         // Extra crisp compensator port crack
         const t = this.ctx.currentTime;
         const crack = this.ctx.createBufferSource();

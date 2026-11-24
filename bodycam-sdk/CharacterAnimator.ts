@@ -405,8 +405,22 @@ export class CharacterAnimator {
     this.secondaryApplier.reset();
   }
 
+  private safeZoneDiscipline = false;
+
   public setAudio(audio: IBodycamAudioSource): void {
     this.audio = audio;
+  }
+
+  /**
+   * Enforces strict safe-zone / FOB / Hideout trigger discipline so the primary index finger
+   * stays extended straight along the receiver outside the trigger guard.
+   */
+  public setSafeZoneDiscipline(active: boolean): void {
+    this.safeZoneDiscipline = active;
+  }
+
+  public getTriggerEngageBlend(): number {
+    return this.triggerEngageBlend;
   }
 
   public isCombatBusy(): boolean {
@@ -2826,9 +2840,12 @@ export class CharacterAnimator {
       this.triggerHoldoverTimer = Math.max(0, this.triggerHoldoverTimer - dt);
     }
 
-    // Strict trigger discipline: right index finger straight off trigger during Sprint, Inspect, Reload, Tubular Reload, Mag-Check, Suppressor Toggle, and Bolt Cycling
+    // Strict trigger discipline: right index finger straight off trigger during Sprint, Low-Ready/Wall-Pullback,
+    // Safe-Zone (FOB/Hideout), Inspect, Reload, Tubular Reload, Mag-Check, Suppressor Toggle, and Bolt Cycling
     const canEngageTrigger =
       isFirearm &&
+      !this.safeZoneDiscipline &&
+      rigState.pullbackRatio < 0.35 &&
       !pdaActiveHold &&
       !grenadeActiveHold &&
       vaultPinR < 0.05 &&
@@ -2849,7 +2866,7 @@ export class CharacterAnimator {
     this.triggerEngageBlend = THREE.MathUtils.damp(
       this.triggerEngageBlend,
       wantsTriggerOn ? 1 : 0,
-      wantsTriggerOn ? 18 : 11,
+      wantsTriggerOn ? 18 : 14,
       dt,
     );
     const triggerEngaged = this.triggerEngageBlend > 0.5;
@@ -2984,10 +3001,17 @@ export class CharacterAnimator {
       }
       leftGripCurl = THREE.MathUtils.lerp(leftGripCurl, 0.16, vaultPinL);
     } else if (weaponAction === 'RELOAD' && isFirearm) {
-      // Physical detachable magazine reload: Reach MagWell -> Pull Mag to Pouch -> Swap -> Seat Mag -> Rack/AR Bolt-Catch Slap -> Return
+      // Platform-specific physical detachable magazine reload IK:
+      //  - MP5 H&K Slap (empty): Lock cocking handle into notch -> Strip curved mag -> Swap -> Seat -> Open-palm downward H&K Slap!
+      //  - AR-15: Strip -> Swap -> Seat & subtle tug verification -> Left-receiver bolt-catch paddle palm slap
+      //  - Pistols: 30° inward cant -> Strip along grip-rake -> Seat + upward baseplate palm-tap -> Rack/Release
+      //  - AK / Standard: Front-lug rock-and-lock mag seat -> Asymmetric charging-handle rack
       leftOverridden = true;
       const p = anim.getActionProgress();
-      const arSlap = anim.isArBoltCatchSlap();
+      const platformStyle = anim.getReloadPlatformStyle();
+      const arSlap = platformStyle === 'ar_bolt_catch';
+      const hkSlap = platformStyle === 'mp5_hk_slap';
+      const isPistolReload = platformStyle === 'pistol_cant';
 
       this.skeleton.magPouchAnchor.getWorldPosition(this._magPouchRoot);
       this.skeleton.root.worldToLocal(this._magPouchRoot);
@@ -2996,7 +3020,56 @@ export class CharacterAnimator {
       this.weaponRig.boltRackAnchor.getWorldPosition(this._boltRackRoot);
       this.skeleton.root.worldToLocal(this._boltRackRoot);
 
-      if (p < 0.16) {
+      if (hkSlap) {
+        if (p < 0.14) {
+          // Lock MP5 cocking handle rearward & upward into detent notch
+          const t = smoothstep(0.0, 0.08, p);
+          const pullBack = smoothstep(0.04, 0.13, p) * 0.052;
+          this.weaponRig.weaponPivot.getWorldQuaternion(this._inspectWeaponQuat);
+          this._inspectSlideWorld.set(0, 0.014 * smoothstep(0.09, 0.14, p), pullBack).applyQuaternion(this._inspectWeaponQuat);
+          this._inspectSlideWorld.applyQuaternion(this._rootWorldQuatInv);
+          this._tmpWorldB.copy(this._boltRackRoot).add(this._inspectSlideWorld);
+          this._lDesiredRoot.lerp(this._tmpWorldB, t);
+          leftGripCurl = 0.90;
+        } else if (p < 0.21) {
+          // Sweep from cocking tube down to curved 9mm magazine
+          const t = smoothstep(0.14, 0.21, p);
+          this._lDesiredRoot.copy(this._boltRackRoot).lerp(this._magWellRoot, t);
+          leftGripCurl = THREE.MathUtils.lerp(0.84, 0.95, t);
+        } else if (p < 0.37) {
+          // Strip curved mag cleanly down to chest pouch
+          const t = smoothstep(0.21, 0.37, p);
+          this._lDesiredRoot.copy(this._magWellRoot).lerp(this._magPouchRoot, t);
+          leftGripCurl = 0.95;
+        } else if (p < 0.48) {
+          const t = smoothstep(0.37, 0.48, p);
+          this._lDesiredRoot.copy(this._magPouchRoot);
+          this._lDesiredRoot.y -= Math.sin(t * Math.PI) * 0.032;
+          leftGripCurl = THREE.MathUtils.lerp(0.76, 0.95, t);
+        } else if (p < 0.65) {
+          // Insert fresh curved 9mm mag firmly into flared magwell
+          const t = smoothstep(0.48, 0.63, p);
+          this._lDesiredRoot.copy(this._magPouchRoot).lerp(this._magWellRoot, t);
+          leftGripCurl = 0.95;
+        } else if (p < 0.86) {
+          // Open-palm windup above cocking tube -> violent downward H&K Slap at p ~ 0.75!
+          const reachT = smoothstep(0.65, 0.72, p);
+          const slapStrike = p >= 0.72 && p <= 0.81 ? smoothstep(0.72, 0.76, p) : 0;
+          const slapRecover = p > 0.76 ? 1 - smoothstep(0.76, 0.84, p) : slapStrike;
+          this._tmpWorldB.copy(this._boltRackRoot);
+          // Raised windup (+5.5cm) plunging swiftly downward (-3.8cm) across detent notch
+          this._tmpWorldB.y += THREE.MathUtils.lerp(0.055, -0.038, slapStrike);
+          this._tmpWorldB.x -= 0.018 * (1 - slapStrike);
+          this._lDesiredRoot.copy(this._magWellRoot).lerp(this._tmpWorldB, reachT);
+          leftGripCurl = THREE.MathUtils.lerp(0.82, 0.22, Math.max(reachT * 0.75, slapRecover));
+          leftPadTap01 = slapRecover;
+        } else {
+          const t = smoothstep(0.86, 1.0, p);
+          this._tmpWorldB.copy(this._lDesiredRoot);
+          this._lDesiredRoot.copy(this._boltRackRoot).lerp(this._tmpWorldB, t);
+          leftGripCurl = THREE.MathUtils.lerp(0.55, spec.leftHandSocket?.gripCurl ?? 0.85, t);
+        }
+      } else if (p < 0.16) {
         // REACH_MAG: handL reaches cleanly from handguard/grip to magazine well
         const t = smoothstep(0.0, 0.16, p);
         this._lDesiredRoot.lerp(this._magWellRoot, t);
@@ -3014,24 +3087,45 @@ export class CharacterAnimator {
         leftGripCurl = THREE.MathUtils.lerp(0.76, 0.95, t);
       } else if (p < 0.65) {
         // INSERT_MAG: raises fresh magazine up and seats it crisply into magwell
-        const t = smoothstep(0.48, 0.63, p);
+        // Pistols add an upward baseplate palm-tap impulse; AR adds subtle seat-and-tug verification
+        const t = smoothstep(0.48, 0.61, p);
         this._lDesiredRoot.copy(this._magPouchRoot).lerp(this._magWellRoot, t);
-        leftGripCurl = 0.95;
+        if (isPistolReload && p >= 0.61) {
+          const tap = Math.sin(((p - 0.61) / 0.04) * Math.PI);
+          this._lDesiredRoot.y += tap * 0.016;
+          leftGripCurl = THREE.MathUtils.lerp(0.95, 0.38, tap);
+          leftPadTap01 = tap;
+        } else if (arSlap && p >= 0.615) {
+          const tug = Math.sin(((p - 0.615) / 0.035) * Math.PI);
+          this._lDesiredRoot.y -= tug * 0.008;
+          leftGripCurl = 0.95;
+        } else {
+          leftGripCurl = 0.95;
+        }
       } else if (p < 0.86) {
         if (arSlap) {
-          // AR-15/HK416 crisp palm slap on left-receiver bolt catch paddle
+          // AR-15/HK416 crisp open-palm slap on left-receiver bolt catch paddle
           const t = smoothstep(0.65, 0.72, p);
           const slapTap = p >= 0.70 && p <= 0.80 ? Math.sin(((p - 0.70) / 0.10) * Math.PI) : 0;
           this._tmpWorldB.copy(this._magWellRoot);
           this._tmpWorldB.y += 0.055;
-          this._tmpWorldB.x -= 0.028 - slapTap * 0.018;
+          this._tmpWorldB.x -= 0.028 - slapTap * 0.020;
           this._lDesiredRoot.copy(this._magWellRoot).lerp(this._tmpWorldB, t);
-          leftGripCurl = THREE.MathUtils.lerp(0.85, 0.32, slapTap);
+          leftGripCurl = THREE.MathUtils.lerp(0.85, 0.28, slapTap);
+          leftPadTap01 = slapTap;
         } else {
-          // RACK_BOLT: reaches up to slide/charging handle and pulls rearward to chamber & release lockback
-          const t = smoothstep(0.65, 0.72, p);
-          const pullBack =
-            p >= 0.70 && p <= 0.86 ? Math.sin(((p - 0.70) / 0.16) * Math.PI) * 0.055 : 0;
+          // RACK_BOLT: visual support-hand contact on slide/charging handle before asymmetric rearward actuation
+          const t = smoothstep(0.65, 0.71, p);
+          let pullBack = 0;
+          if (p >= 0.70 && p <= 0.86) {
+            const r = (p - 0.70) / 0.16;
+            pullBack =
+              r < 0.50
+                ? Math.pow(smoothstep(0.0, 0.50, r), 0.85) * 0.056
+                : r < 0.62
+                  ? 0.056
+                  : (1 - Math.pow(smoothstep(0.62, 1.0, r), 1.35)) * 0.056;
+          }
           this.weaponRig.weaponPivot.getWorldQuaternion(this._inspectWeaponQuat);
           this._inspectSlideWorld.set(0, 0, pullBack).applyQuaternion(this._inspectWeaponQuat);
           this._inspectSlideWorld.applyQuaternion(this._rootWorldQuatInv);

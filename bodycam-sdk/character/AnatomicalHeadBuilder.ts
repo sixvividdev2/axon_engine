@@ -2209,6 +2209,70 @@ export function getSharedEyeballTexture(
   return tex;
 }
 
+export type IrisGlowMode = 'none' | 'yellow' | 'red';
+
+let sharedIrisEmissiveMaskTex: THREE.CanvasTexture | null = null;
+
+/**
+ * Generates and caches a strictly iris-only emissive mask texture (256x256):
+ * - Sclera outside the limbal ring is pure black (#000000) -> ZERO sclera glow.
+ * - Center pupil is pure black (#000000) -> dark crisp pupil core.
+ * - ONLY the annular iris ring (r = 0.44..0.98 * irisR) carries emissive luminance,
+ *   tinted by eyeMat.emissive (amber-yellow for regular/crawler infected, crimson-red for rare runners).
+ */
+export function getSharedIrisEmissiveMaskTexture(): THREE.CanvasTexture {
+  if (sharedIrisEmissiveMaskTex) return sharedIrisEmissiveMaskTex;
+
+  const W = 256;
+  const H = 256;
+  const canvas = createCanvas(W, H);
+  const ctx = canvas.getContext('2d')!;
+
+  // Pure black background (zero glow on sclera)
+  ctx.fillStyle = '#000000';
+  ctx.fillRect(0, 0, W, H);
+
+  const cx = W * 0.5;
+  const cy = H * 0.5;
+  const irisR = W * 0.116;
+
+  // Luminous annular iris glow ring ONLY
+  const ringGrad = ctx.createRadialGradient(cx, cy, irisR * 0.42, cx, cy, irisR * 0.99);
+  ringGrad.addColorStop(0.0, 'rgba(0,0,0,1)');
+  ringGrad.addColorStop(0.14, 'rgba(255,255,255,0.96)');
+  ringGrad.addColorStop(0.62, 'rgba(255,255,255,1.0)');
+  ringGrad.addColorStop(0.88, 'rgba(220,220,220,0.68)');
+  ringGrad.addColorStop(1.0, 'rgba(0,0,0,1)');
+  ctx.fillStyle = ringGrad;
+  ctx.beginPath();
+  ctx.arc(cx, cy, irisR * 0.99, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Subtle radial iris crypt fibers for eerie organic detail inside the glowing iris ring
+  ctx.strokeStyle = 'rgba(180,180,180,0.45)';
+  ctx.lineWidth = 1.1;
+  for (let i = 0; i < 24; i++) {
+    const a = (i / 24) * Math.PI * 2;
+    ctx.beginPath();
+    ctx.moveTo(cx + Math.cos(a) * irisR * 0.48, cy + Math.sin(a) * irisR * 0.48);
+    ctx.lineTo(cx + Math.cos(a) * irisR * 0.90, cy + Math.sin(a) * irisR * 0.90);
+    ctx.stroke();
+  }
+
+  // Re-punch pure black pupil center so pupil never glows
+  ctx.fillStyle = '#000000';
+  ctx.beginPath();
+  ctx.arc(cx, cy, irisR * 0.43, 0, Math.PI * 2);
+  ctx.fill();
+
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.NoColorSpace;
+  tex.anisotropy = 4;
+  tex.needsUpdate = true;
+  sharedIrisEmissiveMaskTex = tex;
+  return tex;
+}
+
 // ============================================================================
 // SHARED ANATOMICAL HEAD ASSEMBLY + HAIR CAP + 3D BROWS + FACE GEAR + EYEWEAR
 // ============================================================================
@@ -2259,6 +2323,8 @@ export interface BuiltAnatomicalHeadAssembly {
   applyFaceGear: (faceGear: FaceGearId) => void;
   applyEyewear: (eyewear: EyewearId) => void;
   applyHeadgearClearance: (helmetType: HelmetTypeId, faceGear?: FaceGearId) => void;
+  applyIrisGlow: (mode: IrisGlowMode) => void;
+  getIrisGlow: () => IrisGlowMode;
 }
 
 export interface BuildHeadAssemblyParams {
@@ -2266,6 +2332,8 @@ export interface BuildHeadAssemblyParams {
   toneSeed: number;
   facePreset?: FacePresetId;
   zombieHairStyle?: ZombieHairStyle;
+  /** Strictly iris-only emissive glow (used for Infected walkers/crawlers 'yellow' and rare runners 'red') */
+  irisGlowMode?: IrisGlowMode;
   anisotropy?: number;
   hoodMaterial: THREE.Material;
   frameMaterial: THREE.Material;
@@ -2452,8 +2520,9 @@ export function buildAnatomicalHeadAssembly(
   }
   root.add(oralCavityMesh, upperTeethMesh);
 
-  // 5. Recessed Independent Eyeballs with Wet Clearcoat Cornea Shader
+  // 5. Recessed Independent Eyeballs with Wet Clearcoat Cornea Shader (+ optional strictly iris-only emissive glow)
   const eyeTex = getSharedEyeballTexture(variant, toneSeed, activeFacePreset);
+  let activeIrisGlow: IrisGlowMode = params.irisGlowMode ?? (variant === 'zombie' ? 'yellow' : 'none');
   const eyeMat = trackMat(
     new THREE.MeshPhysicalMaterial({
       map: eyeTex,
@@ -2464,6 +2533,25 @@ export function buildAnatomicalHeadAssembly(
       reflectivity: 0.95,
     }),
   );
+
+  const applyIrisGlow = (mode: IrisGlowMode): void => {
+    activeIrisGlow = mode;
+    if (mode === 'yellow') {
+      eyeMat.emissive.setHex(0xffc824);
+      eyeMat.emissiveMap = getSharedIrisEmissiveMaskTexture();
+      eyeMat.emissiveIntensity = 2.25;
+    } else if (mode === 'red') {
+      eyeMat.emissive.setHex(0xff1e12);
+      eyeMat.emissiveMap = getSharedIrisEmissiveMaskTexture();
+      eyeMat.emissiveIntensity = 2.55;
+    } else {
+      eyeMat.emissive.setHex(0x000000);
+      eyeMat.emissiveMap = null;
+      eyeMat.emissiveIntensity = 0;
+    }
+    eyeMat.needsUpdate = true;
+  };
+  applyIrisGlow(activeIrisGlow);
 
   const eyeL = new THREE.Group();
   eyeL.name = 'eye_l';
@@ -2998,5 +3086,7 @@ export function buildAnatomicalHeadAssembly(
     applyFaceGear,
     applyEyewear,
     applyHeadgearClearance,
+    applyIrisGlow,
+    getIrisGlow: () => activeIrisGlow,
   };
 }
