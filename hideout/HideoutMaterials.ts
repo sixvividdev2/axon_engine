@@ -497,6 +497,9 @@ export function createHideoutMaterials(maxAniso: number): HideoutMaterialLibrary
       map: hazardTex,
       roughness: 0.68,
       metalness: 0.12,
+      polygonOffset: true,
+      polygonOffsetFactor: -1,
+      polygonOffsetUnits: -2,
     }),
   );
 

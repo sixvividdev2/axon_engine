@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import * as THREE from 'three';
 import { beforeAll, describe, expect, it } from 'vitest';
 import {
@@ -7,6 +9,8 @@ import {
   CharacterAnimator,
   CharacterSkeleton,
   DEFAULT_BODYCAM_SDK_CONFIG,
+  FACIAL_MORPH_TARGET_NAMES,
+  FacialExpressionController,
   OPERATOR_STORAGE_KEY,
   OperatorAssetLoader,
   OperatorSelectionStore,
@@ -23,6 +27,8 @@ import {
   TacticalGrenadeSystem,
   TacticalPdaDevice,
   createPdaMotionState,
+  getWeaponsByCategory,
+  normalizeOperatorGearConfig,
   PdaHudTelemetry,
   WeaponRig,
   buildTacticalEquipmentMesh,
@@ -43,6 +49,8 @@ import {
   normalizeWeaponAttachments,
 } from '../../data/attachments';
 import { AMMO_VARIANTS } from '../../data/calibers';
+import { WEAPON_UNLOCK_RANK } from '../../data/progression';
+import { PMC_FACTIONS } from '../../src/modes/openworld/types';
 import { evalRatchetedSuppressorTwist, RatchetedSuppressorTwistSample } from '../weapons/WeaponAnimator';
 import { WeaponModelFactory } from '../weapons/WeaponModelFactory';
 import {
@@ -56,6 +64,7 @@ import { CharacterAnimator as SurvivalCharacterAnimator } from '../../engine/cha
 import { CharacterDriverState } from '../../engine/character/ControllerStateReader';
 import { WeaponRig as SurvivalWeaponRig } from '../../engine/weapons/WeaponRig';
 import { TacticalOperatorRigFactory } from '../../combat/TacticalOperatorRig';
+import { InfectedZombieRigLibrary } from '../../combat/InfectedZombieRig';
 
 /**
  * Minimal headless 2D canvas stub so Three.js CanvasTexture procedural PBR materials
@@ -2222,6 +2231,277 @@ describe('Phase 11 — Coupled Tactical PDA Locomotion Sway, Sprint Pump, Inerti
     weaponRig.dispose();
   });
 });
+
+describe('Phase 12 — Anatomical Faces, 15 Morph Targets, Eyeball Gaze LOD, Starter Shotgun & Frustum Z-Fighting Audits', () => {
+  it('places Remington 870 Pump Shotgun #1 in Shotguns and unlocks it at Rank 1 across Progression and Open World factions', () => {
+    const shotguns = getWeaponsByCategory('shotguns');
+    expect(shotguns.length).toBeGreaterThanOrEqual(2);
+    expect(shotguns[0].id).toBe('remington_870');
+    expect(shotguns[1].id).toBe('mossberg_590a1');
+    expect(WEAPON_UNLOCK_RANK.remington_870).toBe(1);
+    expect(PMC_FACTIONS.pmc_alpha.starterWeaponIds).toContain('remington_870');
+    expect(PMC_FACTIONS.pmc_bravo.starterWeaponIds).toContain('remington_870');
+    expect(PMC_FACTIONS.pmc_alpha.starterUnlockedWeaponIds).toContain('remington_870');
+    expect(PMC_FACTIONS.pmc_bravo.starterUnlockedWeaponIds).toContain('remington_870');
+  });
+
+  it('builds 15 morph targets and eye_l/eye_r pivots on CharacterSkeleton, TacticalOperatorRig, and InfectedZombieRig with strict parity & FPS masking', () => {
+    for (const opId of ['MALE', 'FEMALE'] as const) {
+      const skel = new CharacterSkeleton(1, 'infection', opId, true);
+      const asm = skel.getHeadAssembly()!;
+      expect(asm).not.toBeNull();
+      expect(asm.eyeL.name).toBe('eye_l');
+      expect(asm.eyeR.name).toBe('eye_r');
+      const dict = asm.headMesh.morphTargetDictionary!;
+      expect(dict).toBeDefined();
+      for (const morphName of FACIAL_MORPH_TARGET_NAMES) {
+        expect(typeof dict[morphName]).toBe('number');
+      }
+      expect(asm.headMesh.morphTargetInfluences?.length).toBe(FACIAL_MORPH_TARGET_NAMES.length);
+
+      // Hot-swapping faceGear & eyewear preserves unit head scale & STRICT parity
+      skel.applyGearConfig({ faceGear: 'open_face', eyewear: 'clear_glasses' });
+      expect(asm.faceGearGroups.neckGaiter.visible).toBe(false);
+      expect(asm.faceGearGroups.balaclava.visible).toBe(false);
+      expect(asm.eyewearGroups.clearGlasses.visible).toBe(true);
+      expect(validateOperatorRig(skel.root, opId, 'STRICT').valid).toBe(true);
+
+      // First-person shadow-only hides all head meshes cleanly (no eye/teeth/mask/glass leak)
+      skel.setFirstPersonHeadShadowOnly(true);
+      asm.root.traverse((obj) => {
+        if ((obj as THREE.Mesh).isMesh) {
+          const mat = (obj as THREE.Mesh).material as THREE.Material;
+          expect(mat.colorWrite).toBe(false);
+          expect(mat.depthWrite).toBe(false);
+        }
+      });
+      skel.setFirstPersonHeadShadowOnly(false);
+      expect((asm.headMesh.material as THREE.MeshStandardMaterial).depthWrite).toBe(true);
+      expect((asm.headMesh.material as THREE.MeshStandardMaterial).colorWrite).toBe(true);
+      skel.dispose();
+    }
+
+    // TacticalOperatorRig 3P face assembly + zero-GC combat pose facial expression drive
+    const opFactory = new TacticalOperatorRigFactory(1);
+    const rig = opFactory.buildOperator('bot', 'op_face_test', 'team_a', 'MALE');
+    const rigHead = rig.headGroup.getObjectByName('anatomical_head_mesh') as THREE.Mesh;
+    expect(rigHead).toBeDefined();
+    expect(rigHead).toBe(rig.headAssembly.headMesh);
+    for (const morphName of FACIAL_MORPH_TARGET_NAMES) {
+      expect(typeof rigHead.morphTargetDictionary?.[morphName]).toBe('number');
+    }
+    expect(rig.headGroup.getObjectByName('eye_l')).toBeDefined();
+    expect(rig.headGroup.getObjectByName('eye_r')).toBeDefined();
+    opFactory.dispose();
+
+    // InfectedZombieRig shares 15 morph targets & eye pivots with zero MeshBasicMaterial
+    const zLib = new InfectedZombieRigLibrary();
+    const zRig = zLib.buildZombie('z_face_test', 'quarantine_guard');
+    const zFace = zRig.headGroup.getObjectByName('anatomical_face_mesh') ?? zRig.headGroup.getObjectByName('anatomical_head_mesh');
+    const zFaceMesh = zFace as THREE.Mesh;
+    expect(zFaceMesh).toBeDefined();
+    for (const morphName of FACIAL_MORPH_TARGET_NAMES) {
+      expect(typeof zFaceMesh.morphTargetDictionary?.[morphName]).toBe('number');
+    }
+    expect(zRig.headGroup.getObjectByName('eye_l')).toBeDefined();
+    expect(zRig.headGroup.getObjectByName('eye_r')).toBeDefined();
+    expect(zRig.jawPivot.parent).toBe(zRig.headGroup);
+    let basicCount = 0;
+    zRig.root.traverse((obj) => {
+      if ((obj as THREE.Mesh).isMesh) {
+        const mats = Array.isArray((obj as THREE.Mesh).material)
+          ? ((obj as THREE.Mesh).material as THREE.Material[])
+          : [(obj as THREE.Mesh).material];
+        for (const m of mats) {
+          if ((m as THREE.Material).type === 'MeshBasicMaterial') basicCount += 1;
+        }
+      }
+    });
+    expect(basicCount).toBe(0);
+    zLib.dispose();
+  });
+
+  it('clamps eyeball gaze yaw/pitch, enforces finite morph weights, and respects 25m/35m LOD culling', () => {
+    const skel = new CharacterSkeleton(1, 'infection', 'FEMALE', true);
+    const asm = skel.getHeadAssembly()!;
+    const ctrl = new FacialExpressionController(7);
+    const influences = asm.headMesh.morphTargetInfluences!;
+
+    // Extreme gaze target off to the side/up -> eyeball pivots must remain anatomically clamped
+    const extremeTarget = new THREE.Vector3(25, 18, -2);
+    for (let i = 0; i < 40; i++) {
+      ctrl.step(
+        1 / 60,
+        {
+          mode: 'human',
+          intent: 'suppressed',
+          stress01: 0.9,
+          injury01: 0.4,
+          flinchImpulse01: i === 5 ? 1.0 : 0,
+          gazeTargetWorld: extremeTarget,
+          distanceToCameraM: 4,
+          isVisible: true,
+        },
+        asm.root,
+        influences,
+        asm.eyeL,
+        asm.eyeR,
+      );
+    }
+
+    expect(Math.abs(asm.eyeL.rotation.y)).toBeLessThanOrEqual(0.481);
+    expect(Math.abs(asm.eyeL.rotation.x)).toBeLessThanOrEqual(0.301);
+    expect(Math.abs(asm.eyeR.rotation.y)).toBeLessThanOrEqual(0.481);
+    for (const w of influences) {
+      expect(Number.isFinite(w)).toBe(true);
+      expect(Number.isNaN(w)).toBe(false);
+    }
+    expect(ctrl.getCurrentWeight('brow_furrow_down')).toBeGreaterThan(0.05);
+
+    // Distance > 35m freezes morph updates cleanly
+    const frozenSnapshot = influences.slice();
+    for (let i = 0; i < 30; i++) {
+      ctrl.step(
+        1 / 60,
+        {
+          mode: 'human',
+          intent: 'calm',
+          stress01: 0,
+          injury01: 0,
+          flinchImpulse01: 0,
+          distanceToCameraM: 42,
+          isVisible: true,
+        },
+        asm.root,
+        influences,
+        asm.eyeL,
+        asm.eyeR,
+      );
+    }
+    expect(influences).toEqual(frozenSnapshot);
+    skel.dispose();
+  });
+
+  it('persists and sanitizes faceGear and eyewear across Locker config and multiplayer packets', () => {
+    const defaults = normalizeOperatorGearConfig(undefined);
+    expect(defaults.faceGear).toBe('neck_gaiter');
+    expect(defaults.eyewear).toBe('none');
+
+    const normalized = normalizeOperatorGearConfig({
+      faceGear: 'open_face',
+      eyewear: 'clear_glasses',
+    });
+    expect(normalized.faceGear).toBe('open_face');
+    expect(normalized.eyewear).toBe('clear_glasses');
+
+    const corrupted = normalizeOperatorGearConfig({
+      faceGear: 'bogus_mask' as unknown as 'neck_gaiter',
+      eyewear: 'laser_eyes' as unknown as 'none',
+    });
+    expect(corrupted.faceGear).toBe('neck_gaiter');
+    expect(corrupted.eyewear).toBe('none');
+
+    const roomState: LobbyRoomState = {
+      code: 'TST002',
+      hostUserId: 'host_1',
+      hostUsername: 'HOST',
+      visibility: 'private',
+      mode: 'battle',
+      battleRule: 'tdm',
+      mapId: 'timberline_compound',
+      maxPlayers: 8,
+      botsEnabled: true,
+      botCount: 4,
+      killLimit: 30,
+      botDifficulty: 'tactical',
+      status: 'in_match',
+      matchSequence: 1,
+      specialEvent: null,
+      members: [
+        {
+          userId: 'host_1',
+          username: 'HOST',
+          team: 'A',
+          ready: true,
+          isHost: true,
+          rank: 1,
+          prestige: 0,
+          connected: true,
+          joinedAt: Date.now(),
+        },
+        {
+          userId: 'peer_2',
+          username: 'PEER',
+          team: 'B',
+          ready: true,
+          isHost: false,
+          rank: 1,
+          prestige: 0,
+          connected: true,
+          joinedAt: Date.now(),
+        },
+      ],
+      chat: [],
+      updatedAt: Date.now(),
+    };
+    const matchState = createDefaultMatchState();
+    const validState = validateAndSanitizeGameMessage(
+      {
+        type: 'game:state',
+        x: 0,
+        y: 0,
+        z: 0,
+        yaw: 0,
+        pitch: 0,
+        weaponId: 'remington_870',
+        hp: 100,
+        maxHp: 100,
+        alive: true,
+        faceGear: 'balaclava',
+        eyewear: 'tinted_visor',
+      },
+      roomState,
+      matchState,
+      { userId: 'peer_2', username: 'PEER' },
+    );
+    expect(validState).toBeTruthy();
+    expect(validState!.payload.faceGear).toBe('balaclava');
+    expect(validState!.payload.eyewear).toBe('tinted_visor');
+  });
+
+  it('enforces tightened PerspectiveCamera near planes (>= 0.08m interior/combat) and separated preview pedestal geometry', () => {
+    const camFiles = [
+      'arena/CadGunsmithStage.ts',
+      'arena/BallisticsSimViewport.ts',
+      'engine/GameEngine.ts',
+      'hideout/ZombiesLobbyController.ts',
+      'hideout/HideoutSessionController.ts',
+      'gym/GymEngine.ts',
+      'bodycam-sdk/weapons/ScopeRenderer.ts',
+      'combat/CombatSessionEngine.ts',
+      'ui/OperatorPreviewStage.ts',
+    ];
+    const camRegex = /new THREE\.PerspectiveCamera\(\s*[\s\S]*?,\s*([0-9.]+)\s*,\s*([0-9.]+)\s*,?\s*\)/g;
+    for (const rel of camFiles) {
+      const src = readFileSync(resolve(process.cwd(), rel), 'utf8');
+      const matches = [...src.matchAll(camRegex)];
+      expect(matches.length, `expected PerspectiveCamera in ${rel}`).toBeGreaterThan(0);
+      for (const m of matches) {
+        const near = Number(m[1]);
+        const far = Number(m[2]);
+        expect(near, `${rel} camera near`).toBeGreaterThanOrEqual(0.08);
+        expect(far / near, `${rel} far/near ratio`).toBeLessThanOrEqual(16000);
+      }
+    }
+
+    // OperatorPreviewStage turntable pedestal vertical clearance
+    const previewSrc = readFileSync(resolve(process.cwd(), 'ui/OperatorPreviewStage.ts'), 'utf8');
+    expect(previewSrc).toContain('plinth.position.y = -0.0325');
+    expect(previewSrc).toContain('deck.position.y = -0.005');
+    expect(previewSrc).toContain('ring.position.y = 0.003');
+  });
+});
+
 
 
 

@@ -214,6 +214,10 @@ export class InfectionZombieAI {
     staggerRatio: 0,
     deathProgress: 0,
     elapsedSec: 0,
+    dt: 0.016,
+    gazeTargetWorld: null,
+    distanceToCameraM: 0,
+    isVisible: true,
   };
 
   constructor(
@@ -769,10 +773,13 @@ export class InfectionZombieAI {
     this._poseInput.staggerRatio = 0;
     this._poseInput.deathProgress = 0;
     this._poseInput.elapsedSec = this.elapsedSec;
-    this.rigLib.applyPose(rig, this._poseInput);
-
+    this._poseInput.dt = 0.016;
+    this._poseInput.gazeTargetWorld = null;
+    this._poseInput.distanceToCameraM = 0;
+    this._poseInput.isVisible = true;
     root.position.copy(z.pos);
     root.rotation.set(0, z.yaw, 0);
+    this.rigLib.applyPose(rig, this._poseInput);
     return z;
   }
 
@@ -1194,6 +1201,14 @@ export class InfectionZombieAI {
           this._poseInput.staggerRatio = 0;
           this._poseInput.deathProgress = Math.min(1, z.deathTimer / 0.55);
           this._poseInput.elapsedSec = this.elapsedSec;
+          this._poseInput.dt = dt;
+          this._poseInput.gazeTargetWorld = null;
+          this._poseInput.distanceToCameraM = Math.hypot(
+            z.pos.x - playerPos.x,
+            z.pos.y - playerPos.y,
+            z.pos.z - playerPos.z,
+          );
+          this._poseInput.isVisible = z.root.visible;
           this.rigLib.applyPose(z.rig, this._poseInput);
           if (z.deathTimer > 3.2) {
             this.group.remove(z.root);
@@ -1248,10 +1263,17 @@ export class InfectionZombieAI {
               : 'locomote';
           this._poseInput.windupProgress = z.netWindup ? 0.65 : 0;
         }
-        this.rigLib.applyPose(z.rig, this._poseInput);
-
         z.root.position.copy(z.pos);
         z.root.rotation.set(0, z.yaw, 0);
+        this._poseInput.dt = dt;
+        this._poseInput.gazeTargetWorld = playerPos;
+        this._poseInput.distanceToCameraM = Math.hypot(
+          z.pos.x - playerPos.x,
+          z.pos.y - playerPos.y,
+          z.pos.z - playerPos.z,
+        );
+        this._poseInput.isVisible = z.root.visible;
+        this.rigLib.applyPose(z.rig, this._poseInput);
       }
       this.updateSpatialZombieAudio(dt, playerPos);
       return;
@@ -1315,6 +1337,14 @@ export class InfectionZombieAI {
         this._poseInput.staggerRatio = 0;
         this._poseInput.deathProgress = Math.min(1, z.deathTimer / 0.55);
         this._poseInput.elapsedSec = this.elapsedSec;
+        this._poseInput.dt = dt;
+        this._poseInput.gazeTargetWorld = null;
+        this._poseInput.distanceToCameraM = Math.hypot(
+          z.pos.x - playerPos.x,
+          z.pos.y - playerPos.y,
+          z.pos.z - playerPos.z,
+        );
+        this._poseInput.isVisible = z.root.visible;
         this.rigLib.applyPose(z.rig, this._poseInput);
         if (z.deathTimer > 3.2) {
           this.group.remove(z.root);
@@ -1382,7 +1412,18 @@ export class InfectionZombieAI {
             this._poseInput.staggerRatio = Math.min(1, z.staggerTimer / 0.35);
             this._poseInput.deathProgress = 0;
             this._poseInput.elapsedSec = this.elapsedSec;
+            this._poseInput.dt = dt;
+            this._poseInput.gazeTargetWorld = z.sillPos;
+            this._poseInput.distanceToCameraM = Math.hypot(
+              z.pos.x - playerPos.x,
+              z.pos.y - playerPos.y,
+              z.pos.z - playerPos.z,
+            );
+            this._poseInput.isVisible = z.root.visible;
+            z.root.position.copy(z.pos);
+            z.root.rotation.set(0, z.yaw, 0);
             this.rigLib.applyPose(z.rig, this._poseInput);
+            continue;
           }
 
           z.root.position.copy(z.pos);
@@ -1426,6 +1467,16 @@ export class InfectionZombieAI {
               this._poseInput.staggerRatio = 0;
               this._poseInput.deathProgress = 0;
               this._poseInput.elapsedSec = this.elapsedSec;
+              this._poseInput.dt = dt;
+              this._poseInput.gazeTargetWorld = playerPos;
+              this._poseInput.distanceToCameraM = Math.hypot(
+                z.pos.x - playerPos.x,
+                z.pos.y - playerPos.y,
+                z.pos.z - playerPos.z,
+              );
+              this._poseInput.isVisible = z.root.visible;
+              z.root.position.copy(z.pos);
+              z.root.rotation.set(0, z.yaw, 0);
               this.rigLib.applyPose(z.rig, this._poseInput);
 
               if (z.tearTimer <= 0 && barrier) {
@@ -1448,6 +1499,16 @@ export class InfectionZombieAI {
               this._poseInput.staggerRatio = Math.min(1, z.staggerTimer / 0.35);
               this._poseInput.deathProgress = 0;
               this._poseInput.elapsedSec = this.elapsedSec;
+              this._poseInput.dt = dt;
+              this._poseInput.gazeTargetWorld = playerPos;
+              this._poseInput.distanceToCameraM = Math.hypot(
+                z.pos.x - playerPos.x,
+                z.pos.y - playerPos.y,
+                z.pos.z - playerPos.z,
+              );
+              this._poseInput.isVisible = z.root.visible;
+              z.root.position.copy(z.pos);
+              z.root.rotation.set(0, z.yaw, 0);
               this.rigLib.applyPose(z.rig, this._poseInput);
             }
           }
@@ -1499,6 +1560,12 @@ export class InfectionZombieAI {
             z.pos.y = THREE.MathUtils.lerp(sillPeakY, z.entryPos.y, ease);
           }
 
+          const faceX = z.entryPos.x - z.sillPos.x;
+          const faceZ = z.entryPos.z - z.sillPos.z;
+          z.yaw = Math.atan2(-faceX, -faceZ);
+          z.root.position.copy(z.pos);
+          z.root.rotation.set(0, z.yaw, 0);
+
           this._poseInput.mode = 'vault';
           this._poseInput.walkCycle = z.walkCycle;
           this._poseInput.speedMps = 0;
@@ -1508,13 +1575,15 @@ export class InfectionZombieAI {
           this._poseInput.staggerRatio = 0;
           this._poseInput.deathProgress = 0;
           this._poseInput.elapsedSec = this.elapsedSec;
+          this._poseInput.dt = dt;
+          this._poseInput.gazeTargetWorld = playerPos;
+          this._poseInput.distanceToCameraM = Math.hypot(
+            z.pos.x - playerPos.x,
+            z.pos.y - playerPos.y,
+            z.pos.z - playerPos.z,
+          );
+          this._poseInput.isVisible = z.root.visible;
           this.rigLib.applyPose(z.rig, this._poseInput);
-
-          const faceX = z.entryPos.x - z.sillPos.x;
-          const faceZ = z.entryPos.z - z.sillPos.z;
-          z.yaw = Math.atan2(-faceX, -faceZ);
-          z.root.position.copy(z.pos);
-          z.root.rotation.set(0, z.yaw, 0);
 
           if (z.vaultT >= 1) {
             z.pos.copy(z.entryPos);
@@ -1756,6 +1825,9 @@ export class InfectionZombieAI {
         z.windupTimer > 0 ? THREE.MathUtils.clamp(1 - z.windupTimer / Math.max(0.05, scaledWindup), 0, 1) : 0;
       const staggerRatio = z.staggerTimer > 0 ? Math.min(1, z.staggerTimer / 0.35) : 0;
 
+      z.root.position.copy(z.pos);
+      z.root.rotation.set(0, z.yaw, 0);
+
       this._poseInput.mode =
         windupProgress > 0.01 ? 'windup' : staggerRatio > 0.05 ? 'stagger' : 'locomote';
       this._poseInput.walkCycle = z.walkCycle;
@@ -1766,10 +1838,15 @@ export class InfectionZombieAI {
       this._poseInput.staggerRatio = staggerRatio;
       this._poseInput.deathProgress = 0;
       this._poseInput.elapsedSec = this.elapsedSec;
+      this._poseInput.dt = dt;
+      this._poseInput.gazeTargetWorld = nearestTarget ? nearestTarget.pos : playerPos;
+      this._poseInput.distanceToCameraM = Math.hypot(
+        z.pos.x - playerPos.x,
+        z.pos.y - playerPos.y,
+        z.pos.z - playerPos.z,
+      );
+      this._poseInput.isVisible = z.root.visible;
       this.rigLib.applyPose(z.rig, this._poseInput);
-
-      z.root.position.copy(z.pos);
-      z.root.rotation.set(0, z.yaw, 0);
     }
 
     // 4. Distance-prioritized horror-mix spatial audio scheduler (6 closest zombies)

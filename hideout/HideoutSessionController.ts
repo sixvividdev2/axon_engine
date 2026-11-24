@@ -325,7 +325,7 @@ export class HideoutSessionController {
     container.appendChild(this.renderer.domElement);
 
     this.scene = new THREE.Scene();
-    this.camera = new THREE.PerspectiveCamera(72, width / height, 0.05, 185);
+    this.camera = new THREE.PerspectiveCamera(72, width / height, 0.08, 185);
     this.scene.add(this.camera);
 
     // Build 4-room Cold-War bunker shell, Arsenal Room, Gun Range Phase 2, 100m Gallery Phase 3 & doors

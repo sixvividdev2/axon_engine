@@ -6,6 +6,8 @@ import {
 } from '../bodycam-sdk/IKSolver';
 import {
   DEFAULT_OPERATOR_ID,
+  EyewearId,
+  FaceGearId,
   GLOVE_COLOR_LIST,
   HELMET_COLOR_LIST,
   HelmetTypeId,
@@ -14,6 +16,15 @@ import {
   OPERATOR_PROFILES,
   OperatorId,
 } from '../bodycam-sdk/operator/OperatorTypes';
+import {
+  buildAnatomicalHeadAssembly,
+  BuiltAnatomicalHeadAssembly,
+} from '../bodycam-sdk/character/AnatomicalHeadBuilder';
+import {
+  FacialExpressionController,
+  FacialExpressionInput,
+  FacialExpressionIntent,
+} from '../bodycam-sdk/character/FacialExpressionController';
 import {
   OperatorUniformId,
   TacticalUniformMaterialBundle,
@@ -101,6 +112,22 @@ export interface TacticalCombatPose {
   headRollOffset?: number;
   /** Upper-body yaw offset in radians for natural alert/scanning posture */
   torsoYawOffset?: number;
+  /** Frame delta time in seconds for facial expression damping & blink timers */
+  dt?: number;
+  /** Facial expression intent ('calm', 'alert', 'aiming', 'suppressed', 'injured', 'dead') */
+  facialIntent?: FacialExpressionIntent;
+  /** 0..1 continuous stress weight for micro-expressions */
+  stress01?: number;
+  /** 0..1 physical trauma grimace */
+  injury01?: number;
+  /** 0..1 sharp flinch impulse */
+  flinchImpulse01?: number;
+  /** World-space point eyes should track */
+  gazeTargetWorld?: Readonly<THREE.Vector3> | null;
+  /** Distance from camera in meters for 25m / 35m facial LOD throttling & freeze */
+  distanceToCameraM?: number;
+  /** Whether rig is visible to active camera (false freezes facial evaluation) */
+  isVisible?: boolean;
 }
 
 export interface BuiltTacticalOperatorRig {
@@ -141,10 +168,13 @@ export interface BuiltTacticalOperatorRig {
     helmetColor?: string;
     nvgMount?: NvgMountId;
     nvgFlipped?: boolean;
+    faceGear?: FaceGearId;
+    eyewear?: EyewearId;
   }) => void;
   setFactionArmband: (colorHex: number | null) => void;
   setIrStrobe: (enabled: boolean, pulseOn?: boolean) => void;
   setWarningLaser: (active: boolean, lengthM?: number) => void;
+  headAssembly: BuiltAnatomicalHeadAssembly;
 }
 
 type MaterialSlot =
@@ -866,17 +896,58 @@ export class TacticalOperatorRigFactory {
     upperBody.add(headGroup);
 
     const headScaleXZ = isFemale ? 0.94 : 1.0;
+    const neckSkin = makeMesh(this.geoNeck, 'skin');
+    neckSkin.scale.set(isFemale ? 0.80 : 0.90, 1.02, isFemale ? 0.80 : 0.90);
+    neckSkin.position.set(0, 0.022, 0.004);
+
     const neck = makeMesh(this.geoNeck, 'hood');
     neck.scale.set(isFemale ? 0.88 : 1.0, 1.0, isFemale ? 0.88 : 1.0);
     neck.position.set(0, 0.02, 0.005);
 
-    const headCore = makeMesh(this.geoHead, 'skin', 'head');
-    headCore.scale.set(0.92 * headScaleXZ, 1.06, 0.96 * headScaleXZ);
-    headCore.position.set(0, 0.128, 0);
+    // Deterministic skin tone seed per actorId so bots & remote operators show varied realistic faces
+    let actorSeedHash = 0;
+    for (let c = 0; c < actorId.length; c++) {
+      actorSeedHash = (actorSeedHash * 31 + actorId.charCodeAt(c)) >>> 0;
+    }
+    const headAssembly = buildAnatomicalHeadAssembly({
+      variant: isFemale ? 'female' : 'male',
+      toneSeed: actorSeedHash,
+      anisotropy: 4,
+      hoodMaterial: activeBundle.hoodMat,
+      frameMaterial: activeBundle.knuckleMat,
+      includeGearAndEyewear: true,
+    });
+    headAssembly.root.position.set(0, 0.028, 0);
+    headAssembly.headMesh.userData = {
+      combatActorType: actorType,
+      actorId,
+      hitZone: 'head',
+      surfaceMaterial: 'wood',
+    };
+    hitMeshes.push(headAssembly.headMesh);
+    for (const child of headAssembly.faceGearGroups.neckGaiter.children) {
+      if ((child as THREE.Mesh).isMesh) {
+        slotBindings.push({ mesh: child as THREE.Mesh, slot: 'hood' });
+      }
+    }
+    for (const child of headAssembly.faceGearGroups.balaclava.children) {
+      if ((child as THREE.Mesh).isMesh) {
+        slotBindings.push({ mesh: child as THREE.Mesh, slot: 'hood' });
+      }
+    }
+    this.disposables.push(...headAssembly.disposables);
 
-    const balaclava = makeMesh(this.geoBalaclava, 'hood', 'head');
-    balaclava.scale.set(headScaleXZ, 1.0, headScaleXZ);
-    balaclava.position.set(0, 0.084, 0.002);
+    const facialController = new FacialExpressionController(actorSeedHash + 7);
+    const facialInputScratch: FacialExpressionInput = {
+      mode: 'human',
+      intent: 'calm',
+      stress01: 0.1,
+      injury01: 0,
+      flinchImpulse01: 0,
+      gazeTargetWorld: null,
+      distanceToCameraM: 8,
+      isVisible: true,
+    };
 
     const helmetShell = makeMesh(this.geoHelmetShell, 'helmet', 'head', 'metal');
     helmetShell.scale.set(headScaleXZ, 0.96, 1.06 * headScaleXZ);
@@ -887,7 +958,7 @@ export class TacticalOperatorRigFactory {
     helmetRim.position.set(0, 0.172, 0.005);
 
     const helmetBand = makeMesh(this.geoHelmetBand, 'iffTrim');
-    helmetBand.scale.set(1.01 * headScaleXZ, 1.0, 1.07 * headScaleXZ);
+    helmetBand.scale.set(1.022 * headScaleXZ, 1.0, 1.082 * headScaleXZ);
     helmetBand.position.set(0, 0.182, 0.005);
 
     const nvgShroud = makeMesh(this.geoNvgShroud, 'hardware');
@@ -925,10 +996,6 @@ export class TacticalOperatorRigFactory {
     arnvgGroup.visible = false;
     nvgPivot.add(arnvgGroup);
 
-    const visor = makeMesh(this.geoVisor, 'visor');
-    visor.scale.set(headScaleXZ, 1.0, 1.0);
-    visor.position.set(0, 0.142, -0.102 * headScaleXZ);
-
     const earL = makeMesh(this.geoEarPro, 'hardware');
     earL.position.set(-0.118 * headScaleXZ, 0.128, 0.01);
     const earR = makeMesh(this.geoEarPro, 'hardware');
@@ -948,15 +1015,14 @@ export class TacticalOperatorRigFactory {
     irStrobeEmitter.visible = false;
 
     headGroup.add(
+      neckSkin,
       neck,
-      headCore,
-      balaclava,
+      headAssembly.root,
       helmetShell,
       helmetRim,
       helmetBand,
       nvgShroud,
       nvgPivot,
-      visor,
       earL,
       earR,
       irStrobeHousing,
@@ -1305,6 +1371,8 @@ export class TacticalOperatorRigFactory {
       helmetColor?: string;
       nvgMount?: NvgMountId;
       nvgFlipped?: boolean;
+      faceGear?: FaceGearId;
+      eyewear?: EyewearId;
     } | null = null;
 
     const setGearAppearance = (gear: {
@@ -1314,6 +1382,8 @@ export class TacticalOperatorRigFactory {
       helmetColor?: string;
       nvgMount?: NvgMountId;
       nvgFlipped?: boolean;
+      faceGear?: FaceGearId;
+      eyewear?: EyewearId;
     }): void => {
       currentGear = { ...gear };
 
@@ -1367,6 +1437,13 @@ export class TacticalOperatorRigFactory {
       pvs7Group.visible = effectiveMount === 'pvs7';
       arnvgGroup.visible = effectiveMount === 'arnvg';
       nvgPivot.rotation.x = gear.nvgFlipped && effectiveMount !== 'none' ? 0.14 : -1.28;
+
+      // 4. Face Gear & Eyewear
+      const faceGear: FaceGearId = gear.faceGear ?? 'neck_gaiter';
+      const eyewear: EyewearId = gear.eyewear ?? 'none';
+      headAssembly.applyFaceGear(faceGear);
+      headAssembly.applyEyewear(eyewear);
+      neck.visible = faceGear !== 'open_face';
     };
 
     const applyUniform = (nextUniformId: OperatorUniformId): void => {
@@ -1532,6 +1609,33 @@ export class TacticalOperatorRigFactory {
         ),
         headYaw,
         -cheekWeldRoll + headRollExtra,
+      );
+
+      // Step anatomical facial expression morphs + eyeball gaze tracking (zero-GC LOD)
+      const inferredIntent: FacialExpressionIntent =
+        pose.facialIntent ??
+        (Math.abs(pose.flinchPitch) > 0.08
+          ? 'suppressed'
+          : ads > 0.45
+            ? 'aiming'
+            : pose.sprint
+              ? 'alert'
+              : 'calm');
+      facialInputScratch.mode = 'human';
+      facialInputScratch.intent = inferredIntent;
+      facialInputScratch.stress01 = pose.stress01 ?? (ads * 0.45 + recoil * 0.4);
+      facialInputScratch.injury01 = pose.injury01 ?? 0;
+      facialInputScratch.flinchImpulse01 = pose.flinchImpulse01 ?? Math.min(1, Math.abs(pose.flinchPitch) * 2.5);
+      facialInputScratch.gazeTargetWorld = pose.gazeTargetWorld ?? null;
+      facialInputScratch.distanceToCameraM = pose.distanceToCameraM ?? 8;
+      facialInputScratch.isVisible = pose.isVisible ?? root.visible;
+      facialController.step(
+        pose.dt ?? 0.016,
+        facialInputScratch,
+        headAssembly.root,
+        headAssembly.morphTargetInfluences,
+        headAssembly.eyeL,
+        headAssembly.eyeR,
       );
 
       // 4. Local weaponSocket placement on upper chest / right shoulder ready-mount
@@ -2055,6 +2159,7 @@ export class TacticalOperatorRigFactory {
       setFactionArmband,
       setIrStrobe,
       setWarningLaser,
+      headAssembly,
     };
   }
 

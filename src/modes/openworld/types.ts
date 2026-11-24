@@ -323,7 +323,7 @@ export const PMC_FACTIONS: Readonly<Record<PmcFactionId, PmcFactionSpec>> = {
     homeHospitalId: 'fob_alpha_medbay',
     homeHospitalName: 'Alpha Forward Surgical Bay',
     doctrine: 'NATO modular carbines, coastal-to-steppe rapid intervention.',
-    starterWeaponIds: ['m4a1', 'hk_mp5', 'glock_17'],
+    starterWeaponIds: ['m4a1', 'hk_mp5', 'remington_870', 'glock_17'],
     starterUnlockedWeaponIds: ['m4a1', 'hk_mp5', 'remington_870', 'mosin_m91_30', 'glock_17', 'beretta_m9'],
     starterUnlockedAttachmentIds: ['rail_mp5_claw', 'optic_t2_red_dot', 'tac_flashlight', 'grip_angled_afg'],
     starterUnlockedArmorPlateIds: ['plate_nij3_steel'],

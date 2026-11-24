@@ -203,7 +203,7 @@ export class BallisticsSimViewport {
 
     const w = Math.max(1, container.clientWidth);
     const h = Math.max(1, container.clientHeight);
-    this.camera = new THREE.PerspectiveCamera(34, w / h, 0.04, 120);
+    this.camera = new THREE.PerspectiveCamera(34, w / h, 0.08, 120);
 
     this.renderer = new THREE.WebGLRenderer({
       antialias: !this.isSoftwareGl,

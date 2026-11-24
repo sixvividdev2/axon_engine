@@ -1,4 +1,13 @@
 import * as THREE from 'three';
+import {
+  buildAnatomicalHeadAssembly,
+  BuiltAnatomicalHeadAssembly,
+} from '../bodycam-sdk/character/AnatomicalHeadBuilder';
+import {
+  FacialExpressionController,
+  FacialExpressionInput,
+  FacialExpressionIntent,
+} from '../bodycam-sdk/character/FacialExpressionController';
 
 export type InfectedArchetypeId = 'quarantine_guard' | 'hazmat_tech' | 'infected_civilian';
 
@@ -14,6 +23,10 @@ export interface InfectedPoseInput {
   staggerRatio: number; // 0..1 hit flinch
   deathProgress: number; // 0..1 buckling fall
   elapsedSec: number;
+  dt?: number;
+  gazeTargetWorld?: Readonly<THREE.Vector3> | null;
+  distanceToCameraM?: number;
+  isVisible?: boolean;
 }
 
 export interface BuiltInfectedZombieRig {
@@ -26,6 +39,9 @@ export interface BuiltInfectedZombieRig {
   neckPivot: THREE.Group;
   headGroup: THREE.Group;
   jawPivot: THREE.Group;
+  headAssembly: BuiltAnatomicalHeadAssembly;
+  facialController: FacialExpressionController;
+  _facialInput: FacialExpressionInput;
   leftHip: THREE.Group;
   leftKnee: THREE.Group;
   leftAnkle: THREE.Group;
@@ -55,9 +71,6 @@ interface ZombieMaterialSet {
   bloodMat: THREE.MeshStandardMaterial;
   bootLeather: THREE.MeshStandardMaterial;
   bootSole: THREE.MeshStandardMaterial;
-  eyeSocketMat: THREE.MeshStandardMaterial;
-  eyeScleraMat: THREE.MeshStandardMaterial;
-  teethMat: THREE.MeshStandardMaterial;
   visorMat: THREE.MeshStandardMaterial;
 }
 
@@ -222,14 +235,6 @@ export class InfectedZombieRigLibrary {
   private readonly geoTornFlap: THREE.BoxGeometry;
 
   private readonly geoNeck: THREE.CylinderGeometry;
-  private readonly geoCranium: THREE.SphereGeometry;
-  private readonly geoBrowRidge: THREE.BoxGeometry;
-  private readonly geoCheek: THREE.SphereGeometry;
-  private readonly geoNose: THREE.BoxGeometry;
-  private readonly geoEyeSocket: THREE.SphereGeometry;
-  private readonly geoEyeBall: THREE.SphereGeometry;
-  private readonly geoJaw: THREE.BoxGeometry;
-  private readonly geoTeeth: THREE.BoxGeometry;
   private readonly geoHelmetShell: THREE.SphereGeometry;
   private readonly geoVisor: THREE.BoxGeometry;
   private readonly geoRespirator: THREE.CylinderGeometry;
@@ -268,21 +273,13 @@ export class InfectedZombieRigLibrary {
     this.geoRibDetail = track(new THREE.BoxGeometry(0.17, 0.022, 0.025));
     this.geoTornFlap = track(new THREE.BoxGeometry(0.13, 0.16, 0.022));
 
-    // Sculpted Head & Articulated Jaw geometries
-    this.geoNeck = track(new THREE.CylinderGeometry(0.056, 0.068, 0.12, 8));
-    this.geoCranium = track(new THREE.SphereGeometry(0.112, 12, 10));
-    this.geoBrowRidge = track(new THREE.BoxGeometry(0.145, 0.032, 0.048));
-    this.geoCheek = track(new THREE.SphereGeometry(0.044, 8, 6));
-    this.geoNose = track(new THREE.BoxGeometry(0.024, 0.038, 0.034));
-    this.geoEyeSocket = track(new THREE.SphereGeometry(0.025, 8, 6));
-    this.geoEyeBall = track(new THREE.SphereGeometry(0.015, 8, 6));
-    this.geoJaw = track(new THREE.BoxGeometry(0.118, 0.064, 0.108));
-    this.geoTeeth = track(new THREE.BoxGeometry(0.072, 0.018, 0.016));
+    // Neck & Archetype Headgear geometries (skull, face, eyes, jaw, and teeth use AnatomicalHeadBuilder)
+    this.geoNeck = track(new THREE.CylinderGeometry(0.050, 0.064, 0.12, 8));
     this.geoHelmetShell = track(
-      new THREE.SphereGeometry(0.128, 12, 8, 0, Math.PI * 2, 0, Math.PI * 0.56),
+      new THREE.SphereGeometry(0.118, 14, 10, 0, Math.PI * 2, 0, Math.PI * 0.56),
     );
-    this.geoVisor = track(new THREE.BoxGeometry(0.19, 0.062, 0.026));
-    this.geoRespirator = track(new THREE.CylinderGeometry(0.042, 0.048, 0.065, 8));
+    this.geoVisor = track(new THREE.BoxGeometry(0.175, 0.056, 0.024));
+    this.geoRespirator = track(new THREE.CylinderGeometry(0.038, 0.044, 0.062, 8));
 
     // 2-Segment Articulated Arms + Clawed Hands
     this.geoShoulderCap = track(new THREE.SphereGeometry(0.066, 8, 6));
@@ -339,29 +336,6 @@ export class InfectedZombieRigLibrary {
         metalness: 0.05,
       }),
     );
-    const sharedEyeSocket = track(
-      new THREE.MeshStandardMaterial({
-        color: 0x181314,
-        roughness: 0.95,
-        metalness: 0.0,
-      }),
-    );
-    const sharedEyeSclera = track(
-      new THREE.MeshStandardMaterial({
-        color: 0x9e9a8d,
-        emissive: 0x261a14,
-        emissiveIntensity: 0.25,
-        roughness: 0.35,
-        metalness: 0.04,
-      }),
-    );
-    const sharedTeeth = track(
-      new THREE.MeshStandardMaterial({
-        color: 0xa69b80,
-        roughness: 0.52,
-        metalness: 0.04,
-      }),
-    );
     const sharedVisor = track(
       new THREE.MeshStandardMaterial({
         color: 0x26323a,
@@ -407,9 +381,6 @@ export class InfectedZombieRigLibrary {
         bloodMat: sharedBlood,
         bootLeather: sharedBootLeather,
         bootSole: sharedBootSole,
-        eyeSocketMat: sharedEyeSocket,
-        eyeScleraMat: sharedEyeSclera,
-        teethMat: sharedTeeth,
         visorMat: sharedVisor,
       },
       hazmat_tech: {
@@ -424,9 +395,6 @@ export class InfectedZombieRigLibrary {
         bloodMat: sharedBlood,
         bootLeather: sharedBootLeather,
         bootSole: sharedBootSole,
-        eyeSocketMat: sharedEyeSocket,
-        eyeScleraMat: sharedEyeSclera,
-        teethMat: sharedTeeth,
         visorMat: sharedVisor,
       },
       infected_civilian: {
@@ -441,9 +409,6 @@ export class InfectedZombieRigLibrary {
         bloodMat: sharedBlood,
         bootLeather: sharedBootLeather,
         bootSole: sharedBootSole,
-        eyeSocketMat: sharedEyeSocket,
-        eyeScleraMat: sharedEyeSclera,
-        teethMat: sharedTeeth,
         visorMat: sharedVisor,
       },
     };
@@ -615,7 +580,7 @@ export class InfectedZombieRigLibrary {
       spineUpper.add(flap);
     }
 
-    // === NECK, SCULPTED HEAD & ARTICULATED LOWER JAW ===
+    // === NECK, ANATOMICAL HEAD (15 MORPHS + EYE TRACKING) & ARTICULATED JAW ===
     const neckPivot = new THREE.Group();
     neckPivot.position.set(0, 0.305, -0.01);
     spineUpper.add(neckPivot);
@@ -628,64 +593,48 @@ export class InfectedZombieRigLibrary {
     headGroup.position.set(0, 0.105, -0.005);
     neckPivot.add(headGroup);
 
-    const cranium = makeMesh(this.geoCranium, mats.skin, 'head', true);
-    cranium.scale.set(0.92, 1.05, 0.98);
-    cranium.position.set(0, 0.075, 0);
-
-    const brow = makeMesh(this.geoBrowRidge, mats.skin);
-    brow.position.set(0, 0.102, -0.094);
-
-    const nose = makeMesh(this.geoNose, mats.skin);
-    nose.position.set(0, 0.064, -0.105);
-
-    const upperTeeth = makeMesh(this.geoTeeth, mats.teethMat);
-    upperTeeth.position.set(0, 0.034, -0.096);
-
-    headGroup.add(cranium, brow, nose, upperTeeth);
-
-    // Sunken shadowed eye sockets + realistic pale bloodshot sclera (no glowing neon boxes)
-    for (const side of [-1, 1]) {
-      const cheek = makeMesh(this.geoCheek, mats.skin);
-      cheek.scale.set(0.85, 0.72, 0.78);
-      cheek.position.set(side * 0.056, 0.055, -0.078);
-
-      const socket = makeMesh(this.geoEyeSocket, mats.eyeSocketMat);
-      socket.scale.set(1.05, 0.85, 0.65);
-      socket.position.set(side * 0.042, 0.082, -0.095);
-
-      const eyeBall = makeMesh(this.geoEyeBall, mats.eyeScleraMat);
-      eyeBall.position.set(side * 0.042, 0.081, -0.102);
-
-      headGroup.add(cheek, socket, eyeBall);
-    }
-
-    // Articulated Lower Jaw Pivot (snaps open on snarls, tears & melee lunges!)
+    // Articulated Lower Jaw Pivot mounted at TMJ hinge relative to headAssembly (-0.015 Y offset)
     const jawPivot = new THREE.Group();
-    jawPivot.position.set(0, 0.038, -0.02);
-    const jawBone = makeMesh(this.geoJaw, mats.skin, 'head');
-    jawBone.position.set(0, -0.032, -0.044);
-    const lowerTeeth = makeMesh(this.geoTeeth, mats.teethMat);
-    lowerTeeth.scale.set(0.9, 0.85, 1.0);
-    lowerTeeth.position.set(0, -0.008, -0.086);
-    const jawBlood = makeMesh(this.geoTeeth, mats.bloodMat);
-    jawBlood.scale.set(1.15, 1.6, 0.9);
-    jawBlood.position.set(0, -0.046, -0.094);
-    jawPivot.add(jawBone, lowerTeeth, jawBlood);
+    jawPivot.position.set(0, 0.057, -0.020);
     headGroup.add(jawPivot);
 
-    // Archetype headgear accents (skewed riot helmet / respirator canister)
+    const headAssembly = buildAnatomicalHeadAssembly({
+      variant: 'zombie',
+      toneSeed: h,
+      anisotropy: 2,
+      hoodMaterial: mats.skin,
+      frameMaterial: mats.gearAccent,
+      jawParentForLowerTeeth: jawPivot,
+      lowerTeethInJawOffset: [0, -0.023, -0.048],
+      includeGearAndEyewear: false,
+    });
+    headAssembly.root.position.set(0, -0.015, 0);
+    headGroup.add(headAssembly.root);
+
+    for (let i = 0; i < headAssembly.disposables.length; i++) {
+      this.disposables.push(headAssembly.disposables[i]);
+    }
+    headAssembly.headMesh.userData = {
+      combatActorType: 'zombie',
+      actorId,
+      hitZone: 'head',
+      surfaceMaterial: 'wood',
+    };
+    hitMeshes.push(headAssembly.headMesh);
+
+    // Archetype headgear accents (skewed riot helmet / respirator canister with >= 4mm facial clearance)
     if (archetype === 'quarantine_guard') {
       const helmet = makeMesh(this.geoHelmetShell, mats.gearAccent, 'head');
-      helmet.position.set(0, 0.096, 0.006);
+      helmet.position.set(0, 0.088, 0.002);
       helmet.rotation.set(-0.08, 0, (h & 1 ? 1 : -1) * 0.09);
       const visor = makeMesh(this.geoVisor, mats.visorMat);
-      visor.position.set(0, 0.118, -0.118);
+      visor.position.set(0, 0.105, -0.108);
       visor.rotation.x = -0.35;
       headGroup.add(helmet, visor);
     } else if (archetype === 'hazmat_tech') {
       // Torn respirator hanging crooked off lower cheek
       const resp = makeMesh(this.geoRespirator, mats.gearAccent);
-      resp.position.set(0.055, 0.015, -0.105);
+      resp.position.set(0.052, 0.018, -0.098);
       resp.rotation.set(0.45, 0.25, -0.3);
       headGroup.add(resp);
     }
@@ -752,6 +701,18 @@ export class InfectedZombieRigLibrary {
       neckPivot,
       headGroup,
       jawPivot,
+      headAssembly,
+      facialController: new FacialExpressionController((h % 997) + 1),
+      _facialInput: {
+        mode: 'zombie',
+        intent: 'shamble',
+        stress01: 0.4,
+        injury01: 0.5,
+        flinchImpulse01: 0,
+        gazeTargetWorld: null,
+        distanceToCameraM: 0,
+        isVisible: true,
+      },
       leftHip: leftLeg.hip,
       leftKnee: leftLeg.knee,
       leftAnkle: leftLeg.ankle,
@@ -816,6 +777,7 @@ export class InfectedZombieRigLibrary {
       rig.leftElbow.rotation.set(-0.55 * ease, 0, 0);
       rig.rightShoulder.rotation.set(0.68 * ease, 0, 0.62 * ease);
       rig.rightElbow.rotation.set(-0.78 * ease, 0, 0);
+      this.stepZombieFacial(rig, input);
       return;
     }
 
@@ -849,6 +811,7 @@ export class InfectedZombieRigLibrary {
       rig.rightShoulder.rotation.set(1.55 - 0.82 * phaseB, -0.18, 0.18);
       rig.rightElbow.rotation.set(-0.68 - 0.35 * lift, 0, 0);
       rig.rightHandPivot.rotation.set(0.45, 0, 0);
+      this.stepZombieFacial(rig, input);
       return;
     }
 
@@ -881,6 +844,7 @@ export class InfectedZombieRigLibrary {
       rig.rightShoulder.rotation.set(1.78 - pull * 0.36, -0.22, 0.14);
       rig.rightElbow.rotation.set(-0.72 - Math.max(0, -pull) * 0.48, 0, 0);
       rig.rightHandPivot.rotation.set(0.38, 0, 0);
+      this.stepZombieFacial(rig, input);
       return;
     }
 
@@ -987,6 +951,41 @@ export class InfectedZombieRigLibrary {
       rig.rightElbow.rotation.set(-0.74 - sprintBlend * 0.34 - Math.max(0, sinW) * 0.24, 0, 0);
       rig.rightHandPivot.rotation.set(0.28, 0, 0.12);
     }
+
+    this.stepZombieFacial(rig, input);
+  }
+
+  private stepZombieFacial(rig: BuiltInfectedZombieRig, input: Readonly<InfectedPoseInput>): void {
+    const f = rig._facialInput;
+    f.mode = 'zombie';
+    let intent: FacialExpressionIntent = 'shamble';
+    if (input.mode === 'death') {
+      intent = 'dead';
+    } else if (input.mode === 'stagger' || input.staggerRatio > 0.05) {
+      intent = 'stagger';
+    } else if (input.mode === 'windup' || input.windupProgress > 0.05) {
+      intent = 'lunge';
+    } else if (input.mode === 'tear' || input.mode === 'vault' || input.speedMps > 2.0) {
+      intent = 'aggro';
+    }
+    f.intent = intent;
+    f.stress01 = input.mode === 'tear' || input.mode === 'windup' ? 0.95 : THREE.MathUtils.clamp(input.speedMps / 4.0, 0.2, 0.95);
+    f.injury01 = 0.7;
+    f.flinchImpulse01 = THREE.MathUtils.clamp(input.staggerRatio, 0, 1);
+    f.gazeTargetWorld = input.gazeTargetWorld ?? null;
+    f.distanceToCameraM = input.distanceToCameraM ?? 0;
+    f.isVisible = input.isVisible ?? rig.root.visible;
+
+    const evalDt = input.dt ?? 0.05;
+    rig.facialController.step(
+      evalDt,
+      f,
+      rig.headAssembly.root,
+      rig.headAssembly.morphTargetInfluences,
+      rig.headAssembly.eyeL,
+      rig.headAssembly.eyeR,
+      rig.jawPivot,
+    );
   }
 
   public dispose(): void {

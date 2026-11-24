@@ -307,6 +307,9 @@ export class ChunkManager {
         roughnessMap: textures.asphalt.roughnessMap,
         roughness: 0.84,
         metalness: 0.05,
+        polygonOffset: true,
+        polygonOffsetFactor: -1,
+        polygonOffsetUnits: -2,
       }),
     );
 
@@ -1121,10 +1124,11 @@ export class ChunkManager {
       );
 
       const pos = stripGeo.attributes.position;
+      const roadLift = isVertical ? 0.036 : 0.030;
       for (let i = 0; i < pos.count; i++) {
         const wx = worldX0 + pos.getX(i);
         const wz = worldZ0 + pos.getZ(i);
-        pos.setY(i, this.roadNetwork.getTerrainHeight(wx, wz) + 0.032);
+        pos.setY(i, this.roadNetwork.getTerrainHeight(wx, wz) + roadLift);
       }
       stripGeo.computeVertexNormals();
       asphaltGeos.push(stripGeo);

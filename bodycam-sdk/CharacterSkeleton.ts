@@ -33,6 +33,15 @@ import {
   TacticalEquipmentId,
 } from '../data/tacticalEquipment';
 import {
+  buildAnatomicalHeadAssembly,
+  BuiltAnatomicalHeadAssembly,
+  getSkinTonePalette,
+} from './character/AnatomicalHeadBuilder';
+import {
+  FacialExpressionController,
+  FacialExpressionInput,
+} from './character/FacialExpressionController';
+import {
   buildTacticalEquipmentMesh,
   BuiltTacticalEquipmentMesh,
   getBeltSlotTransforms,
@@ -189,6 +198,19 @@ export class CharacterSkeleton {
   private pvs7MountGroup: THREE.Group | null = null;
   private arnvgMountGroup: THREE.Group | null = null;
   private nvgFlippedDown = false;
+  private neckGaiterCollarMesh: THREE.Mesh | null = null;
+  private headAssembly: BuiltAnatomicalHeadAssembly | null = null;
+  private readonly facialController: FacialExpressionController;
+  private readonly _facialInputScratch: FacialExpressionInput = {
+    mode: 'human',
+    intent: 'calm',
+    stress01: 0.1,
+    injury01: 0,
+    flinchImpulse01: 0,
+    gazeTargetWorld: null,
+    distanceToCameraM: 1.5,
+    isVisible: true,
+  };
 
   // Hand meshes supporting Gloves ON/OFF + live glove color changes
   private readonly gloveOnlyMeshes: THREE.Mesh[] = [];
@@ -246,6 +268,7 @@ export class CharacterSkeleton {
     this.operatorId = operatorId;
     this.profile = OPERATOR_PROFILES[operatorId] ?? OPERATOR_PROFILES.MALE;
     const p = this.profile;
+    this.facialController = new FacialExpressionController(operatorId === 'FEMALE' ? 2 : 1);
 
     const aniso = Math.min(8, Math.max(1, maxAnisotropy));
     this.anisotropy = aniso;
@@ -320,9 +343,11 @@ export class CharacterSkeleton {
         metalness: 0.04,
       }),
     );
+    const headToneSeed = operatorId === 'FEMALE' ? 0 : 1;
+    const skinPalette = getSkinTonePalette(headToneSeed, operatorId === 'FEMALE' ? 'female' : 'male');
     this.wristSkinMat = this.mat(
       new THREE.MeshStandardMaterial({
-        color: operatorId === 'FEMALE' ? 0xb38d78 : 0x9f7c67,
+        color: skinPalette.wristHex,
         roughness: 0.72,
         metalness: 0.02,
       }),
@@ -708,15 +733,26 @@ export class CharacterSkeleton {
     ik_pole_elbow_r.position.set(0.34, -0.16, 0.24);
     this.chest.add(ik_pole_elbow_l, ik_pole_elbow_r);
 
-    // Neck & Full Tactical FAST Ballistic Helmet Head Group
+    // Neck & Full Tactical Ballistic Head Assembly (anatomical neck + tapered collar + sculpted head)
     this.neck.position.set(0, 0.13, 0.015);
     this.chest.add(this.neck);
+    const neckSkinRadiusTop = 0.044 * (operatorId === 'FEMALE' ? 0.92 : 1.0);
+    const neckSkinRadiusBot = 0.056 * p.torsoWidthScale;
+    const neckSkin = new THREE.Mesh(
+      this.geo(new THREE.CylinderGeometry(neckSkinRadiusTop, neckSkinRadiusBot, 0.095, 14)),
+      this.wristSkinMat,
+    );
+    neckSkin.position.set(0, 0.042, 0);
+    this.neck.add(neckSkin);
+    this.headMeshes.push({ mesh: neckSkin, visibleMat: this.wristSkinMat });
+
     const neckGaiter = new THREE.Mesh(
-      this.geo(new THREE.CylinderGeometry(0.052 * (operatorId === 'FEMALE' ? 0.90 : 1.0), 0.064 * p.torsoWidthScale, 0.095, 12)),
+      this.geo(new THREE.CylinderGeometry(0.052 * (operatorId === 'FEMALE' ? 0.92 : 1.0), 0.064 * p.torsoWidthScale, 0.088, 14)),
       this.hoodMat,
     );
-    neckGaiter.position.set(0, 0.042, 0);
+    neckGaiter.position.set(0, 0.039, 0);
     this.neck.add(neckGaiter);
+    this.neckGaiterCollarMesh = neckGaiter;
     this.headMeshes.push({ mesh: neckGaiter, visibleMat: this.hoodMat });
 
     this.headGroup.position.set(0, 0.09, 0);
@@ -865,27 +901,29 @@ export class CharacterSkeleton {
       return mesh;
     };
 
-    // Balaclava cranium & jaw silhouette
-    const cranium = new THREE.Mesh(this.geo(new THREE.SphereGeometry(0.104, 16, 12)), this.hoodMat);
-    cranium.scale.set(0.86 * scaleX, 1.05, 0.96);
-    cranium.position.set(0, 0.095, -0.008);
-    registerHeadMesh(this.headGroup, cranium);
-
-    // Subtle skin bridge around ballistic eyewear
-    const eyeBridge = new THREE.Mesh(this.geo(new THREE.BoxGeometry(0.115 * scaleX, 0.036, 0.035)), this.wristSkinMat);
-    eyeBridge.position.set(0, 0.102, -0.082);
-    registerHeadMesh(this.headGroup, eyeBridge);
-
-    // Ballistic tactical visor / wraparound eye-pro
-    const visor = new THREE.Mesh(this.geo(new THREE.BoxGeometry(0.142 * scaleX, 0.044, 0.048)), this.visorMat);
-    visor.position.set(0, 0.106, -0.095);
-    registerHeadMesh(this.headGroup, visor);
+    // Anatomical head, 15 facial morphs, independent eyeballs, oral teeth, face gear & eyewear
+    const headVariant = operatorId === 'FEMALE' ? 'female' : 'male';
+    const headToneSeed = operatorId === 'FEMALE' ? 0 : 1;
+    const assembly = buildAnatomicalHeadAssembly({
+      variant: headVariant,
+      toneSeed: headToneSeed,
+      anisotropy: this.anisotropy,
+      hoodMaterial: this.hoodMat,
+      frameMaterial: this.knuckleMat,
+      includeGearAndEyewear: true,
+    });
+    this.headAssembly = assembly;
+    this.headGroup.add(assembly.root);
+    for (let i = 0; i < assembly.allMeshes.length; i++) {
+      const m = assembly.allMeshes[i];
+      this.headMeshes.push({ mesh: m, visibleMat: m.material as THREE.Material });
+    }
 
     // Tactical tied-back low bun silhouette under rear helmet rim for Female operator
     if (operatorId === 'FEMALE') {
-      const hairBun = new THREE.Mesh(this.geo(new THREE.SphereGeometry(0.042, 12, 10)), this.knuckleMat);
+      const hairBun = new THREE.Mesh(this.geo(new THREE.SphereGeometry(0.040, 12, 10)), this.knuckleMat);
       hairBun.scale.set(0.92, 0.84, 1.12);
-      hairBun.position.set(0, 0.062, 0.108);
+      hairBun.position.set(0, 0.062, 0.104);
       registerHeadMesh(this.headGroup, hairBun);
     }
 
@@ -1227,6 +1265,45 @@ export class CharacterSkeleton {
     for (let i = 0; i < this.handGlovePalmMeshes.length; i++) {
       this.handGlovePalmMeshes[i].material = g.glovesEnabled ? this.palmLeatherMat : this.wristSkinMat;
     }
+
+    // 4. Face Gear & Eyewear
+    if (this.headAssembly) {
+      this.headAssembly.applyFaceGear(g.faceGear);
+      this.headAssembly.applyEyewear(g.eyewear);
+    }
+    if (this.neckGaiterCollarMesh) {
+      this.neckGaiterCollarMesh.visible = g.faceGear !== 'open_face';
+    }
+  }
+
+  public updateFacial(
+    dt: number,
+    patch?: Partial<FacialExpressionInput>,
+  ): void {
+    if (!this.headAssembly) return;
+    const inp = this._facialInputScratch;
+    inp.mode = 'human';
+    inp.intent = patch?.intent ?? 'calm';
+    inp.stress01 = patch?.stress01 ?? 0.1;
+    inp.injury01 = patch?.injury01 ?? 0;
+    inp.flinchImpulse01 = patch?.flinchImpulse01 ?? 0;
+    inp.gazeTargetWorld = patch?.gazeTargetWorld ?? null;
+    inp.localGazeYaw = patch?.localGazeYaw;
+    inp.localGazePitch = patch?.localGazePitch;
+    inp.distanceToCameraM = patch?.distanceToCameraM ?? 1.5;
+    inp.isVisible = patch?.isVisible ?? true;
+    this.facialController.step(
+      dt,
+      inp,
+      this.headAssembly.root,
+      this.headAssembly.morphTargetInfluences,
+      this.headAssembly.eyeL,
+      this.headAssembly.eyeR,
+    );
+  }
+
+  public getHeadAssembly(): BuiltAnatomicalHeadAssembly | null {
+    return this.headAssembly;
   }
 
   public getGearConfig(): Readonly<OperatorGearConfig> {
@@ -2737,6 +2814,11 @@ export class CharacterSkeleton {
     this.beltEquipmentMeshes.length = 0;
     this.geos.forEach((g) => g.dispose());
     this.mats.forEach((m) => m.dispose());
+    if (this.headAssembly) {
+      for (const d of this.headAssembly.disposables) {
+        d.dispose();
+      }
+    }
     this.texSets.forEach((t) => {
       t.map.dispose();
       t.normalMap.dispose();

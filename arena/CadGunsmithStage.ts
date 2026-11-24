@@ -102,7 +102,7 @@ export class CadGunsmithStage {
     roomEnv.dispose();
     pmrem.dispose();
 
-    this.camera = new THREE.PerspectiveCamera(42, width / height, 0.06, 48);
+    this.camera = new THREE.PerspectiveCamera(42, width / height, 0.08, 48);
     this.camera.position.set(0.45, 1.32, 0.85);
     this.camera.lookAt(0, 1.05, 0);
 

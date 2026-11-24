@@ -219,7 +219,7 @@ export class ZombiesLobbyController {
     container.appendChild(this.renderer.domElement);
 
     this.scene = new THREE.Scene();
-    this.camera = new THREE.PerspectiveCamera(this.baseCameraFov, width / height, 0.05, 160);
+    this.camera = new THREE.PerspectiveCamera(this.baseCameraFov, width / height, 0.08, 160);
     this.scene.add(this.camera);
 
     this.world = buildZombiesOutpostWorld(this.scene, this.renderer, this.isSoftwareGl);

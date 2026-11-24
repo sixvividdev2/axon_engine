@@ -584,9 +584,11 @@ export class RemotePlayerManager {
       pkt.helmetType !== undefined ||
       pkt.helmetColor !== undefined ||
       pkt.nvgMount !== undefined ||
-      pkt.nvgFlipped !== undefined
+      pkt.nvgFlipped !== undefined ||
+      pkt.faceGear !== undefined ||
+      pkt.eyewear !== undefined
     ) {
-      const nextSig = `${pkt.glovesEnabled ?? ''}|${pkt.gloveColor ?? ''}|${pkt.helmetType ?? ''}|${pkt.helmetColor ?? ''}|${pkt.nvgMount ?? ''}|${pkt.nvgFlipped ? 1 : 0}`;
+      const nextSig = `${pkt.glovesEnabled ?? ''}|${pkt.gloveColor ?? ''}|${pkt.helmetType ?? ''}|${pkt.helmetColor ?? ''}|${pkt.nvgMount ?? ''}|${pkt.nvgFlipped ? 1 : 0}|${pkt.faceGear ?? ''}|${pkt.eyewear ?? ''}`;
       if (op.gearSig !== nextSig) {
         op.gearSig = nextSig;
         op.rig.setGearAppearance({
@@ -596,6 +598,8 @@ export class RemotePlayerManager {
           helmetColor: pkt.helmetColor,
           nvgMount: pkt.nvgMount,
           nvgFlipped: pkt.nvgFlipped,
+          faceGear: pkt.faceGear,
+          eyewear: pkt.eyewear,
         });
       }
     }
@@ -709,9 +713,11 @@ export class RemotePlayerManager {
       pkt.helmetType !== undefined ||
       pkt.helmetColor !== undefined ||
       pkt.nvgMount !== undefined ||
-      pkt.nvgFlipped !== undefined
+      pkt.nvgFlipped !== undefined ||
+      pkt.faceGear !== undefined ||
+      pkt.eyewear !== undefined
     ) {
-      const nextSig = `${pkt.glovesEnabled ?? ''}|${pkt.gloveColor ?? ''}|${pkt.helmetType ?? ''}|${pkt.helmetColor ?? ''}|${pkt.nvgMount ?? ''}|${pkt.nvgFlipped ? 1 : 0}`;
+      const nextSig = `${pkt.glovesEnabled ?? ''}|${pkt.gloveColor ?? ''}|${pkt.helmetType ?? ''}|${pkt.helmetColor ?? ''}|${pkt.nvgMount ?? ''}|${pkt.nvgFlipped ? 1 : 0}|${pkt.faceGear ?? ''}|${pkt.eyewear ?? ''}`;
       if (op.gearSig !== nextSig) {
         op.gearSig = nextSig;
         op.rig.setGearAppearance({
@@ -721,6 +727,8 @@ export class RemotePlayerManager {
           helmetColor: pkt.helmetColor,
           nvgMount: pkt.nvgMount,
           nvgFlipped: pkt.nvgFlipped,
+          faceGear: pkt.faceGear,
+          eyewear: pkt.eyewear,
         });
       }
     }
@@ -947,6 +955,8 @@ export class RemotePlayerManager {
       op.wallObstruction01 = THREE.MathUtils.damp(op.wallObstruction01, targetWallObs, 18, dt);
       op.beltWallTuck01 = THREE.MathUtils.damp(op.beltWallTuck01, targetBeltTuck, 18, dt);
 
+      const distToCam = op.curPos.distanceTo(localCameraPos);
+
       // Unified grounded crouch knees, local weaponSocket shoulder mount, Point Aim cant, and 2-bone arm IK
       const pose = this._poseScratch;
       pose.crouchBlend = op.crouchBlend;
@@ -969,6 +979,22 @@ export class RemotePlayerManager {
       pose.grenadeThrowStyle = op.grenadeThrowStyle;
       pose.wallObstruction01 = op.wallObstruction01;
       pose.beltWallTuck01 = op.beltWallTuck01;
+      pose.dt = dt;
+      pose.distanceToCameraM = distToCam;
+      pose.gazeTargetWorld = localCameraPos;
+      pose.isVisible = rig.root.visible;
+      pose.injury01 = THREE.MathUtils.clamp(1 - op.hp / Math.max(1, op.maxHp), 0, 1);
+      pose.flinchImpulse01 = op.hitFlinchTimer > 0 ? Math.min(1, op.hitFlinchTimer / 0.16) : 0;
+      pose.stress01 = op.isFiring || op.isReloading ? 0.78 : op.adsBlend > 0.3 ? 0.45 : 0.16;
+      pose.facialIntent = !op.alive
+        ? 'dead'
+        : op.hitFlinchTimer > 0.05 || op.hp < 35
+          ? 'injured'
+          : op.adsBlend > 0.45
+            ? 'aiming'
+            : op.isFiring
+              ? 'alert'
+              : 'calm';
       rig.applyCombatPose(pose);
 
       // Muzzle flash, belt grenade visibility/type, laser & tactical light
@@ -998,7 +1024,6 @@ export class RemotePlayerManager {
 
       // Nameplate height & distance/team visibility
       op.nameSprite.position.y = 2.08 - op.crouchBlend * 0.28;
-      const distToCam = op.curPos.distanceTo(localCameraPos);
       const friendly = this.isFriendly(op.userId);
       op.nameSprite.visible = friendly ? distToCam < 65 : distToCam < 22;
     }

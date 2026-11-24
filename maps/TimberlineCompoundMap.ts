@@ -245,10 +245,24 @@ function buildTimberlineCompound(
     new THREE.MeshStandardMaterial({ map: runwayTex, roughness: 0.86, metalness: 0.04 }),
   );
   const matRunwayPaint = trackMat(
-    new THREE.MeshStandardMaterial({ color: 0xd9dad5, roughness: 0.82, metalness: 0.02 }),
+    new THREE.MeshStandardMaterial({
+      color: 0xd9dad5,
+      roughness: 0.82,
+      metalness: 0.02,
+      polygonOffset: true,
+      polygonOffsetFactor: -2,
+      polygonOffsetUnits: -4,
+    }),
   );
   const matYellowPaint = trackMat(
-    new THREE.MeshStandardMaterial({ color: 0xdca437, roughness: 0.75, metalness: 0.05 }),
+    new THREE.MeshStandardMaterial({
+      color: 0xdca437,
+      roughness: 0.75,
+      metalness: 0.05,
+      polygonOffset: true,
+      polygonOffsetFactor: -2,
+      polygonOffsetUnits: -4,
+    }),
   );
   const matBaseConcrete = trackMat(
     new THREE.MeshStandardMaterial({ map: concTex, roughness: 0.91, metalness: 0.04 }),

@@ -276,22 +276,22 @@ function buildKorsakovSubstation(
     addSolidBox(fx, 0.08 + 3.4 + (HALL_H - 3.4) * 0.5, 0, 0.5, HALL_H - 3.4, 6.0, matSlateWall);
   }
 
-  // Sloped concrete threshold aprons seating exterior tarmac seamlessly to Turbine Hall floor slab (0.08m)
+  // Sloped concrete threshold aprons seating exterior tarmac seamlessly to Turbine Hall floor slab (0.08m) without overlap
   const addDoorApron = (x: number, z: number, w: number, d: number): void => {
-    const apron = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(w, 0.08, d)), matSlateFloor);
-    apron.position.set(x, 0.04, z);
+    const apron = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(w, 0.076, d)), matSlateFloor);
+    apron.position.set(x, 0.038, z);
     apron.receiveShadow = !isSoftwareGl && qProfile.castShadows;
     apron.userData.surfaceMaterial = 'concrete';
     sceneGroup.add(apron);
     raycastMeshes.push(apron);
   };
-  for (const dz of [-22.4, 22.4]) {
+  for (const dz of [-22.55, 22.55]) {
     addDoorApron(-24.0, dz, 4.4, 1.1);
     addDoorApron(0, dz, 6.8, 1.1);
     addDoorApron(24.0, dz, 4.4, 1.1);
   }
-  addDoorApron(-33.4, 0, 1.1, 6.4);
-  addDoorApron(33.4, 0, 1.1, 6.4);
+  addDoorApron(-33.55, 0, 1.1, 6.4);
+  addDoorApron(33.55, 0, 1.1, 6.4);
 
   // Interior Switchgear Corridor Divider Walls (X = -21.0 and X = 21.0) with triple arch openings
   for (const ix of [-21.0, 21.0]) {

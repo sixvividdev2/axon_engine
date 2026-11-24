@@ -199,6 +199,7 @@ const _spawnPos = new THREE.Vector3();
 const _velVec = new THREE.Vector3();
 const _impDir = new THREE.Vector3();
 const _muzzleWorld = new THREE.Vector3();
+const _playerGazeTarget = new THREE.Vector3();
 
 const FACTION_ARMBAND_HEX: Readonly<Record<AiFactionKind, number>> = {
   pmc_alpha: 0x38bdf8,
@@ -678,6 +679,18 @@ export class OpenWorldAiDirector {
       helmetColor: kit.helmetColor,
       nvgMount: kit.nvgMount,
       nvgFlipped: false,
+      faceGear:
+        role === 'tower_sniper'
+          ? 'balaclava'
+          : seqIdx % 2 === 0
+            ? 'open_face'
+            : 'neck_gaiter',
+      eyewear:
+        role === 'tower_sniper'
+          ? 'tinted_visor'
+          : seqIdx % 3 === 1
+            ? 'clear_glasses'
+            : 'none',
     });
 
     const normalizedAtt = normalizeWeaponAttachments(kit.weaponId, kit.attachments);
@@ -1295,6 +1308,7 @@ export class OpenWorldAiDirector {
       isNight,
     );
     this.lastVisionRangeM = visionRangeM;
+    _playerGazeTarget.set(playerX, playerY + 1.55, playerZ);
 
     let activeNearby = 0;
     let hostileEngaging = 0;
@@ -1819,6 +1833,28 @@ export class OpenWorldAiDirector {
         _poseScratch.headPitchOffset = a.headPitchOffset;
         _poseScratch.headRollOffset = a.headRollOffset;
         _poseScratch.torsoYawOffset = a.speedMps > 0.25 ? Math.sin(a.walkCycle) * 0.045 : 0;
+        _poseScratch.dt = dt;
+        _poseScratch.distanceToCameraM = distHoriz;
+        _poseScratch.gazeTargetWorld =
+          a.alerted || a.neutralAlertStage !== 'calm' ? _playerGazeTarget : null;
+        _poseScratch.isVisible = a.rig.root.visible;
+        _poseScratch.injury01 = THREE.MathUtils.clamp(1 - a.hp / Math.max(1, a.maxHp), 0, 1);
+        _poseScratch.flinchImpulse01 = Math.min(1, a.flinchPitch * 4);
+        _poseScratch.stress01 = a.alerted
+          ? 0.85
+          : a.neutralAlertStage === 'warned'
+            ? 0.55
+            : 0.15;
+        _poseScratch.facialIntent =
+          a.hp < a.maxHp * 0.4
+            ? 'injured'
+            : a.recoilKick > 0.2
+              ? 'suppressed'
+              : a.adsBlend > 0.45
+                ? 'aiming'
+                : a.alerted || a.neutralAlertStage === 'warned'
+                  ? 'alert'
+                  : 'calm';
         a.rig.applyCombatPose(_poseScratch);
       }
     }

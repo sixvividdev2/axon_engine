@@ -117,7 +117,7 @@ export class ScopeRenderer {
       depthBuffer: false,
     });
 
-    this.scopeCamera = new THREE.PerspectiveCamera(15, 1.0, 0.06, 180);
+    this.scopeCamera = new THREE.PerspectiveCamera(15, 1.0, 0.08, 180);
     // Strict Layer 0 isolation: scopeCamera never sees Layer 1 (player arms/rifle/scope tube)
     this.scopeCamera.layers.set(0);
 

@@ -283,6 +283,20 @@ export function validateAndSanitizeGameMessage(
     if (typeof parsed.nvgFlipped === 'boolean') {
       safePayload.nvgFlipped = parsed.nvgFlipped;
     }
+    if (
+      parsed.faceGear === 'open_face' ||
+      parsed.faceGear === 'neck_gaiter' ||
+      parsed.faceGear === 'balaclava'
+    ) {
+      safePayload.faceGear = parsed.faceGear;
+    }
+    if (
+      parsed.eyewear === 'none' ||
+      parsed.eyewear === 'clear_glasses' ||
+      parsed.eyewear === 'tinted_visor'
+    ) {
+      safePayload.eyewear = parsed.eyewear;
+    }
     safePayload.lean = Number(clampFinite(parsed.lean, -1, 1, 0).toFixed(2));
     safePayload.weaponId = String(parsed.weaponId ?? 'm4a1').slice(0, 40);
     const cleanAtt = sanitizeSyncedWeaponAttachments(parsed.att);
@@ -459,6 +473,20 @@ export function validateAndSanitizeGameMessage(
       VALID_UNIFORM_IDS.has(parsed.uniformId as OperatorUniformId)
     ) {
       safePayload.uniformId = parsed.uniformId;
+    }
+    if (
+      parsed.faceGear === 'open_face' ||
+      parsed.faceGear === 'neck_gaiter' ||
+      parsed.faceGear === 'balaclava'
+    ) {
+      safePayload.faceGear = parsed.faceGear;
+    }
+    if (
+      parsed.eyewear === 'none' ||
+      parsed.eyewear === 'clear_glasses' ||
+      parsed.eyewear === 'tinted_visor'
+    ) {
+      safePayload.eyewear = parsed.eyewear;
     }
   } else if (type === 'game:bot_damage' || type === 'game:zombie_damage') {
     const rawDmg = Number(parsed.damage ?? 0);

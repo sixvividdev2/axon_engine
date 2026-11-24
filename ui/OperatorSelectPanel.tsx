@@ -1,10 +1,12 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { ChevronDown, ChevronUp, RotateCcw } from 'lucide-react';
+import { ChevronDown, ChevronUp, Eye, RotateCcw } from 'lucide-react';
 import {
   useOperatorGearConfig,
   useOperatorSelection,
 } from '../bodycam-sdk/operator/OperatorSelectionStore';
 import {
+  EYEWEAR_LIST,
+  FACE_GEAR_LIST,
   GLOVE_COLOR_LIST,
   HELMET_COLOR_LIST,
   HELMET_TYPE_LIST,
@@ -13,7 +15,7 @@ import {
   OperatorId,
 } from '../bodycam-sdk/operator/OperatorTypes';
 import { OperatorUniformId } from '../bodycam-sdk/TacticalUniforms';
-import { OperatorPreviewStage } from './OperatorPreviewStage';
+import { FacialPreviewIntent, OperatorPreviewStage } from './OperatorPreviewStage';
 
 interface OperatorSelectPanelProps {
   onDeploy: () => void;
@@ -31,7 +33,16 @@ const UNIFORM_SWATCHES: ReadonlyArray<{
   { id: 'infection', label: 'Containment BDU', swatchHex: '#4b553f' },
 ];
 
-type GearDockTab = 'rig' | 'gloves' | 'helmet';
+type GearDockTab = 'rig' | 'face' | 'gloves' | 'helmet';
+
+const FACIAL_PREVIEW_OPTIONS: ReadonlyArray<{
+  id: FacialPreviewIntent;
+  label: string;
+}> = [
+  { id: 'calm', label: 'Calm' },
+  { id: 'alert', label: 'Alert' },
+  { id: 'suppressed', label: 'Under Fire' },
+];
 
 export const OperatorSelectPanel: React.FC<OperatorSelectPanelProps> = ({
   onDeploy,
@@ -41,6 +52,8 @@ export const OperatorSelectPanel: React.FC<OperatorSelectPanelProps> = ({
   const [gear, updateGear] = useOperatorGearConfig();
   const [activeTab, setActiveTab] = useState<GearDockTab>('rig');
   const [nvgFlippedPreview, setNvgFlippedPreview] = useState(false);
+  const [inspectFace, setInspectFace] = useState(false);
+  const [facialPreviewIntent, setFacialPreviewIntent] = useState<FacialPreviewIntent>('calm');
   const [dockCollapsed, setDockCollapsed] = useState(false);
   const [contextLost, setContextLost] = useState(false);
 
@@ -81,12 +94,22 @@ export const OperatorSelectPanel: React.FC<OperatorSelectPanelProps> = ({
     stageRef.current?.setNvgFlipped(nvgFlippedPreview);
   }, [nvgFlippedPreview]);
 
+  useEffect(() => {
+    stageRef.current?.setInspectFace(inspectFace);
+  }, [inspectFace]);
+
+  useEffect(() => {
+    stageRef.current?.setFacialPreviewIntent(facialPreviewIntent);
+  }, [facialPreviewIntent]);
+
   const profile = OPERATOR_PROFILES[operatorId];
   const helmetSpec = HELMET_TYPE_LIST.find((h) => h.id === gear.helmetType) ?? HELMET_TYPE_LIST[0];
   const nvgSpec = NVG_MOUNT_LIST.find((n) => n.id === gear.nvgMount) ?? NVG_MOUNT_LIST[0];
   const gloveColorSpec = GLOVE_COLOR_LIST.find((g) => g.id === gear.gloveColor) ?? GLOVE_COLOR_LIST[0];
   const helmetColorSpec =
     HELMET_COLOR_LIST.find((c) => c.id === gear.helmetColor) ?? HELMET_COLOR_LIST[0];
+  const faceGearSpec = FACE_GEAR_LIST.find((f) => f.id === gear.faceGear) ?? FACE_GEAR_LIST[1];
+  const eyewearSpec = EYEWEAR_LIST.find((e) => e.id === gear.eyewear) ?? EYEWEAR_LIST[0];
   const canMountNvg = helmetSpec.hasMount;
 
   const handleSelectOperator = (next: OperatorId) => {
@@ -127,6 +150,7 @@ export const OperatorSelectPanel: React.FC<OperatorSelectPanelProps> = ({
         </div>
         <div className="mt-1 font-mono-tabular text-[11px] text-neutral-300">
           {helmetSpec.label} ({helmetColorSpec.label}) ·{' '}
+          {faceGearSpec.shortLabel} · {eyewearSpec.shortLabel} ·{' '}
           {gear.nvgMount === 'none' ? 'No NVG' : `${nvgSpec.shortLabel} (${nvgSpec.phosphorLabel})`} ·{' '}
           {gear.glovesEnabled ? `Gloves: ${gloveColorSpec.label}` : 'Bare Hands'}
         </div>
@@ -167,6 +191,7 @@ export const OperatorSelectPanel: React.FC<OperatorSelectPanelProps> = ({
                   {(
                     [
                       { id: 'rig', label: 'Operator & Uniform' },
+                      { id: 'face', label: 'Face & Eyes' },
                       { id: 'gloves', label: 'Gloves' },
                       { id: 'helmet', label: 'Helmet & NVG' },
                     ] as const
@@ -192,6 +217,18 @@ export const OperatorSelectPanel: React.FC<OperatorSelectPanelProps> = ({
                 </div>
 
                 <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setInspectFace((prev) => !prev)}
+                    className={`flex cursor-pointer items-center gap-1.5 whitespace-nowrap border px-3 py-1.5 font-mono-tabular text-[11px] uppercase tracking-wider transition-colors ${
+                      inspectFace
+                        ? 'border-amber-400 bg-amber-500/15 text-amber-300'
+                        : 'border-neutral-700 bg-neutral-900 text-neutral-300 hover:border-amber-400/70 hover:text-neutral-100'
+                    }`}
+                  >
+                    <Eye className="h-3.5 w-3.5" />
+                    <span>{inspectFace ? 'Full Body' : 'Inspect Face'}</span>
+                  </button>
                   {gear.nvgMount !== 'none' && (
                     <button
                       type="button"
@@ -207,7 +244,10 @@ export const OperatorSelectPanel: React.FC<OperatorSelectPanelProps> = ({
                   )}
                   <button
                     type="button"
-                    onClick={() => stageRef.current?.resetCamera()}
+                    onClick={() => {
+                      setInspectFace(false);
+                      stageRef.current?.resetCamera();
+                    }}
                     className="flex cursor-pointer items-center gap-1.5 whitespace-nowrap border border-neutral-700 bg-neutral-900 px-3 py-1.5 font-mono-tabular text-[11px] uppercase tracking-wider text-neutral-300 transition-colors hover:border-amber-400/70 hover:text-neutral-100"
                   >
                     <RotateCcw className="h-3.5 w-3.5" />
@@ -290,6 +330,99 @@ export const OperatorSelectPanel: React.FC<OperatorSelectPanelProps> = ({
                         </button>
                       );
                     })}
+                  </div>
+                </div>
+              )}
+
+              {activeTab === 'face' && (
+                <div className="flex flex-col gap-2.5">
+                  <div className="flex flex-wrap items-center gap-4">
+                    {/* Face Gear: Open Face / Neck Gaiter / Full Balaclava */}
+                    <div className="flex flex-wrap items-center gap-1.5" role="radiogroup" aria-label="Face Gear">
+                      <span className="mr-1 font-mono-tabular text-[11px] uppercase tracking-wider text-neutral-400">
+                        Face Gear
+                      </span>
+                      {FACE_GEAR_LIST.map((fg) => {
+                        const active = gear.faceGear === fg.id;
+                        return (
+                          <button
+                            key={fg.id}
+                            type="button"
+                            role="radio"
+                            aria-checked={active}
+                            onClick={() => updateGear({ faceGear: fg.id })}
+                            title={fg.summary}
+                            className={`cursor-pointer whitespace-nowrap border px-3 py-1.5 font-mono-tabular text-[11px] uppercase tracking-wider transition-colors ${
+                              active
+                                ? 'border-amber-400 bg-amber-500 text-neutral-950 font-semibold'
+                                : 'border-neutral-700 bg-neutral-900 text-neutral-300 hover:border-neutral-500 hover:text-neutral-100'
+                            }`}
+                          >
+                            {fg.label}
+                          </button>
+                        );
+                      })}
+                    </div>
+
+                    <div className="hidden h-6 w-px bg-neutral-800 sm:block" />
+
+                    {/* Eyewear: Unaided / Clear Glasses / Tinted Visor */}
+                    <div className="flex flex-wrap items-center gap-1.5" role="radiogroup" aria-label="Eyewear">
+                      <span className="mr-1 font-mono-tabular text-[11px] uppercase tracking-wider text-neutral-400">
+                        Eyewear
+                      </span>
+                      {EYEWEAR_LIST.map((ew) => {
+                        const active = gear.eyewear === ew.id;
+                        return (
+                          <button
+                            key={ew.id}
+                            type="button"
+                            role="radio"
+                            aria-checked={active}
+                            onClick={() => updateGear({ eyewear: ew.id })}
+                            title={ew.summary}
+                            className={`cursor-pointer whitespace-nowrap border px-3 py-1.5 font-mono-tabular text-[11px] uppercase tracking-wider transition-colors ${
+                              active
+                                ? 'border-amber-400 bg-neutral-900 text-amber-300'
+                                : 'border-neutral-800 bg-neutral-950 text-neutral-400 hover:border-neutral-600 hover:text-neutral-200'
+                            }`}
+                          >
+                            {ew.label}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  {/* Expression Preview + Close-Up Inspection Row */}
+                  <div className="flex flex-wrap items-center justify-between gap-3 border-t border-neutral-800/70 pt-2">
+                    <div className="flex flex-wrap items-center gap-1.5" role="radiogroup" aria-label="Facial Expression Preview">
+                      <span className="mr-1 font-mono-tabular text-[11px] uppercase tracking-wider text-neutral-400">
+                        Expression
+                      </span>
+                      {FACIAL_PREVIEW_OPTIONS.map((opt) => {
+                        const active = facialPreviewIntent === opt.id;
+                        return (
+                          <button
+                            key={opt.id}
+                            type="button"
+                            role="radio"
+                            aria-checked={active}
+                            onClick={() => setFacialPreviewIntent(opt.id)}
+                            className={`cursor-pointer whitespace-nowrap border px-3 py-1 font-mono-tabular text-[11px] uppercase tracking-wider transition-colors ${
+                              active
+                                ? 'border-amber-400 bg-amber-500/15 text-amber-200'
+                                : 'border-neutral-800 bg-neutral-950 text-neutral-400 hover:border-neutral-600 hover:text-neutral-200'
+                            }`}
+                          >
+                            {opt.label}
+                          </button>
+                        );
+                      })}
+                    </div>
+                    <span className="font-mono-tabular text-[11px] text-neutral-500">
+                      Eyes track camera & blink naturally · Morphs drive brow, lids, cheek & jaw
+                    </span>
                   </div>
                 </div>
               )}

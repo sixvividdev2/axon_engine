@@ -12,10 +12,15 @@ import { SecondaryPhysicsRigApplier } from '../bodycam-sdk/physics/SecondaryPhys
 import { OperatorUniformId } from '../bodycam-sdk/TacticalUniforms';
 import { tacticalEquipmentStore } from '../bodycam-sdk/equipment/TacticalEquipmentStore';
 
+export type FacialPreviewIntent = 'calm' | 'alert' | 'suppressed';
+
 const HERO_YAW = 0.34;
 const HERO_PITCH = 0.07;
 const HERO_DIST = 2.55;
 const TARGET_Y = 1.04;
+const FACE_INSPECT_DIST = 0.64;
+const FACE_INSPECT_YAW = 0.16;
+const FACE_INSPECT_PITCH = 0.04;
 
 export interface OperatorPreviewStageOptions {
   container: HTMLElement;
@@ -53,9 +58,13 @@ export class OperatorPreviewStage {
   private targetYaw = HERO_YAW;
   private targetPitch = HERO_PITCH;
   private targetDist = HERO_DIST;
+  private targetLookY = TARGET_Y;
   private currentYaw = HERO_YAW;
   private currentPitch = HERO_PITCH;
   private currentDist = HERO_DIST;
+  private currentLookY = TARGET_Y;
+  private inspectFaceEnabled = false;
+  private facialPreviewIntent: FacialPreviewIntent = 'calm';
   private dragging = false;
   private activePointerId: number | null = null;
   private lastPointerX = 0;
@@ -215,7 +224,7 @@ export class OperatorPreviewStage {
     floor.receiveShadow = true;
     this.scene.add(floor);
 
-    // Cylindrical steel inspection platform (top face sits precisely at y = 0.000)
+    // Cylindrical steel inspection platform (strictly separated Y elevations to eliminate Z-fighting)
     const plinthMat = this.trackDisposable(
       new THREE.MeshStandardMaterial({
         color: 0x1b2028,
@@ -224,10 +233,10 @@ export class OperatorPreviewStage {
       }),
     );
     const plinth = new THREE.Mesh(
-      this.trackDisposable(new THREE.CylinderGeometry(0.92, 1.0, 0.055, 48)),
+      this.trackDisposable(new THREE.CylinderGeometry(0.92, 1.0, 0.045, 48)),
       plinthMat,
     );
-    plinth.position.y = -0.0275;
+    plinth.position.y = -0.0325; // Top face at y = -0.010
     plinth.receiveShadow = true;
     this.scene.add(plinth);
 
@@ -239,10 +248,10 @@ export class OperatorPreviewStage {
       }),
     );
     const deck = new THREE.Mesh(
-      this.trackDisposable(new THREE.CylinderGeometry(0.84, 0.84, 0.004, 48)),
+      this.trackDisposable(new THREE.CylinderGeometry(0.84, 0.84, 0.010, 48)),
       deckMat,
     );
-    deck.position.y = -0.002;
+    deck.position.y = -0.005; // Spans -0.010 .. 0.000 (10mm clearance over plinth)
     deck.receiveShadow = true;
     this.scene.add(deck);
 
@@ -252,22 +261,32 @@ export class OperatorPreviewStage {
         color: 0xf59e0b,
         transparent: true,
         opacity: 0.34,
+        polygonOffset: true,
+        polygonOffsetFactor: -1,
+        polygonOffsetUnits: -1,
       }),
     );
     const ring = new THREE.Mesh(this.trackDisposable(new THREE.RingGeometry(0.855, 0.87, 64)), ringMat);
     ring.rotation.x = -Math.PI * 0.5;
-    ring.position.y = 0.0015;
+    ring.position.y = 0.003;
     this.scene.add(ring);
 
     // Subtle cardinal ticks around the turntable
     const tickGeo = this.trackDisposable(new THREE.BoxGeometry(0.012, 0.003, 0.055));
     const tickMat = this.trackDisposable(
-      new THREE.MeshBasicMaterial({ color: 0x64748b, transparent: true, opacity: 0.45 }),
+      new THREE.MeshBasicMaterial({
+        color: 0x64748b,
+        transparent: true,
+        opacity: 0.45,
+        polygonOffset: true,
+        polygonOffsetFactor: -1,
+        polygonOffsetUnits: -1,
+      }),
     );
     for (let i = 0; i < 12; i++) {
       const ang = (i / 12) * Math.PI * 2;
       const tick = new THREE.Mesh(tickGeo, tickMat);
-      tick.position.set(Math.sin(ang) * 0.78, 0.0015, Math.cos(ang) * 0.78);
+      tick.position.set(Math.sin(ang) * 0.78, 0.004, Math.cos(ang) * 0.78);
       tick.rotation.y = ang;
       this.scene.add(tick);
     }
@@ -324,6 +343,9 @@ export class OperatorPreviewStage {
     if (this.disposed) return;
     if (this.currentOperatorId === operatorId && this.skeleton) return;
     this.loadOperatorRig(operatorId);
+    if (this.inspectFaceEnabled) {
+      this.targetLookY = operatorId === 'FEMALE' ? 1.53 : 1.60;
+    }
   }
 
   public setUniform(uniformId: OperatorUniformId): void {
@@ -358,7 +380,29 @@ export class OperatorPreviewStage {
     }
   }
 
+  public setInspectFace(enabled: boolean): void {
+    if (this.disposed) return;
+    this.inspectFaceEnabled = enabled;
+    if (enabled) {
+      this.targetLookY = this.currentOperatorId === 'FEMALE' ? 1.53 : 1.60;
+      this.targetDist = FACE_INSPECT_DIST;
+      this.targetYaw = FACE_INSPECT_YAW;
+      this.targetPitch = FACE_INSPECT_PITCH;
+    } else {
+      this.targetLookY = TARGET_Y;
+      this.targetDist = HERO_DIST;
+      this.targetYaw = HERO_YAW;
+      this.targetPitch = HERO_PITCH;
+    }
+  }
+
+  public setFacialPreviewIntent(intent: FacialPreviewIntent): void {
+    this.facialPreviewIntent = intent;
+  }
+
   public resetCamera(): void {
+    this.inspectFaceEnabled = false;
+    this.targetLookY = TARGET_Y;
     this.targetYaw = HERO_YAW;
     this.targetPitch = HERO_PITCH;
     this.targetDist = HERO_DIST;
@@ -413,7 +457,8 @@ export class OperatorPreviewStage {
 
   private onWheel = (e: WheelEvent): void => {
     e.preventDefault();
-    this.targetDist = THREE.MathUtils.clamp(this.targetDist + e.deltaY * 0.0014, 1.55, 3.55);
+    const minDist = this.inspectFaceEnabled ? 0.48 : 1.05;
+    this.targetDist = THREE.MathUtils.clamp(this.targetDist + e.deltaY * 0.0014, minDist, 3.55);
   };
 
   private onDoubleClick = (): void => {
@@ -437,15 +482,17 @@ export class OperatorPreviewStage {
     this.currentYaw = THREE.MathUtils.damp(this.currentYaw, this.targetYaw, lambda, dt);
     this.currentPitch = THREE.MathUtils.damp(this.currentPitch, this.targetPitch, lambda, dt);
     this.currentDist = THREE.MathUtils.damp(this.currentDist, this.targetDist, 10, dt);
+    this.currentLookY = THREE.MathUtils.damp(this.currentLookY, this.targetLookY, 10, dt);
 
     const cosP = Math.cos(this.currentPitch);
     const sinP = Math.sin(this.currentPitch);
     const camX = Math.sin(this.currentYaw) * cosP * this.currentDist;
-    const camY = TARGET_Y + sinP * this.currentDist;
+    const camY = this.currentLookY + sinP * this.currentDist;
     const camZ = Math.cos(this.currentYaw) * cosP * this.currentDist;
 
     this.camera.position.set(camX, camY, camZ);
-    this._lookTarget.set(0, TARGET_Y - (this.currentDist - 2.55) * 0.04, 0);
+    const bodyTiltShift = this.inspectFaceEnabled ? 0 : (this.currentDist - 2.55) * 0.04;
+    this._lookTarget.set(0, this.currentLookY - bodyTiltShift, 0);
     this.camera.lookAt(this._lookTarget);
   }
 
@@ -503,6 +550,22 @@ export class OperatorPreviewStage {
 
     if (this.skeleton) {
       this.skeleton.applyPreviewReadyPose(this.elapsedSec);
+      this.skeleton.updateFacial(dt, {
+        intent: this.facialPreviewIntent,
+        stress01:
+          this.facialPreviewIntent === 'suppressed'
+            ? 0.9
+            : this.facialPreviewIntent === 'alert'
+              ? 0.45
+              : 0.12,
+        flinchImpulse01:
+          this.facialPreviewIntent === 'suppressed'
+            ? Math.max(0, Math.sin(this.elapsedSec * 4.5)) * 0.25
+            : 0,
+        gazeTargetWorld: this.camera.position,
+        distanceToCameraM: this.currentDist,
+        isVisible: true,
+      });
       this.secondaryApplier?.update({
         dt,
         rootWorldPos: this._zeroRootPos,

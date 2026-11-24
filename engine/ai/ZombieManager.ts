@@ -1,4 +1,12 @@
 import * as THREE from 'three';
+import {
+  buildAnatomicalHeadAssembly,
+  BuiltAnatomicalHeadAssembly,
+} from '../../bodycam-sdk/character/AnatomicalHeadBuilder';
+import {
+  FacialExpressionController,
+  FacialExpressionInput,
+} from '../../bodycam-sdk/character/FacialExpressionController';
 import { BodycamMeleeHitEvent } from '../../bodycam-sdk/types';
 import { AI_ARCHETYPES, AiArchetypeId, AiArchetypeSpec } from '../../data/aiArchetypes';
 import { LimbId } from '../../data/traumaConfig';
@@ -8,12 +16,25 @@ import { LimbTraumaSystem, TraumaDamageKind } from '../trauma/LimbTraumaSystem';
 import { ZombieSaveState, ZombieStateName } from '../types';
 import { BuiltWorld } from '../world/WorldBuilder';
 
+function hashActorId(id: string): number {
+  let h = 2166136261 >>> 0;
+  for (let i = 0; i < id.length; i++) {
+    h ^= id.charCodeAt(i);
+    h = Math.imul(h, 16777619) >>> 0;
+  }
+  return h;
+}
+
 export interface ZombieActor {
   id: string;
   chunkKey?: string;
   archetype: AiArchetypeSpec;
   group: THREE.Group;
+  headPivot: THREE.Group;
   headMesh: THREE.Mesh;
+  headAssembly: BuiltAnatomicalHeadAssembly;
+  facialController: FacialExpressionController;
+  _facialInput: FacialExpressionInput;
   torsoMesh: THREE.Mesh;
   leftArm: THREE.Group;
   rightArm: THREE.Group;
@@ -23,6 +44,7 @@ export interface ZombieActor {
   actorHitMeshes: THREE.Object3D[];
   actorGeos: THREE.BufferGeometry[];
   actorMats: THREE.Material[];
+  actorDisposables: Array<{ dispose: () => void }>;
   trauma: LimbTraumaSystem;
   hp: number;
   state: ZombieStateName;
@@ -206,6 +228,7 @@ export class ZombieManager {
     }
     for (const g of z.actorGeos) g.dispose();
     for (const m of z.actorMats) m.dispose();
+    for (const d of z.actorDisposables) d.dispose();
     this.zombies.splice(idx, 1);
   }
 
@@ -232,8 +255,7 @@ export class ZombieManager {
 
     const skinMat = new THREE.MeshStandardMaterial({ color: spec.skinColorHex, roughness: 0.9, metalness: 0.04 });
     const clothMat = new THREE.MeshStandardMaterial({ color: spec.clothColorHex, roughness: 0.94, metalness: 0.02 });
-    const eyeMat = new THREE.MeshBasicMaterial({ color: spec.eyeGlowHex });
-    actorMats.push(skinMat, clothMat, eyeMat);
+    actorMats.push(skinMat, clothMat);
 
     // Legs (bottom-center grounded) — tagged with leftLeg / rightLeg hit zones
     const legGeo = new THREE.BoxGeometry(0.16 * s, 0.78 * s, 0.18 * s);
@@ -272,24 +294,29 @@ export class ZombieManager {
     shoulders.position.set(0, 1.40 * s, 0.08 * s);
     group.add(shoulders);
 
-    // Head Hitbox + Pale Eyes
-    const headGeo = new THREE.BoxGeometry(0.24 * s, 0.27 * s, 0.25 * s);
-    actorGeos.push(headGeo);
-    const headMesh = new THREE.Mesh(headGeo, skinMat);
-    headMesh.position.set(0, 1.62 * s, 0.14 * s);
-    headMesh.rotation.x = 0.12;
+    // Anatomical Head + Independent Zombie Eyeballs + 15 Morph Targets (oriented +Z to match ZombieManager)
+    const idHash = hashActorId(id);
+    const headPivot = new THREE.Group();
+    headPivot.position.set(0, 1.50 * s, 0.12 * s);
+    headPivot.scale.setScalar(s);
+    headPivot.rotation.x = 0.08;
+    group.add(headPivot);
+
+    const headAssembly = buildAnatomicalHeadAssembly({
+      variant: 'zombie',
+      toneSeed: idHash,
+      anisotropy: 2,
+      hoodMaterial: skinMat,
+      frameMaterial: clothMat,
+      includeGearAndEyewear: false,
+    });
+    headAssembly.root.rotation.y = Math.PI;
+    headPivot.add(headAssembly.root);
+
+    const headMesh = headAssembly.headMesh;
     headMesh.castShadow = true;
     headMesh.userData.zombieId = id;
     headMesh.userData.hitZone = 'head' satisfies LimbId;
-    group.add(headMesh);
-
-    const eyeGeo = new THREE.BoxGeometry(0.032 * s, 0.022 * s, 0.02 * s);
-    actorGeos.push(eyeGeo);
-    const eyeL = new THREE.Mesh(eyeGeo, eyeMat);
-    eyeL.position.set(-0.055 * s, 0.02 * s, 0.125 * s);
-    const eyeR = new THREE.Mesh(eyeGeo, eyeMat);
-    eyeR.position.set(0.055 * s, 0.02 * s, 0.125 * s);
-    headMesh.add(eyeL, eyeR);
 
     // Reaching Arms — tagged with leftArm / rightArm hit zones
     const armGeo = new THREE.BoxGeometry(0.12 * s, 0.62 * s, 0.12 * s);
@@ -360,7 +387,20 @@ export class ZombieManager {
       chunkKey,
       archetype: spec,
       group,
+      headPivot,
       headMesh,
+      headAssembly,
+      facialController: new FacialExpressionController((idHash % 997) + 1),
+      _facialInput: {
+        mode: 'zombie',
+        intent: state === 'DEAD' ? 'dead' : 'shamble',
+        stress01: 0.2,
+        injury01: 0.4,
+        flinchImpulse01: 0,
+        gazeTargetWorld: null,
+        distanceToCameraM: 0,
+        isVisible: true,
+      },
       torsoMesh,
       leftArm,
       rightArm,
@@ -370,6 +410,7 @@ export class ZombieManager {
       actorHitMeshes,
       actorGeos,
       actorMats,
+      actorDisposables: headAssembly.disposables,
       trauma,
       hp,
       state,
@@ -722,6 +763,19 @@ export class ZombieManager {
           z.deathProgress = Math.min(1, z.deathProgress + dt * 3.8);
           z.group.rotation.x = -Math.PI * 0.48 * z.deathProgress;
           z.group.position.y = world.groundHeightAt(z.group.position.x, z.group.position.z) + 0.14 * z.deathProgress;
+          z._facialInput.mode = 'zombie';
+          z._facialInput.intent = 'dead';
+          z._facialInput.gazeTargetWorld = null;
+          z._facialInput.distanceToCameraM = z.group.position.distanceTo(playerPos);
+          z._facialInput.isVisible = z.group.visible;
+          z.facialController.step(
+            dt,
+            z._facialInput,
+            z.headAssembly.root,
+            z.headAssembly.morphTargetInfluences,
+            z.headAssembly.eyeL,
+            z.headAssembly.eyeR,
+          );
         }
         continue;
       }
@@ -949,31 +1003,56 @@ export class ZombieManager {
         const remainRatio = THREE.MathUtils.clamp(z.staggerTimer / z.staggerTotalSec, 0, 1);
         const env = Math.sin(remainRatio * Math.PI * 0.85);
         if (z.staggerKind === 'head_snap') {
-          z.headMesh.rotation.x = THREE.MathUtils.damp(z.headMesh.rotation.x, -0.62 * env, 24, dt);
-          z.headMesh.rotation.y = THREE.MathUtils.damp(z.headMesh.rotation.y, 0.34 * env, 20, dt);
+          z.headPivot.rotation.x = THREE.MathUtils.damp(z.headPivot.rotation.x, 0.08 - 0.62 * env, 24, dt);
+          z.headPivot.rotation.y = THREE.MathUtils.damp(z.headPivot.rotation.y, 0.34 * env, 20, dt);
           z.torsoMesh.rotation.x = THREE.MathUtils.damp(z.torsoMesh.rotation.x, -0.18 * env, 16, dt);
           z.leftArm.rotation.x = THREE.MathUtils.damp(z.leftArm.rotation.x, baseArmPitchL - 0.32 * env, 14, dt);
           z.rightArm.rotation.x = THREE.MathUtils.damp(z.rightArm.rotation.x, baseArmPitchR - 0.32 * env, 14, dt);
         } else if (z.staggerKind === 'kick_stumble') {
           const flail = Math.sin(nowMs * 0.022) * 0.24 * env;
           z.torsoMesh.rotation.x = THREE.MathUtils.damp(z.torsoMesh.rotation.x, -0.38 * env, 18, dt);
-          z.headMesh.rotation.x = THREE.MathUtils.damp(z.headMesh.rotation.x, -0.28 * env, 16, dt);
+          z.headPivot.rotation.x = THREE.MathUtils.damp(z.headPivot.rotation.x, 0.08 - 0.28 * env, 16, dt);
           z.leftArm.rotation.x = THREE.MathUtils.damp(z.leftArm.rotation.x, -1.78 * env + flail, 16, dt);
           z.rightArm.rotation.x = THREE.MathUtils.damp(z.rightArm.rotation.x, -1.68 * env - flail, 16, dt);
           z.leftLeg.rotation.x = THREE.MathUtils.damp(z.leftLeg.rotation.x, 0.28 * env, 14, dt);
           z.rightLeg.rotation.x = THREE.MathUtils.damp(z.rightLeg.rotation.x, -0.32 * env, 14, dt);
         } else {
           z.torsoMesh.rotation.x = THREE.MathUtils.damp(z.torsoMesh.rotation.x, -0.22 * env, 16, dt);
-          z.headMesh.rotation.x = THREE.MathUtils.damp(z.headMesh.rotation.x, -0.24 * env, 16, dt);
+          z.headPivot.rotation.x = THREE.MathUtils.damp(z.headPivot.rotation.x, 0.08 - 0.24 * env, 16, dt);
         }
       } else {
-        z.headMesh.rotation.x = THREE.MathUtils.damp(z.headMesh.rotation.x, 0, 12, dt);
-        z.headMesh.rotation.y = THREE.MathUtils.damp(z.headMesh.rotation.y, 0, 12, dt);
+        z.headPivot.rotation.x = THREE.MathUtils.damp(z.headPivot.rotation.x, 0.08, 12, dt);
+        z.headPivot.rotation.y = THREE.MathUtils.damp(z.headPivot.rotation.y, 0, 12, dt);
         z.torsoMesh.rotation.x = THREE.MathUtils.damp(z.torsoMesh.rotation.x, 0, 12, dt);
       }
 
       z.group.position.y = groundY + limpDropY;
       z.group.rotation.y = z.yaw;
+
+      const f = z._facialInput;
+      f.mode = 'zombie';
+      f.intent =
+        z.staggerTimer > 0
+          ? 'stagger'
+          : z.state === 'ATTACK'
+            ? 'lunge'
+            : z.state === 'CHASE'
+              ? 'aggro'
+              : 'shamble';
+      f.stress01 = z.state === 'CHASE' || z.state === 'ATTACK' ? 0.92 : z.state === 'INVESTIGATE' ? 0.45 : 0.18;
+      f.injury01 = THREE.MathUtils.clamp(1 - z.hp / Math.max(1, z.archetype.maxHp), 0, 1);
+      f.flinchImpulse01 = z.staggerTimer > 0 ? Math.min(1, z.staggerTimer / 0.35) : 0;
+      f.gazeTargetWorld = z.state === 'CHASE' || z.state === 'ATTACK' ? playerPos : z.investigateTarget;
+      f.distanceToCameraM = distToPlayer;
+      f.isVisible = z.group.visible;
+      z.facialController.step(
+        dt,
+        f,
+        z.headAssembly.root,
+        z.headAssembly.morphTargetInfluences,
+        z.headAssembly.eyeL,
+        z.headAssembly.eyeR,
+      );
     }
   }
 

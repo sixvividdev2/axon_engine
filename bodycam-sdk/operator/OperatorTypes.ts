@@ -150,6 +150,10 @@ export type HelmetColorId =
 
 export type NvgMountId = 'none' | 'pvs7' | 'arnvg';
 
+export type FaceGearId = 'open_face' | 'neck_gaiter' | 'balaclava';
+
+export type EyewearId = 'none' | 'clear_glasses' | 'tinted_visor';
+
 export interface OperatorGearConfig {
   uniformId: OperatorGearUniformId;
   glovesEnabled: boolean;
@@ -157,6 +161,8 @@ export interface OperatorGearConfig {
   helmetType: HelmetTypeId;
   helmetColor: HelmetColorId;
   nvgMount: NvgMountId;
+  faceGear: FaceGearId;
+  eyewear: EyewearId;
 }
 
 export const OPERATOR_GEAR_STORAGE_KEY = 'bfps.operator.gear.v1';
@@ -168,6 +174,8 @@ export const DEFAULT_OPERATOR_GEAR: Readonly<OperatorGearConfig> = {
   helmetType: 'mil_tec',
   helmetColor: 'black',
   nvgMount: 'none',
+  faceGear: 'neck_gaiter',
+  eyewear: 'none',
 };
 
 export interface GloveColorSpec {
@@ -269,11 +277,69 @@ export const NVG_MOUNT_LIST: readonly NvgMountSpec[] = [
   },
 ] as const;
 
+export interface FaceGearSpec {
+  readonly id: FaceGearId;
+  readonly label: string;
+  readonly shortLabel: string;
+  readonly summary: string;
+}
+
+export const FACE_GEAR_LIST: readonly FaceGearSpec[] = [
+  {
+    id: 'open_face',
+    label: 'Open Face',
+    shortLabel: 'OPEN',
+    summary: 'Exposed anatomical jaw, cheeks, and brow with full facial expression visibility.',
+  },
+  {
+    id: 'neck_gaiter',
+    label: 'Neck Gaiter',
+    shortLabel: 'GAITER',
+    summary: 'Lowered tactical fleece gaiter covering lower throat and chin line.',
+  },
+  {
+    id: 'balaclava',
+    label: 'Full Balaclava',
+    shortLabel: 'BALACLAVA',
+    summary: 'FR tactical hood with contoured eye-opening aperture framing brow and gaze.',
+  },
+] as const;
+
+export interface EyewearSpec {
+  readonly id: EyewearId;
+  readonly label: string;
+  readonly shortLabel: string;
+  readonly summary: string;
+}
+
+export const EYEWEAR_LIST: readonly EyewearSpec[] = [
+  {
+    id: 'none',
+    label: 'Unaided Eyes',
+    shortLabel: 'NONE',
+    summary: 'No ballistic eyewear; direct unobstructed view of operator eyes.',
+  },
+  {
+    id: 'clear_glasses',
+    label: 'Clear Ballistic Glasses',
+    shortLabel: 'CLEAR',
+    summary: 'ANSI Z87+ wraparound clear polycarbonate eye-pro preserving full eye contact.',
+  },
+  {
+    id: 'tinted_visor',
+    label: 'Tinted Tactical Visor',
+    shortLabel: 'VISOR',
+    summary: 'Smoked wraparound polycarbonate ballistic shield against glare and debris.',
+  },
+] as const;
+
 const VALID_UNIFORMS = new Set<string>(['team_a', 'team_b', 'ffa', 'infection']);
 const VALID_GLOVE_COLORS = new Set<string>(GLOVE_COLOR_LIST.map((g) => g.id));
 const VALID_HELMET_TYPES = new Set<string>(['mich', 'mil_tec']);
 const VALID_HELMET_COLORS = new Set<string>(HELMET_COLOR_LIST.map((h) => h.id));
 const VALID_NVG_MOUNTS = new Set<string>(['none', 'pvs7', 'arnvg']);
+const VALID_FACE_GEAR = new Set<string>(['open_face', 'neck_gaiter', 'balaclava']);
+const VALID_EYEWEAR = new Set<string>(['none', 'clear_glasses', 'tinted_visor']);
 
 export function normalizeOperatorGearConfig(raw: unknown): OperatorGearConfig {
   const obj = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {};
@@ -301,6 +367,14 @@ export function normalizeOperatorGearConfig(raw: unknown): OperatorGearConfig {
       : DEFAULT_OPERATOR_GEAR.nvgMount;
   // MICH helmet has NO shroud mount — always enforce 'none'
   const nvgMount: NvgMountId = helmetType === 'mil_tec' ? rawNvg : 'none';
+  const faceGear: FaceGearId =
+    typeof obj.faceGear === 'string' && VALID_FACE_GEAR.has(obj.faceGear)
+      ? (obj.faceGear as FaceGearId)
+      : DEFAULT_OPERATOR_GEAR.faceGear;
+  const eyewear: EyewearId =
+    typeof obj.eyewear === 'string' && VALID_EYEWEAR.has(obj.eyewear)
+      ? (obj.eyewear as EyewearId)
+      : DEFAULT_OPERATOR_GEAR.eyewear;
 
   return {
     uniformId,
@@ -309,6 +383,8 @@ export function normalizeOperatorGearConfig(raw: unknown): OperatorGearConfig {
     helmetType,
     helmetColor,
     nvgMount,
+    faceGear,
+    eyewear,
   };
 }
 

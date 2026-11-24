@@ -1,6 +1,10 @@
 import * as THREE from 'three';
 import { LimbId } from '../../data/traumaConfig';
 import { HoldClass } from '../../data/weapons';
+import {
+  buildAnatomicalHeadAssembly,
+  BuiltAnatomicalHeadAssembly,
+} from '../../bodycam-sdk/character/AnatomicalHeadBuilder';
 
 export interface ArticulatedFinger {
   proximal: THREE.Group;
@@ -192,6 +196,7 @@ export class CharacterSkeleton {
   private soleMat: THREE.MeshStandardMaterial;
   private hardwareMat: THREE.MeshStandardMaterial;
   private hoodMat: THREE.MeshStandardMaterial;
+  private headAssembly: BuiltAnatomicalHeadAssembly | null = null;
 
   constructor(maxAnisotropy = 4) {
     const aniso = Math.min(8, Math.max(1, maxAnisotropy));
@@ -487,13 +492,27 @@ export class CharacterSkeleton {
     this.headGroup.position.set(0, 0.09, 0);
     this.neck.add(this.headGroup);
 
-    const cranium = new THREE.Mesh(this.geo(new THREE.SphereGeometry(0.105, 12, 10)), this.hoodMat);
-    cranium.scale.set(0.86, 1.05, 0.96);
-    cranium.position.set(0, 0.10, -0.008);
-    const helmet = new THREE.Mesh(this.geo(new THREE.SphereGeometry(0.122, 12, 10)), this.vestMat);
-    helmet.scale.set(0.92, 0.85, 1.05);
-    helmet.position.set(0, 0.15, 0.0);
-    this.headGroup.add(cranium, helmet);
+    const headAssembly = buildAnatomicalHeadAssembly({
+      variant: 'male',
+      toneSeed: 1,
+      anisotropy: 4,
+      hoodMaterial: this.hoodMat,
+      frameMaterial: this.knuckleMat,
+      includeGearAndEyewear: true,
+    });
+    headAssembly.applyFaceGear('neck_gaiter');
+    headAssembly.applyEyewear('none');
+    this.headAssembly = headAssembly;
+    this.headGroup.add(headAssembly.root);
+
+    const helmet = new THREE.Mesh(
+      this.geo(new THREE.SphereGeometry(0.119, 14, 10, 0, Math.PI * 2, 0, Math.PI * 0.60)),
+      this.vestMat,
+    );
+    helmet.scale.set(0.95, 1.02, 1.06);
+    helmet.position.set(0, 0.115, 0.002);
+    helmet.rotation.x = -0.10;
+    this.headGroup.add(helmet);
     // Hide head geometry in first-person camera so it never clips the lens
     this.headGroup.visible = false;
     neckMesh.visible = false;
@@ -1248,6 +1267,11 @@ export class CharacterSkeleton {
   public dispose(): void {
     for (const g of this.geos) g.dispose();
     for (const m of this.mats) m.dispose();
+    if (this.headAssembly) {
+      for (const d of this.headAssembly.disposables) {
+        d.dispose();
+      }
+    }
     for (const t of this.texSets) {
       t.map.dispose();
       t.normalMap.dispose();

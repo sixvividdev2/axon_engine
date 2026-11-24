@@ -331,7 +331,7 @@ export class GymEngine {
     container.appendChild(this.renderer.domElement);
 
     this.scene = new THREE.Scene();
-    this.camera = new THREE.PerspectiveCamera(72, width / height, 0.05, 160);
+    this.camera = new THREE.PerspectiveCamera(72, width / height, 0.08, 160);
     this.scene.add(this.camera);
 
     // Build calibration gym world & portable adapter

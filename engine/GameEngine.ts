@@ -209,7 +209,7 @@ export class GameEngine {
 
     const w = container.clientWidth || window.innerWidth;
     const h = container.clientHeight || window.innerHeight;
-    this.camera = new THREE.PerspectiveCamera(72, w / Math.max(1, h), 0.06, 180);
+    this.camera = new THREE.PerspectiveCamera(72, w / Math.max(1, h), 0.08, 180);
 
     this.textures = new ProceduralTextureLibrary(this.renderer, this.worldSeed);
     this.audio = new AudioEngine();

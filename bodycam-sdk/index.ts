@@ -22,6 +22,8 @@ export * from './operator/OperatorTypes';
 export * from './operator/OperatorSelectionStore';
 export * from './operator/RigParityValidator';
 export * from './operator/OperatorAssetLoader';
+export * from './character/AnatomicalHeadBuilder';
+export * from './character/FacialExpressionController';
 export * from './physics/SecondaryPhysicsSolver';
 export * from './physics/SecondaryPhysicsRigApplier';
 export * from './physics/ArticulatedRagdoll';

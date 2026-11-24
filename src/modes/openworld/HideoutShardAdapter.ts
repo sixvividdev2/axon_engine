@@ -140,7 +140,9 @@ export class HideoutShardAdapter {
         prev.gloveColor !== nextGear.gloveColor ||
         prev.helmetType !== nextGear.helmetType ||
         prev.helmetColor !== nextGear.helmetColor ||
-        prev.nvgMount !== nextGear.nvgMount;
+        prev.nvgMount !== nextGear.nvgMount ||
+        prev.faceGear !== nextGear.faceGear ||
+        prev.eyewear !== nextGear.eyewear;
       if (changed) {
         this.roster.updateCharacterGear(active.slotId, nextGear);
       }
@@ -170,7 +172,7 @@ export class HideoutShardAdapter {
       return;
     }
 
-    const rigKey = `${active.characterId}|${active.bodyType}|${active.operatorGear.uniformId}|${active.operatorGear.glovesEnabled}|${active.operatorGear.helmetType}|${active.operatorGear.helmetColor}|${active.operatorGear.gloveColor}|${active.operatorGear.nvgMount}`;
+    const rigKey = `${active.characterId}|${active.bodyType}|${active.operatorGear.uniformId}|${active.operatorGear.glovesEnabled}|${active.operatorGear.helmetType}|${active.operatorGear.helmetColor}|${active.operatorGear.gloveColor}|${active.operatorGear.nvgMount}|${active.operatorGear.faceGear}|${active.operatorGear.eyewear}`;
     if (!force && rigKey === this.lastSyncedCharacterKey) {
       return;
     }

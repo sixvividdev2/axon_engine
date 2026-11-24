@@ -822,6 +822,10 @@ export class BattleBotAI {
         ? 'infection'
         : resolveOperatorUniformId('battle', team);
       const rig = this.rigFactory.buildOperator('bot', id, uniformId, operatorId);
+      rig.setGearAppearance({
+        faceGear: i % 5 === 0 ? 'balaclava' : i % 2 === 0 ? 'open_face' : 'neck_gaiter',
+        eyewear: i % 6 === 0 ? 'tinted_visor' : i % 3 === 1 ? 'clear_glasses' : 'none',
+      });
       const initSpec = this.getWeaponSpec(weaponId);
       const initAtt = buildBotAttachmentsForWeapon(initSpec.id, i, this.coopInfectionMode);
       const ownsSuppressor = Boolean(getOwnedSuppressorDef(initAtt));
@@ -3094,12 +3098,25 @@ export class BattleBotAI {
         pose.grenadeThrowStyle = bot.netGrenadeThrowStyle;
         pose.wallObstruction01 = bot.wallObstruction01;
         pose.beltWallTuck01 = bot.beltWallTuck01;
+        pose.dt = dt;
+        pose.distanceToCameraM = bot.pos.distanceTo(playerPos);
+        pose.gazeTargetWorld = playerPos;
+        pose.isVisible = bot.root.visible;
+        pose.injury01 = THREE.MathUtils.clamp(1 - bot.hp / Math.max(1, bot.maxHp), 0, 1);
+        pose.flinchImpulse01 = bot.flinchTimer > 0 ? Math.min(1, bot.flinchTimer / 0.25) : 0;
+        pose.stress01 = isAimingFire ? 0.8 : 0.25;
+        pose.facialIntent =
+          bot.hp < bot.maxHp * 0.38
+            ? 'injured'
+            : isAimingFire
+              ? 'aiming'
+              : 'calm';
 
         bot.bodyPivot.rotation.set(0, 0, 0);
         bot.bodyPivot.position.set(0, 0, 0);
-        bot.rig.applyCombatPose(pose);
         bot.root.position.copy(bot.pos);
         bot.root.rotation.set(0, bot.yaw, 0);
+        bot.rig.applyCombatPose(pose);
       }
       return;
     }
@@ -3247,12 +3264,20 @@ export class BattleBotAI {
         pose.handlingProgress = 0;
         pose.wallObstruction01 = 0;
         pose.beltWallTuck01 = 0;
+        pose.dt = dt;
+        pose.distanceToCameraM = bot.pos.distanceTo(playerPos);
+        pose.gazeTargetWorld = null;
+        pose.isVisible = bot.root.visible;
+        pose.injury01 = THREE.MathUtils.clamp(1 - bot.hp / Math.max(1, bot.maxHp), 0, 1);
+        pose.flinchImpulse01 = 0;
+        pose.stress01 = 0.72;
+        pose.facialIntent = 'alert';
 
         bot.bodyPivot.rotation.set(0, 0, 0);
         bot.bodyPivot.position.set(0, 0, 0);
-        bot.rig.applyCombatPose(pose);
         bot.root.position.copy(bot.pos);
         bot.root.rotation.set(0, bot.yaw, 0);
+        bot.rig.applyCombatPose(pose);
 
         if (bot.vaultT >= 1) {
           bot.pos.copy(bot.vaultEndPos);
@@ -4080,12 +4105,34 @@ export class BattleBotAI {
       pose.grenadeThrowStyle = bot.grenadeThrowStyle;
       pose.wallObstruction01 = bot.wallObstruction01;
       pose.beltWallTuck01 = bot.beltWallTuck01;
+      pose.dt = dt;
+      pose.distanceToCameraM = bot.pos.distanceTo(playerPos);
+      pose.gazeTargetWorld = targetPos ?? playerPos;
+      pose.isVisible = bot.root.visible;
+      pose.injury01 = THREE.MathUtils.clamp(1 - bot.hp / Math.max(1, bot.maxHp), 0, 1);
+      pose.flinchImpulse01 =
+        bot.stunTimer > 0
+          ? 0.9
+          : bot.flinchTimer > 0
+            ? Math.min(1, bot.flinchTimer / 0.25)
+            : 0;
+      pose.stress01 = isAimingFire ? 0.85 : bot.hasLos ? 0.65 : 0.2;
+      pose.facialIntent =
+        bot.stunTimer > 0 || bot.flinchTimer > 0
+          ? 'suppressed'
+          : bot.hp < bot.maxHp * 0.38
+            ? 'injured'
+            : isAimingFire
+              ? 'aiming'
+              : bot.hasLos
+                ? 'alert'
+                : 'calm';
 
       bot.bodyPivot.rotation.set(0, 0, 0);
       bot.bodyPivot.position.set(0, 0, 0);
-      bot.rig.applyCombatPose(pose);
       bot.root.position.copy(bot.pos);
       bot.root.rotation.set(0, bot.yaw, 0);
+      bot.rig.applyCombatPose(pose);
     }
   }
 

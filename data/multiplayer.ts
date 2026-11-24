@@ -475,6 +475,8 @@ export interface GamePlayerStatePacket {
   helmetColor?: string;
   nvgMount?: 'none' | 'pvs7' | 'arnvg';
   nvgFlipped?: boolean;
+  faceGear?: 'open_face' | 'neck_gaiter' | 'balaclava';
+  eyewear?: 'none' | 'clear_glasses' | 'tinted_visor';
   lean: number; // -1..1
   weaponId: string;
   att?: SyncedWeaponAttachments;
@@ -573,6 +575,8 @@ export interface GamePlayerRespawnPacket {
   helmetColor?: string;
   nvgMount?: 'none' | 'pvs7' | 'arnvg';
   nvgFlipped?: boolean;
+  faceGear?: 'open_face' | 'neck_gaiter' | 'balaclava';
+  eyewear?: 'none' | 'clear_glasses' | 'tinted_visor';
   ts: number;
 }
 
