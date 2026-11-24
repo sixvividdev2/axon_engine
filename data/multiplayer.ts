@@ -51,6 +51,8 @@ export interface SpecialEventConfig {
   killfeedPolicy?: LobbyKillfeedPolicy;
   weatherPreset?: WeatherPresetId;
   timeOfDayStart?: TimeOfDayStartSetting;
+  hitmarkersEnabled?: boolean;
+  hudEnabled?: boolean;
 }
 
 export interface SpecialEventRecord {
@@ -99,6 +101,8 @@ export interface LobbySettingsPatch {
   killfeedPolicy?: LobbyKillfeedPolicy;
   weatherPreset?: WeatherPresetId;
   timeOfDayStart?: TimeOfDayStartSetting;
+  hitmarkersEnabled?: boolean;
+  hudEnabled?: boolean;
 }
 
 export interface LobbyRoomState {
@@ -117,6 +121,8 @@ export interface LobbyRoomState {
   killfeedPolicy?: LobbyKillfeedPolicy;
   weatherPreset?: WeatherPresetId;
   timeOfDayStart?: TimeOfDayStartSetting;
+  hitmarkersEnabled?: boolean;
+  hudEnabled?: boolean;
   status: 'lobby' | 'in_match';
   matchSequence: number;
   specialEvent: SpecialEventRecord | null;
@@ -176,6 +182,8 @@ export const DEFAULT_SPECIAL_EVENT_CONFIG: SpecialEventConfig = {
   killfeedPolicy: 'player_choice',
   weatherPreset: 'auto',
   timeOfDayStart: 'auto',
+  hitmarkersEnabled: true,
+  hudEnabled: true,
 };
 
 function clampNum(val: unknown, min: number, max: number, fallback: number): number {
@@ -251,6 +259,9 @@ export function sanitizeSpecialEventConfig(raw: unknown): SpecialEventConfig {
       : 'player_choice',
     weatherPreset: sanitizeWeatherPreset(obj.weatherPreset),
     timeOfDayStart: sanitizeTimeOfDayStart(obj.timeOfDayStart),
+    hitmarkersEnabled:
+      typeof obj.hitmarkersEnabled === 'boolean' ? obj.hitmarkersEnabled : true,
+    hudEnabled: typeof obj.hudEnabled === 'boolean' ? obj.hudEnabled : true,
   };
 }
 

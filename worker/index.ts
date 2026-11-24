@@ -1433,6 +1433,8 @@ export default {
           killfeedPolicy?: 'player_choice' | 'force_on' | 'force_off';
           weatherPreset?: WeatherPresetId;
           timeOfDayStart?: TimeOfDayStartSetting;
+          hitmarkersEnabled?: boolean;
+          hudEnabled?: boolean;
           specialEventId?: string | null;
         }>(request);
 
@@ -1514,6 +1516,16 @@ export default {
         const timeOfDayStart = sanitizeTimeOfDayStart(
           specialEvent ? specialEvent.config.timeOfDayStart : body?.timeOfDayStart,
         );
+        const hitmarkersEnabled = specialEvent
+          ? specialEvent.config.hitmarkersEnabled !== false
+          : typeof body?.hitmarkersEnabled === 'boolean'
+            ? body.hitmarkersEnabled
+            : true;
+        const hudEnabled = specialEvent
+          ? specialEvent.config.hudEnabled !== false
+          : typeof body?.hudEnabled === 'boolean'
+            ? body.hudEnabled
+            : true;
 
         let code = generateLobbyCode();
         for (let attempt = 0; attempt < 5; attempt++) {
@@ -1548,6 +1560,8 @@ export default {
             killfeedPolicy,
             weatherPreset,
             timeOfDayStart,
+            hitmarkersEnabled,
+            hudEnabled,
             specialEvent,
           }),
         });

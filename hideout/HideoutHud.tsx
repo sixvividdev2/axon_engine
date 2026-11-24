@@ -15,6 +15,7 @@ import {
   GRAPHICS_QUALITY_ORDER,
   GRAPHICS_QUALITY_PROFILES,
   GraphicsQualityId,
+  useAdaptiveScaling,
   useGraphicsQuality,
 } from '../data/graphicsQuality';
 import { HubTabId } from '../ui/MainMenuHub';
@@ -55,6 +56,7 @@ export const HideoutHud: React.FC<HideoutHudProps> = ({
   const { user, openAuthModal, openAccountSettings } = useAuth();
   const { openDrawer: openSocialDrawer, incomingRequests } = useSocial();
   const [graphicsQuality, setGraphicsQuality] = useGraphicsQuality();
+  const [adaptiveScaling, setAdaptiveScaling] = useAdaptiveScaling();
   const { activeCharacter, bankruptcy } = useHideoutShardAdapter();
 
   const showLiveHud = snapshot.pointerLocked && !snapshot.pauseOpen && !modalOpen;
@@ -657,6 +659,24 @@ export const HideoutHud: React.FC<HideoutHudProps> = ({
                     );
                   })}
                 </div>
+              </div>
+
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-xs font-medium text-neutral-400 whitespace-nowrap">
+                  Adaptive Scaling
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setAdaptiveScaling(!adaptiveScaling)}
+                  className={`cursor-pointer border px-3 py-1 text-[11px] font-medium transition-colors whitespace-nowrap shrink-0 ${
+                    adaptiveScaling
+                      ? 'border-sky-400/70 bg-sky-950/60 text-sky-200'
+                      : 'border-white/10 bg-[#171a20] text-neutral-400 hover:text-neutral-100'
+                  }`}
+                  title="Automatically scale resolution when FPS drops (OFF by default)"
+                >
+                  {adaptiveScaling ? 'ON (Dynamic DPR)' : 'OFF (Fixed Native)'}
+                </button>
               </div>
             </div>
 

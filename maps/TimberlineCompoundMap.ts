@@ -1440,6 +1440,31 @@ function buildTimberlineCompound(
   sceneGroup.add(rockInst);
   raycastMeshes.push(rockInst);
 
+  // Tactical Highway Shoulder Jersey Barriers, Bridge Chokepoint Cover & Airstrip Apron Baffles
+  const tacticalCoverSpecs: Array<[number, number, number, number, number, 'concrete' | 'wood']> = [
+    // Paved highway shoulder chicanes (X = -2 centerline remains fully open for movement)
+    [-5.6, -26, 0.6, 1.12, 3.2, 'concrete'],
+    [1.8, -16, 0.6, 1.12, 3.2, 'concrete'],
+    [-5.6, 12, 0.6, 1.12, 3.2, 'concrete'],
+    [1.8, 22, 0.6, 1.12, 3.2, 'concrete'],
+    [-5.6, 52, 0.6, 1.12, 3.2, 'concrete'],
+    // Bridge East approach fighting positions
+    [6.6, -52.2, 3.2, 1.12, 0.62, 'concrete'],
+    [6.6, 29.8, 3.2, 1.12, 0.62, 'concrete'],
+    // Airstrip apron flanking cover islands (leaves X = 76 runway nav spine unobstructed)
+    [66.0, -24, 3.6, 1.24, 0.72, 'concrete'],
+    [86.5, -18, 3.6, 1.24, 0.72, 'concrete'],
+    [66.0, 18, 3.6, 1.24, 0.72, 'concrete'],
+    [86.5, 22, 3.6, 1.24, 0.72, 'concrete'],
+    // Timber log stacks near village approaches
+    [-46.0, -45.0, 2.8, 1.05, 1.35, 'wood'],
+    [-48.0, 44.0, 2.8, 1.05, 1.35, 'wood'],
+  ];
+  for (const [cx, cz, cw, ch, cd, surf] of tacticalCoverSpecs) {
+    const cy = sampleVisualTerrainY(cx, cz) + ch * 0.5;
+    addSolidBox(cx, cy, cz, cw, ch, cd, surf === 'wood' ? matWood : matBunkerConcrete, surf);
+  }
+
   // === 7. VALLEY-WIDE NAVGRAPH (Villages, Bridges, Highway, Military Base, Airstrip, Helipad, Bunker) ===
   const rawNodes: NavNode[] = [
     // Paved Highway spine

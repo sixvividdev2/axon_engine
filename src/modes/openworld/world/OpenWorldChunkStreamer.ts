@@ -1,6 +1,15 @@
 import * as THREE from 'three';
 import type { BodycamInteriorSample, BodycamSurfaceMaterial } from '../../../../bodycam-sdk/types';
+import type { GraphicsQualityProfile } from '../../../../data/graphicsQuality';
 import { OpenWorldArchitectureBuilder } from './OpenWorldArchitectureBuilder';
+import {
+  FOB_GUARD_TOWER_DECK_HEIGHT_M,
+  type FobCompoundId,
+  getFobCompoundSpec,
+  getFobGuardTowerSpecs,
+  getFobTerminalAnchor,
+  isFobCompoundId,
+} from './OpenWorldFobLayout';
 import {
   applyAtmosphericHeightFog,
   type AtmoFogSharedUniforms,
@@ -31,6 +40,7 @@ import {
   OPENWORLD_LANDMARKS,
   RESERVOIR_LEVEL_M,
   sampleOpenWorldTerrain,
+  sampleOpenWorldTerrainFromHeight,
   SEA_LEVEL_M,
   WORLD_HALF_M,
   WORLD_SIZE_M,
@@ -58,6 +68,7 @@ interface StreamedChunkRecord {
   readonly terrainGeo: THREE.BufferGeometry;
   readonly ownedGeometries: THREE.BufferGeometry[];
   readonly instancedMeshes: THREE.InstancedMesh[];
+  readonly batchedMeshes: THREE.BatchedMesh[];
   readonly solidObbs: SolidObb[];
   readonly walkDecks: WalkDeck[];
   readonly indoorVolumes: IndoorVolume[];
@@ -68,6 +79,14 @@ interface StreamedChunkRecord {
   readonly instanceCount: number;
 }
 
+interface PendingChunkSpec {
+  readonly key: string;
+  readonly cx: number;
+  readonly cz: number;
+  readonly lod: ChunkLodTier;
+  readonly priority: number;
+}
+
 export interface StreamerStats {
   centerChunkX: number;
   centerChunkZ: number;
@@ -75,6 +94,7 @@ export interface StreamerStats {
   midChunkCount: number;
   totalLoadedChunks: number;
   activeInstanceCount: number;
+  activeBatchedMeshCount: number;
   disposedChunkCount: number;
   landmarkCount: number;
 }
@@ -130,27 +150,73 @@ function createTerrainChunkGeometry(
   const centerZ = chunkCoordToWorldCenter(cz);
   const pos = geo.attributes.position as THREE.BufferAttribute;
   const vertCount = pos.count;
+  const cols = segs + 1;
+  const invStep = segs / CHUNK_SIZE_M;
+  const heights = heightfieldOut && heightfieldOut.length >= vertCount
+    ? heightfieldOut
+    : new Float32Array(vertCount);
   const colors = new Float32Array(vertCount * 3);
 
+  // Pass 1: Evaluate authoritative terrain height ONCE per vertex (3x fewer analytical FBM evals)
   for (let i = 0; i < vertCount; i++) {
-    const lx = pos.getX(i);
-    const lz = pos.getZ(i);
-    const wx = centerX + lx;
-    const wz = centerZ + lz;
-    sampleOpenWorldTerrain(wx, wz, _sample);
-    pos.setY(i, _sample.height);
-    if (heightfieldOut && i < heightfieldOut.length) {
-      heightfieldOut[i] = _sample.height;
+    const wx = centerX + pos.getX(i);
+    const wz = centerZ + pos.getZ(i);
+    const h = evaluateOpenWorldHeight(wx, wz);
+    heights[i] = h;
+    pos.setY(i, h);
+  }
+
+  // Pass 2: Derive slope via finite difference on cached height grid & classify biome vertex colors
+  for (let iz = 0; iz <= segs; iz++) {
+    const izNext = iz < segs ? iz + 1 : iz - 1;
+    const row = iz * cols;
+    const rowNext = izNext * cols;
+    for (let ix = 0; ix <= segs; ix++) {
+      const i = row + ix;
+      const ixNext = ix < segs ? ix + 1 : ix - 1;
+      const h = heights[i];
+      const dx = (heights[row + ixNext] - h) * invStep;
+      const dz = (heights[rowNext + ix] - h) * invStep;
+      const slope = Math.min(1, Math.hypot(dx, dz));
+      const wx = centerX + pos.getX(i);
+      const wz = centerZ + pos.getZ(i);
+      sampleOpenWorldTerrainFromHeight(wx, wz, h, slope, _sample);
+      colors[i * 3] = _sample.r;
+      colors[i * 3 + 1] = _sample.g;
+      colors[i * 3 + 2] = _sample.b;
     }
-    colors[i * 3] = _sample.r;
-    colors[i * 3 + 1] = _sample.g;
-    colors[i * 3 + 2] = _sample.b;
   }
 
   geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
   geo.computeVertexNormals();
   geo.computeBoundingSphere();
   return geo;
+}
+
+function sampleColliderHeightAndSlope(
+  collider: ActiveHeightfieldCollider,
+  worldX: number,
+  worldZ: number,
+  out: { height: number; slope: number },
+): void {
+  const fx = (worldX - collider.minX) / collider.stepM;
+  const fz = (worldZ - collider.minZ) / collider.stepM;
+  const ix = Math.max(0, Math.min(collider.segs - 1, Math.floor(fx)));
+  const iz = Math.max(0, Math.min(collider.segs - 1, Math.floor(fz)));
+  const tx = Math.max(0, Math.min(1, fx - ix));
+  const tz = Math.max(0, Math.min(1, fz - iz));
+  const cols = collider.segs + 1;
+  const h00 = collider.heights[iz * cols + ix];
+  const h10 = collider.heights[iz * cols + ix + 1];
+  const h01 = collider.heights[(iz + 1) * cols + ix];
+  const h11 = collider.heights[(iz + 1) * cols + ix + 1];
+  const h0 = h00 + (h10 - h00) * tx;
+  const h1 = h01 + (h11 - h01) * tx;
+  out.height = h0 + (h1 - h0) * tz;
+  const invStep = 1 / collider.stepM;
+  const dhx = ((h10 - h00) * (1 - tz) + (h11 - h01) * tz) * invStep;
+  const dhz = ((h01 - h00) * (1 - tx) + (h11 - h10) * tx) * invStep;
+  out.slope = Math.min(1, Math.hypot(dhx, dhz));
 }
 
 /**
@@ -205,6 +271,46 @@ function buildGroundedConiferCanopyGeo(): THREE.BufferGeometry {
 }
 
 /**
+ * Merges composite box parts into a compact indexed BufferGeometry with identical
+ * `position` + `normal` attributes for zero-draw-call `THREE.BatchedMesh` heterogeneous prop packing.
+ */
+function buildCompositeBatchedPropGeo(
+  boxes: ReadonlyArray<{ x: number; y: number; z: number; sx: number; sy: number; sz: number }>,
+): THREE.BufferGeometry {
+  const positions: number[] = [];
+  const normals: number[] = [];
+  const indices: number[] = [];
+  const unitBox = new THREE.BoxGeometry(1, 1, 1);
+  const posAttr = unitBox.attributes.position as THREE.BufferAttribute;
+  const normAttr = unitBox.attributes.normal as THREE.BufferAttribute;
+  const idx = unitBox.index!;
+  let vertOffset = 0;
+
+  for (const b of boxes) {
+    for (let i = 0; i < posAttr.count; i++) {
+      positions.push(
+        posAttr.getX(i) * b.sx + b.x,
+        posAttr.getY(i) * b.sy + b.y,
+        posAttr.getZ(i) * b.sz + b.z,
+      );
+      normals.push(normAttr.getX(i), normAttr.getY(i), normAttr.getZ(i));
+    }
+    for (let i = 0; i < idx.count; i++) {
+      indices.push(vertOffset + idx.getX(i));
+    }
+    vertOffset += posAttr.count;
+  }
+  unitBox.dispose();
+
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  geo.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
+  geo.setIndex(indices);
+  geo.computeBoundingSphere();
+  return geo;
+}
+
+/**
  * 4km × 4km 3-Ring Chunk Streamer (`3×3` Active Ring, `5×5` Mid-Range Shell, `4km+` Horizon Proxy).
  * - Uses shared PBR materials and front-packed `InstancedMesh` batches to stay well under 150 draw calls.
  * - Explicitly `.dispose()`s every unloaded or LOD-swapped chunk's geometries and buffers.
@@ -216,6 +322,7 @@ export class OpenWorldChunkStreamer {
 
   private readonly loadedChunks = new Map<string, StreamedChunkRecord>();
   private readonly activeChunks: StreamedChunkRecord[] = [];
+  private readonly fobHorizonGroups = new Map<FobCompoundId, THREE.Group>();
   private readonly activeTreeRoosts: FoliageAnchorPoint[] = [];
   private readonly activeLogAnchors: FoliageAnchorPoint[] = [];
   private readonly activeRockAnchors: FoliageAnchorPoint[] = [];
@@ -242,14 +349,24 @@ export class OpenWorldChunkStreamer {
   private readonly midBuildingGeo: THREE.BoxGeometry;
   private readonly midBuildingMat: THREE.MeshStandardMaterial;
 
+  // Shared heterogeneous static prop library for per-chunk `THREE.BatchedMesh` (1 draw call / chunk)
+  private readonly batchedPropGeos: THREE.BufferGeometry[];
+  private readonly batchedPropMat: THREE.MeshStandardMaterial;
+  private readonly batchedPropTotalVerts: number;
+  private readonly batchedPropTotalIndices: number;
+
   // Horizon proxy disposable resources
   private readonly horizonDisposables: Array<{ dispose(): void }> = [];
 
   private readonly atmoFogUniforms?: AtmoFogSharedUniforms;
+  private readonly pendingQueue: PendingChunkSpec[] = [];
+  private readonly desiredMap = new Map<string, { cx: number; cz: number; lod: ChunkLodTier }>();
   private lastCenterCx = -999;
   private lastCenterCz = -999;
   private disposedChunkCount = 0;
   private activeInstanceCount = 0;
+  private propDensityScale = 1.0;
+  private shadowsEnabled = true;
 
   constructor(
     scene: THREE.Scene,
@@ -278,11 +395,17 @@ export class OpenWorldChunkStreamer {
       vertexColors: true,
       roughness: 0.95,
       metalness: 0.0,
+      polygonOffset: true,
+      polygonOffsetFactor: 1,
+      polygonOffsetUnits: 2,
     });
     this.hlodTerrainMat = new THREE.MeshStandardMaterial({
       vertexColors: true,
       roughness: 0.97,
       metalness: 0.0,
+      polygonOffset: true,
+      polygonOffsetFactor: 2,
+      polygonOffsetUnits: 4,
     });
 
     // Shared bottom-center instanced prop geometries
@@ -310,6 +433,48 @@ export class OpenWorldChunkStreamer {
     this.midBuildingGeo.translate(0, 3.25, 0);
     this.midBuildingMat = new THREE.MeshStandardMaterial({ color: 0x676d74, roughness: 0.84, metalness: 0.14 });
 
+    // 5 heterogeneous composite static props packed into 1 THREE.BatchedMesh per active chunk:
+    // 0: Timber supply crate stack, 1: Twin fuel drum pallet, 2: Tiered sandbag emplacement,
+    // 3: Field diesel generator skids, 4: Rugged tactical comms/ammo case
+    this.batchedPropGeos = [
+      buildCompositeBatchedPropGeo([
+        { x: 0, y: 0.42, z: 0, sx: 1.25, sy: 0.84, sz: 0.92 },
+        { x: 0.12, y: 1.06, z: -0.05, sx: 0.84, sy: 0.44, sz: 0.68 },
+      ]),
+      buildCompositeBatchedPropGeo([
+        { x: 0, y: 0.08, z: 0, sx: 1.35, sy: 0.16, sz: 1.1 },
+        { x: -0.32, y: 0.62, z: -0.18, sx: 0.56, sy: 0.92, sz: 0.56 },
+        { x: 0.34, y: 0.62, z: 0.16, sx: 0.56, sy: 0.92, sz: 0.56 },
+      ]),
+      buildCompositeBatchedPropGeo([
+        { x: 0, y: 0.22, z: 0, sx: 2.3, sy: 0.44, sz: 0.68 },
+        { x: 0, y: 0.62, z: 0.04, sx: 1.95, sy: 0.36, sz: 0.52 },
+        { x: 0, y: 0.94, z: 0.06, sx: 1.45, sy: 0.28, sz: 0.4 },
+      ]),
+      buildCompositeBatchedPropGeo([
+        { x: 0, y: 0.12, z: 0, sx: 1.5, sy: 0.24, sz: 0.86 },
+        { x: -0.08, y: 0.68, z: 0, sx: 1.22, sy: 0.88, sz: 0.72 },
+        { x: 0.56, y: 0.96, z: 0.24, sx: 0.16, sy: 0.62, sz: 0.16 },
+      ]),
+      buildCompositeBatchedPropGeo([
+        { x: 0, y: 0.28, z: 0, sx: 0.96, sy: 0.56, sz: 0.54 },
+        { x: 0, y: 0.58, z: 0, sx: 1.02, sy: 0.08, sz: 0.58 },
+      ]),
+    ];
+    let bVerts = 0;
+    let bIndices = 0;
+    for (const g of this.batchedPropGeos) {
+      bVerts += g.attributes.position.count;
+      bIndices += g.index ? g.index.count : 0;
+    }
+    this.batchedPropTotalVerts = bVerts;
+    this.batchedPropTotalIndices = bIndices;
+    this.batchedPropMat = new THREE.MeshStandardMaterial({
+      color: 0xffffff,
+      roughness: 0.82,
+      metalness: 0.22,
+    });
+
     if (this.atmoFogUniforms) {
       applyAtmosphericHeightFog(this.activeTerrainMat, this.atmoFogUniforms);
       applyAtmosphericHeightFog(this.midTerrainMat, this.atmoFogUniforms);
@@ -320,6 +485,7 @@ export class OpenWorldChunkStreamer {
       applyAtmosphericHeightFog(this.scrubMat, this.atmoFogUniforms);
       applyAtmosphericHeightFog(this.containerMat, this.atmoFogUniforms);
       applyAtmosphericHeightFog(this.midBuildingMat, this.atmoFogUniforms);
+      applyAtmosphericHeightFog(this.batchedPropMat, this.atmoFogUniforms);
     }
 
     this.buildHorizonProxyLayer();
@@ -342,7 +508,7 @@ export class OpenWorldChunkStreamer {
       const wx = pos.getX(i);
       const wz = pos.getZ(i);
       sampleOpenWorldTerrain(wx, wz, _sample);
-      pos.setY(i, _sample.height - 2.4);
+      pos.setY(i, _sample.height - 3.8);
       colors[i * 3] = _sample.r;
       colors[i * 3 + 1] = _sample.g;
       colors[i * 3 + 2] = _sample.b;
@@ -536,33 +702,38 @@ export class OpenWorldChunkStreamer {
           car.position.set(i * 22, 2.3, 10);
           group.add(car);
         }
-      } else {
-        // PMC Alpha / Bravo FOB: Helipad apron + Watchtower + Command Hangar + Faction Beacon
+      } else if (isFobCompoundId(lm.id)) {
+        // PMC Alpha / Bravo FOB: Distant Command radio mast + 4 corner perimeter guard tower silhouettes
         const beaconMat = lm.kind === 'fob_alpha' ? alphaBeaconMat : bravoBeaconMat;
-        const padGeo = registerGeo(new THREE.CylinderGeometry(16, 16.5, 1.2, 16));
-        const pad = new THREE.Mesh(padGeo, darkConcreteMat);
-        pad.position.set(0, 0.5, 0);
-        group.add(pad);
+        const termAnchor = getFobTerminalAnchor(lm.id);
+        const relTermX = termAnchor.worldX - lm.worldX;
+        const relTermZ = termAnchor.worldZ - lm.worldZ;
 
-        const hangarGeo = registerGeo(new THREE.BoxGeometry(28, 9.5, 18));
-        const hangar = new THREE.Mesh(hangarGeo, steelMat);
-        hangar.position.set(-24, 4.75, -10);
-        group.add(hangar);
+        const mastShaftGeo = registerGeo(new THREE.BoxGeometry(1.4, 24, 1.4));
+        const mastShaft = new THREE.Mesh(mastShaftGeo, steelMat);
+        mastShaft.position.set(relTermX, 12, relTermZ);
+        group.add(mastShaft);
 
-        const towerShaftGeo = registerGeo(new THREE.BoxGeometry(4.5, 22, 4.5));
-        const towerShaft = new THREE.Mesh(towerShaftGeo, concreteMat);
-        towerShaft.position.set(22, 11, -14);
-        group.add(towerShaft);
-
-        const cabGeo = registerGeo(new THREE.BoxGeometry(7.6, 3.8, 7.6));
-        const cab = new THREE.Mesh(cabGeo, darkConcreteMat);
-        cab.position.set(22, 23, -14);
-        group.add(cab);
-
-        const beaconGeo = registerGeo(new THREE.BoxGeometry(1.4, 2.2, 1.4));
+        const beaconGeo = registerGeo(new THREE.BoxGeometry(1.5, 2.0, 1.5));
         const beacon = new THREE.Mesh(beaconGeo, beaconMat);
-        beacon.position.set(22, 26, -14);
+        beacon.position.set(relTermX, 24.8, relTermZ);
         group.add(beacon);
+
+        const towerPillarGeo = registerGeo(
+          new THREE.BoxGeometry(2.6, FOB_GUARD_TOWER_DECK_HEIGHT_M + 0.6, 2.6),
+        );
+        const towerRoofGeo = registerGeo(new THREE.BoxGeometry(4.0, 0.5, 4.0));
+        const towers = getFobGuardTowerSpecs(lm.id);
+        for (const tw of towers) {
+          const rx = tw.worldX - lm.worldX;
+          const rz = tw.worldZ - lm.worldZ;
+          const pillar = new THREE.Mesh(towerPillarGeo, concreteMat);
+          pillar.position.set(rx, (FOB_GUARD_TOWER_DECK_HEIGHT_M + 0.6) * 0.5, rz);
+          const roof = new THREE.Mesh(towerRoofGeo, darkConcreteMat);
+          roof.position.set(rx, FOB_GUARD_TOWER_DECK_HEIGHT_M + 3.1, rz);
+          group.add(pillar, roof);
+        }
+        this.fobHorizonGroups.set(lm.id, group);
       }
 
       this.horizonGroup.add(group);
@@ -572,53 +743,91 @@ export class OpenWorldChunkStreamer {
     this.archBuilder.populateHorizonCivilization(this.horizonGroup, this.horizonDisposables);
   }
 
-  /**
-   * Streams chunks around `(worldX, worldZ)` into:
-   * - `3 × 3` Active Ring (Chebyshev distance `<= 1`)
-   * - `5 × 5` Outer Mid-Range Shell (Chebyshev distance `=== 2`)
-   * Explicitly `.dispose()`s any chunk leaving the `5 × 5` footprint or switching LOD.
-   */
-  public update(worldX: number, worldZ: number): boolean {
-    const centerCx = worldToChunkCoord(worldX);
-    const centerCz = worldToChunkCoord(worldZ);
-    if (centerCx === this.lastCenterCx && centerCz === this.lastCenterCz) {
-      return false;
+  public applyQualityProfile(profile: GraphicsQualityProfile, rebuildExisting = false): void {
+    const prevShadows = this.shadowsEnabled;
+    const prevDensity = this.propDensityScale;
+    this.propDensityScale = THREE.MathUtils.clamp(profile.foliageDensity, 0.25, 1.45);
+    this.shadowsEnabled = !this.isSoftwareGl && profile.castShadows;
+    if (this.terrainTexture) {
+      this.terrainTexture.anisotropy = Math.max(1, profile.anisotropyCap);
+      this.terrainTexture.needsUpdate = true;
     }
+    this.archBuilder.applyQualityProfile(profile);
+    this.foliageBuilder.applyQualityProfile(profile);
 
-    this.lastCenterCx = centerCx;
-    this.lastCenterCz = centerCz;
-
-    // 1. Identify desired chunks in the 5 x 5 neighborhood
-    const desired = new Map<string, { cx: number; cz: number; lod: ChunkLodTier }>();
-    for (let dz = -2; dz <= 2; dz++) {
-      for (let dx = -2; dx <= 2; dx++) {
-        const cx = centerCx + dx;
-        const cz = centerCz + dz;
-        if (!isValidChunkCoord(cx, cz)) continue;
-        const chebyshev = Math.max(Math.abs(dx), Math.abs(dz));
-        const lod: ChunkLodTier = chebyshev <= 1 ? 'active' : 'mid';
-        desired.set(chunkKey(cx, cz), { cx, cz, lod });
-      }
-    }
-
-    // 2. Dispose chunks outside the 5 x 5 window OR requiring LOD transition
-    for (const [key, rec] of this.loadedChunks) {
-      const want = desired.get(key);
-      if (!want || want.lod !== rec.lod) {
+    if (
+      rebuildExisting &&
+      (prevShadows !== this.shadowsEnabled || Math.abs(prevDensity - this.propDensityScale) > 0.05) &&
+      this.lastCenterCx !== -999
+    ) {
+      // Mark all loaded chunks for incremental re-streaming without freezing
+      const cx = this.lastCenterCx;
+      const cz = this.lastCenterCz;
+      for (const [key, rec] of this.loadedChunks) {
+        if (rec.cx === cx && rec.cz === cz) continue;
         this.disposeChunkRecord(rec);
         this.loadedChunks.delete(key);
       }
+      this.lastCenterCx = -999;
+      this.lastCenterCz = -999;
+      this.update(chunkCoordToWorldCenter(cx), chunkCoordToWorldCenter(cz), false);
+    }
+  }
+
+  public prewarmShaders(
+    renderer: THREE.WebGLRenderer,
+    scene: THREE.Scene,
+    camera: THREE.Camera,
+  ): void {
+    if (this.isSoftwareGl) return;
+    const prewarmGroup = new THREE.Group();
+    prewarmGroup.name = 'openworld_shader_prewarm';
+    const boxGeo = new THREE.BoxGeometry(0.05, 0.05, 0.05);
+    const vertCount = boxGeo.attributes.position.count;
+    const colors = new Float32Array(vertCount * 3).fill(1);
+    const sway = new Float32Array(vertCount).fill(0.5);
+    boxGeo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+    boxGeo.setAttribute('aSway', new THREE.BufferAttribute(sway, 1));
+
+    const mats: THREE.Material[] = [
+      this.activeTerrainMat,
+      this.midTerrainMat,
+      this.trunkMat,
+      this.canopyMat,
+      this.boulderMat,
+      this.scrubMat,
+      this.containerMat,
+      this.midBuildingMat,
+      this.batchedPropMat,
+      ...this.archBuilder.getSharedMaterials(),
+      ...this.foliageBuilder.getSharedMaterials(),
+    ];
+
+    const tempMeshes: THREE.InstancedMesh[] = [];
+    const identity = new THREE.Matrix4().makeTranslation(0, -1200, 0);
+    for (let i = 0; i < mats.length; i++) {
+      const inst = new THREE.InstancedMesh(boxGeo, mats[i], 1);
+      inst.setMatrixAt(0, identity);
+      inst.instanceMatrix.needsUpdate = true;
+      inst.frustumCulled = false;
+      prewarmGroup.add(inst);
+      tempMeshes.push(inst);
     }
 
-    // 3. Build missing chunks
-    for (const [key, spec] of desired) {
-      if (this.loadedChunks.has(key)) continue;
-      const built = this.buildChunkRecord(spec.cx, spec.cz, spec.lod);
-      this.loadedChunks.set(key, built);
-      this.chunksGroup.add(built.group);
+    scene.add(prewarmGroup);
+    try {
+      renderer.compile(scene, camera);
+    } catch {
+      // Non-fatal fallback
     }
+    scene.remove(prewarmGroup);
+    for (let i = 0; i < tempMeshes.length; i++) {
+      tempMeshes[i].dispose();
+    }
+    boxGeo.dispose();
+  }
 
-    // Recompute active chunk list, fauna anchors & instance totals (zero-GC iteration in hot path)
+  private rebuildActiveArrays(): void {
     this.activeChunks.length = 0;
     this.activeTreeRoosts.length = 0;
     this.activeLogAnchors.length = 0;
@@ -634,7 +843,123 @@ export class OpenWorldChunkStreamer {
       }
     }
     this.activeInstanceCount = instances;
+
+    // Hide coarse FOB horizon proxy blocks whenever the detailed active FOB chunk is loaded
+    // so distant placeholder tower pillars never poke through the real 4-post guard towers
+    for (const [fobId, proxyGroup] of this.fobHorizonGroups) {
+      const spec = getFobCompoundSpec(fobId);
+      const fobKey = chunkKey(worldToChunkCoord(spec.worldX), worldToChunkCoord(spec.worldZ));
+      const rec = this.loadedChunks.get(fobKey);
+      proxyGroup.visible = !(rec && rec.lod === 'active');
+    }
+  }
+
+  /**
+   * Streams chunks around `(worldX, worldZ)` into:
+   * - `3 × 3` Active Ring (Chebyshev distance `<= 1`)
+   * - `5 × 5` Outer Mid-Range Shell (Chebyshev distance `=== 2`)
+   * Builds the immediate center chunk synchronously so terrain collision is always valid,
+   * then builds remaining missing ring chunks via a prioritized time-budgeted queue
+   * (`synchronous = true` drains immediately during boot or landmark teleport).
+   */
+  public update(worldX: number, worldZ: number, synchronous = true): boolean {
+    const centerCx = worldToChunkCoord(worldX);
+    const centerCz = worldToChunkCoord(worldZ);
+    if (centerCx === this.lastCenterCx && centerCz === this.lastCenterCz) {
+      if (synchronous && this.pendingQueue.length > 0) {
+        return this.flushStreamQueue(Number.POSITIVE_INFINITY);
+      }
+      return false;
+    }
+
+    this.lastCenterCx = centerCx;
+    this.lastCenterCz = centerCz;
+
+    // 1. Identify desired chunks in the 5 x 5 neighborhood
+    this.desiredMap.clear();
+    for (let dz = -2; dz <= 2; dz++) {
+      for (let dx = -2; dx <= 2; dx++) {
+        const cx = centerCx + dx;
+        const cz = centerCz + dz;
+        if (!isValidChunkCoord(cx, cz)) continue;
+        const chebyshev = Math.max(Math.abs(dx), Math.abs(dz));
+        const lod: ChunkLodTier = chebyshev <= 1 ? 'active' : 'mid';
+        this.desiredMap.set(chunkKey(cx, cz), { cx, cz, lod });
+      }
+    }
+
+    // 2. Dispose chunks outside the 5 x 5 window OR requiring LOD transition
+    for (const [key, rec] of this.loadedChunks) {
+      const want = this.desiredMap.get(key);
+      if (!want || want.lod !== rec.lod) {
+        this.disposeChunkRecord(rec);
+        this.loadedChunks.delete(key);
+      }
+    }
+
+    // 3. Build center chunk immediately for guaranteed physics ground & queue remaining missing chunks
+    const centerKey = chunkKey(centerCx, centerCz);
+    const centerWant = this.desiredMap.get(centerKey);
+    if (centerWant && !this.loadedChunks.has(centerKey)) {
+      const built = this.buildChunkRecord(centerWant.cx, centerWant.cz, centerWant.lod);
+      this.loadedChunks.set(centerKey, built);
+      this.chunksGroup.add(built.group);
+    }
+
+    this.pendingQueue.length = 0;
+    for (const [key, spec] of this.desiredMap) {
+      if (this.loadedChunks.has(key)) continue;
+      const dx = spec.cx - centerCx;
+      const dz = spec.cz - centerCz;
+      const cheb = Math.max(Math.abs(dx), Math.abs(dz));
+      const priority = cheb * 100 + dx * dx + dz * dz;
+      this.pendingQueue.push({ key, cx: spec.cx, cz: spec.cz, lod: spec.lod, priority });
+    }
+    this.pendingQueue.sort((a, b) => a.priority - b.priority);
+
+    if (synchronous) {
+      this.flushStreamQueue(Number.POSITIVE_INFINITY);
+    } else {
+      this.flushStreamQueue(3.5);
+    }
+
+    this.rebuildActiveArrays();
     return true;
+  }
+
+  /**
+   * Builds queued outer chunks within a strict millisecond budget per frame so turning inward
+   * or crossing chunk boundaries never triggers multi-frame CPU hitches.
+   */
+  public flushStreamQueue(budgetMs = 3.5): boolean {
+    if (this.pendingQueue.length === 0) return false;
+    const startMs = typeof performance !== 'undefined' ? performance.now() : 0;
+    let builtAny = false;
+
+    while (this.pendingQueue.length > 0) {
+      const spec = this.pendingQueue.shift()!;
+      const want = this.desiredMap.get(spec.key);
+      if (!want || want.lod !== spec.lod || this.loadedChunks.has(spec.key)) {
+        continue;
+      }
+      const built = this.buildChunkRecord(spec.cx, spec.cz, spec.lod);
+      this.loadedChunks.set(spec.key, built);
+      this.chunksGroup.add(built.group);
+      builtAny = true;
+
+      if (
+        Number.isFinite(budgetMs) &&
+        typeof performance !== 'undefined' &&
+        performance.now() - startMs >= budgetMs
+      ) {
+        break;
+      }
+    }
+
+    if (builtAny) {
+      this.rebuildActiveArrays();
+    }
+    return builtAny;
   }
 
   private buildChunkRecord(cx: number, cz: number, lod: ChunkLodTier): StreamedChunkRecord {
@@ -666,12 +991,13 @@ export class OpenWorldChunkStreamer {
       terrainGeo,
       lod === 'active' ? this.activeTerrainMat : this.midTerrainMat,
     );
-    terrainMesh.receiveShadow = !this.isSoftwareGl && lod === 'active';
+    terrainMesh.receiveShadow = this.shadowsEnabled && lod === 'active';
     terrainMesh.castShadow = false;
     group.add(terrainMesh);
 
     const ownedGeometries: THREE.BufferGeometry[] = [terrainGeo];
     const instancedMeshes: THREE.InstancedMesh[] = [];
+    const batchedMeshes: THREE.BatchedMesh[] = [];
     const solidObbs: SolidObb[] = [];
     const walkDecks: WalkDeck[] = [];
     const indoorVolumes: IndoorVolume[] = [];
@@ -694,7 +1020,23 @@ export class OpenWorldChunkStreamer {
         indoorVolumes,
       );
       instanceCount += archRes.instanceCount;
-      instanceCount += this.populateActiveChunkProps(cx, cz, centerX, centerZ, group, instancedMeshes, treeRoosts);
+      const fastSampleScratch = { height: 0, slope: 0 };
+      const fastHeightSlope = collider
+        ? (wx: number, wz: number, out: { height: number; slope: number }) =>
+            sampleColliderHeightAndSlope(collider, wx, wz, out)
+        : undefined;
+      instanceCount += this.populateActiveChunkProps(
+        cx,
+        cz,
+        centerX,
+        centerZ,
+        group,
+        instancedMeshes,
+        batchedMeshes,
+        treeRoosts,
+        collider,
+        fastSampleScratch,
+      );
       const foliageRes = this.foliageBuilder.populateActiveChunkFoliage(
         cx,
         cz,
@@ -702,6 +1044,7 @@ export class OpenWorldChunkStreamer {
         centerZ,
         group,
         instancedMeshes,
+        fastHeightSlope,
       );
       instanceCount += foliageRes.instanceCount;
       logAnchors = foliageRes.logAnchors;
@@ -727,6 +1070,7 @@ export class OpenWorldChunkStreamer {
       terrainGeo,
       ownedGeometries,
       instancedMeshes,
+      batchedMeshes,
       solidObbs,
       walkDecks,
       indoorVolumes,
@@ -745,9 +1089,22 @@ export class OpenWorldChunkStreamer {
     centerZ: number,
     group: THREE.Group,
     outMeshes: THREE.InstancedMesh[],
+    outBatchedMeshes: THREE.BatchedMesh[],
     outTreeRoosts: FoliageAnchorPoint[],
+    collider: ActiveHeightfieldCollider | null,
+    hsScratch: { height: number; slope: number },
   ): number {
     const rand = mulberry32(chunkHash(cx, cz, 41));
+
+    const sampleFast = (wx: number, wz: number): void => {
+      if (collider) {
+        sampleColliderHeightAndSlope(collider, wx, wz, hsScratch);
+        sampleOpenWorldTerrainFromHeight(wx, wz, hsScratch.height, hsScratch.slope, _sample);
+      } else {
+        const h = evaluateOpenWorldHeight(wx, wz);
+        sampleOpenWorldTerrainFromHeight(wx, wz, h, 0.1, _sample);
+      }
+    };
 
     // Pre-collect front-packed placements by category
     const treePlacements: Array<{ lx: number; y: number; lz: number; scale: number; yaw: number; tint: number }> = [];
@@ -765,13 +1122,13 @@ export class OpenWorldChunkStreamer {
     };
 
     // 1. Conifer & Pine Forest / Alpine Timberline Trees
-    const treeAttempts = 54;
+    const treeAttempts = Math.round(54 * this.propDensityScale);
     for (let i = 0; i < treeAttempts; i++) {
       const lx = (rand() - 0.5) * (CHUNK_SIZE_M - 10);
       const lz = (rand() - 0.5) * (CHUNK_SIZE_M - 10);
       const wx = centerX + lx;
       const wz = centerZ + lz;
-      sampleOpenWorldTerrain(wx, wz, _sample);
+      sampleFast(wx, wz);
 
       if (_sample.isWater || _sample.isRoad || _sample.isSitePad || _sample.isQuarryPit || _sample.slope > 0.44) continue;
       if (isNearLandmark(wx, wz) || isOnCivilizationClearance(wx, wz, 3.8)) continue;
@@ -798,13 +1155,13 @@ export class OpenWorldChunkStreamer {
     }
 
     // 2. Boulders & Rock Outcrops (Steppe, Quarry, Alpine, Coastal breakwaters)
-    const boulderAttempts = 28;
+    const boulderAttempts = Math.round(28 * this.propDensityScale);
     for (let i = 0; i < boulderAttempts; i++) {
       const lx = (rand() - 0.5) * (CHUNK_SIZE_M - 12);
       const lz = (rand() - 0.5) * (CHUNK_SIZE_M - 12);
       const wx = centerX + lx;
       const wz = centerZ + lz;
-      sampleOpenWorldTerrain(wx, wz, _sample);
+      sampleFast(wx, wz);
       if (_sample.isWater || _sample.isRoad || _sample.isSitePad || isNearLandmark(wx, wz) || isOnCivilizationClearance(wx, wz, 3.5)) continue;
 
       const rockProb =
@@ -829,13 +1186,13 @@ export class OpenWorldChunkStreamer {
     }
 
     // 3. Coastal Marsh Reeds & Steppe Scrub Tufts
-    const scrubAttempts = 40;
+    const scrubAttempts = Math.round(40 * this.propDensityScale);
     for (let i = 0; i < scrubAttempts; i++) {
       const lx = (rand() - 0.5) * (CHUNK_SIZE_M - 8);
       const lz = (rand() - 0.5) * (CHUNK_SIZE_M - 8);
       const wx = centerX + lx;
       const wz = centerZ + lz;
-      sampleOpenWorldTerrain(wx, wz, _sample);
+      sampleFast(wx, wz);
       if (_sample.isWater || _sample.isRoad || _sample.isSitePad || _sample.slope > 0.5 || isNearLandmark(wx, wz) || isOnCivilizationClearance(wx, wz, 2.2)) continue;
       if (_sample.biome === 'alpine_ridge_dam' && _sample.height > 340) continue;
 
@@ -862,7 +1219,7 @@ export class OpenWorldChunkStreamer {
       const lz = (rand() - 0.5) * (CHUNK_SIZE_M - 24);
       const wx = centerX + lx;
       const wz = centerZ + lz;
-      sampleOpenWorldTerrain(wx, wz, _sample);
+      sampleFast(wx, wz);
       if (_sample.isWater || _sample.isRoad || _sample.isSitePad || _sample.slope > 0.16) continue;
       if (isOnCivilizationClearance(wx, wz, 4.5)) continue;
       const industrialZone = _sample.biome === 'coastal_port_marsh' || _sample.isQuarryPit;
@@ -884,9 +1241,9 @@ export class OpenWorldChunkStreamer {
       const count = treePlacements.length;
       const trunks = new THREE.InstancedMesh(this.trunkGeo, this.trunkMat, count);
       const canopies = new THREE.InstancedMesh(this.canopyGeo, this.canopyMat, count);
-      trunks.castShadow = !this.isSoftwareGl;
-      canopies.castShadow = !this.isSoftwareGl;
-      canopies.receiveShadow = !this.isSoftwareGl;
+      trunks.castShadow = false;
+      canopies.castShadow = this.shadowsEnabled;
+      canopies.receiveShadow = this.shadowsEnabled;
 
       for (let i = 0; i < count; i++) {
         const p = treePlacements[i];
@@ -913,8 +1270,8 @@ export class OpenWorldChunkStreamer {
     if (boulderPlacements.length > 0) {
       const count = boulderPlacements.length;
       const rocks = new THREE.InstancedMesh(this.boulderGeo, this.boulderMat, count);
-      rocks.castShadow = !this.isSoftwareGl;
-      rocks.receiveShadow = !this.isSoftwareGl;
+      rocks.castShadow = false;
+      rocks.receiveShadow = false;
       for (let i = 0; i < count; i++) {
         const p = boulderPlacements[i];
         _dummy.position.set(p.lx, p.y, p.lz);
@@ -958,8 +1315,8 @@ export class OpenWorldChunkStreamer {
     if (containerPlacements.length > 0) {
       const count = containerPlacements.length;
       const containers = new THREE.InstancedMesh(this.containerGeo, this.containerMat, count);
-      containers.castShadow = !this.isSoftwareGl;
-      containers.receiveShadow = !this.isSoftwareGl;
+      containers.castShadow = this.shadowsEnabled;
+      containers.receiveShadow = this.shadowsEnabled;
       const palette = [0x2f536e, 0x823626, 0x3b4d38, 0x5c574d];
       for (let i = 0; i < count; i++) {
         const p = containerPlacements[i];
@@ -977,6 +1334,72 @@ export class OpenWorldChunkStreamer {
       group.add(containers);
       outMeshes.push(containers);
       total += count;
+    }
+
+    // 5. Heterogeneous Static Tactical Field Props packed into a single THREE.BatchedMesh (1 draw call)
+    const batchedPlacements: Array<{
+      lx: number;
+      y: number;
+      lz: number;
+      yaw: number;
+      kindIdx: number;
+      colorHex: number;
+    }> = [];
+    const propPalette = [0x6e5a42, 0x3b4d3f, 0x8f846b, 0x4b5563, 0x7c4534];
+    const propAttempts = Math.round(14 * this.propDensityScale);
+    for (let i = 0; i < propAttempts; i++) {
+      const lx = (rand() - 0.5) * (CHUNK_SIZE_M - 22);
+      const lz = (rand() - 0.5) * (CHUNK_SIZE_M - 22);
+      const wx = centerX + lx;
+      const wz = centerZ + lz;
+      sampleFast(wx, wz);
+      if (_sample.isWater || _sample.isRoad || _sample.isSitePad || _sample.slope > 0.22) continue;
+      if (isNearLandmark(wx, wz) || isOnCivilizationClearance(wx, wz, 4.0)) continue;
+      if (rand() > 0.55) continue;
+
+      const kindIdx = Math.floor(rand() * this.batchedPropGeos.length) % this.batchedPropGeos.length;
+      const colorHex = propPalette[(kindIdx + Math.floor(rand() * 2)) % propPalette.length];
+      batchedPlacements.push({
+        lx,
+        y: _sample.height - 0.04,
+        lz,
+        yaw: rand() * Math.PI * 2,
+        kindIdx,
+        colorHex,
+      });
+    }
+
+    if (batchedPlacements.length > 0) {
+      const bm = new THREE.BatchedMesh(
+        batchedPlacements.length,
+        this.batchedPropTotalVerts,
+        this.batchedPropTotalIndices,
+        this.batchedPropMat,
+      );
+      bm.castShadow = this.shadowsEnabled;
+      bm.receiveShadow = this.shadowsEnabled;
+
+      const geoIds: number[] = [];
+      for (let g = 0; g < this.batchedPropGeos.length; g++) {
+        geoIds.push(bm.addGeometry(this.batchedPropGeos[g]));
+      }
+
+      for (let i = 0; i < batchedPlacements.length; i++) {
+        const p = batchedPlacements[i];
+        const instId = bm.addInstance(geoIds[p.kindIdx]);
+        _dummy.position.set(p.lx, p.y, p.lz);
+        _dummy.rotation.set(0, p.yaw, 0);
+        _dummy.scale.set(1, 1, 1);
+        _dummy.updateMatrix();
+        bm.setMatrixAt(instId, _dummy.matrix);
+        _color.setHex(p.colorHex);
+        bm.setColorAt(instId, _color);
+      }
+
+      bm.computeBoundingSphere();
+      group.add(bm);
+      outBatchedMeshes.push(bm);
+      total += batchedPlacements.length;
     }
 
     return total;
@@ -1221,9 +1644,14 @@ export class OpenWorldChunkStreamer {
   public getStats(): StreamerStats {
     let activeChunkCount = 0;
     let midChunkCount = 0;
+    let activeBatchedMeshCount = 0;
     for (const rec of this.loadedChunks.values()) {
-      if (rec.lod === 'active') activeChunkCount++;
-      else midChunkCount++;
+      if (rec.lod === 'active') {
+        activeChunkCount++;
+        activeBatchedMeshCount += rec.batchedMeshes.length;
+      } else {
+        midChunkCount++;
+      }
     }
     return {
       centerChunkX: this.lastCenterCx,
@@ -1232,6 +1660,7 @@ export class OpenWorldChunkStreamer {
       midChunkCount,
       totalLoadedChunks: this.loadedChunks.size,
       activeInstanceCount: this.activeInstanceCount,
+      activeBatchedMeshCount,
       disposedChunkCount: this.disposedChunkCount,
       landmarkCount: OPENWORLD_LANDMARKS.length,
     };
@@ -1251,6 +1680,9 @@ export class OpenWorldChunkStreamer {
     this.chunksGroup.remove(rec.group);
     for (const inst of rec.instancedMeshes) {
       inst.dispose();
+    }
+    for (const bm of rec.batchedMeshes) {
+      bm.dispose();
     }
     for (const geo of rec.ownedGeometries) {
       geo.dispose();
@@ -1289,6 +1721,10 @@ export class OpenWorldChunkStreamer {
     this.containerMat.dispose();
     this.midBuildingGeo.dispose();
     this.midBuildingMat.dispose();
+    for (const g of this.batchedPropGeos) {
+      g.dispose();
+    }
+    this.batchedPropMat.dispose();
 
     this.rootGroup.parent?.remove(this.rootGroup);
   }

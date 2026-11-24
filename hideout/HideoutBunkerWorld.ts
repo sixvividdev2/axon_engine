@@ -18,6 +18,7 @@ import {
   HideoutLongRangeCallbacks,
   HideoutLongRangeGallery,
 } from './HideoutLongRangeGallery';
+import { HideoutAirlockBay } from './HideoutAirlockBay';
 import { HideoutReadyRoom } from './HideoutReadyRoom';
 import { hideoutStateStore } from './HideoutStateStore';
 
@@ -32,7 +33,8 @@ export type HideoutInteractableKind =
   | 'range_ammo_box'
   | 'ballistics_console'
   | 'ops_laptop'
-  | 'ops_briefing_board';
+  | 'ops_briefing_board'
+  | 'airlock_override';
 
 export interface HideoutInteractableMeta {
   kind: HideoutInteractableKind;
@@ -64,7 +66,7 @@ export const HIDEOUT_ROOMS: readonly HideoutRoomBounds[] = [
   { id: 'arsenal', label: 'Arsenal Room', minX: -5.5, maxX: 5.5, minZ: -4.5, maxZ: 4.5 },
   { id: 'gun_range', label: 'Gun Range', minX: 5.5, maxX: 34.0, minZ: -12.0, maxZ: 112.0 },
   { id: 'ready_room', label: 'Ready Room', minX: -16.5, maxX: -5.5, minZ: -5.0, maxZ: 5.0 },
-  { id: 'zombies_portal', label: 'Sector 4 · Containment', minX: -4.5, maxX: 4.5, minZ: 4.5, maxZ: 13.5 },
+  { id: 'zombies_portal', label: 'Sector 4 · Bio-Containment Airlock', minX: -4.5, maxX: 4.5, minZ: 4.5, maxZ: 13.5 },
 ];
 
 export function resolveHideoutRoom(x: number, z: number): HideoutRoomBounds {
@@ -85,6 +87,7 @@ export interface HideoutBunkerWorldHandle {
   gunRange: HideoutGunRange;
   longRangeGallery: HideoutLongRangeGallery;
   readyRoom: HideoutReadyRoom;
+  airlockBay: HideoutAirlockBay;
   root: THREE.Group;
   raycastMeshes: THREE.Object3D[];
   interactableMeshes: THREE.Mesh[];
@@ -367,7 +370,7 @@ export function buildHideoutBunkerWorld(
   };
   makePlaque(5.46, 3.16, 0, -Math.PI * 0.5, 'GUN RANGE', 'BAYS 1–3 · BALLISTICS', '#d97706');
   makePlaque(-5.46, 3.16, 0, Math.PI * 0.5, 'READY ROOM', 'OPS COMMAND · DEPLOY', '#60a5fa');
-  makePlaque(0, 3.16, 4.46, Math.PI, 'SECTOR 4 · RIFT', 'BIO-CONTAINMENT BREACH', '#dc2626');
+  makePlaque(0, 3.16, 4.46, Math.PI, 'SECTOR 4 · AIRLOCK', 'QUARANTINE TRANSPORT BAY', '#d97706');
 
   // --- ROOM 2: READY ROOM SHELL (X ∈ [-16.5, -6.5], Z ∈ [-5.0, 5.0]) ---
   addBoxStructure(-11.5, -0.1, 0, 10.6, 0.2, 10.6, materials.concreteFloor, 'concrete', false);
@@ -415,12 +418,11 @@ export function buildHideoutBunkerWorld(
     { light: rangeDownLight, dropFraction: 0.6 },
   ]);
 
-  // --- ROOM 4: ZOMBIES PORTAL ROOM SHELL (X ∈ [-4.5, 4.5], Z ∈ [5.5, 13.5]) ---
+  // --- ROOM 4: BIO-CONTAINMENT AIRLOCK BAY (X ∈ [-4.5, 4.5], Z ∈ [5.5, 13.5] + Exterior Transport Bay) ---
   addBoxStructure(0, -0.1, 9.5, 9.6, 0.2, 8.6, materials.concreteFloor, 'concrete', false);
   addBoxStructure(0, H_HUB + 0.1, 9.5, 9.6, 0.2, 8.6, materials.concreteCeiling, 'concrete', true, false).userData.isRoof = true;
   addBoxStructure(-4.75, H_HUB * 0.5, 9.5, 0.5, H_HUB, 8.6, materials.concreteWall, 'concrete');
   addBoxStructure(4.75, H_HUB * 0.5, 9.5, 0.5, H_HUB, 8.6, materials.concreteWall, 'concrete');
-  addBoxStructure(0, H_HUB * 0.5, 13.75, 9.6, H_HUB, 0.5, materials.concreteWall, 'concrete');
   const containmentLine = new THREE.Mesh(
     trackGeo(new THREE.PlaneGeometry(2.75, 0.34)),
     materials.hazardStripe,
@@ -428,9 +430,18 @@ export function buildHideoutBunkerWorld(
   containmentLine.rotation.x = -Math.PI * 0.5;
   containmentLine.position.set(0, 0.015, 5.55);
   root.add(containmentLine);
-  addOverheadLamp(0, H_HUB - 0.14, 9.5, materials.hazardRedEmissive, [
+  addOverheadLamp(0, H_HUB - 0.14, 7.6, materials.hazardRedEmissive, [
     { light: portalRoomLight, dropFraction: 1.0 },
   ]);
+
+  const airlockBay = new HideoutAirlockBay({
+    root,
+    physics,
+    materials,
+    raycastMeshes,
+    interactableMeshes,
+    isSoftwareGl,
+  });
 
   // ============================================================================
   // 2. ARSENAL ROOM HERO PROP A: OWNED-ONLY 3D GUN WALL (Z = -4.34)
@@ -1154,10 +1165,11 @@ export function buildHideoutBunkerWorld(
       crateLidPivot.rotation.x = 0;
     }
 
-    // Step Gun Range reactive targets, 30s CQB course, 100m Gallery, Ready Room displays, debris & sparks
+    // Step Gun Range reactive targets, 30s CQB course, 100m Gallery, Ready Room displays, Airlock Bay, debris & sparks
     gunRange.update(clampedDt);
     longRangeGallery.update(clampedDt);
     readyRoom.update(clampedDt);
+    airlockBay.update(clampedDt);
     electronics.update(clampedDt, listenerPos);
     penetrableSystem.update(clampedDt, listenerPos);
   };
@@ -1204,6 +1216,9 @@ export function buildHideoutBunkerWorld(
     if (kind === 'ops_briefing_board') {
       return readyRoom.getBoardWorldPos(outPos);
     }
+    if (kind === 'airlock_override') {
+      return airlockBay.getOverrideSwitchWorldPos(outPos);
+    }
     return false;
   };
 
@@ -1216,6 +1231,7 @@ export function buildHideoutBunkerWorld(
     gunRange,
     longRangeGallery,
     readyRoom,
+    airlockBay,
     root,
     raycastMeshes,
     interactableMeshes,
@@ -1231,6 +1247,7 @@ export function buildHideoutBunkerWorld(
     getSlotTransform,
     updateProps,
     dispose: () => {
+      airlockBay.dispose();
       readyRoom.dispose();
       longRangeGallery.dispose();
       gunRange.dispose();

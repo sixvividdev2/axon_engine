@@ -2403,20 +2403,125 @@ export class WeaponModelFactory {
     // PLATFORM 11: MELEE & THROWABLES ('knife' | 'crowbar' | 'frag_grenade' | 'metal_bolt')
     // =========================================================================
     } else if (style === 'knife') {
-      const handle = new THREE.Mesh(track(new THREE.BoxGeometry(0.022, 0.032, 0.115)), mats.bakelite);
-      handle.position.set(0, 0, 0.035);
-      const pommel = new THREE.Mesh(track(new THREE.BoxGeometry(0.026, 0.036, 0.022)), mats.gunmetal);
-      pommel.position.set(0, 0, 0.098);
-      const guard = new THREE.Mesh(track(new THREE.BoxGeometry(0.020, 0.068, 0.012)), mats.gunmetal);
-      guard.position.set(0, 0.006, -0.025);
-      const blade = new THREE.Mesh(track(new THREE.BoxGeometry(0.005, 0.028, 0.155)), mats.chromeSteel);
-      blade.position.set(0, 0.002, -0.108);
-      const tip = new THREE.Mesh(track(new THREE.ConeGeometry(0.014, 0.045, 4)), mats.chromeSteel);
-      tip.rotation.x = -Math.PI * 0.5;
-      tip.scale.set(0.25, 1, 1);
-      tip.position.set(0, 0.002, -0.205);
-      group.add(handle, pommel, guard, blade, tip);
-      sightAnchor.position.set(0, 0.02, -0.05);
+      // Multi-part tactical KA-BAR style combat knife: grooved handle, contoured guard, fuller & beveled clip-point blade
+      const handleCore = new THREE.Mesh(
+        track(new THREE.CylinderGeometry(0.0135, 0.0145, 0.118, 12)),
+        mats.wornPolymer,
+      );
+      handleCore.rotation.x = Math.PI * 0.5;
+      handleCore.scale.set(0.84, 1.0, 1.18);
+      handleCore.position.set(0, -0.002, 0.038);
+      group.add(handleCore);
+
+      // Molded ergonomic grip grooves (5 tactile bands)
+      for (let i = 0; i < 5; i++) {
+        const band = new THREE.Mesh(
+          track(new THREE.TorusGeometry(0.0138, 0.0022, 6, 12)),
+          mats.anodized,
+        );
+        band.scale.set(0.86, 1.16, 1.0);
+        band.position.set(0, -0.002, -0.004 + i * 0.020);
+        group.add(band);
+      }
+
+      // Chamfered steel butt-cap pommel + tang pin
+      const pommel = new THREE.Mesh(
+        buildBeveledBox(track, 0.024, 0.036, 0.018, 0.0022, 1),
+        mats.gunmetal,
+      );
+      pommel.position.set(0, -0.002, 0.103);
+      const pommelNut = new THREE.Mesh(
+        track(new THREE.CylinderGeometry(0.006, 0.006, 0.006, 8)),
+        mats.chromeSteel,
+      );
+      pommelNut.rotation.x = Math.PI * 0.5;
+      pommelNut.position.set(0, -0.002, 0.114);
+      group.add(pommel, pommelNut);
+
+      // Contoured crossguard with slight forward sweep and thumb ramp
+      const guard = new THREE.Mesh(
+        buildBeveledBox(track, 0.022, 0.068, 0.011, 0.0018, 1),
+        mats.gunmetal,
+      );
+      guard.position.set(0, 0.003, -0.023);
+      const guardUpperSweep = new THREE.Mesh(
+        buildBeveledBox(track, 0.018, 0.014, 0.015, 0.0014, 1),
+        mats.gunmetal,
+      );
+      guardUpperSweep.position.set(0, 0.032, -0.028);
+      guardUpperSweep.rotation.x = 0.36;
+      const guardLowerSweep = new THREE.Mesh(
+        buildBeveledBox(track, 0.018, 0.015, 0.015, 0.0014, 1),
+        mats.gunmetal,
+      );
+      guardLowerSweep.position.set(0, -0.028, -0.028);
+      guardLowerSweep.rotation.x = -0.36;
+      group.add(guard, guardUpperSweep, guardLowerSweep);
+
+      // Ricasso + spine + satin beveled cutting edge + dual-side blood fuller
+      const ricasso = new THREE.Mesh(
+        buildBeveledBox(track, 0.0052, 0.028, 0.024, 0.0006, 1),
+        mats.gunmetal,
+      );
+      ricasso.position.set(0, 0.003, -0.039);
+
+      const bladeSpine = new THREE.Mesh(
+        buildBeveledBox(track, 0.0050, 0.016, 0.132, 0.0006, 1),
+        mats.gunmetal,
+      );
+      bladeSpine.position.set(0, 0.009, -0.114);
+
+      const bladeBevel = new THREE.Mesh(
+        track(new THREE.BoxGeometry(0.0024, 0.015, 0.136)),
+        mats.chromeSteel,
+      );
+      bladeBevel.position.set(0, -0.0045, -0.116);
+
+      // Recessed central fuller groove on both flats of the blade
+      const fullerL = new THREE.Mesh(
+        track(new THREE.BoxGeometry(0.0012, 0.0052, 0.095)),
+        mats.anodized,
+      );
+      fullerL.position.set(-0.0025, 0.0085, -0.104);
+      const fullerR = fullerL.clone();
+      fullerR.position.x = 0.0025;
+
+      // Clip-point beveled tip (profiled flat diamond wedge)
+      const tipBack = new THREE.Mesh(
+        track(new THREE.ConeGeometry(0.015, 0.056, 4)),
+        mats.gunmetal,
+      );
+      tipBack.rotation.x = -Math.PI * 0.5;
+      tipBack.rotation.z = Math.PI * 0.25;
+      tipBack.scale.set(0.22, 1.0, 0.92);
+      tipBack.position.set(0, 0.004, -0.206);
+
+      const tipEdge = new THREE.Mesh(
+        track(new THREE.ConeGeometry(0.012, 0.054, 4)),
+        mats.chromeSteel,
+      );
+      tipEdge.rotation.x = -Math.PI * 0.5;
+      tipEdge.rotation.z = Math.PI * 0.25;
+      tipEdge.scale.set(0.14, 1.0, 0.74);
+      tipEdge.position.set(0, 0.001, -0.212);
+
+      // Thumb-jimping serration strip right ahead of guard on upper spine
+      for (let j = 0; j < 4; j++) {
+        const jimp = new THREE.Mesh(
+          track(new THREE.BoxGeometry(0.0056, 0.0028, 0.0026)),
+          mats.anodized,
+        );
+        jimp.position.set(0, 0.018, -0.036 - j * 0.005);
+        group.add(jimp);
+      }
+
+      group.add(ricasso, bladeSpine, bladeBevel, fullerL, fullerR, tipBack, tipEdge);
+
+      handPoseProfile.gripWidthM = 0.025;
+      handPoseProfile.gripDepthM = 0.034;
+      handPoseProfile.supportStyle = 'single_hand';
+      handPoseProfile.baseSupportStyle = 'single_hand';
+      sightAnchor.position.set(0, 0.02, -0.06);
     } else if (style === 'crowbar') {
       const shaft = new THREE.Mesh(track(new THREE.CylinderGeometry(0.012, 0.012, 0.42, 6)), mats.crowbarRed);
       shaft.rotation.x = Math.PI * 0.5;

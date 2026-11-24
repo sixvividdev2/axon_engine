@@ -1450,6 +1450,16 @@ async function startServer() {
     const timeOfDayStart = sanitizeTimeOfDayStart(
       specialEvent ? specialEvent.config.timeOfDayStart : req.body?.timeOfDayStart,
     );
+    const hitmarkersEnabled = specialEvent
+      ? specialEvent.config.hitmarkersEnabled !== false
+      : typeof req.body?.hitmarkersEnabled === 'boolean'
+        ? req.body.hitmarkersEnabled
+        : true;
+    const hudEnabled = specialEvent
+      ? specialEvent.config.hudEnabled !== false
+      : typeof req.body?.hudEnabled === 'boolean'
+        ? req.body.hudEnabled
+        : true;
 
     let code = generateLobbyCode();
     while (activeLobbyRooms.has(code)) {
@@ -1474,6 +1484,8 @@ async function startServer() {
         killfeedPolicy,
         weatherPreset,
         timeOfDayStart,
+        hitmarkersEnabled,
+        hudEnabled,
         status: 'lobby',
         matchSequence: 0,
         specialEvent,
@@ -1912,6 +1924,12 @@ async function startServer() {
               if (patch.timeOfDayStart !== undefined) {
                 st.timeOfDayStart = sanitizeTimeOfDayStart(patch.timeOfDayStart);
               }
+              if (typeof patch.hitmarkersEnabled === 'boolean') {
+                st.hitmarkersEnabled = patch.hitmarkersEnabled;
+              }
+              if (typeof patch.hudEnabled === 'boolean') {
+                st.hudEnabled = patch.hudEnabled;
+              }
               if (st.specialEvent) {
                 st.specialEvent = {
                   ...st.specialEvent,
@@ -1928,6 +1946,8 @@ async function startServer() {
                     killfeedPolicy: st.killfeedPolicy,
                     weatherPreset: st.weatherPreset,
                     timeOfDayStart: st.timeOfDayStart,
+                    hitmarkersEnabled: st.hitmarkersEnabled,
+                    hudEnabled: st.hudEnabled,
                   }),
                 };
               }

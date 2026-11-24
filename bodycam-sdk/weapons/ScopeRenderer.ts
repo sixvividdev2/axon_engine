@@ -310,7 +310,7 @@ export class ScopeRenderer {
     this.scopeCamera.quaternion.copy(this._objQuat);
     this.scopeCamera.fov = targetFov;
     this.scopeCamera.aspect = 1.0;
-    this.scopeCamera.near = 0.06;
+    this.scopeCamera.near = mainCamera.far > 500 ? Math.max(0.25, mainCamera.near) : 0.06;
     this.scopeCamera.far = mainCamera.far;
     this.scopeCamera.updateProjectionMatrix();
     this.scopeCamera.layers.set(0);

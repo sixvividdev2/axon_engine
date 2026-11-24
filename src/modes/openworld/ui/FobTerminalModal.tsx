@@ -10,10 +10,11 @@ import {
   ShoppingCart,
   X,
 } from 'lucide-react';
-import type {
-  FobTerminalStateSnapshot,
-  FobTraderOffer,
-  SupplyTierStatus,
+import {
+  formatRestockTimer,
+  type FobTerminalStateSnapshot,
+  type FobTraderOffer,
+  type SupplyTierStatus,
 } from '../world/OpenWorldLogisticsEconomy';
 import {
   FOB_UPGRADE_SPECS,
@@ -28,6 +29,7 @@ interface FobTerminalModalProps {
   cashUsd: number;
   callsign: string;
   contractBoard: RotatingContractRecord[];
+  blackMarketContext?: { subFactionName: string; traderName: string } | null;
   onFundUpgrade: () => void;
   onBuyOffer: (offerId: string) => void;
   onAcceptContract: (slotIndex: number) => void;
@@ -55,6 +57,7 @@ export const FobTerminalModal: React.FC<FobTerminalModalProps> = ({
   cashUsd,
   callsign,
   contractBoard,
+  blackMarketContext,
   onFundUpgrade,
   onBuyOffer,
   onAcceptContract,
@@ -91,10 +94,12 @@ export const FobTerminalModal: React.FC<FobTerminalModalProps> = ({
           <div className="flex flex-wrap items-center gap-3 font-mono-tabular">
             <Building2 className="h-4 w-4 text-amber-400" />
             <span className="text-xs font-semibold uppercase tracking-wider text-neutral-50">
-              {factionSpec.name} · In-World FOB Logistics Terminal
+              {blackMarketContext
+                ? `${blackMarketContext.subFactionName} · Black-Market (${blackMarketContext.traderName})`
+                : `${factionSpec.name} · In-World FOB Logistics Terminal`}
             </span>
             <span className="border border-amber-400/55 bg-amber-950/50 px-2 py-0.5 text-[11px] font-semibold text-amber-200">
-              TIER {terminal.fobTier}
+              {blackMarketContext ? 'TRUSTED -15%' : `TIER ${terminal.fobTier}`}
             </span>
             <span className="text-xs text-neutral-300">
               {callsign} · <strong className="text-emerald-300">${cashUsd.toLocaleString()}</strong>
@@ -104,12 +109,12 @@ export const FobTerminalModal: React.FC<FobTerminalModalProps> = ({
           <div className="flex items-center gap-3 font-mono-tabular text-[11px]">
             <span className="flex items-center gap-1 text-neutral-300">
               <Clock className="h-3.5 w-3.5 text-neutral-400" />
-              <span>Restock {terminal.restockRemainingSec}s</span>
+              <span>Restock {formatRestockTimer(terminal.restockRemainingSec)}</span>
             </span>
             {terminal.sabotageDelaySec > 0 && (
               <span className="flex items-center gap-1 border border-red-500/60 bg-red-950/50 px-2 py-0.5 text-red-200">
                 <AlertTriangle className="h-3 w-3" />
-                <span>SABOTAGE STALL +{terminal.sabotageDelaySec}s</span>
+                <span>SABOTAGE STALL +{formatRestockTimer(terminal.sabotageDelaySec)}</span>
               </span>
             )}
             <button
@@ -187,6 +192,7 @@ export const FobTerminalModal: React.FC<FobTerminalModalProps> = ({
                     { id: 'medical', label: 'Medical' },
                     { id: 'ordnance', label: 'Ordnance' },
                     { id: 'armor', label: 'Armor Plates' },
+                    { id: 'utility', label: 'PDA Power' },
                   ] as const
                 ).map((c) => (
                   <button

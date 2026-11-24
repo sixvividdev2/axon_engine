@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import type { GraphicsQualityProfile } from '../../../../data/graphicsQuality';
 import {
   applyWindFoliageShader,
   assignHeightSwayAttribute,
@@ -10,6 +11,7 @@ import {
   type AtmoFogSharedUniforms,
 } from './OpenWorldAtmosphericFogShader';
 import { isOnCivilizationClearance } from './OpenWorldCivilizationTopology';
+import { isInsideFobCompound } from './OpenWorldFobLayout';
 import {
   CHUNK_SIZE_M,
   chunkHash,
@@ -19,6 +21,7 @@ import {
   OPENWORLD_LANDMARKS,
   queryWaterProximity,
   sampleOpenWorldTerrain,
+  sampleOpenWorldTerrainFromHeight,
 } from './OpenWorldTerrain';
 
 export interface FoliageAnchorPoint {
@@ -328,6 +331,8 @@ export class OpenWorldFoliageBuilder {
   public readonly nearGrassMesh: THREE.InstancedMesh;
 
   private readonly isSoftwareGl: boolean;
+  private densityScale = 1.0;
+  private shadowsEnabled = true;
   private readonly grassGeo: THREE.BufferGeometry;
   private readonly grassMat: THREE.MeshStandardMaterial;
   private readonly fernGeo: THREE.BufferGeometry;
@@ -345,9 +350,9 @@ export class OpenWorldFoliageBuilder {
   private readonly stumpGeo: THREE.BufferGeometry;
   private readonly stumpMat: THREE.MeshStandardMaterial;
 
-  // Deterministic near-player grass ring state (zero-GC)
-  private readonly nearRingGridRadius = 11; // (23 x 23 = 529 cells max, step 3.2m -> ~35m radius)
-  private readonly nearRingCellM = 3.2;
+  // Deterministic near-player grass ring state (zero-GC, 15x15 = 225 cells max, ~26m radius)
+  private readonly nearRingGridRadius = 7;
+  private readonly nearRingCellM = 3.8;
   private readonly nearRingCapacity: number;
   private lastNearCellX = 999999;
   private lastNearCellZ = 999999;
@@ -455,10 +460,29 @@ export class OpenWorldFoliageBuilder {
     this.nearGrassMesh = new THREE.InstancedMesh(this.grassGeo, this.grassMat, this.nearRingCapacity);
     this.nearGrassMesh.name = 'openworld_near_grass_ring';
     this.nearGrassMesh.castShadow = false;
-    this.nearGrassMesh.receiveShadow = !isSoftwareGl;
+    this.nearGrassMesh.receiveShadow = false;
     this.nearGrassMesh.frustumCulled = false;
     this.nearGrassMesh.count = 0;
     scene.add(this.nearGrassMesh);
+  }
+
+  public applyQualityProfile(profile: GraphicsQualityProfile): void {
+    this.densityScale = THREE.MathUtils.clamp(profile.foliageDensity, 0.25, 1.45);
+    this.shadowsEnabled = !this.isSoftwareGl && profile.castShadows;
+    this.nearGrassMesh.receiveShadow = false;
+  }
+
+  public getSharedMaterials(): THREE.Material[] {
+    return [
+      this.grassMat,
+      this.fernMat,
+      this.rushMat,
+      this.brushMat,
+      this.rockMat,
+      this.logMat,
+      this.stickMat,
+      this.stumpMat,
+    ];
   }
 
   /**
@@ -518,6 +542,15 @@ export class OpenWorldFoliageBuilder {
     const centerWx = (centerCellX + 0.5) * step;
     const centerWz = (centerCellZ + 0.5) * step;
 
+    // Skip rebuilding grass tufts when operator is inside a paved FOB compound
+    if (isInsideFobCompound(centerWx, centerWz, 4)) {
+      if (this.nearGrassMesh.count !== 0) {
+        this.nearGrassMesh.count = 0;
+        this.nearGrassMesh.instanceMatrix.needsUpdate = true;
+      }
+      return;
+    }
+
     let count = 0;
     for (let dz = -rad; dz <= rad; dz++) {
       const iz = centerCellZ + dz;
@@ -531,17 +564,22 @@ export class OpenWorldFoliageBuilder {
         const wz = (iz + 0.12 + h1 * 0.76) * step;
         const distSq = (wx - centerWx) * (wx - centerWx) + (wz - centerWz) * (wz - centerWz);
         if (distSq > maxDistSq) continue;
+        if (isNearMajorLandmark(wx, wz) || isOnCivilizationClearance(wx, wz, 2.1)) continue;
 
-        sampleOpenWorldTerrain(wx, wz, _sample);
+        // Fast bilinear heightfield lookup (avoids 3x analytical FBM evaluations per cell)
+        const y = sampleGroundHeight(wx, wz);
+        const yx = sampleGroundHeight(wx + 2.5, wz);
+        const yz = sampleGroundHeight(wx, wz + 2.5);
+        const slope = Math.min(1, Math.hypot((yx - y) * 0.4, (yz - y) * 0.4));
+        sampleOpenWorldTerrainFromHeight(wx, wz, y, slope, _sample);
+
         if (
           _sample.isWater ||
           _sample.isRoad ||
           _sample.isSitePad ||
           _sample.isQuarryPit ||
           _sample.slope > 0.44 ||
-          _sample.height > 325 ||
-          isNearMajorLandmark(wx, wz) ||
-          isOnCivilizationClearance(wx, wz, 2.1)
+          _sample.height > 325
         ) {
           continue;
         }
@@ -557,7 +595,6 @@ export class OpenWorldFoliageBuilder {
                 : 0.25;
         if (h2 > chance) continue;
 
-        const y = sampleGroundHeight(wx, wz);
         const scale = 0.85 + h0 * 0.75;
         _dummy.position.set(wx, y - 0.04, wz);
         _dummy.rotation.set(0, h1 * Math.PI * 2, 0);
@@ -597,8 +634,18 @@ export class OpenWorldFoliageBuilder {
     centerZ: number,
     group: THREE.Group,
     outMeshes: THREE.InstancedMesh[],
+    fastHeightSlope?: (wx: number, wz: number, out: { height: number; slope: number }) => void,
   ): ChunkFoliageBuildResult {
     const rand = mulberry32(chunkHash(cx, cz, 719));
+    const hsScratch = { height: 0, slope: 0 };
+    const sampleChunkTerrain = (wx: number, wz: number): void => {
+      if (fastHeightSlope) {
+        fastHeightSlope(wx, wz, hsScratch);
+        sampleOpenWorldTerrainFromHeight(wx, wz, hsScratch.height, hsScratch.slope, _sample);
+      } else {
+        sampleOpenWorldTerrain(wx, wz, _sample);
+      }
+    };
     const logAnchors: FoliageAnchorPoint[] = [];
     const rockAnchors: FoliageAnchorPoint[] = [];
 
@@ -611,13 +658,23 @@ export class OpenWorldFoliageBuilder {
     const stickList: Array<{ lx: number; y: number; lz: number; s: number; yaw: number; tint: number }> = [];
     const stumpList: Array<{ lx: number; y: number; lz: number; s: number; yaw: number; tint: number }> = [];
 
+    const dScale = this.densityScale;
+    const grassAttempts = Math.round(150 * dScale);
+    const fernAttempts = Math.round(88 * dScale);
+    const rushAttempts = Math.round(95 * dScale);
+    const brushAttempts = Math.round(56 * dScale);
+    const rockAttempts = Math.round(64 * dScale);
+    const logAttempts = Math.round(24 * dScale);
+    const stickAttempts = Math.round(68 * dScale);
+    const stumpAttempts = Math.round(16 * dScale);
+
     // 1. Mid-range Chunk Grass Tufts (fills out hills/clearings beyond the 35m near-player skirt)
-    for (let i = 0; i < 150; i++) {
+    for (let i = 0; i < grassAttempts; i++) {
       const lx = (rand() - 0.5) * (CHUNK_SIZE_M - 8);
       const lz = (rand() - 0.5) * (CHUNK_SIZE_M - 8);
       const wx = centerX + lx;
       const wz = centerZ + lz;
-      sampleOpenWorldTerrain(wx, wz, _sample);
+      sampleChunkTerrain(wx, wz);
       if (
         _sample.isWater ||
         _sample.isRoad ||
@@ -656,12 +713,12 @@ export class OpenWorldFoliageBuilder {
     }
 
     // 2. Woodland Ferns (Temperate Conifer shade + damp marsh edges)
-    for (let i = 0; i < 88; i++) {
+    for (let i = 0; i < fernAttempts; i++) {
       const lx = (rand() - 0.5) * (CHUNK_SIZE_M - 10);
       const lz = (rand() - 0.5) * (CHUNK_SIZE_M - 10);
       const wx = centerX + lx;
       const wz = centerZ + lz;
-      sampleOpenWorldTerrain(wx, wz, _sample);
+      sampleChunkTerrain(wx, wz);
       if (
         _sample.isWater ||
         _sample.isRoad ||
@@ -693,12 +750,12 @@ export class OpenWorldFoliageBuilder {
     }
 
     // 3. Marsh Rush & Cattails (Riverbanks, Coastal Marsh Delta, Wetland Edges — frog cover!)
-    for (let i = 0; i < 95; i++) {
+    for (let i = 0; i < rushAttempts; i++) {
       const lx = (rand() - 0.5) * (CHUNK_SIZE_M - 8);
       const lz = (rand() - 0.5) * (CHUNK_SIZE_M - 8);
       const wx = centerX + lx;
       const wz = centerZ + lz;
-      sampleOpenWorldTerrain(wx, wz, _sample);
+      sampleChunkTerrain(wx, wz);
       if (_sample.isRoad || _sample.isSitePad || isNearMajorLandmark(wx, wz) || isOnCivilizationClearance(wx, wz, 2.5)) {
         continue;
       }
@@ -719,12 +776,12 @@ export class OpenWorldFoliageBuilder {
     }
 
     // 4. Dead Brush & Brambles (Highland Steppe, Quarry rims, Alpine scrub, Forest edges)
-    for (let i = 0; i < 56; i++) {
+    for (let i = 0; i < brushAttempts; i++) {
       const lx = (rand() - 0.5) * (CHUNK_SIZE_M - 10);
       const lz = (rand() - 0.5) * (CHUNK_SIZE_M - 10);
       const wx = centerX + lx;
       const wz = centerZ + lz;
-      sampleOpenWorldTerrain(wx, wz, _sample);
+      sampleChunkTerrain(wx, wz);
       if (
         _sample.isWater ||
         _sample.isRoad ||
@@ -753,12 +810,12 @@ export class OpenWorldFoliageBuilder {
     }
 
     // 5. Small Field Rocks & Scree Pebbles (complements large chunk boulders)
-    for (let i = 0; i < 64; i++) {
+    for (let i = 0; i < rockAttempts; i++) {
       const lx = (rand() - 0.5) * (CHUNK_SIZE_M - 10);
       const lz = (rand() - 0.5) * (CHUNK_SIZE_M - 10);
       const wx = centerX + lx;
       const wz = centerZ + lz;
-      sampleOpenWorldTerrain(wx, wz, _sample);
+      sampleChunkTerrain(wx, wz);
       if (
         _sample.isWater ||
         _sample.isRoad ||
@@ -792,12 +849,12 @@ export class OpenWorldFoliageBuilder {
     }
 
     // 6. Fallen Logs & Mossy Timber (Conifer Valley, forest edges, coastal driftwood)
-    for (let i = 0; i < 24; i++) {
+    for (let i = 0; i < logAttempts; i++) {
       const lx = (rand() - 0.5) * (CHUNK_SIZE_M - 16);
       const lz = (rand() - 0.5) * (CHUNK_SIZE_M - 16);
       const wx = centerX + lx;
       const wz = centerZ + lz;
-      sampleOpenWorldTerrain(wx, wz, _sample);
+      sampleChunkTerrain(wx, wz);
       if (
         _sample.isWater ||
         _sample.isRoad ||
@@ -832,12 +889,12 @@ export class OpenWorldFoliageBuilder {
     }
 
     // 7. Sticks, Branches & Shoreline Driftwood
-    for (let i = 0; i < 68; i++) {
+    for (let i = 0; i < stickAttempts; i++) {
       const lx = (rand() - 0.5) * (CHUNK_SIZE_M - 10);
       const lz = (rand() - 0.5) * (CHUNK_SIZE_M - 10);
       const wx = centerX + lx;
       const wz = centerZ + lz;
-      sampleOpenWorldTerrain(wx, wz, _sample);
+      sampleChunkTerrain(wx, wz);
       if (
         _sample.isWater ||
         _sample.isRoad ||
@@ -866,12 +923,12 @@ export class OpenWorldFoliageBuilder {
     }
 
     // 8. Broken Tree Stumps in Conifer Clearings
-    for (let i = 0; i < 16; i++) {
+    for (let i = 0; i < stumpAttempts; i++) {
       const lx = (rand() - 0.5) * (CHUNK_SIZE_M - 16);
       const lz = (rand() - 0.5) * (CHUNK_SIZE_M - 16);
       const wx = centerX + lx;
       const wz = centerZ + lz;
-      sampleOpenWorldTerrain(wx, wz, _sample);
+      sampleChunkTerrain(wx, wz);
       if (
         _sample.isWater ||
         _sample.isRoad ||
@@ -898,7 +955,7 @@ export class OpenWorldFoliageBuilder {
 
     if (grassList.length > 0) {
       const mesh = new THREE.InstancedMesh(this.grassGeo, this.grassMat, grassList.length);
-      mesh.receiveShadow = !this.isSoftwareGl;
+      mesh.receiveShadow = false;
       for (let i = 0; i < grassList.length; i++) {
         const p = grassList[i];
         _dummy.position.set(p.lx, p.y, p.lz);
@@ -919,7 +976,7 @@ export class OpenWorldFoliageBuilder {
 
     if (fernList.length > 0) {
       const mesh = new THREE.InstancedMesh(this.fernGeo, this.fernMat, fernList.length);
-      mesh.receiveShadow = !this.isSoftwareGl;
+      mesh.receiveShadow = false;
       for (let i = 0; i < fernList.length; i++) {
         const p = fernList[i];
         _dummy.position.set(p.lx, p.y, p.lz);
@@ -940,7 +997,7 @@ export class OpenWorldFoliageBuilder {
 
     if (rushList.length > 0) {
       const mesh = new THREE.InstancedMesh(this.rushGeo, this.rushMat, rushList.length);
-      mesh.receiveShadow = !this.isSoftwareGl;
+      mesh.receiveShadow = false;
       for (let i = 0; i < rushList.length; i++) {
         const p = rushList[i];
         _dummy.position.set(p.lx, p.y, p.lz);
@@ -981,7 +1038,7 @@ export class OpenWorldFoliageBuilder {
 
     if (rockList.length > 0) {
       const mesh = new THREE.InstancedMesh(this.rockGeo, this.rockMat, rockList.length);
-      mesh.receiveShadow = !this.isSoftwareGl;
+      mesh.receiveShadow = false;
       for (let i = 0; i < rockList.length; i++) {
         const p = rockList[i];
         _dummy.position.set(p.lx, p.y, p.lz);
@@ -1003,8 +1060,8 @@ export class OpenWorldFoliageBuilder {
 
     if (logList.length > 0) {
       const mesh = new THREE.InstancedMesh(this.logGeo, this.logMat, logList.length);
-      mesh.castShadow = !this.isSoftwareGl;
-      mesh.receiveShadow = !this.isSoftwareGl;
+      mesh.castShadow = false;
+      mesh.receiveShadow = this.shadowsEnabled;
       for (let i = 0; i < logList.length; i++) {
         const p = logList[i];
         _dummy.position.set(p.lx, p.y, p.lz);
@@ -1046,8 +1103,8 @@ export class OpenWorldFoliageBuilder {
 
     if (stumpList.length > 0) {
       const mesh = new THREE.InstancedMesh(this.stumpGeo, this.stumpMat, stumpList.length);
-      mesh.castShadow = !this.isSoftwareGl;
-      mesh.receiveShadow = !this.isSoftwareGl;
+      mesh.castShadow = false;
+      mesh.receiveShadow = false;
       for (let i = 0; i < stumpList.length; i++) {
         const p = stumpList[i];
         _dummy.position.set(p.lx, p.y, p.lz);

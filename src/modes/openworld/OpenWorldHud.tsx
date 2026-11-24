@@ -1,17 +1,12 @@
 import React, { useEffect, useState } from 'react';
 import {
   AlertTriangle,
-  Backpack,
   Camera,
   Check,
-  ChevronDown,
-  ChevronUp,
   CloudFog,
   CloudRain,
   Compass,
-  Crosshair,
   Eye,
-  Flag,
   Flashlight,
   Heart,
   LogOut,
@@ -22,9 +17,15 @@ import {
   Skull,
   Sun,
   Truck,
-  Zap,
+  X,
 } from 'lucide-react';
 import type { BodycamLensPresetId } from '../../../bodycam-sdk';
+import {
+  GRAPHICS_QUALITY_ORDER,
+  GRAPHICS_QUALITY_PROFILES,
+  useAdaptiveScaling,
+  useGraphicsQuality,
+} from '../../../data/graphicsQuality';
 import type {
   CorpseTacticalLootSnapshot,
   ItemSourceLocator,
@@ -35,10 +36,10 @@ import {
   DynamicWorldEventKind,
   OPENWORLD_CONTRACT_CATALOG,
   OpenWorldWeatherId,
-  PMC_FACTIONS,
   SectorControlOwner,
   SUB_FACTION_MAP,
 } from './types';
+import { ArmoryStashModal } from './ui/ArmoryStashModal';
 import { FobTerminalModal } from './ui/FobTerminalModal';
 import { TacticalInventoryModal } from './ui/TacticalInventoryModal';
 import {
@@ -69,10 +70,20 @@ interface OpenWorldHudProps {
     sourceLocator: ItemSourceLocator,
   ) => void;
   onUseMedicalItem: (locator: ItemSourceLocator, med: MedicalItem) => void;
+  onUsePdaBattery: (locator: ItemSourceLocator) => void;
+  onFastTravelToSector: (sectorId: string) => void;
   onFundFobUpgrade: () => void;
   onBuyFobOffer: (offerId: string) => void;
   onAcceptContract: (slotIndex: number) => void;
   onCompleteContract: (slotIndex: number) => void;
+  onDepositArmoryItem: (locator: ItemSourceLocator) => void;
+  onWithdrawArmoryItem: (
+    stashInstanceId: string,
+    target?: 'auto' | 'backpack' | 'secure' | 'belt',
+  ) => void;
+  onEquipArmoryWeapon: (slotKey: 'primary' | 'secondary', weaponId: string) => void;
+  onEquipArmoryArmorPlate: (plateId: string) => void;
+  onResupplyArmoryAmmo: () => void;
   onSabotageConvoy: () => void;
   onTriggerWorldEvent: (kind: DynamicWorldEventKind) => void;
   onExecuteInteract: () => void;
@@ -119,12 +130,16 @@ function formatUsd(amount: number): string {
 function ownerTagColor(owner: SectorControlOwner): string {
   if (owner === 'pmc_alpha') return 'text-sky-300';
   if (owner === 'pmc_bravo') return 'text-amber-300';
+  if (owner === 'subfaction') return 'text-teal-300';
+  if (owner === 'contested') return 'text-red-400';
   return 'text-neutral-400';
 }
 
 function ownerShort(owner: SectorControlOwner): string {
   if (owner === 'pmc_alpha') return 'ALPHA';
   if (owner === 'pmc_bravo') return 'BRAVO';
+  if (owner === 'subfaction') return 'LOCAL';
+  if (owner === 'contested') return 'CONTESTED';
   return 'NEUTRAL';
 }
 
@@ -137,15 +152,21 @@ export const OpenWorldHud: React.FC<OpenWorldHudProps> = ({
   onSetNvgMode,
   onToggleFlashlight,
   onTogglePda,
-  onOpenInventory,
   onCloseModal,
   onMutateInventory,
   onTriggerDragReload,
   onUseMedicalItem,
+  onUsePdaBattery,
+  onFastTravelToSector,
   onFundFobUpgrade,
   onBuyFobOffer,
   onAcceptContract,
   onCompleteContract,
+  onDepositArmoryItem,
+  onWithdrawArmoryItem,
+  onEquipArmoryWeapon,
+  onEquipArmoryArmorPlate,
+  onResupplyArmoryAmmo,
   onSabotageConvoy,
   onTriggerWorldEvent,
   onExecuteInteract,
@@ -159,6 +180,8 @@ export const OpenWorldHud: React.FC<OpenWorldHudProps> = ({
 }) => {
   const [dockOpen, setDockOpen] = useState(false);
   const [dockTab, setDockTab] = useState<DockTabId>('sectors');
+  const [graphicsQuality, setGraphicsQuality] = useGraphicsQuality();
+  const [adaptiveScaling, setAdaptiveScaling] = useAdaptiveScaling();
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -173,10 +196,8 @@ export const OpenWorldHud: React.FC<OpenWorldHudProps> = ({
   }, []);
 
   const char = snapshot.character;
-  const faction = char ? PMC_FACTIONS[char.pmcFaction] : null;
   const atmo = snapshot.atmosphere;
   const combat = snapshot.combat;
-  const activeSector = snapshot.activeSector;
   const completedContracts = new Set(char?.unlocks.completedContractIds ?? []);
 
   return (
@@ -189,237 +210,116 @@ export const OpenWorldHud: React.FC<OpenWorldHudProps> = ({
         />
       )}
 
-      {/* Brief Ballistic Hitmarker Cross */}
-      {combat.hitMarkerAlpha > 0.04 && (
-        <div
-          className="pointer-events-none fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2"
-          style={{ opacity: Math.min(1, combat.hitMarkerAlpha) }}
-        >
-          <Crosshair
-            className={`h-6 w-6 ${combat.hitMarkerHeadshot ? 'text-amber-300' : 'text-neutral-100'}`}
-          />
-        </div>
-      )}
-
-      {/* Top Row: Compact Telemetry + Active Sector Banner + Exfil/Lock Actions */}
-      <div className="flex flex-wrap items-start justify-between gap-4">
-        <div className="pointer-events-auto space-y-1 bg-[#0b0e13]/90 border border-white/10 px-3.5 py-2 text-xs text-neutral-200">
-          <div className="flex flex-wrap items-center gap-2 font-mono-tabular">
-            <span className="font-semibold text-neutral-50">
-              {char ? char.callsign : 'Recon Observer'}
-            </span>
-            {char && faction && (
-              <>
-                <span aria-hidden="true" className="text-neutral-600">·</span>
-                <span className="text-amber-300">{char.shardMode}</span>
-                <span aria-hidden="true" className="text-neutral-600">·</span>
-                <span>{faction.shortName}</span>
-                <span aria-hidden="true" className="text-neutral-600">·</span>
-                <span className="text-neutral-100">{formatUsd(char.cash)}</span>
-              </>
-            )}
-          </div>
-
-          <div className="flex flex-wrap items-center gap-2 font-mono-tabular text-[11px] text-neutral-400">
-            <span className="text-neutral-200">{snapshot.biomeName}</span>
-            <span aria-hidden="true">·</span>
-            <span>Elev {snapshot.groundY.toFixed(1)}m</span>
-            <span aria-hidden="true">·</span>
-            <span className="text-sky-300">Alpha {snapshot.territoryCounts.pmc_alpha}</span>
-            <span className="text-amber-300">Bravo {snapshot.territoryCounts.pmc_bravo}</span>
-            <span>Neutral {snapshot.territoryCounts.neutral}</span>
-          </div>
-
-          <div className="flex flex-wrap items-center gap-2 font-mono-tabular text-[11px] text-neutral-400">
-            <span>{atmo.timeFormatted} {atmo.phaseLabel}</span>
-            <span aria-hidden="true">·</span>
-            <span>{atmo.weatherLabel}</span>
-            <span aria-hidden="true">·</span>
-            <span>FOB Tier {snapshot.fobTier}</span>
-            <span aria-hidden="true">·</span>
-            <span className={snapshot.commsBlackoutCount > 0 ? 'text-amber-300' : 'text-emerald-300'}>
-              Comms {3 - snapshot.commsBlackoutCount}/3
-            </span>
-            <span aria-hidden="true">·</span>
-            <span>{snapshot.drawCalls} calls</span>
-          </div>
-        </div>
-
-        {/* Center-Top Active Sector Capture OR Active World Event Banner */}
-        <div className="flex flex-col items-center gap-1.5">
-          {activeSector && !activeSector.isFob && (
-            <div className="border border-white/14 bg-[#0b0e13]/92 px-4 py-2 text-xs text-neutral-100">
-              <div className="flex items-center justify-between gap-4 font-mono-tabular">
-                <span className="flex items-center gap-1.5 font-semibold">
-                  <Flag className={`h-3.5 w-3.5 ${ownerTagColor(activeSector.owner)}`} />
-                  <span>{activeSector.shortLabel}</span>
-                  <span className="border border-white/12 px-1 text-[9px] uppercase text-neutral-300">
-                    {activeSector.alertState}
-                  </span>
-                </span>
-                <span className={`text-[11px] font-semibold ${ownerTagColor(activeSector.owner)}`}>
-                  {ownerShort(activeSector.owner)}
-                </span>
-              </div>
-              <div className="mt-1.5 h-1.5 w-56 bg-white/10">
-                <div
-                  className={`h-full transition-all duration-150 ${
-                    activeSector.contested ? 'bg-red-500' : 'bg-amber-400'
-                  }`}
-                  style={{ width: `${Math.round(activeSector.liveCapturePct)}%` }}
-                />
-              </div>
-              <div className="mt-1 font-mono-tabular text-[11px] text-neutral-400">
-                {activeSector.contested
-                  ? `Contested · Clear ${activeSector.hostileGarrisonCount} hostile(s)`
-                  : char && activeSector.owner === char.pmcFaction
-                    ? 'Sector Secured · Supply Line Active'
-                    : `Capturing Sector (${Math.round(activeSector.liveCapturePct)}%)`}
-              </div>
-            </div>
-          )}
-
-          {snapshot.worldEvent.activeEvent && !snapshot.worldEvent.activeEvent.lootClaimed && (
-            <div className="flex items-center gap-2.5 border border-red-500/55 bg-[#1a0f12]/92 px-3.5 py-1.5 font-mono-tabular text-[11px] text-red-100">
-              <Zap className="h-3.5 w-3.5 shrink-0 text-amber-300" />
-              <span className="font-semibold text-amber-200">
-                {snapshot.worldEvent.activeEvent.title}
-              </span>
-              <span className="text-neutral-300">
-                ({snapshot.worldEvent.activeEvent.x}, {snapshot.worldEvent.activeEvent.z}) ·{' '}
-                {snapshot.worldEvent.activeEvent.guardsAlive} guard(s) ·{' '}
-                {snapshot.worldEvent.activeEvent.remainingSec}s
-              </span>
-            </div>
-          )}
-        </div>
-
-        {/* Right Top: Render Pipeline Toggle, Pointer Lock & Exfil */}
-        <div className="pointer-events-auto flex items-center gap-2">
-          <button
-            type="button"
-            onClick={() =>
-              onSetRenderPipeline(
-                snapshot.renderPipeline === 'direct' ? 'bodycam_post' : 'direct',
-              )
-            }
-            className={`flex cursor-pointer items-center gap-1.5 border px-3 py-2 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
-              snapshot.renderPipeline === 'bodycam_post'
-                ? 'border-sky-400/65 bg-sky-950/65 text-sky-200 hover:border-sky-300'
-                : 'border-white/15 bg-[#12161e] text-neutral-200 hover:border-amber-400/60 hover:text-amber-200'
-            }`}
-          >
-            <Camera className="h-3.5 w-3.5" />
-            <span>
-              {snapshot.renderPipeline === 'bodycam_post' ? 'Bodycam Lens' : 'Direct 2-Pass'}
-            </span>
-          </button>
-          {!snapshot.pointerLocked && (
+      {/* Unobstructed Top Row — Only shows Resume/Exfil actions when pointer is unlocked */}
+      <div className="flex items-start justify-end">
+        {!snapshot.pointerLocked && snapshot.activeModal === null && (
+          <div className="pointer-events-auto flex items-center gap-2">
             <button
               type="button"
               onClick={onRequestLock}
-              className="cursor-pointer border border-white/15 bg-[#12161e] px-3.5 py-2 text-xs font-medium text-neutral-100 transition-colors hover:border-amber-400/70 hover:text-amber-200 whitespace-nowrap shrink-0"
+              className="cursor-pointer border border-white/15 bg-[#12161e]/95 px-3.5 py-2 text-xs font-medium text-neutral-100 transition-colors hover:border-amber-400/70 hover:text-amber-200 whitespace-nowrap shrink-0"
             >
-              Click to Engage (WASD + LMB)
+              Click to Engage
             </button>
-          )}
-          <button
-            type="button"
-            onClick={onExfilToHideout}
-            className="flex cursor-pointer items-center gap-1.5 border border-amber-500/60 bg-[#1a160f] px-3.5 py-2 text-xs font-semibold text-amber-200 transition-colors hover:border-amber-400 hover:bg-[#241e13] whitespace-nowrap shrink-0"
-          >
-            <LogOut className="h-3.5 w-3.5" />
-            <span>Exfil to Hideout</span>
-          </button>
-        </div>
-      </div>
-
-      {/* Alerts / Toast / Interact Prompt Stack */}
-      <div className="mx-auto flex w-full max-w-3xl flex-col items-center gap-2">
-        {char && snapshot.bankruptcy?.isBankruptcyRisk && (
-          <div
-            role="alert"
-            className="pointer-events-auto flex items-center gap-2.5 border border-red-500/75 bg-[#200c10] px-4 py-2 text-xs text-red-100"
-          >
-            <AlertTriangle className="h-4 w-4 shrink-0 text-red-400" />
-            <span className="font-mono-tabular font-semibold">
-              BANKRUPTCY WARNING · Cash {formatUsd(snapshot.bankruptcy.currentCash)} below Medevac{' '}
-              {formatUsd(snapshot.bankruptcy.nextRespawnFee)} · Death permanently wipes {char.callsign}
-            </span>
-          </div>
-        )}
-
-        {snapshot.toastMessage && (
-          <div className="border border-amber-500/45 bg-[#111419]/95 px-4 py-2 font-mono-tabular text-xs text-amber-100">
-            {snapshot.toastMessage}
-          </div>
-        )}
-
-        {snapshot.interactable && snapshot.navMode === 'foot' && snapshot.activeModal === null && (
-          <div className="pointer-events-auto flex flex-wrap items-center justify-center gap-2">
-            <button
-              type="button"
-              onClick={onExecuteInteract}
-              className={`flex cursor-pointer items-center gap-3 border px-4 py-2 text-left text-xs ${
-                snapshot.interactable.canExecute
-                  ? 'border-amber-400/70 bg-[#12161d]/95 text-neutral-100 hover:border-amber-300'
-                  : 'border-red-500/50 bg-[#1b1114]/95 text-red-100'
-              }`}
-            >
-              <span className="border border-amber-400/60 bg-amber-500/20 px-1.5 py-0.5 font-mono-tabular font-semibold text-amber-200">
-                F
-              </span>
-              <div>
-                <div className="font-semibold">{snapshot.interactable.label}</div>
-                <div className="text-[11px] text-neutral-400">{snapshot.interactable.sublabel}</div>
-              </div>
-            </button>
-
-            {snapshot.interactable.kind === 'convoy_hijack' && snapshot.interactable.canExecute && (
-              <button
-                type="button"
-                onClick={onSabotageConvoy}
-                className="flex cursor-pointer items-center gap-2 border border-red-500/70 bg-[#200f12]/95 px-3.5 py-2 text-xs font-semibold text-red-100 hover:border-red-400"
-              >
-                <span className="border border-red-400/60 bg-red-500/20 px-1.5 py-0.5 font-mono-tabular text-red-200">
-                  X
-                </span>
-                <span>Sabotage Cargo (-15 Supply / +180s Stall)</span>
-              </button>
-            )}
-          </div>
-        )}
-
-        {snapshot.lastDeathOutcome && (
-          <div
-            className={`pointer-events-auto flex flex-wrap items-center justify-between gap-3 border px-4 py-2.5 text-xs ${
-              snapshot.lastDeathOutcome.outcome === 'permadeath_wiped'
-                ? 'border-red-500/80 bg-[#210d11] text-red-100'
-                : 'border-amber-500/65 bg-[#1b160e] text-amber-100'
-            }`}
-          >
-            <span className="font-mono-tabular">
-              {snapshot.lastDeathOutcome.outcome === 'permadeath_wiped'
-                ? `PERMADEATH WIPE: ${snapshot.lastDeathOutcome.callsign} deleted (${snapshot.lastDeathOutcome.wipedSummary.unlockedWeapons} weapon unlocks, ${snapshot.lastDeathOutcome.wipedSummary.unlockedAttachments} optics, ${snapshot.lastDeathOutcome.wipedSummary.stashItemCount} stash items & ${snapshot.lastDeathOutcome.wipedSummary.ownedVehicleCount} vehicles purged).`
-                : `FIELD HOSPITAL RESPAWN: ${snapshot.lastDeathOutcome.callsign} recovered at ${snapshot.lastDeathOutcome.hospital.name} (-${formatUsd(snapshot.lastDeathOutcome.feePaid)}). Corpse logged in shard; Secure Container retained.`}
-            </span>
             <button
               type="button"
               onClick={onExfilToHideout}
-              className="cursor-pointer border border-white/20 bg-black/40 px-3 py-1 text-[11px] font-semibold text-white hover:border-white/50 whitespace-nowrap shrink-0"
+              className="flex cursor-pointer items-center gap-1.5 border border-amber-500/60 bg-[#1a160f]/95 px-3.5 py-2 text-xs font-semibold text-amber-200 transition-colors hover:border-amber-400 hover:bg-[#241e13] whitespace-nowrap shrink-0"
             >
-              Return to Hideout
+              <LogOut className="h-3.5 w-3.5" />
+              <span>Exfil to Hideout</span>
             </button>
           </div>
         )}
       </div>
 
-      {/* Bottom Row: Minimal Operator Vitals Strip + Collapsible Unified Bottom Control Dock */}
+      {/* Keep center viewport 100% open for diegetic aiming, optics, and 3D GPS PDA */}
+      <div className="flex-1" />
+
+      {/* Bottom Row: Non-occluding Alerts/Interactables + Minimal Operator Vitals Strip + Control Dock */}
       <div className="flex flex-col items-center gap-2">
+        <div className="mx-auto flex w-full max-w-3xl flex-col items-center gap-1.5">
+          {char && snapshot.bankruptcy?.isBankruptcyRisk && (
+            <div
+              role="alert"
+              className="pointer-events-auto flex items-center gap-2.5 border border-red-500/75 bg-[#200c10] px-4 py-1.5 text-xs text-red-100"
+            >
+              <AlertTriangle className="h-4 w-4 shrink-0 text-red-400" />
+              <span className="font-mono-tabular font-semibold">
+                BANKRUPTCY WARNING · Cash {formatUsd(snapshot.bankruptcy.currentCash)} below Medevac{' '}
+                {formatUsd(snapshot.bankruptcy.nextRespawnFee)} · Death permanently wipes {char.callsign}
+              </span>
+            </div>
+          )}
+
+          {snapshot.toastMessage && (
+            <div className="border border-amber-500/45 bg-[#111419]/95 px-4 py-1.5 font-mono-tabular text-xs text-amber-100">
+              {snapshot.toastMessage}
+            </div>
+          )}
+
+          {snapshot.interactable && snapshot.navMode === 'foot' && snapshot.activeModal === null && (
+            <div className="pointer-events-auto flex flex-wrap items-center justify-center gap-2">
+              <button
+                type="button"
+                onClick={onExecuteInteract}
+                className={`flex cursor-pointer items-center gap-3 border px-4 py-1.5 text-left text-xs ${
+                  snapshot.interactable.canExecute
+                    ? 'border-amber-400/70 bg-[#12161d]/95 text-neutral-100 hover:border-amber-300'
+                    : 'border-red-500/50 bg-[#1b1114]/95 text-red-100'
+                }`}
+              >
+                <span className="border border-amber-400/60 bg-amber-500/20 px-1.5 py-0.5 font-mono-tabular font-semibold text-amber-200">
+                  F
+                </span>
+                <div>
+                  <div className="font-semibold">{snapshot.interactable.label}</div>
+                  <div className="text-[11px] text-neutral-400">{snapshot.interactable.sublabel}</div>
+                </div>
+              </button>
+
+              {snapshot.interactable.kind === 'convoy_hijack' && snapshot.interactable.canExecute && (
+                <button
+                  type="button"
+                  onClick={onSabotageConvoy}
+                  className="flex cursor-pointer items-center gap-2 border border-red-500/70 bg-[#200f12]/95 px-3.5 py-1.5 text-xs font-semibold text-red-100 hover:border-red-400"
+                >
+                  <span className="border border-red-400/60 bg-red-500/20 px-1.5 py-0.5 font-mono-tabular text-red-200">
+                    X
+                  </span>
+                  <span>Sabotage Cargo (-15 Supply / +180s Stall)</span>
+                </button>
+              )}
+            </div>
+          )}
+
+          {snapshot.lastDeathOutcome && (
+            <div
+              className={`pointer-events-auto flex flex-wrap items-center justify-between gap-3 border px-4 py-2 text-xs ${
+                snapshot.lastDeathOutcome.outcome === 'permadeath_wiped'
+                  ? 'border-red-500/80 bg-[#210d11] text-red-100'
+                  : 'border-amber-500/65 bg-[#1b160e] text-amber-100'
+              }`}
+            >
+              <span className="font-mono-tabular">
+                {snapshot.lastDeathOutcome.outcome === 'permadeath_wiped'
+                  ? `PERMADEATH WIPE: ${snapshot.lastDeathOutcome.callsign} deleted (${snapshot.lastDeathOutcome.wipedSummary.unlockedWeapons} weapon unlocks, ${snapshot.lastDeathOutcome.wipedSummary.unlockedAttachments} optics, ${snapshot.lastDeathOutcome.wipedSummary.stashItemCount} stash items & ${snapshot.lastDeathOutcome.wipedSummary.ownedVehicleCount} vehicles purged).`
+                  : `FIELD HOSPITAL RESPAWN: ${snapshot.lastDeathOutcome.callsign} recovered at ${snapshot.lastDeathOutcome.hospital.name} (-${formatUsd(snapshot.lastDeathOutcome.feePaid)}). Corpse logged in shard; Secure Container retained.`}
+              </span>
+              <button
+                type="button"
+                onClick={onExfilToHideout}
+                className="cursor-pointer border border-white/20 bg-black/40 px-3 py-1 text-[11px] font-semibold text-white hover:border-white/50 whitespace-nowrap shrink-0"
+              >
+                Return to Hideout
+              </button>
+            </div>
+          )}
+        </div>
         {snapshot.navMode === 'foot' && (
-          <div className="flex w-full items-end justify-between gap-4">
-            {/* Compact Bottom-Left Vitals & Armor */}
-            <div className="flex items-center gap-4 border border-white/10 bg-[#0b0e13]/90 px-3.5 py-2 font-mono-tabular text-xs text-neutral-200">
+          <div className="flex w-full items-end justify-start">
+            {/* Minimal Bottom-Left Operator Vitals (HP, Armor Plate & Trauma only) */}
+            <div className="flex items-center gap-3.5 border border-white/10 bg-[#0b0e13]/88 px-3.5 py-2 font-mono-tabular text-xs text-neutral-200">
               <div className="flex items-center gap-1.5">
                 <Heart className="h-3.5 w-3.5 text-red-400" />
                 <span className={combat.hp <= 30 ? 'font-semibold text-red-400' : 'text-neutral-100'}>
@@ -451,75 +351,13 @@ export const OpenWorldHud: React.FC<OpenWorldHudProps> = ({
                   </span>
                 </>
               )}
-              {combat.killsThisSortie > 0 && (
-                <>
-                  <span aria-hidden="true" className="text-neutral-600">·</span>
-                  <span className="text-amber-300">{combat.killsThisSortie} EKIA</span>
-                </>
-              )}
-            </div>
-
-            {/* Compact Bottom-Right Weapon, Mixed-Ammo Chamber & Rig Readout */}
-            <div className="pointer-events-auto flex items-center gap-3 border border-white/10 bg-[#0b0e13]/90 px-3.5 py-2 font-mono-tabular text-xs text-neutral-200">
-              <div>
-                <span className="font-semibold text-neutral-50">{combat.equippedWeaponName}</span>
-                {combat.activeRoundLabel && (
-                  <span className="ml-2 border border-sky-400/40 bg-sky-950/50 px-1.5 py-0.5 text-[10px] font-semibold text-sky-200">
-                    {combat.activeRoundLabel}
-                  </span>
-                )}
-              </div>
-              {combat.magCapacity > 0 && (
-                <>
-                  <span aria-hidden="true" className="text-neutral-600">·</span>
-                  <span>
-                    <strong className={combat.ammoInMag <= 5 ? 'text-amber-400' : 'text-neutral-50'}>
-                      {combat.reloading ? 'RLD' : combat.ammoInMag}
-                    </strong>
-                    <span className="text-neutral-400">
-                      {' '}
-                      / {combat.rigQuickMagCount} Rig Mag{combat.rigQuickMagCount === 1 ? '' : 's'}
-                    </span>
-                    {combat.backpackReserveRounds > 0 && (
-                      <span className="ml-1 text-[10px] text-neutral-500">
-                        (+{combat.backpackReserveRounds} Pack)
-                      </span>
-                    )}
-                  </span>
-                </>
-              )}
-              <span aria-hidden="true" className="text-neutral-600">·</span>
-              <span className="text-neutral-300">
-                {combat.grenadeDrawn ? `ORD:${combat.grenadeHoldStage}` : `FRAG x${combat.grenadeCount}`}
-              </span>
-              <span aria-hidden="true" className="text-neutral-600">·</span>
-              <button
-                type="button"
-                onClick={onOpenInventory}
-                className="flex cursor-pointer items-center gap-1 border border-amber-400/45 bg-amber-950/40 px-2 py-0.5 text-[11px] font-semibold text-amber-200 hover:border-amber-300"
-              >
-                <Backpack className="h-3 w-3" />
-                <span>[Tab] Rig &amp; Pack</span>
-              </button>
-              <span className={combat.isPdaOpen ? 'text-emerald-300' : 'text-neutral-400'}>
-                [M] PDA
-              </span>
             </div>
           </div>
         )}
 
-        {/* Collapsible Unified Bottom Control Dock (Zero Center / Flank Occlusion) */}
-        <div className="pointer-events-auto mx-auto flex w-full max-w-[940px] flex-col items-center">
-          <button
-            type="button"
-            onClick={() => setDockOpen((prev) => !prev)}
-            className="flex cursor-pointer items-center gap-1.5 border border-b-0 border-white/15 bg-[#0e1218] px-3.5 py-1 text-[11px] font-medium text-neutral-300 transition-colors hover:text-neutral-50 whitespace-nowrap"
-          >
-            {dockOpen ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronUp className="h-3.5 w-3.5" />}
-            <span>{dockOpen ? 'Hide Theater Controls (H)' : 'Theater Controls & Sectors (H)'}</span>
-          </button>
-
-          {dockOpen && (
+        {/* Explicit [H] Theater Operations Drawer (hidden cleanly when collapsed) */}
+        {dockOpen && (
+          <div className="pointer-events-auto mx-auto flex w-full max-w-[940px] flex-col items-center">
             <div className="w-full border border-white/14 bg-[#0d1117] px-4 py-3 text-xs text-neutral-200">
               <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/10 pb-2.5">
                 <div className="flex items-center gap-1">
@@ -860,6 +698,40 @@ export const OpenWorldHud: React.FC<OpenWorldHudProps> = ({
                       </div>
                     </div>
 
+                    {/* Graphics Quality Presets & Opt-In Adaptive Scaling (OFF by default) */}
+                    <div className="flex flex-wrap items-center justify-between gap-2 border-t border-white/10 pt-2">
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <span className="text-[11px] font-medium text-neutral-400 mr-1">Quality:</span>
+                        {GRAPHICS_QUALITY_ORDER.map((gid) => (
+                          <button
+                            key={gid}
+                            type="button"
+                            onClick={() => setGraphicsQuality(gid)}
+                            className={`cursor-pointer border px-2 py-1 font-mono-tabular text-[10px] font-semibold uppercase transition-colors whitespace-nowrap shrink-0 ${
+                              graphicsQuality === gid
+                                ? 'border-amber-400/75 bg-amber-950/60 text-amber-200'
+                                : 'border-white/12 bg-[#141922] text-neutral-300 hover:border-white/30'
+                            }`}
+                            title={GRAPHICS_QUALITY_PROFILES[gid].description}
+                          >
+                            {GRAPHICS_QUALITY_PROFILES[gid].shortLabel}
+                          </button>
+                        ))}
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setAdaptiveScaling(!adaptiveScaling)}
+                        className={`cursor-pointer border px-2.5 py-1 font-mono-tabular text-[10px] font-semibold uppercase transition-colors whitespace-nowrap shrink-0 ${
+                          adaptiveScaling
+                            ? 'border-sky-400/70 bg-sky-950/60 text-sky-200'
+                            : 'border-white/12 bg-[#141922] text-neutral-300 hover:border-white/30'
+                        }`}
+                        title="Automatically scale resolution and sky/godrays if FPS dips below target (OFF by default)"
+                      >
+                        Adaptive Scaling: {adaptiveScaling ? 'ON' : 'OFF'}
+                      </button>
+                    </div>
+
                     {/* Phase 5 Dynamic World Events Scheduler & Manual Triggers */}
                     <div className="flex flex-wrap items-center justify-between gap-2 border-t border-white/10 pt-2">
                       <div className="flex flex-wrap items-center gap-1.5 font-mono-tabular text-[11px]">
@@ -889,25 +761,35 @@ export const OpenWorldHud: React.FC<OpenWorldHudProps> = ({
 
                     <div className="flex flex-wrap items-center justify-between gap-3 border-t border-white/10 pt-2">
                       <div className="font-mono-tabular text-[11px] text-neutral-400">
-                        [Tab] Tetris Rig &amp; Pack · LMB Fire · RMB ADS · R Rig Reload · G Grenade · M GPS PDA · N NVG · F Interact · X Sabotage · AI: {snapshot.ai.totalAlive} · Corpses: {snapshot.shardCorpseCount}
+                        [1/2] Firearms · [3] Combat Knife · [0] Empty Hands · [I] Inspect · [Tab] Rig &amp; Pack · [M] GPS PDA ({combat.pdaBatteryPct}%) · [N] NVG · [F] Interact
                       </div>
-                      {char && (
+                      <div className="flex items-center gap-2">
                         <button
                           type="button"
-                          onClick={onTriggerFieldDeath}
-                          className="flex cursor-pointer items-center gap-1.5 border border-red-500/65 bg-red-950/55 px-3 py-1.5 text-xs font-semibold text-red-200 transition-colors hover:border-red-400 hover:bg-red-950/80 whitespace-nowrap shrink-0"
+                          onClick={onExfilToHideout}
+                          className="flex cursor-pointer items-center gap-1.5 border border-amber-500/60 bg-[#1a160f] px-3 py-1.5 text-xs font-semibold text-amber-200 hover:border-amber-400 whitespace-nowrap shrink-0"
                         >
-                          <Skull className="h-3.5 w-3.5" />
-                          <span>Simulate Field Death Here</span>
+                          <LogOut className="h-3.5 w-3.5" />
+                          <span>Exfil</span>
                         </button>
-                      )}
+                        {char && (
+                          <button
+                            type="button"
+                            onClick={onTriggerFieldDeath}
+                            className="flex cursor-pointer items-center gap-1.5 border border-red-500/65 bg-red-950/55 px-3 py-1.5 text-xs font-semibold text-red-200 transition-colors hover:border-red-400 hover:bg-red-950/80 whitespace-nowrap shrink-0"
+                          >
+                            <Skull className="h-3.5 w-3.5" />
+                            <span>Simulate Field Death</span>
+                          </button>
+                        )}
+                      </div>
                     </div>
                   </div>
                 )}
               </div>
             </div>
-          )}
-        </div>
+          </div>
+        )}
       </div>
 
       {/* Phase 5 Interactive Tetris Grid Inventory & Corpse/Event Loot Modal */}
@@ -922,26 +804,94 @@ export const OpenWorldHud: React.FC<OpenWorldHudProps> = ({
             maxHp={combat.maxHp}
             bleeding={combat.bleedingRemainingSec > 0}
             sprintSlow={combat.sprintSlowRemainingSec > 0}
+            pdaBatteryPct={combat.pdaBatteryPct}
             onMutateInventory={onMutateInventory}
             onTriggerDragReload={onTriggerDragReload}
             onUseMedicalItem={onUseMedicalItem}
+            onUsePdaBattery={onUsePdaBattery}
             onClose={onCloseModal}
           />
         )}
 
-      {/* Phase 4 In-World Home FOB Logistics & Quartermaster Terminal Modal */}
-      {snapshot.activeModal === 'fob_terminal' && snapshot.fobTerminalState && char && (
-        <FobTerminalModal
-          terminal={snapshot.fobTerminalState}
-          cashUsd={char.cash}
-          callsign={char.callsign}
-          contractBoard={char.contractBoard ?? []}
-          onFundUpgrade={onFundFobUpgrade}
-          onBuyOffer={onBuyFobOffer}
-          onAcceptContract={onAcceptContract}
-          onCompleteContract={onCompleteContract}
+      {/* Phase 4 In-World Home FOB & Trusted Sub-Faction Black-Market Terminal Modal */}
+      {(snapshot.activeModal === 'fob_terminal' ||
+        snapshot.activeModal === 'black_market_terminal') &&
+        snapshot.fobTerminalState &&
+        char && (
+          <FobTerminalModal
+            terminal={snapshot.fobTerminalState}
+            cashUsd={char.cash}
+            callsign={char.callsign}
+            contractBoard={char.contractBoard ?? []}
+            blackMarketContext={snapshot.blackMarketContext}
+            onFundUpgrade={onFundFobUpgrade}
+            onBuyOffer={onBuyFobOffer}
+            onAcceptContract={onAcceptContract}
+            onCompleteContract={onCompleteContract}
+            onClose={onCloseModal}
+          />
+        )}
+
+      {/* FOB Armory & Persistent Player Stash Lockers Modal */}
+      {snapshot.activeModal === 'armory_stash' && char && (
+        <ArmoryStashModal
+          character={char}
+          onDepositItem={onDepositArmoryItem}
+          onWithdrawItem={onWithdrawArmoryItem}
+          onEquipWeapon={onEquipArmoryWeapon}
+          onEquipArmorPlate={onEquipArmoryArmorPlate}
+          onResupplyAmmo={onResupplyArmoryAmmo}
           onClose={onCloseModal}
         />
+      )}
+
+      {/* Tier 3 FOB Fast-Travel Helipad Dispatch Modal */}
+      {snapshot.activeModal === 'helipad_travel' && (
+        <div className="pointer-events-auto fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
+          <div className="w-full max-w-lg border border-white/15 bg-[#0c1016] text-neutral-100 shadow-2xl">
+            <div className="flex items-center justify-between border-b border-white/10 px-4 py-3">
+              <div>
+                <h2 className="text-sm font-semibold text-neutral-50">
+                  Tier 3 Helipad — Tactical Fast-Travel Dispatch
+                </h2>
+                <p className="text-xs text-neutral-400">
+                  Select any friendly FOB or secured sector landing zone for immediate rotor insertion.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={onCloseModal}
+                className="cursor-pointer border border-white/15 p-1.5 text-neutral-400 hover:border-white/35 hover:text-neutral-100"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+            <div className="grid grid-cols-1 gap-2 p-4 sm:grid-cols-2">
+              {snapshot.fastTravelDestinations.map((dest) => (
+                <button
+                  key={dest.sectorId}
+                  type="button"
+                  onClick={() => onFastTravelToSector(dest.sectorId)}
+                  className="flex cursor-pointer items-center justify-between border border-white/12 bg-[#131820] px-3 py-2.5 text-left transition-colors hover:border-amber-400/70 hover:bg-[#19202b]"
+                >
+                  <div>
+                    <div className="text-xs font-semibold text-neutral-100">{dest.name}</div>
+                    <div className="font-mono-tabular text-[10px] text-neutral-400">
+                      {dest.isFob ? 'HOME FOB LZ' : 'SECURED SECTOR LZ'} · ({Math.round(dest.worldX)},{' '}
+                      {Math.round(dest.worldZ)})
+                    </div>
+                  </div>
+                  <Compass className="h-4 w-4 shrink-0 text-amber-300" />
+                </button>
+              ))}
+              {snapshot.fastTravelDestinations.length === 0 && (
+                <div className="col-span-2 border border-white/10 bg-[#12161e] p-3 text-xs text-neutral-400">
+                  No friendly landing zones currently secured.
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

@@ -85,6 +85,8 @@ export interface CreateLobbyPayload {
   killLimit?: number;
   botDifficulty?: BotDifficultyId;
   killfeedPolicy?: LobbyKillfeedPolicy;
+  hitmarkersEnabled?: boolean;
+  hudEnabled?: boolean;
   specialEventId?: string | null;
 }
 

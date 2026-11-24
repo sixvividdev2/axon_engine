@@ -42,6 +42,7 @@ import {
 } from '../bodycam-sdk/weapons/WeaponModelFactory';
 import { normalizeWeaponAttachments, WeaponAttachments } from '../data/attachments';
 import { SyncedHandlingAction } from '../data/multiplayer';
+import { IR_LAYER } from '../bodycam-sdk/BodycamPostProcess';
 
 export type TacticalActorKind = 'remote_player' | 'bot';
 
@@ -92,6 +93,14 @@ export interface TacticalCombatPose {
   wallObstruction01?: number;
   /** 0..1 waist wall proximity compressing belt equipment radially inward */
   beltWallTuck01?: number;
+  /** Independent head yaw offset in radians (+left, -right, clamped anatomically) */
+  headYaw?: number;
+  /** Independent head pitch offset in radians (+up, -down) */
+  headPitchOffset?: number;
+  /** Independent head roll offset in radians (curious/alert tilt or hit flinch) */
+  headRollOffset?: number;
+  /** Upper-body yaw offset in radians for natural alert/scanning posture */
+  torsoYawOffset?: number;
 }
 
 export interface BuiltTacticalOperatorRig {
@@ -133,6 +142,9 @@ export interface BuiltTacticalOperatorRig {
     nvgMount?: NvgMountId;
     nvgFlipped?: boolean;
   }) => void;
+  setFactionArmband: (colorHex: number | null) => void;
+  setIrStrobe: (enabled: boolean, pulseOn?: boolean) => void;
+  setWarningLaser: (active: boolean, lengthM?: number) => void;
 }
 
 type MaterialSlot =
@@ -314,6 +326,9 @@ export class TacticalOperatorRigFactory {
   private readonly geoFlash: THREE.OctahedronGeometry;
   private readonly geoLaser: THREE.CylinderGeometry;
   private readonly geoLightGlow: THREE.SphereGeometry;
+  private readonly geoArmband: THREE.CylinderGeometry;
+  private readonly geoIrStrobeHousing: THREE.BoxGeometry;
+  private readonly geoIrStrobeEmitter: THREE.SphereGeometry;
 
   constructor(maxAnisotropy = 4) {
     this.materialLib = new TacticalUniformMaterialLibrary(maxAnisotropy);
@@ -389,6 +404,9 @@ export class TacticalOperatorRigFactory {
     this.geoLaser = this.track(new THREE.CylinderGeometry(0.0036, 0.0036, 15, 4));
     this.geoLaser.rotateX(Math.PI * 0.5);
     this.geoLightGlow = this.track(new THREE.SphereGeometry(0.046, 6, 6));
+    this.geoArmband = this.track(new THREE.CylinderGeometry(0.053, 0.049, 0.068, 10, 1, true));
+    this.geoIrStrobeHousing = this.track(new THREE.BoxGeometry(0.036, 0.015, 0.044));
+    this.geoIrStrobeEmitter = this.track(new THREE.SphereGeometry(0.013, 8, 6));
   }
 
   private track<T extends { dispose: () => void }>(res: T): T {
@@ -916,6 +934,19 @@ export class TacticalOperatorRigFactory {
     const earR = makeMesh(this.geoEarPro, 'hardware');
     earR.position.set(0.118 * headScaleXZ, 0.128, 0.01);
 
+    const irStrobeHousing = makeMesh(this.geoIrStrobeHousing, 'hardware');
+    irStrobeHousing.position.set(0, 0.278, 0.025 * headScaleXZ);
+    const irStrobeMat = new THREE.MeshBasicMaterial({
+      color: 0xd9f99d,
+      transparent: true,
+      opacity: 0.95,
+      toneMapped: false,
+    });
+    const irStrobeEmitter = new THREE.Mesh(this.geoIrStrobeEmitter, irStrobeMat);
+    irStrobeEmitter.position.set(0, 0.289, 0.025 * headScaleXZ);
+    irStrobeEmitter.layers.set(IR_LAYER);
+    irStrobeEmitter.visible = false;
+
     headGroup.add(
       neck,
       headCore,
@@ -928,6 +959,8 @@ export class TacticalOperatorRigFactory {
       visor,
       earL,
       earR,
+      irStrobeHousing,
+      irStrobeEmitter,
     );
 
     if (isFemale) {
@@ -937,6 +970,15 @@ export class TacticalOperatorRigFactory {
       bun.position.set(0, 0.096, 0.115);
       headGroup.add(bun);
     }
+
+    // Per-rig colored faction armbands (diegetic IFF)
+    const armbandMat = new THREE.MeshStandardMaterial({
+      color: 0x38bdf8,
+      roughness: 0.72,
+      metalness: 0.05,
+      side: THREE.DoubleSide,
+    });
+    const armbandMeshes: THREE.Mesh[] = [];
 
     // === ARTICULATED 2-BONE ARMS (UpperArm -> Elbow -> Forearm -> Cuff -> Glove) ===
     // Both segments extend along local -Y so identity rotation hangs naturally down for ragdoll parity.
@@ -953,6 +995,13 @@ export class TacticalOperatorRigFactory {
 
       const patch = makeMesh(this.geoShoulderPatch, 'iffTrim');
       patch.position.set(side * 0.052 * armR, -0.105, -0.008);
+
+      const armband = new THREE.Mesh(this.geoArmband, armbandMat);
+      armband.scale.set(armR, 1.0, armR);
+      armband.position.set(0, -0.145, 0);
+      armband.visible = false;
+      armband.castShadow = false;
+      armbandMeshes.push(armband);
 
       const forearmPivot = new THREE.Group();
       forearmPivot.position.set(0, -upperArmLen, 0);
@@ -973,7 +1022,7 @@ export class TacticalOperatorRigFactory {
       glove.position.set(0, -lowerArmLen - 0.025, 0);
 
       forearmPivot.add(elbow, forearmMesh, cuff, glove);
-      armPivot.add(shoulder, upperArmMesh, patch, forearmPivot);
+      armPivot.add(shoulder, upperArmMesh, patch, armband, forearmPivot);
       return { armPivot, forearmPivot, glove };
     };
 
@@ -1002,11 +1051,23 @@ export class TacticalOperatorRigFactory {
     laserBeam.position.set(0.026, 0.02, -7.85);
     laserBeam.visible = false;
 
+    const warningLaserMat = new THREE.MeshBasicMaterial({
+      color: 0xef4444,
+      transparent: true,
+      opacity: 0.72,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+      toneMapped: false,
+    });
+    const warningLaserBeam = new THREE.Mesh(this.geoLaser, warningLaserMat);
+    warningLaserBeam.position.set(0.026, 0.02, -7.85);
+    warningLaserBeam.visible = false;
+
     const flashlightGlow = makeMesh(this.geoLightGlow, 'lightGlow');
     flashlightGlow.position.set(-0.026, -0.008, -0.52);
     flashlightGlow.visible = false;
 
-    weaponPivot.add(muzzleFlash, laserBeam, flashlightGlow);
+    weaponPivot.add(muzzleFlash, laserBeam, warningLaserBeam, flashlightGlow);
 
     // Local grip anchors in weaponSocket space for 2-bone arm IK (updated dynamically from real assembly sockets)
     const rightGripLocal = new THREE.Vector3(0.0, -0.078, -0.012);
@@ -1066,10 +1127,41 @@ export class TacticalOperatorRigFactory {
         built.dispose();
       }
       heldGrenadeMeshes.clear();
+      armbandMat.dispose();
+      irStrobeMat.dispose();
+      warningLaserMat.dispose();
       currentWeaponSig = '';
     };
 
     this.disposables.push({ dispose: disposeWeapon });
+
+    const setFactionArmband = (colorHex: number | null): void => {
+      const show = colorHex !== null;
+      if (show) {
+        armbandMat.color.setHex(colorHex);
+      }
+      for (let i = 0; i < armbandMeshes.length; i++) {
+        armbandMeshes[i].visible = show;
+      }
+    };
+
+    const setIrStrobe = (enabled: boolean, pulseOn = true): void => {
+      irStrobeEmitter.visible = enabled && pulseOn;
+    };
+
+    const setWarningLaser = (active: boolean, lengthM = 24): void => {
+      warningLaserBeam.visible = active && !isUnarmedWeapon;
+      if (active) {
+        const clampedLen = THREE.MathUtils.clamp(lengthM, 2, 48);
+        const scaleZ = clampedLen / 15;
+        warningLaserBeam.scale.set(1.25, 1.25, scaleZ);
+        warningLaserBeam.position.set(
+          laserBeam.position.x,
+          laserBeam.position.y,
+          -clampedLen * 0.5 - 0.35,
+        );
+      }
+    };
 
     const setWeaponLoadout = (
       weaponId: string,
@@ -1415,16 +1507,32 @@ export class TacticalOperatorRigFactory {
       const crouchTorsoForward = -crouch * 0.12;
       const vaultTorsoForward = -vaultW * (vaultPeak * 0.36 + (isHighMantle ? 0.18 * vaultPeak : 0));
       const vaultRoll = vaultW * vaultPeak * (isHighMantle ? 0.04 : 0.18);
+      const strideFactor = THREE.MathUtils.clamp(pose.speedMps / 4.8, 0, 1) * (1 - vaultW) * (1 - ads * 0.55);
+      const strideTorsoYaw = Math.sin(pose.walkCycle) * 0.055 * strideFactor;
+      const strideTorsoRoll = Math.sin(pose.walkCycle) * 0.032 * strideFactor;
+      const torsoYawExtra = THREE.MathUtils.clamp(pose.torsoYawOffset ?? 0, -0.35, 0.35) * (1 - vaultW);
       upperBody.position.set(lean * 0.06 * (1 - vaultW), 0.035, -vaultW * vaultPeak * 0.05);
       upperBody.rotation.set(
         crouchTorsoForward + vaultTorsoForward + pose.flinchPitch + grenadeTorsoPitch,
-        grenadeTorsoYaw,
-        -lean * 0.24 * (1 - vaultW) + vaultRoll,
+        grenadeTorsoYaw + torsoYawExtra + strideTorsoYaw,
+        -lean * 0.24 * (1 - vaultW) + vaultRoll + strideTorsoRoll,
       );
 
-      // 3. Head aim pitch tracking + subtle cheek-weld roll
+      // 3. Head aim pitch/yaw/roll tracking + idle scanning + cheek-weld roll
       const cheekWeldRoll = (ads - pointAim * 0.35) * 0.11 * (1 - vaultW) * (isGrenadeAct ? 0 : 1);
-      headGroup.rotation.set(pitch * 0.76 * (1 - vaultW * 0.6) - vaultW * vaultPeak * 0.18, 0, -cheekWeldRoll);
+      const headYaw = THREE.MathUtils.clamp(pose.headYaw ?? 0, -0.78, 0.78) * (1 - vaultW * 0.8);
+      const headPitchExtra = THREE.MathUtils.clamp(pose.headPitchOffset ?? 0, -0.35, 0.35);
+      const headRollExtra = THREE.MathUtils.clamp(pose.headRollOffset ?? 0, -0.25, 0.25);
+      headGroup.rotation.order = 'YXZ';
+      headGroup.rotation.set(
+        THREE.MathUtils.clamp(
+          pitch * 0.76 * (1 - vaultW * 0.6) - vaultW * vaultPeak * 0.18 + headPitchExtra,
+          -0.68,
+          0.62,
+        ),
+        headYaw,
+        -cheekWeldRoll + headRollExtra,
+      );
 
       // 4. Local weaponSocket placement on upper chest / right shoulder ready-mount
       const effAds = ads * (1 - vaultW) * (isGrenadeAct ? 0 : 1);
@@ -1944,6 +2052,9 @@ export class TacticalOperatorRigFactory {
       setSuppressedVisual,
       disposeWeapon,
       setGearAppearance,
+      setFactionArmband,
+      setIrStrobe,
+      setWarningLaser,
     };
   }
 

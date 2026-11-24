@@ -2871,6 +2871,150 @@ export class BodycamAudio implements IBodycamAudioSource {
   }
 
   /**
+   * Grounded procedural bio-containment airlock audio:
+   * - 'seal': heavy hydraulic slide + steel bulkhead lock thud + brief amber klaxon chirp
+   * - 'decon': high-pressure overhead mist nozzle hiss + low chamber pressurization hum
+   * - 'open': pressure relief vent + heavy outer blast door / transport ramp hydraulic unseal
+   */
+  public playAirlockSequence(stage: 'seal' | 'decon' | 'open'): void {
+    this.ensureInitialized();
+    if (!this.ctx || !this.dryBus || !this.noiseBuffer) return;
+    const ctx = this.ctx;
+    const t = ctx.currentTime;
+
+    if (stage === 'seal') {
+      // 1. Heavy hydraulic motor slide (bandpassed noise + low sawtooth rumble)
+      const slide = ctx.createBufferSource();
+      slide.buffer = this.noiseBuffer;
+      const slideBp = ctx.createBiquadFilter();
+      slideBp.type = 'bandpass';
+      slideBp.frequency.setValueAtTime(340, t);
+      slideBp.frequency.exponentialRampToValueAtTime(160, t + 0.42);
+      slideBp.Q.value = 2.1;
+      const slideG = ctx.createGain();
+      slideG.gain.setValueAtTime(0.001, t);
+      slideG.gain.linearRampToValueAtTime(0.24, t + 0.08);
+      slideG.gain.exponentialRampToValueAtTime(0.001, t + 0.48);
+      slide.connect(slideBp);
+      slideBp.connect(slideG);
+      this.connectToOutputBuses(slideG);
+      slide.start(t, Math.random() * 0.5, 0.52);
+
+      // 2. Heavy steel bulkhead deadbolt slam at +0.34s
+      const slamT = t + 0.34;
+      const sub = ctx.createOscillator();
+      sub.type = 'sine';
+      sub.frequency.setValueAtTime(92, slamT);
+      sub.frequency.exponentialRampToValueAtTime(32, slamT + 0.22);
+      const subG = ctx.createGain();
+      subG.gain.setValueAtTime(0.38, slamT);
+      subG.gain.exponentialRampToValueAtTime(0.001, slamT + 0.25);
+      sub.connect(subG);
+      this.connectToOutputBuses(subG, true);
+      sub.start(slamT);
+      sub.stop(slamT + 0.26);
+
+      const clank = ctx.createOscillator();
+      clank.type = 'triangle';
+      clank.frequency.setValueAtTime(680, slamT);
+      clank.frequency.exponentialRampToValueAtTime(190, slamT + 0.09);
+      const clankG = ctx.createGain();
+      clankG.gain.setValueAtTime(0.22, slamT);
+      clankG.gain.exponentialRampToValueAtTime(0.001, slamT + 0.11);
+      clank.connect(clankG);
+      this.connectToOutputBuses(clankG);
+      clank.start(slamT);
+      clank.stop(slamT + 0.12);
+
+      // 3. Subtle grounded quarantine warning double-chirp
+      for (let i = 0; i < 2; i++) {
+        const cT = t + 0.06 + i * 0.22;
+        const chirp = ctx.createOscillator();
+        chirp.type = 'sawtooth';
+        chirp.frequency.setValueAtTime(520, cT);
+        chirp.frequency.linearRampToValueAtTime(480, cT + 0.12);
+        const lp = ctx.createBiquadFilter();
+        lp.type = 'lowpass';
+        lp.frequency.value = 1200;
+        const cg = ctx.createGain();
+        cg.gain.setValueAtTime(0.001, cT);
+        cg.gain.linearRampToValueAtTime(0.065, cT + 0.015);
+        cg.gain.exponentialRampToValueAtTime(0.001, cT + 0.14);
+        chirp.connect(lp);
+        lp.connect(cg);
+        this.connectToOutputBuses(cg);
+        chirp.start(cT);
+        chirp.stop(cT + 0.15);
+      }
+      return;
+    }
+
+    if (stage === 'decon') {
+      // High-pressure mist nozzle jet hiss (~0.9s) + pressurization drone
+      const hiss = ctx.createBufferSource();
+      hiss.buffer = this.noiseBuffer;
+      const bp = ctx.createBiquadFilter();
+      bp.type = 'bandpass';
+      bp.frequency.setValueAtTime(1600, t);
+      bp.frequency.exponentialRampToValueAtTime(2950, t + 0.25);
+      bp.frequency.exponentialRampToValueAtTime(1150, t + 0.92);
+      bp.Q.value = 1.1;
+      const hg = ctx.createGain();
+      hg.gain.setValueAtTime(0.001, t);
+      hg.gain.linearRampToValueAtTime(0.22, t + 0.12);
+      hg.gain.setValueAtTime(0.18, t + 0.58);
+      hg.gain.exponentialRampToValueAtTime(0.001, t + 0.95);
+      hiss.connect(bp);
+      bp.connect(hg);
+      this.connectToOutputBuses(hg);
+      hiss.start(t, Math.random() * 0.5, 0.98);
+
+      const drone = ctx.createOscillator();
+      drone.type = 'sine';
+      drone.frequency.setValueAtTime(56, t);
+      drone.frequency.linearRampToValueAtTime(74, t + 0.45);
+      drone.frequency.linearRampToValueAtTime(48, t + 0.9);
+      const dg = ctx.createGain();
+      dg.gain.setValueAtTime(0.001, t);
+      dg.gain.linearRampToValueAtTime(0.14, t + 0.18);
+      dg.gain.exponentialRampToValueAtTime(0.001, t + 0.92);
+      drone.connect(dg);
+      this.connectToOutputBuses(dg);
+      drone.start(t);
+      drone.stop(t + 0.94);
+      return;
+    }
+
+    // stage === 'open': Pneumatic pressure vent + outer blast door / transport ramp unseal
+    const vent = ctx.createBufferSource();
+    vent.buffer = this.noiseBuffer;
+    const hp = ctx.createBiquadFilter();
+    hp.type = 'bandpass';
+    hp.frequency.setValueAtTime(2200, t);
+    hp.frequency.exponentialRampToValueAtTime(620, t + 0.42);
+    hp.Q.value = 1.6;
+    const vg = ctx.createGain();
+    vg.gain.setValueAtTime(0.18, t);
+    vg.gain.exponentialRampToValueAtTime(0.001, t + 0.45);
+    vent.connect(hp);
+    hp.connect(vg);
+    this.connectToOutputBuses(vg);
+    vent.start(t, Math.random() * 0.5, 0.48);
+
+    const latch = ctx.createOscillator();
+    latch.type = 'sine';
+    latch.frequency.setValueAtTime(115, t + 0.08);
+    latch.frequency.exponentialRampToValueAtTime(42, t + 0.28);
+    const lg = ctx.createGain();
+    lg.gain.setValueAtTime(0.24, t + 0.08);
+    lg.gain.exponentialRampToValueAtTime(0.001, t + 0.30);
+    latch.connect(lg);
+    this.connectToOutputBuses(lg);
+    latch.start(t + 0.08);
+    latch.stop(t + 0.32);
+  }
+
+  /**
    * Exposes the active Web Audio context and chest-mic output buses so open-world
    * environmental ambience and spatial wildlife audio share the same HRTF listener,
    * interior muffling state, and chest-mic saturation/compressor chain.

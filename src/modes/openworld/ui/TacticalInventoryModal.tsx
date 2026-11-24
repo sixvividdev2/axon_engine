@@ -59,6 +59,7 @@ interface TacticalInventoryModalProps {
   maxHp: number;
   bleeding: boolean;
   sprintSlow: boolean;
+  pdaBatteryPct?: number;
   onMutateInventory: (
     nextInv: OperatorTacticalInventory,
     nextExternal?: CorpseTacticalLootSnapshot | null,
@@ -72,6 +73,7 @@ interface TacticalInventoryModalProps {
     locator: ItemSourceLocator,
     med: MedicalItem,
   ) => void;
+  onUsePdaBattery?: (locator: ItemSourceLocator) => void;
   onClose: () => void;
 }
 
@@ -113,6 +115,8 @@ function itemToneClass(item: TacticalItem): string {
     case 'intel':
     case 'key':
       return 'border-amber-300/60 bg-[#221c10] text-amber-100';
+    case 'battery':
+      return 'border-cyan-400/55 bg-[#0e2026] text-cyan-100';
     default:
       return 'border-white/18 bg-[#171b22] text-neutral-200';
   }
@@ -123,6 +127,7 @@ function itemBadgeText(item: TacticalItem): string {
   if (item.kind === 'ammo_stack') return `x${item.count}`;
   if (item.kind === 'medical') return `${item.usesRemaining}/${item.maxUses}`;
   if (item.kind === 'grenade') return `x${item.count}`;
+  if (item.kind === 'battery') return `${item.chargePct}%`;
   if (item.kind === 'backpack') return `${item.grid.width}x${item.grid.height}`;
   if (item.kind === 'chest_rig') return `${item.rifleMagCapacity}R/${item.pistolMagCapacity}P`;
   return `$${item.valueUsd}`;
@@ -195,9 +200,11 @@ export const TacticalInventoryModal: React.FC<TacticalInventoryModalProps> = ({
   maxHp,
   bleeding,
   sprintSlow,
+  pdaBatteryPct,
   onMutateInventory,
   onTriggerDragReload,
   onUseMedicalItem,
+  onUsePdaBattery,
   onClose,
 }) => {
   const [drag, setDrag] = useState<DragState | null>(null);
@@ -661,6 +668,8 @@ export const TacticalInventoryModal: React.FC<TacticalInventoryModalProps> = ({
                   e.stopPropagation();
                   if (placed.item.kind === 'medical' && !zone.startsWith('external_')) {
                     onUseMedicalItem(loc, placed.item);
+                  } else if (placed.item.kind === 'battery' && !zone.startsWith('external_') && onUsePdaBattery) {
+                    onUsePdaBattery(loc);
                   } else if (placed.item.kind === 'magazine') {
                     setInspectedTarget({ kind: 'locator', locator: loc });
                   } else if (placed.item.kind === 'chest_rig' || placed.item.kind === 'backpack') {
@@ -695,6 +704,18 @@ export const TacticalInventoryModal: React.FC<TacticalInventoryModalProps> = ({
                       className="border border-emerald-400/60 bg-emerald-950/90 px-1 text-[8px] font-semibold text-emerald-200 hover:bg-emerald-800"
                     >
                       USE
+                    </button>
+                  )}
+                  {placed.item.kind === 'battery' && !zone.startsWith('external_') && onUsePdaBattery && (
+                    <button
+                      type="button"
+                      onClick={(ev) => {
+                        ev.stopPropagation();
+                        onUsePdaBattery(loc);
+                      }}
+                      className="border border-cyan-400/60 bg-cyan-950/90 px-1 text-[8px] font-semibold text-cyan-200 hover:bg-cyan-800"
+                    >
+                      PDA
                     </button>
                   )}
                 </div>
@@ -802,6 +823,7 @@ export const TacticalInventoryModal: React.FC<TacticalInventoryModalProps> = ({
               HP {playerHp}/{maxHp}
               {bleeding ? ' · BLEEDING' : ''}
               {sprintSlow ? ' · LEG TRAUMA' : ''}
+              {typeof pdaBatteryPct === 'number' ? ` · PDA ${Math.round(pdaBatteryPct)}%` : ''}
             </span>
           </div>
 

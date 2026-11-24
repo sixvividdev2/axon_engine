@@ -51,12 +51,12 @@ function createInitialSectors(mode: ShardMode): Record<string, SectorControlReco
     landmark_fob_bravo: {
       sectorId: 'landmark_fob_bravo',
       owner: 'pmc_bravo',
-      captureProgress: 100,
+      captureProgress: -100,
       alertState: 'captured',
     },
     landmark_port_terminal: {
       sectorId: 'landmark_port_terminal',
-      owner: mode === 'PvE' ? 'pmc_alpha' : 'neutral',
+      owner: mode === 'PvE' ? 'pmc_alpha' : 'subfaction',
       captureProgress: mode === 'PvE' ? 100 : 0,
       alertState: mode === 'PvE' ? 'captured' : 'calm',
     },
@@ -68,13 +68,13 @@ function createInitialSectors(mode: ShardMode): Record<string, SectorControlReco
     },
     landmark_steppe_quarry: {
       sectorId: 'landmark_steppe_quarry',
-      owner: mode === 'PvE' ? 'pmc_bravo' : 'neutral',
-      captureProgress: mode === 'PvE' ? 100 : 0,
+      owner: mode === 'PvE' ? 'pmc_bravo' : 'subfaction',
+      captureProgress: mode === 'PvE' ? -100 : 0,
       alertState: mode === 'PvE' ? 'captured' : 'calm',
     },
     landmark_alpine_dam: {
       sectorId: 'landmark_alpine_dam',
-      owner: 'neutral',
+      owner: 'subfaction',
       captureProgress: 0,
       alertState: 'calm',
     },
@@ -93,7 +93,7 @@ function createInitialSectors(mode: ShardMode): Record<string, SectorControlReco
     comms_alpine_relay: {
       sectorId: 'comms_alpine_relay',
       owner: 'pmc_bravo',
-      captureProgress: 100,
+      captureProgress: -100,
       alertState: 'captured',
     },
     depot_valley_munitions: {
@@ -274,13 +274,28 @@ export class ShardStore {
               for (const [secId, rec] of Object.entries(src.sectors)) {
                 if (rec && typeof rec === 'object') {
                   const owner: SectorControlOwner =
-                    rec.owner === 'pmc_alpha' || rec.owner === 'pmc_bravo' ? rec.owner : 'neutral';
+                    rec.owner === 'pmc_alpha' ||
+                    rec.owner === 'pmc_bravo' ||
+                    rec.owner === 'subfaction' ||
+                    rec.owner === 'contested'
+                      ? rec.owner
+                      : 'neutral';
+                  const defaultProg =
+                    owner === 'pmc_alpha' ? 100 : owner === 'pmc_bravo' ? -100 : 0;
                   mergedSectors[secId] = {
                     sectorId: secId,
                     owner,
-                    captureProgress: clampPct(rec.captureProgress, owner === 'neutral' ? 0 : 100),
-                    alertState: rec.alertState ?? (owner === 'neutral' ? 'calm' : 'captured'),
-                    lastFlippedAtIso: typeof rec.lastFlippedAtIso === 'string' ? rec.lastFlippedAtIso : undefined,
+                    captureProgress: clampSignedPct(rec.captureProgress, defaultProg),
+                    heat: clampPct(rec.heat, 0),
+                    alertState:
+                      rec.alertState ??
+                      (owner === 'contested'
+                        ? 'contested'
+                        : owner === 'neutral' || owner === 'subfaction'
+                          ? 'calm'
+                          : 'captured'),
+                    lastFlippedAtIso:
+                      typeof rec.lastFlippedAtIso === 'string' ? rec.lastFlippedAtIso : undefined,
                   };
                 }
               }
@@ -490,7 +505,15 @@ export class ShardStore {
     const updatedRecord: SectorControlRecord = {
       sectorId,
       owner: newOwner,
-      captureProgress: newOwner === 'neutral' ? 0 : 100,
+      captureProgress:
+        newOwner === 'pmc_alpha' ? 100 : newOwner === 'pmc_bravo' ? -100 : 0,
+      heat: prev.heat ?? 0,
+      alertState:
+        newOwner === 'contested'
+          ? 'contested'
+          : newOwner === 'pmc_alpha' || newOwner === 'pmc_bravo'
+            ? 'captured'
+            : 'calm',
       lastFlippedAtIso: nowIso,
     };
     const nextSectors: Record<string, SectorControlRecord> = {
@@ -502,7 +525,7 @@ export class ShardStore {
       pmc_alpha: { ...shard.pmcSupplyPools.pmc_alpha },
       pmc_bravo: { ...shard.pmcSupplyPools.pmc_bravo },
     };
-    if (newOwner !== 'neutral' && supplyBonus) {
+    if ((newOwner === 'pmc_alpha' || newOwner === 'pmc_bravo') && supplyBonus) {
       const p = nextPools[newOwner];
       nextPools[newOwner] = {
         ammo: clampPct(p.ammo + (supplyBonus.ammo ?? 0), p.ammo),
@@ -518,7 +541,11 @@ export class ShardStore {
         ? 'PMC Alpha'
         : newOwner === 'pmc_bravo'
           ? 'PMC Bravo'
-          : 'Neutral';
+          : newOwner === 'subfaction'
+            ? 'Sub-Faction'
+            : newOwner === 'contested'
+              ? 'Contested'
+              : 'Neutral';
 
     this.state = {
       shards: {
@@ -765,6 +792,11 @@ export class ShardStore {
 function clampPct(raw: unknown, fallback: number): number {
   if (typeof raw !== 'number' || !Number.isFinite(raw)) return fallback;
   return Math.max(0, Math.min(100, Math.round(raw)));
+}
+
+function clampSignedPct(raw: unknown, fallback: number): number {
+  if (typeof raw !== 'number' || !Number.isFinite(raw)) return fallback;
+  return Math.max(-100, Math.min(100, Math.round(raw)));
 }
 
 function clampFobTier(raw: unknown): FobTier {

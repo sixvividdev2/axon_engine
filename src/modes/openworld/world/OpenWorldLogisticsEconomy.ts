@@ -9,6 +9,7 @@ import {
   createGrenadeItem,
   createMagazineItem,
   createMedicalItem,
+  createPdaBatteryItem,
   MAGAZINE_TEMPLATES,
   stowItemIntoOperatorInventory,
 } from '../inventory/TetrisInventoryCore';
@@ -41,7 +42,7 @@ export interface FobTraderOffer {
   readonly offerId: string;
   readonly name: string;
   readonly shortLabel: string;
-  readonly category: 'ammo' | 'magazine' | 'rig' | 'backpack' | 'medical' | 'ordnance' | 'armor';
+  readonly category: 'ammo' | 'magazine' | 'rig' | 'backpack' | 'medical' | 'ordnance' | 'armor' | 'utility';
   readonly supplyResource: SupplyResourceKey;
   readonly basePriceUsd: number;
   readonly baseStock: number;
@@ -94,6 +95,41 @@ export function classifySupplyTier(pct: number): SupplyStockTier {
   return 'starved';
 }
 
+export const RESTOCK_INTERVAL_HIGH_SEC = 1800; // 30 minutes (>70% supply)
+export const RESTOCK_INTERVAL_STRAINED_SEC = 3600; // 60 minutes (30-70% supply)
+export const RESTOCK_INTERVAL_STARVED_SEC = 7200; // 2 hours (<30% supply)
+
+export function formatRestockTimer(totalSec: number): string {
+  const clean = Math.max(0, Math.ceil(totalSec));
+  const hrs = Math.floor(clean / 3600);
+  const mins = Math.floor((clean % 3600) / 60);
+  const secs = clean % 60;
+  if (hrs > 0) {
+    return `${hrs}:${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+  }
+  return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+}
+
+/**
+ * Computes the unified wall-clock remaining restock countdown shared identically between
+ * Hideout Ready Room Quartermaster (`PerimeterOpsTerminalPanel`) and In-World FOB Quartermaster.
+ */
+export function computeUnifiedRestockRemainingSec(
+  pool: FactionSupplyPool,
+  sabotageDelaySec = 0,
+  nowMs = Date.now(),
+): { remainingSec: number; cycleIntervalSec: number; tier: SupplyStockTier } {
+  const avg = (pool.ammo + pool.medical + pool.fuelParts + pool.intel) / 4;
+  const st = evaluateSupplyResourceStatus('ammo', avg);
+  const cycleIntervalSec = Math.max(60, st.restockIntervalSec + Math.max(0, Math.round(sabotageDelaySec)));
+  const elapsedSec = Math.floor(nowMs / 1000) % cycleIntervalSec;
+  return {
+    remainingSec: Math.max(1, cycleIntervalSec - elapsedSec),
+    cycleIntervalSec,
+    tier: st.tier,
+  };
+}
+
 export function evaluateSupplyResourceStatus(
   resource: SupplyResourceKey,
   pct: number,
@@ -115,7 +151,7 @@ export function evaluateSupplyResourceStatus(
       tierLabel: 'HIGH',
       priceMultiplier: 1.0,
       stockScale: 1.0,
-      restockIntervalSec: 180,
+      restockIntervalSec: RESTOCK_INTERVAL_HIGH_SEC,
     };
   }
   if (tier === 'strained') {
@@ -127,7 +163,7 @@ export function evaluateSupplyResourceStatus(
       tierLabel: 'STRAINED',
       priceMultiplier: 1.2,
       stockScale: 0.5,
-      restockIntervalSec: 360,
+      restockIntervalSec: RESTOCK_INTERVAL_STRAINED_SEC,
     };
   }
   return {
@@ -138,7 +174,7 @@ export function evaluateSupplyResourceStatus(
     tierLabel: 'STARVED',
     priceMultiplier: 1.45,
     stockScale: 0.25,
-    restockIntervalSec: 720,
+    restockIntervalSec: RESTOCK_INTERVAL_STARVED_SEC,
   };
 }
 
@@ -291,6 +327,19 @@ export const FOB_TRADER_OFFERS: readonly FobTraderOffer[] = [
     description: '4-phase fragmentation ordnance. Fits Belt or Chest Rig pouches.',
     createItem: () => createGrenadeItem('m67_frag'),
   },
+  {
+    offerId: 'offer_pda_battery',
+    name: 'CR123A Lithium PDA Cell',
+    shortLabel: 'CR123A',
+    category: 'utility',
+    supplyResource: 'fuelParts',
+    basePriceUsd: 180,
+    baseStock: 10,
+    requiredFobTier: 1,
+    starvedLocked: false,
+    description: '1x1 replacement lithium battery cell. Restores Handheld GPS PDA charge to 100%.',
+    createItem: () => createPdaBatteryItem(100),
+  },
 
   // === ARMOR PLATES ===
   ...ARMOR_PLATE_CATALOG.slice(0, 4).map(
@@ -317,14 +366,19 @@ export const FOB_TRADER_OFFERS: readonly FobTraderOffer[] = [
  */
 export class OpenWorldLogisticsEconomy {
   private readonly purchasedCounts = new Map<string, number>();
+  private lastCycleBucket = -1;
   private restockElapsedSec = 0;
 
   public update(dt: number, pool: FactionSupplyPool, sabotageDelaySec: number): void {
-    const avg = (pool.ammo + pool.medical + pool.fuelParts + pool.intel) / 4;
-    const baseInterval = evaluateSupplyResourceStatus('ammo', avg).restockIntervalSec;
-    const effectiveInterval = baseInterval + Math.max(0, sabotageDelaySec);
+    const unified = computeUnifiedRestockRemainingSec(pool, sabotageDelaySec);
+    const bucket = Math.floor(Date.now() / 1000 / unified.cycleIntervalSec);
+    if (this.lastCycleBucket >= 0 && bucket !== this.lastCycleBucket) {
+      this.purchasedCounts.clear();
+      this.restockElapsedSec = 0;
+    }
+    this.lastCycleBucket = bucket;
     this.restockElapsedSec += dt;
-    if (this.restockElapsedSec >= effectiveInterval) {
+    if (this.restockElapsedSec >= unified.cycleIntervalSec) {
       this.restockElapsedSec = 0;
       this.purchasedCounts.clear();
     }
@@ -333,11 +387,12 @@ export class OpenWorldLogisticsEconomy {
   public getFobTerminalSnapshot(
     character: OpenWorldCharacter,
     shards: ShardStore,
+    options?: { blackMarketDiscount?: boolean },
   ): FobTerminalStateSnapshot {
     const shard = shards.getShard(character.shardMode);
     const faction = character.pmcFaction;
     const pool = shard.pmcSupplyPools[faction];
-    const fobTier = shard.fobTiers[faction] ?? 1;
+    const fobTier = options?.blackMarketDiscount ? 3 : (shard.fobTiers[faction] ?? 1);
     const sabotageDelaySec = shard.restockPenaltySec[faction] ?? 0;
     const avgSupplyPct = Math.round((pool.ammo + pool.medical + pool.fuelParts + pool.intel) / 4);
 
@@ -348,9 +403,8 @@ export class OpenWorldLogisticsEconomy {
       intel: evaluateSupplyResourceStatus('intel', pool.intel),
     };
 
-    const baseRestock = evaluateSupplyResourceStatus('ammo', avgSupplyPct).restockIntervalSec;
-    const totalRestock = baseRestock + sabotageDelaySec;
-    const restockRemainingSec = Math.max(0, Math.ceil(totalRestock - this.restockElapsedSec));
+    const unified = computeUnifiedRestockRemainingSec(pool, sabotageDelaySec);
+    const restockRemainingSec = unified.remainingSec;
 
     let nextUpgrade: FobTerminalStateSnapshot['nextUpgrade'] = null;
     if (fobTier < 3) {
@@ -383,15 +437,16 @@ export class OpenWorldLogisticsEconomy {
       const key = `${character.shardMode}:${faction}:${offer.offerId}`;
       const bought = this.purchasedCounts.get(key) ?? 0;
       const remainingStock = Math.max(0, maxStock - bought);
-      const priceUsd = Math.round(offer.basePriceUsd * st.priceMultiplier);
+      const priceMult = options?.blackMarketDiscount ? st.priceMultiplier * 0.85 : st.priceMultiplier;
+      const priceUsd = Math.round(offer.basePriceUsd * priceMult);
 
       let lockedReason: string | null = null;
       if (fobTier < offer.requiredFobTier) {
         lockedReason = `Requires FOB Tier ${offer.requiredFobTier}`;
-      } else if (st.tier === 'starved' && offer.starvedLocked) {
+      } else if (!options?.blackMarketDiscount && st.tier === 'starved' && offer.starvedLocked) {
         lockedReason = `${st.label} Starved (<30%)`;
       } else if (remainingStock <= 0) {
-        lockedReason = `Out of Stock (Restock ${restockRemainingSec}s)`;
+        lockedReason = `Out of Stock (Restock ${formatRestockTimer(restockRemainingSec)})`;
       } else if (character.cash < priceUsd) {
         lockedReason = 'Insufficient Cash';
       }
@@ -459,11 +514,12 @@ export class OpenWorldLogisticsEconomy {
     character: OpenWorldCharacter,
     roster: CharacterRoster,
     shards: ShardStore,
+    options?: { blackMarketDiscount?: boolean },
   ): { ok: boolean; message: string; equippedPlateId?: string } {
     const offer = FOB_TRADER_OFFERS.find((o) => o.offerId === offerId);
     if (!offer) return { ok: false, message: 'Unknown Quartermaster item.' };
 
-    const snap = this.getFobTerminalSnapshot(character, shards);
+    const snap = this.getFobTerminalSnapshot(character, shards, options);
     const evalOffer = snap.offers.find((o) => o.offerId === offerId);
     if (!evalOffer) return { ok: false, message: 'Offer unavailable.' };
     if (evalOffer.lockedReason) {

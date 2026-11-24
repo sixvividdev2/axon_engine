@@ -1570,7 +1570,7 @@ export class DestructibleDoorSystem {
     actorTeam?: 'A' | 'B' | 'FFA',
     fromRemote = false,
     hitObject?: THREE.Object3D | null,
-    attackType: 'jab' | 'cross' | 'bash' | 'kick' = 'bash',
+    attackType: 'jab' | 'cross' | 'bash' | 'kick' | 'knife_slash' | 'knife_stab' = 'bash',
   ): DoorDamageState | null {
     const d = this.doors.get(doorId);
     if (!d || d.hingeMode !== 'attached') return null;

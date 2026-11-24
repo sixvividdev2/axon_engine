@@ -27,7 +27,13 @@ export type BodycamAcousticKind =
 
 export type BodycamVaultMode = 'NONE' | 'VAULT_OVER' | 'CLIMB_ONTO' | 'HIGH_MANTLE' | 'SPIN_VAULT';
 
-export type BodycamMeleeAttackType = 'jab' | 'cross' | 'bash' | 'kick';
+export type BodycamMeleeAttackType =
+  | 'jab'
+  | 'cross'
+  | 'bash'
+  | 'kick'
+  | 'knife_slash'
+  | 'knife_stab';
 
 export type BodycamMeleeHitZone =
   | 'head'

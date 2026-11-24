@@ -87,9 +87,84 @@ export function getBeltSlotTransforms(
   }
 }
 
+interface CachedSharedMaterials {
+  steelMat: THREE.MeshStandardMaterial;
+  brassMat: THREE.MeshStandardMaterial;
+  corduraMat: THREE.MeshStandardMaterial;
+  ventMat: THREE.MeshStandardMaterial;
+}
+
+let cachedSharedMats: CachedSharedMaterials | null = null;
+const cachedEquipMats = new Map<
+  TacticalEquipmentId,
+  { bodyMat: THREE.MeshStandardMaterial; bandMat: THREE.MeshStandardMaterial }
+>();
+const cachedGeos = new Map<string, THREE.BufferGeometry>();
+
+function getOrCreateGeo<T extends THREE.BufferGeometry>(key: string, factory: () => T): T {
+  const existing = cachedGeos.get(key);
+  if (existing) return existing as T;
+  const created = factory();
+  cachedGeos.set(key, created);
+  return created;
+}
+
+function getSharedMaterials(): CachedSharedMaterials {
+  if (!cachedSharedMats) {
+    cachedSharedMats = {
+      steelMat: new THREE.MeshStandardMaterial({
+        color: 0x3b4046,
+        roughness: 0.42,
+        metalness: 0.78,
+      }),
+      brassMat: new THREE.MeshStandardMaterial({
+        color: 0xc8a956,
+        roughness: 0.34,
+        metalness: 0.84,
+      }),
+      corduraMat: new THREE.MeshStandardMaterial({
+        color: 0x252822,
+        roughness: 0.9,
+        metalness: 0.05,
+      }),
+      ventMat: new THREE.MeshStandardMaterial({
+        color: 0x0e1114,
+        roughness: 0.85,
+        metalness: 0.4,
+      }),
+    };
+  }
+  return cachedSharedMats;
+}
+
+function getEquipmentMaterials(id: TacticalEquipmentId) {
+  let pair = cachedEquipMats.get(id);
+  if (!pair) {
+    const def = getTacticalEquipmentDef(id);
+    pair = {
+      bodyMat: new THREE.MeshStandardMaterial({
+        color: def.bodyHex,
+        roughness: 0.62,
+        metalness: 0.28,
+      }),
+      bandMat: new THREE.MeshStandardMaterial({
+        color: def.bandHex,
+        roughness: 0.48,
+        metalness: 0.16,
+        polygonOffset: true,
+        polygonOffsetFactor: -1,
+        polygonOffsetUnits: -2,
+      }),
+    };
+    cachedEquipMats.set(id, pair);
+  }
+  return pair;
+}
+
 /**
  * Builds a realistic, multi-part PBR 3D mesh for a tactical grenade or utility canister.
- * Used identically for the operator's belt mesh AND thrown 3D projectiles in flight.
+ * Reuses cached BufferGeometries & Materials so drawing/throwing/switching never triggers
+ * runtime shader compilation or WebGL buffer allocation hitches.
  */
 export function buildTacticalEquipmentMesh(
   equipmentId: TacticalEquipmentId,
@@ -102,77 +177,32 @@ export function buildTacticalEquipmentMesh(
   bodyGroup.name = `tactical_body_${def.id}`;
   group.add(bodyGroup);
 
-  const geos: THREE.BufferGeometry[] = [];
-  const mats: THREE.Material[] = [];
-
-  const trackGeo = <T extends THREE.BufferGeometry>(g: T): T => {
-    geos.push(g);
-    return g;
-  };
-  const trackMat = <T extends THREE.Material>(m: T): T => {
-    mats.push(m);
-    return m;
-  };
-
-  const bodyMat = trackMat(
-    new THREE.MeshStandardMaterial({
-      color: def.bodyHex,
-      roughness: 0.62,
-      metalness: 0.28,
-    }),
-  );
-  const bandMat = trackMat(
-    new THREE.MeshStandardMaterial({
-      color: def.bandHex,
-      roughness: 0.48,
-      metalness: 0.16,
-      polygonOffset: true,
-      polygonOffsetFactor: -1,
-      polygonOffsetUnits: -2,
-    }),
-  );
-  const steelMat = trackMat(
-    new THREE.MeshStandardMaterial({
-      color: 0x3b4046,
-      roughness: 0.42,
-      metalness: 0.78,
-    }),
-  );
-  const brassMat = trackMat(
-    new THREE.MeshStandardMaterial({
-      color: 0xc8a956,
-      roughness: 0.34,
-      metalness: 0.84,
-    }),
-  );
-  const corduraMat = trackMat(
-    new THREE.MeshStandardMaterial({
-      color: 0x252822,
-      roughness: 0.9,
-      metalness: 0.05,
-    }),
-  );
+  const { steelMat, brassMat, corduraMat, ventMat } = getSharedMaterials();
+  const { bodyMat, bandMat } = getEquipmentMaterials(def.id);
 
   let fuzeY = 0.042;
   let spoonOffsetX = 0.028;
 
   if (def.id === 'm67_frag') {
-    // M67 spherical-ovoid olive fragmentation body
-    const sphere = new THREE.Mesh(trackGeo(new THREE.SphereGeometry(0.036, 14, 12)), bodyMat);
+    const sphere = new THREE.Mesh(
+      getOrCreateGeo('m67_sphere', () => new THREE.SphereGeometry(0.036, 14, 12)),
+      bodyMat,
+    );
     sphere.scale.set(1, 1.07, 1);
     bodyGroup.add(sphere);
 
-    // Subtle yellow HE identification stripe around upper shoulder
     const band = new THREE.Mesh(
-      trackGeo(new THREE.CylinderGeometry(0.0328, 0.0358, 0.011, 14, 1, true)),
+      getOrCreateGeo(
+        'm67_band',
+        () => new THREE.CylinderGeometry(0.0328, 0.0358, 0.011, 14, 1, true),
+      ),
       bandMat,
     );
     band.position.y = 0.015;
     bodyGroup.add(band);
 
-    // Threaded steel collar
     const collar = new THREE.Mesh(
-      trackGeo(new THREE.CylinderGeometry(0.013, 0.016, 0.015, 10)),
+      getOrCreateGeo('m67_collar', () => new THREE.CylinderGeometry(0.013, 0.016, 0.015, 10)),
       steelMat,
     );
     collar.position.y = 0.041;
@@ -180,46 +210,32 @@ export function buildTacticalEquipmentMesh(
     fuzeY = 0.052;
     spoonOffsetX = 0.029;
   } else if (def.id === 'm84_flash') {
-    // M84 hexagonal metallic stun body with twin end caps & vent ports
     const body = new THREE.Mesh(
-      trackGeo(new THREE.CylinderGeometry(0.025, 0.025, 0.105, 6)),
+      getOrCreateGeo('m84_body', () => new THREE.CylinderGeometry(0.025, 0.025, 0.105, 6)),
       bodyMat,
     );
     bodyGroup.add(body);
 
-    const topCap = new THREE.Mesh(
-      trackGeo(new THREE.CylinderGeometry(0.027, 0.027, 0.014, 10)),
-      steelMat,
-    );
+    const capGeo = getOrCreateGeo('m84_cap', () => new THREE.CylinderGeometry(0.027, 0.027, 0.014, 10));
+    const topCap = new THREE.Mesh(capGeo, steelMat);
     topCap.position.y = 0.054;
-    const botCap = new THREE.Mesh(
-      trackGeo(new THREE.CylinderGeometry(0.027, 0.027, 0.014, 10)),
-      steelMat,
-    );
+    const botCap = new THREE.Mesh(capGeo, steelMat);
     botCap.position.y = -0.054;
     bodyGroup.add(topCap, botCap);
 
-    // Bright tactical stun stripe
     const band = new THREE.Mesh(
-      trackGeo(new THREE.CylinderGeometry(0.0262, 0.0262, 0.016, 6)),
+      getOrCreateGeo('m84_band', () => new THREE.CylinderGeometry(0.0262, 0.0262, 0.016, 6)),
       bandMat,
     );
     band.position.y = 0.022;
     bodyGroup.add(band);
 
-    // Recessed flash vent ring
-    const ventMat = trackMat(
-      new THREE.MeshStandardMaterial({
-        color: 0x0e1114,
-        roughness: 0.85,
-        metalness: 0.4,
-      }),
+    const ventGeo = getOrCreateGeo(
+      'm84_vent',
+      () => new THREE.CylinderGeometry(0.0256, 0.0256, 0.008, 6),
     );
     for (const vy of [-0.018, 0.0]) {
-      const vent = new THREE.Mesh(
-        trackGeo(new THREE.CylinderGeometry(0.0256, 0.0256, 0.008, 6)),
-        ventMat,
-      );
+      const vent = new THREE.Mesh(ventGeo, ventMat);
       vent.position.y = vy;
       bodyGroup.add(vent);
     }
@@ -227,27 +243,26 @@ export function buildTacticalEquipmentMesh(
     fuzeY = 0.068;
     spoonOffsetX = 0.028;
   } else if (def.id === 'm18_smoke') {
-    // M18 tall cylindrical smoke canister with color smoke band & emitter top
     const canister = new THREE.Mesh(
-      trackGeo(new THREE.CylinderGeometry(0.028, 0.028, 0.118, 14)),
+      getOrCreateGeo('m18_canister', () => new THREE.CylinderGeometry(0.028, 0.028, 0.118, 14)),
       bodyMat,
     );
     bodyGroup.add(canister);
 
     const rimTop = new THREE.Mesh(
-      trackGeo(new THREE.CylinderGeometry(0.0295, 0.0295, 0.01, 14)),
+      getOrCreateGeo('m18_rimTop', () => new THREE.CylinderGeometry(0.0295, 0.0295, 0.01, 14)),
       steelMat,
     );
     rimTop.position.y = 0.058;
     const rimBot = new THREE.Mesh(
-      trackGeo(new THREE.CylinderGeometry(0.0295, 0.0295, 0.009, 14)),
+      getOrCreateGeo('m18_rimBot', () => new THREE.CylinderGeometry(0.0295, 0.0295, 0.009, 14)),
       steelMat,
     );
     rimBot.position.y = -0.058;
     bodyGroup.add(rimTop, rimBot);
 
     const band = new THREE.Mesh(
-      trackGeo(new THREE.CylinderGeometry(0.0288, 0.0288, 0.024, 14)),
+      getOrCreateGeo('m18_band', () => new THREE.CylinderGeometry(0.0288, 0.0288, 0.024, 14)),
       bandMat,
     );
     band.position.y = 0.02;
@@ -256,29 +271,28 @@ export function buildTacticalEquipmentMesh(
     fuzeY = 0.07;
     spoonOffsetX = 0.031;
   } else {
-    // AN-M14 heavy thermite incendiary canister with hazard stripes & heat fins
     const canister = new THREE.Mesh(
-      trackGeo(new THREE.CylinderGeometry(0.029, 0.029, 0.116, 12)),
+      getOrCreateGeo('therm_canister', () => new THREE.CylinderGeometry(0.029, 0.029, 0.116, 12)),
       bodyMat,
     );
     bodyGroup.add(canister);
 
     const band = new THREE.Mesh(
-      trackGeo(new THREE.CylinderGeometry(0.03, 0.03, 0.022, 12)),
+      getOrCreateGeo('therm_band', () => new THREE.CylinderGeometry(0.03, 0.03, 0.022, 12)),
       bandMat,
     );
     band.position.y = 0.018;
     bodyGroup.add(band);
 
     const lowBand = new THREE.Mesh(
-      trackGeo(new THREE.CylinderGeometry(0.03, 0.03, 0.01, 12)),
+      getOrCreateGeo('therm_lowBand', () => new THREE.CylinderGeometry(0.03, 0.03, 0.01, 12)),
       bandMat,
     );
     lowBand.position.y = -0.028;
     bodyGroup.add(lowBand);
 
     const headCap = new THREE.Mesh(
-      trackGeo(new THREE.CylinderGeometry(0.031, 0.031, 0.014, 12)),
+      getOrCreateGeo('therm_headCap', () => new THREE.CylinderGeometry(0.031, 0.031, 0.014, 12)),
       steelMat,
     );
     headCap.position.y = 0.058;
@@ -288,9 +302,8 @@ export function buildTacticalEquipmentMesh(
     spoonOffsetX = 0.032;
   }
 
-  // Shared top striker head, hinged safety lever spoon group, and brass pull ring
   const fuzeHead = new THREE.Mesh(
-    trackGeo(new THREE.BoxGeometry(0.024, 0.016, 0.018)),
+    getOrCreateGeo('shared_fuzeHead', () => new THREE.BoxGeometry(0.024, 0.016, 0.018)),
     steelMat,
   );
   fuzeHead.position.y = fuzeY;
@@ -306,14 +319,14 @@ export function buildTacticalEquipmentMesh(
   const spoonGroup = new THREE.Group();
   spoonGroup.name = 'grenade_safety_spoon';
   const spoonTop = new THREE.Mesh(
-    trackGeo(new THREE.BoxGeometry(0.026, 0.005, 0.014)),
+    getOrCreateGeo('shared_spoonTop', () => new THREE.BoxGeometry(0.026, 0.005, 0.014)),
     steelMat,
   );
   spoonTop.position.set(spoonOffsetX * 0.45 - spoonHingeX, 0, 0);
   spoonGroup.add(spoonTop);
 
   const spoonArm = new THREE.Mesh(
-    trackGeo(new THREE.BoxGeometry(0.005, 0.058, 0.014)),
+    getOrCreateGeo('shared_spoonArm', () => new THREE.BoxGeometry(0.005, 0.058, 0.014)),
     steelMat,
   );
   spoonArm.position.set(spoonOffsetX + 0.005 - spoonHingeX, -0.029, 0);
@@ -322,7 +335,7 @@ export function buildTacticalEquipmentMesh(
   spoonAnchor.add(spoonGroup);
 
   const pullRing = new THREE.Mesh(
-    trackGeo(new THREE.TorusGeometry(0.013, 0.0022, 6, 12)),
+    getOrCreateGeo('shared_pullRing', () => new THREE.TorusGeometry(0.013, 0.0022, 6, 12)),
     brassMat,
   );
   pullRing.name = 'grenade_pull_ring';
@@ -345,24 +358,23 @@ export function buildTacticalEquipmentMesh(
     rotation: new THREE.Euler(-0.68, 0, Math.PI * 0.5),
   };
 
-  // Optional MOLLE tactical belt retention strap & cradle when worn on operator belt
   if (options?.withBeltClip) {
     const clipBack = new THREE.Mesh(
-      trackGeo(new THREE.BoxGeometry(0.046, 0.078, 0.014)),
+      getOrCreateGeo('shared_clipBack', () => new THREE.BoxGeometry(0.046, 0.078, 0.014)),
       corduraMat,
     );
     clipBack.position.set(0, 0.008, 0.034);
     bodyGroup.add(clipBack);
 
     const retentionStrap = new THREE.Mesh(
-      trackGeo(new THREE.BoxGeometry(0.068, 0.02, 0.068)),
+      getOrCreateGeo('shared_retentionStrap', () => new THREE.BoxGeometry(0.068, 0.02, 0.068)),
       corduraMat,
     );
     retentionStrap.position.set(0, -0.01, 0.004);
     bodyGroup.add(retentionStrap);
 
     const buckleLatch = new THREE.Mesh(
-      trackGeo(new THREE.BoxGeometry(0.02, 0.024, 0.012)),
+      getOrCreateGeo('shared_buckleLatch', () => new THREE.BoxGeometry(0.02, 0.024, 0.012)),
       steelMat,
     );
     buckleLatch.position.set(0, -0.01, -0.033);
@@ -391,8 +403,17 @@ export function buildTacticalEquipmentMesh(
     pinPullAxis,
     gripOffset,
     dispose: () => {
-      for (const g of geos) g.dispose();
-      for (const m of mats) m.dispose();
+      // Geometries and materials are shared in module cache to avoid WebGL recompile hitches.
+      group.clear();
     },
   };
 }
+
+export const TACTICAL_EQUIPMENT_CACHE_STATS = {
+  get geometryCount(): number {
+    return cachedGeos.size;
+  },
+  get materialPairCount(): number {
+    return cachedEquipMats.size;
+  },
+};

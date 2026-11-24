@@ -591,6 +591,75 @@ export const LobbyRoomView: React.FC<LobbyRoomViewProps> = ({ onOpenLoadoutWorkb
             onChangeTimeOfDay={(timeOfDayStart) => updateSettings({ timeOfDayStart })}
           />
 
+          {/* Host Battle Match Visibility: Hitmarkers & Combat HUD */}
+          {lobby.mode === 'battle' && (
+            <div className="border border-neutral-800 bg-neutral-900/50 p-3">
+              <div className="flex items-center justify-between font-mono-tabular text-[10px] uppercase tracking-wider text-neutral-400">
+                <span>Battle Match HUD &amp; Hitmarkers</span>
+                <span className="text-amber-300">
+                  {isHost ? 'Host Controlled' : 'Locked by Host'}
+                </span>
+              </div>
+              <div className="mt-1.5 grid grid-cols-2 gap-1.5">
+                {isHost ? (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        updateSettings({
+                          hitmarkersEnabled: lobby.hitmarkersEnabled === false,
+                        })
+                      }
+                      className={`cursor-pointer border py-1 font-mono-tabular text-[10px] font-semibold uppercase transition-colors ${
+                        lobby.hitmarkersEnabled !== false
+                          ? 'border-emerald-500/70 bg-emerald-950/50 text-emerald-300'
+                          : 'border-neutral-700 bg-neutral-950 text-neutral-400 hover:border-neutral-500'
+                      }`}
+                    >
+                      Hitmarkers: {lobby.hitmarkersEnabled !== false ? 'ON' : 'OFF'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        updateSettings({
+                          hudEnabled: lobby.hudEnabled === false,
+                        })
+                      }
+                      className={`cursor-pointer border py-1 font-mono-tabular text-[10px] font-semibold uppercase transition-colors ${
+                        lobby.hudEnabled !== false
+                          ? 'border-emerald-500/70 bg-emerald-950/50 text-emerald-300'
+                          : 'border-neutral-700 bg-neutral-950 text-neutral-400 hover:border-neutral-500'
+                      }`}
+                    >
+                      Combat HUD: {lobby.hudEnabled !== false ? 'ON' : 'OFF'}
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <div
+                      className={`border py-1 text-center font-mono-tabular text-[10px] font-semibold uppercase ${
+                        lobby.hitmarkersEnabled !== false
+                          ? 'border-emerald-500/50 bg-emerald-950/35 text-emerald-300'
+                          : 'border-neutral-800 bg-neutral-950 text-neutral-400'
+                      }`}
+                    >
+                      Hitmarkers: {lobby.hitmarkersEnabled !== false ? 'ON' : 'OFF'}
+                    </div>
+                    <div
+                      className={`border py-1 text-center font-mono-tabular text-[10px] font-semibold uppercase ${
+                        lobby.hudEnabled !== false
+                          ? 'border-emerald-500/50 bg-emerald-950/35 text-emerald-300'
+                          : 'border-neutral-800 bg-neutral-950 text-neutral-400'
+                      }`}
+                    >
+                      Combat HUD: {lobby.hudEnabled !== false ? 'ON' : 'OFF'}
+                    </div>
+                  </>
+                )}
+              </div>
+            </div>
+          )}
+
           {/* Host Killfeed Policy Override & Personal Toggle */}
           <div className="border border-neutral-800 bg-neutral-900/50 p-3">
             <div className="flex items-center justify-between font-mono-tabular text-[10px] uppercase tracking-wider text-neutral-400">

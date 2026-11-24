@@ -9,11 +9,25 @@ import { resolveBaseCaliberId } from '../../../data/calibers';
 import { normalizeLoadoutWeaponId } from '../../../data/loadoutStore';
 import { getDefaultReserveForCaliber } from '../../../hideout/HideoutStateStore';
 import {
+  autoPlaceItemInGrid,
   buildStarterTacticalInventory,
   cloneTacticalInventory,
+  cloneTacticalItem,
+  createAmmoStackItem,
+  createGenericLootItem,
+  createGrenadeItem,
+  createLoadedMagazineForWeapon,
+  createMedicalItem,
+  extractItemByLocator,
+  isItemAllowedInBelt,
   resizeSecureContainer,
+  stowItemIntoOperatorInventory,
 } from './inventory/TetrisInventoryCore';
-import type { OperatorTacticalInventory } from './inventory/TetrisInventoryTypes';
+import type {
+  ItemSourceLocator,
+  OperatorTacticalInventory,
+  TacticalItem,
+} from './inventory/TetrisInventoryTypes';
 import {
   ARMOR_PLATE_MAP,
   CHARACTER_SLOT_IDS,
@@ -1696,6 +1710,193 @@ export class CharacterRoster {
       }
     });
     return readyToComplete;
+  }
+
+  /**
+   * Lazily initializes or returns persistent Armory Stash Locker items for this character.
+   */
+  public getOrInitTacticalStash(slotId: CharacterSlotId): TacticalItem[] {
+    const ch = this.state.slots[slotId];
+    if (!ch) return [];
+    if (Array.isArray(ch.tacticalStashItems)) {
+      return ch.tacticalStashItems.map((it) => cloneTacticalItem(it));
+    }
+
+    const seed: TacticalItem[] = [];
+    for (const legacy of ch.stashItems) {
+      if (legacy.itemId === 'ifak_surgical' || legacy.itemId === 'cms_trauma_kit') {
+        for (let i = 0; i < Math.max(1, legacy.quantity); i++) {
+          seed.push(createMedicalItem('ifak'));
+        }
+      } else if (legacy.itemId === 'ammo_case_556') {
+        seed.push(createAmmoStackItem('556x45_m855a1', 60));
+      } else if (legacy.itemId === 'ammo_tin_762') {
+        seed.push(createAmmoStackItem('762x39_7n23', 60));
+      } else {
+        seed.push(
+          createGenericLootItem(
+            legacy.itemId,
+            legacy.name,
+            legacy.name.slice(0, 12),
+            legacy.category === 'intel' || legacy.category === 'key' ? legacy.category : 'barter',
+            1,
+            1,
+            legacy.valueUsd,
+            legacy.quantity,
+          ),
+        );
+      }
+    }
+    seed.push(createGrenadeItem('m67_frag'));
+    seed.push(createLoadedMagazineForWeapon(ch.arsenal.equippedWeaponId !== 'unarmed' ? ch.arsenal.equippedWeaponId : (ch.pmcFaction === 'pmc_bravo' ? 'akm_762' : 'm4a1')));
+
+    this.mutateCharacter(slotId, (c) => {
+      c.tacticalStashItems = seed.map((it) => cloneTacticalItem(it));
+    });
+    return seed;
+  }
+
+  /**
+   * Moves an item from deployed operator inventory (rig/belt/backpack/secure) into the persistent Armory Stash Lockers.
+   */
+  public depositTacticalItemToStash(
+    slotId: CharacterSlotId,
+    locator: ItemSourceLocator,
+  ): { ok: boolean; error?: string; item?: TacticalItem } {
+    const cur = this.state.slots[slotId];
+    if (!cur?.tacticalInventory) return { ok: false, error: 'No deployed inventory active.' };
+
+    this.getOrInitTacticalStash(slotId);
+    let movedItem: TacticalItem | null = null;
+    this.mutateCharacter(slotId, (c) => {
+      if (!c.tacticalInventory) return;
+      const clonedInv = cloneTacticalInventory(c.tacticalInventory);
+      const extracted = extractItemByLocator(clonedInv, locator);
+      if (!extracted) return;
+      movedItem = extracted;
+      c.tacticalInventory = clonedInv;
+      const stash = Array.isArray(c.tacticalStashItems) ? [...c.tacticalStashItems] : [];
+      stash.push(cloneTacticalItem(extracted));
+      c.tacticalStashItems = stash;
+    });
+
+    if (!movedItem) return { ok: false, error: 'Selected item could not be extracted from deployed kit.' };
+    return { ok: true, item: movedItem };
+  }
+
+  /**
+   * Withdraws a TacticalItem from the Armory Stash Lockers back into the operator's deployed kit.
+   */
+  public withdrawStashItemToInventory(
+    slotId: CharacterSlotId,
+    stashInstanceId: string,
+    preferredTarget: 'auto' | 'backpack' | 'secure' | 'belt' = 'auto',
+  ): { ok: boolean; error?: string; item?: TacticalItem } {
+    const cur = this.state.slots[slotId];
+    if (!cur?.tacticalInventory) return { ok: false, error: 'No deployed inventory active.' };
+
+    const stash = this.getOrInitTacticalStash(slotId);
+    const idx = stash.findIndex((it) => it.instanceId === stashInstanceId);
+    if (idx < 0) return { ok: false, error: 'Item not found in Armory Stash.' };
+
+    const invClone = cloneTacticalInventory(cur.tacticalInventory);
+    const candidate = cloneTacticalItem(stash[idx]);
+    let placed = false;
+
+    if (preferredTarget === 'secure') {
+      placed = autoPlaceItemInGrid(invClone.secureContainer, candidate, true);
+    } else if (preferredTarget === 'backpack') {
+      placed = Boolean(invClone.backpack && autoPlaceItemInGrid(invClone.backpack.grid, candidate, true));
+    } else if (preferredTarget === 'belt') {
+      if (isItemAllowedInBelt(candidate)) {
+        const bIdx = invClone.beltSlots.indexOf(null);
+        if (bIdx >= 0) {
+          invClone.beltSlots[bIdx] = candidate;
+          placed = true;
+        }
+      }
+    } else {
+      placed = stowItemIntoOperatorInventory(invClone, candidate);
+      if (!placed) {
+        placed = autoPlaceItemInGrid(invClone.secureContainer, candidate, true);
+      }
+    }
+
+    if (!placed) {
+      return { ok: false, error: 'No free space in Chest Rig, Belt, Backpack, or Secure Container.' };
+    }
+
+    this.mutateCharacter(slotId, (c) => {
+      c.tacticalInventory = invClone;
+      const list = Array.isArray(c.tacticalStashItems) ? [...c.tacticalStashItems] : [];
+      const rmIdx = list.findIndex((it) => it.instanceId === stashInstanceId);
+      if (rmIdx >= 0) list.splice(rmIdx, 1);
+      c.tacticalStashItems = list;
+    });
+
+    return { ok: true, item: candidate };
+  }
+
+  /**
+   * Swaps an owned Arsenal firearm into Primary or Secondary field slot from the FOB Armory Bench.
+   */
+  public equipArmoryWeaponSlot(
+    slotId: CharacterSlotId,
+    slotKey: 'primary' | 'secondary',
+    weaponId: string,
+  ): { ok: boolean; error?: string } {
+    const cur = this.state.slots[slotId];
+    if (!cur) return { ok: false, error: 'Character not found.' };
+    const canonical = weaponId === 'unarmed' ? 'unarmed' : normalizeLoadoutWeaponId(weaponId, '');
+    if (!canonical) return { ok: false, error: 'Invalid weapon ID.' };
+    if (canonical !== 'unarmed' && !cur.arsenal.ownedWeaponIds.includes(canonical)) {
+      return { ok: false, error: 'Weapon not owned in Armory.' };
+    }
+
+    this.mutateCharacter(slotId, (c) => {
+      const nextWeapon = canonical === 'unarmed' ? null : canonical;
+      if (slotKey === 'primary') {
+        c.equippedKit.primaryWeaponId = nextWeapon;
+        if (nextWeapon) c.arsenal.equippedWeaponId = nextWeapon;
+      } else {
+        c.equippedKit.secondaryWeaponId = nextWeapon;
+      }
+      if (c.tacticalInventory) {
+        const loadedMag = nextWeapon ? createLoadedMagazineForWeapon(nextWeapon) : null;
+        const chamber = loadedMag && loadedMag.rounds.length > 0 ? loadedMag.rounds.pop() ?? null : null;
+        c.tacticalInventory[slotKey] = {
+          weaponId: nextWeapon,
+          chamberedRound: chamber,
+          loadedMag,
+        };
+      }
+    });
+    return { ok: true };
+  }
+
+  /**
+   * Swaps an unlocked ballistic Armor Plate into the carrier from the FOB Armory Bench.
+   */
+  public equipArmoryArmorPlate(
+    slotId: CharacterSlotId,
+    plateId: string,
+  ): { ok: boolean; error?: string } {
+    const cur = this.state.slots[slotId];
+    if (!cur) return { ok: false, error: 'Character not found.' };
+    if (!cur.unlocks.unlockedArmorPlateIds.includes(plateId)) {
+      return { ok: false, error: 'Armor plate not unlocked.' };
+    }
+    const spec = ARMOR_PLATE_MAP[plateId];
+    if (!spec) return { ok: false, error: 'Unknown armor plate.' };
+
+    this.mutateCharacter(slotId, (c) => {
+      c.equippedKit.armorPlateId = plateId;
+      c.equippedKit.armorName = spec.name;
+      if (c.tacticalInventory) {
+        c.tacticalInventory.armorPlateId = plateId;
+      }
+    });
+    return { ok: true };
   }
 
   public subscribe(fn: RosterListener): () => void {

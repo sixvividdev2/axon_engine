@@ -617,7 +617,13 @@ export class WeaponAnimator {
 
   public getTriggerPull01(): number {
     if (this.triggerTimer <= 0) return 0;
-    return Math.sin(THREE.MathUtils.clamp(this.triggerTimer / 0.09, 0, 1) * Math.PI);
+    const total = 0.115;
+    const elapsed = THREE.MathUtils.clamp(total - this.triggerTimer, 0, total);
+    // Asymmetric squeeze curve: brisk 32ms rearward break followed by smooth 83ms damped reset
+    if (elapsed < 0.032) {
+      return smoothstep(0, 0.032, elapsed);
+    }
+    return 1 - smoothstep(0.032, total, elapsed);
   }
 
   public isPumpCycling(): boolean {
@@ -852,7 +858,7 @@ export class WeaponAnimator {
       this.interruptInspect();
     }
     this.hammerTimer = 0.085;
-    this.triggerTimer = 0.09;
+    this.triggerTimer = 0.115;
 
     const isBolt = Boolean(opts?.cycleBolt && this.assembly?.boltHandlePivot);
     const isRevolver = Boolean(opts?.isRevolver || this.assembly?.cylinderPivot);
@@ -904,7 +910,7 @@ export class WeaponAnimator {
       this.interruptInspect();
     }
     this.hammerTimer = 0.075;
-    this.triggerTimer = 0.08;
+    this.triggerTimer = 0.105;
     this.emitCue('dryfire', 1.0);
   }
 
@@ -1880,7 +1886,7 @@ export class WeaponAnimator {
       }
       if (asm.trigger) {
         if (this.triggerTimer > 0) this.triggerTimer = Math.max(0, this.triggerTimer - dt);
-        const tPull = this.triggerTimer > 0 ? Math.sin((this.triggerTimer / 0.09) * Math.PI) : 0;
+        const tPull = this.getTriggerPull01();
         asm.trigger.rotation.x = asm.triggerBaseRotX + tPull * 0.42;
       }
       // Keep magazine synced during MAG_CHECK even if CharacterAnimator isn't overriding parent
@@ -2246,39 +2252,71 @@ export class WeaponAnimator {
       this._targetPos.lerp(this._actionPos, env);
       this._targetQuat.slerp(this._actionQuat, env);
     } else if (this.action === 'INSPECT' && !input.isUnarmed) {
-      // 3-Phase Fluid Weapon Inspect (~3.2s):
-      //  Phase 1 (0.00 -> 0.36): Right receiver, ejection port & wear (+38° roll, +22° yaw)
-      //  Phase 2 (0.36 -> 0.77): Left receiver, fire selector & optic mount (-42° roll, -15° yaw)
-      //  Phase 3 (0.77 -> 1.00): Smooth return to Idle
       const p = this.getActionProgress();
-      const raiseEnv = smoothstep(0.0, 0.18, p) * (1 - smoothstep(0.78, 1.0, p));
-      const flip12 = smoothstep(0.34, 0.54, p);
+      const isMeleeKnife = this.assembly?.holdClass === 'melee_1h';
+      if (isMeleeKnife) {
+        // Combat Knife Slow Wrist-Roll Inspect (~3.2s):
+        // Raise blade cleanly into chest-cam center, slowly roll wrist right-to-left to inspect both bevels & fuller, settle back
+        const raiseEnv = smoothstep(0.0, 0.18, p) * (1 - smoothstep(0.80, 1.0, p));
+        const wristRollSweep = smoothstep(0.22, 0.68, p);
+        const rollDeg = THREE.MathUtils.lerp(48, -72, wristRollSweep);
+        const yawDeg = THREE.MathUtils.lerp(42, 62, Math.sin(p * Math.PI));
+        const pitchDeg = THREE.MathUtils.lerp(18, -10, wristRollSweep);
+        const microDrift = Math.sin(p * Math.PI * 3) * 0.003;
 
-      const rollDeg = THREE.MathUtils.lerp(38, -42, flip12);
-      const yawDeg = THREE.MathUtils.lerp(22, -15, flip12);
-      const pitchDeg = THREE.MathUtils.lerp(9, 11, flip12);
-      const microDrift = Math.sin(p * Math.PI * 4) * 0.004;
+        this._tmpVecA
+          .set(
+            THREE.MathUtils.lerp(0.045, 0.018, wristRollSweep),
+            -0.068 + microDrift,
+            -0.275,
+          )
+          .applyQuaternion(input.camWorldQuat as THREE.Quaternion)
+          .add(input.camWorldPos as THREE.Vector3);
+        input.shoulderAnchor.worldToLocal(this._tmpVecA);
 
-      // Center cleanly in chest-cam frame during inspection
-      this._tmpVecA
-        .set(
-          THREE.MathUtils.lerp(-0.025, 0.015, flip12),
-          -0.065 + microDrift,
-          -0.295 - (this.weightClass === 'pistol' ? 0.01 : 0.04),
-        )
-        .applyQuaternion(input.camWorldQuat as THREE.Quaternion)
-        .add(input.camWorldPos as THREE.Vector3);
-      input.shoulderAnchor.worldToLocal(this._tmpVecA);
+        this._tmpEuler.set(
+          THREE.MathUtils.degToRad(pitchDeg),
+          THREE.MathUtils.degToRad(yawDeg),
+          THREE.MathUtils.degToRad(rollDeg),
+          'YXZ',
+        );
+        this._actionQuat.copy(this._adsQuat).multiply(this._addQuat.setFromEuler(this._tmpEuler));
+        this._targetPos.lerp(this._tmpVecA, raiseEnv);
+        this._targetQuat.slerp(this._actionQuat, raiseEnv);
+      } else {
+        // 3-Phase Fluid Weapon Inspect (~3.2s):
+        //  Phase 1 (0.00 -> 0.36): Right receiver, ejection port & wear (+38° roll, +22° yaw)
+        //  Phase 2 (0.36 -> 0.77): Left receiver, fire selector & optic mount (-42° roll, -15° yaw)
+        //  Phase 3 (0.77 -> 1.00): Smooth return to Idle
+        const raiseEnv = smoothstep(0.0, 0.18, p) * (1 - smoothstep(0.78, 1.0, p));
+        const flip12 = smoothstep(0.34, 0.54, p);
 
-      this._tmpEuler.set(
-        THREE.MathUtils.degToRad(pitchDeg),
-        THREE.MathUtils.degToRad(yawDeg),
-        THREE.MathUtils.degToRad(rollDeg),
-        'YXZ',
-      );
-      this._actionQuat.copy(this._adsQuat).multiply(this._addQuat.setFromEuler(this._tmpEuler));
-      this._targetPos.lerp(this._tmpVecA, raiseEnv);
-      this._targetQuat.slerp(this._actionQuat, raiseEnv);
+        const rollDeg = THREE.MathUtils.lerp(38, -42, flip12);
+        const yawDeg = THREE.MathUtils.lerp(22, -15, flip12);
+        const pitchDeg = THREE.MathUtils.lerp(9, 11, flip12);
+        const microDrift = Math.sin(p * Math.PI * 4) * 0.004;
+
+        // Center cleanly in chest-cam frame during inspection
+        this._tmpVecA
+          .set(
+            THREE.MathUtils.lerp(-0.025, 0.015, flip12),
+            -0.065 + microDrift,
+            -0.295 - (this.weightClass === 'pistol' ? 0.01 : 0.04),
+          )
+          .applyQuaternion(input.camWorldQuat as THREE.Quaternion)
+          .add(input.camWorldPos as THREE.Vector3);
+        input.shoulderAnchor.worldToLocal(this._tmpVecA);
+
+        this._tmpEuler.set(
+          THREE.MathUtils.degToRad(pitchDeg),
+          THREE.MathUtils.degToRad(yawDeg),
+          THREE.MathUtils.degToRad(rollDeg),
+          'YXZ',
+        );
+        this._actionQuat.copy(this._adsQuat).multiply(this._addQuat.setFromEuler(this._tmpEuler));
+        this._targetPos.lerp(this._tmpVecA, raiseEnv);
+        this._targetQuat.slerp(this._actionQuat, raiseEnv);
+      }
     } else if (this.tubularPhase !== 'NONE' && input.isFirearm) {
       // Shell-by-shell tubular shotgun reload cant (38°-42° inboard so underside loading port faces left hand cleanly)
       let env = 1;

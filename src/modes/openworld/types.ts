@@ -3,6 +3,7 @@ import type { OperatorGearConfig, OperatorId } from '../../../bodycam-sdk/operat
 import type {
   CorpseTacticalLootSnapshot,
   OperatorTacticalInventory,
+  TacticalItem,
 } from './inventory/TetrisInventoryTypes';
 
 export type CharacterSlotId = 'slot_0' | 'slot_1' | 'slot_2';
@@ -114,8 +115,8 @@ export const FOB_UPGRADE_SPECS: Readonly<Record<FobTier, FobUpgradeSpec>> = {
     name: 'Tier 3 — Hardened Perimeter Stronghold',
     cashCostUsd: 28000,
     minAvgSupplyPct: 65,
-    unlocksSummary: 'Unlocks AVS Heavy Rigs, 55L Logistics Packs, Tungsten AP Rounds, Turret Towers & 3x3 Secure Container.',
-    physicalUpgrades: ['Reinforced Helipad Deck', 'Twin Perimeter Watch Turrets', 'Armor Repair Bay'],
+    unlocksSummary: 'Unlocks AVS Heavy Rigs, 55L Logistics Packs, Tungsten AP Rounds, Live AA/Mortar Defense Turrets, Vehicle Repair Bay, Fast-Travel Helipad & 3x3 Secure Container.',
+    physicalUpgrades: ['Live AA/Mortar Perimeter Turrets', 'Vehicle Repair & Refuel Bay [F]', 'Fast-Travel Helipad Dispatch [F]'],
     upgradesSecureContainerTo3x3: true,
   },
 } as const;
@@ -275,7 +276,7 @@ export const SHARD_RULES: Readonly<Record<ShardMode, ShardRulesSpec>> = {
     pmcRelationsLabel: 'PMC Alpha & PMC Bravo Hostile',
     pmcHostile: true,
     friendlyFireRivalPmc: true,
-    friendlyFireLabel: 'Enabled vs rival PMC (squad rules apply)',
+    friendlyFireLabel: 'Active everywhere (standing penalty & retaliation on allies)',
     corpseLootingPlayers: true,
     corpseLootingLabel: 'Full looting of any player or AI corpse',
     worldStateLabel: 'Shared persistent PvPvE territory & supply pools',
@@ -285,8 +286,8 @@ export const SHARD_RULES: Readonly<Record<ShardMode, ShardRulesSpec>> = {
     label: 'PvE Cooperative Shard',
     pmcRelationsLabel: 'PMC Alpha & PMC Bravo Allied (Ceasefire)',
     pmcHostile: false,
-    friendlyFireRivalPmc: false,
-    friendlyFireLabel: 'Disabled between all PMC players',
+    friendlyFireRivalPmc: true,
+    friendlyFireLabel: 'Active everywhere (standing penalty & immediate retaliation)',
     corpseLootingPlayers: false,
     corpseLootingLabel: 'Players cannot loot other players\' corpses',
     worldStateLabel: 'Isolated persistent PvE territory & supply pools',
@@ -752,6 +753,8 @@ export interface OpenWorldCharacter {
   exfilsCount: number;
   /** Phase 5 spatial Tetris Grid inventory, Chest Rig/Belt/Backpack gear & mixed LIFO magazines */
   tacticalInventory?: OperatorTacticalInventory;
+  /** Persistent FOB Armory Stash Locker inventory (migrated from starter stashItems) */
+  tacticalStashItems?: TacticalItem[];
   /** Phase 5 rotating 3-Slot Sub-Faction Contract Board */
   contractBoard?: RotatingContractRecord[];
 }
@@ -799,12 +802,15 @@ export interface ShardTransitionLogEntry {
   summary: string;
 }
 
-export type SectorControlOwner = PmcFactionId | 'neutral';
+export type SectorControlOwner = PmcFactionId | 'subfaction' | 'contested' | 'neutral';
 
 export interface SectorControlRecord {
   sectorId: string;
   owner: SectorControlOwner;
-  captureProgress: number; // 0..100 for current owner stability
+  /** Signed capture progress (-100 = Bravo, 0 = Neutral/Subfaction, +100 = Alpha) */
+  captureProgress: number;
+  /** Dynamic combat escalation heat 0..100 */
+  heat?: number;
   alertState?: SectorAlertState;
   lastFlippedAtIso?: string;
 }

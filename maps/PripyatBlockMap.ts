@@ -682,6 +682,21 @@ function buildPripyatBlock(
     addSolidBox(cx, cy, cz, cw, 1.04, cd, matSandbag, 'gravel');
   }
 
+  // Staggered precast concrete chicanes & flank timber crates breaking the direct N-S courtyard sightline
+  const chicaneBarriers: Array<[number, number, number, number, number, number]> = [
+    [-4.6, 0.58, -2.6, 3.0, 1.16, 0.55],
+    [4.6, 0.58, 8.8, 3.0, 1.16, 0.55],
+    [-8.4, 0.58, 21.8, 3.2, 1.16, 0.55],
+    [8.4, 0.58, 21.8, 3.2, 1.16, 0.55],
+  ];
+  for (const [bx, by, bz, bw, bh, bd] of chicaneBarriers) {
+    addSolidBox(bx, by, bz, bw, bh, bd, matPanelConc, 'concrete');
+  }
+  addSolidBox(-21.2, 0.55, -3.5, 1.4, 1.1, 1.4, matWood, 'wood');
+  addSolidBox(-21.4, 0.45, -2.0, 1.0, 0.9, 1.0, matWood, 'wood');
+  addSolidBox(21.2, 0.55, -3.5, 1.4, 1.1, 1.4, matWood, 'wood');
+  addSolidBox(21.4, 0.45, -2.0, 1.0, 0.9, 1.0, matWood, 'wood');
+
   // === 5. SEVEN DETAILED COMPOSITE RUSTED SOVIET VEHICLES ===
   buildRustedVehicle(propCtx, 'lada', -15.2, 0, -10.5, 0.42, vehTeal);
   buildRustedVehicle(propCtx, 'moskvitch', 14.8, 0, -9.8, -0.35, vehOchre);

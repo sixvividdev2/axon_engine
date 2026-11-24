@@ -590,6 +590,8 @@ export class LobbyRoomDO {
         killfeedPolicy?: 'player_choice' | 'force_on' | 'force_off';
         weatherPreset?: WeatherPresetId;
         timeOfDayStart?: TimeOfDayStartSetting;
+        hitmarkersEnabled?: boolean;
+        hudEnabled?: boolean;
         specialEvent: SpecialEventRecord | null;
       };
 
@@ -620,6 +622,16 @@ export class LobbyRoomDO {
       const timeOfDayStart = sanitizeTimeOfDayStart(
         ev ? ev.config.timeOfDayStart : body.timeOfDayStart,
       );
+      const hitmarkersEnabled = ev
+        ? ev.config.hitmarkersEnabled !== false
+        : typeof body.hitmarkersEnabled === 'boolean'
+          ? body.hitmarkersEnabled
+          : true;
+      const hudEnabled = ev
+        ? ev.config.hudEnabled !== false
+        : typeof body.hudEnabled === 'boolean'
+          ? body.hudEnabled
+          : true;
 
       this.room = {
         state: {
@@ -638,6 +650,8 @@ export class LobbyRoomDO {
           killfeedPolicy,
           weatherPreset,
           timeOfDayStart,
+          hitmarkersEnabled,
+          hudEnabled,
           status: 'lobby',
           matchSequence: 0,
           specialEvent: ev,
@@ -983,6 +997,12 @@ export class LobbyRoomDO {
       if (patch.timeOfDayStart !== undefined) {
         st.timeOfDayStart = sanitizeTimeOfDayStart(patch.timeOfDayStart);
       }
+      if (typeof patch.hitmarkersEnabled === 'boolean') {
+        st.hitmarkersEnabled = patch.hitmarkersEnabled;
+      }
+      if (typeof patch.hudEnabled === 'boolean') {
+        st.hudEnabled = patch.hudEnabled;
+      }
       if (st.specialEvent) {
         st.specialEvent = {
           ...st.specialEvent,
@@ -999,6 +1019,8 @@ export class LobbyRoomDO {
             killfeedPolicy: st.killfeedPolicy,
             weatherPreset: st.weatherPreset,
             timeOfDayStart: st.timeOfDayStart,
+            hitmarkersEnabled: st.hitmarkersEnabled,
+            hudEnabled: st.hudEnabled,
           }),
         };
       }

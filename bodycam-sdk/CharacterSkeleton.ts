@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { VIEWMODEL_LAYER } from './BodycamPostProcess';
+import { IR_LAYER, VIEWMODEL_LAYER } from './BodycamPostProcess';
 import {
   createTwoBoneIKResult,
   orientLimbAlongYInRootSpace,
@@ -42,6 +42,8 @@ import { WeaponHandPoseProfile } from './weapons/WeaponModelFactory';
 
 export interface HandPoseDynamicOptions {
   profile?: Readonly<WeaponHandPoseProfile> | null;
+  /** 0..1 smooth continuous blend from frame-indexed trigger discipline (0) onto trigger shoe (1) */
+  triggerEngageBlend?: number;
   /** 0..1 live trigger squeeze flexion on right index finger */
   triggerPull01?: number;
   /** 0..1 thumb-index pinch pose for scope throw-lever, elevation turret, or illum dial */
@@ -215,6 +217,11 @@ export class CharacterSkeleton {
   private nvgLensPvs7Mat: THREE.MeshStandardMaterial;
   private nvgLensArnvgMat: THREE.MeshStandardMaterial;
   private headShadowOnlyMat: THREE.MeshBasicMaterial;
+  private armbandMat: THREE.MeshStandardMaterial;
+  private readonly armbandMeshes: THREE.Mesh[] = [];
+  private irStrobeHousingMat: THREE.MeshStandardMaterial;
+  private irStrobeEmitterMat: THREE.MeshBasicMaterial;
+  private readonly irStrobeEmitterMeshes: THREE.Mesh[] = [];
 
   // Pre-allocated scratch objects for zero-GC preview pose solving
   private readonly _previewInvRootMat = new THREE.Matrix4();
@@ -325,6 +332,27 @@ export class CharacterSkeleton {
         color: 0x17191b,
         roughness: 0.38,
         metalness: 0.28,
+      }),
+    );
+    this.armbandMat = this.mat(
+      new THREE.MeshStandardMaterial({
+        color: 0x3b82f6,
+        roughness: 0.86,
+        metalness: 0.04,
+      }),
+    );
+    this.irStrobeHousingMat = this.mat(
+      new THREE.MeshStandardMaterial({
+        color: 0x1e2226,
+        roughness: 0.58,
+        metalness: 0.24,
+      }),
+    );
+    this.irStrobeEmitterMat = this.mat(
+      new THREE.MeshBasicMaterial({
+        color: 0xe6fff0,
+        transparent: true,
+        opacity: 0.95,
       }),
     );
     this.watchDialMat = this.mat(
@@ -949,6 +977,24 @@ export class CharacterSkeleton {
     rearIff.position.set(0, 0.168, 0.106);
     registerHeadMesh(milTecGroup, rearIff);
 
+    // Helmet crown IR IFF strobe housing (Layer 0) + blinking NVG-only IR emitter (IR_LAYER = 2)
+    const strobeHousing = new THREE.Mesh(
+      this.geo(new THREE.BoxGeometry(0.026, 0.013, 0.036)),
+      this.irStrobeHousingMat,
+    );
+    strobeHousing.position.set(0, 0.222, 0.030);
+    registerHeadMesh(this.headGroup, strobeHousing);
+
+    const strobeEmitter = new THREE.Mesh(
+      this.geo(new THREE.SphereGeometry(0.011, 8, 6)),
+      this.irStrobeEmitterMat,
+    );
+    strobeEmitter.position.set(0, 0.233, 0.030);
+    strobeEmitter.layers.set(IR_LAYER);
+    strobeEmitter.visible = false;
+    this.headGroup.add(strobeEmitter);
+    this.irStrobeEmitterMeshes.push(strobeEmitter);
+
     // === ARTICULATING NVG PIVOT ARM (child of Mil-Tec helmet shroud) ===
     const nvgPivot = new THREE.Group();
     nvgPivot.name = 'nvg_mount_pivot';
@@ -1202,6 +1248,18 @@ export class CharacterSkeleton {
       entry.mesh.castShadow = true;
       entry.mesh.receiveShadow = !shadowOnly;
       entry.mesh.material = shadowOnly ? this.headShadowOnlyMat : entry.visibleMat;
+    }
+    for (let i = 0; i < this.irStrobeEmitterMeshes.length; i++) {
+      const emitter = this.irStrobeEmitterMeshes[i];
+      emitter.castShadow = shadowOnly;
+      emitter.receiveShadow = false;
+      emitter.material = shadowOnly ? this.headShadowOnlyMat : this.irStrobeEmitterMat;
+      if (shadowOnly) {
+        emitter.visible = false;
+        emitter.layers.set(0);
+      } else {
+        emitter.layers.set(IR_LAYER);
+      }
     }
   }
 
@@ -1503,10 +1561,30 @@ export class CharacterSkeleton {
     }
   }
 
+  public setFactionArmband(colorHex: number | null): void {
+    const visible = colorHex !== null;
+    if (visible) {
+      this.armbandMat.color.setHex(colorHex);
+    }
+    for (let i = 0; i < this.armbandMeshes.length; i++) {
+      this.armbandMeshes[i].visible = visible;
+    }
+  }
+
+  public setIrStrobe(enabled: boolean, pulseOn = true): void {
+    const show = enabled && pulseOn && !this.headShadowOnly;
+    for (let i = 0; i < this.irStrobeEmitterMeshes.length; i++) {
+      this.irStrobeEmitterMeshes[i].visible = show;
+      if (!this.headShadowOnly) {
+        this.irStrobeEmitterMeshes[i].layers.set(IR_LAYER);
+      }
+    }
+  }
+
   public enableArmViewmodelLayer(): void {
     const assignLayer = (rootObj: THREE.Object3D): void => {
       rootObj.traverse((obj) => {
-        if (obj instanceof THREE.Mesh) {
+        if (obj instanceof THREE.Mesh && !this.irStrobeEmitterMeshes.includes(obj)) {
           obj.layers.set(VIEWMODEL_LAYER);
         }
       });
@@ -1517,7 +1595,7 @@ export class CharacterSkeleton {
 
   public setAllMeshesWorldLayer(): void {
     this.root.traverse((obj) => {
-      if (obj instanceof THREE.Mesh) {
+      if (obj instanceof THREE.Mesh && !this.irStrobeEmitterMeshes.includes(obj)) {
         obj.layers.set(0);
       }
     });
@@ -1575,7 +1653,15 @@ export class CharacterSkeleton {
     shoulderPocket.position.set(side * 0.042 * armR, upperLen * 0.32, 0);
     const shoulderIff = new THREE.Mesh(this.geo(new THREE.BoxGeometry(0.008, 0.036, 0.046)), this.iffTrimMat);
     shoulderIff.position.set(side * 0.052 * armR, upperLen * 0.33, 0);
-    upperArm.add(shoulderCap, bicepCore, shoulderPocket, shoulderIff);
+    // Woven cloth faction identification armband wrapping upper bicep sleeve
+    const armband = new THREE.Mesh(
+      this.geo(new THREE.CylinderGeometry(0.0465 * armR, 0.0495 * armR, 0.054, 14)),
+      this.armbandMat,
+    );
+    armband.position.set(0, upperLen * 0.62, 0);
+    armband.visible = false;
+    this.armbandMeshes.push(armband);
+    upperArm.add(shoulderCap, bicepCore, shoulderPocket, shoulderIff, armband);
 
     // Secondary Bicep & Tricep Soft-Tissue Nodes (children of upperarm_l/r)
     const secBicep = new THREE.Group();
@@ -2131,16 +2217,30 @@ export class CharacterSkeleton {
       setFinger(hand.ring, 37 * gripTight, 52 * gripTight, 33 * gripDistTight);
       setFinger(hand.pinky, 41 * gripTight, 56 * gripTight, 36 * gripDistTight);
 
-      if (triggerPulledOrAds) {
-        // Finger curved naturally onto trigger shoe + live firing squeeze
-        const pullProx = 22 + triggerPull01 * 18;
-        const pullMid = 40 + triggerPull01 * 24;
-        const pullDist = 25 + triggerPull01 * 15;
-        setFinger(hand.index, pullProx, pullMid, pullDist, 0);
-      } else {
-        // Strict trigger discipline: straight index finger indexed high along frame/receiver outside guard
-        setFinger(hand.index, 4, 7, 4, -s * 0.09);
-      }
+      // Smooth continuous trigger-discipline blend (0 = straight along frame, 1 = curved onto trigger shoe)
+      const engage = THREE.MathUtils.clamp(
+        opts?.triggerEngageBlend ?? (triggerPulledOrAds ? 1 : 0),
+        0,
+        1,
+      );
+      const restProx = 4;
+      const restMid = 7;
+      const restDist = 4;
+      const restSplay = -s * 0.095;
+
+      // Calibrated natural trigger-shoe contact + smooth squeeze travel
+      const onProx = 20 + triggerPull01 * 17;
+      const onMid = 37 + triggerPull01 * 22;
+      const onDist = 23 + triggerPull01 * 14;
+      const onSplay = s * 0.015;
+
+      setFinger(
+        hand.index,
+        THREE.MathUtils.lerp(restProx, onProx, engage),
+        THREE.MathUtils.lerp(restMid, onMid, engage),
+        THREE.MathUtils.lerp(restDist, onDist, engage),
+        THREE.MathUtils.lerp(restSplay, onSplay, engage),
+      );
 
       // Thumb wraps high tang; smoothly flicks up/forward when actuating left-side safety/selector
       const baseThumbX = THREE.MathUtils.lerp(-0.20, -0.14, girthNorm);
@@ -2381,6 +2481,27 @@ export class CharacterSkeleton {
         setFinger(hand.pinky, 22, 28, 16, s * 0.04);
         hand.thumbProx.rotation.set(0.06, s * 0.24, s * 0.08);
         hand.thumbDist.rotation.set(-0.14, 0, 0);
+      }
+      return;
+    }
+
+    if (holdClass === 'melee_1h') {
+      if (side === 'right') {
+        // Forward saber grip: fingers wrap snugly around grooved knife handle; thumb braced forward over crossguard spine
+        setFinger(hand.index, 66 * scale, 78 * scale, 50 * scale, s * 0.03);
+        setFinger(hand.middle, 70 * scale, 82 * scale, 54 * scale);
+        setFinger(hand.ring, 74 * scale, 85 * scale, 56 * scale);
+        setFinger(hand.pinky, 76 * scale, 86 * scale, 58 * scale);
+        hand.thumbProx.rotation.set(0.10, s * 0.28, -s * 0.10);
+        hand.thumbDist.rotation.set(-0.22, 0, 0);
+      } else {
+        // Off-hand relaxed tactical balance/guard blade pose
+        setFinger(hand.index, 22, 30, 18, -s * 0.03);
+        setFinger(hand.middle, 26, 35, 20);
+        setFinger(hand.ring, 30, 38, 22);
+        setFinger(hand.pinky, 34, 42, 24, s * 0.03);
+        hand.thumbProx.rotation.set(-0.06, s * 0.26, s * 0.08);
+        hand.thumbDist.rotation.set(-0.18, 0, 0);
       }
       return;
     }

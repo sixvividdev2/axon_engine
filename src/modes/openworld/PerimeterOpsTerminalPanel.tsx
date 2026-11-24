@@ -1,9 +1,10 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   AlertTriangle,
   ArrowLeftRight,
   Award,
   Check,
+  Clock,
   Compass,
   Crosshair,
   HeartPulse,
@@ -24,6 +25,12 @@ import {
   processCharacterDeath,
 } from './PermadeathService';
 import { shardStore } from './ShardStore';
+import {
+  computeUnifiedRestockRemainingSec,
+  evaluateSupplyResourceStatus,
+  formatRestockTimer,
+} from './world/OpenWorldLogisticsEconomy';
+import { createPdaBatteryItem, stowItemIntoOperatorInventory } from './inventory/TetrisInventoryCore';
 import {
   ARMOR_PLATE_CATALOG,
   CHARACTER_SLOT_IDS,
@@ -83,6 +90,49 @@ export const PerimeterOpsTerminalPanel: React.FC<PerimeterOpsTerminalPanelProps>
   const [selectedHospitalId, setSelectedHospitalId] = useState<string>('');
   const [actionNotice, setActionNotice] = useState<string | null>(null);
   const [lastDeathOutcome, setLastDeathOutcome] = useState<CharacterDeathOutcome | null>(null);
+  const [clockTick, setClockTick] = useState(() => Date.now());
+
+  useEffect(() => {
+    const id = window.setInterval(() => setClockTick(Date.now()), 1000);
+    return () => window.clearInterval(id);
+  }, []);
+
+  const hideoutSupply = useMemo(() => {
+    if (!activeCharacter || !activeShard) return null;
+    const pool = activeShard.pmcSupplyPools[activeCharacter.pmcFaction];
+    const sabotage = activeShard.restockPenaltySec[activeCharacter.pmcFaction] ?? 0;
+    const ammoStatus = evaluateSupplyResourceStatus('ammo', pool.ammo);
+    const fuelStatus = evaluateSupplyResourceStatus('fuelParts', pool.fuelParts);
+    const restock = computeUnifiedRestockRemainingSec(pool, sabotage, clockTick);
+    return { pool, ammoStatus, fuelStatus, restock, sabotage };
+  }, [activeCharacter, activeShard, clockTick]);
+
+  const handlePurchasePdaBattery = () => {
+    if (!activeCharacter || !hideoutSupply) return;
+    const price = Math.round(180 * hideoutSupply.fuelStatus.priceMultiplier);
+    if (activeCharacter.cash < price) {
+      setActionNotice('Insufficient cash for CR123A PDA Battery.');
+      return;
+    }
+    const fresh = characterRoster.getCharacter(activeCharacter.slotId);
+    if (!fresh?.tacticalInventory) {
+      setActionNotice('Operator tactical rig unavailable.');
+      return;
+    }
+    const placed = stowItemIntoOperatorInventory(fresh.tacticalInventory, createPdaBatteryItem(100));
+    if (!placed) {
+      setActionNotice('No 1x1 Tetris grid space available in Chest Rig or Backpack.');
+      return;
+    }
+    characterRoster.adjustCash(activeCharacter.slotId, -price);
+    characterRoster.updateTacticalInventory(activeCharacter.slotId, fresh.tacticalInventory);
+    shardStore.recordDiscreteTransition(
+      activeCharacter.shardMode,
+      'trader_purchase',
+      `${activeCharacter.callsign} bought CR123A PDA Cell (${formatUsd(price)})`,
+    );
+    setActionNotice(`Issued CR123A Lithium PDA Cell (${formatUsd(price)}) into field rig.`);
+  };
 
   const hospitals = useMemo(
     () => (activeCharacter ? getAvailableFieldHospitals(activeCharacter) : []),
@@ -1214,16 +1264,50 @@ export const PerimeterOpsTerminalPanel: React.FC<PerimeterOpsTerminalPanelProps>
                   )}
                 </div>
 
-                {/* Quartermaster Buy List */}
+                {/* Quartermaster Buy List (Coupled to Live PMC Supply Pool & 30m/60m/2h+ Restock Timer) */}
                 <div className="border border-white/10 bg-[#11151c] p-3">
-                  <div className="mb-2 flex items-center justify-between text-xs">
+                  <div className="mb-2 flex flex-wrap items-center justify-between gap-2 text-xs">
                     <span className="font-semibold text-neutral-200">
-                      Quartermaster Firearms (Mounts Instantly to 3D Wall)
+                      Quartermaster Firearms (Supply-Coupled · Mounts to 3D Wall)
                     </span>
-                    <span className="font-mono-tabular text-emerald-300">
-                      Cash {formatUsd(activeCharacter.cash)}
-                    </span>
+                    <div className="flex items-center gap-3 font-mono-tabular text-[11px]">
+                      {hideoutSupply && (
+                        <span
+                          className={
+                            hideoutSupply.ammoStatus.tier === 'high'
+                              ? 'text-emerald-300'
+                              : hideoutSupply.ammoStatus.tier === 'strained'
+                                ? 'text-amber-300'
+                                : 'text-red-400'
+                          }
+                        >
+                          <Clock className="mr-1 inline h-3 w-3" />
+                          {hideoutSupply.ammoStatus.tierLabel} ({hideoutSupply.ammoStatus.pct}%) · Restock{' '}
+                          {formatRestockTimer(hideoutSupply.restock.remainingSec)}
+                        </span>
+                      )}
+                      <span className="text-emerald-300">
+                        Cash {formatUsd(activeCharacter.cash)}
+                      </span>
+                    </div>
                   </div>
+                  {hideoutSupply && (
+                    <div className="mb-2 flex flex-wrap items-center justify-between gap-2 border border-white/8 bg-[#0c1016] px-2.5 py-1.5 font-mono-tabular text-[11px] text-neutral-300">
+                      <span>
+                        Supply Pricing {Math.round(hideoutSupply.ammoStatus.priceMultiplier * 100)}% ·
+                        {hideoutSupply.ammoStatus.tier === 'starved'
+                          ? ' STARVED (<30%): High-tier Lv2+ stock gated until supply recovers'
+                          : ' Synced with In-World FOB Quartermaster'}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={handlePurchasePdaBattery}
+                        className="cursor-pointer border border-cyan-400/55 bg-cyan-950/50 px-2 py-0.5 text-[10px] font-semibold text-cyan-200 hover:bg-cyan-900/60"
+                      >
+                        Buy CR123A PDA Cell ({formatUsd(180 * hideoutSupply.fuelStatus.priceMultiplier)})
+                      </button>
+                    </div>
+                  )}
                   <div className="grid max-h-[240px] grid-cols-1 gap-1.5 overflow-y-auto pr-1 sm:grid-cols-2">
                     {QUARTERMASTER_FIREARM_OFFERS.map((offer) => {
                       const prof = resolveWeaponProfile(offer.weaponId);
@@ -1236,8 +1320,14 @@ export const PerimeterOpsTerminalPanel: React.FC<PerimeterOpsTerminalPanelProps>
                           ? (activeCharacter.subFactionStanding[offer.subFactionRequired] ?? 0) <
                             offer.minStanding
                           : false;
-                      const affordable = activeCharacter.cash >= offer.priceUsd;
-                      const disabled = owned || !unlockedForChar || reqStanding || !affordable;
+                      const starvedOut =
+                        hideoutSupply?.ammoStatus.tier === 'starved' && offer.requiredTraderLevel >= 2;
+                      const scaledPrice = Math.round(
+                        offer.priceUsd * (hideoutSupply?.ammoStatus.priceMultiplier ?? 1),
+                      );
+                      const affordable = activeCharacter.cash >= scaledPrice;
+                      const disabled =
+                        owned || !unlockedForChar || reqStanding || starvedOut || !affordable;
                       return (
                         <div
                           key={offer.weaponId}
@@ -1246,7 +1336,7 @@ export const PerimeterOpsTerminalPanel: React.FC<PerimeterOpsTerminalPanelProps>
                           <div className="min-w-0">
                             <div className="truncate font-medium text-neutral-100">{prof.name}</div>
                             <div className="font-mono-tabular text-[11px] text-neutral-400">
-                              {formatUsd(offer.priceUsd)} · {TRADER_MAP[offer.traderId].name} Lv{' '}
+                              {formatUsd(scaledPrice)} · {TRADER_MAP[offer.traderId].name} Lv{' '}
                               {offer.requiredTraderLevel}
                               {offer.subFactionRequired && offer.minStanding !== undefined
                                 ? ` · ${SUB_FACTION_MAP[offer.subFactionRequired].shortName} +${offer.minStanding}`
@@ -1256,7 +1346,7 @@ export const PerimeterOpsTerminalPanel: React.FC<PerimeterOpsTerminalPanelProps>
                           <button
                             type="button"
                             disabled={disabled}
-                            onClick={() => handlePurchaseWeapon(offer.weaponId, offer.priceUsd)}
+                            onClick={() => handlePurchaseWeapon(offer.weaponId, scaledPrice)}
                             className={`border px-2.5 py-1 font-mono-tabular text-[11px] font-semibold whitespace-nowrap shrink-0 ${
                               owned
                                 ? 'cursor-default border-emerald-500/35 bg-emerald-500/12 text-emerald-300'
@@ -1267,11 +1357,13 @@ export const PerimeterOpsTerminalPanel: React.FC<PerimeterOpsTerminalPanelProps>
                           >
                             {owned
                               ? 'Owned'
-                              : !unlockedForChar
-                                ? 'Trader Lock'
-                                : reqStanding
-                                  ? 'Rep Lock'
-                                  : 'Buy'}
+                              : starvedOut
+                                ? 'Starved'
+                                : !unlockedForChar
+                                  ? 'Trader Lock'
+                                  : reqStanding
+                                    ? 'Rep Lock'
+                                    : 'Buy'}
                           </button>
                         </div>
                       );

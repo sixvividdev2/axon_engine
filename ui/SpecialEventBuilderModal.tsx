@@ -490,6 +490,68 @@ export const SpecialEventBuilderModal: React.FC<SpecialEventBuilderModalProps> =
                   </div>
                 </div>
               </div>
+
+              <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                <div className="border border-neutral-800 bg-neutral-900/50 p-3">
+                  <div className="font-mono-tabular text-[10px] uppercase tracking-wider text-neutral-400">
+                    Battle Hitmarkers (Host Rule)
+                  </div>
+                  <div className="mt-2 grid grid-cols-2 gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => patchCfg({ hitmarkersEnabled: true })}
+                      className={`cursor-pointer border py-1.5 font-mono-tabular text-[11px] ${
+                        cfg.hitmarkersEnabled !== false
+                          ? 'border-amber-400 bg-amber-500/20 text-amber-300'
+                          : 'border-neutral-800 bg-neutral-950 text-neutral-400'
+                      }`}
+                    >
+                      Hitmarkers ON
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => patchCfg({ hitmarkersEnabled: false })}
+                      className={`cursor-pointer border py-1.5 font-mono-tabular text-[11px] ${
+                        cfg.hitmarkersEnabled === false
+                          ? 'border-red-500 bg-red-950/60 text-red-200'
+                          : 'border-neutral-800 bg-neutral-950 text-neutral-400'
+                      }`}
+                    >
+                      Hitmarkers OFF
+                    </button>
+                  </div>
+                </div>
+
+                <div className="border border-neutral-800 bg-neutral-900/50 p-3">
+                  <div className="font-mono-tabular text-[10px] uppercase tracking-wider text-neutral-400">
+                    Battle Combat HUD (Host Rule)
+                  </div>
+                  <div className="mt-2 grid grid-cols-2 gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => patchCfg({ hudEnabled: true })}
+                      className={`cursor-pointer border py-1.5 font-mono-tabular text-[11px] ${
+                        cfg.hudEnabled !== false
+                          ? 'border-amber-400 bg-amber-500/20 text-amber-300'
+                          : 'border-neutral-800 bg-neutral-950 text-neutral-400'
+                      }`}
+                    >
+                      HUD ON
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => patchCfg({ hudEnabled: false })}
+                      className={`cursor-pointer border py-1.5 font-mono-tabular text-[11px] ${
+                        cfg.hudEnabled === false
+                          ? 'border-red-500 bg-red-950/60 text-red-200'
+                          : 'border-neutral-800 bg-neutral-950 text-neutral-400'
+                      }`}
+                    >
+                      HUD OFF (Hardcore)
+                    </button>
+                  </div>
+                </div>
+              </div>
             </section>
 
             {/* Section 4: AI Bots Tuning */}

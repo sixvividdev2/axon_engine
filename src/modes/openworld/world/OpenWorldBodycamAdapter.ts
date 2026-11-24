@@ -3,6 +3,7 @@ import {
   BodycamAcousticKind,
   BodycamCapsuleSweepResult,
   BodycamInteriorSample,
+  BodycamMeleeHitEvent,
   BodycamRaycastResult,
   BodycamSurfaceMaterial,
   IBodycamWorldAdapter,
@@ -12,10 +13,13 @@ import { OpenWorldChunkStreamer } from './OpenWorldChunkStreamer';
 import type { OpenWorldConvoyDirector } from './OpenWorldConvoyDirector';
 import type { OpenWorldEventDirector } from './OpenWorldEventDirector';
 import type { WildlifeManager } from './WildlifeManager';
+import type { OpenWorldFobDynamicProps } from './OpenWorldFobDynamicProps';
 import {
   createObbRaycastHit,
   createRoadQueryResult,
   queryRoadNetwork,
+  resolveCapsuleHorizontalAgainstObbs,
+  SolidObb,
 } from './OpenWorldCivilizationTopology';
 import {
   createTerrainSample,
@@ -32,6 +36,9 @@ const _terrainSample = createTerrainSample();
 const _roadScratch = createRoadQueryResult();
 const _obbHitScratch = createObbRaycastHit();
 const _capsuleScratch = { x: 0, z: 0, hitWall: false, wallNormalX: 0, wallNormalZ: 0 };
+const _gateObbsScratch: SolidObb[] = [];
+const _targetHitPointScratch = new THREE.Vector3();
+const _targetHitNormalScratch = new THREE.Vector3();
 const _marchPt = new THREE.Vector3();
 const _tmpNormal = new THREE.Vector3();
 
@@ -49,6 +56,8 @@ export class OpenWorldBodycamAdapter implements IBodycamWorldAdapter {
   private wildlifeManager: WildlifeManager | null = null;
   private convoyDirector: OpenWorldConvoyDirector | null = null;
   private eventDirector: OpenWorldEventDirector | null = null;
+  private fobDynamicProps: OpenWorldFobDynamicProps | null = null;
+  public onMeleeHit?: (event: Readonly<BodycamMeleeHitEvent>) => void;
 
   constructor(
     streamer: OpenWorldChunkStreamer,
@@ -72,6 +81,10 @@ export class OpenWorldBodycamAdapter implements IBodycamWorldAdapter {
 
   public setEventDirector(director: OpenWorldEventDirector | null): void {
     this.eventDirector = director;
+  }
+
+  public setFobDynamicProps(props: OpenWorldFobDynamicProps | null): void {
+    this.fobDynamicProps = props;
   }
 
   public getGroundHeight(x: number, z: number, referenceY: number): number {
@@ -169,6 +182,29 @@ export class OpenWorldBodycamAdapter implements IBodycamWorldAdapter {
       wallNz = _capsuleScratch.wallNormalZ;
     }
 
+    if (this.fobDynamicProps) {
+      this.fobDynamicProps.resolveClosedGateObbs(_gateObbsScratch);
+      if (_gateObbsScratch.length > 0) {
+        resolveCapsuleHorizontalAgainstObbs(
+          _gateObbsScratch,
+          resolvedX,
+          startPos.y,
+          resolvedZ,
+          radius,
+          height,
+          maxStepUpM,
+          _capsuleScratch,
+        );
+        resolvedX = _capsuleScratch.x;
+        resolvedZ = _capsuleScratch.z;
+        if (_capsuleScratch.hitWall) {
+          hitWall = true;
+          wallNx = _capsuleScratch.wallNormalX;
+          wallNz = _capsuleScratch.wallNormalZ;
+        }
+      }
+    }
+
     const groundY = this.getGroundHeight(resolvedX, resolvedZ, startPos.y);
     const targetY = startPos.y + deltaY;
 
@@ -237,13 +273,17 @@ export class OpenWorldBodycamAdapter implements IBodycamWorldAdapter {
     let bestDist = far;
     let foundHit = false;
 
-    // 1. Check live AI operator hit meshes first via Three.js Raycaster
-    if (this.aiDirector.hitMeshes.length > 0) {
+    // 1. Check live nearby AI operator hit meshes first via Three.js Raycaster
+    const aiHitMeshes =
+      typeof this.aiDirector.getRaycastHitMeshes === 'function'
+        ? this.aiDirector.getRaycastHitMeshes()
+        : this.aiDirector.hitMeshes;
+    if (aiHitMeshes.length > 0) {
       _raycaster.set(origin as THREE.Vector3, direction as THREE.Vector3);
       _raycaster.near = near;
       _raycaster.far = far;
       _hits.length = 0;
-      _raycaster.intersectObjects(this.aiDirector.hitMeshes, false, _hits);
+      _raycaster.intersectObjects(aiHitMeshes, false, _hits);
 
       for (let i = 0; i < _hits.length; i++) {
         const h = _hits[i];
@@ -377,6 +417,61 @@ export class OpenWorldBodycamAdapter implements IBodycamWorldAdapter {
       outResult.normalZ = _obbHitScratch.normalZ;
       outResult.surface = _obbHitScratch.surface;
       outResult.object = null;
+    }
+
+    // 2b. Check closed FOB checkpoint boom gates & reactive steel gun-range / CQB targets
+    if (this.fobDynamicProps) {
+      _obbHitScratch.hit = false;
+      _obbHitScratch.distance = bestDist;
+      if (
+        this.fobDynamicProps.raycastClosedGates(
+          origin.x,
+          origin.y,
+          origin.z,
+          direction.x,
+          direction.y,
+          direction.z,
+          near,
+          _obbHitScratch,
+        ) &&
+        _obbHitScratch.distance < bestDist
+      ) {
+        bestDist = _obbHitScratch.distance;
+        foundHit = true;
+        outResult.hit = true;
+        outResult.distance = _obbHitScratch.distance;
+        outResult.pointX = _obbHitScratch.pointX;
+        outResult.pointY = _obbHitScratch.pointY;
+        outResult.pointZ = _obbHitScratch.pointZ;
+        outResult.normalX = _obbHitScratch.normalX;
+        outResult.normalY = _obbHitScratch.normalY;
+        outResult.normalZ = _obbHitScratch.normalZ;
+        outResult.surface = 'metal';
+        outResult.object = null;
+      }
+
+      const targetHit = this.fobDynamicProps.raycastTargets(
+        origin,
+        direction,
+        near,
+        bestDist,
+        _targetHitPointScratch,
+        _targetHitNormalScratch,
+      );
+      if (targetHit.hit && targetHit.distance < bestDist) {
+        bestDist = targetHit.distance;
+        foundHit = true;
+        outResult.hit = true;
+        outResult.distance = targetHit.distance;
+        outResult.pointX = _targetHitPointScratch.x;
+        outResult.pointY = _targetHitPointScratch.y;
+        outResult.pointZ = _targetHitPointScratch.z;
+        outResult.normalX = _targetHitNormalScratch.x;
+        outResult.normalY = _targetHitNormalScratch.y;
+        outResult.normalZ = _targetHitNormalScratch.z;
+        outResult.surface = 'metal';
+        outResult.object = targetHit.object;
+      }
     }
 
     // 3. Fast analytical heightfield/deck raymarch against 4km terrain & bridge decks (coarse + binary refine)

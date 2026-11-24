@@ -12,6 +12,7 @@ import type { PmcFactionId, SecureContainerTier } from '../types';
 import {
   AmmoStackItem,
   BackpackItem,
+  BatteryItem,
   BeltAllowedKind,
   ChestRigItem,
   CorpseTacticalLootSnapshot,
@@ -522,6 +523,23 @@ export function createGrenadeItem(equipmentId = 'm67_frag'): GrenadeItem {
     weightKg: 0.4,
     equipmentId,
     count: 1,
+  };
+}
+
+export function createPdaBatteryItem(chargePct = 100): BatteryItem {
+  return {
+    instanceId: nextTacticalItemId('batt'),
+    templateId: 'pda_battery',
+    name: 'CR123A Lithium PDA Cell',
+    shortLabel: 'CR123A',
+    kind: 'battery',
+    width: 1,
+    height: 1,
+    valueUsd: 180,
+    weightKg: 0.08,
+    chargePct: Math.max(0, Math.min(100, Math.round(chargePct))),
+    usesRemaining: 1,
+    maxUses: 1,
   };
 }
 
@@ -1304,9 +1322,10 @@ export function buildStarterTacticalInventory(
   chestRig.pistolMagSlots[0] = createLoadedMagazineForWeapon(secondaryWep);
   chestRig.pistolMagSlots[1] = createLoadedMagazineForWeapon(secondaryWep);
 
-  // Chest rig general pouches: IFAK + extra bandage
+  // Chest rig general pouches: IFAK + extra bandage + spare CR123A PDA lithium cell
   autoPlaceItemInGrid(chestRig.generalGrid, createMedicalItem('ifak'));
   autoPlaceItemInGrid(chestRig.generalGrid, createMedicalItem('bandage'));
+  autoPlaceItemInGrid(chestRig.generalGrid, createPdaBatteryItem(100));
 
   // Tactical Belt: 2x M67 Frag, 1x Hemostatic Bandage, 1x Combat Splint
   const beltSlots: Array<TacticalItem | null> = [

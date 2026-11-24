@@ -537,6 +537,28 @@ function buildKorsakovSubstation(
   buildRustedVehicle(propCtx, 'zil_truck', -41.5, 0, 14.0, 0.2, truckMats);
   buildRustedVehicle(propCtx, 'pickup', 41.5, 0, -14.0, -0.25, truckMats);
 
+  // Industrial Steel Blast Baffles & Yard Cable-Spool Cover Clusters breaking direct hall-to-yard sightlines
+  const blastBaffles: Array<[number, number, number, number]> = [
+    [-5.8, -25.0, 3.0, 0.48],
+    [5.8, -25.0, 3.0, 0.48],
+    [-5.8, 25.0, 3.0, 0.48],
+    [5.8, 25.0, 3.0, 0.48],
+    [-36.5, -16.5, 0.5, 3.2],
+    [36.5, 16.5, 0.5, 3.2],
+    [-11.5, -10.5, 2.6, 0.44],
+    [11.5, 10.5, 2.6, 0.44],
+  ];
+  for (const [bx, bz, bw, bd] of blastBaffles) {
+    const baseY = Math.abs(bz) < 21.5 && Math.abs(bx) < 32.5 ? 0.08 : 0;
+    addSolidBox(bx, baseY + 0.58, bz, bw, 1.16, bd, matDarkSteel, 'metal');
+    const trim = new THREE.Mesh(
+      trackGeo(new THREE.BoxGeometry(bw + 0.04, 0.08, bd + 0.04)),
+      matHazardYellow,
+    );
+    trim.position.set(bx, baseY + 1.2, bz);
+    sceneGroup.add(trim);
+  }
+
   // === 6. SIGNATURE OPTION 3 LIGHTING: WARM SODIUM-VAPOR FLOODLIGHTS + BLUE EMERGENCY EXIT LIGHTS ===
   type SodiumMountType = 'truss' | 'gantry' | 'wall-west' | 'wall-east';
   const sodiumSpecs: Array<{ x: number; y: number; z: number; intensity: number; mount: SodiumMountType }> = [

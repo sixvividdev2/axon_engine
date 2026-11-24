@@ -1083,6 +1083,16 @@ function buildKinoTheater(
   addSolidBox(20.6, 0.55, -8.5, 1.4, 1.1, 1.4, matBarricadeWood, 'wood');
   addSolidBox(20.4, 0.45, -10.2, 1.1, 0.9, 1.1, matBarricadeWood, 'wood');
 
+  // Stage-Wing Equipment Crates & Grand Foyer Art-Deco Kiting Cover Islands
+  addSolidBox(-9.6, 1.38, -21.2, 1.35, 1.06, 1.35, matBarricadeWood, 'wood');
+  addSolidBox(6.2, 1.38, -21.4, 1.35, 1.06, 1.35, matBarricadeWood, 'wood');
+  for (const fx of [-6.4, 6.4]) {
+    addSolidBox(fx, 0.54, 14.8, 2.2, 1.0, 0.62, matStageWood, 'wood');
+    const brassCap = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(2.26, 0.06, 0.68)), matBrass);
+    brassCap.position.set(fx, 1.07, 14.8);
+    sceneGroup.add(brassCap);
+  }
+
   // === 7. BUYABLE DOORS / DEBRIS BARRICADES ===
   const addBuyableDoor = (
     id: string,

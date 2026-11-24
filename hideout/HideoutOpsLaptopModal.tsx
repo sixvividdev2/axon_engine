@@ -476,6 +476,46 @@ export const HideoutOpsLaptopModal: React.FC<HideoutOpsLaptopModalProps> = ({
                 onChangeTimeOfDay={(timeOfDayStart) => updateBattle({ timeOfDayStart })}
               />
 
+              {/* Host Match Rules: Hitmarkers & Combat HUD */}
+              <div className="flex flex-wrap items-center justify-between gap-3 border border-white/10 bg-[#11151b] px-4 py-3">
+                <div>
+                  <div className="font-mono-tabular text-[11px] font-semibold uppercase tracking-wider text-amber-300">
+                    Match Rules · HUD &amp; Hitmarkers
+                  </div>
+                  <div className="mt-0.5 font-mono-tabular text-[11px] text-neutral-400">
+                    Choose whether Battle matches run with Hitmarkers and Combat HUD enabled
+                  </div>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      updateBattle({ hitmarkersEnabled: battleConfig.hitmarkersEnabled === false })
+                    }
+                    className={`cursor-pointer whitespace-nowrap border px-3 py-1.5 font-mono-tabular text-[11px] font-semibold uppercase transition-colors ${
+                      battleConfig.hitmarkersEnabled !== false
+                        ? 'border-emerald-500/70 bg-emerald-950/45 text-emerald-300'
+                        : 'border-white/12 bg-[#161b23] text-neutral-400 hover:text-neutral-200'
+                    }`}
+                  >
+                    Hitmarkers: {battleConfig.hitmarkersEnabled !== false ? 'ON' : 'OFF'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      updateBattle({ hudEnabled: battleConfig.hudEnabled === false })
+                    }
+                    className={`cursor-pointer whitespace-nowrap border px-3 py-1.5 font-mono-tabular text-[11px] font-semibold uppercase transition-colors ${
+                      battleConfig.hudEnabled !== false
+                        ? 'border-emerald-500/70 bg-emerald-950/45 text-emerald-300'
+                        : 'border-white/12 bg-[#161b23] text-neutral-400 hover:text-neutral-200'
+                    }`}
+                  >
+                    Combat HUD: {battleConfig.hudEnabled !== false ? 'ON' : 'OFF'}
+                  </button>
+                </div>
+              </div>
+
               {/* Deploy Footer */}
               <div className="flex flex-wrap items-center justify-between gap-4 border-t border-white/10 pt-4">
                 <div className="font-mono-tabular text-xs text-neutral-400">
@@ -492,6 +532,8 @@ export const HideoutOpsLaptopModal: React.FC<HideoutOpsLaptopModalProps> = ({
                       tacticalEquipmentId: tacticalSelection.equipmentId,
                       weatherPreset: battleConfig.weatherPreset ?? 'auto',
                       timeOfDayStart: battleConfig.timeOfDayStart ?? 'auto',
+                      hitmarkersEnabled: battleConfig.hitmarkersEnabled !== false,
+                      hudEnabled: battleConfig.hudEnabled !== false,
                     })
                   }
                   className="cursor-pointer bg-amber-500 px-8 py-2.5 font-display text-sm font-bold uppercase tracking-wider text-neutral-950 transition-colors hover:bg-amber-400 whitespace-nowrap shrink-0"

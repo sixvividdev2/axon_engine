@@ -13,6 +13,11 @@ import {
   GameZombiesSyncPacket,
   SyncedZombieState,
 } from '../data/multiplayer';
+import {
+  BuiltInfectedZombieRig,
+  InfectedPoseInput,
+  InfectedZombieRigLibrary,
+} from './InfectedZombieRig';
 
 export interface ZombieDamageResult {
   hit: boolean;
@@ -113,10 +118,7 @@ interface ZombieActor {
   // Visuals
   root: THREE.Group;
   bodyPivot: THREE.Group;
-  leftArm: THREE.Mesh;
-  rightArm: THREE.Mesh;
-  leftLeg: THREE.Mesh;
-  rightLeg: THREE.Mesh;
+  rig: BuiltInfectedZombieRig;
   hitMeshes: THREE.Mesh[];
 }
 
@@ -199,17 +201,20 @@ export class InfectionZombieAI {
   private readonly _audioIndices: number[] = [];
   private readonly _audioDists: number[] = [];
 
-  // Shared zombie geometries/materials
-  private readonly geoLeg: THREE.BoxGeometry;
-  private readonly geoTorso: THREE.BoxGeometry;
-  private readonly geoHead: THREE.BoxGeometry;
-  private readonly geoArm: THREE.BoxGeometry;
-  private readonly geoEye: THREE.BoxGeometry;
-  private readonly matSkin: THREE.MeshStandardMaterial;
-  private readonly matClothesA: THREE.MeshStandardMaterial;
-  private readonly matClothesB: THREE.MeshStandardMaterial;
-  private readonly matBlood: THREE.MeshStandardMaterial;
-  private readonly matEye: THREE.MeshBasicMaterial;
+  // Shared anatomical infected zombie rig library & zero-GC pose input scratch
+  private readonly rigLib: InfectedZombieRigLibrary;
+  private elapsedSec = 0;
+  private readonly _poseInput: InfectedPoseInput = {
+    mode: 'locomote',
+    walkCycle: 0,
+    speedMps: 0,
+    tearPhase: 0,
+    vaultT: 0,
+    windupProgress: 0,
+    staggerRatio: 0,
+    deathProgress: 0,
+    elapsedSec: 0,
+  };
 
   constructor(
     scene: THREE.Scene,
@@ -235,25 +240,7 @@ export class InfectionZombieAI {
 
     scene.add(this.group);
 
-    this.geoLeg = this.track(new THREE.BoxGeometry(0.16, 0.74, 0.17));
-    this.geoTorso = this.track(new THREE.BoxGeometry(0.42, 0.58, 0.24));
-    this.geoHead = this.track(new THREE.BoxGeometry(0.23, 0.26, 0.24));
-    this.geoArm = this.track(new THREE.BoxGeometry(0.11, 0.56, 0.12));
-    this.geoEye = this.track(new THREE.BoxGeometry(0.042, 0.028, 0.02));
-
-    this.matSkin = this.track(
-      new THREE.MeshStandardMaterial({ color: 0x7c8476, roughness: 0.9, metalness: 0.02 }),
-    );
-    this.matClothesA = this.track(
-      new THREE.MeshStandardMaterial({ color: 0x2a2726, roughness: 0.94, metalness: 0.0 }),
-    );
-    this.matClothesB = this.track(
-      new THREE.MeshStandardMaterial({ color: 0x3b2c2a, roughness: 0.94, metalness: 0.0 }),
-    );
-    this.matBlood = this.track(
-      new THREE.MeshStandardMaterial({ color: 0x5c1111, roughness: 0.65, metalness: 0.05 }),
-    );
-    this.matEye = this.track(new THREE.MeshBasicMaterial({ color: 0xffaa2b }));
+    this.rigLib = this.track(new InfectedZombieRigLibrary());
 
     // Pooled blood burst InstancedMesh
     const bloodGeo = this.track(new THREE.BoxGeometry(0.055, 0.055, 0.055));
@@ -697,52 +684,8 @@ export class InfectionZombieAI {
     entryPos?: [number, number, number],
     spawnerId: string | null = null,
   ): ZombieActor {
-    const clothesMat = Math.random() < 0.5 ? this.matClothesA : this.matClothesB;
-
-    const root = new THREE.Group();
-    const bodyPivot = new THREE.Group();
-    root.add(bodyPivot);
-
-    const leftLeg = new THREE.Mesh(this.geoLeg, clothesMat);
-    leftLeg.position.set(-0.11, 0.37, 0);
-    leftLeg.userData = { combatActorType: 'zombie', actorId: id, hitZone: 'limb', surfaceMaterial: 'wood' };
-
-    const rightLeg = new THREE.Mesh(this.geoLeg, clothesMat);
-    rightLeg.position.set(0.11, 0.37, 0);
-    rightLeg.userData = { combatActorType: 'zombie', actorId: id, hitZone: 'limb', surfaceMaterial: 'wood' };
-
-    // Hunched torso
-    const torso = new THREE.Mesh(this.geoTorso, clothesMat);
-    torso.position.set(0, 1.04, -0.05);
-    torso.rotation.x = 0.18;
-    torso.userData = { combatActorType: 'zombie', actorId: id, hitZone: 'thorax', surfaceMaterial: 'wood' };
-
-    const stain = new THREE.Mesh(this.geoTorso, this.matBlood);
-    stain.scale.set(0.75, 0.55, 1.04);
-    stain.position.set(0, 1.02, -0.06);
-    stain.rotation.x = 0.18;
-
-    const head = new THREE.Mesh(this.geoHead, this.matSkin);
-    head.position.set(0, 1.48, -0.14);
-    head.userData = { combatActorType: 'zombie', actorId: id, hitZone: 'head', surfaceMaterial: 'wood' };
-
-    const eyeL = new THREE.Mesh(this.geoEye, this.matEye);
-    eyeL.position.set(-0.055, 1.5, -0.265);
-    const eyeR = new THREE.Mesh(this.geoEye, this.matEye);
-    eyeR.position.set(0.055, 1.5, -0.265);
-
-    // Outstretched grasping arms
-    const leftArm = new THREE.Mesh(this.geoArm, this.matSkin);
-    leftArm.position.set(-0.26, 1.18, -0.26);
-    leftArm.rotation.x = Math.PI * 0.44;
-    leftArm.userData = { combatActorType: 'zombie', actorId: id, hitZone: 'limb', surfaceMaterial: 'wood' };
-
-    const rightArm = new THREE.Mesh(this.geoArm, this.matSkin);
-    rightArm.position.set(0.26, 1.18, -0.26);
-    rightArm.rotation.x = Math.PI * 0.44;
-    rightArm.userData = { combatActorType: 'zombie', actorId: id, hitZone: 'limb', surfaceMaterial: 'wood' };
-
-    bodyPivot.add(leftLeg, rightLeg, torso, stain, head, eyeL, eyeR, leftArm, rightArm);
+    const rig = this.rigLib.buildZombie(id);
+    const { root, bodyPivot } = rig;
     this.group.add(root);
 
     const spawnerDef = spawnerId
@@ -812,13 +755,21 @@ export class InfectionZombieAI {
       lastSpeedMps: 0,
       root,
       bodyPivot,
-      leftArm,
-      rightArm,
-      leftLeg,
-      rightLeg,
-      hitMeshes: [leftLeg, rightLeg, torso, head, leftArm, rightArm],
+      rig,
+      hitMeshes: rig.hitMeshes,
     };
     z.prevWalkStepIndex = Math.floor(z.walkCycle / Math.PI);
+
+    this._poseInput.mode = 'locomote';
+    this._poseInput.walkCycle = z.walkCycle;
+    this._poseInput.speedMps = 0;
+    this._poseInput.tearPhase = 0;
+    this._poseInput.vaultT = 0;
+    this._poseInput.windupProgress = 0;
+    this._poseInput.staggerRatio = 0;
+    this._poseInput.deathProgress = 0;
+    this._poseInput.elapsedSec = this.elapsedSec;
+    this.rigLib.applyPose(rig, this._poseInput);
 
     root.position.copy(z.pos);
     root.rotation.set(0, z.yaw, 0);
@@ -1192,6 +1143,8 @@ export class InfectionZombieAI {
     onZombieSpawn?: (pkt: GameZombieSpawnPacket) => void,
     onBarrierChanged?: (barrierId: string, planksRemaining: number) => void,
   ): void {
+    this.elapsedSec += dt;
+
     // 1. Update blood burst InstancedMesh
     let anyBloodMoved = false;
     for (let i = 0; i < this.bloodParticles.length; i++) {
@@ -1232,9 +1185,16 @@ export class InfectionZombieAI {
         const z = this.zombies[i];
         if (!z.alive) {
           z.deathTimer += dt;
-          const fallT = Math.min(1, z.deathTimer / 0.42);
-          z.bodyPivot.rotation.x = -fallT * (Math.PI * 0.48);
-          z.bodyPivot.position.y = -fallT * 0.15;
+          this._poseInput.mode = 'death';
+          this._poseInput.walkCycle = z.walkCycle;
+          this._poseInput.speedMps = 0;
+          this._poseInput.tearPhase = 0;
+          this._poseInput.vaultT = 0;
+          this._poseInput.windupProgress = 0;
+          this._poseInput.staggerRatio = 0;
+          this._poseInput.deathProgress = Math.min(1, z.deathTimer / 0.55);
+          this._poseInput.elapsedSec = this.elapsedSec;
+          this.rigLib.applyPose(z.rig, this._poseInput);
           if (z.deathTimer > 3.2) {
             this.group.remove(z.root);
             this.zombies.splice(i, 1);
@@ -1256,35 +1216,39 @@ export class InfectionZombieAI {
 
         z.lastSpeedMps = spd;
         z.walkCycle += dt * Math.max(1.2, spd * 2.9);
-        const stride = Math.min(0.65, spd * 0.18);
+
+        this._poseInput.walkCycle = z.walkCycle;
+        this._poseInput.speedMps = spd;
+        this._poseInput.staggerRatio =
+          z.staggerTimer > 0 ? Math.min(1, z.staggerTimer / 0.35) : z.netStagger ? 0.72 : 0;
+        this._poseInput.deathProgress = 0;
+        this._poseInput.elapsedSec = this.elapsedSec;
+
         if (z.netEntryStage === 'vault') {
-          z.leftLeg.rotation.x = -0.82;
-          z.rightLeg.rotation.x = -0.62;
-          z.leftArm.rotation.x = Math.PI * 0.72;
-          z.rightArm.rotation.x = Math.PI * 0.72;
-          z.bodyPivot.rotation.set(0.45, 0, 0);
+          z.vaultT = Math.min(1, z.vaultT + dt / ZOMBIE_WINDOW_VAULT_SEC);
+          this._poseInput.mode = 'vault';
+          this._poseInput.vaultT = z.vaultT;
+          this._poseInput.tearPhase = 0;
+          this._poseInput.windupProgress = 0;
         } else if (z.netEntryStage === 'tear') {
+          z.vaultT = 0;
           z.tearAnimPhase += dt * 5.2;
-          const rip = Math.sin(z.tearAnimPhase);
-          z.leftLeg.rotation.x = 0.06;
-          z.rightLeg.rotation.x = -0.06;
-          z.leftArm.rotation.x = Math.PI * 0.62 + rip * 0.34;
-          z.rightArm.rotation.x = Math.PI * 0.62 - rip * 0.24;
-          z.bodyPivot.rotation.set(-0.08 + rip * 0.12, 0, 0);
+          this._poseInput.mode = 'tear';
+          this._poseInput.tearPhase = z.tearAnimPhase;
+          this._poseInput.vaultT = 0;
+          this._poseInput.windupProgress = 0;
         } else {
-          z.leftLeg.rotation.x = Math.sin(z.walkCycle) * stride;
-          z.rightLeg.rotation.x = -Math.sin(z.walkCycle) * stride;
-          if (z.netWindup) {
-            z.leftArm.rotation.x = Math.PI * 0.78;
-            z.rightArm.rotation.x = Math.PI * 0.78;
-          } else {
-            z.leftArm.rotation.x = Math.PI * 0.44 + Math.sin(z.walkCycle) * 0.18;
-            z.rightArm.rotation.x = Math.PI * 0.44 - Math.sin(z.walkCycle) * 0.18;
-          }
-          const staggerLean = z.staggerTimer > 0 || z.netStagger ? -0.22 : 0;
-          const swayRoll = Math.sin(z.walkCycle * 0.5) * 0.08;
-          z.bodyPivot.rotation.set(staggerLean, 0, swayRoll);
+          z.vaultT = 0;
+          this._poseInput.tearPhase = 0;
+          this._poseInput.vaultT = 0;
+          this._poseInput.mode = z.netWindup
+            ? 'windup'
+            : this._poseInput.staggerRatio > 0.05
+              ? 'stagger'
+              : 'locomote';
+          this._poseInput.windupProgress = z.netWindup ? 0.65 : 0;
         }
+        this.rigLib.applyPose(z.rig, this._poseInput);
 
         z.root.position.copy(z.pos);
         z.root.rotation.set(0, z.yaw, 0);
@@ -1342,9 +1306,16 @@ export class InfectionZombieAI {
 
       if (!z.alive) {
         z.deathTimer += dt;
-        const fallT = Math.min(1, z.deathTimer / 0.42);
-        z.bodyPivot.rotation.x = -fallT * (Math.PI * 0.48);
-        z.bodyPivot.position.y = -fallT * 0.15;
+        this._poseInput.mode = 'death';
+        this._poseInput.walkCycle = z.walkCycle;
+        this._poseInput.speedMps = 0;
+        this._poseInput.tearPhase = 0;
+        this._poseInput.vaultT = 0;
+        this._poseInput.windupProgress = 0;
+        this._poseInput.staggerRatio = 0;
+        this._poseInput.deathProgress = Math.min(1, z.deathTimer / 0.55);
+        this._poseInput.elapsedSec = this.elapsedSec;
+        this.rigLib.applyPose(z.rig, this._poseInput);
         if (z.deathTimer > 3.2) {
           this.group.remove(z.root);
           this.zombies.splice(i, 1);
@@ -1402,13 +1373,16 @@ export class InfectionZombieAI {
 
             z.lastSpeedMps = walkSpd;
             z.walkCycle += dt * Math.max(1.2, walkSpd * 2.9);
-            const stride = Math.min(0.6, walkSpd * 0.18);
-            z.leftLeg.rotation.x = Math.sin(z.walkCycle) * stride;
-            z.rightLeg.rotation.x = -Math.sin(z.walkCycle) * stride;
-            z.leftArm.rotation.x = Math.PI * 0.48 + Math.sin(z.walkCycle) * 0.16;
-            z.rightArm.rotation.x = Math.PI * 0.48 - Math.sin(z.walkCycle) * 0.16;
-            const staggerLean = z.staggerTimer > 0 ? -0.22 : 0.06;
-            z.bodyPivot.rotation.set(staggerLean, 0, Math.sin(z.walkCycle * 0.5) * 0.07);
+            this._poseInput.mode = z.staggerTimer > 0 ? 'stagger' : 'locomote';
+            this._poseInput.walkCycle = z.walkCycle;
+            this._poseInput.speedMps = walkSpd;
+            this._poseInput.tearPhase = 0;
+            this._poseInput.vaultT = 0;
+            this._poseInput.windupProgress = 0;
+            this._poseInput.staggerRatio = Math.min(1, z.staggerTimer / 0.35);
+            this._poseInput.deathProgress = 0;
+            this._poseInput.elapsedSec = this.elapsedSec;
+            this.rigLib.applyPose(z.rig, this._poseInput);
           }
 
           z.root.position.copy(z.pos);
@@ -1443,13 +1417,16 @@ export class InfectionZombieAI {
             if (isActiveTearer && z.staggerTimer <= 0) {
               z.tearTimer -= dt;
               z.tearAnimPhase += dt * 5.8;
-              const pullWave = Math.sin(z.tearAnimPhase);
-              // Two-handed plank wrenching motion
-              z.leftArm.rotation.x = Math.PI * 0.64 + pullWave * 0.36;
-              z.rightArm.rotation.x = Math.PI * 0.64 - pullWave * 0.24;
-              z.leftLeg.rotation.x = 0.08;
-              z.rightLeg.rotation.x = -0.08;
-              z.bodyPivot.rotation.set(-0.08 + pullWave * 0.14, 0, Math.sin(z.tearAnimPhase * 0.5) * 0.06);
+              this._poseInput.mode = 'tear';
+              this._poseInput.walkCycle = z.walkCycle;
+              this._poseInput.speedMps = 0;
+              this._poseInput.tearPhase = z.tearAnimPhase;
+              this._poseInput.vaultT = 0;
+              this._poseInput.windupProgress = 0;
+              this._poseInput.staggerRatio = 0;
+              this._poseInput.deathProgress = 0;
+              this._poseInput.elapsedSec = this.elapsedSec;
+              this.rigLib.applyPose(z.rig, this._poseInput);
 
               if (z.tearTimer <= 0 && barrier) {
                 if (barrier.tearPlank()) {
@@ -1462,11 +1439,16 @@ export class InfectionZombieAI {
             } else {
               // Waiting or briefly staggered at window
               z.tearAnimPhase += dt * 2.4;
-              z.leftArm.rotation.x = Math.PI * 0.52 + Math.sin(z.tearAnimPhase) * 0.12;
-              z.rightArm.rotation.x = Math.PI * 0.52 - Math.sin(z.tearAnimPhase) * 0.12;
-              z.leftLeg.rotation.x = 0;
-              z.rightLeg.rotation.x = 0;
-              z.bodyPivot.rotation.set(z.staggerTimer > 0 ? -0.24 : 0.04, 0, 0);
+              this._poseInput.mode = z.staggerTimer > 0 ? 'stagger' : 'tear';
+              this._poseInput.walkCycle = z.walkCycle;
+              this._poseInput.speedMps = 0;
+              this._poseInput.tearPhase = z.tearAnimPhase;
+              this._poseInput.vaultT = 0;
+              this._poseInput.windupProgress = 0;
+              this._poseInput.staggerRatio = Math.min(1, z.staggerTimer / 0.35);
+              this._poseInput.deathProgress = 0;
+              this._poseInput.elapsedSec = this.elapsedSec;
+              this.rigLib.applyPose(z.rig, this._poseInput);
             }
           }
 
@@ -1490,7 +1472,7 @@ export class InfectionZombieAI {
           const t = z.vaultT;
 
           // Smooth 3-stage physical climb & vault over the window sill:
-          // [0..0.38] Hoist onto window sill, [0.38..0.72] Swing body/legs cleanly over sill, [0.72..1.0] Land inside room
+          // [0..0.38] Hoist onto window sill, [0.38..0.74] Swing body/legs cleanly over sill, [0.74..1.0] Land inside room
           const sillPeakY = z.sillPos.y + 0.14;
           if (t < 0.38) {
             const u = t / 0.38;
@@ -1498,11 +1480,6 @@ export class InfectionZombieAI {
             z.pos.x = THREE.MathUtils.lerp(z.vaultStartPos.x, z.sillPos.x, ease * 0.72);
             z.pos.z = THREE.MathUtils.lerp(z.vaultStartPos.z, z.sillPos.z, ease * 0.72);
             z.pos.y = THREE.MathUtils.lerp(z.vaultStartPos.y, sillPeakY, ease);
-            z.bodyPivot.rotation.set(ease * 0.52, 0, 0);
-            z.leftArm.rotation.x = Math.PI * (0.55 + ease * 0.28);
-            z.rightArm.rotation.x = Math.PI * (0.55 + ease * 0.28);
-            z.leftLeg.rotation.x = -ease * 0.88;
-            z.rightLeg.rotation.x = -ease * 0.45;
           } else if (t < 0.74) {
             const u = (t - 0.38) / 0.36;
             const ease = u * u * (3 - 2 * u);
@@ -1512,11 +1489,6 @@ export class InfectionZombieAI {
             z.pos.z = THREE.MathUtils.lerp(THREE.MathUtils.lerp(z.vaultStartPos.z, z.sillPos.z, 0.72), midZ, ease);
             // Keep hips cleanly above sill top with slight apex arc
             z.pos.y = sillPeakY + Math.sin(u * Math.PI) * 0.18;
-            z.bodyPivot.rotation.set(0.52 - ease * 0.16, 0, Math.sin(u * Math.PI) * 0.14);
-            z.leftArm.rotation.x = Math.PI * 0.78 - ease * 0.35;
-            z.rightArm.rotation.x = Math.PI * 0.78 - ease * 0.35;
-            z.leftLeg.rotation.x = -0.88 + ease * 0.35;
-            z.rightLeg.rotation.x = -0.45 - ease * 0.48;
           } else {
             const u = (t - 0.74) / 0.26;
             const ease = u * u * (3 - 2 * u);
@@ -1525,12 +1497,18 @@ export class InfectionZombieAI {
             z.pos.x = THREE.MathUtils.lerp(midX, z.entryPos.x, ease);
             z.pos.z = THREE.MathUtils.lerp(midZ, z.entryPos.z, ease);
             z.pos.y = THREE.MathUtils.lerp(sillPeakY, z.entryPos.y, ease);
-            z.bodyPivot.rotation.set(0.36 * (1 - ease), 0, 0);
-            z.leftArm.rotation.x = Math.PI * 0.44;
-            z.rightArm.rotation.x = Math.PI * 0.44;
-            z.leftLeg.rotation.x = -0.53 * (1 - ease);
-            z.rightLeg.rotation.x = -0.93 * (1 - ease);
           }
+
+          this._poseInput.mode = 'vault';
+          this._poseInput.walkCycle = z.walkCycle;
+          this._poseInput.speedMps = 0;
+          this._poseInput.tearPhase = 0;
+          this._poseInput.vaultT = t;
+          this._poseInput.windupProgress = 0;
+          this._poseInput.staggerRatio = 0;
+          this._poseInput.deathProgress = 0;
+          this._poseInput.elapsedSec = this.elapsedSec;
+          this.rigLib.applyPose(z.rig, this._poseInput);
 
           const faceX = z.entryPos.x - z.sillPos.x;
           const faceZ = z.entryPos.z - z.sillPos.z;
@@ -1578,8 +1556,6 @@ export class InfectionZombieAI {
         if (z.windupTimer > 0) {
           z.windupTimer -= dt;
           z.yaw = Math.atan2(-dxP, -dzP);
-          z.leftArm.rotation.x = Math.PI * 0.78;
-          z.rightArm.rotation.x = Math.PI * 0.78;
 
           if (z.windupTimer <= 0) {
             z.attackCooldown = scaledCooldown;
@@ -1771,22 +1747,26 @@ export class InfectionZombieAI {
       const groundY = this.map.physics.getGroundHeight(z.pos.x, z.pos.z, z.pos.y, 0.85, 0.14);
       z.pos.y = THREE.MathUtils.damp(z.pos.y, groundY, 14, dt);
 
-      // Shamble / sprint animation
+      // Anatomical shamble / sprint / melee windup / hit stagger pose
       const spd = Math.hypot(moveX, moveZ);
       z.lastSpeedMps = spd;
       z.walkCycle += dt * Math.max(1.2, spd * 2.9);
-      const stride = Math.min(0.65, spd * 0.18);
-      z.leftLeg.rotation.x = Math.sin(z.walkCycle) * stride;
-      z.rightLeg.rotation.x = -Math.sin(z.walkCycle) * stride;
 
-      if (z.windupTimer <= 0) {
-        z.leftArm.rotation.x = Math.PI * 0.44 + Math.sin(z.walkCycle) * 0.18;
-        z.rightArm.rotation.x = Math.PI * 0.44 - Math.sin(z.walkCycle) * 0.18;
-      }
+      const windupProgress =
+        z.windupTimer > 0 ? THREE.MathUtils.clamp(1 - z.windupTimer / Math.max(0.05, scaledWindup), 0, 1) : 0;
+      const staggerRatio = z.staggerTimer > 0 ? Math.min(1, z.staggerTimer / 0.35) : 0;
 
-      const staggerLean = z.staggerTimer > 0 ? -0.25 * (z.staggerTimer / 0.35) : 0;
-      const swayRoll = Math.sin(z.walkCycle * 0.5) * 0.08;
-      z.bodyPivot.rotation.set(staggerLean, 0, swayRoll);
+      this._poseInput.mode =
+        windupProgress > 0.01 ? 'windup' : staggerRatio > 0.05 ? 'stagger' : 'locomote';
+      this._poseInput.walkCycle = z.walkCycle;
+      this._poseInput.speedMps = spd;
+      this._poseInput.tearPhase = 0;
+      this._poseInput.vaultT = 0;
+      this._poseInput.windupProgress = windupProgress;
+      this._poseInput.staggerRatio = staggerRatio;
+      this._poseInput.deathProgress = 0;
+      this._poseInput.elapsedSec = this.elapsedSec;
+      this.rigLib.applyPose(z.rig, this._poseInput);
 
       z.root.position.copy(z.pos);
       z.root.rotation.set(0, z.yaw, 0);

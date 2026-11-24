@@ -52,6 +52,8 @@ const DEFAULT_BATTLE_CONFIG: BattleMatchConfig = {
   secondaryWeaponId: 'makarov_pm',
   weatherPreset: 'auto',
   timeOfDayStart: 'auto',
+  hitmarkersEnabled: true,
+  hudEnabled: true,
 };
 
 const DEFAULT_INFECTION_CONFIG: InfectionMatchConfig = {
@@ -181,11 +183,16 @@ function PlaygroundView({ onReturnToMenu }: { onReturnToMenu: () => void }) {
 function CombatSessionView({
   params,
   multiplayerSession,
+  onUpdateSoloBattleVisibility,
   onRestartInfection,
   onReturnToMenu,
 }: {
   params: CombatSessionParams;
   multiplayerSession?: MultiplayerHudControls | null;
+  onUpdateSoloBattleVisibility?: (patch: {
+    hitmarkersEnabled?: boolean;
+    hudEnabled?: boolean;
+  }) => void;
   onRestartInfection: () => void;
   onReturnToMenu: (tab?: 'battle' | 'infection') => void;
 }) {
@@ -217,15 +224,22 @@ function CombatSessionView({
     };
   }, [params]);
 
-  // Keep RemotePlayerManager roster pruned & hand over Host AI authority on live Host Migration
+  // Keep RemotePlayerManager roster pruned, hand over Host AI authority on live Host Migration,
+  // and sync live Host Battle HUD/Hitmarker visibility toggles across all clients
   useEffect(() => {
     if (lobby && engineRef.current) {
       engineRef.current.syncMultiplayerMembers(
         lobby.members,
         Boolean(user && lobby.hostUserId === user.id),
       );
+      if (params.mode === 'battle') {
+        engineRef.current.setHostMatchVisibility({
+          hitmarkersEnabled: lobby.hitmarkersEnabled !== false,
+          hudEnabled: lobby.hudEnabled !== false,
+        });
+      }
     }
-  }, [lobby, user]);
+  }, [lobby, user, params.mode]);
 
   // Track match completion and display full post-match summary (MVP, leaderboard, badges + career XP for signed-in users)
   useEffect(() => {
@@ -302,6 +316,12 @@ function CombatSessionView({
         <CombatHud
           snapshot={snapshot}
           multiplayerSession={multiplayerSession}
+          onUpdateHostMatchVisibility={(patch) => {
+            engine?.setHostMatchVisibility(patch);
+            if (!multiplayerSession && params.mode === 'battle') {
+              onUpdateSoloBattleVisibility?.(patch);
+            }
+          }}
           onRequestLock={() => engine?.requestLock()}
           onToggleTuner={(open) => engine?.setTunerOpen(open)}
           onUpdateConfig={(patch) => engine?.updateConfig(patch)}
@@ -420,6 +440,9 @@ function AppShell() {
               tacticalEquipmentId: selectedTacticalId,
               weatherPreset,
               timeOfDayStart,
+              hitmarkersEnabled:
+                st.hitmarkersEnabled ?? st.specialEvent?.config.hitmarkersEnabled ?? true,
+              hudEnabled: st.hudEnabled ?? st.specialEvent?.config.hudEnabled ?? true,
             },
             multiplayer: mpBridge,
           };
@@ -454,8 +477,11 @@ function AppShell() {
           lobbyCode: lobby.code,
           eventName: lobby.specialEvent?.name ?? null,
           killfeedPolicy: lobby.killfeedPolicy ?? 'player_choice',
+          hitmarkersEnabled: lobby.hitmarkersEnabled !== false,
+          hudEnabled: lobby.hudEnabled !== false,
           localPlayerName: user?.username ?? 'YOU',
           onHostUpdateKillfeedPolicy: (policy) => updateSettings({ killfeedPolicy: policy }),
+          onHostUpdateMatchVisibility: (patch) => updateSettings(patch),
           onHostRestart: hostRestartMatch,
           onHostEndToLobby: hostEndMatchToLobby,
           onLeaveMatch: () => {
@@ -554,6 +580,9 @@ function AppShell() {
           key={view.sessionKey}
           params={view.params}
           multiplayerSession={multiplayerHudControls}
+          onUpdateSoloBattleVisibility={(patch) =>
+            setBattleConfig((prev) => ({ ...prev, ...patch }))
+          }
           onRestartInfection={() =>
             setView({
               kind: 'combat',

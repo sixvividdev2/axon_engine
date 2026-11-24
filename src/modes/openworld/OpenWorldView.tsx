@@ -69,10 +69,21 @@ export const OpenWorldView: React.FC<OpenWorldViewProps> = ({
           onUseMedicalItem={(loc, med) =>
             engineRef.current?.useMedicalItemFromInventory(loc, med)
           }
+          onUsePdaBattery={(loc) => engineRef.current?.usePdaBatteryFromInventory(loc)}
+          onFastTravelToSector={(secId) => engineRef.current?.fastTravelToSector(secId)}
           onFundFobUpgrade={() => engineRef.current?.fundFobUpgrade()}
           onBuyFobOffer={(offerId) => engineRef.current?.buyFobTraderOffer(offerId)}
           onAcceptContract={(idx) => engineRef.current?.acceptRotatingContract(idx)}
           onCompleteContract={(idx) => engineRef.current?.completeRotatingContract(idx)}
+          onDepositArmoryItem={(loc) => engineRef.current?.depositItemToArmoryStash(loc)}
+          onWithdrawArmoryItem={(id, target) =>
+            engineRef.current?.withdrawItemFromArmoryStash(id, target)
+          }
+          onEquipArmoryWeapon={(slotKey, wId) =>
+            engineRef.current?.equipArmoryWeapon(slotKey, wId)
+          }
+          onEquipArmoryArmorPlate={(plateId) => engineRef.current?.equipArmoryArmorPlate(plateId)}
+          onResupplyArmoryAmmo={() => engineRef.current?.resupplyArmoryAmmo()}
           onSabotageConvoy={() => engineRef.current?.sabotageNearestConvoy()}
           onTriggerWorldEvent={(kind) => engineRef.current?.triggerDynamicWorldEvent(kind)}
           onExecuteInteract={() => engineRef.current?.executeFieldInteraction()}

@@ -25,7 +25,11 @@ export interface BattleMatchConfig {
   tacticalEquipmentId?: TacticalEquipmentId;
   weatherPreset?: WeatherPresetId;
   timeOfDayStart?: TimeOfDayStartSetting;
+  hitmarkersEnabled?: boolean;
+  hudEnabled?: boolean;
 }
+
+export type ZombieDifficultyPresetId = 'standard' | 'hardcore' | 'nightmare' | 'custom';
 
 export interface InfectionMatchConfig {
   mapId: string;
@@ -34,6 +38,12 @@ export interface InfectionMatchConfig {
   tacticalEquipmentId?: TacticalEquipmentId;
   weatherPreset?: WeatherPresetId;
   timeOfDayStart?: TimeOfDayStartSetting;
+  difficultyPreset?: ZombieDifficultyPresetId;
+  zombieHealthMult?: number;
+  zombieMoveSpeedMult?: number;
+  zombieAttackSpeedMult?: number;
+  zombieSpawnAmountMult?: number;
+  waveBreakIntervalSec?: number;
 }
 
 export interface NavNode {

@@ -35,6 +35,7 @@ import {
   TacticalPdaDevice,
   type PdaHudTelemetry,
   type PdaPingMarker,
+  VIEWMODEL_LAYER,
   WeaponRig,
 } from '../bodycam-sdk';
 import {
@@ -51,7 +52,7 @@ import {
   getDefaultAmmoVariant,
   resolveBaseCaliberId,
 } from '../data/calibers';
-import { graphicsQualityStore } from '../data/graphicsQuality';
+import { AdaptivePerformanceController, graphicsQualityStore } from '../data/graphicsQuality';
 import { loadoutStore } from '../data/loadoutStore';
 import {
   DEFAULT_TACTICAL_EQUIPMENT_ID,
@@ -84,7 +85,7 @@ export interface HideoutPromptOption {
 }
 
 export interface HideoutPromptState {
-  key: 'F';
+  key: 'F' | 'E';
   targetLabel?: string;
   options: HideoutPromptOption[];
   selectedIndex: number;
@@ -147,6 +148,8 @@ export interface HideoutControllerCallbacks {
   onOpenOpsLaptop: (initialTab?: OpsLaptopTabId) => void;
   onQuickDeployBattle: () => void;
   onCycleStagedMap: () => string;
+  onEnterZombiesOutpost?: () => void;
+  initialSpawnZone?: 'arsenal' | 'airlock_return';
 }
 
 type HideoutListener = (snap: HideoutSnapshot) => void;
@@ -257,6 +260,11 @@ export class HideoutSessionController {
   private fpsFrames = 0;
   private currentFps = 60;
   private lastEmitMs = 0;
+  private airlockTransitionActive = false;
+  private airlockPressurizationSec = 0;
+  private airlockReturnCooldownSec = 0;
+  private airlockDeconTimeout: number | null = null;
+  private readonly baseCameraFov = 72;
 
   private readonly listeners = new Set<HideoutListener>();
 
@@ -278,6 +286,8 @@ export class HideoutSessionController {
   private readonly _scanObjects: THREE.Object3D[] = [];
   private readonly _runtimeProfile: BodycamWeaponProfile;
   private readonly _scopePassParams: ScopePassParams;
+  private readonly adaptivePerf: AdaptivePerformanceController;
+  private unsubAdaptiveScaling: (() => void) | null = null;
 
   constructor(container: HTMLElement, callbacks: HideoutControllerCallbacks) {
     this.container = container;
@@ -296,6 +306,7 @@ export class HideoutSessionController {
     })();
 
     const gfx = graphicsQualityStore.getProfile();
+    this.adaptivePerf = new AdaptivePerformanceController(gfx);
     this.renderer = new THREE.WebGLRenderer({
       antialias: false,
       powerPreference: 'high-performance',
@@ -550,12 +561,23 @@ export class HideoutSessionController {
     this.animator.setGrenadeSystem(this.grenadeSystem);
     this.syncBeltEquipmentMesh();
 
-    // Spawn player inside the Arsenal Room facing the lit 3D Gun Wall (-Z)
-    this.controller.position.set(0, 0, 1.95);
-    this.controller.torsoYaw = 0;
-    this.controller.aimYaw = 0;
-    this.controller.torsoPitch = 0;
-    this.controller.aimPitch = 0;
+    // Spawn player either in Arsenal Room facing Gun Wall (-Z) or returning from Bio-Containment Airlock
+    if (callbacks.initialSpawnZone === 'airlock_return') {
+      this.controller.position.set(0, 0, 7.25);
+      this.controller.torsoYaw = 0;
+      this.controller.aimYaw = 0;
+      this.controller.torsoPitch = 0;
+      this.controller.aimPitch = 0;
+      this.airlockReturnCooldownSec = 2.6;
+      this.currentRoomId = 'zombies_portal';
+      this.currentRoomLabel = 'Sector 4 · Bio-Containment Airlock';
+    } else {
+      this.controller.position.set(0, 0, 1.95);
+      this.controller.torsoYaw = 0;
+      this.controller.aimYaw = 0;
+      this.controller.torsoPitch = 0;
+      this.controller.aimPitch = 0;
+    }
 
     this.postProcess = new BodycamPostProcess(
       this.renderer,
@@ -683,8 +705,22 @@ export class HideoutSessionController {
     });
 
     if (!this.isSoftwareGl) {
+      this.grenadeSystem.prewarm(
+        this.renderer,
+        this.scene,
+        this.camera,
+        this.skeleton.throwHandSocket,
+        VIEWMODEL_LAYER,
+      );
       this.renderer.compile(this.scene, this.camera);
     }
+
+    this.unsubAdaptiveScaling = graphicsQualityStore.subscribeAdaptiveScaling((enabled) => {
+      if (!enabled && !this.isSoftwareGl) {
+        this.adaptivePerf.reset(graphicsQualityStore.getProfile());
+        this.applyGraphicsQuality();
+      }
+    });
 
     this.lastFrameMs = performance.now();
     this.emitSnapshot(true);
@@ -808,6 +844,7 @@ export class HideoutSessionController {
 
   public applyGraphicsQuality(): void {
     const gfx = graphicsQualityStore.getProfile();
+    this.adaptivePerf.syncProfile(gfx);
     this.renderer.setPixelRatio(
       this.isSoftwareGl ? 1 : Math.min(window.devicePixelRatio || 1, gfx.maxDpr),
     );
@@ -1702,7 +1739,32 @@ export class HideoutSessionController {
         }
         break;
       }
+      case 'airlock_override': {
+        if (this.world.getPropInteractPos('airlock_override', this._ikTargetPos)) {
+          this.interactAnimator.trigger('PROP_INTERACT', this._ikTargetPos);
+        }
+        this.triggerAirlockDeployment();
+        break;
+      }
     }
+  }
+
+  public triggerAirlockDeployment(): void {
+    if (this.airlockTransitionActive || this.disposed) return;
+    this.airlockTransitionActive = true;
+    this.airlockPressurizationSec = 0;
+    this.clearMovementInputs();
+    this.world.airlockBay.triggerPressurizationCycle();
+    this.audio.playAirlockSequence('seal');
+    this.airlockDeconTimeout = window.setTimeout(() => {
+      if (!this.disposed) {
+        this.audio.playAirlockSequence('decon');
+      }
+    }, 300);
+    // Subtle pressurization recoil thump on bodycam rig
+    this.controller.applyRecoil(0.018, (Math.random() - 0.5) * 0.016, 0.008, 0.25);
+    this.callbacks.onEnterZombiesOutpost?.();
+    this.emitSnapshot(true);
   }
 
   private showToast(msg: string): void {
@@ -2047,6 +2109,23 @@ export class HideoutSessionController {
         options: opts,
         selectedIndex: this.selectedOptionIndex,
       };
+      return;
+    }
+
+    if (meta.kind === 'airlock_override') {
+      this.selectedOptionIndex = 0;
+      this.activePrompt = {
+        key: 'E',
+        targetLabel: 'Bio-Containment Airlock Override',
+        options: [
+          {
+            id: 'enter_zombies_outpost',
+            label: 'Cycle Airlock → Quarantine Outpost',
+            hint: 'E / F',
+          },
+        ],
+        selectedIndex: 0,
+      };
     }
   }
 
@@ -2270,7 +2349,16 @@ export class HideoutSessionController {
         this.input.leanLeft = true;
         break;
       case 'KeyE':
-        // Pure lean right — zero interference with [F] interactions!
+        if (
+          !e.repeat &&
+          !this.pdaDevice.isBlockingWeaponActions() &&
+          this.activeTarget?.source === 'prop' &&
+          this.activeTarget.meta.kind === 'airlock_override'
+        ) {
+          this.executeSelectedInteract();
+          break;
+        }
+        // Pure lean right everywhere else — zero interference with [F] interactions!
         this.input.leanRight = true;
         break;
       case 'KeyF':
@@ -2585,6 +2673,18 @@ export class HideoutSessionController {
       this.fpsFrames = 0;
     }
 
+    if (!this.isSoftwareGl) {
+      const adapt = this.adaptivePerf.update(
+        rawDt * 1000,
+        graphicsQualityStore.isAdaptiveScalingEnabled(),
+        this.elapsedSec,
+      );
+      if (adapt.changed) {
+        this.renderer.setPixelRatio(adapt.effectiveDpr);
+        this.onResize();
+      }
+    }
+
     if (!this.contextLost) {
       const swapping = this.swapChoreography.isActive();
       const suppBusy = this.weaponRig.isSuppressorActionActive();
@@ -2698,6 +2798,21 @@ export class HideoutSessionController {
         this.input.ads,
       );
       this.animator.applyCameraAdditiveOverlay(this.camera);
+
+      // Apply subtle bodycam airlock pressurization camera shake & FOV shift during blast door seal
+      if (this.airlockTransitionActive) {
+        this.airlockPressurizationSec += dt;
+        const p = Math.min(1, this.airlockPressurizationSec / 0.72);
+        const shakeAmp = Math.sin(p * Math.PI) * 0.0085;
+        this.camera.position.x += Math.sin(this.elapsedSec * 52) * shakeAmp;
+        this.camera.position.y += Math.cos(this.elapsedSec * 61) * shakeAmp * 0.8;
+        const targetFov = this.baseCameraFov - p * 5.2;
+        if (Math.abs(this.camera.fov - targetFov) > 0.02) {
+          this.camera.fov = THREE.MathUtils.damp(this.camera.fov, targetFov, 7.5, dt);
+          this.camera.updateProjectionMatrix();
+        }
+      }
+
       this.weaponRig.root.visible =
         !swapping && !this.grenadeSystem.isWeaponHidden() && !this.pdaDevice.isWeaponHidden();
 
@@ -2716,6 +2831,21 @@ export class HideoutSessionController {
         if (room.id !== 'gun_range') {
           this.isFiring = false;
         }
+      }
+
+      // Stepping inside the sealed airlock chamber auto-triggers decontamination & transport transition
+      if (this.airlockReturnCooldownSec > 0) {
+        this.airlockReturnCooldownSec = Math.max(0, this.airlockReturnCooldownSec - dt);
+      } else if (
+        !this.airlockTransitionActive &&
+        !this.modalActive &&
+        !this.pauseOpen &&
+        this.world.airlockBay.isInsideAirlockChamber(
+          this.controller.position.x,
+          this.controller.position.z,
+        )
+      ) {
+        this.triggerAirlockDeployment();
       }
 
       // Automatic fire hold while inside Gun Range
@@ -2844,6 +2974,7 @@ export class HideoutSessionController {
     cancelAnimationFrame(this.rafId);
     window.clearTimeout(this.softwareTimerId);
     if (this.toastTimeout !== null) window.clearTimeout(this.toastTimeout);
+    if (this.airlockDeconTimeout !== null) window.clearTimeout(this.airlockDeconTimeout);
 
     document.removeEventListener('pointerlockchange', this.onPointerLockChange);
     window.removeEventListener('mousemove', this.onMouseMove);
@@ -2863,6 +2994,8 @@ export class HideoutSessionController {
     this.unsubOperatorGear();
     this.unsubLoadout();
     this.unsubOpenWorld();
+    this.unsubAdaptiveScaling?.();
+    this.unsubAdaptiveScaling = null;
     this.camera.remove(this.pdaDevice.root);
     this.pdaDevice.dispose();
     this.grenadeSystem.dispose();

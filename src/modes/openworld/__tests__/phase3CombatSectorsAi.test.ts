@@ -201,7 +201,7 @@ describe('Phase 3: Perimeter Operations — Bodycam Combat, Dynamic Sectors & Ta
       evaluateAiRelation('highland_militia', 'PvPvE', 'pmc_alpha', baseStanding, provoked),
     ).toBe('hostile');
 
-    // Verify OpenWorldAiDirector friendly-fire block in PvE and sub-faction standing delta on elimination
+    // Verify OpenWorldAiDirector real friendly-fire damage + standing penalty + retaliation in PvE
     const { roster } = makeHarness();
     const pveChar = roster.createCharacter({
       slotId: 'slot_0',
@@ -214,10 +214,13 @@ describe('Phase 3: Perimeter Operations — Bodycam Combat, Dynamic Sectors & Ta
     const scene = new THREE.Scene();
     const ai = new OpenWorldAiDirector(scene, () => 40, 'pmc_alpha');
     const bravoAgent = ai.getAliveAgents().find((a) => a.faction === 'pmc_bravo')!;
-    const friendlyHit = ai.applyDamage(bravoAgent.id, 60, 'head', pveChar);
-    expect(friendlyHit.blockedFriendly).toBe(true);
-    expect(friendlyHit.hit).toBe(false);
-    expect(bravoAgent.hp).toBe(100);
+    const friendlyHit = ai.applyDamage(bravoAgent.id, 30, 'torso', pveChar);
+    expect(friendlyHit.blockedFriendly).toBe(false);
+    expect(friendlyHit.hit).toBe(true);
+    expect(friendlyHit.friendlyFire).toBe(true);
+    expect(friendlyHit.standingPenalty).toBeGreaterThan(0);
+    expect(bravoAgent.hp).toBeLessThan(100);
+    expect(bravoAgent.retaliationHostile).toBe(true);
 
     // Eliminating a sub-faction operator returns standing penalty & rival gain
     const militiaAgent = ai.getAliveAgents().find((a) => a.faction === 'highland_militia')!;

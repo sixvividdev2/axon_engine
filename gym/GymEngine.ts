@@ -39,8 +39,14 @@ import {
   TacticalGrenadeSystem,
   tacticalEquipmentStore,
   TacticalPdaDevice,
+  VIEWMODEL_LAYER,
   WeaponRig,
 } from '../bodycam-sdk';
+import {
+  AdaptivePerformanceController,
+  graphicsQualityStore,
+  type GraphicsQualityProfile,
+} from '../data/graphicsQuality';
 import {
   getTacticalEquipmentDef,
   TacticalBeltSlot,
@@ -171,6 +177,10 @@ export class GymEngine {
   private readonly irIlluminatorTarget = new THREE.Object3D();
   private readonly unsubTacticalEquipment: () => void;
   private readonly unsubOperatorGear: () => void;
+  private readonly unsubQuality: () => void;
+  private readonly unsubAdaptive: () => void;
+  private readonly adaptivePerf: AdaptivePerformanceController;
+  private qualityProfile: GraphicsQualityProfile;
   private localGear: OperatorGearConfig;
   private nvgFlipped = false;
   private irIlluminatorOn = false;
@@ -304,11 +314,15 @@ export class GymEngine {
     const glRenderer = dbg ? String(gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL)) : '';
     this.isSoftwareGl = /swiftshader|llvmpipe|software/i.test(glRenderer);
 
+    this.qualityProfile = graphicsQualityStore.getProfile();
+    this.adaptivePerf = new AdaptivePerformanceController(this.qualityProfile);
     this.renderer.setPixelRatio(
-      this.isSoftwareGl ? 1 : Math.min(window.devicePixelRatio || 1, 2),
+      this.isSoftwareGl
+        ? 1
+        : Math.min(window.devicePixelRatio || 1, this.qualityProfile.maxDpr),
     );
     this.renderer.setSize(width, height);
-    this.renderer.shadowMap.enabled = !this.isSoftwareGl;
+    this.renderer.shadowMap.enabled = !this.isSoftwareGl && this.qualityProfile.castShadows;
     this.renderer.shadowMap.type = THREE.PCFShadowMap;
     this.renderer.toneMapping = THREE.NoToneMapping; // Handled in BodycamPostProcess
     this.renderer.domElement.style.display = 'block';
@@ -480,6 +494,18 @@ export class GymEngine {
       this.syncNvgRuntime();
       this.emitSnapshot();
     });
+    this.unsubQuality = graphicsQualityStore.subscribe(() => {
+      this.qualityProfile = graphicsQualityStore.getProfile();
+      this.adaptivePerf.reset(this.qualityProfile);
+      this.renderer.shadowMap.enabled = !this.isSoftwareGl && this.qualityProfile.castShadows;
+      this.applyAdaptiveDpr();
+    });
+    this.unsubAdaptive = graphicsQualityStore.subscribeAdaptiveScaling((enabled) => {
+      if (!enabled) {
+        this.adaptivePerf.reset(this.qualityProfile);
+        this.applyAdaptiveDpr();
+      }
+    });
 
     // Initialize bare weapon attachments (or restore saved Gunsmith loadout) & magazine counts
     const savedLoadout = this.saveManager.loadGymLoadout();
@@ -512,9 +538,16 @@ export class GymEngine {
       excludeObjects: [this.skeleton.root, this.weaponRig.root, this.pdaDevice.root],
     });
 
-    // Pre-compile scene shaders once at boot (hardware GL) to avoid mid-session GLSL compile hitches
+    // Pre-compile grenade & scene shaders once at boot (hardware GL) to avoid mid-session GLSL compile hitches
     if (!this.isSoftwareGl) {
       try {
+        this.grenadeSystem.prewarm(
+          this.renderer,
+          this.scene,
+          this.camera,
+          this.skeleton.throwHandSocket,
+          VIEWMODEL_LAYER,
+        );
         this.renderer.compile(this.scene, this.camera);
       } catch {
         // Non-fatal fallback
@@ -524,6 +557,18 @@ export class GymEngine {
     this.bindEvents();
     this.emitSnapshot();
     this.scheduleNextFrame();
+  }
+
+  private applyAdaptiveDpr(): void {
+    if (this.isSoftwareGl) return;
+    const dpr = graphicsQualityStore.isAdaptiveScalingEnabled()
+      ? this.adaptivePerf.state.effectiveDpr
+      : Math.min(window.devicePixelRatio || 1, this.qualityProfile.maxDpr);
+    this.renderer.setPixelRatio(dpr);
+    const w = Math.max(1, this.container.clientWidth);
+    const h = Math.max(1, this.container.clientHeight);
+    this.renderer.setSize(w, h);
+    this.postProcess.setSize(w, h);
   }
 
   private getActiveTraumaModifiers(): Readonly<BodycamTraumaModifiers> {
@@ -2385,6 +2430,17 @@ export class GymEngine {
       this.postProcess.render();
     }
 
+    if (!this.isSoftwareGl) {
+      const adapState = this.adaptivePerf.update(
+        rawDt * 1000,
+        graphicsQualityStore.isAdaptiveScalingEnabled(),
+        this.elapsedSec,
+      );
+      if (adapState.changed) {
+        this.applyAdaptiveDpr();
+      }
+    }
+
     // 5. Write zero-GC POD telemetry & throttle React UI updates (~16 Hz normal, ~60 Hz during Gunsmith orbit)
     this.controller.writeTelemetry(
       this.telemetry,
@@ -2542,6 +2598,8 @@ export class GymEngine {
     }
     this.unsubTacticalEquipment();
     this.unsubOperatorGear();
+    this.unsubQuality();
+    this.unsubAdaptive();
     this.camera.remove(this.irIlluminatorLight, this.irIlluminatorTarget);
     this.pdaDevice.dispose();
     this.grenadeSystem.dispose();

@@ -4,6 +4,7 @@ import { ShardStore } from '../ShardStore';
 import {
   FactionSupplyPool,
   FobTier,
+  getStandingTier,
   OPENWORLD_CONTRACT_CATALOG,
   OPENWORLD_CONTRACT_MAP,
   OpenWorldCharacter,
@@ -15,6 +16,7 @@ import {
   SUB_FACTION_MAP,
   SubFactionId,
   SupplyResourceKey,
+  TRADER_MAP,
 } from '../types';
 import {
   OPENWORLD_LANDMARKS,
@@ -22,6 +24,16 @@ import {
   OpenWorldPoiRole,
   SEA_LEVEL_M,
 } from './OpenWorldTerrain';
+import {
+  fobLocalToWorld,
+  getFobArmoryStashAnchor,
+  getFobCompoundSpec,
+  getFobFieldHospitalAnchor,
+  getFobHelipadAnchor,
+  getFobTerminalAnchor,
+  getFobVehicleRepairBayAnchor,
+  isFobCompoundId,
+} from './OpenWorldFobLayout';
 
 export interface SectorRuntimeState {
   readonly sectorId: string;
@@ -43,11 +55,53 @@ export interface SectorRuntimeState {
   alertState: SectorAlertState;
   /** 0..100 live capture progress toward the player's PMC faction while inside capture zone */
   liveCapturePct: number;
+  /** Signed capture progress (-100 = Bravo, 0 = Neutral/Subfaction, +100 = Alpha) */
+  signedCaptureProgress: number;
+  /** Dynamic combat escalation heat (0..100) */
+  heat: number;
   contested: boolean;
   hostileGarrisonCount: number;
   terminalX: number;
   terminalZ: number;
+  medbayX: number;
+  medbayZ: number;
+  armoryX: number;
+  armoryZ: number;
+  helipadX: number;
+  helipadZ: number;
+  repairBayX: number;
+  repairBayZ: number;
+  subFactionStashX?: number;
+  subFactionStashZ?: number;
+  subFactionMedicX?: number;
+  subFactionMedicZ?: number;
+  subFactionMarketX?: number;
+  subFactionMarketZ?: number;
   alertDecaySec: number;
+}
+
+export interface FobDefenseTurretHandle {
+  readonly sectorId: string;
+  readonly faction: PmcFactionId;
+  readonly role: 'aa_autocannon' | 'mortar';
+  readonly headMesh: THREE.Mesh;
+  readonly barrelMesh: THREE.Mesh;
+  readonly muzzleFlashMesh: THREE.Mesh;
+  readonly worldX: number;
+  readonly worldY: number;
+  readonly worldZ: number;
+  fireCooldown: number;
+  muzzleFlashTimer: number;
+}
+
+export interface FastTravelDestination {
+  readonly sectorId: string;
+  readonly name: string;
+  readonly shortLabel: string;
+  readonly worldX: number;
+  readonly worldZ: number;
+  readonly owner: SectorControlOwner;
+  readonly isFob: boolean;
 }
 
 export interface SectorCaptureCompleteEvent {
@@ -74,6 +128,12 @@ export interface OpenWorldInteractableContext {
     | 'sector_terminal'
     | 'fob_resupply'
     | 'fob_terminal'
+    | 'armory_stash'
+    | 'fob_vehicle_repair'
+    | 'fob_helipad_travel'
+    | 'subfaction_stash'
+    | 'subfaction_medic'
+    | 'subfaction_black_market'
     | 'corpse'
     | 'wildlife_harvest'
     | 'convoy_hijack'
@@ -84,6 +144,7 @@ export interface OpenWorldInteractableContext {
   distanceM: number;
   canExecute: boolean;
   blockedReason?: string;
+  subFactionId?: SubFactionId;
 }
 
 const SECTOR_CAPTURE_RADIUS_M = 48;
@@ -114,6 +175,8 @@ const CONTRACT_BY_LANDMARK: Readonly<Record<string, string>> = {
 const OWNER_COLORS: Readonly<Record<SectorControlOwner, number>> = {
   pmc_alpha: 0x38bdf8,
   pmc_bravo: 0xf59e0b,
+  subfaction: 0xd97706,
+  contested: 0xf97316,
   neutral: 0x94a3b8,
 };
 
@@ -132,7 +195,9 @@ interface SectorVisualHandle {
 
 /**
  * Phase 4 Dynamic Territory Control (12 POIs, 4-State Machine: Calm -> Alerted -> Contested -> Captured),
- * 3 Regional Comms Towers (PDA Fog-of-War), 4 Supply Depots, Physical FOB Tier 1-3 Upgrades,
+ * 3 Regional Comms Towers (PDA Fog-of-War), 4 Supply Depots, Physical FOB Tier 1-3 Upgrades
+ * (including live AA/Mortar perimeter turrets, Vehicle Repair Bay & Fast-Travel Helipad at Tier 3),
+ * Trusted Sub-Faction POI Stations (Forward Stash, Field Medic, Black-Market Terminal),
  * In-World FOB Logistics/Quartermaster Terminals, and Biome Contracts.
  * - Commits discrete `sector_flip`, `contract_completed`, and supply tick writes to ShardStore & CharacterRoster.
  * - Zero per-frame heap allocations; explicit `.dispose()` teardown.
@@ -141,6 +206,7 @@ export class OpenWorldSectorManager {
   public readonly rootGroup = new THREE.Group();
   private readonly sectors = new Map<string, SectorRuntimeState>();
   private readonly visuals = new Map<string, SectorVisualHandle>();
+  private readonly fobTurrets: FobDefenseTurretHandle[] = [];
   private readonly sharedGeometries: THREE.BufferGeometry[] = [];
   private readonly sharedMaterials: THREE.Material[] = [];
 
@@ -196,9 +262,17 @@ export class OpenWorldSectorManager {
     // Physical FOB Tier 2 & Tier 3 Upgrade geometries
     const tier2ShelterGeo = new THREE.BoxGeometry(7.2, 3.4, 5.2);
     const tier2BenchGeo = new THREE.BoxGeometry(2.8, 1.05, 1.1);
-    const tier3HelipadGeo = new THREE.CylinderGeometry(7.2, 7.6, 0.36, 16);
+    const tier3HeliRingGeo = new THREE.RingGeometry(4.8, 5.9, 32);
+    tier3HeliRingGeo.rotateX(-Math.PI * 0.5);
     const tier3TurretBaseGeo = new THREE.CylinderGeometry(0.85, 1.05, 4.4, 8);
     const tier3TurretHeadGeo = new THREE.BoxGeometry(1.45, 0.95, 1.9);
+    const tier3BarrelGeo = new THREE.CylinderGeometry(0.08, 0.11, 2.3, 8);
+    tier3BarrelGeo.rotateX(Math.PI * 0.5);
+    const tier3FlashGeo = new THREE.OctahedronGeometry(0.45, 0);
+    const repairGantryGeo = new THREE.BoxGeometry(6.8, 0.35, 0.45);
+    const repairPostGeo = new THREE.BoxGeometry(0.32, 3.6, 0.32);
+    const subFactionLockerGeo = new THREE.BoxGeometry(1.5, 1.65, 0.75);
+    const subFactionMedicTentGeo = new THREE.BoxGeometry(3.2, 2.35, 2.6);
 
     this.sharedGeometries.push(
       padGeo,
@@ -220,9 +294,15 @@ export class OpenWorldSectorManager {
       fobScreenGeo,
       tier2ShelterGeo,
       tier2BenchGeo,
-      tier3HelipadGeo,
+      tier3HeliRingGeo,
       tier3TurretBaseGeo,
       tier3TurretHeadGeo,
+      tier3BarrelGeo,
+      tier3FlashGeo,
+      repairGantryGeo,
+      repairPostGeo,
+      subFactionLockerGeo,
+      subFactionMedicTentGeo,
     );
 
     const concreteMat = new THREE.MeshStandardMaterial({ color: 0x4b5158, roughness: 0.92, metalness: 0.06 });
@@ -237,7 +317,27 @@ export class OpenWorldSectorManager {
       emissiveIntensity: 1.1,
       roughness: 0.2,
     });
-    const helipadMat = new THREE.MeshStandardMaterial({ color: 0x2e343c, roughness: 0.88, metalness: 0.15 });
+    const helipadMat = new THREE.MeshStandardMaterial({
+      color: 0xd99b26,
+      roughness: 0.72,
+      metalness: 0.12,
+      polygonOffset: true,
+      polygonOffsetFactor: -1,
+      polygonOffsetUnits: -2,
+    });
+
+    const turretFlashMat = new THREE.MeshBasicMaterial({
+      color: 0xfde047,
+      transparent: true,
+      opacity: 0.9,
+      toneMapped: false,
+    });
+    const blackMarketScreenMat = new THREE.MeshStandardMaterial({
+      color: 0xf59e0b,
+      emissive: 0xd97706,
+      emissiveIntensity: 1.0,
+      roughness: 0.25,
+    });
 
     this.sharedMaterials.push(
       concreteMat,
@@ -248,18 +348,45 @@ export class OpenWorldSectorManager {
       medMat,
       fobScreenMat,
       helipadMat,
+      turretFlashMat,
+      blackMarketScreenMat,
     );
 
     for (const lm of OPENWORLD_LANDMARKS) {
-      const groundY = Math.max(SEA_LEVEL_M + 0.3, sampleGroundHeight(lm.worldX, lm.worldZ));
       const isFob = lm.poiRole === 'fob';
+      const rawGroundY = Math.max(SEA_LEVEL_M + 0.3, sampleGroundHeight(lm.worldX, lm.worldZ));
+      const groundY = isFob ? Math.max(rawGroundY, lm.targetElevationM + 0.08) : rawGroundY;
       const contractId = CONTRACT_BY_LANDMARK[lm.id] ?? null;
 
-      // Place FOB Logistics/Quartermaster terminal or Contract terminal cleanly offset from flagpole
-      const terminalX = lm.worldX + (isFob ? -6.8 : 6.5);
-      const terminalZ = lm.worldZ + 6.5;
-      const termY = Math.max(SEA_LEVEL_M + 0.3, sampleGroundHeight(terminalX, terminalZ));
-      const initialOwner: SectorControlOwner = lm.pmcFactionId ?? 'neutral';
+      // Place FOB Logistics/Quartermaster terminal, Field Hospital & Armory Lockers on exact FOB compound anchors
+      const fobTerm = isFobCompoundId(lm.id) ? getFobTerminalAnchor(lm.id) : null;
+      const fobHosp = isFobCompoundId(lm.id) ? getFobFieldHospitalAnchor(lm.id) : null;
+      const fobArmory = isFobCompoundId(lm.id) ? getFobArmoryStashAnchor(lm.id) : null;
+      const fobHeli = isFobCompoundId(lm.id) ? getFobHelipadAnchor(lm.id) : null;
+      const fobRepair = isFobCompoundId(lm.id) ? getFobVehicleRepairBayAnchor(lm.id) : null;
+
+      const terminalX = fobTerm ? fobTerm.worldX : lm.worldX + 6.5;
+      const terminalZ = fobTerm ? fobTerm.worldZ : lm.worldZ + 6.5;
+      const medbayX = fobHosp ? fobHosp.worldX : lm.worldX;
+      const medbayZ = fobHosp ? fobHosp.worldZ : lm.worldZ;
+      const armoryX = fobArmory ? fobArmory.worldX : lm.worldX;
+      const armoryZ = fobArmory ? fobArmory.worldZ : lm.worldZ;
+      const helipadX = fobHeli ? fobHeli.worldX : lm.worldX;
+      const helipadZ = fobHeli ? fobHeli.worldZ : lm.worldZ;
+      const repairBayX = fobRepair ? fobRepair.worldX : lm.worldX;
+      const repairBayZ = fobRepair ? fobRepair.worldZ : lm.worldZ;
+
+      const hasSubFactionPoi = Boolean(!isFob && lm.subFactionId);
+      const subFactionStashX = hasSubFactionPoi ? lm.worldX - 11.5 : undefined;
+      const subFactionStashZ = hasSubFactionPoi ? lm.worldZ + 8.5 : undefined;
+      const subFactionMedicX = hasSubFactionPoi ? lm.worldX - 15.5 : undefined;
+      const subFactionMedicZ = hasSubFactionPoi ? lm.worldZ - 7.5 : undefined;
+      const subFactionMarketX = hasSubFactionPoi ? lm.worldX + 12.5 : undefined;
+      const subFactionMarketZ = hasSubFactionPoi ? lm.worldZ - 9.5 : undefined;
+
+      const rawTermY = Math.max(SEA_LEVEL_M + 0.3, sampleGroundHeight(terminalX, terminalZ));
+      const termY = fobTerm ? Math.max(rawTermY, fobTerm.worldY) : rawTermY;
+      const initialOwner: SectorControlOwner = lm.pmcFactionId ?? (lm.subFactionId ? 'subfaction' : 'neutral');
 
       const state: SectorRuntimeState = {
         sectorId: lm.id,
@@ -278,29 +405,51 @@ export class OpenWorldSectorManager {
         contractId,
         supplyYield: SECTOR_SUPPLY_YIELDS[lm.id] ?? { ammo: 8, medical: 8 },
         owner: initialOwner,
-        alertState: initialOwner === 'neutral' ? 'calm' : 'captured',
-        liveCapturePct: initialOwner !== 'neutral' ? 100 : 0,
+        alertState: initialOwner === 'pmc_alpha' || initialOwner === 'pmc_bravo' ? 'captured' : 'calm',
+        liveCapturePct: initialOwner === 'pmc_alpha' || initialOwner === 'pmc_bravo' ? 100 : 0,
+        signedCaptureProgress:
+          initialOwner === 'pmc_alpha' ? 100 : initialOwner === 'pmc_bravo' ? -100 : 0,
+        heat: 0,
         contested: false,
         hostileGarrisonCount: 0,
         terminalX,
         terminalZ,
+        medbayX,
+        medbayZ,
+        armoryX,
+        armoryZ,
+        helipadX,
+        helipadZ,
+        repairBayX,
+        repairBayZ,
+        subFactionStashX,
+        subFactionStashZ,
+        subFactionMedicX,
+        subFactionMedicZ,
+        subFactionMarketX,
+        subFactionMarketZ,
         alertDecaySec: 0,
       };
       this.sectors.set(lm.id, state);
 
+      const fobSpec = isFob && isFobCompoundId(lm.id) ? getFobCompoundSpec(lm.id) : null;
+      const beaconXZ = fobSpec ? fobLocalToWorld(fobSpec, -14.0, 18.0) : { x: lm.worldX, z: lm.worldZ };
+      const beaconY = fobSpec ? fobSpec.baseY + 0.08 : groundY;
+
       const g = new THREE.Group();
       g.name = `sector_beacon_${lm.id}`;
-      g.position.set(lm.worldX, groundY, lm.worldZ);
+      g.position.set(beaconXZ.x, beaconY, beaconXZ.z);
+      if (fobSpec) g.rotation.y = fobSpec.yaw;
 
       const pad = new THREE.Mesh(padGeo, concreteMat);
       pad.position.y = 0.14;
       pad.receiveShadow = true;
 
       const mast = new THREE.Mesh(mastGeo, steelMat);
-      mast.position.y = 5.75;
+      mast.position.y = 6.03;
 
       const crossBar = new THREE.Mesh(crossBarGeo, steelMat);
-      crossBar.position.set(0, 10.6, 0);
+      crossBar.position.set(0, 10.88, 0);
 
       const flagMat = new THREE.MeshStandardMaterial({
         color: OWNER_COLORS[state.owner],
@@ -318,26 +467,27 @@ export class OpenWorldSectorManager {
       const ringMat = new THREE.MeshBasicMaterial({
         color: OWNER_COLORS[state.owner],
         transparent: true,
-        opacity: isFob ? 0.16 : 0.28,
+        opacity: isFob ? 0.0 : 0.28,
         depthWrite: false,
         side: THREE.DoubleSide,
       });
       this.sharedMaterials.push(flagMat, beaconMat, ringMat);
 
       const flagMesh = new THREE.Mesh(flagGeo, flagMat);
-      flagMesh.position.set(0.1, 9.85, 0);
+      flagMesh.position.set(0.1, 10.13, 0);
 
       const beaconMesh = new THREE.Mesh(beaconGeo, beaconMat);
-      beaconMesh.position.y = lm.poiRole === 'comms_tower' ? 24.4 : 11.95;
+      beaconMesh.position.y = lm.poiRole === 'comms_tower' ? 24.4 : 12.23;
 
       const radioCrate = new THREE.Mesh(crateGeo, crateMat);
-      radioCrate.position.set(1.4, 0.56, 0.8);
+      radioCrate.position.set(1.4, 0.705, 0.8);
 
       const radioAnt = new THREE.Mesh(antennaGeo, steelMat);
-      radioAnt.position.set(1.85, 1.5, 0.8);
+      radioAnt.position.set(1.85, 1.855, 0.8);
 
       const ringMesh = new THREE.Mesh(ringGeo, ringMat);
       ringMesh.position.y = 0.25;
+      ringMesh.visible = !isFob;
 
       g.add(pad, mast, crossBar, flagMesh, beaconMesh, radioCrate, radioAnt, ringMesh);
 
@@ -366,10 +516,11 @@ export class OpenWorldSectorManager {
       let fobTier2Group: THREE.Group | null = null;
       let fobTier3Group: THREE.Group | null = null;
 
-      if (isFob) {
+      if (isFob && fobSpec) {
         const termGroup = new THREE.Group();
         termGroup.name = `fob_logistics_terminal_${lm.id}`;
         termGroup.position.set(terminalX, termY, terminalZ);
+        if (fobTerm) termGroup.rotation.y = fobTerm.yaw;
 
         const desk = new THREE.Mesh(fobConsoleDeskGeo, caseMat);
         desk.position.y = 0.48;
@@ -380,35 +531,104 @@ export class OpenWorldSectorManager {
         termGroup.add(desk, screen, ant);
         this.rootGroup.add(termGroup);
 
-        // Tier 2 Physical FOB Upgrade (Optics Workbench + Surgical Bay Shelter)
+        // Tier 2 Physical FOB Upgrade (Exterior Logistics Supply Wing + Armory Optics Workbench, clear of all buildings)
         fobTier2Group = new THREE.Group();
         fobTier2Group.name = `fob_tier2_${lm.id}`;
+        fobTier2Group.position.set(fobSpec.worldX, fobSpec.baseY, fobSpec.worldZ);
+        fobTier2Group.rotation.y = fobSpec.yaw;
         const shelter = new THREE.Mesh(tier2ShelterGeo, medMat);
-        shelter.position.set(-10.5, 1.7, -5.0);
+        shelter.position.set(-17.5, 1.78, -4.0);
         const bench = new THREE.Mesh(tier2BenchGeo, crateMat);
-        bench.position.set(-10.5, 0.55, 1.8);
+        bench.position.set(10.2, 0.605, -6.8);
         fobTier2Group.add(shelter, bench);
         fobTier2Group.visible = false;
-        g.add(fobTier2Group);
+        this.rootGroup.add(fobTier2Group);
 
-        // Tier 3 Physical FOB Upgrade (Reinforced Helipad + Twin Perimeter Turret Towers)
+        // Tier 3 Physical FOB Upgrade (Live AA/Mortar Perimeter Turrets + Vehicle Repair Bay + Fast-Travel Helipad)
+        const heliAnchor = getFobHelipadAnchor(fobSpec.id);
+        const repairAnchor = getFobVehicleRepairBayAnchor(fobSpec.id);
         fobTier3Group = new THREE.Group();
         fobTier3Group.name = `fob_tier3_${lm.id}`;
-        const helipad = new THREE.Mesh(tier3HelipadGeo, helipadMat);
-        helipad.position.set(13.5, 0.18, -7.5);
-        for (const [tx, tz] of [
-          [-15.5, 11.5],
-          [15.5, 11.5],
-        ]) {
-          const tBase = new THREE.Mesh(tier3TurretBaseGeo, concreteMat);
-          tBase.position.set(tx, 2.2, tz);
-          const tHead = new THREE.Mesh(tier3TurretHeadGeo, steelMat);
-          tHead.position.set(tx, 4.85, tz);
-          fobTier3Group.add(tBase, tHead);
-        }
+        fobTier3Group.position.set(fobSpec.worldX, fobSpec.baseY, fobSpec.worldZ);
+        fobTier3Group.rotation.y = fobSpec.yaw;
+
+        // Helipad Tier 3 beacon ring
+        const helipad = new THREE.Mesh(tier3HeliRingGeo, helipadMat);
+        helipad.position.set(heliAnchor.localX, 0.175, heliAnchor.localZ);
         fobTier3Group.add(helipad);
+
+        // Vehicle Repair & Refuel Bay Gantry
+        const repairGantry = new THREE.Mesh(repairGantryGeo, helipadMat);
+        repairGantry.position.set(repairAnchor.localX, 3.68, repairAnchor.localZ);
+        const postL = new THREE.Mesh(repairPostGeo, steelMat);
+        postL.position.set(repairAnchor.localX - 3.2, 1.88, repairAnchor.localZ);
+        const postR = new THREE.Mesh(repairPostGeo, steelMat);
+        postR.position.set(repairAnchor.localX + 3.2, 1.88, repairAnchor.localZ);
+        fobTier3Group.add(repairGantry, postL, postR);
+
+        // Live tracking/firing AA Autocannon & Mortar Turrets
+        const turretSpecs: ReadonlyArray<{ lx: number; lz: number; role: 'aa_autocannon' | 'mortar' }> = [
+          { lx: -12.5, lz: 34.5, role: 'aa_autocannon' },
+          { lx: 12.5, lz: 34.5, role: 'mortar' },
+        ];
+        for (const ts of turretSpecs) {
+          const tBase = new THREE.Mesh(tier3TurretBaseGeo, concreteMat);
+          tBase.position.set(ts.lx, 2.28, ts.lz);
+          const tHead = new THREE.Mesh(tier3TurretHeadGeo, steelMat);
+          tHead.position.set(ts.lx, 4.955, ts.lz);
+          const tBarrel = new THREE.Mesh(tier3BarrelGeo, caseMat);
+          tBarrel.position.set(0, 0.12, 1.35);
+          if (ts.role === 'mortar') {
+            tBarrel.rotation.x = -0.58;
+          }
+          const tFlash = new THREE.Mesh(tier3FlashGeo, turretFlashMat);
+          tFlash.position.set(0, 0.12, 2.55);
+          tFlash.visible = false;
+          tHead.add(tBarrel, tFlash);
+          fobTier3Group.add(tBase, tHead);
+
+          const wPos = fobLocalToWorld(fobSpec, ts.lx, ts.lz);
+          this.fobTurrets.push({
+            sectorId: lm.id,
+            faction: fobSpec.faction,
+            role: ts.role,
+            headMesh: tHead,
+            barrelMesh: tBarrel,
+            muzzleFlashMesh: tFlash,
+            worldX: wPos.x,
+            worldY: fobSpec.baseY + 4.955,
+            worldZ: wPos.z,
+            fireCooldown: 0,
+            muzzleFlashTimer: 0,
+          });
+        }
         fobTier3Group.visible = false;
-        g.add(fobTier3Group);
+        this.rootGroup.add(fobTier3Group);
+      }
+
+      // Physical In-World Trusted Sub-Faction POI Stations (Forward Stash, Field Medic, Black-Market Terminal)
+      if (hasSubFactionPoi && subFactionStashX !== undefined && subFactionStashZ !== undefined &&
+          subFactionMedicX !== undefined && subFactionMedicZ !== undefined &&
+          subFactionMarketX !== undefined && subFactionMarketZ !== undefined) {
+        const stashY = Math.max(SEA_LEVEL_M + 0.3, sampleGroundHeight(subFactionStashX, subFactionStashZ));
+        const stashMesh = new THREE.Mesh(subFactionLockerGeo, crateMat);
+        stashMesh.position.set(subFactionStashX, stashY + 0.825, subFactionStashZ);
+        this.rootGroup.add(stashMesh);
+
+        const medicY = Math.max(SEA_LEVEL_M + 0.3, sampleGroundHeight(subFactionMedicX, subFactionMedicZ));
+        const medicMesh = new THREE.Mesh(subFactionMedicTentGeo, medMat);
+        medicMesh.position.set(subFactionMedicX, medicY + 1.18, subFactionMedicZ);
+        this.rootGroup.add(medicMesh);
+
+        const marketY = Math.max(SEA_LEVEL_M + 0.3, sampleGroundHeight(subFactionMarketX, subFactionMarketZ));
+        const marketGroup = new THREE.Group();
+        marketGroup.position.set(subFactionMarketX, marketY, subFactionMarketZ);
+        const bmDesk = new THREE.Mesh(caseGeo, caseMat);
+        bmDesk.position.y = 0.28;
+        const bmScreen = new THREE.Mesh(laptopLidGeo, blackMarketScreenMat);
+        bmScreen.position.set(0, 0.74, -0.14);
+        marketGroup.add(bmDesk, bmScreen);
+        this.rootGroup.add(marketGroup);
       }
 
       this.rootGroup.add(g);
@@ -499,13 +719,15 @@ export class OpenWorldSectorManager {
   }
 
   /**
-   * Transitions nearby non-FOB sectors from `calm` -> `alerted` upon gunfire or explosions.
+   * Transitions nearby non-FOB sectors from `calm` -> `alerted` upon gunfire or explosions,
+   * and raises dynamic sector combat `heat` (0..100).
    */
-  public notifyCombatAlert(originX: number, originZ: number, radiusM = 135): void {
+  public notifyCombatAlert(originX: number, originZ: number, radiusM = 135, heatDelta = 14): void {
     for (const sector of this.sectors.values()) {
       if (sector.isFob) continue;
       if (Math.hypot(originX - sector.worldX, originZ - sector.worldZ) <= radiusM) {
         sector.alertDecaySec = 45;
+        sector.heat = Math.min(100, sector.heat + heatDelta);
         if (sector.alertState === 'calm') {
           sector.alertState = 'alerted';
         }
@@ -520,8 +742,32 @@ export class OpenWorldSectorManager {
     const s = this.sectors.get(sectorId);
     if (!s || s.isFob) return;
     s.contested = true;
+    s.owner = 'contested';
     s.alertState = 'contested';
+    s.heat = Math.min(100, Math.max(s.heat, 65));
     s.alertDecaySec = 90;
+  }
+
+  public getFobDefenseTurrets(): readonly FobDefenseTurretHandle[] {
+    return this.fobTurrets;
+  }
+
+  public getFastTravelDestinations(faction: PmcFactionId): FastTravelDestination[] {
+    const out: FastTravelDestination[] = [];
+    for (const s of this.sectors.values()) {
+      if (s.owner === faction || (s.isFob && s.homeFaction === faction)) {
+        out.push({
+          sectorId: s.sectorId,
+          name: s.name,
+          shortLabel: s.shortLabel,
+          worldX: s.isFob ? s.helipadX : s.worldX + 12,
+          worldZ: s.isFob ? s.helipadZ : s.worldZ + 12,
+          owner: s.owner,
+          isFob: s.isFob,
+        });
+      }
+    }
+    return out;
   }
 
   /**
@@ -627,19 +873,25 @@ export class OpenWorldSectorManager {
 
       if (sector.alertDecaySec > 0) {
         sector.alertDecaySec = Math.max(0, sector.alertDecaySec - dt);
+      } else if (sector.heat > 0) {
+        sector.heat = Math.max(0, sector.heat - dt * 1.8);
       }
 
       if (sector.isFob || !character) {
         sector.contested = false;
         sector.alertState = 'captured';
+        sector.signedCaptureProgress =
+          sector.owner === 'pmc_alpha' ? 100 : sector.owner === 'pmc_bravo' ? -100 : 0;
         continue;
       }
 
       const dist = Math.hypot(playerX - sector.worldX, playerZ - sector.worldZ);
       const inZone = dist <= SECTOR_CAPTURE_RADIUS_M;
+      const factionSign = character.pmcFaction === 'pmc_alpha' ? 1 : -1;
 
       if (sector.owner === character.pmcFaction) {
         sector.liveCapturePct = 100;
+        sector.signedCaptureProgress = factionSign * 100;
         sector.contested = inZone && hostiles > 0;
         sector.alertState = sector.contested
           ? 'contested'
@@ -653,10 +905,12 @@ export class OpenWorldSectorManager {
         if (hostiles > 0) {
           sector.contested = true;
           sector.alertState = 'contested';
+          sector.heat = Math.min(100, sector.heat + dt * 4.5);
         } else {
           sector.contested = false;
           sector.alertState = 'contested';
           sector.liveCapturePct = Math.min(100, sector.liveCapturePct + SECTOR_CAPTURE_RATE_PER_SEC * dt);
+          sector.signedCaptureProgress = factionSign * sector.liveCapturePct;
           if (sector.liveCapturePct >= 100) {
             const flip = this.shards.flipSector(
               character.shardMode,
@@ -667,6 +921,7 @@ export class OpenWorldSectorManager {
               sector.supplyYield,
             );
             sector.owner = flip.sector.owner;
+            sector.signedCaptureProgress = factionSign * 100;
             sector.alertState = 'captured';
             this.roster.adjustCash(character.slotId, SECTOR_CAPTURE_CASH_BONUS);
             this.syncFromShard(character.shardMode, this.roster.getCharacter(character.slotId));
@@ -684,11 +939,13 @@ export class OpenWorldSectorManager {
         sector.contested = false;
         if (sector.liveCapturePct > 0) {
           sector.liveCapturePct = Math.max(0, sector.liveCapturePct - 6 * dt);
+          sector.signedCaptureProgress = factionSign * sector.liveCapturePct;
         }
         if (dist <= SECTOR_CAPTURE_RADIUS_M * 1.9) {
           sector.alertState = 'alerted';
         } else if (sector.alertDecaySec <= 0) {
-          sector.alertState = sector.owner === 'neutral' ? 'calm' : 'captured';
+          sector.alertState =
+            sector.owner === 'neutral' || sector.owner === 'subfaction' ? 'calm' : 'captured';
         }
       }
     }
@@ -715,7 +972,7 @@ export class OpenWorldSectorManager {
       const completed = new Set(character.unlocks.completedContractIds);
       const fobTier = this.shards.getFobTier(character.shardMode, character.pmcFaction);
 
-      // 1. In-World Home FOB Logistics & Quartermaster Terminal
+      // 1. In-World Home FOB Command Terminal, Armory Stash Lockers & Field Hospital
       for (const sector of this.sectors.values()) {
         if (!sector.isFob || sector.homeFaction !== character.pmcFaction) continue;
         const dTerm = Math.hypot(playerX - sector.terminalX, playerZ - sector.terminalZ);
@@ -724,24 +981,138 @@ export class OpenWorldSectorManager {
           best = {
             kind: 'fob_terminal',
             id: sector.sectorId,
-            label: `FOB Logistics & Quartermaster Terminal (${sector.shortLabel} · Tier ${fobTier})`,
+            label: `FOB Command & Quartermaster Terminal (${sector.shortLabel} · Tier ${fobTier})`,
             sublabel: 'Fund Tier 1–3 FOB Upgrades, Supply-Coupled Trader Stock & 3-Slot Contract Board',
             distanceM: dTerm,
             canExecute: true,
           };
         }
 
-        const dFob = Math.hypot(playerX - sector.worldX, playerZ - sector.worldZ);
-        if (dFob < bestDist) {
-          bestDist = dFob;
+        const dArmory = Math.hypot(playerX - sector.armoryX, playerZ - sector.armoryZ);
+        if (dArmory < bestDist) {
+          bestDist = dArmory;
+          best = {
+            kind: 'armory_stash',
+            id: sector.sectorId,
+            label: `FOB Armory Stash Lockers (${sector.shortLabel})`,
+            sublabel: 'Access Operator Stash Storage, Transfer Items, Swap Weapons & Refill Ammo',
+            distanceM: dArmory,
+            canExecute: true,
+          };
+        }
+
+        const dMed = Math.hypot(playerX - sector.medbayX, playerZ - sector.medbayZ);
+        if (dMed < bestDist) {
+          bestDist = dMed;
           best = {
             kind: 'fob_resupply',
             id: sector.sectorId,
-            label: `FOB Surgical Medbay (${sector.shortLabel})`,
+            label: `FOB Field Hospital (${sector.shortLabel})`,
             sublabel: 'Restore 100% HP, cure bleeding/leg trauma & repair Armor Plate',
-            distanceM: dFob,
+            distanceM: dMed,
             canExecute: true,
           };
+        }
+
+        // Tier 3 Vehicle Repair Bay & Fast-Travel Helipad
+        const dRepair = Math.hypot(playerX - sector.repairBayX, playerZ - sector.repairBayZ);
+        if (dRepair < bestDist) {
+          bestDist = dRepair;
+          best = {
+            kind: 'fob_vehicle_repair',
+            id: sector.sectorId,
+            label: `Vehicle Repair & Refuel Bay (${sector.shortLabel})`,
+            sublabel:
+              fobTier >= 3
+                ? 'Repair & refuel nearby friendly vehicles to 100%'
+                : 'Requires FOB Tier 3 construction at Command Terminal',
+            distanceM: dRepair,
+            canExecute: fobTier >= 3,
+            blockedReason: fobTier >= 3 ? undefined : 'Requires FOB Tier 3 upgrade.',
+          };
+        }
+
+        const dHeli = Math.hypot(playerX - sector.helipadX, playerZ - sector.helipadZ);
+        if (dHeli < bestDist) {
+          bestDist = dHeli;
+          best = {
+            kind: 'fob_helipad_travel',
+            id: sector.sectorId,
+            label: `Fast-Travel Helipad Dispatch (${sector.shortLabel})`,
+            sublabel:
+              fobTier >= 3
+                ? 'Airlift rapidly to any friendly controlled sector or FOB'
+                : 'Requires FOB Tier 3 construction at Command Terminal',
+            distanceM: dHeli,
+            canExecute: fobTier >= 3,
+            blockedReason: fobTier >= 3 ? undefined : 'Requires FOB Tier 3 upgrade.',
+          };
+        }
+      }
+
+      // 1B. Trusted Sub-Faction Physical POI Services (Forward Field Stash, Field Medic, Black-Market Terminal)
+      for (const sector of this.sectors.values()) {
+        if (!sector.subFactionId || sector.isFob) continue;
+        const sf = SUB_FACTION_MAP[sector.subFactionId];
+        const standing = character.subFactionStanding[sector.subFactionId] ?? 0;
+        const isTrusted = getStandingTier(standing) === 'Trusted';
+
+        if (sector.subFactionStashX !== undefined && sector.subFactionStashZ !== undefined) {
+          const dStash = Math.hypot(playerX - sector.subFactionStashX, playerZ - sector.subFactionStashZ);
+          if (dStash < bestDist) {
+            bestDist = dStash;
+            best = {
+              kind: 'subfaction_stash',
+              id: sector.sectorId,
+              subFactionId: sector.subFactionId,
+              label: `${sf.shortName} Forward Field Stash`,
+              sublabel: isTrusted
+                ? 'Trusted Access — Open persistent Operator Stash & Armory Lockers'
+                : `Requires Trusted Standing (+50 ${sf.shortName}; current ${standing >= 0 ? `+${standing}` : standing})`,
+              distanceM: dStash,
+              canExecute: isTrusted,
+              blockedReason: isTrusted ? undefined : `Requires +50 Trusted standing with ${sf.name}.`,
+            };
+          }
+        }
+
+        if (sector.subFactionMedicX !== undefined && sector.subFactionMedicZ !== undefined) {
+          const dSfMed = Math.hypot(playerX - sector.subFactionMedicX, playerZ - sector.subFactionMedicZ);
+          if (dSfMed < bestDist) {
+            bestDist = dSfMed;
+            best = {
+              kind: 'subfaction_medic',
+              id: sector.sectorId,
+              subFactionId: sector.subFactionId,
+              label: `${sf.shortName} Field Medic Triage`,
+              sublabel: isTrusted
+                ? 'Trusted Access — Full HP heal, stop bleeding & clear leg trauma'
+                : `Requires Trusted Standing (+50 ${sf.shortName}; current ${standing >= 0 ? `+${standing}` : standing})`,
+              distanceM: dSfMed,
+              canExecute: isTrusted,
+              blockedReason: isTrusted ? undefined : `Requires +50 Trusted standing with ${sf.name}.`,
+            };
+          }
+        }
+
+        if (sector.subFactionMarketX !== undefined && sector.subFactionMarketZ !== undefined) {
+          const dBm = Math.hypot(playerX - sector.subFactionMarketX, playerZ - sector.subFactionMarketZ);
+          if (dBm < bestDist) {
+            bestDist = dBm;
+            const tr = TRADER_MAP[sf.traderId];
+            best = {
+              kind: 'subfaction_black_market',
+              id: sector.sectorId,
+              subFactionId: sector.subFactionId,
+              label: `${sf.shortName} Black-Market Terminal (${tr.name})`,
+              sublabel: isTrusted
+                ? 'Trusted Access — Unlocks discounted Tier 3 contraband & AP ammo'
+                : `Requires Trusted Standing (+50 ${sf.shortName}; current ${standing >= 0 ? `+${standing}` : standing})`,
+              distanceM: dBm,
+              canExecute: isTrusted,
+              blockedReason: isTrusted ? undefined : `Requires +50 Trusted standing with ${sf.name}.`,
+            };
+          }
         }
       }
 
@@ -875,6 +1246,7 @@ export class OpenWorldSectorManager {
     for (const m of this.sharedMaterials) m.dispose();
     this.sharedGeometries.length = 0;
     this.sharedMaterials.length = 0;
+    this.fobTurrets.length = 0;
     this.visuals.clear();
     this.sectors.clear();
   }

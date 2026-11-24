@@ -527,14 +527,24 @@ export function evaluateRawOpenWorldHeight(x: number, z: number): number {
     h = lerp(h, -9.0, seaDrop);
   }
 
-  // Gentle flattening pads for major named landmarks so structures sit cleanly grounded
+  // Flattening pads for major named landmarks so structures sit cleanly grounded
   for (let i = 0; i < OPENWORLD_LANDMARKS.length; i++) {
     const lm = OPENWORLD_LANDMARKS[i];
     const dist = Math.hypot(cx - lm.worldX, cz - lm.worldZ);
-    const outer = lm.padRadiusM * 1.65;
-    if (dist < outer) {
-      const blend = 1.0 - smoothstep(lm.padRadiusM * 0.55, outer, dist);
-      h = lerp(h, lm.targetElevationM, blend * 0.92);
+    if (lm.poiRole === 'fob') {
+      // Exact 100% flat plateau covering full compound, corner guard towers, HESCO walls & checkpoint apron
+      const inner = Math.max(lm.padRadiusM * 0.72, 64);
+      const outer = Math.max(lm.padRadiusM * 1.65, 124);
+      if (dist < outer) {
+        const blend = 1.0 - smoothstep(inner, outer, dist);
+        h = lerp(h, lm.targetElevationM, blend);
+      }
+    } else {
+      const outer = lm.padRadiusM * 1.65;
+      if (dist < outer) {
+        const blend = 1.0 - smoothstep(lm.padRadiusM * 0.55, outer, dist);
+        h = lerp(h, lm.targetElevationM, blend * 0.98);
+      }
     }
   }
 
@@ -557,22 +567,38 @@ export function evaluateOpenWorldHeight(x: number, z: number): number {
 
   let h = evaluateRawOpenWorldHeight(x, z);
 
-  // 1. Gently grade roadbed cross-sections along highways, FOB spurs & dirt trails
-  //    (skipping bridge spans so the carved river channel flows cleanly beneath elevated bridge decks)
-  queryRoadNetwork(x, z, _roadGradeScratch);
-  if (_roadGradeScratch.tier !== 'none' && !_roadGradeScratch.onBridge) {
-    const hw = _roadGradeScratch.halfWidthM;
-    const outer = hw + _roadGradeScratch.shoulderM + 5.5;
-    if (_roadGradeScratch.distanceM < outer) {
-      const roadBlend = 1.0 - smoothstep(hw + 0.6, outer, _roadGradeScratch.distanceM);
-      h = lerp(h, _roadGradeScratch.targetY, roadBlend * 0.94);
+  // Lock FOB compound plateaus to exact target elevation so spur road or pad grading
+  // never pulls terrain underneath the tarmac, perimeter walls, or guard towers
+  let fobLock = 0;
+  for (let i = 0; i < OPENWORLD_LANDMARKS.length; i++) {
+    const lm = OPENWORLD_LANDMARKS[i];
+    if (lm.poiRole !== 'fob') continue;
+    const dist = Math.hypot(x - lm.worldX, z - lm.worldZ);
+    if (dist < 80) {
+      const lock = 1.0 - smoothstep(62, 80, dist);
+      if (lock > fobLock) fobLock = lock;
     }
   }
+  const roadAndPadWeight = 1.0 - fobLock;
 
-  // 2. Flatten circular pads beneath every enterable house, gas station, barn & checkpoint
-  querySitePad(x, z, _padGradeScratch);
-  if (_padGradeScratch.blend > 0) {
-    h = lerp(h, _padGradeScratch.targetY, _padGradeScratch.blend * 0.96);
+  if (roadAndPadWeight > 0.001) {
+    // 1. Gently grade roadbed cross-sections along highways, FOB spurs & dirt trails
+    //    (skipping bridge spans so the carved river channel flows cleanly beneath elevated bridge decks)
+    queryRoadNetwork(x, z, _roadGradeScratch);
+    if (_roadGradeScratch.tier !== 'none' && !_roadGradeScratch.onBridge) {
+      const hw = _roadGradeScratch.halfWidthM;
+      const outer = hw + _roadGradeScratch.shoulderM + 5.5;
+      if (_roadGradeScratch.distanceM < outer) {
+        const roadBlend = (1.0 - smoothstep(hw + 0.6, outer, _roadGradeScratch.distanceM)) * roadAndPadWeight;
+        h = lerp(h, _roadGradeScratch.targetY, roadBlend * 0.94);
+      }
+    }
+
+    // 2. Flatten circular pads beneath every enterable house, gas station, barn & checkpoint
+    querySitePad(x, z, _padGradeScratch);
+    if (_padGradeScratch.blend > 0) {
+      h = lerp(h, _padGradeScratch.targetY, _padGradeScratch.blend * 0.96 * roadAndPadWeight);
+    }
   }
 
   return h;
@@ -592,21 +618,16 @@ export function classifyOpenWorldBiome(height: number, z: number): OpenWorldBiom
 }
 
 /**
- * Full zero-allocation terrain & biome sample at `(x, z)`.
- * Writes into `out` if supplied (required for hot paths & chunk builders).
+ * Fast zero-allocation biome/road/albedo classifier given precomputed `(h, slope)` from a chunk heightfield.
+ * Eliminates redundant 3x analytical `evaluateOpenWorldHeight` calls during chunk & foliage generation.
  */
-export function sampleOpenWorldTerrain(
+export function sampleOpenWorldTerrainFromHeight(
   x: number,
   z: number,
+  h: number,
+  slope: number,
   out: TerrainSample = createTerrainSample(),
 ): TerrainSample {
-  const h = evaluateOpenWorldHeight(x, z);
-  const hx = evaluateOpenWorldHeight(x + 4.0, z);
-  const hz = evaluateOpenWorldHeight(x, z + 4.0);
-  const dx = (hx - h) * 0.25;
-  const dz = (hz - h) * 0.25;
-  const slope = Math.min(1, Math.hypot(dx, dz));
-
   const biome = classifyOpenWorldBiome(h, z);
   const isReservoir = z < -1375 && Math.hypot((x - 180) / 360, (z + 1620) / 215) < 1.0 && h < RESERVOIR_LEVEL_M;
   const isWater = h <= SEA_LEVEL_M || isReservoir;
@@ -704,6 +725,24 @@ export function sampleOpenWorldTerrain(
   out.g = g;
   out.b = b;
   return out;
+}
+
+/**
+ * Full zero-allocation terrain & biome sample at `(x, z)`.
+ * Writes into `out` if supplied (required for hot paths & chunk builders).
+ */
+export function sampleOpenWorldTerrain(
+  x: number,
+  z: number,
+  out: TerrainSample = createTerrainSample(),
+): TerrainSample {
+  const h = evaluateOpenWorldHeight(x, z);
+  const hx = evaluateOpenWorldHeight(x + 4.0, z);
+  const hz = evaluateOpenWorldHeight(x, z + 4.0);
+  const dx = (hx - h) * 0.25;
+  const dz = (hz - h) * 0.25;
+  const slope = Math.min(1, Math.hypot(dx, dz));
+  return sampleOpenWorldTerrainFromHeight(x, z, h, slope, out);
 }
 
 export function getNearestLandmark(x: number, z: number): {

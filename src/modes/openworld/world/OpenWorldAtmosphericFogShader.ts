@@ -43,7 +43,7 @@ export function applyAtmosphericHeightFog<T extends THREE.Material>(
       : null;
 
   material.customProgramCacheKey = () =>
-    `${prevCacheKey ? prevCacheKey() : material.type}_ow_atmo_fog_v1`;
+    `${prevCacheKey ? prevCacheKey() : material.type}_ow_atmo_fog_v2`;
 
   material.onBeforeCompile = (shader, renderer) => {
     if (prevBeforeCompile) {
@@ -60,7 +60,10 @@ export function applyAtmosphericHeightFog<T extends THREE.Material>(
       .replace(
         '#include <common>',
         `#include <common>
-        varying vec3 vAtmoWorldPos;
+        uniform vec3 uAtmoSunDir;
+        uniform vec4 uAtmoFogParams;
+        uniform vec3 uAtmoScatterParams;
+        varying vec3 vAtmoFog;
         `,
       )
       .replace(
@@ -69,7 +72,31 @@ export function applyAtmosphericHeightFog<T extends THREE.Material>(
         #ifdef USE_INSTANCING
           atmoObjPos = instanceMatrix * atmoObjPos;
         #endif
-        vAtmoWorldPos = ( modelMatrix * atmoObjPos ).xyz;
+        vec3 atmoWorldPos = ( modelMatrix * atmoObjPos ).xyz;
+        vec3 atmoToVert = atmoWorldPos - cameraPosition;
+        float atmoDist = length(atmoToVert);
+        vec3 atmoViewDir = atmoToVert / max(atmoDist, 0.0001);
+
+        float atmoBaseDens = uAtmoFogParams.x;
+        float atmoMistDens = uAtmoFogParams.y;
+        float atmoFalloff = max(0.002, uAtmoFogParams.z);
+        float atmoFloorY = uAtmoFogParams.w;
+
+        float atmoCamH = max(-6.0, cameraPosition.y - atmoFloorY);
+        float atmoVertH = max(-6.0, atmoWorldPos.y - atmoFloorY);
+        float atmoDeltaH = atmoVertH - atmoCamH;
+        float atmoRayIntegral = abs(atmoDeltaH) > 0.06
+          ? (exp(-atmoFalloff * atmoCamH) - exp(-atmoFalloff * atmoVertH)) / (atmoFalloff * atmoDeltaH)
+          : exp(-atmoFalloff * atmoCamH);
+        atmoRayIntegral = clamp(atmoRayIntegral, 0.0, 1.45);
+
+        float atmoDistTerm = 1.0 - exp(-pow(atmoBaseDens * atmoDist, 1.16));
+        float atmoMistTerm = 1.0 - exp(-atmoMistDens * atmoDist * atmoRayIntegral);
+        float atmoFogFactor = clamp(1.0 - (1.0 - atmoDistTerm) * (1.0 - atmoMistTerm * 0.94), 0.0, 1.0);
+        float atmoDesat = clamp(atmoDistTerm * uAtmoScatterParams.z, 0.0, 0.42);
+        float atmoSunAlign = max(dot(atmoViewDir, uAtmoSunDir), 0.0);
+        float atmoScatter = clamp(pow(atmoSunAlign, uAtmoScatterParams.y) * uAtmoScatterParams.x, 0.0, 1.0);
+        vAtmoFog = vec3(atmoFogFactor, atmoDesat, atmoScatter);
         #include <fog_vertex>`,
       );
 
@@ -77,45 +104,18 @@ export function applyAtmosphericHeightFog<T extends THREE.Material>(
       .replace(
         '#include <common>',
         `#include <common>
-        uniform vec3 uAtmoSunDir;
         uniform vec3 uAtmoFogColor;
         uniform vec3 uAtmoInscatterColor;
-        uniform vec4 uAtmoFogParams;
-        uniform vec3 uAtmoScatterParams;
-        varying vec3 vAtmoWorldPos;
+        varying vec3 vAtmoFog;
         `,
       )
       .replace(
         '#include <fog_fragment>',
         `#ifdef USE_FOG
-          vec3 atmoToFrag = vAtmoWorldPos - cameraPosition;
-          float atmoDist = length(atmoToFrag);
-          vec3 atmoViewDir = atmoToFrag / max(atmoDist, 0.0001);
-
-          float atmoBaseDens = uAtmoFogParams.x;
-          float atmoMistDens = uAtmoFogParams.y;
-          float atmoFalloff = max(0.002, uAtmoFogParams.z);
-          float atmoFloorY = uAtmoFogParams.w;
-
-          float atmoCamH = max(-6.0, cameraPosition.y - atmoFloorY);
-          float atmoFragH = max(-6.0, vAtmoWorldPos.y - atmoFloorY);
-          float atmoDeltaH = atmoFragH - atmoCamH;
-          float atmoRayIntegral = abs(atmoDeltaH) > 0.06
-            ? (exp(-atmoFalloff * atmoCamH) - exp(-atmoFalloff * atmoFragH)) / (atmoFalloff * atmoDeltaH)
-            : exp(-atmoFalloff * atmoCamH);
-          atmoRayIntegral = clamp(atmoRayIntegral, 0.0, 1.45);
-
-          float atmoDistTerm = 1.0 - exp(-pow(atmoBaseDens * atmoDist, 1.16));
-          float atmoMistTerm = 1.0 - exp(-atmoMistDens * atmoDist * atmoRayIntegral);
-          float atmoFogFactor = clamp(1.0 - (1.0 - atmoDistTerm) * (1.0 - atmoMistTerm * 0.94), 0.0, 1.0);
-
-          float atmoSunAlign = max(dot(atmoViewDir, normalize(uAtmoSunDir)), 0.0);
-          float atmoScatter = clamp(pow(atmoSunAlign, uAtmoScatterParams.y) * uAtmoScatterParams.x, 0.0, 1.0);
-          vec3 atmoTargetFog = mix(uAtmoFogColor, uAtmoInscatterColor, atmoScatter);
-
+          vec3 atmoTargetFog = mix(uAtmoFogColor, uAtmoInscatterColor, vAtmoFog.z);
           float atmoLum = dot(gl_FragColor.rgb, vec3(0.299, 0.587, 0.114));
-          gl_FragColor.rgb = mix(gl_FragColor.rgb, vec3(atmoLum), clamp(atmoDistTerm * uAtmoScatterParams.z, 0.0, 0.42));
-          gl_FragColor.rgb = mix(gl_FragColor.rgb, atmoTargetFog, atmoFogFactor);
+          gl_FragColor.rgb = mix(gl_FragColor.rgb, vec3(atmoLum), vAtmoFog.y);
+          gl_FragColor.rgb = mix(gl_FragColor.rgb, atmoTargetFog, vAtmoFog.x);
         #endif`,
       );
   };

@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { OpenWorldAmbienceAudio, isHourInWindow } from './OpenWorldAmbienceAudio';
 import { isOnCivilizationClearance } from './OpenWorldCivilizationTopology';
+import { isInsideFobCompound } from './OpenWorldFobLayout';
 import { FoliageAnchorPoint } from './OpenWorldFoliageBuilder';
 import {
   createTerrainSample,
@@ -521,6 +522,7 @@ export class WildlifeManager {
   private readonly entitiesById = new Map<string, { kind: 'wolf'; entity: WolfEntity; pack: WolfPackBlackboard } | { kind: 'deer'; entity: DeerEntity; herd: DeerHerdBlackboard }>();
   private nextEntitySeq = 1;
   private spawnCheckAccum = 0;
+  private microFaunaAccum = 0;
 
   // Shared macro-fauna geometries & materials
   private readonly sharedGeos: THREE.BufferGeometry[] = [];
@@ -1268,14 +1270,22 @@ export class WildlifeManager {
     // 3. Step Wolf Packs (Patrol, Hunt Deer, Rival Pack Fights, Rare Operator Encircle/Lunge)
     this.updateWolfPacks(dt, ctx);
 
-    // 4. Step Physical Frogs (35m water/marsh grid pool, diegetic croaks, 4m water hop)
-    this.updateFrogs(dt, ctx);
-
-    // 5. Step Daytime Butterflies (25m clearing drift, sprint dispersion)
-    this.updateButterflies(dt, ctx);
-
-    // 6. Step 12m Ground-Clamped Spiders & Ants
-    this.updateInsects(dt, ctx);
+    // 4-6. Step micro-fauna (frogs, butterflies, spiders & ants) at 20Hz outside concrete FOB compounds
+    this.microFaunaAccum += dt;
+    if (this.microFaunaAccum >= 0.05) {
+      const microDt = Math.min(0.1, this.microFaunaAccum);
+      this.microFaunaAccum = 0;
+      if (isInsideFobCompound(ctx.playerX, ctx.playerZ)) {
+        this.frogMesh.count = 0;
+        this.butterflyMesh.count = 0;
+        this.spiderMesh.count = 0;
+        this.antMesh.count = 0;
+      } else {
+        this.updateFrogs(microDt, ctx);
+        this.updateButterflies(microDt, ctx);
+        this.updateInsects(microDt, ctx);
+      }
+    }
   }
 
   /**

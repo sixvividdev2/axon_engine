@@ -1,4 +1,9 @@
 import * as THREE from 'three';
+import type {
+  AdaptivePerformanceState,
+  GraphicsQualityId,
+  GraphicsQualityProfile,
+} from '../../../../data/graphicsQuality';
 import type { OpenWorldWeatherId } from '../types';
 import {
   type AtmoFogSharedUniforms,
@@ -139,7 +144,7 @@ const SKY_VERTEX_SHADER = /* glsl */ `
   }
 `;
 
-const SKY_FRAGMENT_SHADER = /* glsl */ `
+export const OPENWORLD_SKY_FRAGMENT_SHADER = /* glsl */ `
   uniform vec3 uZenithColor;
   uniform vec3 uHorizonColor;
   uniform vec3 uInscatterColor;
@@ -156,18 +161,13 @@ const SKY_FRAGMENT_SHADER = /* glsl */ `
   uniform float uCirrusCoverage;
   uniform float uCloudDrift;
   uniform float uOcclusionPass;
+  uniform float uSkySteps;
   varying vec3 vWorldDir;
 
   float hash21(vec2 p) {
     p = fract(p * vec2(123.34, 456.21));
     p += dot(p, p + 45.32);
     return fract(p.x * p.y);
-  }
-
-  float hash31(vec3 p) {
-    p = fract(p * 0.1031);
-    p += dot(p, p.yzx + 33.33);
-    return fract((p.x + p.y) * p.z);
   }
 
   float starHash(vec3 p) {
@@ -187,78 +187,43 @@ const SKY_FRAGMENT_SHADER = /* glsl */ `
     return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
   }
 
-  float valueNoise3D(vec3 p) {
-    vec3 i = floor(p);
-    vec3 f = fract(p);
-    vec3 u = f * f * (3.0 - 2.0 * f);
-    float n000 = hash31(i + vec3(0.0, 0.0, 0.0));
-    float n100 = hash31(i + vec3(1.0, 0.0, 0.0));
-    float n010 = hash31(i + vec3(0.0, 1.0, 0.0));
-    float n110 = hash31(i + vec3(1.0, 1.0, 0.0));
-    float n001 = hash31(i + vec3(0.0, 0.0, 1.0));
-    float n101 = hash31(i + vec3(1.0, 0.0, 1.0));
-    float n011 = hash31(i + vec3(0.0, 1.0, 1.0));
-    float n111 = hash31(i + vec3(1.0, 1.0, 1.0));
-    float nx00 = mix(n000, n100, u.x);
-    float nx10 = mix(n010, n110, u.x);
-    float nx01 = mix(n001, n101, u.x);
-    float nx11 = mix(n011, n111, u.x);
-    float nxy0 = mix(nx00, nx10, u.y);
-    float nxy1 = mix(nx01, nx11, u.y);
-    return mix(nxy0, nxy1, u.z);
-  }
-
-  float cumulusFbm(vec3 p) {
-    float v = 0.0;
-    float a = 0.54;
-    for (int i = 0; i < 3; i++) {
-      v += a * valueNoise3D(p);
-      p = p * 2.13 + vec3(13.7, 7.1, 19.3);
-      a *= 0.48;
-    }
-    return v;
-  }
-
-  float cirrusFbm(vec2 p) {
+  // Smooth 4-octave world-locked cumulus FBM (zero screen-space dither/swim)
+  float cumulusFbm2D(vec2 p) {
     float v = 0.0;
     float a = 0.52;
     mat2 rot = mat2(0.80, -0.60, 0.60, 0.80);
     for (int i = 0; i < 4; i++) {
       v += a * valueNoise(p);
-      p = rot * p * 2.08 + vec2(7.3, 13.1);
-      a *= 0.5;
+      p = rot * p * 2.07 + vec2(11.3, 6.7);
+      a *= 0.49;
     }
     return v;
   }
 
-  // World-space cumulus density field inside [780m, 1480m] altitude slab.
-  // Clear coverage (~0.42) yields distinct scattered puffs separated by crisp blue gaps.
-  float sampleCumulusDensity(vec3 worldPos, out float heightFrac) {
-    const float CLOUD_BASE_Y = 780.0;
-    const float CLOUD_TOP_Y = 1480.0;
-    heightFrac = clamp((worldPos.y - CLOUD_BASE_Y) / (CLOUD_TOP_Y - CLOUD_BASE_Y), 0.0, 1.0);
-    if (heightFrac <= 0.001 || heightFrac >= 0.999) return 0.0;
+  // Fast 3-octave cirrus FBM
+  float cirrusFbm(vec2 p) {
+    float v = 0.0;
+    float a = 0.55;
+    mat2 rot = mat2(0.80, -0.60, 0.60, 0.80);
+    for (int i = 0; i < 3; i++) {
+      v += a * valueNoise(p);
+      p = rot * p * 2.12 + vec2(7.3, 13.1);
+      a *= 0.48;
+    }
+    return v;
+  }
 
-    // Flat cumulus condensation base + rounded convective dome top
-    float heightEnv = smoothstep(0.0, 0.14, heightFrac) * smoothstep(1.0, 0.34, heightFrac);
+  // Evaluates world-locked cumulus density at horizontal world plane coordinates
+  float sampleCumulusField(vec2 worldXZ) {
+    vec2 macroCoord = worldXZ * 0.00052;
+    float warp = valueNoise(macroCoord * 1.45 + vec2(4.2, 9.7));
+    vec2 warped = macroCoord + vec2(warp * 0.40, -warp * 0.32);
+    float billow = cumulusFbm2D(warped);
 
-    vec3 windPos = worldPos + vec3(uCloudDrift * 9.0, 0.0, uCloudDrift * 3.2);
-    // Low-frequency macro cluster field in world XZ (warped for organic cauliflower outlines)
-    vec2 macroCoord = windPos.xz * 0.00058;
-    float warp = valueNoise(macroCoord * 1.65 + vec2(4.2, 9.7));
-    float baseField = valueNoise(macroCoord + vec2(warp * 0.42, -warp * 0.34)) * 0.65
-                    + valueNoise(macroCoord * 2.15 + vec2(17.3, 5.1)) * 0.35;
-
-    // Scattered puffs with crisp blue gaps at Clear (0.42), thicker broken/overcast at 0.72..0.94
-    float covThreshold = mix(0.66, 0.24, clamp(uCloudCoverage, 0.0, 1.0));
-    float macroShape = smoothstep(covThreshold, covThreshold + 0.18, baseField) * heightEnv;
-    if (macroShape <= 0.004) return 0.0;
-
-    // 3D volumetric puff sculpting & edge erosion (stronger toward top domes)
-    float detail = cumulusFbm(windPos * vec3(0.00175, 0.00235, 0.00175));
-    float erosion = mix(0.18, 0.34, heightFrac) * (1.0 - uOvercast * 0.42);
-    float d = clamp((macroShape - detail * erosion) / max(0.25, 1.0 - erosion), 0.0, 1.0);
-    return smoothstep(0.04, 0.72, d) * (0.85 + uOvercast * 0.55);
+    float covThreshold = mix(0.64, 0.24, clamp(uCloudCoverage, 0.0, 1.0));
+    float softEdge = mix(0.18, 0.24, uOvercast);
+    float d = smoothstep(covThreshold, covThreshold + softEdge, billow);
+    return d * (0.86 + uOvercast * 0.42);
   }
 
   float hgPhase(float cosTheta, float g) {
@@ -266,86 +231,42 @@ const SKY_FRAGMENT_SHADER = /* glsl */ `
     return (1.0 - g2) / (4.0 * 3.14159265 * pow(max(0.05, 1.0 + g2 - 2.0 * g * cosTheta), 1.5));
   }
 
-  // Returns vec4(accumulatedColor.rgb, cloudTransmittance)
-  vec4 raymarchCumulus(vec3 dir, vec3 sunN, float jitter, float sunDot) {
+  // 100% world-locked analytical cumulus canopy with directional sun self-shadowing
+  // Returns vec4(premultipliedColor.rgb, cloudTransmittance)
+  vec4 evaluateCumulusLayer(vec3 dir, vec3 sunN, float sunDot) {
     if (dir.y <= 0.012) return vec4(0.0, 0.0, 0.0, 1.0);
 
-    const float CLOUD_BASE_Y = 780.0;
-    const float CLOUD_TOP_Y = 1480.0;
-    float t0 = max(0.0, (CLOUD_BASE_Y - uWorldAnchor.y) / dir.y);
-    float t1 = max(0.0, (CLOUD_TOP_Y - uWorldAnchor.y) / dir.y);
-    if (t0 >= 14500.0 || t1 <= t0) return vec4(0.0, 0.0, 0.0, 1.0);
-    t1 = min(t1, 14500.0);
+    // Gently curved virtual cloud canopy so distant puffs project smoothly toward horizon
+    const float CLOUD_ALT_M = 920.0;
+    float denom = dir.y + 0.065;
+    float tPlane = min(14500.0, max(120.0, (CLOUD_ALT_M - uWorldAnchor.y) / denom));
+    vec2 windShift = vec2(uCloudDrift * 10.5, uCloudDrift * 3.8);
+    vec2 cloudXZ = uWorldAnchor.xz + dir.xz * tPlane + windShift;
 
-    float marchSpan = t1 - t0;
-    const int STEPS = 12;
-    float dt = marchSpan / float(STEPS);
+    float dens = sampleCumulusField(cloudXZ);
+    if (dens <= 0.003) return vec4(0.0, 0.0, 0.0, 1.0);
+
+    // Single world-locked directional sun-offset sample for sunlit tops vs shaded undersides
+    vec2 sunStepXZ = sunN.xz * (230.0 / max(0.28, sunN.y + 0.35));
+    float sunDens = sampleCumulusField(cloudXZ + sunStepXZ);
+    float selfShadow = exp(-sunDens * (1.35 + uOvercast * 0.45));
+    float crownLift = smoothstep(0.12, 0.85, dens) * 0.24;
+    float litFactor = clamp(selfShadow * 0.82 + crownLift + (1.0 - dens) * 0.14, 0.0, 1.0);
 
     float cosTheta = dot(dir, sunN);
-    float forwardScatter = hgPhase(cosTheta, 0.60) * 1.15;
-    float silverBoost = pow(max(cosTheta, 0.0), 10.0) * 0.55 * (1.0 - uOvercast * 0.65);
+    float forwardScatter = hgPhase(cosTheta, 0.56) * 0.92;
+    float silverBoost = pow(max(cosTheta, 0.0), 8.0) * 0.48 * (1.0 - uOvercast * 0.65);
 
-    vec3 accumColor = vec3(0.0);
-    float transmittance = 1.0;
+    vec3 cloudCol = mix(uCloudShadeColor, uCloudLitColor, litFactor);
+    cloudCol += uSunColor * (forwardScatter * selfShadow * 0.28 + silverBoost * (1.0 - dens * 0.45));
 
-    for (int i = 0; i < STEPS; i++) {
-      float t = t0 + (float(i) + jitter) * dt;
-      vec3 pos = uWorldAnchor + dir * t;
-      float hFrac = 0.0;
-      float dens = sampleCumulusDensity(pos, hFrac);
-      if (dens > 0.002) {
-        // 2-tap directional sun self-shadowing
-        float hDummy = 0.0;
-        float sunD1 = sampleCumulusDensity(pos + sunN * 115.0, hDummy);
-        float sunD2 = sampleCumulusDensity(pos + sunN * 265.0, hDummy);
-        float sunOptical = (sunD1 * 0.65 + sunD2 * 0.35) * 1.65;
-        float sunTrans = exp(-sunOptical * (1.1 + uOvercast * 0.4));
-        float powder = 1.0 - exp(-dens * 2.2);
+    // Aerial perspective so distant horizon clouds melt softly into atmospheric haze
+    float distFade = smoothstep(2600.0, 13500.0, tPlane) * 0.58;
+    cloudCol = mix(cloudCol, uHorizonColor, distFade);
 
-        float litFactor = clamp(sunTrans * (0.72 + powder * 0.45) + hFrac * 0.24, 0.0, 1.0);
-        vec3 stepCol = mix(uCloudShadeColor, uCloudLitColor, litFactor);
-        stepCol += uSunColor * (forwardScatter * sunTrans * 0.32 + silverBoost * (1.0 - dens * 0.4));
-
-        // Distance aerial perspective so far horizon puffs melt softly into sky haze
-        float distFade = smoothstep(3200.0, 14000.0, t) * 0.52;
-        stepCol = mix(stepCol, uHorizonColor, distFade);
-
-        float stepAlpha = 1.0 - exp(-dens * (dt * 0.0038) * (1.0 + uCloudCoverage * 0.55));
-        accumColor += transmittance * stepCol * stepAlpha;
-        transmittance *= (1.0 - stepAlpha);
-        if (transmittance < 0.025) break;
-      }
-    }
-
-    // Smoothly dissolve clouds right above the horizon line
-    float horizonAlpha = smoothstep(0.012, 0.14, dir.y);
-    float finalTrans = mix(1.0, transmittance, horizonAlpha);
-    return vec4(accumColor * horizonAlpha, finalTrans);
-  }
-
-  float raymarchCumulusTransmittance(vec3 dir, float jitter) {
-    if (dir.y <= 0.012) return 1.0;
-    const float CLOUD_BASE_Y = 780.0;
-    const float CLOUD_TOP_Y = 1480.0;
-    float t0 = max(0.0, (CLOUD_BASE_Y - uWorldAnchor.y) / dir.y);
-    float t1 = min(14500.0, max(0.0, (CLOUD_TOP_Y - uWorldAnchor.y) / dir.y));
-    if (t0 >= 14500.0 || t1 <= t0) return 1.0;
-
-    const int OCC_STEPS = 6;
-    float dt = (t1 - t0) / float(OCC_STEPS);
-    float trans = 1.0;
-    for (int i = 0; i < OCC_STEPS; i++) {
-      float t = t0 + (float(i) + jitter) * dt;
-      vec3 pos = uWorldAnchor + dir * t;
-      float hFrac = 0.0;
-      float dens = sampleCumulusDensity(pos, hFrac);
-      if (dens > 0.002) {
-        float stepAlpha = 1.0 - exp(-dens * (dt * 0.0042) * (1.0 + uCloudCoverage * 0.55));
-        trans *= (1.0 - stepAlpha);
-        if (trans < 0.03) break;
-      }
-    }
-    return mix(1.0, trans, smoothstep(0.012, 0.14, dir.y));
+    float horizonAlpha = smoothstep(0.012, 0.15, dir.y);
+    float alpha = clamp(dens * (0.90 + uCloudCoverage * 0.18), 0.0, 0.96) * horizonAlpha;
+    return vec4(cloudCol * alpha, 1.0 - alpha);
   }
 
   void main() {
@@ -356,24 +277,21 @@ const SKY_FRAGMENT_SHADER = /* glsl */ `
     vec3 moonN = normalize(uMoonDir);
     float sunDot = max(dot(dir, sunN), 0.0);
     float moonDot = max(dot(dir, moonN), 0.0);
-    float jitter = hash21(gl_FragCoord.xy);
 
-    // High-altitude procedural cirrus shell (world-locked directional projection)
+    // High-altitude procedural cirrus shell (100% world-locked directional projection)
     float cirrusMask = 0.0;
-    if (dir.y > 0.005) {
-      vec2 skyUv = dir.xz / (dir.y + 0.22);
-      vec2 windUv = skyUv * 0.68 + vec2(uCloudDrift * 0.012, uCloudDrift * 0.0045);
-      float n1 = cirrusFbm(windUv * vec2(1.4, 0.72));
-      float n2 = cirrusFbm(windUv * vec2(2.6, 1.8) - vec2(uCloudDrift * 0.006, 0.0));
-      float rawCirrus = n1 * 0.7 + n2 * 0.3;
-      float threshold = mix(0.68, 0.34, clamp(uCirrusCoverage, 0.0, 1.0));
+    if (dir.y > 0.01) {
+      vec2 skyUv = dir.xz / (dir.y + 0.24);
+      vec2 windUv = skyUv * 0.66 + vec2(uCloudDrift * 0.011, uCloudDrift * 0.0042);
+      float rawCirrus = cirrusFbm(windUv * vec2(1.45, 0.78));
+      float threshold = mix(0.66, 0.34, clamp(uCirrusCoverage, 0.0, 1.0));
       cirrusMask = smoothstep(threshold, threshold + 0.28, rawCirrus) * smoothstep(0.01, 0.22, up);
     }
 
-    // Dedicated occlusion emitter pass for screen-space radial godrays
+    // Dedicated occlusion emitter pass for High/Ultra screen-space radial godrays
     if (uOcclusionPass > 0.5) {
       float corona = (pow(sunDot, 22.0) * 0.42 + smoothstep(0.9965, 0.9994, sunDot) * 1.4) * uSunIntensity;
-      float cumulusTrans = corona > 0.002 ? raymarchCumulusTransmittance(dir, jitter) : 1.0;
+      float cumulusTrans = corona > 0.002 ? evaluateCumulusLayer(dir, sunN, sunDot).a : 1.0;
       float cirrusBlock = clamp(cirrusMask * 0.62 + uOvercast * 0.42, 0.0, 0.90);
       vec3 emitCol = uSunColor * corona * (1.0 - cirrusBlock) * cumulusTrans;
       gl_FragColor = vec4(emitCol, 1.0);
@@ -386,12 +304,12 @@ const SKY_FRAGMENT_SHADER = /* glsl */ `
     vec3 col = mix(uZenithColor, uHorizonColor, clamp(horizonPow + midBand * 0.35, 0.0, 1.0));
 
     // Mie forward-scattering horizon glow around sun
-    float horizonMie = pow(sunDot, 4.5) * pow(1.0 - up, 1.9) * (0.45 + uOvercast * 0.2);
-    col = mix(col, uInscatterColor, clamp(horizonMie * (1.0 - uNightFactor * 0.78), 0.0, 0.75));
+    float horizonMie = pow(sunDot, 4.5) * pow(1.0 - up, 1.9) * (0.48 + uOvercast * 0.2);
+    col = mix(col, uInscatterColor, clamp(horizonMie * (1.0 - uNightFactor * 0.78), 0.0, 0.78));
 
-    // Solar aureole + corona + crisp sun disc
+    // Solar aureole + corona + crisp sun disc (single-pass Mie bloom)
     float clearFactor = 1.0 - clamp(uOvercast * 0.78 + cirrusMask * 0.38, 0.0, 0.94);
-    float aureole = pow(sunDot, 12.0) * 0.34 * uSunIntensity * (1.0 - uOvercast * 0.65);
+    float aureole = pow(sunDot, 10.0) * 0.38 * uSunIntensity * (1.0 - uOvercast * 0.62);
     float innerCorona = pow(sunDot, 96.0) * 0.85 * uSunIntensity * clearFactor;
     float sunDisc = smoothstep(0.9986, 0.9995, sunDot) * 2.1 * uSunIntensity * clearFactor;
     col += uSunColor * (aureole + innerCorona + sunDisc);
@@ -422,8 +340,8 @@ const SKY_FRAGMENT_SHADER = /* glsl */ `
       col = mix(col, cirrusShade, clamp(cirrusMask * (0.42 + uOvercast * 0.34), 0.0, 0.85));
     }
 
-    // Composite world-locked volumetric raymarched cumulus deck over sky, sun, stars & cirrus
-    vec4 cumulus = raymarchCumulus(dir, sunN, jitter, sunDot);
+    // Composite world-locked analytical cumulus deck over sky, sun, stars & cirrus
+    vec4 cumulus = evaluateCumulusLayer(dir, sunN, sunDot);
     col = col * cumulus.a + cumulus.rgb;
 
     // Lower hemisphere blends cleanly into fog horizon color so horizon seams never show
@@ -434,6 +352,7 @@ const SKY_FRAGMENT_SHADER = /* glsl */ `
     gl_FragColor = vec4(col, 1.0);
   }
 `;
+const SKY_FRAGMENT_SHADER = OPENWORLD_SKY_FRAGMENT_SHADER;
 
 const GODRAY_SCATTER_VERTEX_SHADER = /* glsl */ `
   varying vec2 vUv;
@@ -533,6 +452,10 @@ export class OpenWorldAtmosphere {
   private godrayCompositeQuad: THREE.Mesh | null = null;
   private godraysAllowedForPass = true;
   private godraysVisibleThisFrame = false;
+  private adaptiveGodraysAllowed = true;
+  private qualityId: GraphicsQualityId = 'balanced';
+  private fogDensityScale = 1.0;
+  private currentShadowMapSize = 1024;
 
   private timeOfDayHours = 9.5; // Crisp morning start
   private weather: OpenWorldWeatherId = 'clear';
@@ -574,6 +497,11 @@ export class OpenWorldAtmosphere {
     godraysActive: false,
   };
 
+  private shadowDirty = true;
+  private shadowUpdateAccumSec = 0;
+  private lastShadowSnapX = Number.NaN;
+  private lastShadowSnapZ = Number.NaN;
+
   constructor(scene: THREE.Scene, isSoftwareGl: boolean) {
     this.scene = scene;
     this.isSoftwareGl = isSoftwareGl;
@@ -583,14 +511,15 @@ export class OpenWorldAtmosphere {
     this.scene.fog = this.fog;
     this.scene.background = _fogColor.clone();
 
-    // Warm sun / cool moon directional key light
+    // Warm sun / cool moon directional key light (tight ±85m frustum for sharper local shadows & faster shadow pass)
     this.sunLight = new THREE.DirectionalLight(0xfff1dc, 2.2);
     this.sunLight.castShadow = !isSoftwareGl;
     if (!isSoftwareGl) {
-      this.sunLight.shadow.mapSize.set(2048, 2048);
-      this.sunLight.shadow.camera.near = 20;
-      this.sunLight.shadow.camera.far = 420;
-      const d = 135;
+      this.sunLight.shadow.mapSize.set(1024, 1024);
+      this.currentShadowMapSize = 1024;
+      this.sunLight.shadow.camera.near = 15;
+      this.sunLight.shadow.camera.far = 300;
+      const d = 85;
       this.sunLight.shadow.camera.left = -d;
       this.sunLight.shadow.camera.right = d;
       this.sunLight.shadow.camera.top = d;
@@ -606,7 +535,7 @@ export class OpenWorldAtmosphere {
     this.scene.add(this.hemiLight);
 
     // Procedural Rayleigh/Mie + Cirrus Dome (follows camera position, zero depth write)
-    const skyGeo = new THREE.SphereGeometry(4800, 32, 20);
+    const skyGeo = new THREE.SphereGeometry(4300, 32, 20);
     this.skyMaterial = new THREE.ShaderMaterial({
       vertexShader: SKY_VERTEX_SHADER,
       fragmentShader: SKY_FRAGMENT_SHADER,
@@ -630,6 +559,7 @@ export class OpenWorldAtmosphere {
         uCirrusCoverage: { value: WEATHER_PRESETS.clear.cirrusCoverage },
         uCloudDrift: { value: 0.0 },
         uOcclusionPass: { value: 0.0 },
+        uSkySteps: { value: 8.0 },
       },
     });
     this.skyDome = new THREE.Mesh(skyGeo, this.skyMaterial);
@@ -734,8 +664,8 @@ export class OpenWorldAtmosphere {
 
   public setSize(width: number, height: number): void {
     if (!this.occlusionRt || !this.godrayRt) return;
-    const gw = Math.max(240, Math.min(960, Math.floor(width * 0.45)));
-    const gh = Math.max(135, Math.min(540, Math.floor(height * 0.45)));
+    const gw = Math.max(160, Math.min(320, Math.floor(width * 0.25)));
+    const gh = Math.max(90, Math.min(180, Math.floor(height * 0.25)));
     if (this.occlusionRt.width !== gw || this.occlusionRt.height !== gh) {
       this.occlusionRt.setSize(gw, gh);
       this.godrayRt.setSize(gw, gh);
@@ -750,8 +680,59 @@ export class OpenWorldAtmosphere {
   }
 
   /**
-   * On hardware GPUs, renders half-resolution volumetric sky/cloud/terrain occlusion mask
-   * and radial scatter pass before main Layer 0 render.
+   * Returns true when directional shadow map should re-render (~30Hz cadence or immediate snap/quality change).
+   */
+  public consumeShadowUpdateNeeded(dt: number): boolean {
+    if (this.isSoftwareGl || !this.sunLight.castShadow) return false;
+    this.shadowUpdateAccumSec += dt;
+    if (this.shadowDirty || this.shadowUpdateAccumSec >= 0.033) {
+      this.shadowDirty = false;
+      this.shadowUpdateAccumSec = 0;
+      return true;
+    }
+    return false;
+  }
+
+  public setQualityProfile(
+    profile: GraphicsQualityProfile,
+    adaptiveState?: AdaptivePerformanceState,
+  ): void {
+    this.qualityId = profile.id;
+    this.fogDensityScale = profile.fogDensityScale;
+    this.adaptiveGodraysAllowed = adaptiveState ? adaptiveState.godraysAllowed : profile.castShadows;
+
+    const baseSteps =
+      profile.id === 'performance' ? 6 : profile.id === 'balanced' ? 8 : profile.id === 'high' ? 10 : 12;
+    this.skyMaterial.uniforms.uSkySteps.value = adaptiveState
+      ? Math.min(baseSteps, adaptiveState.skySteps)
+      : baseSteps;
+
+    const wantShadows = !this.isSoftwareGl && profile.castShadows;
+    this.sunLight.castShadow = wantShadows;
+    this.shadowDirty = true;
+    if (wantShadows) {
+      const targetSize = Math.max(512, Math.min(2048, profile.shadowMapSize));
+      if (this.currentShadowMapSize !== targetSize) {
+        this.currentShadowMapSize = targetSize;
+        this.sunLight.shadow.mapSize.set(targetSize, targetSize);
+        if (this.sunLight.shadow.map) {
+          this.sunLight.shadow.map.dispose();
+          this.sunLight.shadow.map = null;
+        }
+      }
+    }
+
+    this.applyLightingAndTelemetry(
+      this.skyDome.position.x,
+      this.skyDome.position.y,
+      this.skyDome.position.z,
+    );
+  }
+
+  /**
+   * On hardware GPUs at High/Ultra presets, renders a quarter-res occlusion mask & radial scatter pass.
+   * Performance and Balanced presets skip this extra full-world pass completely (relying on the
+   * zero-cost single-pass Mie solar aureole & corona inside the sky shader).
    */
   public prepareGodrays(renderer: THREE.WebGLRenderer, camera: THREE.PerspectiveCamera): void {
     camera.getWorldDirection(_camForward);
@@ -766,7 +747,11 @@ export class OpenWorldAtmosphere {
       !this.godrayBlurScene ||
       !this.godrayBlurCamera ||
       !this.occluderBlackMat ||
-      !this.godraysAllowedForPass
+      !this.godraysAllowedForPass ||
+      !this.adaptiveGodraysAllowed ||
+      this.qualityId === 'performance' ||
+      this.qualityId === 'balanced' ||
+      this.curOvercast >= 0.72
     ) {
       this.godraysVisibleThisFrame = false;
       if (this.godrayCompositeQuad) this.godrayCompositeQuad.visible = false;
@@ -784,7 +769,7 @@ export class OpenWorldAtmosphere {
       this.currentNightFactor < 0.65
         ? 0.42 + 0.58 * Math.exp(-Math.pow(Math.max(0, _sunDir.y - 0.14) * 2.2, 2))
         : 0.28;
-    const facingBoost = THREE.MathUtils.smoothstep(alignDot, 0.05, 0.72);
+    const facingBoost = THREE.MathUtils.smoothstep(alignDot, 0.35, 0.78);
     const strength = facingBoost * lowSunDrama * this.curGodrayScale;
 
     if (strength <= 0.015) {
@@ -873,6 +858,7 @@ export class OpenWorldAtmosphere {
   public setTimeOfDay(hours: number): void {
     const wrapped = ((hours % 24) + 24) % 24;
     this.timeOfDayHours = wrapped;
+    this.shadowDirty = true;
     this.applyLightingAndTelemetry(
       this.skyDome.position.x,
       this.skyDome.position.y,
@@ -1052,14 +1038,19 @@ export class OpenWorldAtmosphere {
     }
     this.sunLight.color.copy(_sunColor);
 
-    // Snap directional shadow target to 4m texel steps to eliminate shadow shimmer
-    const snapX = Math.round(anchorX / 4) * 4;
-    const snapZ = Math.round(anchorZ / 4) * 4;
+    // Snap directional shadow target to 2m texel steps to eliminate shadow shimmer
+    const snapX = Math.round(anchorX / 2) * 2;
+    const snapZ = Math.round(anchorZ / 2) * 2;
+    if (snapX !== this.lastShadowSnapX || snapZ !== this.lastShadowSnapZ) {
+      this.lastShadowSnapX = snapX;
+      this.lastShadowSnapZ = snapZ;
+      this.shadowDirty = true;
+    }
     this.sunLight.target.position.set(snapX, anchorY, snapZ);
     this.sunLight.position.set(
-      snapX + _sunDir.x * 220,
-      anchorY + _sunDir.y * 220,
-      snapZ + _sunDir.z * 220,
+      snapX + _sunDir.x * 165,
+      anchorY + _sunDir.y * 165,
+      snapZ + _sunDir.z * 165,
     );
 
     // Hemisphere ambient fill
@@ -1087,7 +1078,7 @@ export class OpenWorldAtmosphere {
       this.scene.background.copy(_fogColor);
     }
 
-    const nightDensMult = 1.0 + nightFactor * 0.22;
+    const nightDensMult = (1.0 + nightFactor * 0.22) * this.fogDensityScale;
     this.fog.density = this.curBaseFog * nightDensMult;
 
     this.fogUniforms.uAtmoSunDir.value.copy(_sunDir);
@@ -1096,7 +1087,7 @@ export class OpenWorldAtmosphere {
     this.fogUniforms.uAtmoInscatterColor.value.copy(_inscatterColor);
     this.fogUniforms.uAtmoFogParams.value.set(
       this.curBaseFog * nightDensMult,
-      this.curValleyMist * (1.0 + nightFactor * 0.18),
+      this.curValleyMist * (1.0 + nightFactor * 0.18) * this.fogDensityScale,
       this.curHeightFalloff,
       4.0,
     );

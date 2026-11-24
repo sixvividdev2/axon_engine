@@ -44,6 +44,31 @@ export interface PdaConvoyMarker {
   disabled?: boolean;
 }
 
+export interface PdaSectorOverlay {
+  id: string;
+  code: string;
+  name: string;
+  x: number;
+  z: number;
+  radiusM: number;
+  owner: 'pmc_alpha' | 'pmc_bravo' | 'subfaction' | 'contested' | 'neutral';
+  /** Signed capture progress (-100..+100) or 0..100 normalized contest meter */
+  captureProgress: number;
+  /** Live battle heat 0..100 */
+  heat?: number;
+  /** Optional explicit world-space polygon vertices [x, z] for sector border rendering */
+  polygon?: ReadonlyArray<readonly [number, number]>;
+}
+
+export interface PdaVehicleMarker {
+  id: string;
+  label: string;
+  x: number;
+  z: number;
+  kind: 'ground' | 'air' | 'boat';
+  owned?: boolean;
+}
+
 export interface PdaHudTelemetry {
   playerX: number;
   playerZ: number;
@@ -58,6 +83,8 @@ export interface PdaHudTelemetry {
   pings?: readonly PdaPingMarker[];
   commsBlackoutZones?: readonly PdaCommsBlackoutZone[];
   convoys?: readonly PdaConvoyMarker[];
+  sectors?: readonly PdaSectorOverlay[];
+  vehicles?: readonly PdaVehicleMarker[];
   characterCallsign?: string;
   shardLabel?: string;
   factionLabel?: string;
@@ -65,6 +92,7 @@ export interface PdaHudTelemetry {
   respawnFeeUsd?: number;
   bankruptcyWarning?: boolean;
   bankruptcyText?: string;
+  batteryPct?: number;
 }
 
 export interface PdaOrthoCaptureOptions {
@@ -177,8 +205,9 @@ export class TacticalPdaDevice {
   private readonly rightThumbJoySocket = new THREE.Object3D();
   private readonly rightThumbPowerSocket = new THREE.Object3D();
 
-  // Cached orthographic top-down terrain/architecture image
+  // Cached orthographic top-down terrain/architecture image + optional cached elevation contours
   private mapCacheCanvas: HTMLCanvasElement | null = null;
+  private contourCacheCanvas: HTMLCanvasElement | null = null;
   private mapBounds: PdaMapBounds = { minX: -48, maxX: 48, minZ: -48, maxZ: 48 };
   private mapAspectBounds: PdaMapBounds = { minX: -48, maxX: 48, minZ: -48, maxZ: 48 };
 
@@ -188,6 +217,11 @@ export class TacticalPdaDevice {
   private powerButtonAudioPlayed = false;
   private screenOn = false;
   private bootTimer = 0;
+
+  // Functional CR123A battery system (drains while powered ON in Open World; replaceable via inventory)
+  private batteryPct = 100;
+  private batteryDrainEnabled = false;
+  private batteryDrainRatePerSec = 0.085; // ~19.6 min continuous screen-on runtime per fresh cell
 
   // Motion & interactive joystick state
   private weaponStowBlend = 0;
@@ -521,6 +555,123 @@ export class TacticalPdaDevice {
 
   public getMapZoom(): number {
     return this.mapZoom;
+  }
+
+  public setBatteryDrainEnabled(enabled: boolean, ratePerSec = 0.085): void {
+    this.batteryDrainEnabled = enabled;
+    this.batteryDrainRatePerSec = Math.max(0, ratePerSec);
+  }
+
+  public setBatteryPct(pct: number): void {
+    const clamped = THREE.MathUtils.clamp(pct, 0, 100);
+    if (Math.abs(clamped - this.batteryPct) > 1e-4) {
+      this.batteryPct = clamped;
+      if (this.batteryPct <= 0 && this.screenOn) {
+        this.screenOn = false;
+      }
+      this.screenDirty = true;
+    }
+  }
+
+  public getBatteryPct(): number {
+    return this.batteryPct;
+  }
+
+  public isBatteryDepleted(): boolean {
+    return this.batteryPct <= 0.001;
+  }
+
+  public replaceBattery(chargePct = 100): number {
+    this.batteryPct = Math.max(0, Math.min(100, chargePct));
+    if (this.phase === 'ACTIVE' && !this.screenOn && this.batteryPct > 0) {
+      this.screenOn = true;
+      this.bootTimer = 0;
+    }
+    this.audio?.playPdaPowerSound(true);
+    this.screenDirty = true;
+    return this.batteryPct;
+  }
+
+  /**
+   * Pre-renders crisp marching-squares topographic elevation contour lines (minor 25m / index 100m)
+   * onto a cached offscreen canvas so zero height queries run inside the 60fps loop.
+   */
+  public setElevationSampler(
+    sampleHeight: (x: number, z: number) => number,
+    bounds?: PdaMapBounds,
+  ): void {
+    const b = bounds ?? this.mapAspectBounds;
+    const size = 512;
+    const gridN = 96;
+    const canvas = document.createElement('canvas');
+    canvas.width = size;
+    canvas.height = size;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const heights = new Float32Array((gridN + 1) * (gridN + 1));
+    const spanX = Math.max(1, b.maxX - b.minX);
+    const spanZ = Math.max(1, b.maxZ - b.minZ);
+    let minH = Infinity;
+    let maxH = -Infinity;
+    for (let j = 0; j <= gridN; j++) {
+      const wz = b.minZ + (j / gridN) * spanZ;
+      for (let i = 0; i <= gridN; i++) {
+        const wx = b.minX + (i / gridN) * spanX;
+        const h = sampleHeight(wx, wz);
+        heights[j * (gridN + 1) + i] = h;
+        if (h < minH) minH = h;
+        if (h > maxH) maxH = h;
+      }
+    }
+
+    const cellPx = size / gridN;
+    const startElev = Math.ceil(Math.max(10, minH) / 25) * 25;
+    const endElev = Math.min(480, maxH);
+
+    for (let elev = startElev; elev <= endElev; elev += 25) {
+      const isIndex = elev % 100 === 0;
+      ctx.strokeStyle = isIndex ? 'rgba(203, 213, 225, 0.34)' : 'rgba(148, 163, 184, 0.16)';
+      ctx.lineWidth = isIndex ? 1.4 : 0.85;
+      ctx.beginPath();
+
+      for (let j = 0; j < gridN; j++) {
+        const row0 = j * (gridN + 1);
+        const row1 = (j + 1) * (gridN + 1);
+        for (let i = 0; i < gridN; i++) {
+          const h00 = heights[row0 + i];
+          const h10 = heights[row0 + i + 1];
+          const h11 = heights[row1 + i + 1];
+          const h01 = heights[row1 + i];
+
+          const pts: number[] = [];
+          const interp = (a: number, bVal: number) => {
+            const denom = bVal - a;
+            return Math.abs(denom) < 1e-4 ? 0.5 : (elev - a) / denom;
+          };
+          if ((h00 < elev) !== (h10 < elev)) {
+            pts.push((i + interp(h00, h10)) * cellPx, j * cellPx);
+          }
+          if ((h10 < elev) !== (h11 < elev)) {
+            pts.push((i + 1) * cellPx, (j + interp(h10, h11)) * cellPx);
+          }
+          if ((h01 < elev) !== (h11 < elev)) {
+            pts.push((i + interp(h01, h11)) * cellPx, (j + 1) * cellPx);
+          }
+          if ((h00 < elev) !== (h01 < elev)) {
+            pts.push(i * cellPx, (j + interp(h00, h01)) * cellPx);
+          }
+          if (pts.length >= 4) {
+            ctx.moveTo(pts[0], pts[1]);
+            ctx.lineTo(pts[2], pts[3]);
+          }
+        }
+      }
+      ctx.stroke();
+    }
+
+    this.contourCacheCanvas = canvas;
+    this.screenDirty = true;
   }
 
   /**
@@ -900,11 +1051,16 @@ export class TacticalPdaDevice {
       const p = THREE.MathUtils.clamp(this.phaseTimer / POWER_PRESS_DUR, 0, 1);
       if (p >= 0.42 && !this.powerButtonAudioPlayed) {
         this.powerButtonAudioPlayed = true;
-        this.screenOn = true;
-        this.bootTimer = 0;
         this.tiltImpulseX = 0.095;
         this.tiltImpulseZ = -0.075;
-        this.audio?.playPdaPowerSound(true);
+        if (!this.isBatteryDepleted()) {
+          this.screenOn = true;
+          this.bootTimer = 0;
+          this.audio?.playPdaPowerSound(true);
+        } else {
+          this.screenOn = false;
+          this.audio?.playPdaButtonClick();
+        }
         this.screenDirty = true;
       }
       if (this.phaseTimer >= POWER_PRESS_DUR) {
@@ -913,7 +1069,17 @@ export class TacticalPdaDevice {
       }
     } else if (this.phase === 'ACTIVE') {
       this.weaponStowBlend = 1;
-      this.bootTimer += clampedDt;
+      if (this.screenOn) {
+        this.bootTimer += clampedDt;
+        if (this.batteryDrainEnabled && this.batteryPct > 0) {
+          this.batteryPct = Math.max(0, this.batteryPct - this.batteryDrainRatePerSec * clampedDt);
+          if (this.batteryPct <= 0) {
+            this.screenOn = false;
+            this.audio?.playPdaPowerSound(false);
+            this.screenDirty = true;
+          }
+        }
+      }
     } else if (this.phase === 'POWER_OFF') {
       this.weaponStowBlend = 1;
       const p = THREE.MathUtils.clamp(this.phaseTimer / POWER_OFF_DUR, 0, 1);
@@ -1234,10 +1400,25 @@ export class TacticalPdaDevice {
       offGrad.addColorStop(1, '#080b0c');
       ctx.fillStyle = offGrad;
       ctx.fillRect(0, 0, SCREEN_W, SCREEN_H);
-      ctx.fillStyle = 'rgba(148, 163, 184, 0.14)';
-      ctx.font = 'bold 20px monospace';
-      ctx.textAlign = 'center';
-      ctx.fillText('AXON TACTICAL PDA · STANDBY', SCREEN_W * 0.5, SCREEN_H * 0.5);
+      if (this.isBatteryDepleted()) {
+        ctx.strokeStyle = 'rgba(239, 68, 68, 0.55)';
+        ctx.lineWidth = 3;
+        ctx.strokeRect(SCREEN_W * 0.5 - 46, SCREEN_H * 0.5 - 52, 86, 40);
+        ctx.fillStyle = 'rgba(239, 68, 68, 0.55)';
+        ctx.fillRect(SCREEN_W * 0.5 + 40, SCREEN_H * 0.5 - 42, 8, 20);
+        ctx.fillStyle = 'rgba(248, 113, 113, 0.78)';
+        ctx.font = 'bold 22px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText('BATTERY DEPLETED · 0%', SCREEN_W * 0.5, SCREEN_H * 0.5 + 24);
+        ctx.fillStyle = 'rgba(148, 163, 184, 0.55)';
+        ctx.font = 'bold 14px monospace';
+        ctx.fillText('SWAP CR123A CELL IN INVENTORY [TAB]', SCREEN_W * 0.5, SCREEN_H * 0.5 + 50);
+      } else {
+        ctx.fillStyle = 'rgba(148, 163, 184, 0.14)';
+        ctx.font = 'bold 20px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText('AXON TACTICAL PDA · STANDBY', SCREEN_W * 0.5, SCREEN_H * 0.5);
+      }
       return;
     }
 
@@ -1321,14 +1502,42 @@ export class TacticalPdaDevice {
     ctx.textAlign = 'center';
     ctx.fillText(`${Math.round(headingDeg).toString().padStart(3, '0')}°`, compCx, 58);
 
-    // Right: Wind Vane & Zone Label
+    // Right: Zone Label, Zoom & Corner Battery Widget
+    const effBattery = Math.round(
+      typeof this.telemetry.batteryPct === 'number' ? this.telemetry.batteryPct : this.batteryPct,
+    );
+    const lowBatt = effBattery < 20;
+    const battCol = lowBatt ? (Math.sin(elapsed * 7) > 0 ? '#f59e0b' : '#ef4444') : '#34d399';
+
     ctx.textAlign = 'right';
     ctx.fillStyle = '#cbd5e1';
-    ctx.font = 'bold 15px monospace';
-    ctx.fillText(this.telemetry.zoneLabel || this.telemetry.modeLabel || 'AO TAC-MAP', SCREEN_W - 64, 29);
+    ctx.font = 'bold 14px monospace';
+    ctx.fillText(this.telemetry.zoneLabel || this.telemetry.modeLabel || 'AO TAC-MAP', SCREEN_W - 140, 27);
     ctx.fillStyle = '#38bdf8';
     ctx.font = '13px monospace';
-    ctx.fillText(`ZOOM ${this.mapZoom.toFixed(1)}x`, SCREEN_W - 64, 49);
+    ctx.fillText(`ZOOM ${this.mapZoom.toFixed(1)}x`, SCREEN_W - 140, 48);
+
+    // Corner Battery Indicator (4 segmented cells + tabular %)
+    const bx = SCREEN_W - 122;
+    const by = 14;
+    const bw = 46;
+    const bh = 18;
+    ctx.strokeStyle = battCol;
+    ctx.lineWidth = 2;
+    ctx.strokeRect(bx, by, bw, bh);
+    ctx.fillStyle = battCol;
+    ctx.fillRect(bx + bw, by + 5, 4, bh - 10);
+    const filledCells = Math.ceil((effBattery / 100) * 4);
+    for (let c = 0; c < 4; c++) {
+      if (c < filledCells) {
+        ctx.fillStyle = battCol;
+        ctx.fillRect(bx + 3 + c * 10.2, by + 3, 8, bh - 6);
+      }
+    }
+    ctx.textAlign = 'center';
+    ctx.fillStyle = lowBatt ? '#fbbf24' : '#cbd5e1';
+    ctx.font = 'bold 12px monospace';
+    ctx.fillText(lowBatt ? `LOW ${effBattery}%` : `${effBattery}%`, bx + bw * 0.5 + 2, 50);
 
     // Wind direction dial
     const vaneCx = SCREEN_W - 34;
@@ -1385,6 +1594,130 @@ export class TacticalPdaDevice {
     } else {
       ctx.fillStyle = '#0f1b1f';
       ctx.fillRect(0, mapTop, mapW, mapH);
+    }
+
+    // Cached topographic elevation contour overlay
+    if (this.contourCacheCanvas) {
+      ctx.drawImage(this.contourCacheCanvas, imgLeft, imgTop, drawSize, drawSize);
+    }
+
+    // Sector Border Polygons & Live Contest Progress Rings
+    if (this.telemetry.sectors && this.telemetry.sectors.length > 0) {
+      const worldSpanX = Math.max(1, this.mapAspectBounds.maxX - this.mapAspectBounds.minX);
+      for (const sec of this.telemetry.sectors) {
+        const uv = this.worldToMapUV(sec.x, sec.z);
+        const pt = uvToScreen(uv.u, uv.v);
+        const radPx = Math.max(22, (sec.radiusM / worldSpanX) * drawSize);
+        const ownerColor =
+          sec.owner === 'pmc_alpha'
+            ? '#38bdf8'
+            : sec.owner === 'pmc_bravo'
+              ? '#f43f5e'
+              : sec.owner === 'subfaction'
+                ? '#f59e0b'
+                : sec.owner === 'contested'
+                  ? '#fb923c'
+                  : '#94a3b8';
+        const ownerFill =
+          sec.owner === 'pmc_alpha'
+            ? 'rgba(56, 189, 248, 0.08)'
+            : sec.owner === 'pmc_bravo'
+              ? 'rgba(244, 63, 94, 0.08)'
+              : sec.owner === 'subfaction'
+                ? 'rgba(245, 158, 11, 0.08)'
+                : sec.owner === 'contested'
+                  ? 'rgba(251, 146, 60, 0.14)'
+                  : 'rgba(148, 163, 184, 0.05)';
+
+        // Draw polygonal sector boundary (explicit polygon or 6-sided tactical hex)
+        ctx.beginPath();
+        if (sec.polygon && sec.polygon.length >= 3) {
+          for (let k = 0; k < sec.polygon.length; k++) {
+            const puv = this.worldToMapUV(sec.polygon[k][0], sec.polygon[k][1]);
+            const spt = uvToScreen(puv.u, puv.v);
+            if (k === 0) ctx.moveTo(spt.sx, spt.sy);
+            else ctx.lineTo(spt.sx, spt.sy);
+          }
+          ctx.closePath();
+        } else {
+          for (let k = 0; k < 6; k++) {
+            const ang = (k / 6) * Math.PI * 2 + Math.PI / 6;
+            const hx = pt.sx + Math.cos(ang) * radPx;
+            const hy = pt.sy + Math.sin(ang) * radPx;
+            if (k === 0) ctx.moveTo(hx, hy);
+            else ctx.lineTo(hx, hy);
+          }
+          ctx.closePath();
+        }
+        ctx.fillStyle = ownerFill;
+        ctx.fill();
+        ctx.strokeStyle = ownerColor;
+        ctx.lineWidth = sec.owner === 'contested' ? 2.2 : 1.5;
+        ctx.setLineDash(sec.owner === 'contested' ? [7, 4] : []);
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        // Live Contest Progress Ring (when partially captured or actively contested)
+        const absProg = THREE.MathUtils.clamp(Math.abs(sec.captureProgress) / 100, 0, 1);
+        const isContestedRing =
+          sec.owner === 'contested' || (absProg > 0.02 && absProg < 0.99);
+        if (isContestedRing) {
+          const ringR = Math.max(14, radPx * 0.44);
+          ctx.strokeStyle = 'rgba(15, 23, 42, 0.72)';
+          ctx.lineWidth = 4;
+          ctx.beginPath();
+          ctx.arc(pt.sx, pt.sy, ringR, 0, Math.PI * 2);
+          ctx.stroke();
+
+          ctx.strokeStyle = sec.captureProgress >= 0 ? '#38bdf8' : '#f43f5e';
+          ctx.lineWidth = 3.5;
+          ctx.beginPath();
+          ctx.arc(pt.sx, pt.sy, ringR, -Math.PI * 0.5, -Math.PI * 0.5 + Math.PI * 2 * absProg);
+          ctx.stroke();
+        }
+
+        // Sector Code & Label
+        ctx.fillStyle = ownerColor;
+        ctx.font = 'bold 12px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText(sec.code.toUpperCase(), pt.sx, pt.sy - 3);
+        ctx.fillStyle = 'rgba(226, 232, 240, 0.8)';
+        ctx.font = '10px monospace';
+        ctx.fillText(sec.name.slice(0, 14).toUpperCase(), pt.sx, pt.sy + 10);
+      }
+      ctx.textAlign = 'left';
+    }
+
+    // Owned / Tracked Vehicles
+    if (this.telemetry.vehicles && this.telemetry.vehicles.length > 0) {
+      for (const veh of this.telemetry.vehicles) {
+        const uv = this.worldToMapUV(veh.x, veh.z);
+        const pt = uvToScreen(uv.u, uv.v);
+        const vCol = veh.owned ? '#34d399' : '#94a3b8';
+        ctx.save();
+        ctx.translate(pt.sx, pt.sy);
+        ctx.fillStyle = vCol;
+        ctx.strokeStyle = '#0f172a';
+        ctx.lineWidth = 2;
+        if (veh.kind === 'air') {
+          ctx.beginPath();
+          ctx.moveTo(0, -8);
+          ctx.lineTo(8, 0);
+          ctx.lineTo(0, 8);
+          ctx.lineTo(-8, 0);
+          ctx.closePath();
+          ctx.fill();
+          ctx.stroke();
+        } else {
+          ctx.fillRect(-7, -5, 14, 10);
+          ctx.strokeRect(-7, -5, 14, 10);
+        }
+        ctx.restore();
+        ctx.fillStyle = vCol;
+        ctx.font = 'bold 11px monospace';
+        ctx.textAlign = 'left';
+        ctx.fillText(veh.label.slice(0, 14).toUpperCase(), pt.sx + 10, pt.sy + 4);
+      }
     }
 
     // Tactical grid overlay (A-H / 1-8)
@@ -1661,5 +1994,6 @@ export class TacticalPdaDevice {
     this.geos.length = 0;
     this.mats.length = 0;
     this.mapCacheCanvas = null;
+    this.contourCacheCanvas = null;
   }
 }

@@ -9,6 +9,7 @@ import {
   GRAPHICS_QUALITY_ORDER,
   GRAPHICS_QUALITY_PROFILES,
   GraphicsQualityId,
+  useAdaptiveScaling,
   useGraphicsQuality,
 } from '../data/graphicsQuality';
 import {
@@ -30,8 +31,14 @@ export interface MultiplayerHudControls {
   lobbyCode: string;
   eventName?: string | null;
   killfeedPolicy?: LobbyKillfeedPolicy;
+  hitmarkersEnabled?: boolean;
+  hudEnabled?: boolean;
   localPlayerName?: string;
   onHostUpdateKillfeedPolicy?: (policy: LobbyKillfeedPolicy) => void;
+  onHostUpdateMatchVisibility?: (patch: {
+    hitmarkersEnabled?: boolean;
+    hudEnabled?: boolean;
+  }) => void;
   onHostRestart: () => void;
   onHostEndToLobby: () => void;
   onLeaveMatch: () => void;
@@ -40,6 +47,10 @@ export interface MultiplayerHudControls {
 interface CombatHudProps {
   snapshot: CombatSessionSnapshot;
   multiplayerSession?: MultiplayerHudControls | null;
+  onUpdateHostMatchVisibility?: (patch: {
+    hitmarkersEnabled?: boolean;
+    hudEnabled?: boolean;
+  }) => void;
   onRequestLock: () => void;
   onToggleTuner: (open: boolean) => void;
   onUpdateConfig: (patch: Partial<BodycamSDKConfig>) => void;
@@ -66,6 +77,7 @@ function formatRecTimestamp(elapsedSec: number): string {
 export const CombatHud: React.FC<CombatHudProps> = ({
   snapshot,
   multiplayerSession,
+  onUpdateHostMatchVisibility,
   onRequestLock,
   onToggleTuner,
   onUpdateConfig,
@@ -80,10 +92,21 @@ export const CombatHud: React.FC<CombatHudProps> = ({
   const isInfection = snapshot.mode === 'infection';
   const [personalKillfeed, setPersonalKillfeed] = useKillfeedPreference();
   const [graphicsQuality, setGraphicsQuality] = useGraphicsQuality();
+  const [adaptiveScaling, setAdaptiveScaling] = useAdaptiveScaling();
   const effectiveKillfeed = resolveEffectiveKillfeed(
     personalKillfeed && snapshot.config.showKillfeed,
     multiplayerSession?.killfeedPolicy ?? null,
   );
+  const showMatchHud = isBattle ? snapshot.hudEnabled : true;
+  const showHitmarkers = isBattle ? snapshot.hitmarkersEnabled : true;
+  const canEditHostBattleRules =
+    isBattle && (!multiplayerSession || multiplayerSession.isHost);
+  const applyHostVisibility = (patch: { hitmarkersEnabled?: boolean; hudEnabled?: boolean }) => {
+    if (multiplayerSession?.onHostUpdateMatchVisibility) {
+      multiplayerSession.onHostUpdateMatchVisibility(patch);
+    }
+    onUpdateHostMatchVisibility?.(patch);
+  };
   const hpRatio = Math.max(0, Math.min(1, snapshot.hp / Math.max(1, snapshot.maxHp)));
   const presetLabel =
     snapshot.config.lensPreset === 'gopro_chest'
@@ -103,12 +126,12 @@ export const CombatHud: React.FC<CombatHudProps> = ({
       {/* Top-Left CSS-Animated Killfeed (Active in Battle & Infection; Host Override > Player Toggle) */}
       <KillfeedOverlay
         entries={snapshot.killfeed}
-        enabled={effectiveKillfeed.enabled}
+        enabled={showMatchHud && effectiveKillfeed.enabled}
         localPlayerName={multiplayerSession?.localPlayerName ?? 'YOU'}
       />
 
       {/* Mid-Left Tactical Squad Radio Feed (Allied Bot Comms in Infection & Battle TDM) */}
-      {snapshot.squadComms.length > 0 && (
+      {showMatchHud && snapshot.squadComms.length > 0 && (
         <div className="pointer-events-none fixed left-5 bottom-40 z-10 flex w-72 flex-col gap-1 font-mono-tabular">
           <div className="text-[9px] font-semibold uppercase tracking-[0.18em] text-neutral-400">
             SQUAD RADIO · VHF CH-04
@@ -138,7 +161,7 @@ export const CombatHud: React.FC<CombatHudProps> = ({
       )}
 
       {/* World-Projected Tactical Pings (Z Key · Auto-Detect Location / Enemy / Item · Distance Fade) */}
-      {snapshot.tacticalPings.length > 0 && (
+      {showMatchHud && snapshot.tacticalPings.length > 0 && (
         <div className="pointer-events-none fixed inset-0 z-10 overflow-hidden">
           {snapshot.tacticalPings.map((ping) => {
             const isEnemy = ping.kind === 'enemy';
@@ -249,7 +272,7 @@ export const CombatHud: React.FC<CombatHudProps> = ({
       )}
 
       {/* Top-Right Diegetic Bodycam Recording Stamp & ECG */}
-      {snapshot.config.showRecOverlay && (
+      {showMatchHud && snapshot.config.showRecOverlay && (
         <div
           className="fixed top-4 right-5 flex flex-col items-end font-mono-tabular text-[11px] leading-tight tracking-wider text-neutral-100/90"
           style={{ textShadow: '0 1px 2px rgba(0,0,0,0.92)' }}
@@ -283,7 +306,8 @@ export const CombatHud: React.FC<CombatHudProps> = ({
       {isBattle && (
         <>
           {/* Top-Center Score Bar */}
-          <div className="fixed top-4 left-1/2 flex -translate-x-1/2 items-center gap-4 border border-neutral-800/90 bg-neutral-950/88 px-4 py-1.5 font-mono-tabular text-xs text-neutral-100">
+          {showMatchHud && (
+            <div className="fixed top-4 left-1/2 flex -translate-x-1/2 items-center gap-4 border border-neutral-800/90 bg-neutral-950/88 px-4 py-1.5 font-mono-tabular text-xs text-neutral-100">
             {snapshot.battleRule === 'tdm' ? (
               <>
                 <div className="flex items-center gap-2">
@@ -325,7 +349,8 @@ export const CombatHud: React.FC<CombatHudProps> = ({
                 </div>
               </>
             )}
-          </div>
+            </div>
+          )}
 
           {/* Respawn / Eliminated Spectating Banner */}
           {!snapshot.playerAlive && snapshot.matchOutcome === 'active' && (
@@ -583,8 +608,8 @@ export const CombatHud: React.FC<CombatHudProps> = ({
         </>
       )}
 
-      {/* Subtle Center Hitmarker Ticks (only visible briefly on hit) */}
-      {snapshot.pointerLocked && snapshot.hitmarkerActive && (
+      {/* Subtle Center Hitmarker Ticks (only visible briefly on hit; Host-controllable in Battle) */}
+      {snapshot.pointerLocked && showHitmarkers && snapshot.hitmarkerActive && (
         <div className="fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2">
           <svg width="28" height="28" viewBox="0 0 28 28">
             <g
@@ -602,7 +627,7 @@ export const CombatHud: React.FC<CombatHudProps> = ({
       )}
 
       {/* Authentic 4-Stage Grenade Manual of Arms Indicator (Zero HUD power/cook bar) */}
-      {snapshot.pointerLocked && snapshot.grenadeHoldStage !== 'HOLSTERED' && (
+      {showMatchHud && snapshot.pointerLocked && snapshot.grenadeHoldStage !== 'HOLSTERED' && (
         <div
           className={`fixed top-[56%] left-1/2 flex w-80 -translate-x-1/2 flex-col gap-1 border px-3.5 py-1.5 font-mono-tabular ${
             snapshot.grenadeHoldStage === 'LEVER_RELEASED'
@@ -657,14 +682,15 @@ export const CombatHud: React.FC<CombatHudProps> = ({
       )}
 
       {/* Transient Toast */}
-      {snapshot.toastMessage && (
+      {showMatchHud && snapshot.toastMessage && (
         <div className="fixed bottom-12 left-1/2 -translate-x-1/2 border border-neutral-700/80 bg-neutral-950/90 px-3.5 py-1.5 font-mono-tabular text-xs text-neutral-100">
           {snapshot.toastMessage}
         </div>
       )}
 
       {/* Bottom-Right Health, Belt Ordnance & Weapon Status Block */}
-      <div className="fixed right-5 bottom-4 flex flex-col items-end gap-1.5">
+      {showMatchHud && (
+        <div className="fixed right-5 bottom-4 flex flex-col items-end gap-1.5">
         {/* Tactical Health Bar */}
         <div className="flex items-center gap-2.5 bg-neutral-950/86 px-3 py-1.5 font-mono-tabular text-[11px]">
           <span className="text-[10px] uppercase tracking-wider text-neutral-400">
@@ -771,6 +797,7 @@ export const CombatHud: React.FC<CombatHudProps> = ({
           </div>
         </div>
       </div>
+      )}
 
       {/* Contextual Door Interact Dot (hidden by default; white when near, amber when ready) + [F] Scroll Menu */}
       {snapshot.pointerLocked &&
@@ -840,7 +867,7 @@ export const CombatHud: React.FC<CombatHudProps> = ({
         )}
 
       {/* Bottom-Center Compact Controls Hint Strip */}
-      {snapshot.pointerLocked && (
+      {showMatchHud && snapshot.pointerLocked && (
         <div
           className="fixed bottom-3 left-1/2 hidden -translate-x-1/2 items-center gap-2.5 whitespace-nowrap font-mono-tabular text-[10px] uppercase tracking-wider text-neutral-300/75 lg:flex"
           style={{ textShadow: '0 1px 2px rgba(0,0,0,0.95)' }}
@@ -914,6 +941,44 @@ export const CombatHud: React.FC<CombatHudProps> = ({
               >
                 F1 · Bodycam Optics Settings
               </button>
+              {isBattle && (
+                <div className="border border-neutral-800 bg-neutral-900/75 p-3">
+                  <div className="mb-2 flex items-center justify-between font-mono-tabular text-[10px] uppercase tracking-wider text-amber-300">
+                    <span>{canEditHostBattleRules ? 'Host Match Rules' : 'Host Match Rules (Locked)'}</span>
+                    {multiplayerSession && (
+                      <span className="text-neutral-500">Live Sync</span>
+                    )}
+                  </div>
+                  <div className="grid grid-cols-2 gap-2">
+                    <button
+                      type="button"
+                      disabled={!canEditHostBattleRules}
+                      onClick={() =>
+                        applyHostVisibility({ hitmarkersEnabled: !snapshot.hitmarkersEnabled })
+                      }
+                      className={`border px-2.5 py-1.5 font-mono-tabular text-[11px] font-semibold uppercase transition-colors disabled:cursor-not-allowed disabled:opacity-65 ${
+                        snapshot.hitmarkersEnabled
+                          ? 'cursor-pointer border-emerald-500/70 bg-emerald-950/45 text-emerald-300'
+                          : 'cursor-pointer border-neutral-700 bg-neutral-950 text-neutral-400'
+                      }`}
+                    >
+                      Hitmarkers: {snapshot.hitmarkersEnabled ? 'ON' : 'OFF'}
+                    </button>
+                    <button
+                      type="button"
+                      disabled={!canEditHostBattleRules}
+                      onClick={() => applyHostVisibility({ hudEnabled: !snapshot.hudEnabled })}
+                      className={`border px-2.5 py-1.5 font-mono-tabular text-[11px] font-semibold uppercase transition-colors disabled:cursor-not-allowed disabled:opacity-65 ${
+                        snapshot.hudEnabled
+                          ? 'cursor-pointer border-emerald-500/70 bg-emerald-950/45 text-emerald-300'
+                          : 'cursor-pointer border-neutral-700 bg-neutral-950 text-neutral-400'
+                      }`}
+                    >
+                      Combat HUD: {snapshot.hudEnabled ? 'ON' : 'OFF'}
+                    </button>
+                  </div>
+                </div>
+              )}
               {multiplayerSession ? (
                 <>
                   {multiplayerSession.isHost ? (
@@ -1173,6 +1238,37 @@ export const CombatHud: React.FC<CombatHudProps> = ({
                 </div>
               )}
 
+              {isBattle && (
+                <div className="mt-2.5 grid grid-cols-2 gap-1.5">
+                  <button
+                    type="button"
+                    disabled={!canEditHostBattleRules}
+                    onClick={() =>
+                      applyHostVisibility({ hitmarkersEnabled: !snapshot.hitmarkersEnabled })
+                    }
+                    className={`border py-1 font-mono-tabular text-[9px] font-semibold uppercase disabled:cursor-not-allowed disabled:opacity-60 ${
+                      snapshot.hitmarkersEnabled
+                        ? 'cursor-pointer border-emerald-500/70 bg-emerald-950/50 text-emerald-300'
+                        : 'cursor-pointer border-neutral-700 bg-neutral-900 text-neutral-400'
+                    }`}
+                  >
+                    Hitmarkers: {snapshot.hitmarkersEnabled ? 'ON' : 'OFF'}
+                  </button>
+                  <button
+                    type="button"
+                    disabled={!canEditHostBattleRules}
+                    onClick={() => applyHostVisibility({ hudEnabled: !snapshot.hudEnabled })}
+                    className={`border py-1 font-mono-tabular text-[9px] font-semibold uppercase disabled:cursor-not-allowed disabled:opacity-60 ${
+                      snapshot.hudEnabled
+                        ? 'cursor-pointer border-emerald-500/70 bg-emerald-950/50 text-emerald-300'
+                        : 'cursor-pointer border-neutral-700 bg-neutral-900 text-neutral-400'
+                    }`}
+                  >
+                    HUD: {snapshot.hudEnabled ? 'ON' : 'OFF'}
+                  </button>
+                </div>
+              )}
+
               <div className="mt-3">
                 <div className="mb-1.5 flex items-center justify-between font-mono-tabular text-[10px] uppercase tracking-wider text-neutral-400">
                   <span>Graphics Mode</span>
@@ -1198,6 +1294,21 @@ export const CombatHud: React.FC<CombatHudProps> = ({
                       {GRAPHICS_QUALITY_PROFILES[gid].shortLabel}
                     </button>
                   ))}
+                </div>
+                <div className="mt-2 flex items-center justify-between font-mono-tabular text-[10px] uppercase tracking-wider text-neutral-400">
+                  <span>Adaptive Scaling</span>
+                  <button
+                    type="button"
+                    onClick={() => setAdaptiveScaling(!adaptiveScaling)}
+                    className={`cursor-pointer border px-2 py-0.5 text-[10px] font-semibold whitespace-nowrap shrink-0 ${
+                      adaptiveScaling
+                        ? 'border-sky-500/70 bg-sky-950/50 text-sky-300'
+                        : 'border-neutral-700 bg-neutral-900 text-neutral-400 hover:text-neutral-200'
+                    }`}
+                    title="Auto-scale DPR if frame rate drops below target (OFF by default)"
+                  >
+                    {adaptiveScaling ? 'ON' : 'OFF'}
+                  </button>
                 </div>
               </div>
             </div>

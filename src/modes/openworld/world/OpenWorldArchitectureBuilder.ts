@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import type { BodycamSurfaceMaterial } from '../../../../bodycam-sdk/types';
+import type { GraphicsQualityProfile } from '../../../../data/graphicsQuality';
 import {
   applyAtmosphericHeightFog,
   type AtmoFogSharedUniforms,
@@ -23,8 +24,16 @@ import {
   chunkHash,
   evaluateOpenWorldHeight,
   mulberry32,
+  OPENWORLD_LANDMARKS,
+  OpenWorldLandmarkSpec,
   SEA_LEVEL_M,
 } from './OpenWorldTerrain';
+import {
+  FOB_GUARD_TOWER_DECK_HEIGHT_M,
+  FobCompoundSpec,
+  getFobCompoundsOverlappingRect,
+  getFobGuardTowerSpecs,
+} from './OpenWorldFobLayout';
 
 // ============================================================================
 // PROCEDURAL CANVAS TEXTURES (100% Local, Headless-Node Safe)
@@ -333,14 +342,27 @@ interface GeometryBucket {
   vertexCount: number;
 }
 
+export interface AuditedArchBox {
+  readonly mat: ArchMaterialKey;
+  readonly wx: number;
+  readonly wy: number;
+  readonly wz: number;
+  readonly sx: number;
+  readonly sy: number;
+  readonly sz: number;
+  readonly yaw: number;
+}
+
 class ChunkGeometryBatcher {
   private readonly buckets = new Map<ArchMaterialKey, GeometryBucket>();
   private readonly chunkOriginX: number;
   private readonly chunkOriginZ: number;
+  private readonly auditLog: AuditedArchBox[] | null;
 
-  constructor(chunkOriginX: number, chunkOriginZ: number) {
+  constructor(chunkOriginX: number, chunkOriginZ: number, auditLog: AuditedArchBox[] | null = null) {
     this.chunkOriginX = chunkOriginX;
     this.chunkOriginZ = chunkOriginZ;
+    this.auditLog = auditLog;
   }
 
   private getBucket(mat: ArchMaterialKey): GeometryBucket {
@@ -368,6 +390,9 @@ class ChunkGeometryBatcher {
     colorG = 1,
     colorB = 1,
   ): void {
+    if (this.auditLog) {
+      this.auditLog.push({ mat, wx, wy, wz, sx, sy, sz, yaw });
+    }
     const b = this.getBucket(mat);
     const cosY = Math.cos(yaw);
     const sinY = Math.sin(yaw);
@@ -893,9 +918,11 @@ export class OpenWorldArchitectureBuilder {
   private readonly midSiteGeo: THREE.BufferGeometry;
 
   private nightFactor = 0;
+  private shadowsEnabled = true;
 
   constructor(isSoftwareGl = false, atmoFogUniforms?: AtmoFogSharedUniforms) {
     this.isSoftwareGl = isSoftwareGl;
+    this.shadowsEnabled = !isSoftwareGl;
 
     const hwTex = createHighwayAsphaltTexture();
     const spurTex = createFobSpurTexture();
@@ -1150,6 +1177,35 @@ export class OpenWorldArchitectureBuilder {
     return this.streetlightEmissiveMat.emissiveIntensity;
   }
 
+  public applyQualityProfile(profile: GraphicsQualityProfile): void {
+    this.shadowsEnabled = !this.isSoftwareGl && profile.castShadows;
+    const cap = Math.max(1, profile.anisotropyCap);
+    for (let i = 0; i < this.textures.length; i++) {
+      this.textures[i].anisotropy = cap;
+      this.textures[i].needsUpdate = true;
+    }
+  }
+
+  public getSharedMaterials(): THREE.Material[] {
+    return [
+      ...Object.values(this.archMaterials),
+      this.highwayMat,
+      this.spurMat,
+      this.dirtMat,
+      this.midRoadMat,
+      this.vehicleBodyMat,
+      this.vehicleTrimMat,
+      this.streetlightPoleMat,
+      this.streetlightEmissiveMat,
+      this.utilityPoleMat,
+      this.guardrailMat,
+      this.barrierMat,
+      this.signPostMat,
+      this.signBoardMat,
+      this.midSiteMat,
+    ];
+  }
+
   // ============================================================================
   // HORIZON LAYER: 3 STEEL-TRUSS RIVER BRIDGES + 8 WATER TOWERS / RADIO MASTS
   // ============================================================================
@@ -1230,51 +1286,52 @@ export class OpenWorldArchitectureBuilder {
     const bayLen = b.lengthM / bays;
     for (let i = 0; i < bays; i++) {
       const lz = -halfLen + (i + 0.5) * bayLen;
-      // Roadway surface slab
-      addBridgePart('concreteDark', 0, -0.35, lz, b.widthM, 0.7, bayLen + 0.12, 0.34, 0.36, 0.38);
-      // Raised sidewalk/curb shoulders on both sides
-      addBridgePart('concrete', -halfW + 0.55, 0.12, lz, 1.05, 0.34, bayLen + 0.1, 0.64, 0.66, 0.65);
-      addBridgePart('concrete', halfW - 0.55, 0.12, lz, 1.05, 0.34, bayLen + 0.1, 0.64, 0.66, 0.65);
-      // Steel underside longitudinal girders
-      addBridgePart('steel', -halfW + 1.2, -1.05, lz, 0.45, 0.85, bayLen + 0.1, 0.32, 0.36, 0.40);
-      addBridgePart('steel', halfW - 1.2, -1.05, lz, 0.45, 0.85, bayLen + 0.1, 0.32, 0.36, 0.40);
+      // Roadway surface slab (exact bayLen abutment avoids bay-joint coplanar Z-fighting)
+      addBridgePart('concreteDark', 0, -0.35, lz, b.widthM, 0.7, bayLen, 0.34, 0.36, 0.38);
+      // Raised sidewalk/curb shoulders seated cleanly on top of deck (+0.00..+0.34)
+      addBridgePart('concrete', -halfW + 0.55, 0.17, lz, 1.05, 0.34, bayLen, 0.64, 0.66, 0.65);
+      addBridgePart('concrete', halfW - 0.55, 0.17, lz, 1.05, 0.34, bayLen, 0.64, 0.66, 0.65);
+      // Steel underside longitudinal girders seated strictly below deck (-1.55..-0.70)
+      addBridgePart('steel', -halfW + 1.2, -1.125, lz, 0.45, 0.85, bayLen, 0.32, 0.36, 0.40);
+      addBridgePart('steel', halfW - 1.2, -1.125, lz, 0.45, 0.85, bayLen, 0.32, 0.36, 0.40);
 
       // Side steel safety guardrails (solid ballistic cover!)
-      addBridgePart('steel', -halfW + 0.18, 0.92, lz, 0.22, 0.36, bayLen + 0.08, 0.50, 0.54, 0.56);
-      addBridgePart('steel', halfW - 0.18, 0.92, lz, 0.22, 0.36, bayLen + 0.08, 0.50, 0.54, 0.56);
+      addBridgePart('steel', -halfW + 0.18, 0.92, lz, 0.22, 0.36, bayLen, 0.50, 0.54, 0.56);
+      addBridgePart('steel', halfW - 0.18, 0.92, lz, 0.22, 0.36, bayLen, 0.50, 0.54, 0.56);
 
       // Upper steel truss chords & overhead portal bracing on interior bays
       if (i > 0 && i < bays - 1) {
-        addBridgePart('steel', -halfW + 0.24, 5.4, lz, 0.38, 0.42, bayLen + 0.1, 0.30, 0.35, 0.38);
-        addBridgePart('steel', halfW - 0.24, 5.4, lz, 0.38, 0.42, bayLen + 0.1, 0.30, 0.35, 0.38);
+        addBridgePart('steel', -halfW + 0.24, 5.4, lz, 0.38, 0.42, bayLen, 0.30, 0.35, 0.38);
+        addBridgePart('steel', halfW - 0.24, 5.4, lz, 0.38, 0.42, bayLen, 0.30, 0.35, 0.38);
         // Overhead portal crossbeam every bay
-        addBridgePart('steel', 0, 5.4, lz - bayLen * 0.5, b.widthM - 0.4, 0.38, 0.38, 0.32, 0.36, 0.40);
+        addBridgePart('steel', 0, 5.4, lz - bayLen * 0.5, b.widthM - 0.86, 0.38, 0.38, 0.32, 0.36, 0.40);
       }
 
-      // Vertical truss posts at bay joints
+      // Vertical truss posts seated cleanly atop curb (0.34) up to upper chord underside (5.19)
       const postZ = -halfLen + i * bayLen;
       if (i > 0) {
-        const postH = i === 1 || i === bays - 1 ? 5.6 : 5.6;
-        addBridgePart('steel', -halfW + 0.24, postH * 0.5, postZ, 0.36, postH, 0.36, 0.34, 0.38, 0.42);
-        addBridgePart('steel', halfW - 0.24, postH * 0.5, postZ, 0.36, postH, 0.36, 0.34, 0.38, 0.42);
+        const postBot = 0.34;
+        const postH = 5.19 - postBot;
+        addBridgePart('steel', -halfW + 0.24, postBot + postH * 0.5, postZ, 0.36, postH, 0.36, 0.34, 0.38, 0.42);
+        addBridgePart('steel', halfW - 0.24, postBot + postH * 0.5, postZ, 0.36, postH, 0.36, 0.34, 0.38, 0.42);
       }
     }
 
-    // 2 heavy reinforced concrete river piers sunk deep (-18m) below river floor
+    // 2 heavy reinforced concrete river piers seated cleanly beneath cap beam [-20.25..-2.45]
     for (const pierFrac of [-0.24, 0.24]) {
       const pz = pierFrac * b.lengthM;
-      addBridgePart('concrete', -halfW + 1.4, -10.5, pz, 2.2, 19.5, 3.2, 0.58, 0.60, 0.58);
-      addBridgePart('concrete', halfW - 1.4, -10.5, pz, 2.2, 19.5, 3.2, 0.58, 0.60, 0.58);
-      addBridgePart('concrete', 0, -1.65, pz, b.widthM - 0.6, 1.6, 2.6, 0.56, 0.58, 0.56);
+      addBridgePart('concrete', -halfW + 1.4, -11.35, pz, 2.2, 17.8, 3.2, 0.58, 0.60, 0.58);
+      addBridgePart('concrete', halfW - 1.4, -11.35, pz, 2.2, 17.8, 3.2, 0.58, 0.60, 0.58);
+      addBridgePart('concrete', 0, -1.65, pz, b.widthM - 0.3, 1.6, 3.4, 0.56, 0.58, 0.56);
     }
 
-    // Heavy concrete end abutments seated deeply into both riverbanks
+    // Heavy concrete end abutments seated deeply into both riverbanks cleanly outside bridge span
     for (const endSign of [-1, 1]) {
-      const az = endSign * (halfLen + 1.8);
+      const az = endSign * (halfLen + 2.25);
       addBridgePart('concrete', 0, -5.0, az, b.widthM + 2.4, 10.2, 4.4, 0.62, 0.63, 0.60);
-      // End approach wing walls
-      addBridgePart('concrete', -halfW - 0.85, 0.55, az, 0.65, 1.3, 4.8, 0.65, 0.66, 0.64);
-      addBridgePart('concrete', halfW + 0.85, 0.55, az, 0.65, 1.3, 4.8, 0.65, 0.66, 0.64);
+      // End approach wing walls seated cleanly atop abutment edge
+      addBridgePart('concrete', -halfW - 0.85, 0.75, az, 0.65, 1.3, 4.4, 0.65, 0.66, 0.64);
+      addBridgePart('concrete', halfW + 0.85, 0.75, az, 0.65, 1.3, 4.4, 0.65, 0.66, 0.64);
     }
   }
 
@@ -1306,28 +1363,29 @@ export class OpenWorldArchitectureBuilder {
       }
     }
 
-    // Horizontal cross-bracing rings at 2 heights
+    // Horizontal cross-bracing rings at 2 heights (butted cleanly inside corner columns)
+    const braceSpan = spread * 2 - 0.62;
     for (const frac of [0.35, 0.7]) {
       const ry = baseY + legH * frac;
-      batcher.addBox('steel', t.x, ry, t.z + spread, spread * 2, 0.34, 0.34, 0, 0.42, 0.47, 0.50);
-      batcher.addBox('steel', t.x, ry, t.z - spread, spread * 2, 0.34, 0.34, 0, 0.42, 0.47, 0.50);
-      batcher.addBox('steel', t.x + spread, ry, t.z, 0.34, 0.34, spread * 2, 0, 0.42, 0.47, 0.50);
-      batcher.addBox('steel', t.x - spread, ry, t.z, 0.34, 0.34, spread * 2, 0, 0.42, 0.47, 0.50);
+      batcher.addBox('steel', t.x, ry, t.z + spread, braceSpan, 0.34, 0.34, 0, 0.42, 0.47, 0.50);
+      batcher.addBox('steel', t.x, ry, t.z - spread, braceSpan, 0.34, 0.34, 0, 0.42, 0.47, 0.50);
+      batcher.addBox('steel', t.x + spread, ry, t.z, 0.34, 0.34, braceSpan, 0, 0.42, 0.47, 0.50);
+      batcher.addBox('steel', t.x - spread, ry, t.z, 0.34, 0.34, braceSpan, 0, 0.42, 0.47, 0.50);
     }
 
     // Central riser pipe
     batcher.addBox('steel', t.x, baseY + legH * 0.5, t.z, 1.3, legH + 1.0, 1.3, 0, 0.38, 0.42, 0.46);
 
-    // Elevated steel tank body (octagonal composite from 2 rotated square prisms) + catwalk + cap
+    // Elevated steel tank body (rotated prism inset 4cm vertically so caps never Z-fight) + catwalk + cap
     const tankY = baseY + legH + 3.6;
     batcher.addBox('steel', t.x, tankY, t.z, 8.2, 6.8, 8.2, 0, 0.62, 0.67, 0.69);
-    batcher.addBox('steel', t.x, tankY, t.z, 8.2, 6.8, 8.2, Math.PI * 0.25, 0.60, 0.65, 0.67);
+    batcher.addBox('steel', t.x, tankY, t.z, 8.2, 6.72, 8.2, Math.PI * 0.25, 0.60, 0.65, 0.67);
     // Catwalk ring
     batcher.addBox('steel', t.x, baseY + legH + 0.3, t.z, 10.6, 0.32, 10.6, 0, 0.36, 0.40, 0.44);
     // Conical cap silhouette + aviation finial beacon
     batcher.addBox('roofMetal', t.x, tankY + 4.2, t.z, 6.8, 1.6, 6.8, Math.PI * 0.25, 0.44, 0.49, 0.52);
-    batcher.addBox('roofMetal', t.x, tankY + 5.4, t.z, 3.6, 1.2, 3.6, 0, 0.44, 0.49, 0.52);
-    batcher.addBox('emissiveBeacon', t.x, tankY + 6.5, t.z, 0.65, 0.85, 0.65, 0, 1, 1, 1);
+    batcher.addBox('roofMetal', t.x, tankY + 5.6, t.z, 3.6, 1.2, 3.6, 0, 0.44, 0.49, 0.52);
+    batcher.addBox('emissiveBeacon', t.x, tankY + 6.625, t.z, 0.65, 0.85, 0.65, 0, 1, 1, 1);
   }
 
   private appendRadioMastGeometry(
@@ -1345,24 +1403,26 @@ export class OpenWorldArchitectureBuilder {
     // Alternating red & white lattice mast sections
     const segCount = 8;
     const segH = h / segCount;
+    const ringH = 0.22;
+    const railH = Math.max(0.2, segH - ringH);
     for (let s = 0; s < segCount; s++) {
       const frac = s / segCount;
       const w = 2.4 - frac * 1.45;
-      const sy = baseY + (s + 0.5) * segH;
+      const sy = baseY + s * segH + railH * 0.5;
       const isRed = s % 2 === 0;
       const r = isRed ? 0.78 : 0.86;
       const g = isRed ? 0.22 : 0.87;
       const b = isRed ? 0.18 : 0.85;
 
-      // 4 lattice corner rails
+      // 4 lattice corner rails (stopping cleanly below horizontal ring brace)
       const o = w * 0.45;
       for (const cx of [-o, o]) {
         for (const cz of [-o, o]) {
-          batcher.addBox('fasciaTint', t.x + cx, sy, t.z + cz, 0.24, segH, 0.24, 0, r, g, b);
+          batcher.addBox('fasciaTint', t.x + cx, sy, t.z + cz, 0.24, railH, 0.24, 0, r, g, b);
         }
       }
       // Horizontal ring brace
-      batcher.addBox('fasciaTint', t.x, baseY + (s + 1) * segH, t.z, w, 0.22, w, 0, r, g, b);
+      batcher.addBox('fasciaTint', t.x, baseY + (s + 1) * segH - ringH * 0.5, t.z, w, ringH, w, 0, r, g, b);
     }
 
     // Microwave dish & antenna arrays near upper third
@@ -1457,12 +1517,72 @@ export class OpenWorldArchitectureBuilder {
       );
     }
 
+    // 3b. Full Military FOB Compounds (Alpha FOB & Bravo FOB) overlapping this chunk
+    const overlappingFobs = getFobCompoundsOverlappingRect(
+      centerX - halfChunk,
+      centerX + halfChunk,
+      centerZ - halfChunk,
+      centerZ + halfChunk,
+    );
+    for (let i = 0; i < overlappingFobs.length; i++) {
+      const fob = overlappingFobs[i];
+      const ownsFobVisuals =
+        fob.worldX >= centerX - halfChunk &&
+        fob.worldX < centerX + halfChunk &&
+        fob.worldZ >= centerZ - halfChunk &&
+        fob.worldZ < centerZ + halfChunk;
+      this.buildFobCompound(
+        fob,
+        ownsFobVisuals ? batcher : null,
+        outObbs,
+        outDecks,
+        outIndoor,
+        ownsFobVisuals ? vehiclePlacements : null,
+        ownsFobVisuals ? streetlightPlacements : null,
+        ownsFobVisuals ? barrierPlacements : null,
+      );
+    }
+
+    // 3c. Secondary Major Open World POI Tactical Cover, Landmarks & Floodlight Poles
+    for (let i = 0; i < OPENWORLD_LANDMARKS.length; i++) {
+      const lm = OPENWORLD_LANDMARKS[i];
+      if (
+        lm.kind !== 'port' &&
+        lm.kind !== 'railyard' &&
+        lm.kind !== 'quarry' &&
+        lm.kind !== 'dam'
+      ) {
+        continue;
+      }
+      const reach = 48;
+      if (
+        lm.worldX + reach < centerX - halfChunk ||
+        lm.worldX - reach > centerX + halfChunk ||
+        lm.worldZ + reach < centerZ - halfChunk ||
+        lm.worldZ - reach > centerZ + halfChunk
+      ) {
+        continue;
+      }
+      const ownsPoiVisuals =
+        lm.worldX >= centerX - halfChunk &&
+        lm.worldX < centerX + halfChunk &&
+        lm.worldZ >= centerZ - halfChunk &&
+        lm.worldZ < centerZ + halfChunk;
+      this.buildMajorPoiTacticalSetDressing(
+        lm,
+        ownsPoiVisuals ? batcher : null,
+        outObbs,
+        ownsPoiVisuals ? streetlightPlacements : null,
+        ownsPoiVisuals ? barrierPlacements : null,
+      );
+    }
+
     meshCount += batcher.finalizeToGroup(
       group,
       this.archMaterials,
       ownedGeometries,
-      !this.isSoftwareGl,
-      !this.isSoftwareGl,
+      this.shadowsEnabled,
+      this.shadowsEnabled,
     );
 
     // 4. Roadside Hardware along paved segments owned by this chunk (Guardrails, Utility Poles + Power Lines, Signs, Streetlights, Abandoned Cars)
@@ -1890,12 +2010,14 @@ export class OpenWorldArchitectureBuilder {
           b,
         );
       }
-      // Subtle timber door jamb trim (visual only, flush inside jamb)
+      // Subtle timber door jamb trim (inset cleanly inside opening so zero overlap with wall/floor/lintel)
       if (batcher) {
-        const pL = localToWorldXZ(t, oMin + 0.03, lz);
-        const pR = localToWorldXZ(t, oMax - 0.03, lz);
-        batcher.addBox('woodTrim', pL.x, t.wy + baseY + doorTop * 0.5, pL.z, 0.07, doorTop, thick + 0.06, t.yaw, 0.34, 0.27, 0.22);
-        batcher.addBox('woodTrim', pR.x, t.wy + baseY + doorTop * 0.5, pR.z, 0.07, doorTop, thick + 0.06, t.yaw, 0.34, 0.27, 0.22);
+        const jambH = Math.max(0.2, doorTop - 0.02);
+        const jambY = t.wy + baseY + 0.01 + jambH * 0.5;
+        const pL = localToWorldXZ(t, oMin + 0.035, lz);
+        const pR = localToWorldXZ(t, oMax - 0.035, lz);
+        batcher.addBox('woodTrim', pL.x, jambY, pL.z, 0.06, jambH, thick + 0.05, t.yaw, 0.34, 0.27, 0.22);
+        batcher.addBox('woodTrim', pR.x, jambY, pR.z, 0.06, jambH, thick + 0.05, t.yaw, 0.34, 0.27, 0.22);
       }
     } else {
       // Waist-high window bay: lower sill blocks crouching cover + bullets; open middle allows aiming/shooting!
@@ -1936,10 +2058,10 @@ export class OpenWorldArchitectureBuilder {
           b,
         );
       }
-      // Recessed window sill ledge
+      // Recessed window sill ledge (clear of side pillars and proud of sill top)
       if (batcher) {
         const pMid = localToWorldXZ(t, openMid, lz);
-        batcher.addBox('woodTrim', pMid.x, t.wy + baseY + sillH + 0.02, pMid.z, openW + 0.14, 0.08, thick + 0.12, t.yaw, 0.38, 0.33, 0.28);
+        batcher.addBox('woodTrim', pMid.x, t.wy + baseY + sillH + 0.03, pMid.z, Math.max(0.2, openW - 0.02), 0.06, thick + 0.12, t.yaw, 0.38, 0.33, 0.28);
       }
     }
   }
@@ -2056,6 +2178,14 @@ export class OpenWorldArchitectureBuilder {
           b,
         );
       }
+      if (batcher) {
+        const jambH = Math.max(0.2, doorTop - 0.02);
+        const jambY = t.wy + baseY + 0.01 + jambH * 0.5;
+        const pB = localToWorldXZ(t, lx, oMin + 0.035);
+        const pF = localToWorldXZ(t, lx, oMax - 0.035);
+        batcher.addBox('woodTrim', pB.x, jambY, pB.z, thick + 0.05, jambH, 0.06, t.yaw, 0.34, 0.27, 0.22);
+        batcher.addBox('woodTrim', pF.x, jambY, pF.z, thick + 0.05, jambH, 0.06, t.yaw, 0.34, 0.27, 0.22);
+      }
     } else {
       const sillH = opening.sillH ?? 0.96;
       const winTop = opening.topH ?? 2.16;
@@ -2096,7 +2226,7 @@ export class OpenWorldArchitectureBuilder {
       }
       if (batcher) {
         const pMid = localToWorldXZ(t, lx, openMid);
-        batcher.addBox('woodTrim', pMid.x, t.wy + baseY + sillH + 0.02, pMid.z, thick + 0.12, 0.08, openW + 0.14, t.yaw, 0.38, 0.33, 0.28);
+        batcher.addBox('woodTrim', pMid.x, t.wy + baseY + sillH + 0.03, pMid.z, thick + 0.12, 0.06, Math.max(0.2, openW - 0.02), t.yaw, 0.38, 0.33, 0.28);
       }
     }
   }
@@ -2155,11 +2285,11 @@ export class OpenWorldArchitectureBuilder {
     const floorTopY = 0.24;
     const thick = 0.26;
 
-    // 1. Deep Concrete Foundation Plinth (-1.8m subterranean skirt prevents any hillside floating)
+    // 1. Deep Concrete Foundation Plinth (top = t.wy + 0.15, supporting wood floor slab [0.15..0.24] with zero overlap)
     if (batcher) {
-      batcher.addBox('concrete', t.wx, t.wy - 0.82, t.wz, widthX + 0.3, 2.08, depthZ + 0.3, t.yaw, 0.62, 0.63, 0.60);
-      // Warm timber interior floor deck
-      batcher.addBox('barnWood', t.wx, t.wy + floorTopY - 0.04, t.wz, widthX - 0.2, 0.08, depthZ - 0.2, t.yaw, 0.68, 0.54, 0.40);
+      batcher.addBox('concrete', t.wx, t.wy - 0.85, t.wz, widthX + 0.3, 2.0, depthZ + 0.3, t.yaw, 0.62, 0.63, 0.60);
+      // Warm timber interior floor deck sitting cleanly atop foundation plinth
+      batcher.addBox('barnWood', t.wx, t.wy + 0.195, t.wz, widthX - 0.16, 0.09, depthZ - 0.16, t.yaw, 0.68, 0.54, 0.40);
     }
 
     // Walkable interior floor + entry threshold
@@ -2176,15 +2306,16 @@ export class OpenWorldArchitectureBuilder {
       surface: 'wood',
     });
 
-    // Front Porch deck & posts for homesteads
+    // Front Porch deck & posts for homesteads (starts cleanly outside house foundation plinth at hz + 0.15)
     if (hasPorch && batcher) {
-      const porchCenter = localToWorldXZ(t, 0, hz + 0.9);
-      batcher.addBox('concrete', porchCenter.x, t.wy - 0.78, porchCenter.z, widthX * 0.72, 2.0, 1.85, t.yaw, 0.60, 0.61, 0.59);
-      // Porch canopy & 2 slender timber posts
-      batcher.addBox('roofMetal', porchCenter.x, t.wy + floorTopY + 2.68, porchCenter.z, widthX * 0.74, 0.16, 1.95, t.yaw, rr, rg, rb);
+      const porchFound = localToWorldXZ(t, 0, hz + 1.0);
+      const porchRoof = localToWorldXZ(t, 0, hz + 0.9);
+      batcher.addBox('concrete', porchFound.x, t.wy - 0.80, porchFound.z, widthX * 0.72, 2.0, 1.70, t.yaw, 0.60, 0.61, 0.59);
+      // Porch canopy & 2 slender timber posts seated on porch deck (top 0.20) up to canopy underside
+      batcher.addBox('roofMetal', porchRoof.x, t.wy + floorTopY + 2.68, porchRoof.z, widthX * 0.74, 0.16, 1.95, t.yaw, rr, rg, rb);
       for (const px of [-widthX * 0.31, widthX * 0.31]) {
         const pp = localToWorldXZ(t, px, hz + 1.68);
-        batcher.addBox('woodTrim', pp.x, t.wy + floorTopY + 1.35, pp.z, 0.18, 2.7, 0.18, t.yaw, 0.45, 0.36, 0.28);
+        batcher.addBox('woodTrim', pp.x, t.wy + 0.20 + 1.32, pp.z, 0.18, 2.64, 0.18, t.yaw, 0.45, 0.36, 0.28);
       }
     }
 
@@ -2386,15 +2517,15 @@ export class OpenWorldArchitectureBuilder {
         this.addSolidBox(t, batcher, outObbs, 'steel', 'metal', px, padTopY + canopyH * 0.5, pz, 0.44, canopyH, 0.44, 0.78, 0.80, 0.82);
       }
     }
-    // Canopy roof slab + vibrant brand fascia trim + night-emissive ceiling light panels
+    // Canopy roof slab + vibrant brand fascia trim (inset vertically inside slab height to avoid coplanar top) + soffit lights
     this.addSolidBox(t, batcher, outObbs, 'concreteDark', 'metal', 0, padTopY + canopyH + 0.32, canopyZ, 14.4, 0.56, 9.2, 0.84, 0.85, 0.86);
     if (batcher) {
       const cp = localToWorldXZ(t, 0, canopyZ);
-      batcher.addBox('fasciaTint', cp.x, t.wy + padTopY + canopyH + 0.36, cp.z, 14.65, 0.48, 9.45, t.yaw, br, bg, bb);
+      batcher.addBox('fasciaTint', cp.x, t.wy + padTopY + canopyH + 0.32, cp.z, 14.65, 0.44, 9.45, t.yaw, br, bg, bb);
       // 4 glowing soffit ceiling fixtures under canopy (no PointLights!)
       for (const lx of [-3.6, 0, 3.6]) {
         const lp = localToWorldXZ(t, lx, canopyZ);
-        batcher.addBox('emissiveCanopy', lp.x, t.wy + padTopY + canopyH - 0.02, lp.z, 1.5, 0.08, 3.2, t.yaw, 1, 1, 1);
+        batcher.addBox('emissiveCanopy', lp.x, t.wy + padTopY + canopyH - 0.01, lp.z, 1.5, 0.06, 3.2, t.yaw, 1, 1, 1);
       }
     }
 
@@ -2478,13 +2609,19 @@ export class OpenWorldArchitectureBuilder {
       topH: 2.18,
     });
 
-    // Store flat roof slab + brand fascia stripe + rooftop AC unit
+    // Store floor plinth sitting cleanly atop forecourt pad [padTopY .. storeFloorY]
+    if (batcher) {
+      const sp = localToWorldXZ(t, 0, storeZ);
+      batcher.addBox('concreteDark', sp.x, t.wy + padTopY + 0.06, sp.z, storeW + 0.1, 0.12, storeD + 0.1, t.yaw, 0.60, 0.62, 0.61);
+    }
+
+    // Store flat roof slab + brand fascia stripe (inset vertically inside slab height) + rooftop AC unit
     this.addSolidBox(t, batcher, outObbs, 'concreteDark', 'concrete', 0, storeFloorY + storeH + 0.22, storeZ, storeW + 0.6, 0.44, storeD + 0.6, 0.50, 0.52, 0.54);
     if (batcher) {
       const sp = localToWorldXZ(t, 0, storeZ);
-      batcher.addBox('fasciaTint', sp.x, t.wy + storeFloorY + storeH + 0.28, sp.z, storeW + 0.72, 0.36, storeD + 0.72, t.yaw, br, bg, bb);
+      batcher.addBox('fasciaTint', sp.x, t.wy + storeFloorY + storeH + 0.22, sp.z, storeW + 0.72, 0.32, storeD + 0.72, t.yaw, br, bg, bb);
       const ac = localToWorldXZ(t, 3.2, storeZ - 1.0);
-      batcher.addBox('steel', ac.x, t.wy + storeFloorY + storeH + 0.92, ac.z, 1.8, 0.95, 1.4, t.yaw, 0.62, 0.65, 0.67);
+      batcher.addBox('steel', ac.x, t.wy + storeFloorY + storeH + 0.915, ac.z, 1.8, 0.95, 1.4, t.yaw, 0.62, 0.65, 0.67);
     }
 
     // Interior Store Props: L-Checkout Counter, 2 Merch Shelving Aisles, Back Office Partition
@@ -2559,8 +2696,8 @@ export class OpenWorldArchitectureBuilder {
     const wb = isRedBarn ? 0.20 : 0.32;
 
     if (batcher) {
-      batcher.addBox('concrete', t.wx, t.wy - 0.85, t.wz, widthX + 0.3, 2.08, depthZ + 0.3, t.yaw, 0.58, 0.58, 0.56);
-      batcher.addBox('barnWood', t.wx, t.wy + floorY - 0.04, t.wz, widthX - 0.2, 0.08, depthZ - 0.2, t.yaw, 0.56, 0.45, 0.34);
+      batcher.addBox('concrete', t.wx, t.wy - 0.88, t.wz, widthX + 0.3, 2.0, depthZ + 0.3, t.yaw, 0.58, 0.58, 0.56);
+      batcher.addBox('barnWood', t.wx, t.wy + 0.16, t.wz, widthX - 0.16, 0.08, depthZ - 0.16, t.yaw, 0.56, 0.45, 0.34);
     }
 
     outDecks.push({
@@ -2732,10 +2869,10 @@ export class OpenWorldArchitectureBuilder {
       material: 'concrete',
     });
 
-    // Opposite HESCO / sandbag firing bastion (-6.4m X)
+    // Opposite HESCO / sandbag firing bastion (-6.4m X, side wings flush-butted to -5.35 without overlap)
     this.addSolidBox(t, batcher, outObbs, 'concrete', 'concrete', -6.4, 0.62, 0, 2.1, 1.24, 4.4, 0.64, 0.58, 0.46);
-    this.addSolidBox(t, batcher, outObbs, 'concrete', 'concrete', -5.6, 0.62, 2.2, 2.2, 1.24, 1.2, 0.64, 0.58, 0.46);
-    this.addSolidBox(t, batcher, outObbs, 'concrete', 'concrete', -5.6, 0.62, -2.2, 2.2, 1.24, 1.2, 0.64, 0.58, 0.46);
+    this.addSolidBox(t, batcher, outObbs, 'concrete', 'concrete', -4.5, 0.62, 2.2, 1.7, 1.24, 1.2, 0.64, 0.58, 0.46);
+    this.addSolidBox(t, batcher, outObbs, 'concrete', 'concrete', -4.5, 0.62, -2.2, 1.7, 1.24, 1.2, 0.64, 0.58, 0.46);
 
     // Striped Counterweight Boom Gate Pedestal + Overhead Gate Arm (raised 2.6m clear so operators walk freely beneath)
     this.addSolidBox(t, batcher, outObbs, 'fasciaTint', 'metal', 4.3, 0.65, 0, 0.62, 1.3, 0.62, 0.82, 0.22, 0.18);
@@ -2780,6 +2917,903 @@ export class OpenWorldArchitectureBuilder {
       lightsOut.push({ wx: lp.x, wy: t.wy, wz: lp.z, yaw: t.yaw + Math.PI * 0.5 });
     }
     void site;
+  }
+
+  // ============================================================================
+  // FULL MILITARY FOB COMPOUND BUILDER (Alpha FOB & Bravo FOB)
+  // ============================================================================
+
+  /**
+   * Secondary Major POI Tactical Cover & Atmosphere (Port, Railyard, Quarry, Alpine Dam).
+   * Keeps a 14m radius clear around landmark center so flagpoles/terminals/spawns remain unobstructed.
+   * Uses the chunk batcher + instanced barriers/floodlights for zero additional draw calls.
+   */
+  private buildMajorPoiTacticalSetDressing(
+    lm: OpenWorldLandmarkSpec,
+    batcher: ChunkGeometryBatcher | null,
+    outObbs: SolidObb[],
+    lightsOut: Array<{ wx: number; wy: number; wz: number; yaw: number }> | null,
+    barriersOut: Array<{ wx: number; wy: number; wz: number; yaw: number }> | null,
+  ): void {
+    const addCoverBox = (
+      matKey: ArchMaterialKey,
+      dx: number,
+      dz: number,
+      sx: number,
+      sy: number,
+      sz: number,
+      yaw: number,
+      r: number,
+      g: number,
+      b: number,
+      surface: BodycamSurfaceMaterial,
+      yOffset = 0,
+    ): void => {
+      const wx = lm.worldX + dx;
+      const wz = lm.worldZ + dz;
+      const gy = evaluateOpenWorldHeight(wx, wz);
+      if (gy <= SEA_LEVEL_M + 0.2) return;
+      const cy = gy + yOffset + sy * 0.5;
+      if (batcher) {
+        batcher.addBox(matKey, wx, cy, wz, sx, sy, sz, yaw, r, g, b);
+      }
+      outObbs.push({
+        cx: wx,
+        cy,
+        cz: wz,
+        hx: sx * 0.5,
+        hy: sy * 0.5,
+        hz: sz * 0.5,
+        cosY: Math.cos(yaw),
+        sinY: Math.sin(yaw),
+        surface,
+        blocksBullets: true,
+        blocksPlayer: true,
+      });
+    };
+
+    const addPoiBarrier = (dx: number, dz: number, yaw: number): void => {
+      const wx = lm.worldX + dx;
+      const wz = lm.worldZ + dz;
+      const gy = evaluateOpenWorldHeight(wx, wz);
+      if (gy <= SEA_LEVEL_M + 0.2) return;
+      if (barriersOut) {
+        barriersOut.push({ wx, wy: gy, wz, yaw });
+      }
+      outObbs.push({
+        cx: wx,
+        cy: gy + 0.52,
+        cz: wz,
+        hx: 1.45,
+        hy: 0.52,
+        hz: 0.36,
+        cosY: Math.cos(yaw),
+        sinY: Math.sin(yaw),
+        surface: 'concrete',
+        blocksBullets: true,
+        blocksPlayer: true,
+      });
+    };
+
+    const addPoiLight = (dx: number, dz: number, yaw: number): void => {
+      if (!lightsOut) return;
+      const wx = lm.worldX + dx;
+      const wz = lm.worldZ + dz;
+      const gy = evaluateOpenWorldHeight(wx, wz);
+      if (gy <= SEA_LEVEL_M + 0.2) return;
+      lightsOut.push({ wx, wy: gy, wz, yaw });
+    };
+
+    if (lm.kind === 'port') {
+      // Stacked maritime shipping containers creating multi-lane CQB lanes around the Container Terminal
+      addCoverBox('roofMetal', -22, -18, 6.2, 2.6, 2.45, 0.08, 0.22, 0.38, 0.52, 'metal');
+      addCoverBox('roofMetal', -22, -18, 6.1, 2.5, 2.4, 0.08, 0.58, 0.26, 0.22, 'metal', 2.6);
+      addCoverBox('roofMetal', 21, -17, 6.2, 2.6, 2.45, -0.14, 0.28, 0.44, 0.32, 'metal');
+      addCoverBox('roofMetal', -21, 19, 6.2, 2.6, 2.45, 0.22, 0.56, 0.42, 0.22, 'metal');
+      addCoverBox('roofMetal', 23, 18, 6.2, 2.6, 2.45, -0.06, 0.24, 0.36, 0.48, 'metal');
+      addCoverBox('roofMetal', 23, 18, 6.1, 2.5, 2.4, -0.06, 0.42, 0.44, 0.46, 'metal', 2.6);
+      addCoverBox('steel', 0, -24, 4.4, 1.35, 1.8, 0, 0.42, 0.44, 0.46, 'metal');
+      addPoiBarrier(-15, 0, Math.PI * 0.5);
+      addPoiBarrier(15, 0, Math.PI * 0.5);
+      addPoiBarrier(0, 17, 0);
+      addPoiLight(-28, -26, Math.PI * 0.25);
+      addPoiLight(28, -26, -Math.PI * 0.25);
+      addPoiLight(-28, 26, Math.PI * 0.75);
+      addPoiLight(28, 26, -Math.PI * 0.75);
+    } else if (lm.kind === 'railyard') {
+      // Parked freight boxcars & stacked logging timber bunks framing railyard lanes
+      addCoverBox('roofMetal', -24, -14, 11.4, 3.2, 2.85, 0.04, 0.48, 0.24, 0.20, 'metal');
+      addCoverBox('roofMetal', 24, 15, 11.4, 3.2, 2.85, 0.04, 0.28, 0.36, 0.44, 'metal');
+      addCoverBox('barnWood', -18, 17, 5.2, 1.45, 2.2, 0.12, 0.52, 0.38, 0.26, 'wood');
+      addCoverBox('barnWood', 19, -16, 5.2, 1.45, 2.2, -0.18, 0.48, 0.35, 0.24, 'wood');
+      addCoverBox('concrete', 0, -22, 6.4, 1.15, 1.4, 0, 0.54, 0.54, 0.52, 'concrete');
+      addPoiBarrier(-16, -2, Math.PI * 0.5);
+      addPoiBarrier(16, 2, Math.PI * 0.5);
+      addPoiBarrier(0, 19, 0);
+      addPoiLight(-28, -22, Math.PI * 0.25);
+      addPoiLight(28, -22, -Math.PI * 0.25);
+      addPoiLight(-28, 24, Math.PI * 0.75);
+      addPoiLight(28, 24, -Math.PI * 0.75);
+    } else if (lm.kind === 'quarry') {
+      // Limestone quarry reinforced concrete blast shelters & equipment cover blocks
+      addCoverBox('concrete', -22, -16, 5.6, 2.4, 3.2, 0.24, 0.64, 0.61, 0.55, 'concrete');
+      addCoverBox('concrete', 22, -16, 5.6, 2.4, 3.2, -0.24, 0.62, 0.59, 0.53, 'concrete');
+      addCoverBox('concreteDark', -20, 18, 6.0, 1.65, 1.8, 0.15, 0.56, 0.53, 0.48, 'concrete');
+      addCoverBox('concreteDark', 20, 18, 6.0, 1.65, 1.8, -0.15, 0.56, 0.53, 0.48, 'concrete');
+      addCoverBox('steel', 0, -24, 4.2, 2.1, 2.4, 0, 0.52, 0.44, 0.24, 'metal');
+      addPoiBarrier(-15, 2, Math.PI * 0.5);
+      addPoiBarrier(15, -2, Math.PI * 0.5);
+      addPoiBarrier(0, 18, 0);
+      addPoiLight(-26, -24, Math.PI * 0.25);
+      addPoiLight(26, -24, -Math.PI * 0.25);
+      addPoiLight(-26, 24, Math.PI * 0.75);
+      addPoiLight(26, 24, -Math.PI * 0.75);
+    } else if (lm.kind === 'dam') {
+      // Alpine Remnant reinforced concrete dam parapets & armored generator enclosures
+      addCoverBox('concrete', -21, -15, 6.2, 1.85, 1.5, 0.1, 0.68, 0.70, 0.72, 'concrete');
+      addCoverBox('concrete', 21, -15, 6.2, 1.85, 1.5, -0.1, 0.68, 0.70, 0.72, 'concrete');
+      addCoverBox('steel', -20, 17, 4.8, 2.35, 2.6, 0.06, 0.40, 0.46, 0.52, 'metal');
+      addCoverBox('steel', 20, 17, 4.8, 2.35, 2.6, -0.06, 0.40, 0.46, 0.52, 'metal');
+      addCoverBox('concreteDark', 0, -23, 7.2, 1.35, 1.2, 0, 0.62, 0.64, 0.67, 'concrete');
+      addPoiBarrier(-16, 0, Math.PI * 0.5);
+      addPoiBarrier(16, 0, Math.PI * 0.5);
+      addPoiBarrier(0, 18, 0);
+      addPoiLight(-25, -22, Math.PI * 0.25);
+      addPoiLight(25, -22, -Math.PI * 0.25);
+      addPoiLight(-25, 22, Math.PI * 0.75);
+      addPoiLight(25, 22, -Math.PI * 0.75);
+    }
+  }
+
+  private buildFobCompound(
+    fob: FobCompoundSpec,
+    batcher: ChunkGeometryBatcher | null,
+    outObbs: SolidObb[],
+    outDecks: WalkDeck[],
+    outIndoor: IndoorVolume[],
+    vehiclesOut: Array<{ wx: number; wy: number; wz: number; yaw: number; colorHex: number }> | null,
+    lightsOut: Array<{ wx: number; wy: number; wz: number; yaw: number }> | null,
+    barriersOut: Array<{ wx: number; wy: number; wz: number; yaw: number }> | null,
+  ): void {
+    const t = makeTransform(fob.worldX, fob.baseY, fob.worldZ, fob.yaw);
+    const isAlpha = fob.faction === 'pmc_alpha';
+    const [accentR, accentG, accentB] = isAlpha ? [0.22, 0.52, 0.72] : [0.76, 0.50, 0.16];
+    const [oliveR, oliveG, oliveB] = [0.32, 0.36, 0.25];
+    const [hescoR, hescoG, hescoB] = [0.64, 0.58, 0.45];
+
+    // 1. Concrete Compound Pads & Entry Road Apron (non-overlapping flush seam at lz = +39.0)
+    const yardP = localToWorldXZ(t, 0, -2.0);
+    const apronP = localToWorldXZ(t, 0, 44.75);
+    const heliP = localToWorldXZ(t, 2.0, 21.5);
+    if (batcher) {
+      // Main central courtyard tarmac spanning full HESCO interior (lz in [-43..+39], top = t.wy + 0.08)
+      batcher.addBox('concreteDark', yardP.x, t.wy - 0.34, yardP.z, 86, 0.84, 82, t.yaw, 0.44, 0.45, 0.44);
+      // Checkpoint concrete approach apron extending to spur road (lz in [+39.0..+50.5], top = t.wy + 0.08)
+      batcher.addBox('concreteDark', apronP.x, t.wy - 0.34, apronP.z, 22, 0.84, 11.5, t.yaw, 0.40, 0.41, 0.40);
+      // Helipad concrete apron at (2.0, 21.5, top = t.wy + 0.16, embedded -0.70m)
+      batcher.addBox('concrete', heliP.x, t.wy - 0.27, heliP.z, 13.5, 0.86, 13.5, t.yaw, 0.54, 0.55, 0.53);
+      // Crisp H markings with zero bar intersection overlap
+      batcher.addBox('fasciaTint', heliP.x, t.wy + 0.175, heliP.z, 2.8, 0.03, 0.9, t.yaw, accentR, accentG, accentB);
+      const heliLeft = localToWorldXZ(t, 2.0 - 1.85, 21.5);
+      const heliRight = localToWorldXZ(t, 2.0 + 1.85, 21.5);
+      batcher.addBox('fasciaTint', heliLeft.x, t.wy + 0.175, heliLeft.z, 0.9, 0.03, 5.4, t.yaw, accentR, accentG, accentB);
+      batcher.addBox('fasciaTint', heliRight.x, t.wy + 0.175, heliRight.z, 0.9, 0.03, 5.4, t.yaw, accentR, accentG, accentB);
+    }
+    outDecks.push(
+      {
+        cx: yardP.x,
+        cz: yardP.z,
+        hx: 43.2,
+        hz: 41.2,
+        cosY: t.cosY,
+        sinY: t.sinY,
+        baseY: t.wy + 0.08,
+        slopeAlongZ: 0,
+        thicknessM: 0.9,
+        surface: 'concrete',
+      },
+      {
+        cx: apronP.x,
+        cz: apronP.z,
+        hx: 11.2,
+        hz: 6.0,
+        cosY: t.cosY,
+        sinY: t.sinY,
+        baseY: t.wy + 0.08,
+        slopeAlongZ: 0,
+        thicknessM: 0.9,
+        surface: 'concrete',
+      },
+      {
+        cx: heliP.x,
+        cz: heliP.z,
+        hx: 6.75,
+        hz: 6.75,
+        cosY: t.cosY,
+        sinY: t.sinY,
+        baseY: t.wy + 0.16,
+        slopeAlongZ: 0,
+        thicknessM: 0.9,
+        surface: 'concrete',
+      },
+    );
+
+    // 2. Perimeter HESCO Bastion Security Walls (cleanly mitered/butted at corners with zero overlap)
+    // North (-Z) continuous wall (lx in [-43.85..+43.85], lz in [-43.85..-42.55])
+    this.addSolidBox(t, batcher, outObbs, 'concrete', 'concrete', 0, 0.98, -43.2, 87.7, 3.46, 1.3, hescoR, hescoG, hescoB);
+    // East (+X) continuous wall strictly between North & South walls (lz in [-42.55..+38.55])
+    this.addSolidBox(t, batcher, outObbs, 'concrete', 'concrete', 43.2, 0.98, -2.0, 1.3, 3.46, 81.1, hescoR, hescoG, hescoB);
+    // West (-X) wall with side pedestrian tactical sally-port at lz = -22 (leaving [-24..-20] open)
+    this.addSolidBox(t, batcher, outObbs, 'concrete', 'concrete', -43.2, 0.98, -33.275, 1.3, 3.46, 18.55, hescoR, hescoG, hescoB);
+    this.addSolidBox(t, batcher, outObbs, 'concrete', 'concrete', -43.2, 0.98, 9.275, 1.3, 3.46, 58.55, hescoR, hescoG, hescoB);
+    // South (+Z) front wall split cleanly around the 10.4m Main Military Checkpoint Sally-Port [-5.2..+5.2]
+    this.addSolidBox(t, batcher, outObbs, 'concrete', 'concrete', -24.525, 0.98, 39.2, 38.65, 3.46, 1.3, hescoR, hescoG, hescoB);
+    this.addSolidBox(t, batcher, outObbs, 'concrete', 'concrete', 24.525, 0.98, 39.2, 38.65, 3.46, 1.3, hescoR, hescoG, hescoB);
+
+    // 3. Military Base Checkpoint Entry + Guardhouse Booth + Overhead Canopy + Boom Gate Pedestal (at lz = +40)
+    {
+      const gz = 40.0;
+      const bx = 6.8;
+      const bw = 4.4;
+      const bd = 4.2;
+      const bFloor = 0.18;
+      const bWallH = 3.0;
+      const wt = 0.24;
+
+      if (batcher) {
+        const gp = localToWorldXZ(t, bx, gz);
+        batcher.addBox('concrete', gp.x, t.wy - 0.72, gp.z, bw + 0.3, 1.8, bd + 0.3, t.yaw, 0.56, 0.58, 0.56);
+        // Overhead checkpoint steel inspection canopy spanning the entry lanes [-5.5..+5.5]
+        const canP = localToWorldXZ(t, 0, gz);
+        batcher.addBox('steel', canP.x, t.wy + 4.35, canP.z, 12.2, 0.34, 5.4, t.yaw, 0.34, 0.38, 0.42);
+        batcher.addBox('fasciaTint', canP.x, t.wy + 4.35, canP.z, 12.35, 0.22, 5.55, t.yaw, accentR, accentG, accentB);
+        // Canopy columns (stopping cleanly at canopy underside 4.18)
+        for (const cx of [-5.2, 4.9]) {
+          for (const cz of [gz - 2.1, gz + 2.1]) {
+            const cp = localToWorldXZ(t, cx, cz);
+            batcher.addBox('steel', cp.x, t.wy + 2.13, cp.z, 0.28, 4.10, 0.28, t.yaw, 0.38, 0.41, 0.44);
+          }
+        }
+        // Under-canopy floodlight bar
+        batcher.addBox('emissiveCanopy', canP.x, t.wy + 4.14, canP.z, 8.0, 0.08, 0.85, t.yaw, 1, 1, 1);
+      }
+
+      const boothWorld = localToWorldXZ(t, bx, gz);
+      outDecks.push({
+        cx: boothWorld.x,
+        cz: boothWorld.z,
+        hx: bw * 0.5 + 0.25,
+        hz: bd * 0.5 + 0.25,
+        cosY: t.cosY,
+        sinY: t.sinY,
+        baseY: t.wy + bFloor,
+        slopeAlongZ: 0,
+        thicknessM: 0.25,
+        surface: 'concrete',
+      });
+
+      this.addWallAlongZ(t, batcher, outObbs, 'concrete', 'concrete', gz - bd * 0.5, gz + bd * 0.5, bx - bw * 0.5 + wt * 0.5, bFloor, bWallH, wt, 0.62, 0.64, 0.62, {
+        kind: 'door',
+        center: gz,
+        width: 1.45,
+        topH: 2.3,
+      });
+      this.addWallAlongZ(t, batcher, outObbs, 'concrete', 'concrete', gz - bd * 0.5, gz + bd * 0.5, bx + bw * 0.5 - wt * 0.5, bFloor, bWallH, wt, 0.60, 0.62, 0.60);
+      this.addWallAlongX(t, batcher, outObbs, 'concrete', 'concrete', bx - bw * 0.5 + wt, bx + bw * 0.5 - wt, gz + bd * 0.5 - wt * 0.5, bFloor, bWallH, wt, 0.62, 0.64, 0.62, {
+        kind: 'window',
+        center: bx,
+        width: 2.3,
+        sillH: 1.0,
+        topH: 2.2,
+      });
+      this.addWallAlongX(t, batcher, outObbs, 'concrete', 'concrete', bx - bw * 0.5 + wt, bx + bw * 0.5 - wt, gz - bd * 0.5 + wt * 0.5, bFloor, bWallH, wt, 0.62, 0.64, 0.62, {
+        kind: 'window',
+        center: bx,
+        width: 2.3,
+        sillH: 1.0,
+        topH: 2.2,
+      });
+      this.addSolidBox(t, batcher, outObbs, 'concreteDark', 'concrete', bx, bFloor + bWallH + 0.16, gz, bw + 0.8, 0.32, bd + 0.8, 0.42, 0.45, 0.46);
+      this.addSolidBox(t, batcher, outObbs, 'woodTrim', 'wood', bx + 0.9, bFloor + 0.46, gz + 0.9, 1.1, 0.92, 0.72, 0.46, 0.38, 0.28);
+
+      outIndoor.push({
+        cx: boothWorld.x,
+        cz: boothWorld.z,
+        hx: bw * 0.5 - 0.24,
+        hz: bd * 0.5 - 0.24,
+        cosY: t.cosY,
+        sinY: t.sinY,
+        minY: t.wy + bFloor - 0.1,
+        maxY: t.wy + bFloor + bWallH + 0.15,
+        material: 'concrete',
+      });
+
+      // Opposite sandbag checkpoint bunker (-6.8, gz) + Boom Gate Pedestal (+3.85, gz)
+      this.addSolidBox(t, batcher, outObbs, 'concrete', 'concrete', -6.8, 0.65, gz, 2.2, 1.3, 4.4, hescoR, hescoG, hescoB);
+      this.addSolidBox(t, batcher, outObbs, 'fasciaTint', 'metal', 3.85, 0.65, gz, 0.56, 1.3, 0.56, 0.82, 0.22, 0.18);
+
+      // Gate Jersey-Barrier S-Chicane (keeps vehicles/runners weaving cleanly)
+      for (const c of [
+        { lx: -2.0, lz: gz + 6.4, dyaw: 0.28 },
+        { lx: 2.0, lz: gz - 5.6, dyaw: 0.28 },
+      ]) {
+        const bp = localToWorldXZ(t, c.lx, c.lz);
+        const bYaw = t.yaw + Math.PI * 0.5 + c.dyaw;
+        if (barriersOut) {
+          barriersOut.push({ wx: bp.x, wy: t.wy, wz: bp.z, yaw: bYaw });
+        }
+        outObbs.push({
+          cx: bp.x,
+          cy: t.wy + 0.52,
+          cz: bp.z,
+          hx: 0.35,
+          hy: 0.52,
+          hz: 1.45,
+          cosY: Math.cos(bYaw),
+          sinY: Math.sin(bYaw),
+          surface: 'concrete',
+          blocksBullets: true,
+          blocksPlayer: true,
+        });
+      }
+
+      if (lightsOut) {
+        const l1 = localToWorldXZ(t, -6.5, gz + 4.8);
+        const l2 = localToWorldXZ(t, 6.5, gz - 4.8);
+        lightsOut.push({ wx: l1.x, wy: t.wy, wz: l1.z, yaw: t.yaw + Math.PI * 0.5 });
+        lightsOut.push({ wx: l2.x, wy: t.wy, wz: l2.z, yaw: t.yaw - Math.PI * 0.5 });
+      }
+    }
+
+    // 4. Four Climbable Corner Guard Towers (with Switchback Staircase + Sniper Deck + Parapets + Floodlights)
+    const towers = getFobGuardTowerSpecs(fob.id);
+    const towerDeckH = FOB_GUARD_TOWER_DECK_HEIGHT_M;
+    for (let ti = 0; ti < towers.length; ti++) {
+      const tw = towers[ti];
+      const tx = tw.localX;
+      const tz = tw.localZ;
+      const halfTw = 2.35;
+
+      // Tower foundation & corner steel columns (foundation top = 0.12 proudly above tarmac 0.08)
+      if (batcher) {
+        const twP = localToWorldXZ(t, tx, tz);
+        batcher.addBox('concreteDark', twP.x, t.wy - 0.63, twP.z, 5.2, 1.5, 5.2, t.yaw, 0.48, 0.50, 0.48);
+        // Deck slab & underside steel framing
+        batcher.addBox('steel', twP.x, t.wy + towerDeckH - 0.14, twP.z, halfTw * 2 + 0.25, 0.28, halfTw * 2 + 0.25, t.yaw, 0.38, 0.42, 0.45);
+        // Overhead watchtower canopy roof
+        batcher.addBox('roofMetal', twP.x, t.wy + towerDeckH + 2.75, twP.z, halfTw * 2 + 0.8, 0.20, halfTw * 2 + 0.8, t.yaw, 0.34, 0.38, 0.40);
+        // Floodlight bar mounted under roof edge
+        batcher.addBox('emissiveFlood', twP.x, t.wy + towerDeckH + 2.56, twP.z, 1.4, 0.18, 1.4, t.yaw, 1, 1, 1);
+      }
+
+      // 4 structural corner posts (base to canopy underside)
+      const postBot = 0.12;
+      const postTop = towerDeckH + 2.65;
+      const postH = postTop - postBot;
+      for (const sx of [-halfTw + 0.16, halfTw - 0.16]) {
+        for (const sz of [-halfTw + 0.16, halfTw - 0.16]) {
+          this.addSolidBox(t, batcher, outObbs, 'steel', 'metal', tx + sx, postBot + postH * 0.5, tz + sz, 0.28, postH, 0.28, 0.35, 0.39, 0.42);
+        }
+      }
+
+      // Guard tower upper walkable deck + overhead roof OBB
+      const twCenter = localToWorldXZ(t, tx, tz);
+      outDecks.push({
+        cx: twCenter.x,
+        cz: twCenter.z,
+        hx: halfTw,
+        hz: halfTw,
+        cosY: t.cosY,
+        sinY: t.sinY,
+        baseY: t.wy + towerDeckH,
+        slopeAlongZ: 0,
+        thicknessM: 0.35,
+        surface: 'metal',
+      });
+      outObbs.push({
+        cx: twCenter.x,
+        cy: t.wy + towerDeckH + 2.75,
+        cz: twCenter.z,
+        hx: halfTw + 0.3,
+        hy: 0.15,
+        hz: halfTw + 0.3,
+        cosY: t.cosY,
+        sinY: t.sinY,
+        surface: 'metal',
+        blocksBullets: true,
+        blocksPlayer: true,
+      });
+
+      // Waist-high sandbag/steel parapet walls (1.02m high, trimmed strictly between corner posts)
+      const pH = 1.02;
+      const pSpan = halfTw * 2 - 0.64;
+      const stairSide = tx < 0 ? 1 : -1; // Stair climbs along interior-facing X flank
+      this.addSolidBox(t, batcher, outObbs, 'concrete', 'concrete', tx, towerDeckH + pH * 0.5, tz - halfTw + 0.18, pSpan, pH, 0.24, hescoR, hescoG, hescoB);
+      this.addSolidBox(t, batcher, outObbs, 'concrete', 'concrete', tx, towerDeckH + pH * 0.5, tz + halfTw - 0.18, pSpan, pH, 0.24, hescoR, hescoG, hescoB);
+      this.addSolidBox(t, batcher, outObbs, 'concrete', 'concrete', tx - stairSide * (halfTw - 0.18), towerDeckH + pH * 0.5, tz, 0.24, pH, pSpan, hescoR, hescoG, hescoB);
+
+      // Exterior Climbable Staircase (14 wide metal stair treads stepping cleanly up to landing bridge)
+      const stepCount = 14;
+      const stairX = tx + stairSide * (halfTw + 0.85);
+      const stepDirZ = tz < 0 ? 1 : -1; // climb inward from tower side
+      for (let s = 1; s <= stepCount; s++) {
+        const frac = s / (stepCount + 1);
+        const stepY = frac * towerDeckH;
+        const stepLz = tz - stepDirZ * 2.2 + stepDirZ * frac * 4.2;
+        const stepWorld = localToWorldXZ(t, stairX, stepLz);
+        if (batcher) {
+          batcher.addBox('steel', stepWorld.x, t.wy + stepY - 0.08, stepWorld.z, 1.35, 0.16, 0.55, t.yaw, 0.42, 0.46, 0.50);
+        }
+        outDecks.push({
+          cx: stepWorld.x,
+          cz: stepWorld.z,
+          hx: 0.72,
+          hz: 0.34,
+          cosY: t.cosY,
+          sinY: t.sinY,
+          baseY: t.wy + stepY,
+          slopeAlongZ: 0,
+          thicknessM: 0.24,
+          surface: 'metal',
+        });
+      }
+      // Upper stair landing bridge spanning strictly outside deck overhang (halfTw + 0.13 .. halfTw + 0.85)
+      const landLz = tz + stepDirZ * 2.0;
+      const landWorld = localToWorldXZ(t, tx + stairSide * (halfTw + 0.49), landLz);
+      if (batcher) {
+        batcher.addBox('steel', landWorld.x, t.wy + towerDeckH - 0.13, landWorld.z, 0.72, 0.22, 1.3, t.yaw, 0.40, 0.44, 0.48);
+      }
+      outDecks.push({
+        cx: landWorld.x,
+        cz: landWorld.z,
+        hx: 0.65,
+        hz: 0.7,
+        cosY: t.cosY,
+        sinY: t.sinY,
+        baseY: t.wy + towerDeckH - 0.02,
+        slopeAlongZ: 0,
+        thicknessM: 0.3,
+        surface: 'metal',
+      });
+    }
+
+    // 5. Command & Quartermaster Station Bunker (at lx = -5.5, lz = +4.0, houses `fob_terminal`)
+    this.buildFobConcreteStation(t, -5.5, 4.0, 11.0, 8.0, 3.6, batcher, outObbs, outDecks, outIndoor, {
+      wallColor: [0.58, 0.60, 0.58],
+      accentColor: [accentR, accentG, accentB],
+      doorWall: 'front',
+      backDoor: true,
+      hasCommsMast: true,
+      stationKind: 'command',
+    });
+
+    // 6. Field Hospital & Surgical Aid Tent (at lx = +18.0, lz = +9.0, houses `fob_resupply`)
+    this.buildFobTent(t, 18.0, 9.0, 12.0, 8.0, 3.2, batcher, outObbs, outDecks, outIndoor, {
+      roofColor: [0.84, 0.86, 0.85],
+      wallColor: [0.42, 0.47, 0.34],
+      isMedicalHospital: true,
+    });
+
+    // 7. Fortified FOB Armory & Stash Lockers (at lx = +18.0, lz = -7.0, houses `armory_stash`)
+    this.buildFobConcreteStation(t, 18.0, -7.0, 11.0, 8.0, 3.5, batcher, outObbs, outDecks, outIndoor, {
+      wallColor: [0.52, 0.54, 0.55],
+      accentColor: [accentR, accentG, accentB],
+      doorWall: 'left',
+      backDoor: false,
+      hasCommsMast: false,
+      stationKind: 'armory',
+    });
+
+    // 8. Barracks Bunkhouse + 2 Logistics/Billeting Field Tents + Motorpool Bay
+    this.buildFobConcreteStation(t, -29.0, 19.0, 12.0, 9.0, 3.4, batcher, outObbs, outDecks, outIndoor, {
+      wallColor: [0.56, 0.55, 0.50],
+      accentColor: [oliveR, oliveG, oliveB],
+      doorWall: 'right',
+      backDoor: true,
+      hasCommsMast: false,
+      stationKind: 'barracks',
+    });
+    this.buildFobTent(t, -29.0, 5.5, 10.0, 6.2, 2.9, batcher, outObbs, outDecks, outIndoor, {
+      roofColor: [0.34, 0.39, 0.27],
+      wallColor: [0.30, 0.34, 0.24],
+      isMedicalHospital: false,
+    });
+    this.buildFobTent(t, 29.0, 21.0, 10.0, 6.2, 2.9, batcher, outObbs, outDecks, outIndoor, {
+      roofColor: [0.36, 0.38, 0.28],
+      wallColor: [0.31, 0.33, 0.25],
+      isMedicalHospital: false,
+    });
+
+    // Motorpool Covered Shelter Bay (+31.5, -6.5 -> shifted to +31.5, +8.0? No, Armory is +18,-7 & Hosp is +18,+9 -> put Motorpool at (+32.5, +6.5))
+    {
+      const mx = 32.5;
+      const mz = 6.5;
+      const mw = 8.4;
+      const md = 10.0;
+      const mh = 4.0;
+      const mp = localToWorldXZ(t, mx, mz);
+      if (batcher) {
+        batcher.addBox('concrete', mp.x, t.wy - 0.25, mp.z, mw + 0.6, 0.70, md + 0.6, t.yaw, 0.50, 0.51, 0.50);
+        batcher.addBox('roofMetal', mp.x, t.wy + mh, mp.z, mw + 0.8, 0.22, md + 0.8, t.yaw, 0.36, 0.40, 0.38);
+      }
+      outDecks.push({
+        cx: mp.x,
+        cz: mp.z,
+        hx: mw * 0.5 + 0.35,
+        hz: md * 0.5 + 0.35,
+        cosY: t.cosY,
+        sinY: t.sinY,
+        baseY: t.wy + 0.10,
+        slopeAlongZ: 0,
+        thicknessM: 0.75,
+        surface: 'concrete',
+      });
+      for (const sx of [-mw * 0.46, mw * 0.46]) {
+        for (const sz of [-md * 0.45, 0, md * 0.45]) {
+          this.addSolidBox(t, batcher, outObbs, 'steel', 'metal', mx + sx, 0.10 + (mh - 0.21) * 0.5, mz + sz, 0.24, mh - 0.21, 0.24, 0.38, 0.41, 0.44);
+        }
+      }
+      outObbs.push({
+        cx: mp.x,
+        cy: t.wy + mh,
+        cz: mp.z,
+        hx: mw * 0.5 + 0.4,
+        hy: 0.15,
+        hz: md * 0.5 + 0.4,
+        cosY: t.cosY,
+        sinY: t.sinY,
+        surface: 'metal',
+        blocksBullets: true,
+        blocksPlayer: true,
+      });
+      if (vehiclesOut) {
+        vehiclesOut.push({
+          wx: mp.x,
+          wy: t.wy + 0.10,
+          wz: mp.z,
+          yaw: t.yaw,
+          colorHex: 0x4f5d47,
+        });
+      }
+    }
+
+    // 9. Barracks Live-Fire Gun Range (3 Lanes at lx in [+20..+37], lz in [-37..-17])
+    {
+      const rx = 28.0;
+      const shootZ = -18.5;
+      const rangePadP = localToWorldXZ(t, rx, -28.0);
+      if (batcher) {
+        batcher.addBox('concreteDark', rangePadP.x, t.wy - 0.25, rangePadP.z, 17.5, 0.70, 21.0, t.yaw, 0.46, 0.45, 0.42);
+        // Overhead shooting shed awning above shooter benches
+        const shedP = localToWorldXZ(t, rx, shootZ);
+        batcher.addBox('roofMetal', shedP.x, t.wy + 3.15, shedP.z, 16.5, 0.18, 4.2, t.yaw, 0.36, 0.40, 0.36);
+        batcher.addBox('emissiveFlood', shedP.x, t.wy + 2.98, shedP.z, 10.0, 0.08, 0.35, t.yaw, 1, 1, 1);
+      }
+      outDecks.push({
+        cx: rangePadP.x,
+        cz: rangePadP.z,
+        hx: 8.8,
+        hz: 10.6,
+        cosY: t.cosY,
+        sinY: t.sinY,
+        baseY: t.wy + 0.10,
+        slopeAlongZ: 0,
+        thicknessM: 0.75,
+        surface: 'concrete',
+      });
+      // Shooting canopy support posts & concrete firing tables for 3 lanes
+      for (const laneX of [22.5, 28.0, 33.5]) {
+        this.addSolidBox(t, batcher, outObbs, 'woodTrim', 'wood', laneX, 0.52, shootZ - 0.6, 1.85, 0.88, 0.85, 0.48, 0.38, 0.28);
+        // Lane divider stall partitions beside shooter
+        this.addSolidBox(t, batcher, outObbs, 'woodTrim', 'wood', laneX - 2.6, 1.35, shootZ - 0.4, 0.14, 2.5, 2.2, 0.42, 0.35, 0.25);
+      }
+      this.addSolidBox(t, batcher, outObbs, 'woodTrim', 'wood', 36.1, 1.35, shootZ - 0.4, 0.14, 2.5, 2.2, 0.42, 0.35, 0.25);
+      // Heavy Armored Backstop Berm Wall behind live-fire targets (lz = -37.2, skirted into terrain)
+      this.addSolidBox(t, batcher, outObbs, 'concrete', 'concrete', rx, 1.325, -37.2, 17.2, 3.95, 1.4, 0.54, 0.50, 0.42);
+    }
+
+    // 10. Barracks Walled CQB Shoot-House Range (lx in [0..+16], lz in [-36..-22])
+    {
+      const cx = 8.0;
+      const cz = -29.0;
+      const cw = 16.0;
+      const cd = 14.0;
+      const floorY = 0.18;
+      const wallH = 2.95;
+      const wt = 0.22;
+      const houseCenter = localToWorldXZ(t, cx, cz);
+
+      if (batcher) {
+        batcher.addBox('concrete', houseCenter.x, t.wy - 0.21, houseCenter.z, cw + 0.4, 0.78, cd + 0.4, t.yaw, 0.52, 0.52, 0.50);
+      }
+      outDecks.push({
+        cx: houseCenter.x,
+        cz: houseCenter.z,
+        hx: cw * 0.5 + 0.3,
+        hz: cd * 0.5 + 0.3,
+        cosY: t.cosY,
+        sinY: t.sinY,
+        baseY: t.wy + floorY,
+        slopeAlongZ: 0,
+        thicknessM: 0.24,
+        surface: 'concrete',
+      });
+
+      // Outer CQB walls (X-walls trimmed between Z-wall thicknesses so corners never overlap)
+      this.addWallAlongZ(t, batcher, outObbs, 'barnWood', 'wood', cz - cd * 0.5, cz + cd * 0.5, cx - cw * 0.5 + wt * 0.5, floorY, wallH, wt, 0.50, 0.44, 0.34, {
+        kind: 'door',
+        center: cz,
+        width: 2.0,
+        topH: 2.4,
+      });
+      this.addWallAlongZ(t, batcher, outObbs, 'barnWood', 'wood', cz - cd * 0.5, cz + cd * 0.5, cx + cw * 0.5 - wt * 0.5, floorY, wallH, wt, 0.50, 0.44, 0.34, {
+        kind: 'door',
+        center: cz + 2.5,
+        width: 1.65,
+        topH: 2.4,
+      });
+      this.addWallAlongX(t, batcher, outObbs, 'barnWood', 'wood', cx - cw * 0.5 + wt, cx + cw * 0.5 - wt, cz - cd * 0.5 + wt * 0.5, floorY, wallH, wt, 0.50, 0.44, 0.34);
+      this.addWallAlongX(t, batcher, outObbs, 'barnWood', 'wood', cx - cw * 0.5 + wt, cx + cw * 0.5 - wt, cz + cd * 0.5 - wt * 0.5, floorY, wallH, wt, 0.50, 0.44, 0.34, {
+        kind: 'door',
+        center: cx - 3.5,
+        width: 1.75,
+        topH: 2.4,
+      });
+
+      // Interior CQB Shoot-House Room Partitions & Breaching Doorways (X-partition split cleanly at Z-partition seam)
+      this.addWallAlongZ(t, batcher, outObbs, 'woodTrim', 'wood', cz - cd * 0.5 + wt, cz + 1.5, cx - 0.5, floorY, wallH - 0.1, 0.18, 0.56, 0.48, 0.35, {
+        kind: 'door',
+        center: cz - 3.2,
+        width: 1.55,
+        topH: 2.35,
+      });
+      this.addWallAlongX(t, batcher, outObbs, 'woodTrim', 'wood', cx - cw * 0.5 + wt, cx - 0.59, cz - 0.2, floorY, wallH - 0.1, 0.18, 0.56, 0.48, 0.35);
+      this.addWallAlongX(t, batcher, outObbs, 'woodTrim', 'wood', cx - 0.41, cx + cw * 0.5 - wt, cz - 0.2, floorY, wallH - 0.1, 0.18, 0.56, 0.48, 0.35, {
+        kind: 'door',
+        center: cx + 3.4,
+        width: 1.65,
+        topH: 2.35,
+      });
+      // Interior cover barricade inside East CQB bay
+      this.addSolidBox(t, batcher, outObbs, 'woodTrim', 'wood', cx + 4.2, floorY + 0.65, cz + 3.2, 2.0, 1.3, 0.45, 0.48, 0.40, 0.30);
+    }
+
+    // Exterior compound floodlight posts along main internal avenues
+    if (lightsOut) {
+      for (const [lx, lz, dyaw] of [
+        [-12, 22, 0],
+        [12, 22, Math.PI],
+        [12, -16, Math.PI],
+      ] as const) {
+        const lp = localToWorldXZ(t, lx, lz);
+        lightsOut.push({ wx: lp.x, wy: t.wy, wz: lp.z, yaw: t.yaw + dyaw });
+      }
+    }
+  }
+
+  private buildFobConcreteStation(
+    t: LocalTransform,
+    cx: number,
+    cz: number,
+    widthX: number,
+    depthZ: number,
+    wallH: number,
+    batcher: ChunkGeometryBatcher | null,
+    outObbs: SolidObb[],
+    outDecks: WalkDeck[],
+    outIndoor: IndoorVolume[],
+    opts: {
+      wallColor: [number, number, number];
+      accentColor: [number, number, number];
+      doorWall: 'front' | 'left' | 'right';
+      backDoor: boolean;
+      hasCommsMast: boolean;
+      stationKind: 'command' | 'armory' | 'barracks';
+    },
+  ): void {
+    const hx = widthX * 0.5;
+    const hz = depthZ * 0.5;
+    const floorY = 0.22;
+    const wt = 0.28;
+    const [wr, wg, wb] = opts.wallColor;
+    const [ar, ag, ab] = opts.accentColor;
+    const centerWorld = localToWorldXZ(t, cx, cz);
+
+    if (batcher) {
+      // Concrete foundation plinth stops at t.wy + 0.16; interior floor slab [0.16..0.22] sits cleanly atop it (zero coplanar Z-fighting)
+      batcher.addBox('concrete', centerWorld.x, t.wy - 0.74, centerWorld.z, widthX + 0.4, 1.8, depthZ + 0.4, t.yaw, 0.52, 0.53, 0.51);
+      batcher.addBox('concreteDark', centerWorld.x, t.wy + 0.19, centerWorld.z, widthX - 0.12, 0.06, depthZ - 0.12, t.yaw, 0.42, 0.44, 0.44);
+    }
+    outDecks.push({
+      cx: centerWorld.x,
+      cz: centerWorld.z,
+      hx: hx + 0.35,
+      hz: hz + 0.35,
+      cosY: t.cosY,
+      sinY: t.sinY,
+      baseY: t.wy + floorY,
+      slopeAlongZ: 0,
+      thicknessM: 0.28,
+      surface: 'concrete',
+    });
+
+    // +Z wall
+    this.addWallAlongX(
+      t, batcher, outObbs, 'concrete', 'concrete', cx - hx, cx + hx, cz + hz - wt * 0.5, floorY, wallH, wt, wr, wg, wb,
+      opts.doorWall === 'front'
+        ? { kind: 'door', center: cx, width: 2.1, topH: 2.45 }
+        : { kind: 'window', center: cx, width: 2.6, sillH: 1.05, topH: 2.15 },
+    );
+    // -Z wall
+    this.addWallAlongX(
+      t, batcher, outObbs, 'concrete', 'concrete', cx - hx, cx + hx, cz - hz + wt * 0.5, floorY, wallH, wt, wr, wg, wb,
+      opts.backDoor
+        ? { kind: 'door', center: cx - 1.5, width: 1.65, topH: 2.38 }
+        : { kind: 'window', center: cx, width: 2.2, sillH: 1.05, topH: 2.15 },
+    );
+    // -X wall
+    this.addWallAlongZ(
+      t, batcher, outObbs, 'concrete', 'concrete', cz - hz + wt, cz + hz - wt, cx - hx + wt * 0.5, floorY, wallH, wt, wr, wg, wb,
+      opts.doorWall === 'left'
+        ? { kind: 'door', center: cz, width: 2.0, topH: 2.45 }
+        : { kind: 'window', center: cz, width: 2.4, sillH: 1.05, topH: 2.15 },
+    );
+    // +X wall
+    this.addWallAlongZ(
+      t, batcher, outObbs, 'concrete', 'concrete', cz - hz + wt, cz + hz - wt, cx + hx - wt * 0.5, floorY, wallH, wt, wr, wg, wb,
+      opts.doorWall === 'right'
+        ? { kind: 'door', center: cz, width: 2.0, topH: 2.45 }
+        : { kind: 'window', center: cz, width: 2.4, sillH: 1.05, topH: 2.15 },
+    );
+
+    // Concrete roof slab + faction fascia trim
+    this.addSolidBox(t, batcher, outObbs, 'concreteDark', 'concrete', cx, floorY + wallH + 0.20, cz, widthX + 0.7, 0.40, depthZ + 0.7, 0.42, 0.44, 0.45);
+    if (batcher) {
+      batcher.addBox('fasciaTint', centerWorld.x, t.wy + floorY + wallH + 0.22, centerWorld.z, widthX + 0.8, 0.22, depthZ + 0.8, t.yaw, ar, ag, ab);
+      batcher.addBox('emissiveCanopy', centerWorld.x, t.wy + floorY + wallH - 0.04, centerWorld.z, 3.2, 0.06, 0.42, t.yaw, 1, 1, 1);
+      if (opts.hasCommsMast) {
+        const mastP = localToWorldXZ(t, cx + 2.8, cz - 1.8);
+        batcher.addBox('steel', mastP.x, t.wy + floorY + wallH + 5.8, mastP.z, 0.42, 11.2, 0.42, t.yaw, 0.46, 0.50, 0.54);
+        batcher.addBox('emissiveBeacon', mastP.x, t.wy + floorY + wallH + 11.5, mastP.z, 0.55, 0.55, 0.55, t.yaw, 1, 1, 1);
+      }
+    }
+
+    // Station-specific interior props
+    if (opts.stationKind === 'command') {
+      // Tactical map briefing table & radio comms cabinet
+      this.addSolidBox(t, batcher, outObbs, 'steel', 'metal', cx + 2.2, floorY + 0.48, cz - 1.6, 2.6, 0.96, 1.3, 0.34, 0.38, 0.42);
+      this.addSolidBox(t, batcher, outObbs, 'steel', 'metal', cx - 3.6, floorY + 1.05, cz - 2.6, 1.4, 2.1, 0.75, 0.30, 0.34, 0.36);
+    } else if (opts.stationKind === 'armory') {
+      // 5 Steel Player Stash Lockers along back/right interior walls + Weapon Rack + Armor Workbench
+      for (let k = 0; k < 5; k++) {
+        const lx = cx - 3.2 + k * 1.45;
+        this.addSolidBox(t, batcher, outObbs, 'steel', 'metal', lx, floorY + 1.05, cz - hz + 0.75, 1.15, 2.1, 0.72, 0.28, 0.34, 0.30);
+      }
+      // Gunsmith workbench & armor stand
+      this.addSolidBox(t, batcher, outObbs, 'woodTrim', 'wood', cx + 1.2, floorY + 0.46, cz + 1.8, 3.2, 0.92, 0.95, 0.46, 0.36, 0.26);
+      this.addSolidBox(t, batcher, outObbs, 'steel', 'metal', cx + hx - 0.85, floorY + 0.95, cz - 0.4, 0.65, 1.9, 3.4, 0.32, 0.36, 0.38);
+    } else {
+      // Barracks: 4 double bunk frames + footlockers
+      for (const bx of [cx - 3.8, cx - 1.2, cx + 1.4]) {
+        this.addSolidBox(t, batcher, outObbs, 'steel', 'metal', bx, floorY + 0.85, cz - 2.6, 1.1, 1.7, 2.1, 0.36, 0.38, 0.34);
+        this.addSolidBox(t, batcher, outObbs, 'woodTrim', 'wood', bx, floorY + 0.28, cz + 2.4, 0.95, 0.56, 0.55, 0.36, 0.38, 0.26);
+      }
+    }
+
+    outIndoor.push({
+      cx: centerWorld.x,
+      cz: centerWorld.z,
+      hx: hx - 0.3,
+      hz: hz - 0.3,
+      cosY: t.cosY,
+      sinY: t.sinY,
+      minY: t.wy + floorY - 0.1,
+      maxY: t.wy + floorY + wallH + 0.15,
+      material: 'concrete',
+    });
+  }
+
+  private buildFobTent(
+    t: LocalTransform,
+    cx: number,
+    cz: number,
+    widthX: number,
+    depthZ: number,
+    wallH: number,
+    batcher: ChunkGeometryBatcher | null,
+    outObbs: SolidObb[],
+    outDecks: WalkDeck[],
+    outIndoor: IndoorVolume[],
+    opts: {
+      roofColor: [number, number, number];
+      wallColor: [number, number, number];
+      isMedicalHospital: boolean;
+    },
+  ): void {
+    const hx = widthX * 0.5;
+    const hz = depthZ * 0.5;
+    const floorY = 0.18;
+    const wt = 0.16;
+    const [rr, rg, rb] = opts.roofColor;
+    const [wr, wg, wb] = opts.wallColor;
+    const centerWorld = localToWorldXZ(t, cx, cz);
+
+    if (batcher) {
+      // Foundation top = t.wy + 0.14; interior floor slab [0.14..0.18] rests flush atop foundation
+      batcher.addBox('concrete', centerWorld.x, t.wy - 0.71, centerWorld.z, widthX + 0.4, 1.7, depthZ + 0.4, t.yaw, 0.54, 0.55, 0.52);
+      batcher.addBox('concreteDark', centerWorld.x, t.wy + 0.16, centerWorld.z, widthX - 0.12, 0.04, depthZ - 0.12, t.yaw, 0.45, 0.47, 0.46);
+    }
+    outDecks.push({
+      cx: centerWorld.x,
+      cz: centerWorld.z,
+      hx: hx + 0.35,
+      hz: hz + 0.35,
+      cosY: t.cosY,
+      sinY: t.sinY,
+      baseY: t.wy + floorY,
+      slopeAlongZ: 0,
+      thicknessM: 0.25,
+      surface: 'concrete',
+    });
+
+    // Open canvas tent flaps on +X/-X (or -X/+Z for Field Hospital) + canvas side walls
+    this.addWallAlongZ(t, batcher, outObbs, 'wallSiding', 'wood', cz - hz, cz + hz, cx - hx + wt * 0.5, floorY, wallH, wt, wr, wg, wb, {
+      kind: 'door',
+      center: cz,
+      width: 2.6,
+      topH: 2.45,
+    });
+    this.addWallAlongZ(t, batcher, outObbs, 'wallSiding', 'wood', cz - hz, cz + hz, cx + hx - wt * 0.5, floorY, wallH, wt, wr, wg, wb, {
+      kind: 'door',
+      center: cz,
+      width: 2.6,
+      topH: 2.45,
+    });
+    this.addWallAlongX(t, batcher, outObbs, 'wallSiding', 'wood', cx - hx + wt, cx + hx - wt, cz + hz - wt * 0.5, floorY, wallH, wt, wr, wg, wb, {
+      kind: 'door',
+      center: cx,
+      width: 2.4,
+      topH: 2.4,
+    });
+    this.addWallAlongX(t, batcher, outObbs, 'wallSiding', 'wood', cx - hx + wt, cx + hx - wt, cz - hz + wt * 0.5, floorY, wallH, wt, wr, wg, wb);
+
+    const eaveY = t.wy + floorY + wallH;
+    if (batcher) {
+      batcher.addGableRoof('wallSiding', 'wallSiding', centerWorld.x, eaveY, centerWorld.z, widthX, depthZ, 1.55, t.yaw, rr, rg, rb, wr, wg, wb);
+      batcher.addBox('emissiveCanopy', centerWorld.x, eaveY - 0.12, centerWorld.z, 3.0, 0.06, 0.36, t.yaw, 1, 1, 1);
+      if (opts.isMedicalHospital) {
+        // Bold crimson Red Cross insignia atop the Field Hospital roof ridge (non-overlapping arms)
+        batcher.addBox('fasciaTint', centerWorld.x, eaveY + 1.56, centerWorld.z, 2.6, 0.10, 0.72, t.yaw, 0.85, 0.14, 0.14);
+        const crossN = localToWorldXZ(t, cx, cz - 0.83);
+        const crossS = localToWorldXZ(t, cx, cz + 0.83);
+        batcher.addBox('fasciaTint', crossN.x, eaveY + 1.56, crossN.z, 0.72, 0.10, 0.94, t.yaw, 0.85, 0.14, 0.14);
+        batcher.addBox('fasciaTint', crossS.x, eaveY + 1.56, crossS.z, 0.72, 0.10, 0.94, t.yaw, 0.85, 0.14, 0.14);
+      }
+    }
+
+    if (opts.isMedicalHospital) {
+      // Field Hospital surgical beds/cots & trauma supply cabinets
+      for (const mx of [cx - 3.6, cx - 1.2, cx + 1.2, cx + 3.6]) {
+        this.addSolidBox(t, batcher, outObbs, 'steel', 'metal', mx, floorY + 0.35, cz - 2.3, 1.0, 0.7, 2.0, 0.75, 0.78, 0.78);
+      }
+      this.addSolidBox(t, batcher, outObbs, 'steel', 'metal', cx - 3.5, floorY + 0.85, cz + 2.5, 2.2, 1.7, 0.65, 0.80, 0.82, 0.84);
+    } else {
+      // Supply crates & field tables inside logistics/billeting tent
+      this.addSolidBox(t, batcher, outObbs, 'woodTrim', 'wood', cx - 2.5, floorY + 0.55, cz - 1.6, 1.6, 1.1, 1.2, 0.44, 0.38, 0.28);
+      this.addSolidBox(t, batcher, outObbs, 'woodTrim', 'wood', cx + 2.4, floorY + 0.55, cz - 1.6, 1.6, 1.1, 1.2, 0.38, 0.42, 0.30);
+    }
+
+    outIndoor.push({
+      cx: centerWorld.x,
+      cz: centerWorld.z,
+      hx: hx - 0.25,
+      hz: hz - 0.25,
+      cosY: t.cosY,
+      sinY: t.sinY,
+      minY: t.wy + floorY - 0.1,
+      maxY: eaveY + 0.2,
+      material: 'wood',
+    });
   }
 
   // ============================================================================
@@ -2920,9 +3954,9 @@ export class OpenWorldArchitectureBuilder {
       const n = vehiclePlacements.length;
       const bodies = new THREE.InstancedMesh(this.vehicleBodyGeo, this.vehicleBodyMat, n);
       const trims = new THREE.InstancedMesh(this.vehicleTrimGeo, this.vehicleTrimMat, n);
-      bodies.castShadow = !this.isSoftwareGl;
-      bodies.receiveShadow = !this.isSoftwareGl;
-      trims.castShadow = !this.isSoftwareGl;
+      bodies.castShadow = this.shadowsEnabled;
+      bodies.receiveShadow = this.shadowsEnabled;
+      trims.castShadow = false;
 
       for (let i = 0; i < n; i++) {
         const p = vehiclePlacements[i];
@@ -2965,7 +3999,7 @@ export class OpenWorldArchitectureBuilder {
       const n = streetlightPlacements.length;
       const poles = new THREE.InstancedMesh(this.streetlightPoleGeo, this.streetlightPoleMat, n);
       const lamps = new THREE.InstancedMesh(this.streetlightLampGeo, this.streetlightEmissiveMat, n);
-      poles.castShadow = !this.isSoftwareGl;
+      poles.castShadow = false;
       for (let i = 0; i < n; i++) {
         const p = streetlightPlacements[i];
         _dummy.position.set(p.wx - centerX, p.wy, p.wz - centerZ);
@@ -2988,7 +4022,7 @@ export class OpenWorldArchitectureBuilder {
     if (polePlacements.length > 0) {
       const n = polePlacements.length;
       const poles = new THREE.InstancedMesh(this.utilityPoleGeo, this.utilityPoleMat, n);
-      poles.castShadow = !this.isSoftwareGl;
+      poles.castShadow = false;
       for (let i = 0; i < n; i++) {
         const p = polePlacements[i];
         _dummy.position.set(p.wx - centerX, p.wy, p.wz - centerZ);
@@ -3057,8 +4091,8 @@ export class OpenWorldArchitectureBuilder {
     if (guardrailPlacements.length > 0) {
       const n = guardrailPlacements.length;
       const rails = new THREE.InstancedMesh(this.guardrailGeo, this.guardrailMat, n);
-      rails.castShadow = !this.isSoftwareGl;
-      rails.receiveShadow = !this.isSoftwareGl;
+      rails.castShadow = false;
+      rails.receiveShadow = this.shadowsEnabled;
       for (let i = 0; i < n; i++) {
         const p = guardrailPlacements[i];
         _dummy.position.set(p.wx - centerX, p.wy, p.wz - centerZ);
@@ -3078,8 +4112,8 @@ export class OpenWorldArchitectureBuilder {
     if (barrierPlacements.length > 0) {
       const n = barrierPlacements.length;
       const barriers = new THREE.InstancedMesh(this.barrierGeo, this.barrierMat, n);
-      barriers.castShadow = !this.isSoftwareGl;
-      barriers.receiveShadow = !this.isSoftwareGl;
+      barriers.castShadow = this.shadowsEnabled;
+      barriers.receiveShadow = this.shadowsEnabled;
       for (let i = 0; i < n; i++) {
         const p = barrierPlacements[i];
         _dummy.position.set(p.wx - centerX, p.wy, p.wz - centerZ);
@@ -3152,5 +4186,35 @@ export class OpenWorldArchitectureBuilder {
     this.signPostGeo.dispose();
     this.signBoardGeo.dispose();
     this.midSiteGeo.dispose();
+  }
+
+  /**
+   * Diagnostic audit helper (used by automated Z-fighting/coplanarity tests)
+   * that returns all box primitives emitted for a given FOB compound or baked site.
+   */
+  public auditFobCompoundBoxes(fob: FobCompoundSpec): AuditedArchBox[] {
+    const log: AuditedArchBox[] = [];
+    const batcher = new ChunkGeometryBatcher(fob.worldX, fob.worldZ, log);
+    this.buildFobCompound(fob, batcher, [], [], [], null, null, null);
+    return log;
+  }
+
+  public auditSiteBoxes(site: BakedOpenWorldSite): AuditedArchBox[] {
+    const log: AuditedArchBox[] = [];
+    const batcher = new ChunkGeometryBatcher(site.x, site.z, log);
+    this.buildSite(site, batcher, [], [], [], null, null, null);
+    return log;
+  }
+
+  public auditHorizonCivilizationBoxes(): AuditedArchBox[] {
+    const log: AuditedArchBox[] = [];
+    const batcher = new ChunkGeometryBatcher(0, 0, log);
+    const wires: number[] = [];
+    for (const b of getBakedRiverBridges()) this.appendSteelTrussBridgeGeometry(batcher, b);
+    for (const t of getBakedHorizonTowers()) {
+      if (t.kind === 'water_tower') this.appendWaterTowerGeometry(batcher, t);
+      else this.appendRadioMastGeometry(batcher, t, wires);
+    }
+    return log;
   }
 }

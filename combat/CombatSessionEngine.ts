@@ -43,6 +43,7 @@ import {
   tacticalEquipmentStore,
   TacticalGrenadeSystem,
   TacticalPdaDevice,
+  VIEWMODEL_LAYER,
   WeaponRig,
 } from '../bodycam-sdk';
 import {
@@ -66,7 +67,11 @@ import {
   TacticalBeltSlot,
   TacticalEquipmentId,
 } from '../data/tacticalEquipment';
-import { getGraphicsQualityProfile, graphicsQualityStore } from '../data/graphicsQuality';
+import {
+  AdaptivePerformanceController,
+  getGraphicsQualityProfile,
+  graphicsQualityStore,
+} from '../data/graphicsQuality';
 import { killfeedPreferenceStore } from '../data/killfeedSettings';
 import { loadoutStore } from '../data/loadoutStore';
 import { CombatantMatchStats } from '../data/progression';
@@ -238,7 +243,9 @@ export interface CombatSessionSnapshot {
   heartStress: number;
   holdBreathActive: boolean;
 
-  // Hitmarker
+  // Hitmarker & Host Match Visibility (Battle Mode)
+  hitmarkersEnabled: boolean;
+  hudEnabled: boolean;
   hitmarkerActive: boolean;
   hitmarkerHeadshot: boolean;
   hitmarkerKill: boolean;
@@ -247,7 +254,7 @@ export interface CombatSessionSnapshot {
   equippedWeaponId: string;
   equippedWeaponName: string;
   equippedCaliber: string;
-  activeSlotIndex: number; // 0, 1, or -1 (unarmed)
+  activeSlotIndex: number; // 0, 1, -2 (combat_knife), or -1 (unarmed)
   weaponSlots: Array<{ id: string; name: string }>;
   ammoInMag: number;
   magCapacity: number;
@@ -543,7 +550,9 @@ export class CombatSessionEngine {
   private reloadTimer = 0;
   private stamina = 1.0;
 
-  // Hitmarker & physiology
+  // Hitmarker & Host Match Visibility (Battle Mode)
+  private hitmarkersEnabled = true;
+  private hudEnabled = true;
   private hitmarkerTimer = 0;
   private hitmarkerHeadshot = false;
   private hitmarkerKill = false;
@@ -602,16 +611,23 @@ export class CombatSessionEngine {
   private readonly _traumaMods: BodycamTraumaModifiers = { ...DEFAULT_TRAUMA_MODIFIERS };
   private readonly _runtimeProfile: BodycamWeaponProfile;
   private readonly _scopePassParams: ScopePassParams;
+  private readonly adaptivePerf: AdaptivePerformanceController;
+  private unsubAdaptiveScaling: (() => void) | null = null;
 
   constructor(container: HTMLElement, params: CombatSessionParams) {
     this.container = container;
     this.params = params;
+    if (params.mode === 'battle') {
+      this.hitmarkersEnabled = params.battleConfig.hitmarkersEnabled !== false;
+      this.hudEnabled = params.battleConfig.hudEnabled !== false;
+    }
 
     const width = Math.max(1, container.clientWidth);
     const height = Math.max(1, container.clientHeight);
 
     const activeQuality = graphicsQualityStore.getQuality();
     const qProfile = getGraphicsQualityProfile(activeQuality);
+    this.adaptivePerf = new AdaptivePerformanceController(qProfile);
     this.config.graphicsQuality = activeQuality;
     this.config.showKillfeed = killfeedPreferenceStore.getEnabled();
 
@@ -732,11 +748,11 @@ export class CombatSessionEngine {
       });
     } else {
       this.zombieAI = new InfectionZombieAI(this.scene, this.map, this.audio, {
-        zombieHealthMult: evCfg?.zombieHealthMult,
-        zombieMoveSpeedMult: evCfg?.zombieMoveSpeedMult,
-        zombieAttackSpeedMult: evCfg?.zombieAttackSpeedMult,
-        zombieSpawnAmountMult: evCfg?.zombieSpawnAmountMult,
-        waveBreakIntervalSec: evCfg?.waveBreakIntervalSec,
+        zombieHealthMult: evCfg?.zombieHealthMult ?? params.infectionConfig.zombieHealthMult,
+        zombieMoveSpeedMult: evCfg?.zombieMoveSpeedMult ?? params.infectionConfig.zombieMoveSpeedMult,
+        zombieAttackSpeedMult: evCfg?.zombieAttackSpeedMult ?? params.infectionConfig.zombieAttackSpeedMult,
+        zombieSpawnAmountMult: evCfg?.zombieSpawnAmountMult ?? params.infectionConfig.zombieSpawnAmountMult,
+        waveBreakIntervalSec: evCfg?.waveBreakIntervalSec ?? params.infectionConfig.waveBreakIntervalSec,
         isClientReplica,
       });
 
@@ -1045,14 +1061,35 @@ export class CombatSessionEngine {
       excludeObjects: [this.skeleton.root, this.weaponRig.root, this.pdaDevice.root],
     });
 
-    // Pre-warm WebGL shaders once at boot on hardware GPUs to eliminate mid-combat GLSL compile hitches
+    // Pre-warm grenade & WebGL shaders once at boot on hardware GPUs to eliminate mid-combat GLSL compile hitches
     if (!this.isSoftwareGl) {
       try {
+        this.grenadeSystem.prewarm(
+          this.renderer,
+          this.scene,
+          this.camera,
+          this.skeleton.throwHandSocket,
+          VIEWMODEL_LAYER,
+        );
         this.renderer.compile(this.scene, this.camera);
       } catch {
         // Non-fatal fallback
       }
     }
+
+    this.unsubAdaptiveScaling = graphicsQualityStore.subscribeAdaptiveScaling((enabled) => {
+      if (!enabled && !this.isSoftwareGl) {
+        const qProf = getGraphicsQualityProfile(graphicsQualityStore.getQuality());
+        this.adaptivePerf.reset(qProf);
+        this.renderer.setPixelRatio(
+          Math.min(window.devicePixelRatio || 1, qProf.maxDpr),
+        );
+        this.postProcess.setSize(
+          Math.max(1, this.container.clientWidth),
+          Math.max(1, this.container.clientHeight),
+        );
+      }
+    });
 
     this.bindEvents();
     this.emitSnapshot();
@@ -1278,7 +1315,7 @@ export class CombatSessionEngine {
     this._runtimeProfile.recoilPitchRad = base.recoilPitchRad * derived.recoilPitchMult;
     this._runtimeProfile.recoilYawRad = base.recoilYawRad * derived.recoilYawMult;
 
-    if (base.holdClass !== 'unarmed') {
+    if (base.holdClass !== 'unarmed' && base.holdClass !== 'melee_1h') {
       this._runtimeProfile.caliberLabel = `${ammo.shortName} · ${calId.toUpperCase()}`;
       this._runtimeProfile.muzzleVelocityMps =
         ammo.baseVelocityMs * (base.barrelVelocityMult ?? 1.0) * derived.velocityMult;
@@ -1345,10 +1382,37 @@ export class CombatSessionEngine {
       this.equipWeaponById('unarmed', silent);
       return;
     }
+    if (slotIdx === -2) {
+      this.activeSlotIndex = -2;
+      this.equipWeaponById('combat_knife', silent);
+      return;
+    }
     const wId = this.weaponSlots[slotIdx];
     if (!wId) return;
     this.activeSlotIndex = slotIdx;
     this.equipWeaponById(wId, silent);
+  }
+
+  public setHostMatchVisibility(patch: {
+    hitmarkersEnabled?: boolean;
+    hudEnabled?: boolean;
+  }): void {
+    if (this.params.mode !== 'battle') return;
+    let changed = false;
+    if (typeof patch.hitmarkersEnabled === 'boolean' && patch.hitmarkersEnabled !== this.hitmarkersEnabled) {
+      this.hitmarkersEnabled = patch.hitmarkersEnabled;
+      if (!this.hitmarkersEnabled) {
+        this.hitmarkerTimer = 0;
+      }
+      changed = true;
+    }
+    if (typeof patch.hudEnabled === 'boolean' && patch.hudEnabled !== this.hudEnabled) {
+      this.hudEnabled = patch.hudEnabled;
+      changed = true;
+    }
+    if (changed) {
+      this.emitSnapshot();
+    }
   }
 
   private spawnPlayerAtStart(): void {
@@ -1426,6 +1490,7 @@ export class CombatSessionEngine {
       !this.weaponRig.isTubularReloading() &&
       !this.weaponRig.isBlockingFiringAction() &&
       this._runtimeProfile.holdClass !== 'unarmed' &&
+      this._runtimeProfile.holdClass !== 'melee_1h' &&
       (this.magAmmoByWeapon[this._runtimeProfile.id] ?? 0) > 0
     );
   }
@@ -2429,8 +2494,13 @@ export class CombatSessionEngine {
     if (patch.graphicsQuality) {
       graphicsQualityStore.setQuality(patch.graphicsQuality);
       const qProfile = getGraphicsQualityProfile(patch.graphicsQuality);
+      this.adaptivePerf.syncProfile(qProfile);
       this.renderer.setPixelRatio(
         this.isSoftwareGl ? 1 : Math.min(window.devicePixelRatio || 1, qProfile.maxDpr),
+      );
+      this.postProcess.setSize(
+        Math.max(1, this.container.clientWidth),
+        Math.max(1, this.container.clientHeight),
       );
       this.renderer.shadowMap.enabled = !this.isSoftwareGl && qProfile.castShadows;
       this.renderer.shadowMap.needsUpdate = true;
@@ -3366,8 +3436,18 @@ export class CombatSessionEngine {
   private handleMeleeHit(ev: Readonly<BodycamMeleeHitEvent>): void {
     const ud = ev.object?.userData;
     const isKick = ev.attackType === 'kick';
-    const meleeDmg = isKick ? 42 : ev.attackType === 'bash' ? 68 : 52;
-    const kbSpeed = isKick ? 7.8 : 4.6;
+    const isKnife = ev.attackType === 'knife_slash' || ev.attackType === 'knife_stab';
+    const meleeDmg =
+      ev.attackType === 'knife_stab'
+        ? 95
+        : ev.attackType === 'knife_slash'
+          ? 55
+          : isKick
+            ? 42
+            : ev.attackType === 'bash'
+              ? 68
+              : 52;
+    const kbSpeed = isKick ? 7.8 : isKnife ? 3.2 : 4.6;
 
     // Physical Destructible Doors: melee bash/punch/kick -> exact geometric punch-through holes + hinge velocity
     if (ud?.destructibleDoorId && this.map.doorSystem) {
@@ -4380,6 +4460,15 @@ export class CombatSessionEngine {
       return;
     }
 
+    if (prof.holdClass === 'melee_1h') {
+      if (this.semiTriggerConsumed || this.controller.isVaulting()) return;
+      if (this.animator.triggerKnifeSlash(this.controller)) {
+        this.semiTriggerConsumed = true;
+        this.stamina = Math.max(0, this.stamina - 0.04);
+      }
+      return;
+    }
+
     if (prof.fireMode === 'none' || prof.magCapacity <= 0) return;
     const curAmmo = this.magAmmoByWeapon[prof.id] ?? 0;
     if (this.weaponRig.isTubularReloading()) {
@@ -4523,7 +4612,7 @@ export class CombatSessionEngine {
       return;
     }
     const prof = this._runtimeProfile;
-    if (prof.holdClass === 'unarmed') {
+    if (prof.holdClass === 'unarmed' || prof.holdClass === 'melee_1h') {
       this.showToast('No Suppressor Equipped');
       return;
     }
@@ -4734,10 +4823,16 @@ export class CombatSessionEngine {
       this.semiTriggerConsumed = false;
       this.attemptFire();
     } else if (e.button === 2) {
-      this.input.ads = true;
+      if (this._runtimeProfile.holdClass === 'melee_1h') {
+        if (!this.controller.isVaulting() && this.animator.triggerKnifeStab(this.controller)) {
+          this.stamina = Math.max(0, this.stamina - 0.08);
+        }
+      } else {
+        this.input.ads = true;
+      }
     } else if (e.button === 1) {
       const prof = this._runtimeProfile;
-      if (prof.holdClass === 'unarmed') return;
+      if (prof.holdClass === 'unarmed' || prof.holdClass === 'melee_1h') return;
       const cur = this.adsModeByWeapon[prof.id] ?? 'PRIMARY';
       const next: AdsMode = cur === 'POINT_AIM' ? 'PRIMARY' : 'POINT_AIM';
       this.adsModeByWeapon[prof.id] = next;
@@ -4835,6 +4930,9 @@ export class CombatSessionEngine {
       case 'Digit2':
         this.equipSlot(1);
         break;
+      case 'Digit3':
+        this.equipSlot(-2);
+        break;
       case 'Digit4':
       case 'Digit5':
       case 'KeyH':
@@ -4842,6 +4940,16 @@ export class CombatSessionEngine {
         break;
       case 'Digit0':
         this.equipSlot(-1);
+        break;
+      case 'KeyI':
+        if (
+          !e.repeat &&
+          !this.pdaDevice.isBlockingWeaponActions() &&
+          !this.controller.isSprinting &&
+          !this.controller.isVaulting()
+        ) {
+          this.weaponRig.triggerInspect();
+        }
         break;
       case 'KeyW':
         this.input.forward = true;
@@ -4941,6 +5049,8 @@ export class CombatSessionEngine {
         ) {
           if (this._runtimeProfile.holdClass === 'unarmed') {
             this.animator.triggerUnarmedPunch(this.controller, false);
+          } else if (this._runtimeProfile.holdClass === 'melee_1h') {
+            this.animator.triggerKnifeSlash(this.controller);
           } else if (this.animator.triggerArmedBash(this.controller, this._runtimeProfile.holdClass)) {
             this.reloadTimer = 0;
           }
@@ -5514,6 +5624,21 @@ export class CombatSessionEngine {
       this.fpsFrames = 0;
     }
 
+    if (!this.isSoftwareGl) {
+      const adapt = this.adaptivePerf.update(
+        rawDt * 1000,
+        graphicsQualityStore.isAdaptiveScalingEnabled(),
+        this.elapsedSec,
+      );
+      if (adapt.changed) {
+        this.renderer.setPixelRatio(adapt.effectiveDpr);
+        this.postProcess.setSize(
+          Math.max(1, this.container.clientWidth),
+          Math.max(1, this.container.clientHeight),
+        );
+      }
+    }
+
     if (this.toastTimer > 0) {
       this.toastTimer -= dt;
       if (this.toastTimer <= 0) this.toastMessage = null;
@@ -5631,7 +5756,11 @@ export class CombatSessionEngine {
       baseAdsMode === 'PRIMARY' &&
       this.weaponRig.shouldForceNodsCantedAim(true);
     this.input.adsMode = nodsForceCant ? 'POINT_AIM' : baseAdsMode;
-    const firearmAdsBlocking = this.input.ads && prof.holdClass !== 'unarmed' && !grenadeDrawn;
+    const firearmAdsBlocking =
+      this.input.ads &&
+      prof.holdClass !== 'unarmed' &&
+      prof.holdClass !== 'melee_1h' &&
+      !grenadeDrawn;
     this.input.sprint = !suppBusy && !pdaBusy && this.shiftHeld && !firearmAdsBlocking;
     this.input.holdBreath = !suppBusy && !pdaBusy && this.input.ads && (this.shiftHeld || this.altHeld);
 
@@ -6339,7 +6468,9 @@ export class CombatSessionEngine {
       heartStress: this.heartStress,
       holdBreathActive: this.controller.isHoldBreathActive(),
 
-      hitmarkerActive: this.hitmarkerTimer > 0,
+      hitmarkersEnabled: this.hitmarkersEnabled,
+      hudEnabled: this.hudEnabled,
+      hitmarkerActive: this.hitmarkersEnabled && this.hitmarkerTimer > 0,
       hitmarkerHeadshot: this.hitmarkerHeadshot,
       hitmarkerKill: this.hitmarkerKill,
 
@@ -6709,6 +6840,8 @@ export class CombatSessionEngine {
     this.unsubTacticalEquipment = null;
     this.unsubOperatorGear?.();
     this.unsubOperatorGear = null;
+    this.unsubAdaptiveScaling?.();
+    this.unsubAdaptiveScaling = null;
     this.camera.remove(this.irIlluminatorLight);
     this.camera.remove(this.irIlluminatorTarget);
     if (document.pointerLockElement === this.renderer.domElement) {

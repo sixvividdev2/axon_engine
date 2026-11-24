@@ -21,6 +21,7 @@ import {
 import {
   GRAPHICS_QUALITY_ORDER,
   GRAPHICS_QUALITY_PROFILES,
+  useAdaptiveScaling,
   useGraphicsQuality,
 } from '../data/graphicsQuality';
 import { useKillfeedPreference } from '../data/killfeedSettings';
@@ -87,6 +88,7 @@ export const MainMenuHub: React.FC<MainMenuHubProps> = ({
   const loadoutState = useLoadoutStore();
   const activeLoadout = loadoutState.slots[loadoutState.activeIndex] ?? loadoutState.slots[0];
   const [graphicsQuality, setGraphicsQuality] = useGraphicsQuality();
+  const [adaptiveScaling, setAdaptiveScaling] = useAdaptiveScaling();
   const [personalKillfeed, setPersonalKillfeed] = useKillfeedPreference();
   const [lobbyWorkbenchOpen, setLobbyWorkbenchOpen] = useState<boolean>(false);
   const [activeTab, setActiveTab] = useState<HubTabId>(lobby ? 'multiplayer' : initialTab);
@@ -623,6 +625,46 @@ export const MainMenuHub: React.FC<MainMenuHubProps> = ({
                 onChangeTimeOfDay={(timeOfDayStart) => updateBattle({ timeOfDayStart })}
               />
 
+              {/* Host Match Visibility Controls (Hitmarkers & Combat HUD) */}
+              <div className="flex flex-wrap items-center justify-between gap-3 border border-neutral-800 bg-neutral-950/88 px-4 py-3">
+                <div>
+                  <div className="font-mono-tabular text-[10px] uppercase tracking-[0.18em] text-amber-400">
+                    Match Rules · HUD &amp; Hitmarkers
+                  </div>
+                  <div className="mt-0.5 font-mono-tabular text-[11px] text-neutral-400">
+                    Toggle Battle hitmarkers and combat HUD overlays independently (also adjustable live in-match)
+                  </div>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      updateBattle({ hitmarkersEnabled: battleConfig.hitmarkersEnabled === false })
+                    }
+                    className={`cursor-pointer whitespace-nowrap border px-3 py-1.5 font-mono-tabular text-[11px] font-semibold uppercase transition-colors ${
+                      battleConfig.hitmarkersEnabled !== false
+                        ? 'border-emerald-500/70 bg-emerald-950/45 text-emerald-300'
+                        : 'border-neutral-700 bg-neutral-900 text-neutral-400 hover:text-neutral-200'
+                    }`}
+                  >
+                    Hitmarkers: {battleConfig.hitmarkersEnabled !== false ? 'ON' : 'OFF'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      updateBattle({ hudEnabled: battleConfig.hudEnabled === false })
+                    }
+                    className={`cursor-pointer whitespace-nowrap border px-3 py-1.5 font-mono-tabular text-[11px] font-semibold uppercase transition-colors ${
+                      battleConfig.hudEnabled !== false
+                        ? 'border-emerald-500/70 bg-emerald-950/45 text-emerald-300'
+                        : 'border-neutral-700 bg-neutral-900 text-neutral-400 hover:text-neutral-200'
+                    }`}
+                  >
+                    Combat HUD: {battleConfig.hudEnabled !== false ? 'ON' : 'OFF'}
+                  </button>
+                </div>
+              </div>
+
               <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
                 <div className="font-mono-tabular text-xs text-neutral-400">
                   {battleConfig.rule === 'tdm'
@@ -638,6 +680,8 @@ export const MainMenuHub: React.FC<MainMenuHubProps> = ({
                       tacticalEquipmentId: tacticalSelection.equipmentId,
                       weatherPreset: battleConfig.weatherPreset ?? 'auto',
                       timeOfDayStart: battleConfig.timeOfDayStart ?? 'auto',
+                      hitmarkersEnabled: battleConfig.hitmarkersEnabled !== false,
+                      hudEnabled: battleConfig.hudEnabled !== false,
                     })
                   }
                   className="cursor-pointer whitespace-nowrap shrink-0 bg-amber-500 px-8 py-3 font-display text-base font-bold uppercase tracking-wider text-neutral-950 transition-colors hover:bg-amber-400"
@@ -864,7 +908,7 @@ export const MainMenuHub: React.FC<MainMenuHubProps> = ({
                   key={gid}
                   type="button"
                   onClick={() => setGraphicsQuality(gid)}
-                  className={`cursor-pointer border px-1.5 py-0.5 text-[10px] uppercase transition-colors ${
+                  className={`cursor-pointer border px-1.5 py-0.5 text-[10px] uppercase transition-colors whitespace-nowrap shrink-0 ${
                     graphicsQuality === gid
                       ? 'border-amber-400 bg-amber-500/20 text-amber-300'
                       : 'border-neutral-800 bg-neutral-900 text-neutral-500 hover:text-neutral-200'
@@ -874,6 +918,18 @@ export const MainMenuHub: React.FC<MainMenuHubProps> = ({
                   {GRAPHICS_QUALITY_PROFILES[gid].shortLabel}
                 </button>
               ))}
+              <button
+                type="button"
+                onClick={() => setAdaptiveScaling(!adaptiveScaling)}
+                className={`ml-1 cursor-pointer border px-2 py-0.5 text-[10px] uppercase transition-colors whitespace-nowrap shrink-0 ${
+                  adaptiveScaling
+                    ? 'border-sky-400/70 bg-sky-950/50 text-sky-300'
+                    : 'border-neutral-800 bg-neutral-900 text-neutral-500 hover:text-neutral-200'
+                }`}
+                title="Automatically scale resolution & secondary effects if framerate drops below target (OFF by default)"
+              >
+                Adaptive: {adaptiveScaling ? 'ON' : 'OFF'}
+              </button>
             </div>
             <button
               type="button"

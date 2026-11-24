@@ -11,6 +11,7 @@ export type TacticalItemKind =
   | 'intel'
   | 'key'
   | 'barter'
+  | 'battery'
   | 'weapon_loose';
 
 export type MagazineClass = 'rifle' | 'pistol';
@@ -111,6 +112,13 @@ export interface LooseWeaponItem extends TacticalItemBase {
   weaponId: string;
 }
 
+export interface BatteryItem extends TacticalItemBase {
+  kind: 'battery';
+  chargePct: number;
+  usesRemaining: number;
+  maxUses: number;
+}
+
 export interface GenericLootItem extends TacticalItemBase {
   kind: 'intel' | 'key' | 'barter';
   quantity: number;
@@ -125,6 +133,7 @@ export type TacticalItem =
   | BackpackItem
   | ArmorPlateItem
   | LooseWeaponItem
+  | BatteryItem
   | GenericLootItem;
 
 export interface EquippedWeaponSlotState {

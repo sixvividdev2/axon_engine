@@ -267,7 +267,9 @@ export class TacticalGrenadeSystem {
   private heldBoneEquipmentId: TacticalEquipmentId | null = null;
   private heldBoneLayer = VIEWMODEL_LAYER;
   private heldBoneRingAttachedTo: THREE.Object3D | null = null;
+  private readonly heldBonePool = new Map<string, BuiltTacticalEquipmentMesh>();
   private lastThrowHandSocket: THREE.Object3D | null = null;
+  private prewarmed = false;
   private weaponStowBlend = 0;
   private pinPullPhase: GrenadePinPullPhase = 'NONE';
   private pinPullElapsed = 0;
@@ -538,18 +540,19 @@ export class TacticalGrenadeSystem {
   }
 
   private disposeHeldBoneMesh(): void {
-    if (this.heldBoneBuilt) {
-      if (this.heldBoneBuilt.pullRingMesh.parent) {
-        this.heldBoneBuilt.pullRingMesh.parent.remove(this.heldBoneBuilt.pullRingMesh);
+    for (const built of this.heldBonePool.values()) {
+      if (built.pullRingMesh.parent) {
+        built.pullRingMesh.parent.remove(built.pullRingMesh);
       }
-      if (this.heldBoneBuilt.group.parent) {
-        this.heldBoneBuilt.group.parent.remove(this.heldBoneBuilt.group);
+      if (built.group.parent) {
+        built.group.parent.remove(built.group);
       }
-      this.heldBoneBuilt.dispose();
-      this.heldBoneBuilt = null;
-      this.heldBoneEquipmentId = null;
-      this.heldBoneRingAttachedTo = null;
+      built.dispose();
     }
+    this.heldBonePool.clear();
+    this.heldBoneBuilt = null;
+    this.heldBoneEquipmentId = null;
+    this.heldBoneRingAttachedTo = null;
   }
 
   private ensureHeldBoneMesh(
@@ -559,26 +562,157 @@ export class TacticalGrenadeSystem {
   ): BuiltTacticalEquipmentMesh {
     this.lastThrowHandSocket = throwHandSocket;
     if (
-      !this.heldBoneBuilt ||
-      this.heldBoneEquipmentId !== equipmentId ||
-      this.heldBoneLayer !== renderLayer
+      this.heldBoneBuilt &&
+      (this.heldBoneEquipmentId !== equipmentId || this.heldBoneLayer !== renderLayer)
     ) {
-      this.disposeHeldBoneMesh();
-      this.heldBoneLayer = renderLayer;
-      this.heldBoneBuilt = buildTacticalEquipmentMesh(equipmentId, {
+      this.heldBoneBuilt.group.visible = false;
+      this.heldBoneBuilt.pullRingMesh.visible = false;
+    }
+
+    const poolKey = `${equipmentId}:${renderLayer}`;
+    let built = this.heldBonePool.get(poolKey);
+    if (!built) {
+      built = buildTacticalEquipmentMesh(equipmentId, {
         withBeltClip: false,
         scale: 1.0,
         renderLayer,
       });
-      this.heldBoneEquipmentId = equipmentId;
-      this.heldBoneBuilt.group.position.copy(this.heldBoneBuilt.gripOffset.position);
-      this.heldBoneBuilt.group.rotation.copy(this.heldBoneBuilt.gripOffset.rotation);
-      throwHandSocket.add(this.heldBoneBuilt.group);
-      this.heldBoneRingAttachedTo = this.heldBoneBuilt.group;
-    } else if (this.heldBoneBuilt.group.parent !== throwHandSocket) {
-      throwHandSocket.add(this.heldBoneBuilt.group);
+      built.group.position.copy(built.gripOffset.position);
+      built.group.rotation.copy(built.gripOffset.rotation);
+      built.group.visible = false;
+      built.pullRingMesh.visible = false;
+      throwHandSocket.add(built.group);
+      this.heldBonePool.set(poolKey, built);
+    } else if (built.group.parent !== throwHandSocket) {
+      throwHandSocket.add(built.group);
     }
-    return this.heldBoneBuilt;
+
+    this.heldBoneLayer = renderLayer;
+    this.heldBoneEquipmentId = equipmentId;
+    this.heldBoneBuilt = built;
+    if (!this.heldBoneRingAttachedTo) {
+      this.heldBoneRingAttachedTo = built.group;
+    }
+    return built;
+  }
+
+  /**
+   * Pre-builds and WebGL-compiles all 4 tactical equipment meshes (both Layer 0 projectile &
+   * VIEWMODEL_LAYER first-person bone meshes), spoon prop, and pooled VFX shaders once at session
+   * startup so pulling out a grenade or detonating ordnance mid-match causes zero shader hitches.
+   */
+  public prewarm(
+    renderer: THREE.WebGLRenderer,
+    scene: THREE.Scene,
+    camera: THREE.Camera,
+    throwHandSocket?: THREE.Object3D | null,
+    renderLayer = VIEWMODEL_LAYER,
+  ): void {
+    if (this.prewarmed) return;
+    this.prewarmed = true;
+
+    const allIds: readonly TacticalEquipmentId[] = [
+      'm67_frag',
+      'm84_flash',
+      'm18_smoke',
+      'an_m14_thermite',
+    ];
+
+    const worldWarmupProxies: BuiltTacticalEquipmentMesh[] = [];
+    for (let i = 0; i < allIds.length; i++) {
+      const builtWorld = buildTacticalEquipmentMesh(allIds[i], {
+        withBeltClip: false,
+        scale: 1.0,
+        renderLayer: 0,
+      });
+      builtWorld.group.position.set(0, -450, 0);
+      this.root.add(builtWorld.group);
+      worldWarmupProxies.push(builtWorld);
+    }
+
+    const spoonProxy = new THREE.Mesh(this.geoSpoonProp, this.matSpoonProp);
+    spoonProxy.position.set(0, -450, 0);
+    this.root.add(spoonProxy);
+
+    // Temporarily reveal 1 explosion, 1 smoke cloud, and 1 thermite zone for shader pre-compile
+    const exp0 = this.explosions[0];
+    const prevExpVis = exp0 ? exp0.group.visible : false;
+    const prevExpCount = exp0 ? exp0.sparkInst.count : 0;
+    if (exp0) {
+      exp0.group.position.set(0, -450, 0);
+      exp0.group.visible = true;
+      exp0.sparkInst.count = 1;
+    }
+    const smk0 = this.smokeClouds[0];
+    const prevSmkVis = smk0 ? smk0.group.visible : false;
+    const prevSmkPuffVis = smk0?.puffs[0]?.mesh.visible ?? false;
+    if (smk0) {
+      smk0.group.position.set(0, -450, 0);
+      smk0.group.visible = true;
+      if (smk0.puffs[0]) smk0.puffs[0].mesh.visible = true;
+    }
+    const th0 = this.thermiteZones[0];
+    const prevThVis = th0 ? th0.group.visible : false;
+    if (th0) {
+      th0.group.position.set(0, -450, 0);
+      th0.group.visible = true;
+    }
+
+    // Ensure viewmodel held-grenade pool entries exist & are temporarily visible during compile
+    const prevHeldStates: Array<{ built: BuiltTacticalEquipmentMesh; vis: boolean; ringVis: boolean }> =
+      [];
+    if (throwHandSocket) {
+      for (let i = 0; i < allIds.length; i++) {
+        const builtVm = this.ensureHeldBoneMesh(allIds[i], throwHandSocket, renderLayer);
+        prevHeldStates.push({
+          built: builtVm,
+          vis: builtVm.group.visible,
+          ringVis: builtVm.pullRingMesh.visible,
+        });
+        builtVm.group.visible = true;
+        builtVm.pullRingMesh.visible = true;
+      }
+      // Restore active held pointer if none was drawn
+      if (this.holdStage === 'HOLSTERED') {
+        this.heldBoneBuilt = null;
+        this.heldBoneEquipmentId = null;
+        this.heldBoneRingAttachedTo = null;
+      }
+    }
+
+    const prevLayerMask = camera.layers.mask;
+    try {
+      camera.layers.set(0);
+      renderer.compile(scene, camera);
+      if (throwHandSocket) {
+        camera.layers.set(renderLayer);
+        renderer.compile(scene, camera);
+      }
+    } catch {
+      // Non-fatal in headless / mock contexts
+    } finally {
+      camera.layers.mask = prevLayerMask;
+      for (const p of worldWarmupProxies) {
+        this.root.remove(p.group);
+        p.dispose();
+      }
+      this.root.remove(spoonProxy);
+      if (exp0) {
+        exp0.group.visible = prevExpVis;
+        exp0.sparkInst.count = prevExpCount;
+      }
+      if (smk0) {
+        smk0.group.visible = prevSmkVis;
+        if (smk0.puffs[0]) smk0.puffs[0].mesh.visible = prevSmkPuffVis;
+      }
+      if (th0) {
+        th0.group.visible = prevThVis;
+      }
+      for (const st of prevHeldStates) {
+        st.built.group.visible = st.vis;
+        st.built.pullRingMesh.visible = st.ringVis;
+      }
+    }
   }
 
   /**

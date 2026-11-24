@@ -28,7 +28,14 @@ import {
 } from './types';
 import { WeaponRig } from './WeaponRig';
 
-export type BodycamCombatMove = 'NONE' | 'LEFT_JAB' | 'RIGHT_CROSS' | 'ARMED_BASH' | 'PUSH_KICK';
+export type BodycamCombatMove =
+  | 'NONE'
+  | 'LEFT_JAB'
+  | 'RIGHT_CROSS'
+  | 'ARMED_BASH'
+  | 'PUSH_KICK'
+  | 'KNIFE_SLASH'
+  | 'KNIFE_STAB';
 export type BodycamKickTriggerResult = 'ok' | 'busy' | 'airborne' | 'dual_leg_trauma';
 
 /**
@@ -152,6 +159,9 @@ export class CharacterAnimator {
   private unarmedGuardBlend = 0;
   private unarmedSprintBlend = 0;
   private punchFromGuard = false;
+  private knifeSlashAlt = false;
+  private triggerEngageBlend = 0;
+  private triggerHoldoverTimer = 0;
 
   // Smooth additive camera twist / lean-back overlay (applied post-controller with zero drift)
   private camAddPitch = 0;
@@ -514,6 +524,43 @@ export class CharacterAnimator {
   }
 
   /**
+   * Trigger a rapid Combat Knife forward-saber diagonal slash (LMB when holding melee_1h).
+   */
+  public triggerKnifeSlash(controller?: BodycamController): boolean {
+    if (controller?.isVaulting()) return false;
+    if (this.combatMove !== 'NONE') return false;
+    this.weaponRig.cancelAction();
+    this.knifeSlashAlt = !this.knifeSlashAlt;
+    this.combatMove = 'KNIFE_SLASH';
+    this.combatTime = 0;
+    this.combatDuration = 0.34;
+    this.combatHitEvaluated = false;
+    this.hitstopTimer = 0;
+    this.audio?.playMeleeWhoosh?.('cross');
+    this.audio?.playGearRattle('melee', 0.42);
+    controller?.addExertionImpulse(0.10);
+    return true;
+  }
+
+  /**
+   * Trigger a heavy Combat Knife forward saber thrust/stab (RMB when holding melee_1h).
+   */
+  public triggerKnifeStab(controller?: BodycamController): boolean {
+    if (controller?.isVaulting()) return false;
+    if (this.combatMove !== 'NONE') return false;
+    this.weaponRig.cancelAction();
+    this.combatMove = 'KNIFE_STAB';
+    this.combatTime = 0;
+    this.combatDuration = 0.46;
+    this.combatHitEvaluated = false;
+    this.hitstopTimer = 0;
+    this.audio?.playMeleeWhoosh?.('bash');
+    this.audio?.playGearRattle('melee', 0.58);
+    controller?.addExertionImpulse(0.16);
+    return true;
+  }
+
+  /**
    * Trigger a grounded Tactical Push-Kick (X) using right-leg 2-bone IK.
    * Usable both unarmed and while holding any firearm.
    * Disabled if airborne, vaulting, or if BOTH legs are fractured/blacked out.
@@ -744,6 +791,19 @@ export class CharacterAnimator {
         punchTorsoYaw = 0.22 * drive;
         rightClavProtract = 0.36 * protractBoost * drive;
         leftClavProtract = -0.12 * drive;
+      }
+    } else if (this.combatMove === 'KNIFE_SLASH' || this.combatMove === 'KNIFE_STAB') {
+      const p = THREE.MathUtils.clamp(this.combatTime / Math.max(0.01, this.combatDuration), 0, 1);
+      const strikeEnv = smoothstep(0.08, 0.36, p) * (1 - smoothstep(0.55, 1.0, p));
+      if (this.combatMove === 'KNIFE_SLASH') {
+        const dirSign = this.knifeSlashAlt ? 1 : -1;
+        punchTorsoYaw = dirSign * 0.14 * strikeEnv;
+        rightClavProtract = 0.24 * strikeEnv;
+        leftClavProtract = -0.06 * strikeEnv;
+      } else {
+        punchTorsoYaw = 0.20 * strikeEnv;
+        rightClavProtract = 0.34 * strikeEnv;
+        leftClavProtract = -0.10 * strikeEnv;
       }
     } else if (this.grenadeSystem && this.grenadeSystem.getWeaponStowBlend() > 0.25) {
       const style = this.grenadeSystem.getThrowStyle();
@@ -1069,6 +1129,55 @@ export class CharacterAnimator {
         if (p >= 1) {
           this.combatMove = 'NONE';
         }
+      } else if (this.combatMove === 'KNIFE_SLASH') {
+        const dirSign = this.knifeSlashAlt ? 1 : -1;
+        if (p < 0.20) {
+          const w = smoothstep(0.0, 0.20, p);
+          targetCamYaw = -dirSign * 0.042 * w;
+          targetCamPitch = 0.012 * w;
+          targetCamRoll = -dirSign * 0.028 * w;
+        } else if (p < 0.50) {
+          const s = easeOutQuart((p - 0.20) / 0.30);
+          targetCamYaw = THREE.MathUtils.lerp(-dirSign * 0.042, dirSign * 0.088, s);
+          targetCamPitch = THREE.MathUtils.lerp(0.012, -0.024, s);
+          targetCamRoll = THREE.MathUtils.lerp(-dirSign * 0.028, dirSign * 0.048, s);
+        } else {
+          const r = smoothstep(0.50, 1.0, p);
+          targetCamYaw = dirSign * 0.088 * (1 - r);
+          targetCamPitch = -0.024 * (1 - r);
+          targetCamRoll = dirSign * 0.048 * (1 - r);
+        }
+        if (!this.combatHitEvaluated && p >= 0.30) {
+          this.combatHitEvaluated = true;
+          this.performCombatSpherecast('knife_slash', controller, adapter, trauma);
+        }
+        if (p >= 1) {
+          this.combatMove = 'NONE';
+        }
+      } else if (this.combatMove === 'KNIFE_STAB') {
+        if (p < 0.24) {
+          const w = smoothstep(0.0, 0.24, p);
+          targetCamYaw = -0.065 * w;
+          targetCamPitch = 0.018 * w;
+          targetCamRoll = -0.032 * w;
+        } else if (p < 0.48) {
+          const s = easeOutQuart((p - 0.24) / 0.24);
+          targetCamYaw = THREE.MathUtils.lerp(-0.065, 0.115, s);
+          targetCamPitch = THREE.MathUtils.lerp(0.018, -0.032, s);
+          targetCamRoll = THREE.MathUtils.lerp(-0.032, 0.056, s);
+        } else {
+          const r = smoothstep(0.48, 1.0, p);
+          targetCamYaw = 0.115 * (1 - r);
+          targetCamPitch = -0.032 * (1 - r);
+          targetCamRoll = 0.056 * (1 - r);
+        }
+        if (!this.combatHitEvaluated && p >= 0.33) {
+          this.combatHitEvaluated = true;
+          this.performCombatSpherecast('knife_stab', controller, adapter, trauma);
+        }
+        if (p >= 1) {
+          this.combatMove = 'NONE';
+        }
       } else if (this.combatMove === 'PUSH_KICK') {
         // Chamber (0.00–0.16): -4° cam roll, +7° chest lean-back -> Snap Thrust (0.16–0.34) -> Plant Recovery (0.40–1.00)
         const chamberEnv = smoothstep(0.0, 0.16, p);
@@ -1154,16 +1263,26 @@ export class CharacterAnimator {
     }
 
     const radius =
-      attackType === 'kick' ? 0.24 : attackType === 'bash' ? 0.16 : 0.14;
+      attackType === 'kick'
+        ? 0.24
+        : attackType === 'bash'
+          ? 0.16
+          : attackType === 'knife_slash' || attackType === 'knife_stab'
+            ? 0.15
+            : 0.14;
     // Reach measured from origin (kick starts 0.12m behind center -> +0.42m compensates so full boot reach ~1.16m ahead)
     const reachM =
       attackType === 'kick'
         ? 1.16 + 0.36
-        : attackType === 'bash'
-          ? 0.85 + 0.28
-          : attackType === 'cross'
-            ? 0.68 + 0.36
-            : 0.58 + 0.36;
+        : attackType === 'knife_stab'
+          ? 1.24 + 0.28
+          : attackType === 'knife_slash'
+            ? 1.08 + 0.28
+            : attackType === 'bash'
+              ? 0.85 + 0.28
+              : attackType === 'cross'
+                ? 0.68 + 0.36
+                : 0.58 + 0.36;
 
     let hit = this.queryMeleeSpherecast(adapter, this._meleeOrigin, this._meleeDir, radius, reachM);
 
@@ -1264,6 +1383,14 @@ export class CharacterAnimator {
       ev.damageEnergyJ = 345;
       ev.knockbackForce = 0;
       ev.stunDurationSec = hitZone === 'head' ? 0.72 : 0;
+    } else if (attackType === 'knife_slash') {
+      ev.damageEnergyJ = hitZone === 'head' ? 780 : 540;
+      ev.knockbackForce = 1.2;
+      ev.stunDurationSec = hitZone === 'head' ? 0.45 : 0.18;
+    } else if (attackType === 'knife_stab') {
+      ev.damageEnergyJ = hitZone === 'head' ? 1200 : 880;
+      ev.knockbackForce = 2.4;
+      ev.stunDurationSec = hitZone === 'head' ? 0.75 : 0.36;
     } else if (attackType === 'bash') {
       ev.damageEnergyJ = 285;
       ev.knockbackForce = 2.8;
@@ -1276,11 +1403,24 @@ export class CharacterAnimator {
     }
 
     // Visceral 28–32ms limb hitstop on solid impact
-    this.hitstopTimer = attackType === 'kick' ? 0.032 : attackType === 'cross' ? 0.030 : 0.028;
+    this.hitstopTimer =
+      attackType === 'kick' || attackType === 'knife_stab'
+        ? 0.032
+        : attackType === 'cross' || attackType === 'knife_slash'
+          ? 0.028
+          : 0.026;
 
     // Sharp chest-cam shock impulse via existing additive recoil hook
     const shockPitch =
-      attackType === 'kick' ? 0.034 : attackType === 'cross' ? 0.024 : attackType === 'bash' ? 0.022 : 0.016;
+      attackType === 'kick'
+        ? 0.034
+        : attackType === 'knife_stab'
+          ? 0.026
+          : attackType === 'cross' || attackType === 'knife_slash'
+            ? 0.020
+            : attackType === 'bash'
+              ? 0.022
+              : 0.016;
     const shockYaw = attackType === 'kick' ? 0.020 : 0.015;
     controller.applyRecoil(shockPitch, shockYaw, attackType === 'bash' ? 0.025 : 0.012, 0.45, {
       stanceCoupled: false,
@@ -1961,6 +2101,69 @@ export class CharacterAnimator {
           this._actionRotOffset.z += -0.48 * (1 - r);
         }
       }
+    } else if (this.combatMove === 'KNIFE_SLASH' && spec.holdClass === 'melee_1h') {
+      // Alternating diagonal saber slash across chest-cam center
+      const p = THREE.MathUtils.clamp(this.combatTime / Math.max(0.01, this.combatDuration), 0, 1);
+      const dir = this.knifeSlashAlt ? 1 : -1;
+      const windX = dir > 0 ? 0.13 : -0.15;
+      const windY = dir > 0 ? 0.09 : -0.04;
+      const windZ = 0.05;
+      const endX = dir > 0 ? -0.22 : 0.18;
+      const endY = dir > 0 ? -0.09 : 0.07;
+      const endZ = -0.18;
+      if (p < 0.20) {
+        const w = smoothstep(0.0, 0.20, p);
+        this._actionPosOffset.x += windX * w;
+        this._actionPosOffset.y += windY * w;
+        this._actionPosOffset.z += windZ * w;
+        this._actionRotOffset.x += 0.28 * w;
+        this._actionRotOffset.y += -dir * 0.58 * w;
+        this._actionRotOffset.z += -dir * 0.65 * w;
+      } else if (p < 0.50) {
+        const s = easeOutQuart((p - 0.20) / 0.30);
+        this._actionPosOffset.x += THREE.MathUtils.lerp(windX, endX, s);
+        this._actionPosOffset.y += THREE.MathUtils.lerp(windY, endY, s);
+        this._actionPosOffset.z += THREE.MathUtils.lerp(windZ, endZ, s);
+        this._actionRotOffset.x += THREE.MathUtils.lerp(0.28, -0.42, s);
+        this._actionRotOffset.y += THREE.MathUtils.lerp(-dir * 0.58, dir * 1.15, s);
+        this._actionRotOffset.z += THREE.MathUtils.lerp(-dir * 0.65, dir * 0.92, s);
+      } else {
+        const r = smoothstep(0.50, 1.0, p);
+        this._actionPosOffset.x += endX * (1 - r);
+        this._actionPosOffset.y += endY * (1 - r);
+        this._actionPosOffset.z += endZ * (1 - r);
+        this._actionRotOffset.x += -0.42 * (1 - r);
+        this._actionRotOffset.y += dir * 1.15 * (1 - r);
+        this._actionRotOffset.z += dir * 0.92 * (1 - r);
+      }
+    } else if (this.combatMove === 'KNIFE_STAB' && spec.holdClass === 'melee_1h') {
+      // Heavy forward saber-grip thrust straight through center sightline
+      const p = THREE.MathUtils.clamp(this.combatTime / Math.max(0.01, this.combatDuration), 0, 1);
+      if (p < 0.24) {
+        const w = smoothstep(0.0, 0.24, p);
+        this._actionPosOffset.x += 0.08 * w;
+        this._actionPosOffset.y += -0.05 * w;
+        this._actionPosOffset.z += 0.11 * w;
+        this._actionRotOffset.x += -0.10 * w;
+        this._actionRotOffset.y += -0.18 * w;
+        this._actionRotOffset.z += -0.25 * w;
+      } else if (p < 0.48) {
+        const s = easeOutQuart((p - 0.24) / 0.24);
+        this._actionPosOffset.x += THREE.MathUtils.lerp(0.08, -0.08, s);
+        this._actionPosOffset.y += THREE.MathUtils.lerp(-0.05, 0.03, s);
+        this._actionPosOffset.z += THREE.MathUtils.lerp(0.11, -0.27, s);
+        this._actionRotOffset.x += THREE.MathUtils.lerp(-0.10, -0.16, s);
+        this._actionRotOffset.y += THREE.MathUtils.lerp(-0.18, 0.24, s);
+        this._actionRotOffset.z += THREE.MathUtils.lerp(-0.25, 0.42, s);
+      } else {
+        const r = smoothstep(0.48, 1.0, p);
+        this._actionPosOffset.x += -0.08 * (1 - r);
+        this._actionPosOffset.y += 0.03 * (1 - r);
+        this._actionPosOffset.z += -0.27 * (1 - r);
+        this._actionRotOffset.x += -0.16 * (1 - r);
+        this._actionRotOffset.y += 0.24 * (1 - r);
+        this._actionRotOffset.z += 0.42 * (1 - r);
+      }
     } else if (this.combatMove === 'PUSH_KICK' && spec.holdClass !== 'unarmed') {
       // Brace firearm tightly across chest during Tactical Push-Kick
       const p = THREE.MathUtils.clamp(this.combatTime / Math.max(0.01, this.combatDuration), 0, 1);
@@ -2615,25 +2818,46 @@ export class CharacterAnimator {
     const weaponAsm = this.weaponRig.getModelAssembly();
     const weaponAction = anim.getActiveAction();
     const triggerPull01 = anim.getTriggerPull01();
-    // Strict trigger discipline: right index finger straight off the trigger during Sprint, Inspect, Reload, Tubular Reload, Mag-Check, Suppressor Toggle, and Bolt Cycling
-    const triggerEngaged =
-      !isUnarmed &&
+    const activelyFiring = triggerPull01 > 0.015 || rigState.recoilZ > 0.004;
+    if (activelyFiring && isFirearm) {
+      // Hold finger naturally on trigger shoe for 0.45s after each shot so hip-fire bursts never flicker
+      this.triggerHoldoverTimer = 0.45;
+    } else if (this.triggerHoldoverTimer > 0) {
+      this.triggerHoldoverTimer = Math.max(0, this.triggerHoldoverTimer - dt);
+    }
+
+    // Strict trigger discipline: right index finger straight off trigger during Sprint, Inspect, Reload, Tubular Reload, Mag-Check, Suppressor Toggle, and Bolt Cycling
+    const canEngageTrigger =
+      isFirearm &&
       !pdaActiveHold &&
       !grenadeActiveHold &&
       vaultPinR < 0.05 &&
       boltHandW < 0.05 &&
       !controller.isSprinting &&
       weaponAction === 'NONE' &&
-      !anim.isTubularReloading() &&
+      !anim.isTubularReloading();
+    const wantsTriggerOn =
+      canEngageTrigger &&
       (controller.isAds ||
         controller.isCanted ||
         controller.isPointAim ||
-        rigState.recoilZ > 0.004 ||
-        triggerPull01 > 0.02);
+        this.triggerHoldoverTimer > 0 ||
+        activelyFiring);
+    if (!canEngageTrigger) {
+      this.triggerHoldoverTimer = 0;
+    }
+    this.triggerEngageBlend = THREE.MathUtils.damp(
+      this.triggerEngageBlend,
+      wantsTriggerOn ? 1 : 0,
+      wantsTriggerOn ? 18 : 11,
+      dt,
+    );
+    const triggerEngaged = this.triggerEngageBlend > 0.5;
     if (pdaActiveHold && pdaIkW > 0.55) {
       // Deferred until after both Right & Left 2-bone arm IK + post-IK PDA reach guard complete
     } else if (grenadeActiveHold && grenadeIkW > 0.45 && this.grenadeSystem) {
       this._rightHandPoseOpts.profile = null;
+      this._rightHandPoseOpts.triggerEngageBlend = 0;
       this._rightHandPoseOpts.triggerPull01 = 0;
       this._rightHandPoseOpts.thumbFlick01 = 0;
       this._rightHandPoseOpts.pinchPose01 = 0;
@@ -2651,6 +2875,7 @@ export class CharacterAnimator {
       );
     } else {
       this._rightHandPoseOpts.profile = weaponAsm?.handPoseProfile ?? null;
+      this._rightHandPoseOpts.triggerEngageBlend = this.triggerEngageBlend;
       this._rightHandPoseOpts.triggerPull01 = triggerPull01;
       this._rightHandPoseOpts.thumbFlick01 = anim.getRightThumbFlick01();
       this._rightHandPoseOpts.pinchPose01 = 0;
