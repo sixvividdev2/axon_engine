@@ -1232,3 +1232,444 @@ export function createWaterNormalTexture(
   tex.needsUpdate = true;
   return tex;
 }
+
+/**
+ * Procedural Cracked Granite & Mossy Slate PBR Texture Set (albedo + bump + roughness)
+ * for sculpted boulders and multi-stone outcrops.
+ */
+export function createGraniteBoulderTextureSet(
+  maxAniso: number,
+  seed = 5401,
+): {
+  map: THREE.CanvasTexture;
+  bumpMap: THREE.CanvasTexture;
+  roughnessMap: THREE.CanvasTexture;
+} {
+  const size = 512;
+  const colCanvas = document.createElement('canvas');
+  colCanvas.width = size;
+  colCanvas.height = size;
+  const colCtx = colCanvas.getContext('2d')!;
+
+  const bumpCanvas = document.createElement('canvas');
+  bumpCanvas.width = size;
+  bumpCanvas.height = size;
+  const bumpCtx = bumpCanvas.getContext('2d')!;
+
+  const roughCanvas = document.createElement('canvas');
+  roughCanvas.width = size;
+  roughCanvas.height = size;
+  const roughCtx = roughCanvas.getContext('2d')!;
+
+  const rand = seededRand(seed);
+
+  // Neutral-warm alpine granite base (tinted further by vertex colors & instance colors)
+  colCtx.fillStyle = '#737674';
+  colCtx.fillRect(0, 0, size, size);
+  bumpCtx.fillStyle = '#888888';
+  bumpCtx.fillRect(0, 0, size, size);
+  roughCtx.fillStyle = '#d4d4d4';
+  roughCtx.fillRect(0, 0, size, size);
+
+  // Geological sedimentary / metamorphic strata bands
+  for (let i = 0; i < 42; i++) {
+    const y = rand() * size;
+    const h = 6 + rand() * 26;
+    const bright = rand() > 0.48;
+    colCtx.fillStyle = bright
+      ? `rgba(164, 166, 160, ${0.08 + rand() * 0.12})`
+      : `rgba(42, 46, 48, ${0.10 + rand() * 0.16})`;
+    colCtx.fillRect(0, y, size, h);
+
+    bumpCtx.fillStyle = bright ? 'rgba(210,210,210,0.16)' : 'rgba(55,55,55,0.22)';
+    bumpCtx.fillRect(0, y, size, h * 0.7);
+  }
+
+  // Broad mineral blotches & weathered lichen patches
+  for (let i = 0; i < 85; i++) {
+    const x = rand() * size;
+    const y = rand() * size;
+    const r = 14 + rand() * 54;
+    const isLichen = rand() < 0.24;
+    const grad = colCtx.createRadialGradient(x, y, 2, x, y, r);
+    if (isLichen) {
+      grad.addColorStop(0, 'rgba(92, 108, 72, 0.32)');
+      grad.addColorStop(1, 'rgba(92, 108, 72, 0)');
+    } else if (rand() > 0.5) {
+      grad.addColorStop(0, 'rgba(176, 174, 166, 0.18)');
+      grad.addColorStop(1, 'rgba(176, 174, 166, 0)');
+    } else {
+      grad.addColorStop(0, 'rgba(34, 38, 42, 0.26)');
+      grad.addColorStop(1, 'rgba(34, 38, 42, 0)');
+    }
+    colCtx.fillStyle = grad;
+    colCtx.fillRect(x - r, y - r, r * 2, r * 2);
+
+    if (isLichen) {
+      roughCtx.fillStyle = 'rgba(248,248,248,0.45)';
+      roughCtx.beginPath();
+      roughCtx.arc(x, y, r * 0.7, 0, Math.PI * 2);
+      roughCtx.fill();
+    } else {
+      const rg = rand() > 0.5 ? 185 : 230;
+      roughCtx.fillStyle = `rgba(${rg},${rg},${rg},0.22)`;
+      roughCtx.beginPath();
+      roughCtx.arc(x, y, r * 0.65, 0, Math.PI * 2);
+      roughCtx.fill();
+    }
+  }
+
+  // Sharp angular rock fracture crevices & chipped facets
+  for (let f = 0; f < 34; f++) {
+    let px = rand() * size;
+    let py = rand() * size;
+    const segs = 4 + Math.floor(rand() * 5);
+    const baseAngle = rand() * Math.PI * 2;
+    const lineW = 1.2 + rand() * 2.4;
+
+    colCtx.strokeStyle = `rgba(22, 24, 26, ${0.42 + rand() * 0.34})`;
+    colCtx.lineWidth = lineW;
+    colCtx.beginPath();
+    colCtx.moveTo(px, py);
+
+    bumpCtx.strokeStyle = 'rgba(12, 12, 12, 0.85)';
+    bumpCtx.lineWidth = lineW + 1.1;
+    bumpCtx.beginPath();
+    bumpCtx.moveTo(px, py);
+
+    roughCtx.strokeStyle = 'rgba(250, 250, 250, 0.7)';
+    roughCtx.lineWidth = lineW + 1.0;
+    roughCtx.beginPath();
+    roughCtx.moveTo(px, py);
+
+    for (let s = 0; s < segs; s++) {
+      const ang = baseAngle + (rand() - 0.5) * 1.1;
+      const len = 18 + rand() * 44;
+      px += Math.cos(ang) * len;
+      py += Math.sin(ang) * len;
+      colCtx.lineTo(px, py);
+      bumpCtx.lineTo(px, py);
+      roughCtx.lineTo(px, py);
+    }
+    colCtx.stroke();
+    bumpCtx.stroke();
+    roughCtx.stroke();
+
+    // Crisp sun-catching facet lip right beside fracture
+    bumpCtx.strokeStyle = 'rgba(235, 235, 235, 0.45)';
+    bumpCtx.lineWidth = 1.2;
+    bumpCtx.stroke();
+  }
+
+  // Fine quartz / feldspar granite speckle grain
+  for (let i = 0; i < 4200; i++) {
+    const gx = rand() * size;
+    const gy = rand() * size;
+    const w = 1 + rand() * 2.5;
+    const h = 1 + rand() * 2.2;
+    const light = rand() > 0.48;
+    colCtx.fillStyle = light ? 'rgba(202,200,192,0.22)' : 'rgba(26,28,30,0.28)';
+    colCtx.fillRect(gx, gy, w, h);
+    bumpCtx.fillStyle = light ? 'rgba(225,225,225,0.28)' : 'rgba(40,40,40,0.3)';
+    bumpCtx.fillRect(gx, gy, w, h);
+  }
+
+  const map = makeCanvasTex(colCanvas, 2, 2, maxAniso, true);
+  const bumpMap = makeCanvasTex(bumpCanvas, 2, 2, maxAniso, false);
+  const roughnessMap = makeCanvasTex(roughCanvas, 2, 2, maxAniso, false);
+  return { map, bumpMap, roughnessMap };
+}
+
+/**
+ * Procedural deeply furrowed conifer / pine bark PBR texture set (albedo + bump).
+ */
+export function createPineBarkTextureSet(
+  maxAniso: number,
+  seed = 5502,
+): { map: THREE.CanvasTexture; bumpMap: THREE.CanvasTexture } {
+  const w = 256;
+  const h = 512;
+  const colCanvas = document.createElement('canvas');
+  colCanvas.width = w;
+  colCanvas.height = h;
+  const colCtx = colCanvas.getContext('2d')!;
+
+  const bumpCanvas = document.createElement('canvas');
+  bumpCanvas.width = w;
+  bumpCanvas.height = h;
+  const bumpCtx = bumpCanvas.getContext('2d')!;
+
+  const rand = seededRand(seed);
+
+  colCtx.fillStyle = '#3d2c20';
+  colCtx.fillRect(0, 0, w, h);
+  bumpCtx.fillStyle = '#707070';
+  bumpCtx.fillRect(0, 0, w, h);
+
+  // Overlapping vertical bark plates with warm reddish-brown ridges & dark fissures
+  for (let i = 0; i < 110; i++) {
+    const px = rand() * w;
+    const py = rand() * h;
+    const pw = 8 + rand() * 18;
+    const ph = 32 + rand() * 96;
+    const warm = rand() > 0.4;
+    colCtx.fillStyle = warm
+      ? `rgb(${Math.round(74 + rand() * 28)},${Math.round(52 + rand() * 18)},${Math.round(36 + rand() * 14)})`
+      : `rgb(${Math.round(52 + rand() * 18)},${Math.round(38 + rand() * 14)},${Math.round(28 + rand() * 10)})`;
+    colCtx.fillRect(px, py, pw, ph);
+
+    bumpCtx.fillStyle = `rgb(${Math.round(145 + rand() * 75)},${Math.round(145 + rand() * 75)},${Math.round(145 + rand() * 75)})`;
+    bumpCtx.fillRect(px + 1, py + 2, Math.max(2, pw - 3), ph - 4);
+  }
+
+  // Deep vertical bark fissures
+  for (let i = 0; i < 65; i++) {
+    let fx = rand() * w;
+    let fy = 0;
+    const lw = 1.5 + rand() * 3.0;
+    colCtx.strokeStyle = `rgba(18, 13, 10, ${0.55 + rand() * 0.35})`;
+    colCtx.lineWidth = lw;
+    colCtx.beginPath();
+    colCtx.moveTo(fx, fy);
+
+    bumpCtx.strokeStyle = 'rgba(14, 14, 14, 0.9)';
+    bumpCtx.lineWidth = lw + 1;
+    bumpCtx.beginPath();
+    bumpCtx.moveTo(fx, fy);
+
+    while (fy < h) {
+      fy += 28 + rand() * 32;
+      fx += (rand() - 0.5) * 10;
+      colCtx.lineTo(fx, fy);
+      bumpCtx.lineTo(fx, fy);
+    }
+    colCtx.stroke();
+    bumpCtx.stroke();
+  }
+
+  // Subtle green-grey moss streaks on shaded bark
+  for (let i = 0; i < 24; i++) {
+    const mx = rand() * w;
+    const my = rand() * h;
+    const mr = 8 + rand() * 20;
+    const grad = colCtx.createRadialGradient(mx, my, 1, mx, my, mr);
+    grad.addColorStop(0, 'rgba(62, 78, 46, 0.28)');
+    grad.addColorStop(1, 'rgba(62, 78, 46, 0)');
+    colCtx.fillStyle = grad;
+    colCtx.fillRect(mx - mr, my - mr, mr * 2, mr * 2);
+  }
+
+  const map = makeCanvasTex(colCanvas, 2, 2, maxAniso, true);
+  const bumpMap = makeCanvasTex(bumpCanvas, 2, 2, maxAniso, false);
+  return { map, bumpMap };
+}
+
+/**
+ * Procedural dense alpine spruce / pine needle-cluster albedo texture (tiled across scalloped boughs).
+ */
+export function createPineNeedleTexture(maxAniso: number, seed = 5509): THREE.CanvasTexture {
+  const size = 256;
+  const c = document.createElement('canvas');
+  c.width = size;
+  c.height = size;
+  const ctx = c.getContext('2d')!;
+  const rand = seededRand(seed);
+
+  // Deep interior spruce shadow base
+  ctx.fillStyle = '#2d442b';
+  ctx.fillRect(0, 0, size, size);
+
+  // Subtle dark woody branchlets peeking between needle sprays
+  ctx.strokeStyle = 'rgba(42, 32, 22, 0.52)';
+  ctx.lineWidth = 3;
+  for (let b = 0; b < 18; b++) {
+    const bx = rand() * size;
+    const by = rand() * size;
+    const ang = -Math.PI * 0.5 + (rand() - 0.5) * 1.1;
+    ctx.beginPath();
+    ctx.moveTo(bx, by);
+    ctx.lineTo(bx + Math.cos(ang) * 44, by + Math.sin(ang) * 44);
+    ctx.stroke();
+  }
+
+  // Dense layered radiating conifer needle fans (bright neutral green so per-instance color tinting shines)
+  for (let i = 0; i < 420; i++) {
+    const nx = rand() * size;
+    const ny = rand() * size;
+    const baseAng = Math.PI * 0.5 + (rand() - 0.5) * 1.6;
+    const len = 10 + rand() * 16;
+    const shade = 0.62 + rand() * 0.58;
+    const r = Math.min(255, Math.round(78 * shade));
+    const g = Math.min(255, Math.round(124 * shade));
+    const b = Math.min(255, Math.round(70 * shade));
+    ctx.strokeStyle = `rgb(${r},${g},${b})`;
+    ctx.lineWidth = 1.6 + rand() * 1.2;
+    ctx.beginPath();
+    ctx.moveTo(nx, ny);
+    ctx.lineTo(nx + Math.cos(baseAng) * len, ny + Math.sin(baseAng) * len);
+    ctx.stroke();
+  }
+
+  // Bright sunlit needle tips for crisp close-up texture read
+  for (let i = 0; i < 160; i++) {
+    const nx = rand() * size;
+    const ny = rand() * size;
+    const ang = Math.PI * 0.5 + (rand() - 0.5) * 1.4;
+    ctx.strokeStyle = `rgba(148, 186, 118, ${0.32 + rand() * 0.35})`;
+    ctx.lineWidth = 1.3;
+    ctx.beginPath();
+    ctx.moveTo(nx, ny);
+    ctx.lineTo(nx + Math.cos(ang) * 9, ny + Math.sin(ang) * 9);
+    ctx.stroke();
+  }
+
+  return makeCanvasTex(c, 3, 2, maxAniso, true);
+}
+
+/**
+ * Procedural peeling white birch bark PBR texture set (chalk-white papery bark + dark horizontal lenticels + dark root base).
+ */
+export function createBirchBarkTextureSet(
+  maxAniso: number,
+  seed = 5610,
+): { map: THREE.CanvasTexture; bumpMap: THREE.CanvasTexture } {
+  const w = 256;
+  const h = 512;
+  const colCanvas = document.createElement('canvas');
+  colCanvas.width = w;
+  colCanvas.height = h;
+  const colCtx = colCanvas.getContext('2d')!;
+
+  const bumpCanvas = document.createElement('canvas');
+  bumpCanvas.width = w;
+  bumpCanvas.height = h;
+  const bumpCtx = bumpCanvas.getContext('2d')!;
+
+  const rand = seededRand(seed);
+
+  // Off-white papery birch base
+  colCtx.fillStyle = '#d6d2c7';
+  colCtx.fillRect(0, 0, w, h);
+  bumpCtx.fillStyle = '#a0a0a0';
+  bumpCtx.fillRect(0, 0, w, h);
+
+  // Subtle horizontal papery peel bands
+  for (let y = 0; y < h; y += 8) {
+    const shade = 204 + Math.round((rand() - 0.5) * 26);
+    colCtx.fillStyle = `rgb(${shade},${shade - 3},${shade - 9})`;
+    colCtx.fillRect(0, y, w, 6 + rand() * 5);
+  }
+
+  // Signature dark horizontal birch lenticels & bark scars
+  for (let i = 0; i < 170; i++) {
+    const lx = rand() * w;
+    const ly = rand() * h;
+    const lw = 10 + rand() * 38;
+    const lh = 1.5 + rand() * 3.8;
+    colCtx.fillStyle = `rgba(34, 31, 28, ${0.48 + rand() * 0.42})`;
+    colCtx.fillRect(lx, ly, lw, lh);
+    bumpCtx.fillStyle = 'rgba(30, 30, 30, 0.75)';
+    bumpCtx.fillRect(lx, ly, lw, lh + 1);
+  }
+
+  // Dark diamond knots & lower trunk bark fissures
+  for (let i = 0; i < 18; i++) {
+    const kx = rand() * w;
+    const ky = 40 + rand() * (h - 80);
+    const kr = 5 + rand() * 11;
+    colCtx.fillStyle = 'rgba(28, 25, 22, 0.86)';
+    colCtx.beginPath();
+    colCtx.ellipse(kx, ky, kr * 1.4, kr * 0.72, (rand() - 0.5) * 0.3, 0, Math.PI * 2);
+    colCtx.fill();
+    bumpCtx.fillStyle = 'rgba(18, 18, 18, 0.9)';
+    bumpCtx.beginPath();
+    bumpCtx.ellipse(kx, ky, kr * 1.4, kr * 0.72, 0, 0, Math.PI * 2);
+    bumpCtx.fill();
+  }
+
+  // Weathered dark mossy collar at bottom 22% of trunk
+  const rootGrad = colCtx.createLinearGradient(0, h * 0.74, 0, h);
+  rootGrad.addColorStop(0, 'rgba(42, 38, 32, 0)');
+  rootGrad.addColorStop(0.55, 'rgba(38, 36, 30, 0.65)');
+  rootGrad.addColorStop(1, 'rgba(28, 26, 22, 0.92)');
+  colCtx.fillStyle = rootGrad;
+  colCtx.fillRect(0, h * 0.74, w, h * 0.26);
+
+  const map = makeCanvasTex(colCanvas, 1, 1, maxAniso, true);
+  const bumpMap = makeCanvasTex(bumpCanvas, 1, 1, maxAniso, false);
+  return { map, bumpMap };
+}
+
+/**
+ * Alpha-cutout serrated birch/broadleaf foliage cluster texture for lush botanical canopies.
+ */
+export function createBirchLeafClusterTexture(maxAniso: number, seed = 5624): THREE.CanvasTexture {
+  const size = 256;
+  const c = document.createElement('canvas');
+  c.width = size;
+  c.height = size;
+  const ctx = c.getContext('2d')!;
+  const rand = seededRand(seed);
+  ctx.clearRect(0, 0, size, size);
+
+  // Thin woody branching twigs radiating from center
+  ctx.strokeStyle = '#534536';
+  ctx.lineWidth = 3.2;
+  ctx.lineCap = 'round';
+  const branches = [
+    [128, 244, 128, 36],
+    [128, 198, 42, 86],
+    [128, 188, 214, 92],
+    [128, 132, 52, 42],
+    [128, 126, 206, 46],
+    [82, 140, 32, 148],
+    [174, 142, 224, 148],
+  ];
+  for (const [x0, y0, x1, y1] of branches) {
+    ctx.beginPath();
+    ctx.moveTo(x0, y0);
+    ctx.quadraticCurveTo((x0 + x1) * 0.5 + (rand() - 0.5) * 12, (y0 + y1) * 0.5, x1, y1);
+    ctx.stroke();
+  }
+
+  // Dense overlapping diamond-ovate birch leaves (bright neutral foliage so instanceColor tints cleanly)
+  for (let i = 0; i < 128; i++) {
+    const b = branches[i % branches.length];
+    const u = 0.14 + rand() * 0.92;
+    const lx = b[0] + (b[2] - b[0]) * u + (rand() - 0.5) * 46;
+    const ly = b[1] + (b[3] - b[1]) * u + (rand() - 0.5) * 40;
+    const len = 14 + rand() * 14;
+    const wid = 8 + rand() * 8;
+    const ang = (rand() - 0.5) * Math.PI * 2;
+    const shade = 0.68 + rand() * 0.42;
+
+    ctx.save();
+    ctx.translate(lx, ly);
+    ctx.rotate(ang);
+    ctx.fillStyle = `rgb(${Math.round(145 * shade)},${Math.round(182 * shade)},${Math.round(112 * shade)})`;
+    ctx.beginPath();
+    ctx.moveTo(0, -len * 0.55);
+    ctx.quadraticCurveTo(wid * 0.72, -len * 0.1, 0, len * 0.55);
+    ctx.quadraticCurveTo(-wid * 0.72, -len * 0.1, 0, -len * 0.55);
+    ctx.closePath();
+    ctx.fill();
+
+    // Central leaf vein
+    ctx.strokeStyle = 'rgba(210, 232, 168, 0.28)';
+    ctx.lineWidth = 0.9;
+    ctx.beginPath();
+    ctx.moveTo(0, -len * 0.4);
+    ctx.lineTo(0, len * 0.4);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.anisotropy = Math.min(8, Math.max(1, maxAniso));
+  tex.wrapS = THREE.ClampToEdgeWrapping;
+  tex.wrapT = THREE.ClampToEdgeWrapping;
+  tex.needsUpdate = true;
+  return tex;
+}
+

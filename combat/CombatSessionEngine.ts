@@ -687,11 +687,17 @@ export class CombatSessionEngine {
     this.camera = new THREE.PerspectiveCamera(72, width / height, 0.08, 360);
     this.scene.add(this.camera);
 
-    // Resolve and build selected map with selected Graphics Quality tier
+    // Resolve and build selected map with selected Graphics Quality tier & battle rule
     const mapId =
       params.mode === 'battle' ? params.battleConfig.mapId : params.infectionConfig.mapId;
     const mapDef = getMapDefinitionById(mapId) ?? getMapDefinitionById('pripyat_block')!;
-    this.map = mapDef.build(this.scene, this.renderer, this.isSoftwareGl, activeQuality);
+    this.map = mapDef.build(this.scene, this.renderer, this.isSoftwareGl, activeQuality, {
+      battleRule: params.mode === 'battle' ? params.battleConfig.rule : undefined,
+    });
+    if (this.map.isExpandedConquest) {
+      this.camera.far = 540;
+      this.camera.updateProjectionMatrix();
+    }
 
     // Audio
     this.audio = new BodycamAudio();

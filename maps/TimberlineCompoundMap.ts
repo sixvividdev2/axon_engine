@@ -12,23 +12,27 @@ import {
   NightLightEntry,
   WettableSurfaceEntry,
 } from '../engine/world/WeatherTimeSystem';
+import { createWindShaderUniforms } from '../engine/world/WindFoliageShader';
 import {
-  applyWindFoliageShader,
-  assignHeightSwayAttribute,
-  createWindShaderUniforms,
-} from '../engine/world/WindFoliageShader';
-import {
+  BoulderSpot,
   buildArmoryWeaponRack,
   buildInstancedFerns,
   buildInstancedGrassTufts,
+  buildInstancedPineTrees,
+  buildInstancedSculptedBoulders,
   buildInstancedUndergrowthShrubs,
   buildOfficeDesk,
   buildRadarTower,
   buildRealisticHelicopterProp,
   buildRustedVehicle,
+  PineTreeSpot,
   PropFactoryContext,
   VehicleMaterials,
 } from './MapPropFactory';
+import {
+  buildEnterableCoverBuilding,
+  createCoverBuildingMaterialPack,
+} from './CoverBuildingFactory';
 import {
   createAsphaltRoadTexture,
   createCabinWoodTexture,
@@ -44,6 +48,7 @@ import {
   buildNavGraph,
   BuiltMapInstance,
   IMapDefinition,
+  MapBuildOptions,
   MapLightingPreset,
   NavNode,
   SpawnPoint,
@@ -82,7 +87,7 @@ function getRiverCenterX(z: number): number {
  * - Carves a smooth riverbed channel along getRiverCenterX(z) down to Y = -1.65m.
  * - Gently rolls into natural wooded mountain ridges past |x|,|z| > 108m (no artificial box walls!).
  */
-function sampleVisualTerrainY(x: number, z: number): number {
+function sampleVisualTerrainY(x: number, z: number, expandedConquest = false): number {
   // 1. River channel carve
   const riverX = getRiverCenterX(z);
   const distRiver = Math.abs(x - riverX);
@@ -95,7 +100,7 @@ function sampleVisualTerrainY(x: number, z: number): number {
 
   // 2. Keep Military Base, Highway, Villages & Lone Cabins level (Y = 0)
   const inMilBase = x >= 2 && x <= 104 && z >= -68 && z <= 64;
-  const inHighway = Math.abs(x - -2) <= 7.5 && Math.abs(z) <= 115;
+  const inHighway = Math.abs(x - -2) <= 7.5 && Math.abs(z) <= (expandedConquest ? 132 : 115);
   const inVillageNW = x >= -86 && x <= -36 && z >= -82 && z <= -36;
   const inVillageSW = x >= -88 && x <= -38 && z >= 34 && z <= 84;
   const nearLoneCabin =
@@ -103,13 +108,33 @@ function sampleVisualTerrainY(x: number, z: number): number {
     (Math.hypot(x - -96, z - 4) < 12) ||
     (Math.hypot(x - 84, z - 82) < 12);
 
-  if (inMilBase || inHighway || inVillageNW || inVillageSW || nearLoneCabin) {
+  // Expanded Conquest flat pads: West Logging Road, East Airfield Perimeter Road, HQs, South Bend FOB & Cover Buildings
+  const inConquestFlats =
+    expandedConquest &&
+    ((Math.abs(x - -124) <= 10 && Math.abs(z) <= 84) ||
+      (Math.abs(x - 122) <= 10 && Math.abs(z) <= 84) ||
+      (Math.abs(z - -48) <= 8 && x >= -132 && x <= -58) ||
+      (Math.abs(z - 34) <= 8 && x >= -132 && x <= -58) ||
+      (Math.abs(z) <= 10 && x >= -146 && x <= -84) ||
+      (Math.abs(z) <= 10 && x >= 92 && x <= 146) ||
+      (Math.abs(z - -62) <= 8 && x >= 90 && x <= 132) ||
+      (Math.abs(z - 58) <= 8 && x >= 90 && x <= 132) ||
+      (Math.hypot(x - -130, z) < 20) ||
+      (Math.hypot(x - 130, z) < 20) ||
+      (Math.hypot(x - -52, z - 86) < 16) ||
+      (Math.hypot(x - -104, z - -30) < 12) ||
+      (Math.hypot(x - -104, z - 48) < 12) ||
+      (Math.hypot(x - 108, z - -34) < 13) ||
+      (Math.hypot(x - 108, z - 36) < 13) ||
+      (Math.hypot(x - -12, z - 82) < 12));
+
+  if (inMilBase || inHighway || inVillageNW || inVillageSW || nearLoneCabin || inConquestFlats) {
     return riverCarve;
   }
 
   // 3. Gentle forest undulations inside playable valley + dramatic mountain ridges around perimeter
-  const edgeX = Math.max(0, Math.abs(x) - 104);
-  const edgeZ = Math.max(0, Math.abs(z) - 104);
+  const edgeX = Math.max(0, Math.abs(x) - (expandedConquest ? 150 : 104));
+  const edgeZ = Math.max(0, Math.abs(z) - (expandedConquest ? 118 : 104));
   const outerDist = Math.hypot(edgeX, edgeZ);
   const outerBlend = THREE.MathUtils.clamp(outerDist / 28.0, 0, 1);
   const outerSmooth = outerBlend * outerBlend * (3 - 2 * outerBlend);
@@ -130,11 +155,11 @@ function sampleVisualTerrainY(x: number, z: number): number {
  * so the player & bots can walk DOWN into the bunker at Y = -3.6m without terrain clamping
  * them back to Y = 0, while the solid concrete bunker roof collider supports walking on top at Y = 0!
  */
-function samplePhysicsTerrainY(x: number, z: number): number {
+function samplePhysicsTerrainY(x: number, z: number, expandedConquest = false): number {
   if (x >= 42.6 && x <= 62.4 && z >= -16.4 && z <= 4.4) {
     return -10.0;
   }
-  return sampleVisualTerrainY(x, z);
+  return sampleVisualTerrainY(x, z, expandedConquest);
 }
 
 function buildTimberlineCompound(
@@ -142,15 +167,19 @@ function buildTimberlineCompound(
   renderer: THREE.WebGLRenderer,
   isSoftwareGl: boolean,
   graphicsQuality?: GraphicsQualityId,
+  options?: MapBuildOptions,
 ): BuiltMapInstance {
   const qProfile = getGraphicsQualityProfile(graphicsQuality);
+  const isConquest = options?.battleRule === 'conquest';
+  const sampleVisY = (x: number, z: number) => sampleVisualTerrainY(x, z, isConquest);
+  const samplePhysY = (x: number, z: number) => samplePhysicsTerrainY(x, z, isConquest);
 
   const physics = new BodycamPhysicsWorld();
   physics.baseFloorY = -4.5; // Allow subterranean bunker floor at Y = -3.6m!
-  physics.boundsMinX = -114;
-  physics.boundsMaxX = 114;
-  physics.boundsMinZ = -114;
-  physics.boundsMaxZ = 114;
+  physics.boundsMinX = isConquest ? -160 : -114;
+  physics.boundsMaxX = isConquest ? 160 : 114;
+  physics.boundsMinZ = isConquest ? -130 : -114;
+  physics.boundsMaxZ = isConquest ? 130 : 114;
 
   const sceneGroup = new THREE.Group();
   scene.add(sceneGroup);
@@ -176,7 +205,7 @@ function buildTimberlineCompound(
   scene.background = new THREE.Color(LIGHTING_PRESET.backgroundHex);
   scene.fog = new THREE.FogExp2(
     LIGHTING_PRESET.fogHex,
-    LIGHTING_PRESET.fogDensity * qProfile.fogDensityScale,
+    LIGHTING_PRESET.fogDensity * qProfile.fogDensityScale * (isConquest ? 0.8 : 1.0),
   );
 
   const pmrem = new THREE.PMREMGenerator(renderer);
@@ -202,11 +231,12 @@ function buildTimberlineCompound(
     const sm = Math.min(2048, qProfile.shadowMapSize);
     sun.shadow.mapSize.set(sm, sm);
     sun.shadow.camera.near = 4;
-    sun.shadow.camera.far = 260;
-    sun.shadow.camera.left = -120;
-    sun.shadow.camera.right = 120;
-    sun.shadow.camera.top = 120;
-    sun.shadow.camera.bottom = -120;
+    sun.shadow.camera.far = isConquest ? 340 : 260;
+    const shadowHalf = isConquest ? 155 : 120;
+    sun.shadow.camera.left = -shadowHalf;
+    sun.shadow.camera.right = shadowHalf;
+    sun.shadow.camera.top = shadowHalf;
+    sun.shadow.camera.bottom = -shadowHalf;
     sun.shadow.bias = -0.0005;
     sun.shadow.normalBias = 0.03;
   }
@@ -311,12 +341,6 @@ function buildTimberlineCompound(
   const waterHandle = createRiverWaterMaterial(riverNormalA, riverNormalB);
   const matRiver = trackMat(waterHandle.material);
 
-  const matBark = trackMat(new THREE.MeshStandardMaterial({ color: 0x463426, roughness: 0.95 }));
-  const matPineNeedles = trackMat(new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.88 }));
-  applyWindFoliageShader(matBark, windUniforms, { swayScale: 0.06, isTrunk: true });
-  applyWindFoliageShader(matPineNeedles, windUniforms, { swayScale: 0.21 });
-
-  const matRock = trackMat(new THREE.MeshStandardMaterial({ color: 0x5c6160, roughness: 0.94 }));
   const matRunwayBulb = trackMat(
     new THREE.MeshStandardMaterial({ color: 0xffefc2, emissive: 0xf7c96b, emissiveIntensity: 2.8, roughness: 0.15 }),
   );
@@ -373,6 +397,7 @@ function buildTimberlineCompound(
     isSoftwareGl,
     trackGeo,
     trackMat,
+    trackTex,
     windUniforms,
     maxAniso,
   };
@@ -413,16 +438,17 @@ function buildTimberlineCompound(
     return mesh;
   };
 
-  // === 1. MASSIVE 340m x 340m HIGH-RESOLUTION TERRAIN WITH CLEAN BUNKER ENTRANCE CUTOUT ===
-  const terrainSize = 340;
+  // === 1. MASSIVE HIGH-RESOLUTION TERRAIN WITH CLEAN BUNKER ENTRANCE CUTOUT ===
+  const terrainW = isConquest ? 440 : 340;
+  const terrainD = isConquest ? 380 : 340;
   const segs = graphicsQuality === 'performance' ? 144 : 192;
-  const terrainGeo = trackGeo(new THREE.PlaneGeometry(terrainSize, terrainSize, segs, segs));
+  const terrainGeo = trackGeo(new THREE.PlaneGeometry(terrainW, terrainD, segs, segs));
   terrainGeo.rotateX(-Math.PI * 0.5);
   const posAttr = terrainGeo.attributes.position;
   for (let i = 0; i < posAttr.count; i++) {
     const vx = posAttr.getX(i);
     const vz = posAttr.getZ(i);
-    posAttr.setY(i, sampleVisualTerrainY(vx, vz));
+    posAttr.setY(i, sampleVisY(vx, vz));
   }
   // Remove triangles overlapping the underground bunker stairwell opening so terrain never slices the entry!
   const oldIndex = terrainGeo.getIndex()!;
@@ -447,7 +473,7 @@ function buildTimberlineCompound(
   terrainMesh.userData.analyticalRaycastCovered = true;
   sceneGroup.add(terrainMesh);
   raycastMeshes.push(terrainMesh);
-  physics.setTerrainHeightSampler(samplePhysicsTerrainY, {
+  physics.setTerrainHeightSampler(samplePhysY, {
     enableRaycast: true,
     surface: 'grass',
     terrainMesh,
@@ -481,7 +507,7 @@ function buildTimberlineCompound(
     for (let ix = 0; ix <= riverColsX; ix++) {
       const tx = ix / riverColsX;
       const wx = rx + (tx * 2 - 1) * riverHalfW;
-      const groundY = sampleVisualTerrainY(wx, z);
+      const groundY = sampleVisY(wx, z);
       const depth = Math.max(0, waterSurfaceY - groundY);
 
       let pierMask = 0;
@@ -521,44 +547,36 @@ function buildTimberlineCompound(
   const riverMesh = new THREE.Mesh(riverGeo, matRiver);
   sceneGroup.add(riverMesh);
 
-  // Natural shoreline river cobbles tucked cleanly where water meets the bank slopes
-  const cobbleGeo = trackGeo(new THREE.DodecahedronGeometry(0.42, 1));
+  // Natural shoreline river cobbles tucked cleanly where water meets the bank slopes (sculpted granite)
   const cobbleRand = seededRand(8831);
-  const cobblePositions: Array<{ x: number; y: number; z: number; sx: number; sy: number; sz: number; ry: number }> = [];
+  const cobbleSpots: BoulderSpot[] = [];
   for (let i = 0; i < 160; i++) {
-    const z = -112 + cobbleRand() * 224;
+    const z = -124 + cobbleRand() * 248;
     if (Math.abs(z - -48) < 5.2 || Math.abs(z - 34) < 5.2) continue;
     const rx = getRiverCenterX(z);
     const side = cobbleRand() > 0.5 ? 1 : -1;
     const x = rx + side * (5.6 + cobbleRand() * 2.2);
-    const groundY = sampleVisualTerrainY(x, z);
+    const groundY = sampleVisY(x, z);
     if (groundY > -0.65 && groundY < 0.05) {
-      cobblePositions.push({
+      cobbleSpots.push({
         x,
         y: groundY - 0.04,
         z,
-        sx: 0.7 + cobbleRand() * 1.15,
-        sy: 0.35 + cobbleRand() * 0.4,
-        sz: 0.65 + cobbleRand() * 0.95,
-        ry: cobbleRand() * Math.PI * 2,
+        sx: (0.7 + cobbleRand() * 1.15) * 0.42,
+        sy: (0.35 + cobbleRand() * 0.4) * 0.42,
+        sz: (0.65 + cobbleRand() * 0.95) * 0.42,
+        yaw: cobbleRand() * Math.PI * 2,
+        variant: i % 3 === 0 ? 1 : 0,
+        tint: new THREE.Color().setHSL(0.08 + cobbleRand() * 0.06, 0.08, 0.72 + cobbleRand() * 0.2),
       });
     }
   }
-  if (cobblePositions.length > 0) {
-    const cobbleInst = new THREE.InstancedMesh(cobbleGeo, matRock, cobblePositions.length);
-    for (let i = 0; i < cobblePositions.length; i++) {
-      const c = cobblePositions[i];
-      dummy.position.set(c.x, c.y, c.z);
-      dummy.rotation.set(0, c.ry, 0);
-      dummy.scale.set(c.sx, c.sy, c.sz);
-      dummy.updateMatrix();
-      cobbleInst.setMatrixAt(i, dummy.matrix);
-    }
-    cobbleInst.instanceMatrix.needsUpdate = true;
-    cobbleInst.computeBoundingSphere();
-    cobbleInst.userData.surfaceMaterial = 'gravel';
-    sceneGroup.add(cobbleInst);
-  }
+  buildInstancedSculptedBoulders(propCtx, cobbleSpots, {
+    castShadow: false,
+    receiveShadow: qProfile.castShadows,
+    addColliders: false,
+    seed: 8831,
+  });
 
   // Two anchored timber-and-steel Road Bridges with full concrete abutments, 45° wing-walls & flush approach ramps
   const buildBridge = (bz: number): void => {
@@ -680,8 +698,8 @@ function buildTimberlineCompound(
     physics.addSurfaceZone({ minX: x - w * 0.5, maxX: x + w * 0.5, minZ: z - d * 0.5, maxZ: z + d * 0.5, surface });
   };
 
-  // Main North-South Paved Highway along X = -2 (Z in [-112, 112])
-  addFlatRoadStrip(-2, 0, 7.6, 224, matRoad, 'asphalt', 0.05);
+  // Main North-South Paved Highway along X = -2
+  addFlatRoadStrip(-2, 0, 7.6, isConquest ? 248 : 224, matRoad, 'asphalt', 0.05);
   // Paved Military Base Entry Spur (Z = -48, X in [1.8, 16]) and South Spur (Z = 34, X in [1.8, 16])
   addFlatRoadStrip(8.9, -48, 14.2, 6.4, matRoad, 'asphalt', 0.055);
   addFlatRoadStrip(8.9, 34, 14.2, 6.4, matRoad, 'asphalt', 0.055);
@@ -692,6 +710,23 @@ function buildTimberlineCompound(
   addFlatRoadStrip(-62, 54, 4.6, 38, matDirtPath, 'gravel', 0.04);
   addFlatRoadStrip(-11.5, -48, 13.0, 4.8, matDirtPath, 'gravel', 0.04);
   addFlatRoadStrip(-10.5, 34, 11.0, 4.8, matDirtPath, 'gravel', 0.04);
+
+  if (isConquest) {
+    // Expanded Conquest Road Network: West Valley Logging Road + East Airfield Perimeter Road + HQ Spurs
+    addFlatRoadStrip(-124, 0, 6.2, 152, matDirtPath, 'gravel', 0.042);
+    addFlatRoadStrip(-96, -48, 56, 5.0, matDirtPath, 'gravel', 0.042);
+    addFlatRoadStrip(-96, 34, 56, 5.0, matDirtPath, 'gravel', 0.042);
+    addFlatRoadStrip(-112, 0, 44, 5.4, matDirtPath, 'gravel', 0.045);
+    addFlatRoadStrip(-58, 76, 4.8, 28, matDirtPath, 'gravel', 0.042);
+    // East Airfield Perimeter Paved Service Road
+    addFlatRoadStrip(122, 0, 6.8, 152, matRoad, 'asphalt', 0.05);
+    addFlatRoadStrip(108, -62, 32, 5.4, matRoad, 'asphalt', 0.05);
+    addFlatRoadStrip(108, 58, 32, 5.4, matRoad, 'asphalt', 0.05);
+    addFlatRoadStrip(112, 0, 40, 6.0, matRoad, 'asphalt', 0.052);
+    // HQ Tactical Staging Pads (West Alpine Ridge & East Runway Perimeter)
+    addFlatRoadStrip(-130, 0, 18, 22, matDirtPath, 'gravel', 0.045);
+    addFlatRoadStrip(130, 0, 18, 22, matRoad, 'asphalt', 0.052);
+  }
 
   // === 4. ENTERABLE FURNISHED TIMBER CABIN HELPER (Villages & Lone Cabins) ===
   const penetrableSystem = new PenetrableSurfaceSystem(sceneGroup, { isSoftwareGl });
@@ -705,7 +740,7 @@ function buildTimberlineCompound(
     doorSideA: 'north' | 'south' | 'east' | 'west',
     doorSideB?: 'north' | 'south' | 'east' | 'west',
   ): void => {
-    const baseY = Math.max(0, sampleVisualTerrainY(cx, cz));
+    const baseY = Math.max(0, sampleVisY(cx, cz));
     const h = 3.1;
     const t = 0.28;
     const doorW = 1.95;
@@ -917,12 +952,17 @@ function buildTimberlineCompound(
     }
   };
 
-  // Outer Military Base Fence (gates at West Z=-48, West Z=34, North X=52, South X=52)
+  // Outer Military Base Fence (gates at West Z=-48, West Z=34, North X=52, South X=52; plus East Z=0 gate in Conquest)
   addFence(12, -62, 46, -62);
   addFence(58, -62, 96, -62);
   addFence(12, 58, 46, 58);
   addFence(58, 58, 96, 58);
-  addFence(96, -61.8, 96, 57.8);
+  if (isConquest) {
+    addFence(96, -61.8, 96, -7.0);
+    addFence(96, 7.0, 96, 57.8);
+  } else {
+    addFence(96, -61.8, 96, 57.8);
+  }
   addFence(12, -61.8, 12, -52.5);
   addFence(12, -43.5, 12, 29.5);
   addFence(12, 38.5, 12, 57.8);
@@ -1262,123 +1302,149 @@ function buildTimberlineCompound(
   postInst.computeBoundingSphere();
   sceneGroup.add(postInst);
 
-  // === 6. MASSIVE INSTANCED PINE FOREST & BOULDERS (Scaled by GraphicsQuality) ===
+  // === 5G. EXPANDED CONQUEST NEUTRAL ENTERABLE COVER BUILDINGS (PURE COVER, NON-OBJECTIVE) ===
+  const conquestCoverBuildings: Array<{
+    built: ReturnType<typeof buildEnterableCoverBuilding>;
+    anchorNode: string;
+  }> = [];
+  if (isConquest) {
+    const cabinMats = createCoverBuildingMaterialPack(propCtx, 'timber_cabin', trackTex);
+    const garageMats = createCoverBuildingMaterialPack(propCtx, 'industrial_garage', trackTex);
+    const coverSpecs: Array<{
+      id: string;
+      preset: 'timber_cabin' | 'industrial_garage';
+      x: number;
+      z: number;
+      rotQuarterTurns: 0 | 1 | 2 | 3;
+      width: number;
+      depth: number;
+      anchorNode: string;
+    }> = [
+      { id: 'tl_ranger_cabin', preset: 'timber_cabin', x: -104, z: -30, rotQuarterTurns: 0, width: 10.6, depth: 8.4, anchorNode: 'cq_west_log_n' },
+      { id: 'tl_sawmill_shed', preset: 'timber_cabin', x: -104, z: 48, rotQuarterTurns: 1, width: 11.2, depth: 8.4, anchorNode: 'cq_west_log_s' },
+      { id: 'tl_motor_pool', preset: 'industrial_garage', x: 108, z: -34, rotQuarterTurns: 1, width: 12.4, depth: 9.2, anchorNode: 'cq_east_perim_n' },
+      { id: 'tl_boathouse', preset: 'timber_cabin', x: -12, z: 82, rotQuarterTurns: 0, width: 10.4, depth: 8.2, anchorNode: 'hwy_s' },
+      { id: 'tl_maint_shop', preset: 'industrial_garage', x: 108, z: 36, rotQuarterTurns: 3, width: 12.2, depth: 9.2, anchorNode: 'cq_east_perim_s' },
+    ];
+    for (const cs of coverSpecs) {
+      const built = buildEnterableCoverBuilding(
+        propCtx,
+        {
+          id: cs.id,
+          preset: cs.preset,
+          x: cs.x,
+          z: cs.z,
+          y: Math.max(0, sampleVisY(cs.x, cs.z)),
+          rotQuarterTurns: cs.rotQuarterTurns,
+          width: cs.width,
+          depth: cs.depth,
+          materials: cs.preset === 'timber_cabin' ? cabinMats : garageMats,
+        },
+        trackTex,
+      );
+      conquestCoverBuildings.push({ built, anchorNode: cs.anchorNode });
+    }
+  }
+
+  // === 6. MASSIVE HIGH-DETAIL INSTANCED PINE FOREST & SCULPTED BOULDERS ===
   const rand = seededRand(202705);
-  const targetTrees = Math.max(120, Math.round(340 * qProfile.foliageDensity));
-  const treeSpots: Array<{ x: number; y: number; z: number; scale: number; yaw: number; tint: THREE.Color }> = [];
+  const targetTrees = Math.max(
+    isConquest ? 160 : 120,
+    Math.round((isConquest ? 420 : 340) * qProfile.foliageDensity),
+  );
+  const treeSpots: PineTreeSpot[] = [];
 
   const isClearForTree = (tx: number, tz: number): boolean => {
     // Keep Military Base compound + airstrip clear
     if (tx >= 8 && tx <= 102 && tz >= -67 && tz <= 63) return false;
     // Keep paved highway clear
-    if (Math.abs(tx - -2) < 8.5 && Math.abs(tz) < 120) return false;
+    if (Math.abs(tx - -2) < 8.5 && Math.abs(tz) < (isConquest ? 132 : 120)) return false;
     // Keep river channel & banks clear
     if (Math.abs(tx - getRiverCenterX(tz)) < 11.5) return false;
     // Keep bridge dirt approaches clear
-    if (Math.abs(tz - -48) < 6.0 && tx > -78 && tx < 16) return false;
-    if (Math.abs(tz - 34) < 6.0 && tx > -78 && tx < 16) return false;
+    if (Math.abs(tz - -48) < 6.0 && tx > (isConquest ? -134 : -78) && tx < 16) return false;
+    if (Math.abs(tz - 34) < 6.0 && tx > (isConquest ? -134 : -78) && tx < 16) return false;
     // Keep Village clusters & lone cabins clear
     if (tx >= -82 && tx <= -40 && tz >= -74 && tz <= -42) return false;
     if (tx >= -84 && tx <= -44 && tz >= 42 && tz <= 78) return false;
     if (Math.hypot(tx - 78, tz - -84) < 11) return false;
     if (Math.hypot(tx - -96, tz - 4) < 11) return false;
     if (Math.hypot(tx - 84, tz - 82) < 11) return false;
+    if (isConquest) {
+      // Keep West Logging Road, East Airfield Perimeter Road, HQs, South Bend FOB & Cover Buildings clear
+      if (Math.abs(tx - -124) < 9.5 && Math.abs(tz) < 86) return false;
+      if (Math.abs(tx - 122) < 9.5 && Math.abs(tz) < 86) return false;
+      if (Math.abs(tz) < 10 && (tx < -84 || tx > 92)) return false;
+      if (Math.abs(tz - -62) < 7 && tx > 90 && tx < 132) return false;
+      if (Math.abs(tz - 58) < 7 && tx > 90 && tx < 132) return false;
+      if (Math.hypot(tx - -130, tz) < 20) return false;
+      if (Math.hypot(tx - 130, tz) < 20) return false;
+      if (Math.hypot(tx - -52, tz - 86) < 15) return false;
+      if (Math.hypot(tx - -104, tz - -30) < 11) return false;
+      if (Math.hypot(tx - -104, tz - 48) < 11) return false;
+      if (Math.hypot(tx - 108, tz - -34) < 12) return false;
+      if (Math.hypot(tx - 108, tz - 36) < 12) return false;
+      if (Math.hypot(tx - -12, tz - 82) < 11) return false;
+    }
     return true;
   };
 
-  for (let attempt = 0; attempt < 2600 && treeSpots.length < targetTrees; attempt++) {
-    const tx = (rand() - 0.5) * 285;
-    const tz = (rand() - 0.5) * 285;
+  const treeSpanX = isConquest ? 380 : 285;
+  const treeSpanZ = isConquest ? 320 : 285;
+  for (let attempt = 0; attempt < 3400 && treeSpots.length < targetTrees; attempt++) {
+    const tx = (rand() - 0.5) * treeSpanX;
+    const tz = (rand() - 0.5) * treeSpanZ;
     if (!isClearForTree(tx, tz)) continue;
     if (treeSpots.some((s) => (s.x - tx) ** 2 + (s.z - tz) ** 2 < 24.0)) continue;
-    const ty = sampleVisualTerrainY(tx, tz);
-    const scale = 0.9 + rand() * 0.55;
-    const tint = new THREE.Color().setHSL(0.30 + (rand() - 0.5) * 0.05, 0.30 + rand() * 0.14, 0.18 + rand() * 0.09);
+    const ty = sampleVisY(tx, tz);
+    const scale = 0.92 + rand() * 0.56;
+    const tint = new THREE.Color().setHSL(0.30 + (rand() - 0.5) * 0.05, 0.30 + rand() * 0.14, 0.24 + rand() * 0.11);
     treeSpots.push({ x: tx, y: ty, z: tz, scale, yaw: rand() * Math.PI * 2, tint });
   }
 
-  const trunkGeo = trackGeo(new THREE.CylinderGeometry(0.18, 0.32, 3.6, 7, 3));
-  trunkGeo.translate(0, 1.8, 0);
-  assignHeightSwayAttribute(trunkGeo, 0, 3.6, 2.0);
-  const tier1Geo = trackGeo(new THREE.ConeGeometry(2.5, 4.6, 9, 3));
-  tier1Geo.translate(0, 4.5, 0);
-  assignHeightSwayAttribute(tier1Geo, 0.8, 10.6, 1.5);
-  const tier2Geo = trackGeo(new THREE.ConeGeometry(1.9, 3.8, 9, 2));
-  tier2Geo.translate(0, 7.0, 0);
-  assignHeightSwayAttribute(tier2Geo, 0.8, 10.6, 1.5);
-  const tier3Geo = trackGeo(new THREE.ConeGeometry(1.25, 3.0, 8, 2));
-  tier3Geo.translate(0, 9.2, 0);
-  assignHeightSwayAttribute(tier3Geo, 0.8, 10.6, 1.5);
-
-  const tCount = treeSpots.length;
-  const trunkInst = new THREE.InstancedMesh(trunkGeo, matBark, tCount);
-  const tier1Inst = new THREE.InstancedMesh(tier1Geo, matPineNeedles, tCount);
-  const tier2Inst = new THREE.InstancedMesh(tier2Geo, matPineNeedles, tCount);
-  const tier3Inst = new THREE.InstancedMesh(tier3Geo, matPineNeedles, tCount);
-
-  trunkInst.castShadow = !isSoftwareGl && qProfile.castShadows;
-  tier1Inst.castShadow = !isSoftwareGl && qProfile.castShadows;
-
-  treeSpots.forEach((t, i) => {
-    dummy.position.set(t.x, t.y - 0.1, t.z);
-    dummy.rotation.set(0, t.yaw, 0);
-    dummy.scale.setScalar(t.scale);
-    dummy.updateMatrix();
-    trunkInst.setMatrixAt(i, dummy.matrix);
-    tier1Inst.setMatrixAt(i, dummy.matrix);
-    tier2Inst.setMatrixAt(i, dummy.matrix);
-    tier3Inst.setMatrixAt(i, dummy.matrix);
-
-    tier1Inst.setColorAt(i, t.tint);
-    tier2Inst.setColorAt(i, t.tint.clone().offsetHSL(0, 0, 0.02));
-    tier3Inst.setColorAt(i, t.tint.clone().offsetHSL(0, 0, 0.04));
-
-    if (Math.abs(t.x) <= 112 && Math.abs(t.z) <= 112) {
-      const r = 0.34 * t.scale;
-      physics.addBox({
-        minX: t.x - r,
-        maxX: t.x + r,
-        minY: t.y,
-        maxY: t.y + 4.0,
-        minZ: t.z - r,
-        maxZ: t.z + r,
-        surface: 'wood',
-        blocksMovement: true,
-        blocksRaycast: true,
-        meshRef: trunkInst,
-      });
-    }
+  // High-detail fluted trunk + root flare + deadwood stubs + 5-whorl scalloped pine canopy (ONLY 2 draw calls!)
+  buildInstancedPineTrees(propCtx, treeSpots, {
+    castShadow: qProfile.castShadows,
+    receiveShadow: qProfile.castShadows,
+    addTrunkColliders: true,
+    colliderBounds: {
+      minX: physics.boundsMinX + 2,
+      maxX: physics.boundsMaxX - 2,
+      minZ: physics.boundsMinZ + 2,
+      maxZ: physics.boundsMaxZ - 2,
+    },
+    seed: 2027,
   });
-
-  for (const inst of [trunkInst, tier1Inst, tier2Inst, tier3Inst]) {
-    inst.instanceMatrix.needsUpdate = true;
-    if (inst.instanceColor) inst.instanceColor.needsUpdate = true;
-    inst.computeBoundingSphere();
-    inst.userData.surfaceMaterial = 'wood';
-    sceneGroup.add(inst);
-  }
-  trunkInst.userData.analyticalRaycastCovered = true;
-  raycastMeshes.push(trunkInst);
 
   // Botanical undergrowth: dense wind-reactive grass clumps, forest ferns, and leafy shrubs
   const isClearFoliage = (gx: number, gz: number): boolean => {
     if (gx >= 11 && gx <= 97 && gz >= -63 && gz <= 59) return false;
     if (Math.abs(gx - getRiverCenterX(gz)) < 7.6) return false;
     if (Math.abs(gx - -2) < 5.0) return false;
-    if (Math.abs(gz - -48) < 4.5 && gx > -74 && gx < 14) return false;
-    if (Math.abs(gz - 34) < 4.5 && gx > -74 && gx < 14) return false;
+    if (Math.abs(gz - -48) < 4.5 && gx > (isConquest ? -130 : -74) && gx < 14) return false;
+    if (Math.abs(gz - 34) < 4.5 && gx > (isConquest ? -130 : -74) && gx < 14) return false;
     if (gx >= -82 && gx <= -40 && gz >= -74 && gz <= -42) return false;
     if (gx >= -84 && gx <= -44 && gz >= 42 && gz <= 78) return false;
+    if (isConquest) {
+      if (Math.abs(gx - -124) < 6.0 && Math.abs(gz) < 82) return false;
+      if (Math.abs(gx - 122) < 6.0 && Math.abs(gz) < 82) return false;
+      if (Math.hypot(gx - -130, gz) < 16 || Math.hypot(gx - 130, gz) < 16) return false;
+      if (Math.hypot(gx - -104, gz - -30) < 9 || Math.hypot(gx - -104, gz - 48) < 9) return false;
+      if (Math.hypot(gx - 108, gz - -34) < 10 || Math.hypot(gx - 108, gz - 36) < 10) return false;
+      if (Math.hypot(gx - -12, gz - 82) < 9) return false;
+    }
     return true;
   };
 
-  const grassCount = Math.max(180, Math.round(620 * qProfile.foliageDensity));
+  const grassSpanX = isConquest ? 304 : 214;
+  const grassSpanZ = isConquest ? 248 : 214;
+  const grassCount = Math.max(180, Math.round((isConquest ? 680 : 620) * qProfile.foliageDensity));
   const grassSpots: Array<{ x: number; y: number; z: number; scale: number; yaw: number; tint: THREE.Color }> = [];
   for (let i = 0; i < grassCount * 2 && grassSpots.length < grassCount; i++) {
-    const gx = (rand() - 0.5) * 214;
-    const gz = (rand() - 0.5) * 214;
+    const gx = (rand() - 0.5) * grassSpanX;
+    const gz = (rand() - 0.5) * grassSpanZ;
     if (!isClearFoliage(gx, gz)) continue;
-    const gy = sampleVisualTerrainY(gx, gz);
+    const gy = sampleVisY(gx, gz);
     if (gy < -0.22) continue;
     grassSpots.push({
       x: gx,
@@ -1394,10 +1460,10 @@ function buildTimberlineCompound(
   const fernCount = Math.max(70, Math.round(220 * qProfile.foliageDensity));
   const fernSpots: Array<{ x: number; y: number; z: number; scale: number; yaw: number; tint: THREE.Color }> = [];
   for (let i = 0; i < fernCount * 2 && fernSpots.length < fernCount; i++) {
-    const fx = (rand() - 0.5) * 210;
-    const fz = (rand() - 0.5) * 210;
+    const fx = (rand() - 0.5) * (grassSpanX - 4);
+    const fz = (rand() - 0.5) * (grassSpanZ - 4);
     if (!isClearFoliage(fx, fz)) continue;
-    const fy = sampleVisualTerrainY(fx, fz);
+    const fy = sampleVisY(fx, fz);
     if (fy < -0.15) continue;
     fernSpots.push({
       x: fx,
@@ -1413,10 +1479,10 @@ function buildTimberlineCompound(
   const shrubCount = Math.max(55, Math.round(170 * qProfile.foliageDensity));
   const shrubSpots: Array<{ x: number; y: number; z: number; scale: number; yaw: number; tint: THREE.Color }> = [];
   for (let i = 0; i < shrubCount * 2 && shrubSpots.length < shrubCount; i++) {
-    const sx = (rand() - 0.5) * 216;
-    const sz = (rand() - 0.5) * 216;
+    const sx = (rand() - 0.5) * grassSpanX;
+    const sz = (rand() - 0.5) * grassSpanZ;
     if (!isClearFoliage(sx, sz)) continue;
-    const sy = sampleVisualTerrainY(sx, sz);
+    const sy = sampleVisY(sx, sz);
     if (sy < -0.12) continue;
     shrubSpots.push({
       x: sx,
@@ -1429,45 +1495,61 @@ function buildTimberlineCompound(
   }
   buildInstancedUndergrowthShrubs(propCtx, shrubSpots);
 
-  // Natural mossy valley boulders along riverbanks & forest flanks
-  const rockGeo = trackGeo(new THREE.DodecahedronGeometry(1.3, 0));
-  const rockSpots: Array<[number, number]> = [
-    [-12, -26],
-    [-38, -22],
-    [-14, 12],
-    [-38, 14],
-    [-10, 68],
-    [-40, -78],
-    [40, -82],
-    [44, 78],
+  // High-detail fractured granite boulders & multi-stone outcrop clusters along riverbanks & forest flanks
+  const baseRockCoords: Array<[number, number, number, number, number]> = [
+    [-12, -26, 1.55, 1.05, 1.35],
+    [-38, -22, 1.7, 1.15, 1.45],
+    [-14, 12, 1.5, 0.98, 1.3],
+    [-38, 14, 1.65, 1.12, 1.4],
+    [-10, 68, 1.55, 1.02, 1.35],
+    [-40, -78, 1.8, 1.2, 1.5],
+    [40, -82, 1.75, 1.18, 1.45],
+    [44, 78, 1.65, 1.1, 1.4],
+    [-42, -8, 1.45, 0.96, 1.25],
+    [-16, -68, 1.5, 1.0, 1.3],
+    [22, -80, 1.6, 1.05, 1.35],
+    [24, 74, 1.55, 1.02, 1.3],
   ];
-  const rockInst = new THREE.InstancedMesh(rockGeo, matRock, rockSpots.length);
-  rockSpots.forEach(([rx, rz], i) => {
-    const ry = sampleVisualTerrainY(rx, rz);
-    dummy.position.set(rx, ry + 0.6, rz);
-    dummy.rotation.set(i * 0.5, i * 1.1, 0);
-    dummy.scale.set(1.4, 0.88, 1.2);
-    dummy.updateMatrix();
-    rockInst.setMatrixAt(i, dummy.matrix);
-    physics.addBox({
-      minX: rx - 1.4,
-      maxX: rx + 1.4,
-      minY: ry,
-      maxY: ry + 1.5,
-      minZ: rz - 1.2,
-      maxZ: rz + 1.2,
-      surface: 'concrete',
-      blocksMovement: true,
-      blocksRaycast: true,
-      meshRef: rockInst,
-    });
+  if (isConquest) {
+    baseRockCoords.push(
+      [-114, -64, 1.85, 1.24, 1.55],
+      [-136, -24, 1.75, 1.18, 1.5],
+      [-112, 18, 1.65, 1.12, 1.4],
+      [-138, 56, 1.9, 1.28, 1.6],
+      [-82, -16, 1.6, 1.08, 1.35],
+      [-80, 20, 1.65, 1.1, 1.4],
+      [-34, 92, 1.75, 1.15, 1.5],
+      [108, -74, 1.8, 1.22, 1.5],
+      [136, -42, 1.7, 1.16, 1.45],
+      [138, 28, 1.85, 1.25, 1.55],
+      [110, 74, 1.7, 1.14, 1.45],
+      [20, -96, 1.85, 1.26, 1.55],
+      [22, 98, 1.8, 1.2, 1.5],
+    );
+  }
+  const boulderSpots: BoulderSpot[] = baseRockCoords.map(([rx, rz, sx, sy, sz], i) => ({
+    x: rx,
+    y: sampleVisY(rx, rz),
+    z: rz,
+    sx,
+    sy,
+    sz,
+    yaw: i * 1.17 + 0.4,
+    variant: i % 2 === 0 ? 0 : 1,
+    tint: new THREE.Color().setHSL(0.08 + (i % 4) * 0.02, 0.07, 0.8 + (i % 3) * 0.08),
+  }));
+  buildInstancedSculptedBoulders(propCtx, boulderSpots, {
+    castShadow: qProfile.castShadows,
+    receiveShadow: qProfile.castShadows,
+    addColliders: true,
+    colliderBounds: {
+      minX: physics.boundsMinX + 2,
+      maxX: physics.boundsMaxX - 2,
+      minZ: physics.boundsMinZ + 2,
+      maxZ: physics.boundsMaxZ - 2,
+    },
+    seed: 2029,
   });
-  rockInst.instanceMatrix.needsUpdate = true;
-  rockInst.computeBoundingSphere();
-  rockInst.userData.surfaceMaterial = 'concrete';
-  rockInst.userData.analyticalRaycastCovered = true;
-  sceneGroup.add(rockInst);
-  raycastMeshes.push(rockInst);
 
   // Tactical Highway Shoulder Jersey Barriers, Bridge Chokepoint Cover & Airstrip Apron Baffles
   const tacticalCoverSpecs: Array<[number, number, number, number, number, 'concrete' | 'wood']> = [
@@ -1489,8 +1571,17 @@ function buildTimberlineCompound(
     [-46.0, -45.0, 2.8, 1.05, 1.35, 'wood'],
     [-48.0, 44.0, 2.8, 1.05, 1.35, 'wood'],
   ];
+  if (isConquest) {
+    tacticalCoverSpecs.push(
+      [-119, -22, 0.7, 1.12, 3.4, 'wood'],
+      [-129, 22, 0.7, 1.12, 3.4, 'wood'],
+      [117, -18, 0.7, 1.16, 3.4, 'concrete'],
+      [127, 20, 0.7, 1.16, 3.4, 'concrete'],
+      [-46, 82, 3.2, 1.1, 0.7, 'wood'],
+    );
+  }
   for (const [cx, cz, cw, ch, cd, surf] of tacticalCoverSpecs) {
-    const cy = sampleVisualTerrainY(cx, cz) + ch * 0.5;
+    const cy = sampleVisY(cx, cz) + ch * 0.5;
     addSolidBox(cx, cy, cz, cw, ch, cd, surf === 'wood' ? matWood : matBunkerConcrete, surf);
   }
 
@@ -1540,22 +1631,91 @@ function buildTimberlineCompound(
     { id: 'bunker_in', position: [55.0, bFloorY, -6.0], zoneId: 'default', neighbors: ['bunker_door'], isCover: true, coverNormal: [-1, 0] },
   ];
 
-  const teamA: SpawnPoint[] = [
-    { position: [-54, 0, -48], yaw: Math.PI * 0.5 },
-    { position: [-58, 0.3, -64], yaw: Math.PI * 0.65 },
-    { position: [-2, 0.05, -62], yaw: Math.PI },
-    { position: [-62, 0, 48], yaw: Math.PI * 0.35 },
-    { position: [-88, 0, 4], yaw: Math.PI * 0.5 },
-    { position: [-2, 0.05, 58], yaw: 0 },
-  ];
-  const teamB: SpawnPoint[] = [
-    { position: [50, 0.04, -54], yaw: Math.PI },
-    { position: [76, 0.08, -42], yaw: -Math.PI * 0.65 },
-    { position: [76, 0.08, 36], yaw: -Math.PI * 0.35 },
-    { position: [37, 0.04, 24], yaw: -Math.PI * 0.5 },
-    { position: [37, 0.04, -22], yaw: -Math.PI * 0.5 },
-    { position: [54, bFloorY, -6], yaw: -Math.PI * 0.5 },
-  ];
+  if (isConquest) {
+    const linkBidirectional = (idA: string, idB: string) => {
+      const a = rawNodes.find((n) => n.id === idA);
+      const b = rawNodes.find((n) => n.id === idB);
+      if (a && !a.neighbors.includes(idB)) a.neighbors.push(idB);
+      if (b && !b.neighbors.includes(idA)) b.neighbors.push(idA);
+    };
+    rawNodes.push(
+      { id: 'cq_hq_a', position: [-130, samplePhysY(-130, 0), 0], zoneId: 'default', neighbors: ['cq_west_log_n', 'cq_west_log_s', 'lone_w'] },
+      { id: 'cq_west_log_n', position: [-124, samplePhysY(-124, -48), -48], zoneId: 'default', neighbors: ['cq_hq_a', 'vil_nw_c'] },
+      { id: 'cq_west_log_s', position: [-124, samplePhysY(-124, 34), 34], zoneId: 'default', neighbors: ['cq_hq_a', 'vil_sw_c'] },
+      { id: 'cq_south_bend', position: [-52, samplePhysY(-52, 86), 86], zoneId: 'default', neighbors: ['vil_sw_s', 'hwy_s'] },
+      { id: 'cq_base_gate_e', position: [98, 0.05, 0], zoneId: 'default', neighbors: ['airstrip_mid', 'cq_hq_b', 'cq_east_perim_n', 'cq_east_perim_s'] },
+      { id: 'cq_east_perim_n', position: [122, 0.05, -48], zoneId: 'default', neighbors: ['cq_base_gate_e', 'cq_hq_b', 'base_gate_n'] },
+      { id: 'cq_east_perim_s', position: [122, 0.05, 48], zoneId: 'default', neighbors: ['cq_base_gate_e', 'cq_hq_b', 'base_gate_s'] },
+      { id: 'cq_hq_b', position: [130, 0.05, 0], zoneId: 'default', neighbors: ['cq_base_gate_e', 'cq_east_perim_n', 'cq_east_perim_s'] },
+    );
+    linkBidirectional('cq_hq_a', 'lone_w');
+    linkBidirectional('cq_west_log_n', 'vil_nw_c');
+    linkBidirectional('cq_west_log_s', 'vil_sw_c');
+    linkBidirectional('cq_south_bend', 'vil_sw_s');
+    linkBidirectional('cq_south_bend', 'hwy_s');
+    linkBidirectional('cq_base_gate_e', 'airstrip_mid');
+    linkBidirectional('cq_east_perim_n', 'base_gate_n');
+    linkBidirectional('cq_east_perim_s', 'base_gate_s');
+
+    for (const { built, anchorNode } of conquestCoverBuildings) {
+      const inId = `cb_${built.id}_in`;
+      const doorIds: string[] = [];
+      built.entryPoints.forEach((ep, idx) => {
+        const dId = `cb_${built.id}_d${idx}`;
+        doorIds.push(dId);
+        rawNodes.push({
+          id: dId,
+          position: ep,
+          zoneId: 'default',
+          neighbors: [inId, anchorNode],
+        });
+        linkBidirectional(dId, anchorNode);
+      });
+      rawNodes.push({
+        id: inId,
+        position: built.interiorPos,
+        zoneId: 'default',
+        neighbors: doorIds,
+        isCover: true,
+        coverNormal: [1, 0],
+      });
+    }
+  }
+
+  const teamA: SpawnPoint[] = isConquest
+    ? [
+        { position: [-130, samplePhysY(-130, 0), 0], yaw: Math.PI * 0.5 },
+        { position: [-132, samplePhysY(-132, -8), -8], yaw: Math.PI * 0.5 },
+        { position: [-132, samplePhysY(-132, 8), 8], yaw: Math.PI * 0.5 },
+        { position: [-126, samplePhysY(-126, -12), -12], yaw: Math.PI * 0.55 },
+        { position: [-126, samplePhysY(-126, 12), 12], yaw: Math.PI * 0.45 },
+        { position: [-124, samplePhysY(-124, 0), 0], yaw: Math.PI * 0.5 },
+      ]
+    : [
+        { position: [-54, 0, -48], yaw: Math.PI * 0.5 },
+        { position: [-58, 0.3, -64], yaw: Math.PI * 0.65 },
+        { position: [-2, 0.05, -62], yaw: Math.PI },
+        { position: [-62, 0, 48], yaw: Math.PI * 0.35 },
+        { position: [-88, 0, 4], yaw: Math.PI * 0.5 },
+        { position: [-2, 0.05, 58], yaw: 0 },
+      ];
+  const teamB: SpawnPoint[] = isConquest
+    ? [
+        { position: [130, 0.05, 0], yaw: -Math.PI * 0.5 },
+        { position: [132, 0.05, -8], yaw: -Math.PI * 0.5 },
+        { position: [132, 0.05, 8], yaw: -Math.PI * 0.5 },
+        { position: [126, 0.05, -12], yaw: -Math.PI * 0.55 },
+        { position: [126, 0.05, 12], yaw: -Math.PI * 0.45 },
+        { position: [124, 0.05, 0], yaw: -Math.PI * 0.5 },
+      ]
+    : [
+        { position: [50, 0.04, -54], yaw: Math.PI },
+        { position: [76, 0.08, -42], yaw: -Math.PI * 0.65 },
+        { position: [76, 0.08, 36], yaw: -Math.PI * 0.35 },
+        { position: [37, 0.04, 24], yaw: -Math.PI * 0.5 },
+        { position: [37, 0.04, -22], yaw: -Math.PI * 0.5 },
+        { position: [54, bFloorY, -6], yaw: -Math.PI * 0.5 },
+      ];
   const ffa: SpawnPoint[] = [
     ...teamA,
     ...teamB,
@@ -1695,87 +1855,189 @@ function buildTimberlineCompound(
       teamA,
       teamB,
       ffa,
-      playerStart: teamB[3], // drops player facing the base, garages, radar & valley!
+      playerStart: isConquest ? teamA[0] : teamB[3],
       zombieSpawners: [],
     },
     battleObjectives: {
-      hqA: {
-        id: 'hq_a',
-        team: 'A',
-        label: 'West Valley Village HQ',
-        position: [-62, samplePhysicsTerrainY(-62, 0), 0],
-        safeRadiusM: 16,
-        spawnPoints: teamA,
-      },
-      hqB: {
-        id: 'hq_b',
-        team: 'B',
-        label: 'East Airbase HQ',
-        position: [76, 0.08, -2],
-        safeRadiusM: 16,
-        spawnPoints: teamB,
-      },
-      conquestPois: [
-        {
-          id: 'poi_hwy_north_cp',
-          code: 'CP-1',
-          label: 'North Bridge Highway Checkpoint',
-          kind: 'checkpoint',
-          position: [-2, 0.05, -48],
-          captureRadiusM: 9.0,
-          territoryWeight: 1.0,
-          roadYaw: Math.PI * 0.5,
-        },
-        {
-          id: 'poi_village_fob',
-          code: 'FOB-A',
-          label: 'North Village FOB',
-          kind: 'fob',
-          position: [-58, samplePhysicsTerrainY(-58, -52), -52],
-          captureRadiusM: 9.5,
-          territoryWeight: 1.3,
-          spawnPoints: [
-            { position: [-54, samplePhysicsTerrainY(-54, -48), -48], yaw: Math.PI * 0.5 },
-            { position: [-62, samplePhysicsTerrainY(-62, -55), -55], yaw: Math.PI * 0.4 },
-            { position: [-58, samplePhysicsTerrainY(-58, -62), -62], yaw: Math.PI * 0.5 },
+      hqA: isConquest
+        ? {
+            id: 'hq_a',
+            team: 'A',
+            label: 'West Alpine Ridge HQ',
+            position: [-130, samplePhysY(-130, 0), 0],
+            safeRadiusM: 18,
+            spawnPoints: teamA,
+          }
+        : {
+            id: 'hq_a',
+            team: 'A',
+            label: 'West Valley Village HQ',
+            position: [-62, samplePhysY(-62, 0), 0],
+            safeRadiusM: 16,
+            spawnPoints: teamA,
+          },
+      hqB: isConquest
+        ? {
+            id: 'hq_b',
+            team: 'B',
+            label: 'East Runway Perimeter HQ',
+            position: [130, 0.05, 0],
+            safeRadiusM: 18,
+            spawnPoints: teamB,
+          }
+        : {
+            id: 'hq_b',
+            team: 'B',
+            label: 'East Airbase HQ',
+            position: [76, 0.08, -2],
+            safeRadiusM: 16,
+            spawnPoints: teamB,
+          },
+      conquestPois: isConquest
+        ? [
+            {
+              id: 'poi_hwy_north_cp',
+              code: 'CP-1',
+              label: 'North Bridge Highway Checkpoint',
+              kind: 'checkpoint',
+              position: [-2, 0.05, -48],
+              captureRadiusM: 9.0,
+              territoryWeight: 1.0,
+              roadYaw: Math.PI * 0.5,
+            },
+            {
+              id: 'poi_west_log_cp',
+              code: 'CP-3',
+              label: 'West Logging Road Checkpoint',
+              kind: 'checkpoint',
+              position: [-124, samplePhysY(-124, -48), -48],
+              captureRadiusM: 8.8,
+              territoryWeight: 1.0,
+              roadYaw: 0,
+            },
+            {
+              id: 'poi_village_fob',
+              code: 'FOB-A',
+              label: 'North Village FOB',
+              kind: 'fob',
+              position: [-58, samplePhysY(-58, -52), -52],
+              captureRadiusM: 9.5,
+              territoryWeight: 1.3,
+              spawnPoints: [
+                { position: [-54, samplePhysY(-54, -48), -48], yaw: Math.PI * 0.5 },
+                { position: [-62, samplePhysY(-62, -55), -55], yaw: Math.PI * 0.4 },
+                { position: [-58, samplePhysY(-58, -62), -62], yaw: Math.PI * 0.5 },
+              ],
+            },
+            {
+              id: 'poi_hwy_mid_outpost',
+              code: 'OUTPOST',
+              label: 'Central Highway Outpost',
+              kind: 'outpost',
+              position: [-2, 0.05, -6],
+              captureRadiusM: 9.5,
+              territoryWeight: 1.6,
+            },
+            {
+              id: 'poi_airbase_fob',
+              code: 'FOB-B',
+              label: 'Airbase Garage FOB',
+              kind: 'fob',
+              position: [37, 0.04, 10],
+              captureRadiusM: 9.5,
+              territoryWeight: 1.3,
+              spawnPoints: [
+                { position: [37, 0.04, 22], yaw: -Math.PI * 0.5 },
+                { position: [37, 0.04, -14], yaw: -Math.PI * 0.5 },
+                { position: [32, 0.04, 10], yaw: -Math.PI * 0.5 },
+              ],
+            },
+            {
+              id: 'poi_south_bend_fob',
+              code: 'FOB-C',
+              label: 'South River Bend FOB',
+              kind: 'fob',
+              position: [-52, samplePhysY(-52, 86), 86],
+              captureRadiusM: 9.2,
+              territoryWeight: 1.3,
+              spawnPoints: [
+                { position: [-58, samplePhysY(-58, 86), 86], yaw: Math.PI * 0.25 },
+                { position: [-46, samplePhysY(-46, 86), 86], yaw: Math.PI * 0.35 },
+                { position: [-52, samplePhysY(-52, 92), 92], yaw: 0 },
+              ],
+            },
+            {
+              id: 'poi_hwy_south_cp',
+              code: 'CP-2',
+              label: 'South Bridge Highway Checkpoint',
+              kind: 'checkpoint',
+              position: [-2, 0.05, 34],
+              captureRadiusM: 9.0,
+              territoryWeight: 1.0,
+              roadYaw: Math.PI * 0.5,
+            },
+          ]
+        : [
+            {
+              id: 'poi_hwy_north_cp',
+              code: 'CP-1',
+              label: 'North Bridge Highway Checkpoint',
+              kind: 'checkpoint',
+              position: [-2, 0.05, -48],
+              captureRadiusM: 9.0,
+              territoryWeight: 1.0,
+              roadYaw: Math.PI * 0.5,
+            },
+            {
+              id: 'poi_village_fob',
+              code: 'FOB-A',
+              label: 'North Village FOB',
+              kind: 'fob',
+              position: [-58, samplePhysY(-58, -52), -52],
+              captureRadiusM: 9.5,
+              territoryWeight: 1.3,
+              spawnPoints: [
+                { position: [-54, samplePhysY(-54, -48), -48], yaw: Math.PI * 0.5 },
+                { position: [-62, samplePhysY(-62, -55), -55], yaw: Math.PI * 0.4 },
+                { position: [-58, samplePhysY(-58, -62), -62], yaw: Math.PI * 0.5 },
+              ],
+            },
+            {
+              id: 'poi_hwy_mid_outpost',
+              code: 'OUTPOST',
+              label: 'Central Highway Outpost',
+              kind: 'outpost',
+              position: [-2, 0.05, -6],
+              captureRadiusM: 9.5,
+              territoryWeight: 1.6,
+            },
+            {
+              id: 'poi_airbase_fob',
+              code: 'FOB-B',
+              label: 'Airbase Garage FOB',
+              kind: 'fob',
+              position: [37, 0.04, 10],
+              captureRadiusM: 9.5,
+              territoryWeight: 1.3,
+              spawnPoints: [
+                { position: [37, 0.04, 22], yaw: -Math.PI * 0.5 },
+                { position: [37, 0.04, -14], yaw: -Math.PI * 0.5 },
+                { position: [32, 0.04, 10], yaw: -Math.PI * 0.5 },
+              ],
+            },
+            {
+              id: 'poi_hwy_south_cp',
+              code: 'CP-2',
+              label: 'South Bridge Highway Checkpoint',
+              kind: 'checkpoint',
+              position: [-2, 0.05, 34],
+              captureRadiusM: 9.0,
+              territoryWeight: 1.0,
+              roadYaw: Math.PI * 0.5,
+            },
           ],
-        },
-        {
-          id: 'poi_hwy_mid_outpost',
-          code: 'OUTPOST',
-          label: 'Central Highway Outpost',
-          kind: 'outpost',
-          position: [-2, 0.05, -6],
-          captureRadiusM: 9.5,
-          territoryWeight: 1.6,
-        },
-        {
-          id: 'poi_airbase_fob',
-          code: 'FOB-B',
-          label: 'Airbase Garage FOB',
-          kind: 'fob',
-          position: [37, 0.04, 10],
-          captureRadiusM: 9.5,
-          territoryWeight: 1.3,
-          spawnPoints: [
-            { position: [37, 0.04, 22], yaw: -Math.PI * 0.5 },
-            { position: [37, 0.04, -14], yaw: -Math.PI * 0.5 },
-            { position: [32, 0.04, 10], yaw: -Math.PI * 0.5 },
-          ],
-        },
-        {
-          id: 'poi_hwy_south_cp',
-          code: 'CP-2',
-          label: 'South Bridge Highway Checkpoint',
-          kind: 'checkpoint',
-          position: [-2, 0.05, 34],
-          captureRadiusM: 9.0,
-          territoryWeight: 1.0,
-          roadYaw: Math.PI * 0.5,
-        },
-      ],
       ctfFlags: [
-        { team: 'A', label: 'West Valley Flag', position: [-58, samplePhysicsTerrainY(-58, -52), -52] },
+        { team: 'A', label: 'West Valley Flag', position: [-58, samplePhysY(-58, -52), -52] },
         { team: 'B', label: 'East Airbase Flag', position: [50, 0.04, -32] },
       ],
       kothHills: [
@@ -1786,7 +2048,8 @@ function buildTimberlineCompound(
         { id: 'hill_north_br', label: 'North Highway Crossing', position: [-2, 0.05, -48], radiusM: 9.0 },
       ],
     },
-    terrainHeightAt: samplePhysicsTerrainY,
+    isExpandedConquest: isConquest,
+    terrainHeightAt: samplePhysY,
     interactables: [],
     lightingPreset: LIGHTING_PRESET,
     supportsDynamicWeatherTime: true,

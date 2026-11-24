@@ -11,15 +11,21 @@ import {
 } from '../engine/world/WeatherTimeSystem';
 import { createWindShaderUniforms } from '../engine/world/WindFoliageShader';
 import {
+  BoulderSpot,
   buildInstancedBirchTrees,
   buildInstancedFerns,
   buildInstancedGrassTufts,
+  buildInstancedSculptedBoulders,
   buildInstancedUndergrowthShrubs,
   buildOfficeDesk,
   buildRustedVehicle,
   PropFactoryContext,
   VehicleMaterials,
 } from './MapPropFactory';
+import {
+  buildEnterableCoverBuilding,
+  createCoverBuildingMaterialPack,
+} from './CoverBuildingFactory';
 import {
   createAsphaltRoadTexture,
   createCabinWoodTexture,
@@ -32,6 +38,7 @@ import {
   buildNavGraph,
   BuiltMapInstance,
   IMapDefinition,
+  MapBuildOptions,
   MapLightingPreset,
   NavNode,
   SpawnPoint,
@@ -63,15 +70,17 @@ function buildPripyatBlock(
   renderer: THREE.WebGLRenderer,
   isSoftwareGl: boolean,
   graphicsQuality?: GraphicsQualityId,
+  options?: MapBuildOptions,
 ): BuiltMapInstance {
   const qProfile = getGraphicsQualityProfile(graphicsQuality);
+  const isConquest = options?.battleRule === 'conquest';
 
   const physics = new BodycamPhysicsWorld();
   physics.baseFloorY = 0;
-  physics.boundsMinX = -46.5;
-  physics.boundsMaxX = 46.5;
-  physics.boundsMinZ = -40.5;
-  physics.boundsMaxZ = 40.5;
+  physics.boundsMinX = isConquest ? -95 : -46.5;
+  physics.boundsMaxX = isConquest ? 95 : 46.5;
+  physics.boundsMinZ = isConquest ? -110 : -40.5;
+  physics.boundsMaxZ = isConquest ? 110 : 40.5;
 
   const sceneGroup = new THREE.Group();
   scene.add(sceneGroup);
@@ -98,7 +107,7 @@ function buildPripyatBlock(
   scene.background = new THREE.Color(LIGHTING_PRESET.backgroundHex);
   scene.fog = new THREE.FogExp2(
     LIGHTING_PRESET.fogHex,
-    LIGHTING_PRESET.fogDensity * qProfile.fogDensityScale,
+    LIGHTING_PRESET.fogDensity * qProfile.fogDensityScale * (isConquest ? 0.78 : 1.0),
   );
 
   const pmrem = new THREE.PMREMGenerator(renderer);
@@ -124,11 +133,12 @@ function buildPripyatBlock(
     const sm = Math.min(2048, qProfile.shadowMapSize);
     sun.shadow.mapSize.set(sm, sm);
     sun.shadow.camera.near = 2;
-    sun.shadow.camera.far = 140;
-    sun.shadow.camera.left = -54;
-    sun.shadow.camera.right = 54;
-    sun.shadow.camera.top = 54;
-    sun.shadow.camera.bottom = -54;
+    sun.shadow.camera.far = isConquest ? 240 : 140;
+    const shadowHalf = isConquest ? 112 : 54;
+    sun.shadow.camera.left = -shadowHalf;
+    sun.shadow.camera.right = shadowHalf;
+    sun.shadow.camera.top = shadowHalf;
+    sun.shadow.camera.bottom = -shadowHalf;
     sun.shadow.bias = -0.0005;
     sun.shadow.normalBias = 0.025;
   }
@@ -230,6 +240,7 @@ function buildPripyatBlock(
     isSoftwareGl,
     trackGeo,
     trackMat,
+    trackTex,
     windUniforms,
     maxAniso,
   };
@@ -265,6 +276,7 @@ function buildPripyatBlock(
     mesh.castShadow = !isSoftwareGl && qProfile.castShadows && castShadow && h > 0.35;
     mesh.receiveShadow = !isSoftwareGl && qProfile.castShadows;
     mesh.userData.surfaceMaterial = surface;
+    mesh.userData.analyticalRaycastCovered = true;
     sceneGroup.add(mesh);
     raycastMeshes.push(mesh);
     physics.addBox({
@@ -276,6 +288,8 @@ function buildPripyatBlock(
       maxZ: z + d * 0.5,
       surface,
       blocksMovement: true,
+      blocksRaycast: true,
+      meshRef: mesh,
     });
     if (mat === matTealPlaster && h >= 1.1 && Math.min(w, d) <= 0.36 && Math.max(w, d) >= 0.45) {
       const faceAxis = w < d ? 'x' : 'z';
@@ -393,7 +407,8 @@ function buildPripyatBlock(
 
   // === 1. GROUND LAYER (Strictly separated Y-layers -> ZERO Z-FIGHTING) ===
   // Base cracked mossy Pripyat asphalt courtyard & boulevard (y = 0)
-  const mainGround = new THREE.Mesh(trackGeo(new THREE.PlaneGeometry(180, 180)), matAsphalt);
+  const groundSpan = isConquest ? 310 : 180;
+  const mainGround = new THREE.Mesh(trackGeo(new THREE.PlaneGeometry(groundSpan, groundSpan)), matAsphalt);
   mainGround.rotation.x = -Math.PI * 0.5;
   mainGround.position.y = 0;
   mainGround.receiveShadow = !isSoftwareGl && qProfile.castShadows;
@@ -627,13 +642,76 @@ function buildPripyatBlock(
   buildOfficeDesk(propCtx, 0, F2_Y + 0.04, -24.0, 0.08, matWood, matSteel);
 
   // === 4. SOUTH BOULEVARD PERIMETER WALL, BUS STOP & CENTRAL COURTYARD LANDMARKS ===
-  // Iconic Soviet PO-2 precast concrete perimeter fence framing South & flanking edges
-  addSolidBox(0, 1.45, 39.8, 92.0, 2.9, 0.45, matPanelConc);
-  addSolidBox(-45.8, 1.45, 29.0, 0.45, 2.9, 21.2, matPanelConc);
-  addSolidBox(45.8, 1.45, 29.0, 0.45, 2.9, 21.2, matPanelConc);
-  addSolidBox(-45.8, 1.45, -26.5, 0.45, 2.9, 27.0, matPanelConc);
-  addSolidBox(45.8, 1.45, -26.5, 0.45, 2.9, 27.0, matPanelConc);
-  addSolidBox(0, 1.45, -39.8, 92.0, 2.9, 0.45, matPanelConc);
+  // Iconic Soviet PO-2 precast concrete perimeter fence framing courtyard (open boulevard gates in Conquest)
+  if (isConquest) {
+    // North & South inner courtyard fences with wide 20m boulevard gateways at X in [-10, 10]
+    addSolidBox(-28.0, 1.45, 39.8, 36.0, 2.9, 0.45, matPanelConc);
+    addSolidBox(28.0, 1.45, 39.8, 36.0, 2.9, 0.45, matPanelConc);
+    addSolidBox(-28.0, 1.45, -39.8, 36.0, 2.9, 0.45, matPanelConc);
+    addSolidBox(28.0, 1.45, -39.8, 36.0, 2.9, 0.45, matPanelConc);
+    // West & East inner courtyard fences leaving wide flanking avenue openings at Z in [-14, 18]
+    addSolidBox(-45.8, 1.45, 29.0, 0.45, 2.9, 21.2, matPanelConc);
+    addSolidBox(45.8, 1.45, 29.0, 0.45, 2.9, 21.2, matPanelConc);
+    addSolidBox(-45.8, 1.45, -27.0, 0.45, 2.9, 25.0, matPanelConc);
+    addSolidBox(45.8, 1.45, -27.0, 0.45, 2.9, 25.0, matPanelConc);
+
+    // Outer microdistrict Soviet PO-2 perimeter walls at X = ±94.5, Z = ±109.5
+    addSolidBox(0, 1.65, -109.5, 189.4, 3.3, 0.5, matPanelConc);
+    addSolidBox(0, 1.65, 109.5, 189.4, 3.3, 0.5, matPanelConc);
+    addSolidBox(-94.5, 1.65, 0, 0.5, 3.3, 219.0, matPanelConc);
+    addSolidBox(94.5, 1.65, 0, 0.5, 3.3, 219.0, matPanelConc);
+
+    // Expanded Soviet Boulevards, Flanking Avenues & Raised Concrete Sidewalk Medians
+    const matBoulevardStrip = trackMat(
+      new THREE.MeshStandardMaterial({ color: 0x3b3f3d, roughness: 0.9, metalness: 0.03 }),
+    );
+    const addRoadRibbon = (rx: number, rz: number, rw: number, rd: number): void => {
+      const m = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(rw, 0.05, rd)), matBoulevardStrip);
+      m.position.set(rx, 0.025, rz);
+      m.receiveShadow = !isSoftwareGl && qProfile.castShadows;
+      m.userData.surfaceMaterial = 'asphalt';
+      sceneGroup.add(m);
+      raycastMeshes.push(m);
+    };
+    // North & South Soviet Boulevards (Z = ±68) + Flanking East/West Avenues (X = ±68) + HQ Approaches
+    addRoadRibbon(0, -68, 172, 11.0);
+    addRoadRibbon(0, 68, 172, 11.0);
+    addRoadRibbon(-68, 0, 10.0, 148);
+    addRoadRibbon(68, 0, 10.0, 148);
+    addRoadRibbon(0, -69, 12.0, 64);
+    addRoadRibbon(0, 69, 12.0, 64);
+    // Sidewalk islands & street concrete cover along expanded boulevards
+    for (const sz of [-61.5, 61.5]) {
+      addSolidBox(-34, 0.04, sz, 48, 0.08, 2.2, matSidewalk, 'concrete', false);
+      addSolidBox(34, 0.04, sz, 48, 0.08, 2.2, matSidewalk, 'concrete', false);
+    }
+    for (const [bx, bz, bw, bd] of [
+      [-18, -68, 3.4, 0.65],
+      [18, -68, 3.4, 0.65],
+      [-18, 68, 3.4, 0.65],
+      [18, 68, 3.4, 0.65],
+      [-68, -28, 0.65, 3.6],
+      [-68, 28, 0.65, 3.6],
+      [68, -28, 0.65, 3.6],
+      [68, 28, 0.65, 3.6],
+    ] as Array<[number, number, number, number]>) {
+      addSolidBox(bx, 0.56, bz, bw, 1.12, bd, matPanelConc, 'concrete');
+    }
+    // Outer avenue derelict vehicles for street-fighting cover
+    buildRustedVehicle(propCtx, 'zil_truck', -28, 0, -68, 0.12, vehTruck);
+    buildRustedVehicle(propCtx, 'lada', 26, 0, -68, -0.22, vehTeal);
+    buildRustedVehicle(propCtx, 'moskvitch', -24, 0, 68, 0.25, vehOchre);
+    buildRustedVehicle(propCtx, 'zil_truck', 28, 0, 68, -0.1, vehTruck);
+    buildRustedVehicle(propCtx, 'pickup', -68, 0, -14, Math.PI * 0.45, vehCream);
+    buildRustedVehicle(propCtx, 'lada', 68, 0, 16, -Math.PI * 0.48, vehTeal);
+  } else {
+    addSolidBox(0, 1.45, 39.8, 92.0, 2.9, 0.45, matPanelConc);
+    addSolidBox(-45.8, 1.45, 29.0, 0.45, 2.9, 21.2, matPanelConc);
+    addSolidBox(45.8, 1.45, 29.0, 0.45, 2.9, 21.2, matPanelConc);
+    addSolidBox(-45.8, 1.45, -26.5, 0.45, 2.9, 27.0, matPanelConc);
+    addSolidBox(45.8, 1.45, -26.5, 0.45, 2.9, 27.0, matPanelConc);
+    addSolidBox(0, 1.45, -39.8, 92.0, 2.9, 0.45, matPanelConc);
+  }
 
   // Rusted Soviet Bus Stop Pavilion on South Boulevard (X = 0, Z = 23.6)
   addSolidBox(0, 1.35, 25.2, 6.2, 2.55, 0.24, matTealPlaster);
@@ -706,9 +784,53 @@ function buildPripyatBlock(
   buildRustedVehicle(propCtx, 'lada', 17.5, 0, 15.2, -0.62, vehTeal);
   buildRustedVehicle(propCtx, 'pickup', -28.0, 0, 28.5, 0.85, vehTruck);
 
-  // === 6. OVERGROWN EXCLUSION ZONE FOLIAGE (Birch Trees, Saplings & Grass Tufts) ===
+  // === 5B. CONQUEST NEUTRAL ENTERABLE COVER BUILDINGS (PURE COVER, NON-OBJECTIVE) ===
+  const conquestCoverBuildings: Array<{
+    built: ReturnType<typeof buildEnterableCoverBuilding>;
+    anchorNode: string;
+  }> = [];
+  if (isConquest) {
+    const annexMats = createCoverBuildingMaterialPack(propCtx, 'soviet_annex', trackTex);
+    const depotMats = createCoverBuildingMaterialPack(propCtx, 'industrial_garage', trackTex);
+    const coverSpecs: Array<{
+      id: string;
+      preset: 'soviet_annex' | 'industrial_garage';
+      x: number;
+      z: number;
+      rotQuarterTurns: 0 | 1 | 2 | 3;
+      width: number;
+      depth: number;
+      anchorNode: string;
+    }> = [
+      { id: 'pr_grocery', preset: 'soviet_annex', x: -54, z: -54, rotQuarterTurns: 0, width: 11.0, depth: 8.6, anchorNode: 'cq_blvd_nw' },
+      { id: 'pr_post_office', preset: 'soviet_annex', x: 54, z: -54, rotQuarterTurns: 2, width: 11.0, depth: 8.6, anchorNode: 'cq_blvd_ne' },
+      { id: 'pr_bus_depot', preset: 'industrial_garage', x: -54, z: 54, rotQuarterTurns: 1, width: 12.2, depth: 9.2, anchorNode: 'cq_blvd_sw' },
+      { id: 'pr_clinic', preset: 'soviet_annex', x: 54, z: 54, rotQuarterTurns: 3, width: 11.2, depth: 8.8, anchorNode: 'cq_blvd_se' },
+      { id: 'pr_lobby_block', preset: 'soviet_annex', x: -82, z: 0, rotQuarterTurns: 1, width: 11.4, depth: 8.6, anchorNode: 'cq_ave_w' },
+    ];
+    for (const cs of coverSpecs) {
+      const built = buildEnterableCoverBuilding(
+        propCtx,
+        {
+          id: cs.id,
+          preset: cs.preset,
+          x: cs.x,
+          z: cs.z,
+          y: 0,
+          rotQuarterTurns: cs.rotQuarterTurns,
+          width: cs.width,
+          depth: cs.depth,
+          materials: cs.preset === 'industrial_garage' ? depotMats : annexMats,
+        },
+        trackTex,
+      );
+      conquestCoverBuildings.push({ built, anchorNode: cs.anchorNode });
+    }
+  }
+
+  // === 6. OVERGROWN EXCLUSION ZONE FOLIAGE (High-Detail Birch Trees, Boulders & Grass Tufts) ===
   const rand = seededRand(19860426);
-  const birchTarget = Math.max(18, Math.round(48 * qProfile.foliageDensity));
+  const birchTarget = Math.max(18, Math.round((isConquest ? 64 : 48) * qProfile.foliageDensity));
   const birchSpots: Array<{ x: number; y: number; z: number; scale: number; yaw: number; tint: THREE.Color }> = [];
 
   // Hand-placed iconic courtyard birch saplings growing near lawns & cracks
@@ -723,6 +845,22 @@ function buildPripyatBlock(
     [-21.5, 34.5, 1.1],
     [22.5, 35.0, 1.15],
   ];
+  if (isConquest) {
+    courtyardTrees.push(
+      [-36, -54, 1.05],
+      [36, -54, 1.08],
+      [-36, 54, 1.02],
+      [36, 54, 1.12],
+      [-80, -34, 1.15],
+      [-80, 34, 1.1],
+      [80, -34, 1.12],
+      [80, 34, 1.08],
+      [-28, -86, 1.18],
+      [28, -86, 1.14],
+      [-28, 86, 1.16],
+      [28, 86, 1.12],
+    );
+  }
   for (const [tx, tz, sc] of courtyardTrees) {
     birchSpots.push({
       x: tx,
@@ -736,9 +874,9 @@ function buildPripyatBlock(
   // Ring of dense Exclusion Zone birch forest outside the perimeter fences
   for (let i = 0; i < birchTarget; i++) {
     const ang = (i / birchTarget) * Math.PI * 2 + (rand() - 0.5) * 0.15;
-    const dist = 48.0 + rand() * 26.0;
+    const dist = (isConquest ? 102.0 : 48.0) + rand() * 26.0;
     const tx = Math.cos(ang) * dist;
-    const tz = Math.sin(ang) * dist * 0.88;
+    const tz = Math.sin(ang) * dist * (isConquest ? 1.08 : 0.88);
     birchSpots.push({
       x: tx,
       y: 0,
@@ -749,6 +887,51 @@ function buildPripyatBlock(
     });
   }
   buildInstancedBirchTrees(propCtx, birchSpots, false);
+
+  // Sculpted Exclusion Zone park boulders & overgrown concrete rubble outcrops (1–2 draw calls)
+  const pripyatRockCoords: Array<[number, number, number, number, number]> = [
+    [-13.5, 9.5, 0.95, 0.62, 0.85],
+    [13.5, 9.8, 0.9, 0.58, 0.8],
+    [-22.0, 35.8, 1.15, 0.72, 0.95],
+    [22.5, 36.0, 1.1, 0.68, 0.92],
+  ];
+  if (isConquest) {
+    pripyatRockCoords.push(
+      [-36, -80, 1.45, 0.95, 1.25],
+      [36, -80, 1.4, 0.92, 1.2],
+      [-36, 80, 1.45, 0.95, 1.25],
+      [36, 80, 1.4, 0.9, 1.2],
+      [-80, -48, 1.35, 0.88, 1.18],
+      [80, -48, 1.4, 0.9, 1.22],
+      [-80, 48, 1.38, 0.9, 1.2],
+      [80, 48, 1.35, 0.86, 1.16],
+      [82, -14, 1.45, 0.96, 1.25],
+      [82, 18, 1.35, 0.88, 1.15],
+    );
+  }
+  const pripyatRocks: BoulderSpot[] = pripyatRockCoords.map(([rx, rz, sx, sy, sz], i) => ({
+    x: rx,
+    y: 0,
+    z: rz,
+    sx,
+    sy,
+    sz,
+    yaw: i * 1.25,
+    variant: i % 2 === 0 ? 1 : 0,
+    tint: new THREE.Color().setHSL(0.11, 0.06, 0.78 + (i % 3) * 0.08),
+  }));
+  buildInstancedSculptedBoulders(propCtx, pripyatRocks, {
+    castShadow: qProfile.castShadows,
+    receiveShadow: qProfile.castShadows,
+    addColliders: true,
+    colliderBounds: {
+      minX: physics.boundsMinX + 2,
+      maxX: physics.boundsMaxX - 2,
+      minZ: physics.boundsMinZ + 2,
+      maxZ: physics.boundsMaxZ - 2,
+    },
+    seed: 1986,
+  });
 
   // Overgrown grass, courtyard ferns & woody shrubs bursting through cracked asphalt & lawns
   const grassCount = Math.max(95, Math.round(290 * qProfile.foliageDensity));
@@ -801,15 +984,16 @@ function buildPripyatBlock(
 
   // Distant Pripyat 9-story Brezhnevka skyline silhouette blocks outside map bounds
   const skylineGeo = trackGeo(new THREE.BoxGeometry(28, 28, 14));
+  const skyScale = isConquest ? 1.85 : 1.0;
   const skylinePositions: Array<[number, number, number, number]> = [
-    [-76, 14, -46, 0.12],
-    [-28, 15, -72, 0],
-    [28, 16, -72, 0.05],
-    [76, 14, -42, -0.15],
-    [-78, 13, 18, 0.08],
-    [78, 14, 22, -0.08],
-    [-46, 15, 74, 0.04],
-    [46, 14, 74, -0.06],
+    [-76 * skyScale, 14, -46 * skyScale, 0.12],
+    [-28 * skyScale, 15, -72 * skyScale, 0],
+    [28 * skyScale, 16, -72 * skyScale, 0.05],
+    [76 * skyScale, 14, -42 * skyScale, -0.15],
+    [-78 * skyScale, 13, 18 * skyScale, 0.08],
+    [78 * skyScale, 14, 22 * skyScale, -0.08],
+    [-46 * skyScale, 15, 74 * skyScale, 0.04],
+    [46 * skyScale, 14, 74 * skyScale, -0.06],
   ];
   const skylineInst = new THREE.InstancedMesh(skylineGeo, matDarkConcrete, skylinePositions.length);
   skylinePositions.forEach(([bx, by, bz, ry], idx) => {
@@ -928,22 +1112,91 @@ function buildPripyatBlock(
     { id: 'e_u_s', position: [30.0, F2_Y + 0.04, 11.0], zoneId: 'default', neighbors: ['e_u_n'], isCover: true, coverNormal: [-1, 0] },
   ];
 
-  const teamA: SpawnPoint[] = [
-    { position: [0, 0.08, -32.0], yaw: Math.PI },
-    { position: [-22.0, 0.08, -31.5], yaw: Math.PI * 0.85 },
-    { position: [22.0, 0.08, -31.5], yaw: -Math.PI * 0.85 },
-    { position: [-28.0, 0.08, -22.5], yaw: Math.PI * 0.8 },
-    { position: [28.0, 0.08, -22.5], yaw: -Math.PI * 0.8 },
-    { position: [0, F2_Y + 0.04, -22.5], yaw: Math.PI },
-  ];
-  const teamB: SpawnPoint[] = [
-    { position: [0, 0, 34.5], yaw: 0 },
-    { position: [-22.0, 0, 33.0], yaw: Math.PI * 0.15 },
-    { position: [22.0, 0, 33.0], yaw: -Math.PI * 0.15 },
-    { position: [-30.0, 0.08, 13.5], yaw: Math.PI * 0.35 },
-    { position: [30.0, 0.08, 13.5], yaw: -Math.PI * 0.35 },
-    { position: [-10.0, 0, 35.0], yaw: 0 },
-  ];
+  if (isConquest) {
+    const linkBidirectional = (idA: string, idB: string) => {
+      const a = rawNodes.find((n) => n.id === idA);
+      const b = rawNodes.find((n) => n.id === idB);
+      if (a && !a.neighbors.includes(idB)) a.neighbors.push(idB);
+      if (b && !b.neighbors.includes(idA)) b.neighbors.push(idA);
+    };
+    rawNodes.push(
+      { id: 'cq_hq_a', position: [0, 0, -94], zoneId: 'default', neighbors: ['cq_blvd_nc', 'cq_blvd_nw', 'cq_blvd_ne'] },
+      { id: 'cq_blvd_nc', position: [0, 0, -68], zoneId: 'default', neighbors: ['cq_hq_a', 'n_back', 'cq_blvd_nw', 'cq_blvd_ne'] },
+      { id: 'cq_blvd_nw', position: [-68, 0, -68], zoneId: 'default', neighbors: ['cq_hq_a', 'cq_blvd_nc', 'cq_ave_w'] },
+      { id: 'cq_blvd_ne', position: [68, 0, -68], zoneId: 'default', neighbors: ['cq_hq_a', 'cq_blvd_nc', 'cq_ave_e'] },
+      { id: 'cq_ave_w', position: [-68, 0, 0], zoneId: 'default', neighbors: ['cq_blvd_nw', 'cq_blvd_sw', 'w_g_n', 'w_g_s'] },
+      { id: 'cq_ave_e', position: [68, 0, 0], zoneId: 'default', neighbors: ['cq_blvd_ne', 'cq_blvd_se', 'e_g_n', 'e_g_s'] },
+      { id: 'cq_blvd_sw', position: [-68, 0, 68], zoneId: 'default', neighbors: ['cq_ave_w', 'cq_blvd_sc', 'cq_hq_b'] },
+      { id: 'cq_blvd_se', position: [68, 0, 68], zoneId: 'default', neighbors: ['cq_ave_e', 'cq_blvd_sc', 'cq_hq_b'] },
+      { id: 'cq_blvd_sc', position: [0, 0, 68], zoneId: 'default', neighbors: ['blvd_c', 'cq_blvd_sw', 'cq_blvd_se', 'cq_hq_b'] },
+      { id: 'cq_hq_b', position: [0, 0, 94], zoneId: 'default', neighbors: ['cq_blvd_sc', 'cq_blvd_sw', 'cq_blvd_se'] },
+    );
+    linkBidirectional('cq_blvd_nc', 'n_back');
+    linkBidirectional('cq_blvd_sc', 'blvd_c');
+    linkBidirectional('cq_ave_w', 'w_g_n');
+    linkBidirectional('cq_ave_w', 'w_g_s');
+    linkBidirectional('cq_ave_e', 'e_g_n');
+    linkBidirectional('cq_ave_e', 'e_g_s');
+
+    for (const { built, anchorNode } of conquestCoverBuildings) {
+      const inId = `cb_${built.id}_in`;
+      const doorIds: string[] = [];
+      built.entryPoints.forEach((ep, idx) => {
+        const dId = `cb_${built.id}_d${idx}`;
+        doorIds.push(dId);
+        rawNodes.push({
+          id: dId,
+          position: ep,
+          zoneId: 'default',
+          neighbors: [inId, anchorNode],
+        });
+        linkBidirectional(dId, anchorNode);
+      });
+      rawNodes.push({
+        id: inId,
+        position: built.interiorPos,
+        zoneId: 'default',
+        neighbors: doorIds,
+        isCover: true,
+        coverNormal: [0, 1],
+      });
+    }
+  }
+
+  const teamA: SpawnPoint[] = isConquest
+    ? [
+        { position: [0, 0, -94], yaw: Math.PI },
+        { position: [-10, 0, -96], yaw: Math.PI },
+        { position: [10, 0, -96], yaw: Math.PI },
+        { position: [-18, 0, -91], yaw: Math.PI * 0.9 },
+        { position: [18, 0, -91], yaw: -Math.PI * 0.9 },
+        { position: [0, 0, -88], yaw: Math.PI },
+      ]
+    : [
+        { position: [0, 0.08, -32.0], yaw: Math.PI },
+        { position: [-22.0, 0.08, -31.5], yaw: Math.PI * 0.85 },
+        { position: [22.0, 0.08, -31.5], yaw: -Math.PI * 0.85 },
+        { position: [-28.0, 0.08, -22.5], yaw: Math.PI * 0.8 },
+        { position: [28.0, 0.08, -22.5], yaw: -Math.PI * 0.8 },
+        { position: [0, F2_Y + 0.04, -22.5], yaw: Math.PI },
+      ];
+  const teamB: SpawnPoint[] = isConquest
+    ? [
+        { position: [0, 0, 94], yaw: 0 },
+        { position: [-10, 0, 96], yaw: 0 },
+        { position: [10, 0, 96], yaw: 0 },
+        { position: [-18, 0, 91], yaw: Math.PI * 0.1 },
+        { position: [18, 0, 91], yaw: -Math.PI * 0.1 },
+        { position: [0, 0, 88], yaw: 0 },
+      ]
+    : [
+        { position: [0, 0, 34.5], yaw: 0 },
+        { position: [-22.0, 0, 33.0], yaw: Math.PI * 0.15 },
+        { position: [22.0, 0, 33.0], yaw: -Math.PI * 0.15 },
+        { position: [-30.0, 0.08, 13.5], yaw: Math.PI * 0.35 },
+        { position: [30.0, 0.08, 13.5], yaw: -Math.PI * 0.35 },
+        { position: [-10.0, 0, 35.0], yaw: 0 },
+      ];
   const ffa: SpawnPoint[] = [
     ...teamA,
     ...teamB,
@@ -1046,71 +1299,173 @@ function buildPripyatBlock(
       zombieSpawners: [],
     },
     battleObjectives: {
-      hqA: {
-        id: 'hq_a',
-        team: 'A',
-        label: 'North Brezhnevka HQ',
-        position: [0, 0.08, -33.5],
-        safeRadiusM: 12,
-        spawnPoints: teamA,
-      },
-      hqB: {
-        id: 'hq_b',
-        team: 'B',
-        label: 'South Boulevard HQ',
-        position: [0, 0, 34.5],
-        safeRadiusM: 12,
-        spawnPoints: teamB,
-      },
-      conquestPois: [
-        {
-          id: 'poi_blvd_cp',
-          code: 'CP-1',
-          label: 'South Boulevard Checkpoint',
-          kind: 'checkpoint',
-          position: [0, 0, 17.5],
-          captureRadiusM: 7.2,
-          territoryWeight: 1.0,
-          roadYaw: Math.PI * 0.5,
-        },
-        {
-          id: 'poi_west_fob',
-          code: 'FOB-A',
-          label: 'West Wing FOB',
-          kind: 'fob',
-          position: [-26.5, 0.08, 0.5],
-          captureRadiusM: 7.2,
-          territoryWeight: 1.25,
-          spawnPoints: [
-            { position: [-30.0, 0.08, -6.5], yaw: -Math.PI * 0.5 },
-            { position: [-30.0, 0.08, 10.5], yaw: -Math.PI * 0.5 },
-            { position: [-24.0, 0.08, 0.0], yaw: -Math.PI * 0.5 },
+      hqA: isConquest
+        ? {
+            id: 'hq_a',
+            team: 'A',
+            label: 'North Boulevard HQ',
+            position: [0, 0, -94],
+            safeRadiusM: 16,
+            spawnPoints: teamA,
+          }
+        : {
+            id: 'hq_a',
+            team: 'A',
+            label: 'North Brezhnevka HQ',
+            position: [0, 0.08, -33.5],
+            safeRadiusM: 12,
+            spawnPoints: teamA,
+          },
+      hqB: isConquest
+        ? {
+            id: 'hq_b',
+            team: 'B',
+            label: 'South Metro Avenue HQ',
+            position: [0, 0, 94],
+            safeRadiusM: 16,
+            spawnPoints: teamB,
+          }
+        : {
+            id: 'hq_b',
+            team: 'B',
+            label: 'South Boulevard HQ',
+            position: [0, 0, 34.5],
+            safeRadiusM: 12,
+            spawnPoints: teamB,
+          },
+      conquestPois: isConquest
+        ? [
+            {
+              id: 'poi_north_blvd_cp',
+              code: 'CP-1',
+              label: 'North Boulevard Checkpoint',
+              kind: 'checkpoint',
+              position: [0, 0, -68],
+              captureRadiusM: 8.2,
+              territoryWeight: 1.0,
+              roadYaw: 0,
+            },
+            {
+              id: 'poi_south_metro_cp',
+              code: 'CP-2',
+              label: 'South Metro Avenue Checkpoint',
+              kind: 'checkpoint',
+              position: [0, 0, 68],
+              captureRadiusM: 8.2,
+              territoryWeight: 1.0,
+              roadYaw: 0,
+            },
+            {
+              id: 'poi_east_ave_cp',
+              code: 'CP-3',
+              label: 'East Flanking Avenue Checkpoint',
+              kind: 'checkpoint',
+              position: [68, 0, 0],
+              captureRadiusM: 8.0,
+              territoryWeight: 1.0,
+              roadYaw: Math.PI * 0.5,
+            },
+            {
+              id: 'poi_west_fob',
+              code: 'FOB-A',
+              label: 'West Wing FOB',
+              kind: 'fob',
+              position: [-26.5, 0.08, 0.5],
+              captureRadiusM: 7.5,
+              territoryWeight: 1.25,
+              spawnPoints: [
+                { position: [-30.0, 0.08, -6.5], yaw: -Math.PI * 0.5 },
+                { position: [-30.0, 0.08, 10.5], yaw: -Math.PI * 0.5 },
+                { position: [-24.0, 0.08, 0.0], yaw: -Math.PI * 0.5 },
+              ],
+            },
+            {
+              id: 'poi_courtyard',
+              code: 'OUTPOST',
+              label: 'Central Courtyard Outpost',
+              kind: 'outpost',
+              position: [0, 0.04, -3.5],
+              captureRadiusM: 8.2,
+              territoryWeight: 1.6,
+            },
+            {
+              id: 'poi_east_fob',
+              code: 'FOB-B',
+              label: 'East Wing FOB',
+              kind: 'fob',
+              position: [26.5, 0.08, 0.5],
+              captureRadiusM: 7.5,
+              territoryWeight: 1.25,
+              spawnPoints: [
+                { position: [30.0, 0.08, -6.5], yaw: Math.PI * 0.5 },
+                { position: [30.0, 0.08, 10.5], yaw: Math.PI * 0.5 },
+                { position: [24.0, 0.08, 0.0], yaw: Math.PI * 0.5 },
+              ],
+            },
+            {
+              id: 'poi_nw_depot_fob',
+              code: 'FOB-C',
+              label: 'North Boulevard Depot FOB',
+              kind: 'fob',
+              position: [-68, 0, -68],
+              captureRadiusM: 8.2,
+              territoryWeight: 1.3,
+              spawnPoints: [
+                { position: [-74, 0, -68], yaw: Math.PI * 0.5 },
+                { position: [-68, 0, -74], yaw: Math.PI },
+                { position: [-62, 0, -68], yaw: -Math.PI * 0.5 },
+              ],
+            },
+          ]
+        : [
+            {
+              id: 'poi_blvd_cp',
+              code: 'CP-1',
+              label: 'South Boulevard Checkpoint',
+              kind: 'checkpoint',
+              position: [0, 0, 17.5],
+              captureRadiusM: 7.2,
+              territoryWeight: 1.0,
+              roadYaw: Math.PI * 0.5,
+            },
+            {
+              id: 'poi_west_fob',
+              code: 'FOB-A',
+              label: 'West Wing FOB',
+              kind: 'fob',
+              position: [-26.5, 0.08, 0.5],
+              captureRadiusM: 7.2,
+              territoryWeight: 1.25,
+              spawnPoints: [
+                { position: [-30.0, 0.08, -6.5], yaw: -Math.PI * 0.5 },
+                { position: [-30.0, 0.08, 10.5], yaw: -Math.PI * 0.5 },
+                { position: [-24.0, 0.08, 0.0], yaw: -Math.PI * 0.5 },
+              ],
+            },
+            {
+              id: 'poi_courtyard',
+              code: 'OUTPOST',
+              label: 'Central Courtyard Outpost',
+              kind: 'outpost',
+              position: [0, 0.04, -3.5],
+              captureRadiusM: 7.8,
+              territoryWeight: 1.5,
+            },
+            {
+              id: 'poi_east_fob',
+              code: 'FOB-B',
+              label: 'East Wing FOB',
+              kind: 'fob',
+              position: [26.5, 0.08, 0.5],
+              captureRadiusM: 7.2,
+              territoryWeight: 1.25,
+              spawnPoints: [
+                { position: [30.0, 0.08, -6.5], yaw: Math.PI * 0.5 },
+                { position: [30.0, 0.08, 10.5], yaw: Math.PI * 0.5 },
+                { position: [24.0, 0.08, 0.0], yaw: Math.PI * 0.5 },
+              ],
+            },
           ],
-        },
-        {
-          id: 'poi_courtyard',
-          code: 'OUTPOST',
-          label: 'Central Courtyard Outpost',
-          kind: 'outpost',
-          position: [0, 0.04, -3.5],
-          captureRadiusM: 7.8,
-          territoryWeight: 1.5,
-        },
-        {
-          id: 'poi_east_fob',
-          code: 'FOB-B',
-          label: 'East Wing FOB',
-          kind: 'fob',
-          position: [26.5, 0.08, 0.5],
-          captureRadiusM: 7.2,
-          territoryWeight: 1.25,
-          spawnPoints: [
-            { position: [30.0, 0.08, -6.5], yaw: Math.PI * 0.5 },
-            { position: [30.0, 0.08, 10.5], yaw: Math.PI * 0.5 },
-            { position: [24.0, 0.08, 0.0], yaw: Math.PI * 0.5 },
-          ],
-        },
-      ],
       ctfFlags: [
         { team: 'A', label: 'North Courtyard Flag', position: [0, 0.08, -26.5] },
         { team: 'B', label: 'South Boulevard Flag', position: [0, 0, 29.0] },
@@ -1122,6 +1477,7 @@ function buildPripyatBlock(
         { id: 'hill_blvd', label: 'South Boulevard', position: [0, 0, 17.5], radiusM: 7.2 },
       ],
     },
+    isExpandedConquest: isConquest,
     interactables: [],
     lightingPreset: LIGHTING_PRESET,
     supportsDynamicWeatherTime: true,

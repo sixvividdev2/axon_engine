@@ -6,13 +6,19 @@ import {
   WindShaderUniforms,
 } from '../engine/world/WindFoliageShader';
 import {
+  createBirchBarkTextureSet,
+  createBirchLeafClusterTexture,
   createFernFrondTexture,
+  createGraniteBoulderTextureSet,
   createGrassClumpTexture,
+  createPineBarkTextureSet,
+  createPineNeedleTexture,
   createShrubBranchTexture,
 } from './MapTextures';
 
 export type TrackGeoFn = <T extends THREE.BufferGeometry>(g: T) => T;
 export type TrackMatFn = <T extends THREE.Material>(m: T) => T;
+export type TrackTexFn = <T extends THREE.Texture>(t: T) => T;
 
 export interface PropFactoryContext {
   sceneGroup: THREE.Group;
@@ -21,6 +27,7 @@ export interface PropFactoryContext {
   isSoftwareGl: boolean;
   trackGeo: TrackGeoFn;
   trackMat: TrackMatFn;
+  trackTex?: TrackTexFn;
   windUniforms?: WindShaderUniforms | null;
   maxAniso?: number;
 }
@@ -594,59 +601,754 @@ export function buildArmoryWeaponRack(
   return g;
 }
 
-/** Instanced overgrown birch trees & saplings (distinctive white-bark Exclusion Zone trees) */
+/**
+ * Merges multiple BufferGeometries (converting indexed -> non-indexed cleanly) into a single
+ * GPU-friendly BufferGeometry with position, normal, uv, optional vertex color, and optional aSway.
+ * Disposes every source geometry after copying to guarantee zero leaked GPU buffers.
+ */
+function mergePartsToSingleGeometry(
+  parts: THREE.BufferGeometry[],
+  includeColor: boolean,
+  includeSway: boolean,
+): THREE.BufferGeometry {
+  const converted: THREE.BufferGeometry[] = [];
+  let totalVerts = 0;
+
+  for (let i = 0; i < parts.length; i++) {
+    const src = parts[i];
+    const g = src.index ? src.toNonIndexed() : src;
+    if (g !== src) src.dispose();
+    if (!g.getAttribute('normal')) g.computeVertexNormals();
+    totalVerts += g.getAttribute('position').count;
+    converted.push(g);
+  }
+
+  const posOut = new Float32Array(totalVerts * 3);
+  const normOut = new Float32Array(totalVerts * 3);
+  const uvOut = new Float32Array(totalVerts * 2);
+  const colOut = includeColor ? new Float32Array(totalVerts * 3) : null;
+  const swayOut = includeSway ? new Float32Array(totalVerts) : null;
+
+  let o3 = 0;
+  let o2 = 0;
+  let o1 = 0;
+
+  for (let p = 0; p < converted.length; p++) {
+    const g = converted[p];
+    const pos = g.getAttribute('position');
+    const norm = g.getAttribute('normal');
+    const uv = g.getAttribute('uv');
+    const col = includeColor ? g.getAttribute('color') : null;
+    const sway = includeSway ? g.getAttribute('aSway') : null;
+
+    for (let i = 0; i < pos.count; i++) {
+      posOut[o3] = pos.getX(i);
+      posOut[o3 + 1] = pos.getY(i);
+      posOut[o3 + 2] = pos.getZ(i);
+
+      normOut[o3] = norm.getX(i);
+      normOut[o3 + 1] = norm.getY(i);
+      normOut[o3 + 2] = norm.getZ(i);
+
+      if (uv) {
+        uvOut[o2] = uv.getX(i);
+        uvOut[o2 + 1] = uv.getY(i);
+      } else {
+        uvOut[o2] = pos.getX(i) * 0.5 + 0.5;
+        uvOut[o2 + 1] = pos.getY(i) * 0.5 + 0.5;
+      }
+
+      if (colOut) {
+        if (col) {
+          colOut[o3] = col.getX(i);
+          colOut[o3 + 1] = col.getY(i);
+          colOut[o3 + 2] = col.getZ(i);
+        } else {
+          colOut[o3] = 1;
+          colOut[o3 + 1] = 1;
+          colOut[o3 + 2] = 1;
+        }
+      }
+
+      if (swayOut) {
+        swayOut[o1] = sway ? sway.getX(i) : 0;
+      }
+
+      o3 += 3;
+      o2 += 2;
+      o1 += 1;
+    }
+    g.dispose();
+  }
+
+  const out = new THREE.BufferGeometry();
+  out.setAttribute('position', new THREE.BufferAttribute(posOut, 3));
+  out.setAttribute('normal', new THREE.BufferAttribute(normOut, 3));
+  out.setAttribute('uv', new THREE.BufferAttribute(uvOut, 2));
+  if (colOut) out.setAttribute('color', new THREE.BufferAttribute(colOut, 3));
+  if (swayOut) out.setAttribute('aSway', new THREE.BufferAttribute(swayOut, 1));
+  out.computeBoundingSphere();
+  return out;
+}
+
+/** Deterministic 3D trigonometric ridge/crag noise for sculpted boulders */
+function rockNoise3(x: number, y: number, z: number, seed: number): number {
+  const s1 = Math.sin(x * 2.15 + y * 1.43 + seed) * Math.cos(z * 2.07 - y * 1.18 + seed * 0.7);
+  const s2 = Math.sin(x * 4.61 - z * 3.89 + seed * 1.9) * Math.sin(y * 4.17 + x * 2.31);
+  const s3 = Math.cos(z * 7.83 + y * 6.41 - x * 5.93 + seed * 2.3);
+  // Ridged cleavage component creates realistic sharp granite edges
+  const ridge = 1.0 - Math.abs(Math.sin(x * 2.9 + z * 2.4 - y * 1.7 + seed * 1.3));
+  return s1 * 0.42 + s2 * 0.24 + s3 * 0.1 + (ridge - 0.5) * 0.34;
+}
+
+/**
+ * Sculpts a single angular fractured rock sub-mesh with planar cleavage facets,
+ * stratified displacement, flat embedded base, and baked per-vertex crevice AO + moss tint.
+ */
+function createSculptedRockPiece(
+  radius: number,
+  detail: number,
+  seed: number,
+  scaleX: number,
+  scaleY: number,
+  scaleZ: number,
+  offsetX = 0,
+  offsetY = 0,
+  offsetZ = 0,
+  rotY = 0,
+): THREE.BufferGeometry {
+  const base = new THREE.IcosahedronGeometry(radius, detail);
+  const geo = base.index ? base.toNonIndexed() : base.clone();
+  base.dispose();
+
+  // Four deterministic oblique shear/cleavage planes give crisp geological rock faces
+  const planes: Array<[number, number, number, number]> = [
+    [Math.cos(seed), 0.42, Math.sin(seed), radius * 0.78],
+    [Math.cos(seed + 2.1), 0.25, Math.sin(seed + 2.1), radius * 0.82],
+    [Math.cos(seed + 4.3), -0.32, Math.sin(seed + 4.3), radius * 0.86],
+    [0.18 * Math.sin(seed * 1.7), 0.94, 0.28 * Math.cos(seed * 1.3), radius * 0.74],
+  ];
+
+  const pos = geo.getAttribute('position');
+  const uv = geo.getAttribute('uv');
+  const colors = new Float32Array(pos.count * 3);
+  const cosR = Math.cos(rotY);
+  const sinR = Math.sin(rotY);
+
+  for (let i = 0; i < pos.count; i++) {
+    let vx = pos.getX(i);
+    let vy = pos.getY(i);
+    let vz = pos.getZ(i);
+    const len = Math.max(1e-5, Math.hypot(vx, vy, vz));
+    const nx = vx / len;
+    const ny = vy / len;
+    const nz = vz / len;
+
+    // Multi-octave crag & strata displacement
+    const n = rockNoise3(nx, ny, nz, seed);
+    const strata = Math.sin(ny * 8.5 + nx * 2.2 + seed) * 0.055;
+    let rMod = 1.0 + n * 0.26 + strata;
+
+    vx = nx * radius * rMod;
+    vy = ny * radius * rMod;
+    vz = nz * radius * rMod;
+
+    // Apply planar fracture cleavage clipping for authentic chiseled rock faces
+    for (let p = 0; p < planes.length; p++) {
+      const [px, py, pz, dLim] = planes[p];
+      const dot = vx * px + vy * py + vz * pz;
+      if (dot > dLim) {
+        const push = (dot - dLim) * 0.76;
+        vx -= px * push;
+        vy -= py * push;
+        vz -= pz * push;
+      }
+    }
+
+    // Flatten embedded underside so boulders sit heavily anchored in soil
+    if (vy < -radius * 0.45) {
+      vy = -radius * 0.45 + (vy + radius * 0.45) * 0.22;
+    }
+
+    // Non-uniform rock proportions + local rotation + offset
+    const sx = vx * scaleX;
+    const sy = vy * scaleY;
+    const sz = vz * scaleZ;
+    const rx = sx * cosR - sz * sinR + offsetX;
+    const rz = sx * sinR + sz * cosR + offsetZ;
+    const ry = sy + offsetY;
+    pos.setXYZ(i, rx, ry, rz);
+
+    // Triplanar-style seam-free UVs for crisp stone texture at every viewing angle
+    uv.setXY(i, (rx + rz) * 0.42 + 0.5, ry * 0.58 + (rx - rz) * 0.16 + 0.5);
+
+    // Baked crevice AO (darkens base & crevices; subtle mossy warmth on sun-exposed top ledges)
+    const heightNorm = THREE.MathUtils.clamp((sy / Math.max(0.2, radius * scaleY) + 0.55) / 1.35, 0, 1);
+    const creviceAO = THREE.MathUtils.clamp(0.62 + n * 0.36 + heightNorm * 0.34, 0.46, 1.12);
+    const mossLift = heightNorm > 0.62 && ny > 0.38 ? (heightNorm - 0.62) * 0.26 : 0;
+    colors[i * 3] = Math.min(1.1, creviceAO * (1.0 - mossLift * 0.22));
+    colors[i * 3 + 1] = Math.min(1.12, creviceAO * (1.0 + mossLift * 0.18));
+    colors[i * 3 + 2] = Math.min(1.08, creviceAO * (1.0 - mossLift * 0.32));
+  }
+
+  geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+  geo.computeVertexNormals();
+  return geo;
+}
+
+export interface BoulderSpot {
+  x: number;
+  y: number;
+  z: number;
+  sx: number;
+  sy: number;
+  sz: number;
+  yaw: number;
+  /** Optional variant override (0 = large crag boulder, 1 = multi-stone outcrop cluster) */
+  variant?: 0 | 1;
+  /** Optional per-instance stone tint */
+  tint?: THREE.Color;
+}
+
+/**
+ * Renders high-detail fractured granite boulders & layered multi-stone rock outcrops using
+ * only 1–2 InstancedMesh draw calls total (zero FPS impact vs raw dodecahedra!), backed by
+ * cracked-granite albedo/bump/roughness PBR maps, baked crevice AO, and fast analytical AABB colliders.
+ */
+export function buildInstancedSculptedBoulders(
+  ctx: PropFactoryContext,
+  spots: BoulderSpot[],
+  options?: {
+    castShadow?: boolean;
+    receiveShadow?: boolean;
+    addColliders?: boolean;
+    colliderBounds?: { minX: number; maxX: number; minZ: number; maxZ: number };
+    seed?: number;
+  },
+): THREE.InstancedMesh[] {
+  if (spots.length === 0) return [];
+  const { sceneGroup, physics, raycastMeshes, isSoftwareGl, trackGeo, trackMat, trackTex, maxAniso } = ctx;
+  const regTex = <T extends THREE.Texture>(t: T): T => (trackTex ? trackTex(t) : t);
+
+  const rockTex = createGraniteBoulderTextureSet(maxAniso ?? 4, options?.seed ?? 5401);
+  regTex(rockTex.map);
+  regTex(rockTex.bumpMap);
+  regTex(rockTex.roughnessMap);
+
+  const matRock = trackMat(
+    new THREE.MeshStandardMaterial({
+      color: 0xffffff,
+      map: rockTex.map,
+      bumpMap: rockTex.bumpMap,
+      bumpScale: 0.085,
+      roughnessMap: rockTex.roughnessMap,
+      roughness: 0.94,
+      metalness: 0.04,
+      vertexColors: true,
+    }),
+  );
+
+  // Archetype 0: Sculpted angular crag boulder with fractured facets & embedded skirt
+  const cragGeo = trackGeo(
+    mergePartsToSingleGeometry(
+      [
+        createSculptedRockPiece(1.08, 2, 1.37, 1.05, 0.86, 0.96, 0, 0.14, 0, 0),
+        createSculptedRockPiece(0.46, 1, 4.19, 1.15, 0.52, 0.92, 0.72, -0.18, 0.44, 0.9),
+      ],
+      true,
+      false,
+    ),
+  );
+
+  // Archetype 1: Layered multi-stone geological outcrop / talus cluster (3 stones merged into 1 draw call!)
+  const outcropGeo = trackGeo(
+    mergePartsToSingleGeometry(
+      [
+        createSculptedRockPiece(1.02, 2, 2.83, 1.18, 0.78, 0.94, -0.12, 0.12, -0.05, 0.2),
+        createSculptedRockPiece(0.68, 1, 6.11, 0.95, 0.64, 1.08, 0.68, -0.04, 0.36, 1.35),
+        createSculptedRockPiece(0.48, 1, 9.47, 1.12, 0.48, 0.85, -0.64, -0.16, 0.48, -0.7),
+      ],
+      true,
+      false,
+    ),
+  );
+
+  const group0: BoulderSpot[] = [];
+  const group1: BoulderSpot[] = [];
+  for (let i = 0; i < spots.length; i++) {
+    const s = spots[i];
+    const v = s.variant ?? ((i % 2) as 0 | 1);
+    if (v === 0) group0.push(s);
+    else group1.push(s);
+  }
+
+  const dummy = new THREE.Object3D();
+  const baseColor = new THREE.Color();
+  const outMeshes: THREE.InstancedMesh[] = [];
+  const addColliders = options?.addColliders ?? true;
+  const cBounds = options?.colliderBounds;
+  const doCast = !isSoftwareGl && (options?.castShadow ?? true);
+  const doRecv = !isSoftwareGl && (options?.receiveShadow ?? true);
+
+  const buildBatch = (batch: BoulderSpot[], geo: THREE.BufferGeometry) => {
+    if (batch.length === 0) return;
+    const inst = new THREE.InstancedMesh(geo, matRock, batch.length);
+    inst.castShadow = doCast;
+    inst.receiveShadow = doRecv;
+
+    for (let i = 0; i < batch.length; i++) {
+      const r = batch[i];
+      dummy.position.set(r.x, r.y + r.sy * 0.28, r.z);
+      dummy.rotation.set(0, r.yaw, 0);
+      dummy.scale.set(r.sx, r.sy, r.sz);
+      dummy.updateMatrix();
+      inst.setMatrixAt(i, dummy.matrix);
+
+      if (r.tint) {
+        inst.setColorAt(i, r.tint);
+      } else {
+        // Subtle natural granite/slate mineral variation per rock
+        const vShade = 0.84 + ((i * 37) % 100) * 0.0028;
+        const warmShift = ((i * 53) % 11) * 0.006 - 0.03;
+        baseColor.setRGB(vShade + warmShift, vShade, vShade - warmShift * 0.7);
+        inst.setColorAt(i, baseColor);
+      }
+
+      if (addColliders) {
+        const inBounds =
+          !cBounds ||
+          (r.x >= cBounds.minX && r.x <= cBounds.maxX && r.z >= cBounds.minZ && r.z <= cBounds.maxZ);
+        if (inBounds) {
+          physics.addBox({
+            minX: r.x - r.sx * 0.88,
+            maxX: r.x + r.sx * 0.88,
+            minY: r.y - r.sy * 0.5,
+            maxY: r.y + r.sy * 0.84,
+            minZ: r.z - r.sz * 0.88,
+            maxZ: r.z + r.sz * 0.88,
+            surface: 'concrete',
+            blocksMovement: true,
+            blocksRaycast: true,
+            meshRef: inst,
+          });
+        }
+      }
+    }
+
+    inst.instanceMatrix.needsUpdate = true;
+    if (inst.instanceColor) inst.instanceColor.needsUpdate = true;
+    inst.computeBoundingSphere();
+    inst.userData.surfaceMaterial = 'concrete';
+    if (addColliders) {
+      inst.userData.analyticalRaycastCovered = true;
+    }
+    sceneGroup.add(inst);
+    raycastMeshes.push(inst);
+    outMeshes.push(inst);
+  };
+
+  buildBatch(group0, cragGeo);
+  buildBatch(group1, outcropGeo);
+  return outMeshes;
+}
+
+/**
+ * Builds a single organic scalloped conifer needle-whorl tier (replacing plain cones)
+ * with radial branch-lobe undulations, downward tip droop, and baked interior shadow vertex-AO.
+ */
+function createScallopedPineWhorl(
+  baseRadius: number,
+  height: number,
+  yBottom: number,
+  lobes: number,
+  phase: number,
+  droopM: number,
+  leanX: number,
+  leanZ: number,
+): THREE.BufferGeometry {
+  const radialSegs = lobes * 2;
+  const heightSegs = 3;
+  const cone = new THREE.ConeGeometry(baseRadius, height, radialSegs, heightSegs, false);
+  const geo = cone.index ? cone.toNonIndexed() : cone.clone();
+  cone.dispose();
+
+  const pos = geo.getAttribute('position');
+  const uv = geo.getAttribute('uv');
+  const colors = new Float32Array(pos.count * 3);
+
+  for (let i = 0; i < pos.count; i++) {
+    const ox = pos.getX(i);
+    const oy = pos.getY(i); // [-height/2 .. +height/2]
+    const oz = pos.getZ(i);
+
+    const hFrac = THREE.MathUtils.clamp((oy + height * 0.5) / height, 0, 1); // 0=bottom rim, 1=tip
+    const ang = Math.atan2(oz, ox);
+    const rad = Math.hypot(ox, oz);
+
+    // Jagged scalloped branch lobes strongest near the lower rim, tapering smoothly toward the apex
+    const rimWeight = Math.pow(1.0 - hFrac, 0.82);
+    const lobeWave = Math.sin(ang * lobes + phase);
+    const subWave = Math.cos(ang * (lobes * 2 - 1) - phase * 1.4);
+    const radialScale = 1.0 + rimWeight * (lobeWave * 0.24 + subWave * 0.09);
+
+    // Natural gravity-drooped bough tips on protruding branch lobes
+    const tipDroop = rimWeight * (0.55 + 0.45 * lobeWave) * droopM;
+    // Slight fuller belly curve so whorls read like layered boughs, not rigid triangles
+    const bellyBow = Math.sin(hFrac * Math.PI) * 0.14 * baseRadius;
+
+    const dirX = rad > 1e-5 ? ox / rad : 0;
+    const dirZ = rad > 1e-5 ? oz / rad : 0;
+
+    const nx = dirX * (rad * radialScale + bellyBow) + leanX * hFrac;
+    const nz = dirZ * (rad * radialScale + bellyBow) + leanZ * hFrac;
+    const ny = yBottom + (oy + height * 0.5) - tipDroop;
+
+    pos.setXYZ(i, nx, ny, nz);
+    uv.setXY(i, (ang / (Math.PI * 2) + 0.5) * 2.5, hFrac * 1.8);
+
+    // Baked inner-crown AO: underside & recessed notches stay deep forest shadow; sunlit tips glow
+    const lobeBright = 0.5 + 0.5 * lobeWave;
+    const shade = THREE.MathUtils.clamp(
+      0.56 + hFrac * 0.34 + lobeBright * rimWeight * 0.24 - (oy < -height * 0.48 ? 0.18 : 0),
+      0.42,
+      1.16,
+    );
+    colors[i * 3] = shade * 0.96;
+    colors[i * 3 + 1] = shade * 1.04;
+    colors[i * 3 + 2] = shade * 0.94;
+  }
+
+  geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+  geo.computeVertexNormals();
+  return geo;
+}
+
+export interface PineTreeSpot {
+  x: number;
+  y: number;
+  z: number;
+  scale: number;
+  yaw: number;
+  tint: THREE.Color;
+}
+
+/**
+ * Renders high-detail organic alpine pine/spruce trees using ONLY 2 InstancedMesh draw calls
+ * for the entire forest (down from 3–4 separate cone meshes!):
+ *  1) Fluted buttress-root trunk + lower deadwood branch stubs with furrowed pine bark + bump map
+ *  2) 5-whorl asymmetrically drooped scalloped needle-bough canopy with baked interior AO + wind sway
+ * Backed by fast analytical trunk AABB colliders (`analyticalRaycastCovered = true`).
+ */
+export function buildInstancedPineTrees(
+  ctx: PropFactoryContext,
+  spots: PineTreeSpot[],
+  options?: {
+    castShadow?: boolean;
+    receiveShadow?: boolean;
+    addTrunkColliders?: boolean;
+    colliderBounds?: { minX: number; maxX: number; minZ: number; maxZ: number };
+    seed?: number;
+  },
+): { trunkInst: THREE.InstancedMesh; canopyInst: THREE.InstancedMesh } | null {
+  if (spots.length === 0) return null;
+  const { sceneGroup, physics, raycastMeshes, isSoftwareGl, trackGeo, trackMat, trackTex, windUniforms, maxAniso } =
+    ctx;
+  const regTex = <T extends THREE.Texture>(t: T): T => (trackTex ? trackTex(t) : t);
+
+  const barkTex = createPineBarkTextureSet(maxAniso ?? 4, options?.seed ?? 5502);
+  const needleTex = createPineNeedleTexture(maxAniso ?? 4, (options?.seed ?? 5502) + 7);
+  regTex(barkTex.map);
+  regTex(barkTex.bumpMap);
+  regTex(needleTex);
+
+  const matBark = trackMat(
+    new THREE.MeshStandardMaterial({
+      color: 0xffffff,
+      map: barkTex.map,
+      bumpMap: barkTex.bumpMap,
+      bumpScale: 0.06,
+      roughness: 0.94,
+      metalness: 0.02,
+      vertexColors: true,
+    }),
+  );
+  const matNeedles = trackMat(
+    new THREE.MeshStandardMaterial({
+      color: 0xffffff,
+      map: needleTex,
+      roughness: 0.87,
+      metalness: 0.01,
+      vertexColors: true,
+    }),
+  );
+
+  if (windUniforms) {
+    applyWindFoliageShader(matBark, windUniforms, { swayScale: 0.06, isTrunk: true });
+    applyWindFoliageShader(matNeedles, windUniforms, { swayScale: 0.21 });
+  }
+
+  // 1. Sculpted trunk with fluted root flare + subtle organic curve + 4 lower deadwood branch stubs
+  const mainTrunk = new THREE.CylinderGeometry(0.11, 0.34, 7.6, 8, 5);
+  mainTrunk.translate(0, 3.8, 0);
+  {
+    const pos = mainTrunk.getAttribute('position');
+    const cols = new Float32Array(pos.count * 3);
+    for (let i = 0; i < pos.count; i++) {
+      let vx = pos.getX(i);
+      const vy = pos.getY(i);
+      let vz = pos.getZ(i);
+      const hFrac = THREE.MathUtils.clamp(vy / 7.6, 0, 1);
+      const ang = Math.atan2(vz, vx);
+      // Fluted buttress roots near base (y < 1.4m)
+      const rootFactor = Math.max(0, 1.0 - vy / 1.45);
+      const flute = 1.0 + rootFactor * rootFactor * (0.34 + 0.28 * Math.cos(ang * 5.0));
+      vx = vx * flute + Math.sin(hFrac * Math.PI) * 0.08;
+      vz = vz * flute + Math.cos(hFrac * Math.PI * 0.8) * 0.05;
+      pos.setXYZ(i, vx, vy, vz);
+      const shade = 0.72 + hFrac * 0.3;
+      cols[i * 3] = shade;
+      cols[i * 3 + 1] = shade;
+      cols[i * 3 + 2] = shade;
+    }
+    mainTrunk.setAttribute('color', new THREE.BufferAttribute(cols, 3));
+    mainTrunk.computeVertexNormals();
+  }
+
+  const trunkParts: THREE.BufferGeometry[] = [mainTrunk];
+  const stubDefs = [
+    { y: 1.85, ang: 0.4, len: 0.78, tilt: 1.15 },
+    { y: 2.35, ang: 2.35, len: 0.92, tilt: 1.22 },
+    { y: 2.85, ang: 4.15, len: 0.84, tilt: 1.18 },
+    { y: 3.3, ang: 5.4, len: 0.72, tilt: 1.12 },
+  ];
+  for (const st of stubDefs) {
+    const stub = new THREE.CylinderGeometry(0.025, 0.068, st.len, 5, 1);
+    stub.translate(0, st.len * 0.5, 0);
+    stub.rotateZ(-st.tilt);
+    stub.rotateY(st.ang);
+    stub.translate(0, st.y, 0);
+    trunkParts.push(stub);
+  }
+  const trunkGeo = trackGeo(mergePartsToSingleGeometry(trunkParts, true, true));
+  assignHeightSwayAttribute(trunkGeo, 0, 7.6, 2.0);
+
+  // 2. Merged 5-whorl asymmetrically drooped scalloped pine canopy (1 draw call for all foliage!)
+  const whorlParts = [
+    createScallopedPineWhorl(2.55, 3.15, 2.35, 7, 0.3, 0.42, 0.06, -0.04),
+    createScallopedPineWhorl(2.18, 3.05, 4.15, 7, 1.45, 0.36, -0.05, 0.07),
+    createScallopedPineWhorl(1.78, 2.85, 5.85, 6, 2.6, 0.3, 0.05, 0.05),
+    createScallopedPineWhorl(1.32, 2.55, 7.45, 6, 0.85, 0.22, -0.04, -0.03),
+    createScallopedPineWhorl(0.84, 2.25, 8.85, 5, 2.1, 0.14, 0.02, 0.02),
+  ];
+  const canopyGeo = trackGeo(mergePartsToSingleGeometry(whorlParts, true, true));
+  assignHeightSwayAttribute(canopyGeo, 1.8, 11.2, 1.65);
+
+  const trunkInst = new THREE.InstancedMesh(trunkGeo, matBark, spots.length);
+  const canopyInst = new THREE.InstancedMesh(canopyGeo, matNeedles, spots.length);
+
+  const doCast = !isSoftwareGl && (options?.castShadow ?? true);
+  const doRecv = !isSoftwareGl && (options?.receiveShadow ?? true);
+  trunkInst.castShadow = doCast;
+  trunkInst.receiveShadow = doRecv;
+  canopyInst.castShadow = doCast;
+  canopyInst.receiveShadow = doRecv;
+
+  const dummy = new THREE.Object3D();
+  const addColliders = options?.addTrunkColliders ?? true;
+  const cBounds = options?.colliderBounds;
+
+  for (let i = 0; i < spots.length; i++) {
+    const t = spots[i];
+    const hVar = 0.88 + ((i * 29) % 100) * 0.0028;
+    dummy.position.set(t.x, t.y - 0.16, t.z);
+    dummy.rotation.set(((i % 5) - 2) * 0.016, t.yaw, (((i * 3) % 5) - 2) * 0.016);
+    dummy.scale.set(t.scale, t.scale * hVar, t.scale);
+    dummy.updateMatrix();
+    trunkInst.setMatrixAt(i, dummy.matrix);
+    canopyInst.setMatrixAt(i, dummy.matrix);
+    canopyInst.setColorAt(i, t.tint);
+
+    if (addColliders) {
+      const inBounds =
+        !cBounds ||
+        (t.x >= cBounds.minX && t.x <= cBounds.maxX && t.z >= cBounds.minZ && t.z <= cBounds.maxZ);
+      if (inBounds) {
+        const r = 0.34 * t.scale;
+        physics.addBox({
+          minX: t.x - r,
+          maxX: t.x + r,
+          minY: t.y - 0.2,
+          maxY: t.y + 4.4 * t.scale,
+          minZ: t.z - r,
+          maxZ: t.z + r,
+          surface: 'wood',
+          blocksMovement: true,
+          blocksRaycast: true,
+          meshRef: trunkInst,
+        });
+      }
+    }
+  }
+
+  for (const inst of [trunkInst, canopyInst]) {
+    inst.instanceMatrix.needsUpdate = true;
+    if (inst.instanceColor) inst.instanceColor.needsUpdate = true;
+    inst.computeBoundingSphere();
+    inst.userData.surfaceMaterial = 'wood';
+    sceneGroup.add(inst);
+  }
+  if (addColliders) {
+    trunkInst.userData.analyticalRaycastCovered = true;
+  }
+  raycastMeshes.push(trunkInst);
+
+  return { trunkInst, canopyInst };
+}
+
+/**
+ * Instanced high-detail overgrown birch trees (peeling white bark with dark horizontal lenticels,
+ * flared root base, 3 forked upper limbs, and botanical multi-lobe leaf-spray crown in 2 draw calls total).
+ */
 export function buildInstancedBirchTrees(
   ctx: PropFactoryContext,
   spots: Array<{ x: number; y: number; z: number; scale: number; yaw: number; tint: THREE.Color }>,
   addTrunkColliders = false,
 ): void {
   if (spots.length === 0) return;
-  const { sceneGroup, physics, raycastMeshes, isSoftwareGl, trackGeo, trackMat, windUniforms } = ctx;
+  const { sceneGroup, physics, raycastMeshes, isSoftwareGl, trackGeo, trackMat, trackTex, windUniforms, maxAniso } =
+    ctx;
+  const regTex = <T extends THREE.Texture>(t: T): T => (trackTex ? trackTex(t) : t);
 
-  const matBirchBark = trackMat(new THREE.MeshStandardMaterial({ color: 0xc9c6bc, roughness: 0.9, metalness: 0.02 }));
-  const matFoliage = trackMat(new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.86, metalness: 0.02 }));
+  const barkTex = createBirchBarkTextureSet(maxAniso ?? 4, 5610);
+  const leafTex = createBirchLeafClusterTexture(maxAniso ?? 4, 5624);
+  regTex(barkTex.map);
+  regTex(barkTex.bumpMap);
+  regTex(leafTex);
+
+  const matBirchBark = trackMat(
+    new THREE.MeshStandardMaterial({
+      color: 0xffffff,
+      map: barkTex.map,
+      bumpMap: barkTex.bumpMap,
+      bumpScale: 0.04,
+      roughness: 0.88,
+      metalness: 0.02,
+    }),
+  );
+  const matFoliage = trackMat(
+    new THREE.MeshStandardMaterial({
+      color: 0xffffff,
+      map: leafTex,
+      alphaTest: 0.36,
+      roughness: 0.84,
+      metalness: 0.01,
+      side: THREE.DoubleSide,
+      vertexColors: true,
+    }),
+  );
   if (windUniforms) {
-    applyWindFoliageShader(matBirchBark, windUniforms, { swayScale: 0.09, isTrunk: true });
-    applyWindFoliageShader(matFoliage, windUniforms, { swayScale: 0.22 });
+    applyWindFoliageShader(matBirchBark, windUniforms, { swayScale: 0.08, isTrunk: true });
+    applyWindFoliageShader(matFoliage, windUniforms, { swayScale: 0.24 });
   }
 
-  const trunkGeo = trackGeo(new THREE.CylinderGeometry(0.09, 0.17, 4.6, 7, 3));
-  trunkGeo.translate(0, 2.3, 0);
-  assignHeightSwayAttribute(trunkGeo, 0, 4.6, 2.0);
-  const crown1Geo = trackGeo(new THREE.DodecahedronGeometry(1.55, 1));
-  crown1Geo.translate(0, 5.1, 0);
-  assignHeightSwayAttribute(crown1Geo, 1.2, 6.8, 1.5);
-  const crown2Geo = trackGeo(new THREE.DodecahedronGeometry(1.18, 1));
-  crown2Geo.translate(0.55, 6.25, -0.35);
-  assignHeightSwayAttribute(crown2Geo, 1.2, 7.6, 1.5);
+  // 1. Flared slightly bowed birch trunk + 3 ascending upper forked limbs merged into 1 geometry
+  const mainStem = new THREE.CylinderGeometry(0.085, 0.21, 4.6, 8, 4);
+  mainStem.translate(0, 2.3, 0);
+  {
+    const pos = mainStem.getAttribute('position');
+    for (let i = 0; i < pos.count; i++) {
+      const vy = pos.getY(i);
+      const t = vy / 4.6;
+      const rootFlare = vy < 0.9 ? 1.0 + (1.0 - vy / 0.9) * 0.28 : 1.0;
+      pos.setX(i, pos.getX(i) * rootFlare + Math.sin(t * Math.PI) * 0.14);
+      pos.setZ(i, pos.getZ(i) * rootFlare + Math.cos(t * Math.PI * 0.7) * 0.06);
+    }
+    mainStem.computeVertexNormals();
+  }
+
+  const limb1 = new THREE.CylinderGeometry(0.035, 0.075, 2.45, 6, 2);
+  limb1.translate(0, 1.22, 0);
+  limb1.rotateZ(0.42);
+  limb1.rotateY(0.5);
+  limb1.translate(0.08, 3.65, 0.04);
+
+  const limb2 = new THREE.CylinderGeometry(0.032, 0.068, 2.3, 6, 2);
+  limb2.translate(0, 1.15, 0);
+  limb2.rotateZ(-0.48);
+  limb2.rotateY(2.4);
+  limb2.translate(-0.04, 3.85, -0.05);
+
+  const limb3 = new THREE.CylinderGeometry(0.028, 0.062, 2.0, 6, 2);
+  limb3.translate(0, 1.0, 0);
+  limb3.rotateZ(0.36);
+  limb3.rotateY(4.5);
+  limb3.translate(0.02, 4.15, 0.02);
+
+  const trunkGeo = trackGeo(mergePartsToSingleGeometry([mainStem, limb1, limb2, limb3], false, true));
+  assignHeightSwayAttribute(trunkGeo, 0, 6.2, 2.0);
+
+  // 2. Botanical multi-lobe leaf-spray crown (18 crossed angled leaf-cluster cards merged into 1 draw call!)
+  const crownCards: THREE.BufferGeometry[] = [];
+  const clusterAnchors: Array<[number, number, number, number, number]> = [
+    [0.0, 5.4, 0.0, 2.35, 0.92],
+    [-0.95, 5.05, 0.55, 1.85, 0.88],
+    [0.98, 5.25, -0.45, 1.9, 0.96],
+    [0.35, 6.35, 0.25, 1.75, 1.06],
+    [-0.55, 6.1, -0.6, 1.65, 1.02],
+    [0.05, 4.45, -0.75, 1.55, 0.78],
+  ];
+
+  for (let c = 0; c < clusterAnchors.length; c++) {
+    const [cx, cy, cz, sz, bright] = clusterAnchors[c];
+    for (let k = 0; k < 3; k++) {
+      const card = new THREE.PlaneGeometry(sz, sz * 0.94, 1, 1);
+      const tilt = (k - 1) * 0.34;
+      const yaw = (k / 3) * Math.PI + c * 0.65;
+      card.rotateX(tilt);
+      card.rotateY(yaw);
+      card.translate(cx, cy, cz);
+
+      const pAttr = card.getAttribute('position');
+      const cols = new Float32Array(pAttr.count * 3);
+      for (let v = 0; v < pAttr.count; v++) {
+        const vy = pAttr.getY(v);
+        const ao = THREE.MathUtils.clamp(bright * (0.74 + ((vy - 3.8) / 3.6) * 0.36), 0.58, 1.15);
+        cols[v * 3] = ao;
+        cols[v * 3 + 1] = ao;
+        cols[v * 3 + 2] = ao;
+      }
+      card.setAttribute('color', new THREE.BufferAttribute(cols, 3));
+      crownCards.push(card);
+    }
+  }
+
+  const crownGeo = trackGeo(mergePartsToSingleGeometry(crownCards, true, true));
+  assignHeightSwayAttribute(crownGeo, 1.8, 7.6, 1.55);
 
   const trunkInst = new THREE.InstancedMesh(trunkGeo, matBirchBark, spots.length);
-  const crown1Inst = new THREE.InstancedMesh(crown1Geo, matFoliage, spots.length);
-  const crown2Inst = new THREE.InstancedMesh(crown2Geo, matFoliage, spots.length);
+  const crownInst = new THREE.InstancedMesh(crownGeo, matFoliage, spots.length);
 
   trunkInst.castShadow = !isSoftwareGl;
-  crown1Inst.castShadow = !isSoftwareGl;
+  trunkInst.receiveShadow = !isSoftwareGl;
+  crownInst.castShadow = !isSoftwareGl;
 
   const dummy = new THREE.Object3D();
   spots.forEach((s, i) => {
-    dummy.position.set(s.x, s.y - 0.05, s.z);
-    dummy.rotation.set(0, s.yaw, 0);
+    dummy.position.set(s.x, s.y - 0.08, s.z);
+    dummy.rotation.set(((i % 3) - 1) * 0.025, s.yaw, (((i * 2) % 3) - 1) * 0.02);
     dummy.scale.set(s.scale, s.scale * (0.92 + (i % 3) * 0.12), s.scale);
     dummy.updateMatrix();
     trunkInst.setMatrixAt(i, dummy.matrix);
-    crown1Inst.setMatrixAt(i, dummy.matrix);
-    crown2Inst.setMatrixAt(i, dummy.matrix);
-
-    crown1Inst.setColorAt(i, s.tint);
-    crown2Inst.setColorAt(i, s.tint.clone().offsetHSL(0.01, 0, 0.04));
+    crownInst.setMatrixAt(i, dummy.matrix);
+    crownInst.setColorAt(i, s.tint);
 
     if (addTrunkColliders) {
-      const r = 0.24 * s.scale;
+      const r = 0.25 * s.scale;
       physics.addBox({
         minX: s.x - r,
         maxX: s.x + r,
-        minY: s.y,
-        maxY: s.y + 3.6,
+        minY: s.y - 0.1,
+        maxY: s.y + 3.8 * s.scale,
         minZ: s.z - r,
         maxZ: s.z + r,
         surface: 'wood',
@@ -657,7 +1359,7 @@ export function buildInstancedBirchTrees(
     }
   });
 
-  for (const inst of [trunkInst, crown1Inst, crown2Inst]) {
+  for (const inst of [trunkInst, crownInst]) {
     inst.instanceMatrix.needsUpdate = true;
     if (inst.instanceColor) inst.instanceColor.needsUpdate = true;
     inst.computeBoundingSphere();
@@ -704,7 +1406,7 @@ function createRosetteCardGeometry(
   // Merge cards cleanly into a single non-indexed BufferGeometry
   let totalVerts = 0;
   const nonIndexed = planes.map((p) => {
-    const g = p.toNonIndexed();
+    const g = p.index ? p.toNonIndexed() : p.clone();
     p.dispose();
     totalVerts += g.getAttribute('position').count;
     return g;

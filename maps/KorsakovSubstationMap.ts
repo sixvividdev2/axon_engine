@@ -7,12 +7,21 @@ import { createStencilSignTexture } from '../gym/GymTextures';
 import { WettableSurfaceEntry } from '../engine/world/WeatherTimeSystem';
 import { createWindShaderUniforms } from '../engine/world/WindFoliageShader';
 import {
+  BoulderSpot,
+  buildInstancedBirchTrees,
   buildInstancedGrassTufts,
+  buildInstancedPineTrees,
+  buildInstancedSculptedBoulders,
   buildOfficeDesk,
   buildRustedVehicle,
+  PineTreeSpot,
   PropFactoryContext,
   VehicleMaterials,
 } from './MapPropFactory';
+import {
+  buildEnterableCoverBuilding,
+  createCoverBuildingMaterialPack,
+} from './CoverBuildingFactory';
 import {
   createAsphaltRoadTexture,
   createCorrugatedMetalTexture,
@@ -23,6 +32,7 @@ import {
   buildNavGraph,
   BuiltMapInstance,
   IMapDefinition,
+  MapBuildOptions,
   MapLightingPreset,
   NavNode,
   SpawnPoint,
@@ -47,15 +57,17 @@ function buildKorsakovSubstation(
   renderer: THREE.WebGLRenderer,
   isSoftwareGl: boolean,
   graphicsQuality?: GraphicsQualityId,
+  options?: MapBuildOptions,
 ): BuiltMapInstance {
   const qProfile = getGraphicsQualityProfile(graphicsQuality);
+  const isConquest = options?.battleRule === 'conquest';
 
   const physics = new BodycamPhysicsWorld();
   physics.baseFloorY = 0;
-  physics.boundsMinX = -49.5;
-  physics.boundsMaxX = 49.5;
-  physics.boundsMinZ = -41.5;
-  physics.boundsMaxZ = 41.5;
+  physics.boundsMinX = isConquest ? -95 : -49.5;
+  physics.boundsMaxX = isConquest ? 95 : 49.5;
+  physics.boundsMinZ = isConquest ? -110 : -41.5;
+  physics.boundsMaxZ = isConquest ? 110 : 41.5;
 
   const sceneGroup = new THREE.Group();
   scene.add(sceneGroup);
@@ -81,7 +93,7 @@ function buildKorsakovSubstation(
   scene.background = new THREE.Color(LIGHTING_PRESET.backgroundHex);
   scene.fog = new THREE.FogExp2(
     LIGHTING_PRESET.fogHex,
-    LIGHTING_PRESET.fogDensity * qProfile.fogDensityScale,
+    LIGHTING_PRESET.fogDensity * qProfile.fogDensityScale * (isConquest ? 0.72 : 1.0),
   );
 
   const pmrem = new THREE.PMREMGenerator(renderer);
@@ -107,11 +119,12 @@ function buildKorsakovSubstation(
     const sm = Math.min(2048, qProfile.shadowMapSize);
     skyKey.shadow.mapSize.set(sm, sm);
     skyKey.shadow.camera.near = 2;
-    skyKey.shadow.camera.far = 145;
-    skyKey.shadow.camera.left = -56;
-    skyKey.shadow.camera.right = 56;
-    skyKey.shadow.camera.top = 56;
-    skyKey.shadow.camera.bottom = -56;
+    skyKey.shadow.camera.far = isConquest ? 240 : 145;
+    const shadowHalf = isConquest ? 112 : 56;
+    skyKey.shadow.camera.left = -shadowHalf;
+    skyKey.shadow.camera.right = shadowHalf;
+    skyKey.shadow.camera.top = shadowHalf;
+    skyKey.shadow.camera.bottom = -shadowHalf;
     skyKey.shadow.bias = -0.0005;
     skyKey.shadow.normalBias = 0.025;
   }
@@ -189,6 +202,7 @@ function buildKorsakovSubstation(
     isSoftwareGl,
     trackGeo,
     trackMat,
+    trackTex,
     windUniforms,
     maxAniso,
   };
@@ -215,6 +229,7 @@ function buildKorsakovSubstation(
     mesh.castShadow = !isSoftwareGl && qProfile.castShadows && castShadow && h > 0.35;
     mesh.receiveShadow = !isSoftwareGl && qProfile.castShadows;
     mesh.userData.surfaceMaterial = surface;
+    mesh.userData.analyticalRaycastCovered = true;
     sceneGroup.add(mesh);
     raycastMeshes.push(mesh);
     physics.addBox({
@@ -226,12 +241,15 @@ function buildKorsakovSubstation(
       maxZ: z + d * 0.5,
       surface,
       blocksMovement: true,
+      blocksRaycast: true,
+      meshRef: mesh,
     });
     return mesh;
   };
 
   // === 1. GROUND LAYER & OUTDOOR WET-SLATE YARD (Zero Z-Fighting) ===
-  const yardGround = new THREE.Mesh(trackGeo(new THREE.PlaneGeometry(180, 180)), matYardTarmac);
+  const groundSpan = isConquest ? 310 : 180;
+  const yardGround = new THREE.Mesh(trackGeo(new THREE.PlaneGeometry(groundSpan, groundSpan)), matYardTarmac);
   yardGround.rotation.x = -Math.PI * 0.5;
   yardGround.position.y = 0;
   yardGround.receiveShadow = !isSoftwareGl && qProfile.castShadows;
@@ -243,11 +261,61 @@ function buildKorsakovSubstation(
   addSolidBox(0, 0.04, 0, 66.0, 0.08, 44.0, matSlateFloor, 'concrete', false);
   physics.addInteriorZone({ minX: -33, maxX: 33, minY: 0, maxY: 11.5, minZ: -22, maxZ: 22, material: 'concrete' });
 
-  // Outer perimeter concrete security wall framing the Substation site (X = ±50, Z = ±42)
-  addSolidBox(0, 2.0, -42.0, 100.4, 4.0, 0.5, matSlateWall);
-  addSolidBox(0, 2.0, 42.0, 100.4, 4.0, 0.5, matSlateWall);
-  addSolidBox(-50.0, 2.0, 0, 0.5, 4.0, 83.5, matSlateWall);
-  addSolidBox(50.0, 2.0, 0, 0.5, 4.0, 83.5, matSlateWall);
+  // Outer perimeter concrete security wall framing the Substation site (open vehicle gates in Conquest)
+  if (isConquest) {
+    // Inner substation walls with wide 20m North/South & 18m West/East freight gates
+    addSolidBox(-30.0, 2.0, -42.0, 40.4, 4.0, 0.5, matSlateWall);
+    addSolidBox(30.0, 2.0, -42.0, 40.4, 4.0, 0.5, matSlateWall);
+    addSolidBox(-30.0, 2.0, 42.0, 40.4, 4.0, 0.5, matSlateWall);
+    addSolidBox(30.0, 2.0, 42.0, 40.4, 4.0, 0.5, matSlateWall);
+    addSolidBox(-50.0, 2.0, -25.5, 0.5, 4.0, 33.0, matSlateWall);
+    addSolidBox(-50.0, 2.0, 25.5, 0.5, 4.0, 33.0, matSlateWall);
+    addSolidBox(50.0, 2.0, -25.5, 0.5, 4.0, 33.0, matSlateWall);
+    addSolidBox(50.0, 2.0, 25.5, 0.5, 4.0, 33.0, matSlateWall);
+
+    // Outer industrial park perimeter walls at X = ±94.5, Z = ±109.5
+    addSolidBox(0, 2.0, -109.5, 189.4, 4.0, 0.5, matSlateWall);
+    addSolidBox(0, 2.0, 109.5, 189.4, 4.0, 0.5, matSlateWall);
+    addSolidBox(-94.5, 2.0, 0, 0.5, 4.0, 219.0, matSlateWall);
+    addSolidBox(94.5, 2.0, 0, 0.5, 4.0, 219.0, matSlateWall);
+
+    // Expanded Industrial Arterial Access Roads & Perimeter Service Ring
+    const matAccessRoad = trackMat(
+      new THREE.MeshStandardMaterial({ color: 0x2a3139, roughness: 0.78, metalness: 0.12 }),
+    );
+    const addServiceRoad = (rx: number, rz: number, rw: number, rd: number): void => {
+      const m = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(rw, 0.05, rd)), matAccessRoad);
+      m.position.set(rx, 0.025, rz);
+      m.receiveShadow = !isSoftwareGl && qProfile.castShadows;
+      m.userData.surfaceMaterial = 'asphalt';
+      sceneGroup.add(m);
+      raycastMeshes.push(m);
+    };
+    addServiceRoad(0, -68, 172, 11.0);
+    addServiceRoad(0, 68, 172, 11.0);
+    addServiceRoad(-68, 0, 10.0, 148);
+    addServiceRoad(68, 0, 10.0, 148);
+    addServiceRoad(0, -69, 12.0, 64);
+    addServiceRoad(0, 69, 12.0, 64);
+    // Steel rail tracks across South Rail Freight HQ yard (Z = 82)
+    for (const railZ of [80.8, 82.4]) {
+      const rail = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(178, 0.12, 0.14)), matDarkSteel);
+      rail.position.set(0, 0.06, railZ);
+      sceneGroup.add(rail);
+    }
+    // Outer yard shipping containers & concrete cover baffles
+    addSolidBox(-26, 1.32, -60, 6.4, 2.64, 2.5, matContSlate, 'metal');
+    addSolidBox(26, 1.32, -60, 6.4, 2.64, 2.5, matContSlate, 'metal');
+    addSolidBox(-26, 1.32, 60, 6.4, 2.64, 2.5, matContSlate, 'metal');
+    addSolidBox(26, 1.32, 60, 6.4, 2.64, 2.5, matContSlate, 'metal');
+    addSolidBox(-60, 1.32, -24, 2.5, 2.64, 6.4, matContSlate, 'metal');
+    addSolidBox(60, 1.32, 24, 2.5, 2.64, 6.4, matContSlate, 'metal');
+  } else {
+    addSolidBox(0, 2.0, -42.0, 100.4, 4.0, 0.5, matSlateWall);
+    addSolidBox(0, 2.0, 42.0, 100.4, 4.0, 0.5, matSlateWall);
+    addSolidBox(-50.0, 2.0, 0, 0.5, 4.0, 83.5, matSlateWall);
+    addSolidBox(50.0, 2.0, 0, 0.5, 4.0, 83.5, matSlateWall);
+  }
 
   // === 2. MAIN HYDRO-TURBINE HALL SHELL (X in [-33, 33], Z in [-22, 22], Height = 10.6m) ===
   const HALL_H = 10.6;
@@ -725,28 +793,221 @@ function buildKorsakovSubstation(
     { id: 'ey_c', position: [39.0, 0, 0], zoneId: 'default', neighbors: ['sw_e_c', 'ny_e', 'sy_e'], isCover: true, coverNormal: [-1, 0] },
   ];
 
-  const teamA: SpawnPoint[] = [
-    { position: [0, 0, -37.5], yaw: Math.PI },
-    { position: [-24, 0, -37.0], yaw: Math.PI * 0.85 },
-    { position: [24, 0, -37.0], yaw: -Math.PI * 0.85 },
-    { position: [-38, 0, -26.0], yaw: Math.PI * 0.7 },
-    { position: [38, 0, -26.0], yaw: -Math.PI * 0.7 },
-    { position: [0, CAT_Y, -18.5], yaw: Math.PI },
-  ];
-  const teamB: SpawnPoint[] = [
-    { position: [0, 0, 37.5], yaw: 0 },
-    { position: [-24, 0, 37.0], yaw: Math.PI * 0.15 },
-    { position: [24, 0, 37.0], yaw: -Math.PI * 0.15 },
-    { position: [-38, 0, 26.0], yaw: Math.PI * 0.3 },
-    { position: [38, 0, 26.0], yaw: -Math.PI * 0.3 },
-    { position: [0, CAT_Y, 18.5], yaw: 0 },
-  ];
+  // === 6B. CONQUEST NEUTRAL ENTERABLE COVER BUILDINGS, SCULPTED BOULDERS & PERIMETER GROVES ===
+  const conquestCoverBuildings: Array<{
+    built: ReturnType<typeof buildEnterableCoverBuilding>;
+    anchorNode: string;
+  }> = [];
+  if (isConquest) {
+    const garageMats = createCoverBuildingMaterialPack(propCtx, 'industrial_garage', trackTex);
+    const annexMats = createCoverBuildingMaterialPack(propCtx, 'soviet_annex', trackTex);
+    const coverSpecs: Array<{
+      id: string;
+      preset: 'industrial_garage' | 'soviet_annex';
+      x: number;
+      z: number;
+      rotQuarterTurns: 0 | 1 | 2 | 3;
+      width: number;
+      depth: number;
+      anchorNode: string;
+    }> = [
+      { id: 'ks_transformer_shop', preset: 'industrial_garage', x: -54, z: -54, rotQuarterTurns: 0, width: 12.2, depth: 9.2, anchorNode: 'cq_ring_nw' },
+      { id: 'ks_dispatch_office', preset: 'soviet_annex', x: 54, z: -54, rotQuarterTurns: 2, width: 11.0, depth: 8.6, anchorNode: 'cq_ring_ne' },
+      { id: 'ks_rail_warehouse', preset: 'industrial_garage', x: -54, z: 54, rotQuarterTurns: 1, width: 12.4, depth: 9.2, anchorNode: 'cq_ring_sw' },
+      { id: 'ks_pump_house', preset: 'soviet_annex', x: 54, z: 54, rotQuarterTurns: 3, width: 11.0, depth: 8.6, anchorNode: 'cq_ring_se' },
+      { id: 'ks_maint_garage', preset: 'industrial_garage', x: 82, z: 0, rotQuarterTurns: 3, width: 12.0, depth: 9.0, anchorNode: 'cq_ring_e' },
+    ];
+    for (const cs of coverSpecs) {
+      const built = buildEnterableCoverBuilding(
+        propCtx,
+        {
+          id: cs.id,
+          preset: cs.preset,
+          x: cs.x,
+          z: cs.z,
+          y: 0,
+          rotQuarterTurns: cs.rotQuarterTurns,
+          width: cs.width,
+          depth: cs.depth,
+          materials: cs.preset === 'industrial_garage' ? garageMats : annexMats,
+        },
+        trackTex,
+      );
+      conquestCoverBuildings.push({ built, anchorNode: cs.anchorNode });
+    }
+
+    const linkBidirectional = (idA: string, idB: string) => {
+      const a = rawNodes.find((n) => n.id === idA);
+      const b = rawNodes.find((n) => n.id === idB);
+      if (a && !a.neighbors.includes(idB)) a.neighbors.push(idB);
+      if (b && !b.neighbors.includes(idA)) b.neighbors.push(idA);
+    };
+    rawNodes.push(
+      { id: 'cq_hq_a', position: [0, 0, -94], zoneId: 'default', neighbors: ['cq_north_gate', 'cq_ring_nw', 'cq_ring_ne'] },
+      { id: 'cq_north_gate', position: [0, 0, -68], zoneId: 'default', neighbors: ['cq_hq_a', 'ny_c', 'cq_ring_nw', 'cq_ring_ne'] },
+      { id: 'cq_ring_nw', position: [-68, 0, -68], zoneId: 'default', neighbors: ['cq_hq_a', 'cq_north_gate', 'cq_ring_w'] },
+      { id: 'cq_ring_ne', position: [68, 0, -68], zoneId: 'default', neighbors: ['cq_hq_a', 'cq_north_gate', 'cq_ring_e'] },
+      { id: 'cq_ring_w', position: [-68, 0, 0], zoneId: 'default', neighbors: ['cq_ring_nw', 'cq_ring_sw', 'wy_c'] },
+      { id: 'cq_ring_e', position: [68, 0, 0], zoneId: 'default', neighbors: ['cq_ring_ne', 'cq_ring_se', 'ey_c'] },
+      { id: 'cq_ring_sw', position: [-68, 0, 68], zoneId: 'default', neighbors: ['cq_ring_w', 'cq_south_rail', 'cq_hq_b'] },
+      { id: 'cq_ring_se', position: [68, 0, 68], zoneId: 'default', neighbors: ['cq_ring_e', 'cq_south_rail', 'cq_hq_b'] },
+      { id: 'cq_south_rail', position: [0, 0, 68], zoneId: 'default', neighbors: ['sy_c', 'cq_ring_sw', 'cq_ring_se', 'cq_hq_b'] },
+      { id: 'cq_hq_b', position: [0, 0, 94], zoneId: 'default', neighbors: ['cq_south_rail', 'cq_ring_sw', 'cq_ring_se'] },
+    );
+    linkBidirectional('cq_north_gate', 'ny_c');
+    linkBidirectional('cq_south_rail', 'sy_c');
+    linkBidirectional('cq_ring_w', 'wy_c');
+    linkBidirectional('cq_ring_e', 'ey_c');
+
+    for (const { built, anchorNode } of conquestCoverBuildings) {
+      const inId = `cb_${built.id}_in`;
+      const doorIds: string[] = [];
+      built.entryPoints.forEach((ep, idx) => {
+        const dId = `cb_${built.id}_d${idx}`;
+        doorIds.push(dId);
+        rawNodes.push({
+          id: dId,
+          position: ep,
+          zoneId: 'default',
+          neighbors: [inId, anchorNode],
+        });
+        linkBidirectional(dId, anchorNode);
+      });
+      rawNodes.push({
+        id: inId,
+        position: built.interiorPos,
+        zoneId: 'default',
+        neighbors: doorIds,
+        isCover: true,
+        coverNormal: [0, 1],
+      });
+    }
+  }
+
+  const teamA: SpawnPoint[] = isConquest
+    ? [
+        { position: [0, 0, -94], yaw: Math.PI },
+        { position: [-10, 0, -96], yaw: Math.PI },
+        { position: [10, 0, -96], yaw: Math.PI },
+        { position: [-18, 0, -91], yaw: Math.PI * 0.9 },
+        { position: [18, 0, -91], yaw: -Math.PI * 0.9 },
+        { position: [0, 0, -88], yaw: Math.PI },
+      ]
+    : [
+        { position: [0, 0, -37.5], yaw: Math.PI },
+        { position: [-24, 0, -37.0], yaw: Math.PI * 0.85 },
+        { position: [24, 0, -37.0], yaw: -Math.PI * 0.85 },
+        { position: [-38, 0, -26.0], yaw: Math.PI * 0.7 },
+        { position: [38, 0, -26.0], yaw: -Math.PI * 0.7 },
+        { position: [0, CAT_Y, -18.5], yaw: Math.PI },
+      ];
+  const teamB: SpawnPoint[] = isConquest
+    ? [
+        { position: [0, 0, 94], yaw: 0 },
+        { position: [-10, 0, 96], yaw: 0 },
+        { position: [10, 0, 96], yaw: 0 },
+        { position: [-18, 0, 91], yaw: Math.PI * 0.1 },
+        { position: [18, 0, 91], yaw: -Math.PI * 0.1 },
+        { position: [0, 0, 88], yaw: 0 },
+      ]
+    : [
+        { position: [0, 0, 37.5], yaw: 0 },
+        { position: [-24, 0, 37.0], yaw: Math.PI * 0.15 },
+        { position: [24, 0, 37.0], yaw: -Math.PI * 0.15 },
+        { position: [-38, 0, 26.0], yaw: Math.PI * 0.3 },
+        { position: [38, 0, 26.0], yaw: -Math.PI * 0.3 },
+        { position: [0, CAT_Y, 18.5], yaw: 0 },
+      ];
   const ffa: SpawnPoint[] = [
     ...teamA,
     ...teamB,
     { position: [-42, 0, 0], yaw: -Math.PI * 0.5 },
     { position: [42, 0, 0], yaw: Math.PI * 0.5 },
   ];
+
+  // Sculpted embankment granite boulders along perimeter berms & outer industrial switchyards
+  const korsakovRockCoords: Array<[number, number, number, number, number]> = [
+    [-46.5, -38.0, 1.35, 0.88, 1.2],
+    [46.5, -38.0, 1.4, 0.9, 1.25],
+    [-46.5, 38.0, 1.38, 0.86, 1.18],
+    [46.5, 38.0, 1.42, 0.92, 1.22],
+  ];
+  if (isConquest) {
+    korsakovRockCoords.push(
+      [-36, -86, 1.6, 1.05, 1.4],
+      [36, -86, 1.55, 1.0, 1.35],
+      [-36, 88, 1.62, 1.08, 1.42],
+      [36, 88, 1.58, 1.02, 1.36],
+      [-82, -46, 1.5, 0.96, 1.3],
+      [-82, 46, 1.52, 0.98, 1.32],
+      [82, -46, 1.48, 0.95, 1.28],
+      [82, 46, 1.54, 1.0, 1.34],
+      [-82, -16, 1.45, 0.92, 1.25],
+      [-82, 18, 1.42, 0.9, 1.22],
+    );
+  }
+  const korsakovRocks: BoulderSpot[] = korsakovRockCoords.map(([rx, rz, sx, sy, sz], i) => ({
+    x: rx,
+    y: 0,
+    z: rz,
+    sx,
+    sy,
+    sz,
+    yaw: i * 1.13 + 0.3,
+    variant: i % 2 === 0 ? 0 : 1,
+    tint: new THREE.Color().setHSL(0.58, 0.08, 0.72 + (i % 3) * 0.08),
+  }));
+  buildInstancedSculptedBoulders(propCtx, korsakovRocks, {
+    castShadow: qProfile.castShadows,
+    receiveShadow: qProfile.castShadows,
+    addColliders: true,
+    colliderBounds: {
+      minX: physics.boundsMinX + 2,
+      maxX: physics.boundsMaxX - 2,
+      minZ: physics.boundsMinZ + 2,
+      maxZ: physics.boundsMaxZ - 2,
+    },
+    seed: 7709,
+  });
+
+  // High-detail perimeter pine & birch windbreak groves framing the substation compound
+  const pinePerimeterSpots: PineTreeSpot[] = [];
+  const birchPerimeterSpots: Array<{ x: number; y: number; z: number; scale: number; yaw: number; tint: THREE.Color }> = [];
+  const groveCount = Math.max(16, Math.round((isConquest ? 48 : 28) * qProfile.foliageDensity));
+  const ringDistX = isConquest ? 104 : 58;
+  const ringDistZ = isConquest ? 118 : 50;
+  for (let i = 0; i < groveCount; i++) {
+    const ang = (i / groveCount) * Math.PI * 2;
+    const jitter = ((i * 37) % 11) * 1.35;
+    const tx = Math.cos(ang) * (ringDistX + jitter);
+    const tz = Math.sin(ang) * (ringDistZ + jitter);
+    if (i % 3 === 0) {
+      birchPerimeterSpots.push({
+        x: tx,
+        y: 0,
+        z: tz,
+        scale: 0.95 + (i % 4) * 0.12,
+        yaw: i * 1.3,
+        tint: new THREE.Color().setHSL(0.26, 0.24, 0.24 + (i % 3) * 0.04),
+      });
+    } else {
+      pinePerimeterSpots.push({
+        x: tx,
+        y: 0,
+        z: tz,
+        scale: 0.95 + (i % 5) * 0.11,
+        yaw: i * 0.9,
+        tint: new THREE.Color().setHSL(0.32, 0.26, 0.2 + (i % 3) * 0.04),
+      });
+    }
+  }
+  buildInstancedPineTrees(propCtx, pinePerimeterSpots, {
+    castShadow: false,
+    receiveShadow: qProfile.castShadows,
+    addTrunkColliders: false,
+    seed: 7711,
+  });
+  buildInstancedBirchTrees(propCtx, birchPerimeterSpots, false);
 
   // Yard crack weeds hugging outer concrete perimeter walls
   const weedSpots: Array<{ x: number; y: number; z: number; scale: number; yaw: number; tint: THREE.Color }> = [];
@@ -844,71 +1105,173 @@ function buildKorsakovSubstation(
       zombieSpawners: [],
     },
     battleObjectives: {
-      hqA: {
-        id: 'hq_a',
-        team: 'A',
-        label: 'North Transformer HQ',
-        position: [0, 0, -37.5],
-        safeRadiusM: 12,
-        spawnPoints: teamA,
-      },
-      hqB: {
-        id: 'hq_b',
-        team: 'B',
-        label: 'South Yard HQ',
-        position: [0, 0, 37.5],
-        safeRadiusM: 12,
-        spawnPoints: teamB,
-      },
-      conquestPois: [
-        {
-          id: 'poi_west_fob',
-          code: 'FOB-A',
-          label: 'West HV Yard FOB',
-          kind: 'fob',
-          position: [-39.0, 0, 0],
-          captureRadiusM: 7.5,
-          territoryWeight: 1.25,
-          spawnPoints: [
-            { position: [-39.0, 0, -10], yaw: -Math.PI * 0.5 },
-            { position: [-39.0, 0, 10], yaw: -Math.PI * 0.5 },
-            { position: [-42.0, 0, 0], yaw: -Math.PI * 0.5 },
+      hqA: isConquest
+        ? {
+            id: 'hq_a',
+            team: 'A',
+            label: 'North Switchyard HQ',
+            position: [0, 0, -94],
+            safeRadiusM: 16,
+            spawnPoints: teamA,
+          }
+        : {
+            id: 'hq_a',
+            team: 'A',
+            label: 'North Transformer HQ',
+            position: [0, 0, -37.5],
+            safeRadiusM: 12,
+            spawnPoints: teamA,
+          },
+      hqB: isConquest
+        ? {
+            id: 'hq_b',
+            team: 'B',
+            label: 'South Rail Freight HQ',
+            position: [0, 0, 94],
+            safeRadiusM: 16,
+            spawnPoints: teamB,
+          }
+        : {
+            id: 'hq_b',
+            team: 'B',
+            label: 'South Yard HQ',
+            position: [0, 0, 37.5],
+            safeRadiusM: 12,
+            spawnPoints: teamB,
+          },
+      conquestPois: isConquest
+        ? [
+            {
+              id: 'poi_north_gate_cp',
+              code: 'CP-1',
+              label: 'North Gate Access Checkpoint',
+              kind: 'checkpoint',
+              position: [0, 0, -68],
+              captureRadiusM: 8.2,
+              territoryWeight: 1.0,
+              roadYaw: 0,
+            },
+            {
+              id: 'poi_south_rail_cp',
+              code: 'CP-2',
+              label: 'South Rail Crossing Checkpoint',
+              kind: 'checkpoint',
+              position: [0, 0, 68],
+              captureRadiusM: 8.2,
+              territoryWeight: 1.0,
+              roadYaw: 0,
+            },
+            {
+              id: 'poi_west_ring_cp',
+              code: 'CP-3',
+              label: 'West Service Ring Checkpoint',
+              kind: 'checkpoint',
+              position: [-68, 0, 0],
+              captureRadiusM: 8.0,
+              territoryWeight: 1.0,
+              roadYaw: Math.PI * 0.5,
+            },
+            {
+              id: 'poi_west_fob',
+              code: 'FOB-A',
+              label: 'West HV Yard FOB',
+              kind: 'fob',
+              position: [-39.0, 0, 0],
+              captureRadiusM: 7.5,
+              territoryWeight: 1.25,
+              spawnPoints: [
+                { position: [-39.0, 0, -10], yaw: -Math.PI * 0.5 },
+                { position: [-39.0, 0, 10], yaw: -Math.PI * 0.5 },
+                { position: [-42.0, 0, 0], yaw: -Math.PI * 0.5 },
+              ],
+            },
+            {
+              id: 'poi_turbine_outpost',
+              code: 'OUTPOST',
+              label: 'Central Turbine Hall',
+              kind: 'outpost',
+              position: [0, 0.08, 0],
+              captureRadiusM: 8.4,
+              territoryWeight: 1.6,
+            },
+            {
+              id: 'poi_east_fob',
+              code: 'FOB-B',
+              label: 'East HV Yard FOB',
+              kind: 'fob',
+              position: [39.0, 0, 0],
+              captureRadiusM: 7.5,
+              territoryWeight: 1.25,
+              spawnPoints: [
+                { position: [39.0, 0, -10], yaw: Math.PI * 0.5 },
+                { position: [39.0, 0, 10], yaw: Math.PI * 0.5 },
+                { position: [42.0, 0, 0], yaw: Math.PI * 0.5 },
+              ],
+            },
+            {
+              id: 'poi_north_logistics_fob',
+              code: 'FOB-C',
+              label: 'North Logistics Yard FOB',
+              kind: 'fob',
+              position: [68, 0, -68],
+              captureRadiusM: 8.2,
+              territoryWeight: 1.3,
+              spawnPoints: [
+                { position: [74, 0, -68], yaw: -Math.PI * 0.5 },
+                { position: [68, 0, -74], yaw: Math.PI },
+                { position: [62, 0, -68], yaw: Math.PI * 0.5 },
+              ],
+            },
+          ]
+        : [
+            {
+              id: 'poi_west_fob',
+              code: 'FOB-A',
+              label: 'West HV Yard FOB',
+              kind: 'fob',
+              position: [-39.0, 0, 0],
+              captureRadiusM: 7.5,
+              territoryWeight: 1.25,
+              spawnPoints: [
+                { position: [-39.0, 0, -10], yaw: -Math.PI * 0.5 },
+                { position: [-39.0, 0, 10], yaw: -Math.PI * 0.5 },
+                { position: [-42.0, 0, 0], yaw: -Math.PI * 0.5 },
+              ],
+            },
+            {
+              id: 'poi_turbine_outpost',
+              code: 'OUTPOST',
+              label: 'Central Turbine Hall',
+              kind: 'outpost',
+              position: [0, 0.08, 0],
+              captureRadiusM: 8.2,
+              territoryWeight: 1.6,
+            },
+            {
+              id: 'poi_east_fob',
+              code: 'FOB-B',
+              label: 'East HV Yard FOB',
+              kind: 'fob',
+              position: [39.0, 0, 0],
+              captureRadiusM: 7.5,
+              territoryWeight: 1.25,
+              spawnPoints: [
+                { position: [39.0, 0, -10], yaw: Math.PI * 0.5 },
+                { position: [39.0, 0, 10], yaw: Math.PI * 0.5 },
+                { position: [42.0, 0, 0], yaw: Math.PI * 0.5 },
+              ],
+            },
+            {
+              id: 'poi_south_cp',
+              code: 'CP-1',
+              label: 'South Service Road Checkpoint',
+              kind: 'checkpoint',
+              position: [0, 0, 27.0],
+              captureRadiusM: 7.2,
+              territoryWeight: 1.0,
+              roadYaw: Math.PI * 0.5,
+            },
           ],
-        },
-        {
-          id: 'poi_turbine_outpost',
-          code: 'OUTPOST',
-          label: 'Central Turbine Hall',
-          kind: 'outpost',
-          position: [0, 0.08, 0],
-          captureRadiusM: 8.2,
-          territoryWeight: 1.6,
-        },
-        {
-          id: 'poi_east_fob',
-          code: 'FOB-B',
-          label: 'East HV Yard FOB',
-          kind: 'fob',
-          position: [39.0, 0, 0],
-          captureRadiusM: 7.5,
-          territoryWeight: 1.25,
-          spawnPoints: [
-            { position: [39.0, 0, -10], yaw: Math.PI * 0.5 },
-            { position: [39.0, 0, 10], yaw: Math.PI * 0.5 },
-            { position: [42.0, 0, 0], yaw: Math.PI * 0.5 },
-          ],
-        },
-        {
-          id: 'poi_south_cp',
-          code: 'CP-1',
-          label: 'South Service Road Checkpoint',
-          kind: 'checkpoint',
-          position: [0, 0, 27.0],
-          captureRadiusM: 7.2,
-          territoryWeight: 1.0,
-          roadYaw: Math.PI * 0.5,
-        },
-      ],
       ctfFlags: [
         { team: 'A', label: 'North Yard Flag', position: [0, 0, -31.5] },
         { team: 'B', label: 'South Yard Flag', position: [0, 0, 31.5] },
@@ -920,6 +1283,7 @@ function buildKorsakovSubstation(
         { id: 'hill_south_yard', label: 'South Yard Apron', position: [0, 0, 27.0], radiusM: 7.5 },
       ],
     },
+    isExpandedConquest: isConquest,
     interactables: [],
     lightingPreset: LIGHTING_PRESET,
     supportsDynamicWeatherTime: true,

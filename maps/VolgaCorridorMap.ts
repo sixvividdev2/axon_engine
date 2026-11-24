@@ -3,15 +3,22 @@ import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment
 import { BodycamPhysicsWorld, BodycamSurfaceMaterial } from '../bodycam-sdk';
 import { getGraphicsQualityProfile, GraphicsQualityId } from '../data/graphicsQuality';
 import { NightLightEntry, WettableSurfaceEntry } from '../engine/world/WeatherTimeSystem';
-import {
-  applyWindFoliageShader,
-  assignHeightSwayAttribute,
-  createWindShaderUniforms,
-} from '../engine/world/WindFoliageShader';
+import { createWindShaderUniforms } from '../engine/world/WindFoliageShader';
 import { createStencilSignTexture } from '../gym/GymTextures';
 import {
+  buildEnterableCoverBuilding,
+  CoverBuildingMaterialPack,
+  CoverBuildingPreset,
+  createCoverBuildingMaterialPack,
+} from './CoverBuildingFactory';
+import {
+  BoulderSpot,
+  buildInstancedBirchTrees,
   buildInstancedGrassTufts,
+  buildInstancedPineTrees,
+  buildInstancedSculptedBoulders,
   buildRustedVehicle,
+  PineTreeSpot,
   PropFactoryContext,
   VehicleMaterials,
 } from './MapPropFactory';
@@ -26,6 +33,7 @@ import {
   BuiltMapInstance,
   IMapDefinition,
   MapBattleObjectives,
+  MapBuildOptions,
   MapLightingPreset,
   NavNode,
   SpawnPoint,
@@ -66,37 +74,53 @@ function smoothstep(edge0: number, edge1: number, x: number): number {
  * - Raised tactical ridges at South FOB-A (-20, 38), North FOB-B (20, -38), and Central Outpost (0, -4)
  * - Natural rising perimeter hills outside playable bounds (zero floating walls)
  */
-export function sampleVolgaTerrainY(x: number, z: number): number {
+export function sampleVolgaTerrainY(x: number, z: number, expanded = false): number {
   // Base gentle steppe undulation
   let h =
     Math.sin(x * 0.026) * Math.cos(z * 0.032) * 1.15 +
     Math.sin(x * 0.055 + 0.8) * Math.sin(z * 0.048 - 0.5) * 0.45;
 
-  // Flatten highway corridor & HQ aprons
+  const hqX = expanded ? 148 : 92;
+
+  // Flatten highway corridor & HQ aprons (+ North/South supply roads in expanded Conquest)
   const hwyBlend = 1 - smoothstep(5.5, 16.0, Math.abs(z));
-  const hqWestBlend = 1 - smoothstep(14.0, 26.0, Math.hypot(x + 92, z));
-  const hqEastBlend = 1 - smoothstep(14.0, 26.0, Math.hypot(x - 92, z));
-  const flatFactor = Math.max(hwyBlend, hqWestBlend, hqEastBlend);
+  const hqWestBlend = 1 - smoothstep(15.0, 28.0, Math.hypot(x + hqX, z));
+  const hqEastBlend = 1 - smoothstep(15.0, 28.0, Math.hypot(x - hqX, z));
+  let flatFactor = Math.max(hwyBlend, hqWestBlend, hqEastBlend);
+
+  if (expanded) {
+    const northRoadBlend =
+      Math.abs(x) < 126 ? 1 - smoothstep(4.2, 11.5, Math.abs(z + 56)) : 0;
+    const southRoadBlend =
+      Math.abs(x) < 126 ? 1 - smoothstep(4.2, 11.5, Math.abs(z - 56)) : 0;
+    const fobCBlend = 1 - smoothstep(10.0, 20.0, Math.hypot(x + 84, z + 56));
+    const fobDBlend = 1 - smoothstep(10.0, 20.0, Math.hypot(x - 84, z - 56));
+    flatFactor = Math.max(flatFactor, northRoadBlend * 0.85, southRoadBlend * 0.85, fobCBlend, fobDBlend);
+  }
   h *= 1 - flatFactor * 0.94;
 
-  // Raised tactical plateau for South Ridge FOB-A (-20, 38)
-  const fobADist = Math.hypot(x + 20, z - 38);
+  // Raised tactical plateaus for inner FOBs & Relay Outpost
+  const fobAX = expanded ? -38 : -20;
+  const fobBX = expanded ? 38 : 20;
+  const fobADist = Math.hypot(x - fobAX, z - 38);
   const fobALift = (1 - smoothstep(12.0, 26.0, fobADist)) * 2.1;
 
-  // Raised tactical plateau for North Timber FOB-B (20, -38)
-  const fobBDist = Math.hypot(x - 20, z + 38);
+  const fobBDist = Math.hypot(x - fobBX, z + 38);
   const fobBLift = (1 - smoothstep(12.0, 26.0, fobBDist)) * 2.0;
 
-  // Slight tactical mound for Central Relay Outpost (0, -18) overlooking the highway
   const outDist = Math.hypot(x, z + 18);
   const outLift = (1 - smoothstep(10.0, 22.0, outDist)) * 1.65;
 
-  // Natural perimeter ridge rising cleanly outside the 220m x 150m combat corridor
-  const edgeX = smoothstep(106, 148, Math.abs(x));
-  const edgeZ = smoothstep(72, 114, Math.abs(z));
+  // Natural perimeter ridge rising cleanly outside combat bounds
+  const edgeX0 = expanded ? 168 : 106;
+  const edgeX1 = expanded ? 214 : 148;
+  const edgeZ0 = expanded ? 103 : 72;
+  const edgeZ1 = expanded ? 148 : 114;
+  const edgeX = smoothstep(edgeX0, edgeX1, Math.abs(x));
+  const edgeZ = smoothstep(edgeZ0, edgeZ1, Math.abs(z));
   const perimeterRidge =
     Math.max(edgeX, edgeZ) *
-    (11.5 + Math.sin(x * 0.09 + z * 0.07) * 3.2 + Math.cos(x * 0.05 - z * 0.11) * 2.4);
+    (12.5 + Math.sin(x * 0.08 + z * 0.065) * 3.4 + Math.cos(x * 0.045 - z * 0.1) * 2.5);
 
   return h + fobALift + fobBLift + outLift + perimeterRidge;
 }
@@ -166,15 +190,22 @@ function buildVolgaCorridor(
   renderer: THREE.WebGLRenderer,
   isSoftwareGl: boolean,
   graphicsQuality?: GraphicsQualityId,
+  options?: MapBuildOptions,
 ): BuiltMapInstance {
   const qProfile = getGraphicsQualityProfile(graphicsQuality);
+  const isConquest = options?.battleRule === 'conquest';
+  const sampleY = (x: number, z: number): number => sampleVolgaTerrainY(x, z, isConquest);
+
+  const boundX = isConquest ? 170 : 108;
+  const boundZ = isConquest ? 105 : 73;
+  const hqX = isConquest ? 148 : 92;
 
   const physics = new BodycamPhysicsWorld();
   physics.baseFloorY = -4;
-  physics.boundsMinX = -108;
-  physics.boundsMaxX = 108;
-  physics.boundsMinZ = -73;
-  physics.boundsMaxZ = 73;
+  physics.boundsMinX = -boundX;
+  physics.boundsMaxX = boundX;
+  physics.boundsMinZ = -boundZ;
+  physics.boundsMaxZ = boundZ;
 
   const sceneGroup = new THREE.Group();
   scene.add(sceneGroup);
@@ -203,7 +234,7 @@ function buildVolgaCorridor(
   scene.background = new THREE.Color(LIGHTING_PRESET.backgroundHex);
   scene.fog = new THREE.FogExp2(
     LIGHTING_PRESET.fogHex,
-    LIGHTING_PRESET.fogDensity * qProfile.fogDensityScale,
+    LIGHTING_PRESET.fogDensity * (isConquest ? 0.74 : 1.0) * qProfile.fogDensityScale,
   );
 
   const pmrem = new THREE.PMREMGenerator(renderer);
@@ -229,11 +260,13 @@ function buildVolgaCorridor(
     const sm = Math.min(2048, qProfile.shadowMapSize);
     sunLight.shadow.mapSize.set(sm, sm);
     sunLight.shadow.camera.near = 10;
-    sunLight.shadow.camera.far = 260;
-    sunLight.shadow.camera.left = -115;
-    sunLight.shadow.camera.right = 115;
-    sunLight.shadow.camera.top = 90;
-    sunLight.shadow.camera.bottom = -90;
+    sunLight.shadow.camera.far = isConquest ? 360 : 260;
+    const scX = isConquest ? 172 : 115;
+    const scZ = isConquest ? 128 : 90;
+    sunLight.shadow.camera.left = -scX;
+    sunLight.shadow.camera.right = scX;
+    sunLight.shadow.camera.top = scZ;
+    sunLight.shadow.camera.bottom = -scZ;
     sunLight.shadow.bias = -0.0006;
     sunLight.shadow.normalBias = 0.04;
   }
@@ -285,15 +318,6 @@ function buildVolgaCorridor(
   const matBoom = trackMat(
     new THREE.MeshStandardMaterial({ map: boomTex, roughness: 0.55, metalness: 0.25 }),
   );
-  const matRock = trackMat(
-    new THREE.MeshStandardMaterial({ color: 0x5c605e, roughness: 0.93, metalness: 0.04 }),
-  );
-  const matBark = trackMat(
-    new THREE.MeshStandardMaterial({ color: 0x433325, roughness: 0.92, metalness: 0.02 }),
-  );
-  const matPine = trackMat(
-    new THREE.MeshStandardMaterial({ color: 0x2c422c, roughness: 0.85, metalness: 0.02 }),
-  );
   const matLampBulb = trackMat(
     new THREE.MeshStandardMaterial({
       color: 0xffdf9a,
@@ -311,7 +335,6 @@ function buildVolgaCorridor(
     }),
   );
 
-  applyWindFoliageShader(matPine, windUniforms, { swayScale: 0.24 });
   wettableSurfaces.push(
     { material: matAsphalt, baseRoughness: 0.82, baseEnvMapIntensity: 0.65 },
     { material: matConcrete, baseRoughness: 0.88, baseEnvMapIntensity: 0.55 },
@@ -324,8 +347,10 @@ function buildVolgaCorridor(
     raycastMeshes,
     trackGeo,
     trackMat,
+    trackTex,
     isSoftwareGl,
     windUniforms,
+    maxAniso,
   };
 
   const vehMats: VehicleMaterials = {
@@ -380,14 +405,18 @@ function buildVolgaCorridor(
     return m;
   };
 
-  // === 1. CONTINUOUS ROLLING TERRAIN MESH (310m x 230m) ===
-  const terrainGeo = trackGeo(new THREE.PlaneGeometry(310, 230, 124, 92));
+  // === 1. CONTINUOUS ROLLING TERRAIN MESH (310x230m classic; 440x310m expanded Conquest) ===
+  const terrW = isConquest ? 440 : 310;
+  const terrD = isConquest ? 310 : 230;
+  const terrSegX = isConquest ? 132 : 124;
+  const terrSegZ = isConquest ? 96 : 92;
+  const terrainGeo = trackGeo(new THREE.PlaneGeometry(terrW, terrD, terrSegX, terrSegZ));
   terrainGeo.rotateX(-Math.PI * 0.5);
   const posAttr = terrainGeo.attributes.position as THREE.BufferAttribute;
   for (let i = 0; i < posAttr.count; i++) {
     const vx = posAttr.getX(i);
     const vz = posAttr.getZ(i);
-    posAttr.setY(i, sampleVolgaTerrainY(vx, vz));
+    posAttr.setY(i, sampleY(vx, vz));
   }
   terrainGeo.computeVertexNormals();
   const terrainMesh = new THREE.Mesh(terrainGeo, matTerrain);
@@ -396,27 +425,53 @@ function buildVolgaCorridor(
   terrainMesh.userData.analyticalRaycastCovered = true;
   sceneGroup.add(terrainMesh);
   raycastMeshes.push(terrainMesh);
-  physics.setTerrainHeightSampler(sampleVolgaTerrainY, {
+  physics.setTerrainHeightSampler(sampleY, {
     enableRaycast: true,
     surface: 'grass',
     terrainMesh,
   });
 
-  // === 2. CENTRAL MILITARY HIGHWAY (East-West along Z = 0, X from -112 to +112) ===
-  const roadGeo = trackGeo(new THREE.PlaneGeometry(224, 10.6, 56, 2));
-  roadGeo.rotateX(-Math.PI * 0.5);
-  const roadPos = roadGeo.attributes.position as THREE.BufferAttribute;
-  for (let i = 0; i < roadPos.count; i++) {
-    const rx = roadPos.getX(i);
-    const rz = roadPos.getZ(i);
-    roadPos.setY(i, sampleVolgaTerrainY(rx, rz) + 0.045);
+  // Helper to drape an asphalt road ribbon smoothly over the heightfield
+  const addDrapeRoad = (
+    cx: number,
+    cz: number,
+    length: number,
+    width: number,
+    axis: 'x' | 'z',
+    segs = 48,
+    yLift = 0.045,
+  ): void => {
+    const rw = axis === 'x' ? length : width;
+    const rd = axis === 'x' ? width : length;
+    const g = trackGeo(new THREE.PlaneGeometry(rw, rd, axis === 'x' ? segs : 2, axis === 'z' ? segs : 2));
+    g.rotateX(-Math.PI * 0.5);
+    const pa = g.attributes.position as THREE.BufferAttribute;
+    for (let i = 0; i < pa.count; i++) {
+      const wx = cx + pa.getX(i);
+      const wz = cz + pa.getZ(i);
+      pa.setXYZ(i, wx, sampleY(wx, wz) + yLift, wz);
+    }
+    g.computeVertexNormals();
+    const rm = new THREE.Mesh(g, matAsphalt);
+    rm.receiveShadow = !isSoftwareGl && qProfile.castShadows;
+    rm.userData.surfaceMaterial = 'concrete';
+    rm.userData.analyticalRaycastCovered = true;
+    sceneGroup.add(rm);
+    raycastMeshes.push(rm);
+  };
+
+  // === 2. ROAD NETWORK (Main Highway + North Service Loop & South Supply Road in Conquest) ===
+  addDrapeRoad(0, 0, isConquest ? 344 : 224, 10.6, 'x', isConquest ? 72 : 56, 0.045);
+  if (isConquest) {
+    // North Service Loop Road (Z = -56) & South Timber Supply Road (Z = +56)
+    addDrapeRoad(0, -56, 246, 7.6, 'x', 54, 0.055);
+    addDrapeRoad(0, 56, 246, 7.6, 'x', 54, 0.055);
+    // North-South cross-connector spurs joining highway to service loops & flanks
+    for (const spurX of [-118, -48, 48, 118]) {
+      addDrapeRoad(spurX, -28, 56, 6.4, 'z', 18, 0.05);
+      addDrapeRoad(spurX, 28, 56, 6.4, 'z', 18, 0.05);
+    }
   }
-  roadGeo.computeVertexNormals();
-  const roadMesh = new THREE.Mesh(roadGeo, matAsphalt);
-  roadMesh.receiveShadow = !isSoftwareGl && qProfile.castShadows;
-  roadMesh.userData.surfaceMaterial = 'concrete';
-  sceneGroup.add(roadMesh);
-  raycastMeshes.push(roadMesh);
 
   // Helper to stamp a fortified Hesco wall segment on terrain
   const hescoBlocks: Array<{ x: number; y: number; z: number; rotY: number; sx: number; sy: number; sz: number }> = [];
@@ -428,7 +483,7 @@ function buildVolgaCorridor(
     thick: number,
     rotY = 0,
   ): void => {
-    const ty = sampleVolgaTerrainY(cx, cz);
+    const ty = sampleY(cx, cz);
     hescoBlocks.push({
       x: cx,
       y: ty + height * 0.5 - 0.12,
@@ -453,35 +508,31 @@ function buildVolgaCorridor(
     });
   };
 
-  // === 3. OPPOSITE-SIDE PROTECTED TEAM HQs (Team A West, Team B East) ===
+  // === 3. OPPOSITE-SIDE PROTECTED TEAM HQs (Spread to ±148m in Conquest; ±92m classic) ===
   const buildTeamHq = (team: 'A' | 'B', baseX: number): void => {
-    const dir = team === 'A' ? 1 : -1; // faces toward center
-    const groundY = sampleVolgaTerrainY(baseX, 0);
+    const dir = team === 'A' ? 1 : -1;
+    const groundY = sampleY(baseX, 0);
 
-    // Concrete staging apron (24m x 32m)
     const apron = new THREE.Mesh(
       trackGeo(new THREE.BoxGeometry(24, 0.16, 32)),
       matConcrete,
     );
     apron.position.set(baseX, groundY + 0.04, 0);
-    apron.receiveShadow = true;
+    apron.receiveShadow = !isSoftwareGl && qProfile.castShadows;
     apron.userData.surfaceMaterial = 'concrete';
     sceneGroup.add(apron);
     raycastMeshes.push(apron);
 
-    // Hesco perimeter walls with wide central highway gate (Z in [-6, 6]) and flank exits
-    addHescoWall(baseX - dir * 12.2, 0, 1.8, 2.5, 32.0, 0); // Rear bastion
-    addHescoWall(baseX, -16.2, 24.0, 2.4, 1.8, 0); // North bastion
-    addHescoWall(baseX, 16.2, 24.0, 2.4, 1.8, 0); // South bastion
-    addHescoWall(baseX + dir * 12.2, -11.5, 1.8, 2.4, 9.5, 0); // Front-North flank wall
-    addHescoWall(baseX + dir * 12.2, 11.5, 1.8, 2.4, 9.5, 0); // Front-South flank wall
+    addHescoWall(baseX - dir * 12.2, 0, 1.8, 2.5, 32.0, 0);
+    addHescoWall(baseX, -16.2, 24.0, 2.4, 1.8, 0);
+    addHescoWall(baseX, 16.2, 24.0, 2.4, 1.8, 0);
+    addHescoWall(baseX + dir * 12.2, -11.5, 1.8, 2.4, 9.5, 0);
+    addHescoWall(baseX + dir * 12.2, 11.5, 1.8, 2.4, 9.5, 0);
 
-    // Armored Command Shelter + Cargo Container
     const shelterX = baseX - dir * 5.2;
     addSolidBox(shelterX, groundY + 1.65, -9.2, 7.2, 3.1, 5.2, matOliveSteel, 'metal');
     addSolidBox(shelterX, groundY + 1.4, 9.2, 6.2, 2.7, 2.6, matRust, 'metal');
 
-    // Stencil HQ Sign
     const signTex = trackTex(
       createStencilSignTexture(
         team === 'A' ? 'ALPHA HQ · WEST BASE' : 'BRAVO HQ · EAST BASE',
@@ -499,7 +550,6 @@ function buildVolgaCorridor(
     sign.rotation.y = team === 'A' ? Math.PI * 0.5 : -Math.PI * 0.5;
     sceneGroup.add(sign);
 
-    // Floodlight pole
     const pole = new THREE.Mesh(trackGeo(new THREE.CylinderGeometry(0.12, 0.18, 7.6, 8)), matSteel);
     pole.position.set(baseX + dir * 9.5, groundY + 3.8, -13.5);
     sceneGroup.add(pole);
@@ -513,24 +563,22 @@ function buildVolgaCorridor(
     nightLights.push({ light: pl, baseLightIntensity: 18, emissiveMat: matLampBulb, baseEmissiveIntensity: 2.4 });
   };
 
-  buildTeamHq('A', -92);
-  buildTeamHq('B', 92);
+  buildTeamHq('A', -hqX);
+  buildTeamHq('B', hqX);
 
-  // === 4. TWO MILITARY ROAD CHECKPOINTS (CP-1 at X=-48, CP-2 at X=+48) ===
-  const buildRoadCheckpoint = (cx: number, code: string, label: string): void => {
-    const ty = sampleVolgaTerrainY(cx, 0);
+  // === 4. MILITARY ROAD CHECKPOINTS ===
+  const buildRoadCheckpoint = (cx: number, cz: number, code: string, label: string): void => {
+    const ty = sampleY(cx, cz);
 
-    // Guardhouse bunker on north shoulder of highway (Z = -7.6)
     const gx = cx;
-    const gz = -7.8;
-    const gy = sampleVolgaTerrainY(gx, gz);
+    const gz = cz - 7.8;
+    const gy = sampleY(gx, gz);
     addSolidBox(gx, gy + 1.45, gz - 1.5, 4.4, 2.9, 0.35, matConcreteDark, 'concrete');
     addSolidBox(gx - 2.05, gy + 1.45, gz, 0.35, 2.9, 3.2, matConcreteDark, 'concrete');
     addSolidBox(gx + 2.05, gy + 1.45, gz, 0.35, 2.9, 3.2, matConcreteDark, 'concrete');
-    addSolidBox(gx, gy + 0.55, gz + 1.45, 4.4, 1.1, 0.32, matConcreteDark, 'concrete'); // viewing counter
+    addSolidBox(gx, gy + 0.55, gz + 1.45, 4.4, 1.1, 0.32, matConcreteDark, 'concrete');
     addSolidBox(gx, gy + 3.05, gz, 5.0, 0.32, 3.8, matSteel, 'metal');
 
-    // Checkpoint stencil sign mounted on guardhouse roof fascia
     const cpSignTex = trackTex(
       createStencilSignTexture(`${code} · ${label.toUpperCase()}`, 'MILITARY ROAD CHECKPOINT', '#f59e0b', '#171c22', maxAniso),
     );
@@ -541,51 +589,58 @@ function buildVolgaCorridor(
     cpSign.position.set(gx, gy + 3.05, gz + 1.92);
     sceneGroup.add(cpSign);
 
-    // Raised striped military boom gate spanning the highway (open enough for infantry sprinting under)
     const pivotPost = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(0.45, 1.3, 0.45)), matSteel);
-    pivotPost.position.set(cx, ty + 0.65, -5.6);
+    pivotPost.position.set(cx, ty + 0.65, cz - 5.2);
     sceneGroup.add(pivotPost);
-    const boomBar = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(0.14, 0.14, 9.4)), matBoom);
-    boomBar.position.set(cx, ty + 2.35, -1.0);
-    boomBar.rotation.x = 0.22; // angled up like a half-raised checkpoint arm
+    const boomBar = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(0.14, 0.14, 8.8)), matBoom);
+    boomBar.position.set(cx, ty + 2.35, cz - 0.8);
+    boomBar.rotation.x = 0.22;
     sceneGroup.add(boomBar);
 
-    // Staggered Concrete Jersey Barriers creating a realistic vehicle chicane & infantry fighting cover
-    addSolidBox(cx - 5.5, ty + 0.55, -2.6, 1.1, 1.05, 4.4, matConcrete, 'concrete');
-    addSolidBox(cx + 5.5, ty + 0.55, 2.6, 1.1, 1.05, 4.4, matConcrete, 'concrete');
-    addSolidBox(cx - 2.4, ty + 0.55, 7.2, 4.8, 1.05, 1.0, matSandbag, 'gravel');
-    addSolidBox(cx + 3.2, ty + 0.55, 7.2, 4.4, 1.05, 1.0, matSandbag, 'gravel');
+    addSolidBox(cx - 5.5, ty + 0.55, cz - 2.5, 1.1, 1.05, 4.2, matConcrete, 'concrete');
+    addSolidBox(cx + 5.5, ty + 0.55, cz + 2.5, 1.1, 1.05, 4.2, matConcrete, 'concrete');
+    addSolidBox(cx - 2.4, ty + 0.55, cz + 6.8, 4.8, 1.05, 1.0, matSandbag, 'gravel');
+    addSolidBox(cx + 3.2, ty + 0.55, cz + 6.8, 4.4, 1.05, 1.0, matSandbag, 'gravel');
 
-    // Parked military vehicle on south shoulder
-    buildRustedVehicle(propCtx, 'zil_truck', cx + (cx < 0 ? -7.8 : 7.8), sampleVolgaTerrainY(cx, 10.5), 10.5, cx < 0 ? 0.28 : -2.85, vehMats);
+    buildRustedVehicle(
+      propCtx,
+      'zil_truck',
+      cx + (cx <= 0 ? -7.8 : 7.8),
+      sampleY(cx + (cx <= 0 ? -7.8 : 7.8), cz + 10.2),
+      cz + 10.2,
+      cx <= 0 ? 0.28 : -2.85,
+      vehMats,
+    );
 
-    // Checkpoint floodlight
     const lPole = new THREE.Mesh(trackGeo(new THREE.CylinderGeometry(0.09, 0.13, 6.2, 7)), matSteel);
-    lPole.position.set(cx, ty + 3.1, 6.2);
+    lPole.position.set(cx, ty + 3.1, cz + 6.0);
     sceneGroup.add(lPole);
     const pl = new THREE.PointLight(0xffd28a, 0, 22, 1.7);
     pl.visible = false;
-    pl.position.set(cx, ty + 6.0, 4.0);
+    pl.position.set(cx, ty + 6.0, cz + 3.8);
     sceneGroup.add(pl);
     nightLights.push({ light: pl, baseLightIntensity: 14 });
   };
 
-  buildRoadCheckpoint(-48, 'CP-1', 'West Checkpoint');
-  buildRoadCheckpoint(48, 'CP-2', 'East Checkpoint');
+  const cp1X = isConquest ? -78 : -48;
+  const cp2X = isConquest ? 78 : 48;
+  buildRoadCheckpoint(cp1X, 0, 'CP-1', 'West Highway');
+  buildRoadCheckpoint(cp2X, 0, 'CP-2', 'East Highway');
+  if (isConquest) {
+    buildRoadCheckpoint(0, -56, 'CP-3', 'North Service Road');
+  }
 
-  // === 5. TWO FORTIFIED FORWARD OPERATING BASES (FOB-A South Ridge, FOB-B North Timber) ===
+  // === 5. FORTIFIED FORWARD OPERATING BASES ===
   const buildFob = (cx: number, cz: number, code: string, label: string, accentHex: string): void => {
-    const ty = sampleVolgaTerrainY(cx, cz);
+    const ty = sampleY(cx, cz);
 
-    // Concrete FOB pad
     const pad = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(18, 0.18, 18)), matConcrete);
     pad.position.set(cx, ty + 0.05, cz);
-    pad.receiveShadow = true;
+    pad.receiveShadow = !isSoftwareGl && qProfile.castShadows;
     pad.userData.surfaceMaterial = 'concrete';
     sceneGroup.add(pad);
     raycastMeshes.push(pad);
 
-    // Four-corner Hesco bastions leaving wide tactical entrances on all 4 cardinal sides
     addHescoWall(cx - 6.2, cz - 9.0, 6.0, 2.0, 1.3, 0);
     addHescoWall(cx + 6.2, cz - 9.0, 6.0, 2.0, 1.3, 0);
     addHescoWall(cx - 6.2, cz + 9.0, 6.0, 2.0, 1.3, 0);
@@ -595,17 +650,14 @@ function buildVolgaCorridor(
     addHescoWall(cx + 9.0, cz - 6.2, 1.3, 2.0, 6.0, 0);
     addHescoWall(cx + 9.0, cz + 6.2, 1.3, 2.0, 6.0, 0);
 
-    // Open-ended tactical command shelter + supply crates
     addSolidBox(cx - 4.4, ty + 1.5, cz - 3.6, 5.2, 2.8, 3.6, matDesertTan, 'metal');
     addSolidBox(cx + 4.5, ty + 0.65, cz + 4.2, 2.6, 1.25, 1.8, matCrate, 'wood');
     addSolidBox(cx + 4.8, ty + 0.65, cz - 4.2, 1.8, 1.15, 2.6, matSandbag, 'gravel');
 
-    // Comms antenna mast
     const mast = new THREE.Mesh(trackGeo(new THREE.CylinderGeometry(0.08, 0.14, 8.8, 8)), matSteel);
     mast.position.set(cx - 5.2, ty + 4.4, cz - 4.4);
     sceneGroup.add(mast);
 
-    // FOB Stencil Sign
     const fobTex = trackTex(
       createStencilSignTexture(`${code} · ${label.toUpperCase()}`, 'FORWARD DEPLOYMENT BASE', accentHex, '#141a20', maxAniso),
     );
@@ -623,16 +675,22 @@ function buildVolgaCorridor(
     nightLights.push({ light: pl, baseLightIntensity: 13 });
   };
 
-  buildFob(-20, 38, 'FOB-A', 'South Ridge FOB', '#38bdf8');
-  buildFob(20, -38, 'FOB-B', 'North Timber FOB', '#f97316');
+  const fobAX = isConquest ? -38 : -20;
+  const fobBX = isConquest ? 38 : 20;
+  buildFob(fobAX, 38, 'FOB-A', 'South Ridge FOB', '#38bdf8');
+  buildFob(fobBX, -38, 'FOB-B', 'North Timber FOB', '#f97316');
+  if (isConquest) {
+    buildFob(-84, -56, 'FOB-C', 'NW Logging FOB', '#34d399');
+    buildFob(84, 56, 'FOB-D', 'SE Supply FOB', '#fb7185');
+  }
 
   // === 6. CENTRAL HILLTOP RELAY OUTPOST (X = 0, Z = -18, high-value strategic anchor) ===
   const outX = 0;
   const outZ = -18;
-  const outY = sampleVolgaTerrainY(outX, outZ);
+  const outY = sampleY(outX, outZ);
   const outPad = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(20, 0.22, 16)), matConcreteDark);
   outPad.position.set(outX, outY + 0.06, outZ);
-  outPad.receiveShadow = true;
+  outPad.receiveShadow = !isSoftwareGl && qProfile.castShadows;
   outPad.userData.surfaceMaterial = 'concrete';
   sceneGroup.add(outPad);
   raycastMeshes.push(outPad);
@@ -662,6 +720,54 @@ function buildVolgaCorridor(
   outSign.position.set(outX, outY + 3.55, outZ + 0.56);
   sceneGroup.add(outSign);
 
+  // === 6B. NEUTRAL ENTERABLE COVER BUILDINGS (Conquest Expanded: 6 non-objective buildings with full interiors) ===
+  const coverBuildingSpecs: Array<{
+    id: string;
+    preset: CoverBuildingPreset;
+    x: number;
+    z: number;
+    rot: 0 | 1 | 2 | 3;
+    w: number;
+    d: number;
+    linkNode: string;
+  }> = isConquest
+    ? [
+        { id: 'volga_garage_w', preset: 'industrial_garage', x: -108, z: 18, rot: 0, w: 12.2, d: 9.0, linkNode: 'hwy_w1' },
+        { id: 'volga_farmhouse_s', preset: 'rural_farmhouse', x: -12, z: 72, rot: 2, w: 11.2, d: 8.6, linkNode: 'south_rd_c' },
+        { id: 'volga_logging_nw', preset: 'timber_cabin', x: -46, z: -74, rot: 0, w: 11.4, d: 8.6, linkNode: 'north_rd_w' },
+        { id: 'volga_station_e', preset: 'industrial_garage', x: 108, z: -18, rot: 2, w: 12.2, d: 9.0, linkNode: 'hwy_e1' },
+        { id: 'volga_annex_mid', preset: 'soviet_annex', x: 26, z: 18, rot: 0, w: 10.6, d: 8.4, linkNode: 'hwy_mid_e' },
+        { id: 'volga_barn_se', preset: 'timber_cabin', x: 46, z: 74, rot: 2, w: 11.6, d: 8.8, linkNode: 'south_rd_e' },
+      ]
+    : [];
+
+  const packCache = new Map<CoverBuildingPreset, CoverBuildingMaterialPack>();
+  const builtCoverBuildings = coverBuildingSpecs.map((b) => {
+    let pack = packCache.get(b.preset);
+    if (!pack) {
+      pack = createCoverBuildingMaterialPack(propCtx, b.preset, trackTex);
+      packCache.set(b.preset, pack);
+    }
+    return {
+      spec: b,
+      built: buildEnterableCoverBuilding(
+        propCtx,
+        {
+          id: b.id,
+          preset: b.preset,
+          x: b.x,
+          z: b.z,
+          y: sampleY(b.x, b.z) + 0.04,
+          rotQuarterTurns: b.rot,
+          width: b.w,
+          depth: b.d,
+          materials: pack,
+        },
+        trackTex,
+      ),
+    };
+  });
+
   // Additional mid-highway tactical cover (sandbags & cargo crates along flanks)
   const fieldCoverSpecs: Array<[number, number, number, number, number, 'concrete' | 'wood' | 'gravel']> = [
     [-22, 6.4, 3.6, 1.1, 1.1, 'gravel'],
@@ -675,7 +781,7 @@ function buildVolgaCorridor(
     [12, 36, 3.6, 1.25, 1.5, 'wood'],
   ];
   for (const [fx, fz, fw, fh, fd, surf] of fieldCoverSpecs) {
-    const fy = sampleVolgaTerrainY(fx, fz) + fh * 0.5;
+    const fy = sampleY(fx, fz) + fh * 0.5;
     addSolidBox(
       fx,
       fy,
@@ -708,144 +814,123 @@ function buildVolgaCorridor(
   sceneGroup.add(hescoInst);
   raycastMeshes.push(hescoInst);
 
-  // === 7. INSTANCED PINE FOREST, PERIMETER BOULDERS & GRASS TUFTS ===
+  // === 7. HIGH-DETAIL INSTANCED PINE FOREST, BIRCH GROVES, SCULPTED BOULDERS & GRASS TUFTS ===
   const rand = seededRand(88047);
   const isClear = (tx: number, tz: number): boolean => {
     // Keep central highway clear
-    if (Math.abs(tz) < 11.5 && Math.abs(tx) < 116) return false;
+    if (Math.abs(tz) < 11.5 && Math.abs(tx) < boundX + 10) return false;
+    // Keep Conquest North/South service roads & spurs clear
+    if (isConquest) {
+      if (Math.abs(tx) < 126 && (Math.abs(tz + 56) < 8.5 || Math.abs(tz - 56) < 8.5)) return false;
+      for (const sx of [-118, -48, 48, 118]) {
+        if (Math.abs(tx - sx) < 6.8 && Math.abs(tz) < 60) return false;
+      }
+      if (Math.hypot(tx + 84, tz + 56) < 16) return false;
+      if (Math.hypot(tx - 84, tz - 56) < 16) return false;
+      if (Math.hypot(tx, tz + 56) < 15) return false;
+      for (const cb of coverBuildingSpecs) {
+        if (Math.abs(tx - cb.x) < cb.w * 0.5 + 4.5 && Math.abs(tz - cb.z) < cb.d * 0.5 + 4.5) {
+          return false;
+        }
+      }
+    }
     // Keep West & East HQs clear
-    if (Math.abs(tx + 92) < 18 && Math.abs(tz) < 22) return false;
-    if (Math.abs(tx - 92) < 18 && Math.abs(tz) < 22) return false;
+    if (Math.abs(tx + hqX) < 19 && Math.abs(tz) < 22) return false;
+    if (Math.abs(tx - hqX) < 19 && Math.abs(tz) < 22) return false;
     // Keep FOBs, Outpost & Checkpoints clear
-    if (Math.hypot(tx + 48, tz) < 15) return false;
-    if (Math.hypot(tx - 48, tz) < 15) return false;
-    if (Math.hypot(tx + 20, tz - 38) < 16) return false;
-    if (Math.hypot(tx - 20, tz + 38) < 16) return false;
+    if (Math.hypot(tx - cp1X, tz) < 15) return false;
+    if (Math.hypot(tx - cp2X, tz) < 15) return false;
+    if (Math.hypot(tx - fobAX, tz - 38) < 16) return false;
+    if (Math.hypot(tx - fobBX, tz + 38) < 16) return false;
     if (Math.hypot(tx, tz + 18) < 15) return false;
     return true;
   };
 
-  const targetTrees = Math.max(110, Math.round(280 * qProfile.foliageDensity));
-  const treeSpots: Array<{ x: number; y: number; z: number; scale: number; yaw: number; tint: THREE.Color }> = [];
-  for (let attempt = 0; attempt < 2200 && treeSpots.length < targetTrees; attempt++) {
-    const tx = (rand() - 0.5) * 280;
-    const tz = (rand() - 0.5) * 204;
+  const targetTrees = Math.max(120, Math.round((isConquest ? 360 : 260) * qProfile.foliageDensity));
+  const pineSpots: PineTreeSpot[] = [];
+  const birchSpots: Array<{ x: number; y: number; z: number; scale: number; yaw: number; tint: THREE.Color }> = [];
+  const scatterSpanX = isConquest ? 400 : 280;
+  const scatterSpanZ = isConquest ? 275 : 204;
+
+  for (let attempt = 0; attempt < 3200 && pineSpots.length < targetTrees; attempt++) {
+    const tx = (rand() - 0.5) * scatterSpanX;
+    const tz = (rand() - 0.5) * scatterSpanZ;
     if (!isClear(tx, tz)) continue;
-    // Slightly denser around natural perimeter ridges
-    const nearEdge = Math.abs(tx) > 96 || Math.abs(tz) > 62;
-    const minDistSq = nearEdge ? 18 : 34;
-    if (treeSpots.some((s) => (s.x - tx) ** 2 + (s.z - tz) ** 2 < minDistSq)) continue;
-    const ty = sampleVolgaTerrainY(tx, tz);
-    const scale = 0.88 + rand() * 0.65;
-    const tint = new THREE.Color().setHSL(0.29 + (rand() - 0.5) * 0.05, 0.3 + rand() * 0.14, 0.19 + rand() * 0.09);
-    treeSpots.push({ x: tx, y: ty, z: tz, scale, yaw: rand() * Math.PI * 2, tint });
+    const nearEdge = Math.abs(tx) > boundX - 12 || Math.abs(tz) > boundZ - 12;
+    const minDistSq = nearEdge ? 20 : 38;
+    if (pineSpots.some((s) => (s.x - tx) ** 2 + (s.z - tz) ** 2 < minDistSq)) continue;
+    const ty = sampleY(tx, tz);
+    const scale = 0.86 + rand() * 0.62;
+    // Neutral-bright alpine spruce tints (multiplied onto needle texture & vertex AO)
+    const tint = new THREE.Color().setHSL(0.28 + (rand() - 0.5) * 0.05, 0.24 + rand() * 0.14, 0.62 + rand() * 0.2);
+    pineSpots.push({ x: tx, y: ty, z: tz, scale, yaw: rand() * Math.PI * 2, tint });
   }
 
-  const trunkGeo = trackGeo(new THREE.CylinderGeometry(0.18, 0.34, 3.6, 7, 2));
-  trunkGeo.translate(0, 1.8, 0);
-  assignHeightSwayAttribute(trunkGeo, 0, 3.6, 1.8);
-  const t1Geo = trackGeo(new THREE.ConeGeometry(2.45, 4.5, 8, 2));
-  t1Geo.translate(0, 4.4, 0);
-  assignHeightSwayAttribute(t1Geo, 0.8, 10.4, 1.4);
-  const t2Geo = trackGeo(new THREE.ConeGeometry(1.75, 3.7, 8, 2));
-  t2Geo.translate(0, 7.1, 0);
-  assignHeightSwayAttribute(t2Geo, 0.8, 10.4, 1.4);
+  // Scattered white-bark birch trees near clearings and roadside meadows (2 draw calls total!)
+  const targetBirches = Math.max(24, Math.round((isConquest ? 68 : 40) * qProfile.foliageDensity));
+  for (let attempt = 0; attempt < 900 && birchSpots.length < targetBirches; attempt++) {
+    const tx = (rand() - 0.5) * (boundX * 1.9);
+    const tz = (rand() - 0.5) * (boundZ * 1.85);
+    if (!isClear(tx, tz)) continue;
+    if (pineSpots.some((s) => (s.x - tx) ** 2 + (s.z - tz) ** 2 < 18)) continue;
+    if (birchSpots.some((s) => (s.x - tx) ** 2 + (s.z - tz) ** 2 < 24)) continue;
+    birchSpots.push({
+      x: tx,
+      y: sampleY(tx, tz),
+      z: tz,
+      scale: 0.9 + rand() * 0.48,
+      yaw: rand() * Math.PI * 2,
+      tint: new THREE.Color().setHSL(0.22 + (rand() - 0.5) * 0.06, 0.28 + rand() * 0.14, 0.68 + rand() * 0.18),
+    });
+  }
 
-  const trunkInst = new THREE.InstancedMesh(trunkGeo, matBark, treeSpots.length);
-  const tier1Inst = new THREE.InstancedMesh(t1Geo, matPine, treeSpots.length);
-  const tier2Inst = new THREE.InstancedMesh(t2Geo, matPine, treeSpots.length);
-  trunkInst.castShadow = !isSoftwareGl && qProfile.castShadows;
-  tier1Inst.castShadow = !isSoftwareGl && qProfile.castShadows;
-
-  treeSpots.forEach((t, i) => {
-    dummy.position.set(t.x, t.y - 0.15, t.z);
-    dummy.rotation.set(0, t.yaw, 0);
-    dummy.scale.setScalar(t.scale);
-    dummy.updateMatrix();
-    trunkInst.setMatrixAt(i, dummy.matrix);
-    tier1Inst.setMatrixAt(i, dummy.matrix);
-    tier2Inst.setMatrixAt(i, dummy.matrix);
-    tier1Inst.setColorAt(i, t.tint);
-    tier2Inst.setColorAt(i, t.tint.clone().offsetHSL(0, 0, 0.03));
-
-    if (Math.abs(t.x) <= 106 && Math.abs(t.z) <= 72) {
-      const r = 0.34 * t.scale;
-      physics.addBox({
-        minX: t.x - r,
-        maxX: t.x + r,
-        minY: t.y,
-        maxY: t.y + 4.0,
-        minZ: t.z - r,
-        maxZ: t.z + r,
-        surface: 'wood',
-        blocksMovement: true,
-        blocksRaycast: true,
-        meshRef: trunkInst,
-      });
-    }
+  buildInstancedPineTrees(propCtx, pineSpots, {
+    castShadow: qProfile.castShadows,
+    receiveShadow: qProfile.castShadows,
+    addTrunkColliders: true,
+    colliderBounds: { minX: -boundX + 2, maxX: boundX - 2, minZ: -boundZ + 2, maxZ: boundZ - 2 },
+    seed: 5511,
   });
-  for (const inst of [trunkInst, tier1Inst, tier2Inst]) {
-    inst.instanceMatrix.needsUpdate = true;
-    if (inst.instanceColor) inst.instanceColor.needsUpdate = true;
-    inst.computeBoundingSphere();
-    inst.userData.surfaceMaterial = 'wood';
-    sceneGroup.add(inst);
-  }
-  trunkInst.userData.analyticalRaycastCovered = true;
-  raycastMeshes.push(trunkInst);
+  buildInstancedBirchTrees(propCtx, birchSpots, true);
 
-  // Instanced Boulders (tactical hillside cover + natural perimeter rock shelves)
-  const rockGeo = trackGeo(new THREE.DodecahedronGeometry(1.15, 1));
-  const rockSpots: Array<{ x: number; y: number; z: number; sx: number; sy: number; sz: number; yaw: number }> = [];
-  for (let i = 0; i < 68; i++) {
-    const rx = (rand() - 0.5) * 236;
-    const rz = (rand() - 0.5) * 164;
+  // High-detail sculpted fractured boulders & layered multi-stone outcrops (2 draw calls total!)
+  const rockTarget = isConquest ? 104 : 68;
+  const rockSpots: BoulderSpot[] = [];
+  for (let i = 0; i < rockTarget * 2 && rockSpots.length < rockTarget; i++) {
+    const rx = (rand() - 0.5) * (boundX * 2.15);
+    const rz = (rand() - 0.5) * (boundZ * 2.15);
     if (!isClear(rx, rz)) continue;
-    const ry = sampleVolgaTerrainY(rx, rz);
-    const s = 0.9 + rand() * 1.45;
-    rockSpots.push({ x: rx, y: ry + s * 0.35, z: rz, sx: s * 1.2, sy: s * 0.85, sz: s, yaw: rand() * Math.PI * 2 });
+    const ry = sampleY(rx, rz);
+    const s = 0.95 + rand() * 1.55;
+    rockSpots.push({
+      x: rx,
+      y: ry,
+      z: rz,
+      sx: s * (1.05 + rand() * 0.35),
+      sy: s * (0.72 + rand() * 0.3),
+      sz: s * (0.9 + rand() * 0.3),
+      yaw: rand() * Math.PI * 2,
+      variant: (i % 2) as 0 | 1,
+    });
   }
-  const rockInst = new THREE.InstancedMesh(rockGeo, matRock, rockSpots.length);
-  rockInst.castShadow = !isSoftwareGl && qProfile.castShadows;
-  rockInst.receiveShadow = !isSoftwareGl && qProfile.castShadows;
-  rockSpots.forEach((r, i) => {
-    dummy.position.set(r.x, r.y, r.z);
-    dummy.rotation.set(rand() * 0.3, r.yaw, rand() * 0.3);
-    dummy.scale.set(r.sx, r.sy, r.sz);
-    dummy.updateMatrix();
-    rockInst.setMatrixAt(i, dummy.matrix);
-    if (Math.abs(r.x) <= 106 && Math.abs(r.z) <= 72) {
-      physics.addBox({
-        minX: r.x - r.sx * 0.85,
-        maxX: r.x + r.sx * 0.85,
-        minY: r.y - r.sy,
-        maxY: r.y + r.sy * 0.78,
-        minZ: r.z - r.sz * 0.85,
-        maxZ: r.z + r.sz * 0.85,
-        surface: 'concrete',
-        blocksMovement: true,
-        blocksRaycast: true,
-        meshRef: rockInst,
-      });
-    }
+  buildInstancedSculptedBoulders(propCtx, rockSpots, {
+    castShadow: qProfile.castShadows,
+    receiveShadow: qProfile.castShadows,
+    addColliders: true,
+    colliderBounds: { minX: -boundX + 2, maxX: boundX - 2, minZ: -boundZ + 2, maxZ: boundZ - 2 },
+    seed: 5412,
   });
-  rockInst.instanceMatrix.needsUpdate = true;
-  rockInst.computeBoundingSphere();
-  rockInst.userData.surfaceMaterial = 'concrete';
-  rockInst.userData.analyticalRaycastCovered = true;
-  sceneGroup.add(rockInst);
-  raycastMeshes.push(rockInst);
 
   // Wind-swayed grass tufts
-  const grassCount = Math.max(140, Math.round(420 * qProfile.foliageDensity));
+  const grassCount = Math.max(150, Math.round((isConquest ? 520 : 420) * qProfile.foliageDensity));
   const grassSpots: Array<{ x: number; y: number; z: number; scale: number; yaw: number; tint: THREE.Color }> = [];
   for (let i = 0; i < grassCount * 2 && grassSpots.length < grassCount; i++) {
-    const gx = (rand() - 0.5) * 210;
-    const gz = (rand() - 0.5) * 140;
+    const gx = (rand() - 0.5) * (boundX * 1.9);
+    const gz = (rand() - 0.5) * (boundZ * 1.85);
     if (!isClear(gx, gz)) continue;
     grassSpots.push({
       x: gx,
-      y: sampleVolgaTerrainY(gx, gz),
+      y: sampleY(gx, gz),
       z: gz,
       scale: 0.75 + rand() * 0.7,
       yaw: rand() * Math.PI * 2,
@@ -863,198 +948,303 @@ function buildVolgaCorridor(
     isCover = false,
   ): NavNode => ({
     id,
-    position: [x, sampleVolgaTerrainY(x, z) + 0.08, z],
+    position: [x, sampleY(x, z) + 0.08, z],
     zoneId: 'default',
     neighbors,
     isCover,
   });
 
-  const rawNodes: NavNode[] = [
-    // West HQ & Approaches
-    nodeAt('hqa_c', -90, 0, ['hqa_n', 'hqa_s', 'hwy_w1']),
-    nodeAt('hqa_n', -82, -14, ['hqa_c', 'flank_nw']),
-    nodeAt('hqa_s', -82, 14, ['hqa_c', 'flank_sw']),
-    nodeAt('hwy_w1', -70, 0, ['hqa_c', 'cp1_c', 'flank_nw', 'flank_sw']),
+  const rawNodes: NavNode[] = isConquest
+    ? [
+        // West Alpha HQ (-148, 0) & Western Approaches
+        nodeAt('hqa_c', -144, 0, ['hqa_n', 'hqa_s', 'hwy_w1']),
+        nodeAt('hqa_n', -132, -16, ['hqa_c', 'spur_nw']),
+        nodeAt('hqa_s', -132, 16, ['hqa_c', 'spur_sw']),
+        nodeAt('hwy_w1', -118, 0, ['hqa_c', 'cp1_c', 'spur_nw', 'spur_sw']),
+        nodeAt('spur_nw', -118, -56, ['hqa_n', 'hwy_w1', 'fobc_c']),
+        nodeAt('spur_sw', -118, 56, ['hqa_s', 'hwy_w1', 'south_rd_w']),
 
-    // CP-1 West Highway Checkpoint
-    nodeAt('cp1_c', -48, 0, ['hwy_w1', 'hwy_mid_w', 'flank_nw', 'flank_sw'], true),
-    nodeAt('flank_nw', -54, -26, ['hqa_n', 'hwy_w1', 'cp1_c', 'mid_nw', 'out_w']),
-    nodeAt('flank_sw', -54, 26, ['hqa_s', 'hwy_w1', 'cp1_c', 'foba_w']),
+        // NW Logging FOB-C (-84, -56) & West Highway CP-1 (-78, 0)
+        nodeAt('fobc_c', -84, -56, ['spur_nw', 'north_rd_w', 'cp1_c'], true),
+        nodeAt('cp1_c', -78, 0, ['hwy_w1', 'hwy_mid_w', 'fobc_c', 'south_rd_w'], true),
+        nodeAt('south_rd_w', -78, 56, ['spur_sw', 'cp1_c', 'foba_c', 'south_rd_c']),
 
-    // Central Highway & Outpost
-    nodeAt('hwy_mid_w', -24, 0, ['cp1_c', 'hwy_c', 'out_s', 'foba_n'], true),
-    nodeAt('hwy_c', 0, 0, ['hwy_mid_w', 'hwy_mid_e', 'out_s', 'mid_s'], true),
-    nodeAt('hwy_mid_e', 24, 0, ['hwy_c', 'cp2_c', 'out_s', 'fobb_s'], true),
+        // North Service Road & CP-3 (0, -56)
+        nodeAt('north_rd_w', -48, -56, ['fobc_c', 'cp3_c', 'hwy_mid_w', 'out_w']),
+        nodeAt('cp3_c', 0, -56, ['north_rd_w', 'north_rd_e', 'out_c'], true),
+        nodeAt('north_rd_e', 48, -56, ['cp3_c', 'fobb_c', 'spur_ne', 'hwy_mid_e']),
 
-    // Outpost Relay Hill (0, -18)
-    nodeAt('out_c', 0, -16, ['out_s', 'out_w', 'out_e', 'mid_nw', 'fobb_w'], true),
-    nodeAt('out_s', 0, -8, ['out_c', 'hwy_c', 'hwy_mid_w', 'hwy_mid_e']),
-    nodeAt('out_w', -18, -18, ['out_c', 'flank_nw', 'mid_nw']),
-    nodeAt('out_e', 18, -18, ['out_c', 'fobb_s', 'fobb_w']),
-    nodeAt('mid_nw', -26, -34, ['flank_nw', 'out_w', 'out_c', 'fobb_w']),
+        // Central Highway & Outpost Relay Hill
+        nodeAt('hwy_mid_w', -48, 0, ['cp1_c', 'hwy_c', 'north_rd_w', 'foba_c'], true),
+        nodeAt('hwy_c', 0, 0, ['hwy_mid_w', 'hwy_mid_e', 'out_s', 'south_rd_c'], true),
+        nodeAt('hwy_mid_e', 48, 0, ['hwy_c', 'cp2_c', 'north_rd_e', 'fobb_c', 'south_rd_e'], true),
+        nodeAt('out_c', 0, -16, ['out_s', 'out_w', 'out_e', 'cp3_c'], true),
+        nodeAt('out_s', 0, -8, ['out_c', 'hwy_c', 'hwy_mid_w', 'hwy_mid_e']),
+        nodeAt('out_w', -24, -22, ['out_c', 'north_rd_w', 'hwy_mid_w']),
+        nodeAt('out_e', 24, -22, ['out_c', 'fobb_c', 'hwy_mid_e']),
 
-    // South Ridge FOB-A (-20, 38)
-    nodeAt('foba_c', -20, 38, ['foba_w', 'foba_n', 'foba_e'], true),
-    nodeAt('foba_w', -34, 34, ['foba_c', 'flank_sw']),
-    nodeAt('foba_n', -20, 22, ['foba_c', 'hwy_mid_w', 'mid_s']),
-    nodeAt('foba_e', -2, 34, ['foba_c', 'mid_s', 'flank_se']),
-    nodeAt('mid_s', 6, 22, ['hwy_c', 'foba_n', 'foba_e', 'flank_se']),
+        // Inner FOBs (FOB-A South-West Ridge, FOB-B North-East Timber) & South Road
+        nodeAt('foba_c', -38, 38, ['hwy_mid_w', 'south_rd_w', 'south_rd_c'], true),
+        nodeAt('fobb_c', 38, -38, ['hwy_mid_e', 'north_rd_e', 'out_e', 'cp2_c'], true),
+        nodeAt('south_rd_c', 0, 56, ['south_rd_w', 'south_rd_e', 'foba_c', 'hwy_c']),
+        nodeAt('south_rd_e', 48, 56, ['south_rd_c', 'fobd_c', 'hwy_mid_e']),
 
-    // North Timber FOB-B (20, -38)
-    nodeAt('fobb_c', 20, -38, ['fobb_w', 'fobb_s', 'fobb_e'], true),
-    nodeAt('fobb_w', 2, -34, ['fobb_c', 'mid_nw', 'out_c', 'out_e']),
-    nodeAt('fobb_s', 20, -22, ['fobb_c', 'hwy_mid_e', 'out_e']),
-    nodeAt('fobb_e', 36, -32, ['fobb_c', 'flank_ne']),
+        // SE Supply FOB-D (+84, 56), East Highway CP-2 (+78, 0) & Bravo HQ (+148, 0)
+        nodeAt('fobd_c', 84, 56, ['south_rd_e', 'spur_se', 'cp2_c'], true),
+        nodeAt('cp2_c', 78, 0, ['hwy_mid_e', 'hwy_e1', 'fobb_c', 'fobd_c'], true),
+        nodeAt('spur_ne', 118, -56, ['north_rd_e', 'hwy_e1', 'hqb_n']),
+        nodeAt('spur_se', 118, 56, ['fobd_c', 'hwy_e1', 'hqb_s']),
+        nodeAt('hwy_e1', 118, 0, ['cp2_c', 'spur_ne', 'spur_se', 'hqb_c']),
+        nodeAt('hqb_c', 144, 0, ['hwy_e1', 'hqb_n', 'hqb_s']),
+        nodeAt('hqb_n', 132, -16, ['hqb_c', 'spur_ne']),
+        nodeAt('hqb_s', 132, 16, ['hqb_c', 'spur_se']),
+      ]
+    : [
+        // Classic compact Volga NavGraph
+        nodeAt('hqa_c', -90, 0, ['hqa_n', 'hqa_s', 'hwy_w1']),
+        nodeAt('hqa_n', -82, -14, ['hqa_c', 'flank_nw']),
+        nodeAt('hqa_s', -82, 14, ['hqa_c', 'flank_sw']),
+        nodeAt('hwy_w1', -70, 0, ['hqa_c', 'cp1_c', 'flank_nw', 'flank_sw']),
+        nodeAt('cp1_c', -48, 0, ['hwy_w1', 'hwy_mid_w', 'flank_nw', 'flank_sw'], true),
+        nodeAt('flank_nw', -54, -26, ['hqa_n', 'hwy_w1', 'cp1_c', 'mid_nw', 'out_w']),
+        nodeAt('flank_sw', -54, 26, ['hqa_s', 'hwy_w1', 'cp1_c', 'foba_w']),
+        nodeAt('hwy_mid_w', -24, 0, ['cp1_c', 'hwy_c', 'out_s', 'foba_n'], true),
+        nodeAt('hwy_c', 0, 0, ['hwy_mid_w', 'hwy_mid_e', 'out_s', 'mid_s'], true),
+        nodeAt('hwy_mid_e', 24, 0, ['hwy_c', 'cp2_c', 'out_s', 'fobb_s'], true),
+        nodeAt('out_c', 0, -16, ['out_s', 'out_w', 'out_e', 'mid_nw', 'fobb_w'], true),
+        nodeAt('out_s', 0, -8, ['out_c', 'hwy_c', 'hwy_mid_w', 'hwy_mid_e']),
+        nodeAt('out_w', -18, -18, ['out_c', 'flank_nw', 'mid_nw']),
+        nodeAt('out_e', 18, -18, ['out_c', 'fobb_s', 'fobb_w']),
+        nodeAt('mid_nw', -26, -34, ['flank_nw', 'out_w', 'out_c', 'fobb_w']),
+        nodeAt('foba_c', -20, 38, ['foba_w', 'foba_n', 'foba_e'], true),
+        nodeAt('foba_w', -34, 34, ['foba_c', 'flank_sw']),
+        nodeAt('foba_n', -20, 22, ['foba_c', 'hwy_mid_w', 'mid_s']),
+        nodeAt('foba_e', -2, 34, ['foba_c', 'mid_s', 'flank_se']),
+        nodeAt('mid_s', 6, 22, ['hwy_c', 'foba_n', 'foba_e', 'flank_se']),
+        nodeAt('fobb_c', 20, -38, ['fobb_w', 'fobb_s', 'fobb_e'], true),
+        nodeAt('fobb_w', 2, -34, ['fobb_c', 'mid_nw', 'out_c', 'out_e']),
+        nodeAt('fobb_s', 20, -22, ['fobb_c', 'hwy_mid_e', 'out_e']),
+        nodeAt('fobb_e', 36, -32, ['fobb_c', 'flank_ne']),
+        nodeAt('cp2_c', 48, 0, ['hwy_mid_e', 'hwy_e1', 'flank_ne', 'flank_se'], true),
+        nodeAt('flank_ne', 54, -26, ['fobb_e', 'cp2_c', 'hwy_e1', 'hqb_n']),
+        nodeAt('flank_se', 54, 26, ['foba_e', 'mid_s', 'cp2_c', 'hwy_e1', 'hqb_s']),
+        nodeAt('hwy_e1', 70, 0, ['cp2_c', 'flank_ne', 'flank_se', 'hqb_c']),
+        nodeAt('hqb_c', 90, 0, ['hwy_e1', 'hqb_n', 'hqb_s']),
+        nodeAt('hqb_n', 82, -14, ['hqb_c', 'flank_ne']),
+        nodeAt('hqb_s', 82, 14, ['hqb_c', 'flank_se']),
+      ];
 
-    // CP-2 East Highway Checkpoint & East HQ
-    nodeAt('cp2_c', 48, 0, ['hwy_mid_e', 'hwy_e1', 'flank_ne', 'flank_se'], true),
-    nodeAt('flank_ne', 54, -26, ['fobb_e', 'cp2_c', 'hwy_e1', 'hqb_n']),
-    nodeAt('flank_se', 54, 26, ['foba_e', 'mid_s', 'cp2_c', 'hwy_e1', 'hqb_s']),
-    nodeAt('hwy_e1', 70, 0, ['cp2_c', 'flank_ne', 'flank_se', 'hqb_c']),
-    nodeAt('hqb_c', 90, 0, ['hwy_e1', 'hqb_n', 'hqb_s']),
-    nodeAt('hqb_n', 82, -14, ['hqb_c', 'flank_ne']),
-    nodeAt('hqb_s', 82, 14, ['hqb_c', 'flank_se']),
-  ];
+  // Wire every neutral enterable cover building's interior + doorway entry nodes into NavGraph
+  for (const { spec, built } of builtCoverBuildings) {
+    const inId = `cb_${spec.id}_in`;
+    const entryIds = built.entryPoints.map((_, idx) => `cb_${spec.id}_door_${idx}`);
+    rawNodes.push({
+      id: inId,
+      position: built.interiorPos,
+      zoneId: 'default',
+      neighbors: entryIds,
+      isCover: true,
+    });
+    built.entryPoints.forEach((ep, idx) => {
+      rawNodes.push({
+        id: entryIds[idx],
+        position: [ep[0], sampleY(ep[0], ep[2]) + 0.08, ep[2]],
+        zoneId: 'default',
+        neighbors: [inId, spec.linkNode],
+      });
+    });
+  }
 
   // === 9. SPAWNS & BATTLE OBJECTIVE LAYOUT ===
   const sp = (x: number, z: number, yaw: number): SpawnPoint => ({
-    position: [x, sampleVolgaTerrainY(x, z) + 0.1, z],
+    position: [x, sampleY(x, z) + 0.1, z],
     yaw,
   });
 
   const hqASpawns: SpawnPoint[] = [
-    sp(-90, 0, -Math.PI * 0.5),
-    sp(-94, -5.5, -Math.PI * 0.5),
-    sp(-94, 5.5, -Math.PI * 0.5),
-    sp(-86, -10.5, -Math.PI * 0.45),
-    sp(-86, 10.5, -Math.PI * 0.55),
-    sp(-98, 0, -Math.PI * 0.5),
+    sp(-hqX + 2, 0, -Math.PI * 0.5),
+    sp(-hqX - 2, -5.5, -Math.PI * 0.5),
+    sp(-hqX - 2, 5.5, -Math.PI * 0.5),
+    sp(-hqX + 6, -10.5, -Math.PI * 0.45),
+    sp(-hqX + 6, 10.5, -Math.PI * 0.55),
+    sp(-hqX - 6, 0, -Math.PI * 0.5),
   ];
   const hqBSpawns: SpawnPoint[] = [
-    sp(90, 0, Math.PI * 0.5),
-    sp(94, -5.5, Math.PI * 0.5),
-    sp(94, 5.5, Math.PI * 0.5),
-    sp(86, -10.5, Math.PI * 0.55),
-    sp(86, 10.5, Math.PI * 0.45),
-    sp(98, 0, Math.PI * 0.5),
+    sp(hqX - 2, 0, Math.PI * 0.5),
+    sp(hqX + 2, -5.5, Math.PI * 0.5),
+    sp(hqX + 2, 5.5, Math.PI * 0.5),
+    sp(hqX - 6, -10.5, Math.PI * 0.55),
+    sp(hqX - 6, 10.5, Math.PI * 0.45),
+    sp(hqX + 6, 0, Math.PI * 0.5),
   ];
+
+  const conquestPois: MapBattleObjectives['conquestPois'] = [
+    {
+      id: 'poi_cp1',
+      code: 'CP-1',
+      label: 'West Highway Checkpoint',
+      kind: 'checkpoint',
+      position: [cp1X, sampleY(cp1X, 0), 0],
+      captureRadiusM: 9.5,
+      territoryWeight: 1.0,
+      initialOwner: null,
+      hasBuiltInProps: true,
+      roadYaw: 0,
+    },
+    {
+      id: 'poi_fob_a',
+      code: 'FOB-A',
+      label: 'South Ridge FOB',
+      kind: 'fob',
+      position: [fobAX, sampleY(fobAX, 38), 38],
+      captureRadiusM: 10.0,
+      territoryWeight: 1.35,
+      initialOwner: null,
+      hasBuiltInProps: true,
+      spawnPoints: [
+        sp(fobAX, 34, Math.PI),
+        sp(fobAX + 4.5, 38, -Math.PI * 0.5),
+        sp(fobAX - 4.5, 41, Math.PI * 0.5),
+        sp(fobAX + 3, 43, Math.PI),
+      ],
+    },
+    {
+      id: 'poi_outpost',
+      code: 'OUTPOST',
+      label: 'Relay Hill Outpost',
+      kind: 'outpost',
+      position: [0, sampleY(0, -18), -18],
+      captureRadiusM: 10.5,
+      territoryWeight: 1.75,
+      initialOwner: null,
+      hasBuiltInProps: true,
+    },
+    {
+      id: 'poi_fob_b',
+      code: 'FOB-B',
+      label: 'North Timber FOB',
+      kind: 'fob',
+      position: [fobBX, sampleY(fobBX, -38), -38],
+      captureRadiusM: 10.0,
+      territoryWeight: 1.35,
+      initialOwner: null,
+      hasBuiltInProps: true,
+      spawnPoints: [
+        sp(fobBX, -34, 0),
+        sp(fobBX - 4.5, -38, Math.PI * 0.5),
+        sp(fobBX + 4.5, -41, -Math.PI * 0.5),
+        sp(fobBX - 3, -43, 0),
+      ],
+    },
+    {
+      id: 'poi_cp2',
+      code: 'CP-2',
+      label: 'East Highway Checkpoint',
+      kind: 'checkpoint',
+      position: [cp2X, sampleY(cp2X, 0), 0],
+      captureRadiusM: 9.5,
+      territoryWeight: 1.0,
+      initialOwner: null,
+      hasBuiltInProps: true,
+      roadYaw: 0,
+    },
+  ];
+
+  if (isConquest) {
+    conquestPois.push(
+      {
+        id: 'poi_cp3_north',
+        code: 'CP-3',
+        label: 'North Service Checkpoint',
+        kind: 'checkpoint',
+        position: [0, sampleY(0, -56), -56],
+        captureRadiusM: 9.5,
+        territoryWeight: 1.05,
+        initialOwner: null,
+        hasBuiltInProps: true,
+        roadYaw: 0,
+      },
+      {
+        id: 'poi_fob_c',
+        code: 'FOB-C',
+        label: 'NW Logging Yard FOB',
+        kind: 'fob',
+        position: [-84, sampleY(-84, -56), -56],
+        captureRadiusM: 10.0,
+        territoryWeight: 1.35,
+        initialOwner: null,
+        hasBuiltInProps: true,
+        spawnPoints: [
+          sp(-84, -52, 0),
+          sp(-80, -56, -Math.PI * 0.5),
+          sp(-88, -60, -Math.PI * 0.4),
+        ],
+      },
+      {
+        id: 'poi_fob_d',
+        code: 'FOB-D',
+        label: 'SE Supply Depot FOB',
+        kind: 'fob',
+        position: [84, sampleY(84, 56), 56],
+        captureRadiusM: 10.0,
+        territoryWeight: 1.35,
+        initialOwner: null,
+        hasBuiltInProps: true,
+        spawnPoints: [
+          sp(84, 52, Math.PI),
+          sp(80, 56, Math.PI * 0.5),
+          sp(88, 60, Math.PI * 0.6),
+        ],
+      },
+    );
+  }
 
   const battleObjectives: MapBattleObjectives = {
     hqA: {
       id: 'hq_a',
       team: 'A',
       label: 'Alpha HQ (West)',
-      position: [-92, sampleVolgaTerrainY(-92, 0), 0],
-      safeRadiusM: 18,
+      position: [-hqX, sampleY(-hqX, 0), 0],
+      safeRadiusM: isConquest ? 22 : 18,
       spawnPoints: hqASpawns,
     },
     hqB: {
       id: 'hq_b',
       team: 'B',
       label: 'Bravo HQ (East)',
-      position: [92, sampleVolgaTerrainY(92, 0), 0],
-      safeRadiusM: 18,
+      position: [hqX, sampleY(hqX, 0), 0],
+      safeRadiusM: isConquest ? 22 : 18,
       spawnPoints: hqBSpawns,
     },
-    conquestPois: [
-      {
-        id: 'poi_cp1',
-        code: 'CP-1',
-        label: 'West Highway Checkpoint',
-        kind: 'checkpoint',
-        position: [-48, sampleVolgaTerrainY(-48, 0), 0],
-        captureRadiusM: 9.5,
-        territoryWeight: 1.0,
-        initialOwner: null,
-        hasBuiltInProps: true,
-        roadYaw: 0,
-      },
-      {
-        id: 'poi_fob_a',
-        code: 'FOB-A',
-        label: 'South Ridge FOB',
-        kind: 'fob',
-        position: [-20, sampleVolgaTerrainY(-20, 38), 38],
-        captureRadiusM: 10.0,
-        territoryWeight: 1.35,
-        initialOwner: null,
-        hasBuiltInProps: true,
-        spawnPoints: [
-          sp(-20, 34, Math.PI),
-          sp(-15.5, 38, -Math.PI * 0.5),
-          sp(-24.5, 41, Math.PI * 0.5),
-          sp(-17, 43, Math.PI),
-        ],
-      },
-      {
-        id: 'poi_outpost',
-        code: 'OUTPOST',
-        label: 'Relay Hill Outpost',
-        kind: 'outpost',
-        position: [0, sampleVolgaTerrainY(0, -18), -18],
-        captureRadiusM: 10.5,
-        territoryWeight: 1.75,
-        initialOwner: null,
-        hasBuiltInProps: true,
-      },
-      {
-        id: 'poi_fob_b',
-        code: 'FOB-B',
-        label: 'North Timber FOB',
-        kind: 'fob',
-        position: [20, sampleVolgaTerrainY(20, -38), -38],
-        captureRadiusM: 10.0,
-        territoryWeight: 1.35,
-        initialOwner: null,
-        hasBuiltInProps: true,
-        spawnPoints: [
-          sp(20, -34, 0),
-          sp(15.5, -38, Math.PI * 0.5),
-          sp(24.5, -41, -Math.PI * 0.5),
-          sp(17, -43, 0),
-        ],
-      },
-      {
-        id: 'poi_cp2',
-        code: 'CP-2',
-        label: 'East Highway Checkpoint',
-        kind: 'checkpoint',
-        position: [48, sampleVolgaTerrainY(48, 0), 0],
-        captureRadiusM: 9.5,
-        territoryWeight: 1.0,
-        initialOwner: null,
-        hasBuiltInProps: true,
-        roadYaw: 0,
-      },
-    ],
+    conquestPois,
     ctfFlags: [
       {
         team: 'A',
         label: 'Alpha Base Flag',
-        position: [-78, sampleVolgaTerrainY(-78, 0), 0],
+        position: [-78, sampleY(-78, 0), 0],
       },
       {
         team: 'B',
         label: 'Bravo Base Flag',
-        position: [78, sampleVolgaTerrainY(78, 0), 0],
+        position: [78, sampleY(78, 0), 0],
       },
     ],
     kothHills: [
-      { id: 'hill_outpost', label: 'Relay Hill Outpost', position: [0, sampleVolgaTerrainY(0, -18), -18], radiusM: 9.5 },
-      { id: 'hill_cp1', label: 'West Highway Checkpoint', position: [-48, sampleVolgaTerrainY(-48, 0), 0], radiusM: 9.0 },
-      { id: 'hill_fob_a', label: 'South Ridge FOB', position: [-20, sampleVolgaTerrainY(-20, 38), 38], radiusM: 9.5 },
-      { id: 'hill_cp2', label: 'East Highway Checkpoint', position: [48, sampleVolgaTerrainY(48, 0), 0], radiusM: 9.0 },
-      { id: 'hill_fob_b', label: 'North Timber FOB', position: [20, sampleVolgaTerrainY(20, -38), -38], radiusM: 9.5 },
+      { id: 'hill_outpost', label: 'Relay Hill Outpost', position: [0, sampleY(0, -18), -18], radiusM: 9.5 },
+      { id: 'hill_cp1', label: 'West Highway Checkpoint', position: [cp1X, sampleY(cp1X, 0), 0], radiusM: 9.0 },
+      { id: 'hill_fob_a', label: 'South Ridge FOB', position: [fobAX, sampleY(fobAX, 38), 38], radiusM: 9.5 },
+      { id: 'hill_cp2', label: 'East Highway Checkpoint', position: [cp2X, sampleY(cp2X, 0), 0], radiusM: 9.0 },
+      { id: 'hill_fob_b', label: 'North Timber FOB', position: [fobBX, sampleY(fobBX, -38), -38], radiusM: 9.5 },
     ],
   };
 
   const ffaSpawns: SpawnPoint[] = [
     ...hqASpawns.slice(0, 3),
     ...hqBSpawns.slice(0, 3),
-    sp(-48, 8, Math.PI),
-    sp(48, -8, 0),
-    sp(-20, 38, Math.PI),
-    sp(20, -38, 0),
+    sp(cp1X, 8, Math.PI),
+    sp(cp2X, -8, 0),
+    sp(fobAX, 38, Math.PI),
+    sp(fobBX, -38, 0),
     sp(0, -10, 0),
     sp(0, 22, Math.PI),
   ];
@@ -1076,10 +1266,11 @@ function buildVolgaCorridor(
       zombieSpawners: [],
     },
     battleObjectives,
-    terrainHeightAt: sampleVolgaTerrainY,
+    terrainHeightAt: sampleY,
     interactables: [],
     lightingPreset: LIGHTING_PRESET,
     supportsDynamicWeatherTime: true,
+    isExpandedConquest: isConquest,
     envBindings: {
       windUniforms,
       wettableSurfaces,

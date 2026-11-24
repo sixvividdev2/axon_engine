@@ -365,9 +365,16 @@ export interface BuiltMapInstance {
     objOrId: THREE.Object3D | string,
     impactPoint?: Readonly<THREE.Vector3>,
   ) => { breakableId: string; impactPoint: THREE.Vector3 } | null;
+  /** True when built with the expanded Conquest layout (spread-out HQs, extra roads/POIs/cover buildings) */
+  isExpandedConquest?: boolean;
   setPowerState?: (powered: boolean) => void;
   update?: (dt: number, elapsedSec: number) => void;
   dispose: () => void;
+}
+
+export interface MapBuildOptions {
+  /** Active Battle ruleset; when 'conquest', Battle maps construct their expanded Conquest theater */
+  battleRule?: BattleRuleId;
 }
 
 export interface IMapDefinition {
@@ -394,6 +401,7 @@ export interface IMapDefinition {
     renderer: THREE.WebGLRenderer,
     isSoftwareGl: boolean,
     graphicsQuality?: GraphicsQualityId,
+    options?: MapBuildOptions,
   ) => BuiltMapInstance;
 }
 

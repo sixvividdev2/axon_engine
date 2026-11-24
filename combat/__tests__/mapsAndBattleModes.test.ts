@@ -79,7 +79,7 @@ beforeAll(() => {
   vi.spyOn(THREE.PMREMGenerator.prototype, 'dispose').mockImplementation(() => {});
 });
 
-function buildMapById(id: string) {
+function buildMapById(id: string, options?: { battleRule?: 'tdm' | 'ffa' | 'ctf' | 'koth' | 'conquest' | 'kc_tdm' | 'kc_ffa' }) {
   const def = getMapDefinitionById(id);
   if (!def) throw new Error(`Map not found: ${id}`);
   const scene = new THREE.Scene();
@@ -89,7 +89,7 @@ function buildMapById(id: string) {
     toneMapping: THREE.ACESFilmicToneMapping,
     toneMappingExposure: 1,
   } as unknown as THREE.WebGLRenderer;
-  return def.build(scene, mockRenderer, true, 'balanced');
+  return def.build(scene, mockRenderer, true, 'balanced', options);
 }
 
 function makeTestLoadouts() {
@@ -795,4 +795,133 @@ describe('Conquest performance and shooting spring stability', () => {
     map.dispose();
   });
 });
+
+describe('Expanded Conquest Maps, Spread HQs, Enterable Cover Buildings & High-Detail Foliage/Rocks', () => {
+  const mapExpectations: Array<{
+    id: string;
+    minHqDistanceM: number;
+    expectedPois: number;
+    minCoverBuildings: number;
+  }> = [
+    { id: 'volga_corridor', minHqDistanceM: 280, expectedPois: 8, minCoverBuildings: 6 },
+    { id: 'timberline_compound', minHqDistanceM: 250, expectedPois: 7, minCoverBuildings: 5 },
+    { id: 'pripyat_block', minHqDistanceM: 180, expectedPois: 7, minCoverBuildings: 5 },
+    { id: 'korsakov_substation', minHqDistanceM: 180, expectedPois: 7, minCoverBuildings: 5 },
+  ];
+
+  it('expands bounds, spreads HQs apart, adds extra POIs and neutral enterable cover buildings with connected NavGraph on all 4 Battle maps in Conquest', () => {
+    for (const spec of mapExpectations) {
+      const classic = buildMapById(spec.id, { battleRule: 'tdm' });
+      const conquest = buildMapById(spec.id, { battleRule: 'conquest' });
+
+      expect(classic.isExpandedConquest).toBe(false);
+      expect(conquest.isExpandedConquest).toBe(true);
+
+      // Playable footprint strictly larger in Conquest
+      const classicArea =
+        (classic.physics.boundsMaxX - classic.physics.boundsMinX) *
+        (classic.physics.boundsMaxZ - classic.physics.boundsMinZ);
+      const conquestArea =
+        (conquest.physics.boundsMaxX - conquest.physics.boundsMinX) *
+        (conquest.physics.boundsMaxZ - conquest.physics.boundsMinZ);
+      expect(conquestArea).toBeGreaterThan(classicArea * 1.4);
+
+      // Spread-out HQs
+      const classicObj = classic.battleObjectives!;
+      const cqObj = conquest.battleObjectives!;
+      const classicHqDist = Math.hypot(
+        classicObj.hqA.position[0] - classicObj.hqB.position[0],
+        classicObj.hqA.position[2] - classicObj.hqB.position[2],
+      );
+      const cqHqDist = Math.hypot(
+        cqObj.hqA.position[0] - cqObj.hqB.position[0],
+        cqObj.hqA.position[2] - cqObj.hqB.position[2],
+      );
+      expect(cqHqDist).toBeGreaterThanOrEqual(spec.minHqDistanceM);
+      expect(cqHqDist).toBeGreaterThan(classicHqDist * 1.35);
+
+      // Expanded POI roster (FOBs, Checkpoints, Outpost)
+      expect(cqObj.conquestPois.length).toBe(spec.expectedPois);
+      expect(cqObj.conquestPois.filter((p) => p.kind === 'fob').length).toBeGreaterThanOrEqual(3);
+      expect(cqObj.conquestPois.filter((p) => p.kind === 'checkpoint').length).toBeGreaterThanOrEqual(3);
+      expect(cqObj.conquestPois.filter((p) => p.kind === 'outpost').length).toBeGreaterThanOrEqual(1);
+
+      // Neutral enterable cover buildings present (strictly non-objective)
+      const coverGroups = conquest.sceneGroup.children.filter(
+        (child) => child.name && child.name.startsWith('cover_building_'),
+      );
+      expect(coverGroups.length).toBeGreaterThanOrEqual(spec.minCoverBuildings);
+      for (const cg of coverGroups) {
+        let wallCount = 0;
+        cg.traverse((obj) => {
+          if (obj instanceof THREE.Mesh && obj.userData?.analyticalRaycastCovered === true) {
+            wallCount++;
+          }
+        });
+        expect(wallCount).toBeGreaterThanOrEqual(10);
+      }
+
+      // NavGraph BFS reachability: Alpha HQ -> Bravo HQ and every cover building interior node
+      const nodes = conquest.navGraph.nodes;
+      const byId = new Map(nodes.map((n) => [n.id, n]));
+      const nearestNodeId = (pos: [number, number, number]) => {
+        let best = nodes[0];
+        let bestD = Infinity;
+        for (const n of nodes) {
+          const d = Math.hypot(n.position[0] - pos[0], n.position[2] - pos[2]);
+          if (d < bestD) {
+            bestD = d;
+            best = n;
+          }
+        }
+        return best.id;
+      };
+      const startId = nearestNodeId(cqObj.hqA.position);
+      const goalId = nearestNodeId(cqObj.hqB.position);
+      const visited = new Set<string>([startId]);
+      const queue = [startId];
+      while (queue.length > 0) {
+        const cur = queue.shift()!;
+        const node = byId.get(cur);
+        if (!node) continue;
+        for (const nxt of node.neighbors) {
+          if (!visited.has(nxt)) {
+            visited.add(nxt);
+            queue.push(nxt);
+          }
+        }
+      }
+      expect(visited.has(goalId)).toBe(true);
+      const coverInteriorNodes = nodes.filter((n) => n.id.startsWith('cb_') && n.id.endsWith('_in'));
+      expect(coverInteriorNodes.length).toBeGreaterThanOrEqual(spec.minCoverBuildings);
+      for (const cin of coverInteriorNodes) {
+        expect(visited.has(cin.id)).toBe(true);
+      }
+
+      // High-detail sculpted boulders & trees use InstancedMesh with analyticalRaycastCovered = true
+      const instancedMeshes: THREE.InstancedMesh[] = [];
+      conquest.sceneGroup.traverse((obj) => {
+        if (obj instanceof THREE.InstancedMesh) instancedMeshes.push(obj);
+      });
+      const analyticalInstanced = instancedMeshes.filter(
+        (m) => m.userData?.analyticalRaycastCovered === true,
+      );
+      expect(analyticalInstanced.length).toBeGreaterThanOrEqual(1);
+
+      classic.dispose();
+      conquest.dispose();
+    }
+  });
+
+  it('preserves Timberline underground bunker cutout in Conquest-expanded mode', () => {
+    const cqTimber = buildMapById('timberline_compound', { battleRule: 'conquest' });
+    const bunkerClear = cqTimber.physics.isSegmentOccluded(
+      new THREE.Vector3(53.5, -2.0, -8.0),
+      new THREE.Vector3(56.5, -2.0, -4.0),
+    );
+    expect(bunkerClear).toBe(false);
+    cqTimber.dispose();
+  });
+});
+
 
