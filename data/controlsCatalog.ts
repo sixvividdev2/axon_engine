@@ -73,8 +73,14 @@ export const CONTROL_BINDING_GROUPS: readonly ControlBindingGroup[] = [
       { id: 'interact_scroll', keys: ['Scroll'], action: 'Cycle Contextual Action Prompt' },
       {
         id: 'pda',
+        keys: ['P'],
+        action: 'Toggle 3D TAC-PDA',
+        detail: 'Draws / powers off PDA on last active tab · Tab Switch Mode',
+      },
+      {
+        id: 'tactical_map',
         keys: ['M'],
-        action: 'Open / Stow 3D TAC-PDA Map',
+        action: 'Open Tactical Map (TAC-PDA)',
         detail: 'LMB Drag Pan · Wheel Zoom · R / RMB Recenter',
       },
       { id: 'ping', keys: ['Z'], action: 'Contextual Tactical Ping' },

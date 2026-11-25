@@ -39,6 +39,7 @@ import {
   TacticalGrenadeSystem,
   tacticalEquipmentStore,
   TacticalPdaDevice,
+  type PdaTabMode,
   VIEWMODEL_LAYER,
   WeaponRig,
 } from '../bodycam-sdk';
@@ -1797,10 +1798,20 @@ export class GymEngine {
     this.emitSnapshot();
   };
 
-  private togglePda(): void {
+  private togglePda(targetTab?: PdaTabMode): void {
     if (this.world.gunsmithBench.isOpen() || this.tunerOpen) return;
-    const next = !this.pdaDevice.isOpen();
+    const wasOpen = this.pdaDevice.isOpen();
+    if (targetTab && wasOpen && this.pdaDevice.getActiveTab() !== targetTab) {
+      this.pdaDevice.setActiveTab(targetTab);
+      this.audio.playPdaButtonClick();
+      this.emitSnapshot();
+      return;
+    }
+    const next = !wasOpen;
     if (next) {
+      if (targetTab) {
+        this.pdaDevice.setActiveTab(targetTab);
+      }
       if (this.grenadeSystem.isDrawn() && !this.grenadeSystem.isPinPulled()) {
         this.handleGrenadeHolsterOrToss();
       }
@@ -2056,8 +2067,11 @@ export class GymEngine {
           }
         }
         break;
-      case 'KeyM':
+      case 'KeyP':
         if (!e.repeat) this.togglePda();
+        break;
+      case 'KeyM':
+        if (!e.repeat) this.togglePda('tac_map');
         break;
       case 'KeyB':
         if (!e.repeat && !this.pdaDevice.isBlockingWeaponActions()) {

@@ -231,7 +231,7 @@ const COMPASS_LABELS: ReadonlyArray<{ deg: number; label: string; major: boolean
 
 const DRAWING_DUR = 0.19;
 const POWER_PRESS_DUR = 0.27;
-const POWER_OFF_DUR = 0.14;
+const POWER_OFF_DUR = 0.27;
 const STOWING_DUR = 0.18;
 
 const SCREEN_W = 1024;
@@ -610,10 +610,20 @@ export class TacticalPdaDevice {
     return this.phase;
   }
 
+  public isScreenOn(): boolean {
+    return this.screenOn;
+  }
+
   public getPowerPressWeight(): number {
-    if (this.phase !== 'POWER_PRESS') return 0;
-    const p = THREE.MathUtils.clamp(this.phaseTimer / POWER_PRESS_DUR, 0, 1);
-    return Math.sin(p * Math.PI);
+    if (this.phase === 'POWER_PRESS') {
+      const p = THREE.MathUtils.clamp(this.phaseTimer / POWER_PRESS_DUR, 0, 1);
+      return Math.sin(p * Math.PI);
+    }
+    if (this.phase === 'POWER_OFF') {
+      const p = THREE.MathUtils.clamp(this.phaseTimer / POWER_OFF_DUR, 0, 1);
+      return Math.sin(p * Math.PI);
+    }
+    return 0;
   }
 
   public getJoystickTilt(): { x: number; y: number } {
@@ -908,7 +918,7 @@ export class TacticalPdaDevice {
       }
     } else {
       this.dragging = false;
-      if (this.phase === 'DRAWING') {
+      if (this.phase === 'DRAWING' || (this.phase === 'POWER_PRESS' && !this.screenOn)) {
         this.phase = 'STOWING';
         this.phaseTimer = (1 - THREE.MathUtils.clamp(this.raiseBlend, 0, 1)) * STOWING_DUR;
         this.thumbIntentX = 0;
@@ -916,11 +926,9 @@ export class TacticalPdaDevice {
       } else if (this.phase === 'POWER_PRESS' || this.phase === 'ACTIVE') {
         this.phase = 'POWER_OFF';
         this.phaseTimer = 0;
+        this.powerButtonAudioPlayed = false;
         this.thumbIntentX = 0;
         this.thumbIntentY = 0;
-        if (this.screenOn) {
-          this.audio?.playPdaPowerSound(false);
-        }
         this.screenDirty = true;
       }
     }
@@ -1228,8 +1236,16 @@ export class TacticalPdaDevice {
     } else if (this.phase === 'POWER_OFF') {
       this.weaponStowBlend = 1;
       const p = THREE.MathUtils.clamp(this.phaseTimer / POWER_OFF_DUR, 0, 1);
-      if (p >= 0.35 && this.screenOn) {
-        this.screenOn = false;
+      if (p >= 0.42 && !this.powerButtonAudioPlayed) {
+        this.powerButtonAudioPlayed = true;
+        this.tiltImpulseX = 0.095;
+        this.tiltImpulseZ = -0.075;
+        if (this.screenOn) {
+          this.screenOn = false;
+          this.audio?.playPdaPowerSound(false);
+        } else {
+          this.audio?.playPdaButtonClick();
+        }
         this.screenDirty = true;
       }
       if (this.phaseTimer >= POWER_OFF_DUR) {
@@ -1286,7 +1302,7 @@ export class TacticalPdaDevice {
       targetBringCloser = 1;
     } else if (this.phase === 'POWER_OFF') {
       targetRaise = 1;
-      targetBringCloser = 0.35;
+      targetBringCloser = 1 - smoothstep01(this.phaseTimer / 0.16) * 0.75;
     } else if (this.phase === 'STOWING') {
       targetRaise = 1 - smoothstep01(this.phaseTimer / STOWING_DUR);
       targetBringCloser = 0;

@@ -106,6 +106,7 @@ function installHeadlessCanvasStub(): void {
     translate: noop,
     rotate: noop,
     scale: noop,
+    drawImage: noop,
     setLineDash: noop,
     createLinearGradient: () => fakeGrad,
     createRadialGradient: () => fakeGrad,
@@ -1749,6 +1750,96 @@ describe('Phase 9 — Tactical PDA Click+Drag Grab-Sheet Pan, Zero-Snap GPS Unlo
       skel.dispose();
       pda.dispose();
     }
+  });
+
+  it('presses the physical power button with the right thumb to turn off the PDA before stowing', () => {
+    const powerEvents: boolean[] = [];
+    const audioMock = new Proxy(
+      {
+        playPdaPowerSound: (on: boolean) => {
+          powerEvents.push(on);
+        },
+        playPdaButtonClick: () => {},
+      },
+      {
+        get(target, prop: string) {
+          if (prop in target) return (target as Record<string, unknown>)[prop];
+          return () => {};
+        },
+      },
+    ) as unknown as ConstructorParameters<typeof TacticalPdaDevice>[0];
+
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(75, 16 / 9, 0.02, 100);
+    camera.position.set(0, 1.65, 0);
+    camera.updateMatrixWorld(true);
+
+    const pda = new TacticalPdaDevice(audioMock);
+    camera.add(pda.root);
+    scene.add(camera);
+
+    const tel = makeTelemetry(0, 0);
+    advanceToActive(pda, tel);
+    expect(pda.isScreenOn()).toBe(true);
+    expect(powerEvents).toEqual([true]);
+
+    const skel = new CharacterSkeleton(1, 'team_a', 'MALE');
+    scene.add(skel.root);
+
+    // Trigger stow: must enter POWER_OFF with screen still ON and audio NOT yet fired
+    pda.setOpen(false);
+    expect(pda.getPhase()).toBe('POWER_OFF');
+    expect(pda.isScreenOn()).toBe(true);
+    expect(powerEvents).toEqual([true]);
+
+    // Step just before click threshold (p < 0.42 -> ~0.083s = 5 frames): thumb rising toward power button, screen still on
+    let elapsed = 2.0;
+    for (let i = 0; i < 5; i++) {
+      elapsed += 1 / 60;
+      pda.update(1 / 60, elapsed, 0, false);
+    }
+    expect(pda.getPhase()).toBe('POWER_OFF');
+    expect(pda.getPowerPressWeight()).toBeGreaterThan(0.5);
+    expect(pda.isScreenOn()).toBe(true);
+    expect(powerEvents).toEqual([true]);
+
+    // Step through click peak (~0.133s = +3 frames -> p ~ 0.49): thumb touches power button, screen shuts off & audio fires
+    for (let i = 0; i < 3; i++) {
+      elapsed += 1 / 60;
+      pda.update(1 / 60, elapsed, 0, false);
+    }
+    scene.updateMatrixWorld(true);
+    expect(pda.getPhase()).toBe('POWER_OFF');
+    expect(pda.getPowerPressWeight()).toBeGreaterThan(0.95);
+    expect(pda.isScreenOn()).toBe(false);
+    expect(powerEvents).toEqual([true, false]);
+
+    const gripPos = new THREE.Vector3();
+    const gripQuat = new THREE.Quaternion();
+    const thumbTarget = new THREE.Vector3();
+    const thumbTip = new THREE.Vector3();
+    pda.getRightGripWorldTransform(gripPos, gripQuat);
+    placeObjectWorldTransform(skel.rightArm.hand.root, gripPos, gripQuat);
+    pda.getRightThumbWorldTarget(thumbTarget);
+    skel.applyPdaHandPose('right', pda.getPowerPressWeight(), 0, 0, thumbTarget);
+    skel.root.updateMatrixWorld(true);
+    skel.getRightThumbTipWorldPosition(thumbTip);
+    expect(thumbTip.distanceTo(thumbTarget)).toBeLessThan(0.005);
+
+    // Finish POWER_OFF -> transitions to STOWING -> STOWED cleanly
+    let sawStowing = false;
+    for (let i = 0; i < 30; i++) {
+      elapsed += 1 / 60;
+      pda.update(1 / 60, elapsed, 0, false);
+      if (pda.getPhase() === 'STOWING') sawStowing = true;
+    }
+    expect(sawStowing).toBe(true);
+    expect(pda.getPhase()).toBe('STOWED');
+    expect(pda.getPowerPressWeight()).toBe(0);
+    expect(powerEvents).toEqual([true, false]);
+
+    skel.dispose();
+    pda.dispose();
   });
 });
 

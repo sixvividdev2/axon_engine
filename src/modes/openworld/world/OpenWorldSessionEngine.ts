@@ -32,6 +32,7 @@ import {
   type PdaHudTelemetry,
   type PdaPingMarker,
   type PdaSectorOverlay,
+  type PdaTabMode,
   type PdaVehicleMarker,
   VIEWMODEL_LAYER,
   WeaponRig,
@@ -1461,8 +1462,11 @@ export class OpenWorldSessionEngine {
       case 'KeyR':
         if (!e.repeat) this.startReload();
         break;
-      case 'KeyM':
+      case 'KeyP':
         if (!e.repeat) this.togglePda();
+        break;
+      case 'KeyM':
+        if (!e.repeat) this.togglePda('tac_map');
         break;
       case 'KeyG':
       case 'Digit4':
@@ -1653,10 +1657,20 @@ export class OpenWorldSessionEngine {
     }
   }
 
-  public togglePda(): void {
+  public togglePda(targetTab?: PdaTabMode): void {
     if (this.navMode !== 'foot') return;
-    const next = !this.pdaDevice.isOpen();
+    const wasOpen = this.pdaDevice.isOpen();
+    if (targetTab && wasOpen && this.pdaDevice.getActiveTab() !== targetTab) {
+      this.pdaDevice.setActiveTab(targetTab);
+      this.audio.playPdaButtonClick();
+      this.emitSnapshot();
+      return;
+    }
+    const next = !wasOpen;
     if (next) {
+      if (targetTab) {
+        this.pdaDevice.setActiveTab(targetTab);
+      }
       this.isFiring = false;
       this.input.ads = false;
       this.reloadTimer = 0;

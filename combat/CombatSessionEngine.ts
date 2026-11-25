@@ -160,6 +160,7 @@ import type {
   PdaHqExclusionZone,
   PdaMortarFiringTableTelemetry,
   PdaMortarPitMarker,
+  PdaTabMode,
 } from '../bodycam-sdk/TacticalPdaDevice';
 import {
   BattleBotAI,
@@ -6310,10 +6311,20 @@ export class CombatSessionEngine {
     this.emitSnapshot();
   };
 
-  private togglePda(): void {
+  private togglePda(targetTab?: PdaTabMode): void {
     if (!this.playerAlive || this.gameOver || this.matchOutcome !== 'active') return;
-    const next = !this.pdaDevice.isOpen();
+    const wasOpen = this.pdaDevice.isOpen();
+    if (targetTab && wasOpen && this.pdaDevice.getActiveTab() !== targetTab) {
+      this.pdaDevice.setActiveTab(targetTab);
+      this.audio.playPdaButtonClick();
+      this.emitSnapshot();
+      return;
+    }
+    const next = !wasOpen;
     if (next) {
+      if (targetTab) {
+        this.pdaDevice.setActiveTab(targetTab);
+      }
       if (this.grenadeSystem.isDrawn() && !this.grenadeSystem.isPinPulled()) {
         this.handleGrenadeHolsterOrToss();
       }
@@ -6717,8 +6728,11 @@ export class CombatSessionEngine {
           }
         }
         break;
-      case 'KeyM':
+      case 'KeyP':
         if (!e.repeat) this.togglePda();
+        break;
+      case 'KeyM':
+        if (!e.repeat) this.togglePda('tac_map');
         break;
       case 'KeyG':
         if (!e.repeat && !this.pdaDevice.isBlockingWeaponActions()) this.toggleSuppressor();

@@ -34,6 +34,14 @@ describe('Controls Catalog & Game Settings Store', () => {
     const lean = allBindings.find((b) => b.id === 'lean');
     expect(lean).toBeDefined();
     expect(lean?.keys).toEqual(['Q', 'E']);
+
+    const pda = allBindings.find((b) => b.id === 'pda');
+    expect(pda).toBeDefined();
+    expect(pda?.keys).toEqual(['P']);
+
+    const tacticalMap = allBindings.find((b) => b.id === 'tactical_map');
+    expect(tacticalMap).toBeDefined();
+    expect(tacticalMap?.keys).toEqual(['M']);
   });
 
   it('transitions openGameSettings, setGameSettingsTab, and closeGameSettings state cleanly', () => {
