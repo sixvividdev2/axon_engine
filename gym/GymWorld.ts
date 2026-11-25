@@ -1167,20 +1167,29 @@ export function buildGymWorld(
   for (const rx of [-0.72, 0.72]) {
     for (const rz of [-0.22, 0.22]) {
       pushGymBox(gymSteelGeos, 0.05, 1.88, 0.05, 8.4 + rx, 0.94, 20.6 + rz);
+      physics.addBox({
+        minX: 8.4 + rx - 0.03,
+        maxX: 8.4 + rx + 0.03,
+        minY: 0,
+        maxY: 1.88,
+        minZ: 20.6 + rz - 0.03,
+        maxZ: 20.6 + rz + 0.03,
+        surface: 'metal',
+      });
     }
   }
   for (const sy of [0.16, 0.72, 1.28, 1.84]) {
     pushGymBox(gymSteelGeos, 1.5, 0.035, 0.48, 8.4, sy, 20.6);
+    physics.addBox({
+      minX: 8.4 - 0.75,
+      maxX: 8.4 + 0.75,
+      minY: sy - 0.0175,
+      maxY: sy + 0.0175,
+      minZ: 20.6 - 0.24,
+      maxZ: 20.6 + 0.24,
+      surface: 'metal',
+    });
   }
-  physics.addBox({
-    minX: 7.6,
-    maxX: 9.2,
-    minY: 0,
-    maxY: 1.9,
-    minZ: 20.32,
-    maxZ: 20.88,
-    surface: 'metal',
-  });
   // Staging timber pallet beside the South workshop rack (X = 11.2, Z = 19.6, top Y = 0.14m)
   for (const pz of [-0.42, 0, 0.42]) {
     pushGymBox(gymWoodGeos, 1.24, 0.09, 0.11, 11.2, 0.045, 19.6 + pz);

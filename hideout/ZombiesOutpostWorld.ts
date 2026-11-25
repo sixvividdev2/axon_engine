@@ -1082,23 +1082,32 @@ export function buildZombiesOutpostWorld(
   for (const rx of [-0.26, 0.26]) {
     for (const rz of [-0.84, 0.84]) {
       pushQBox(qDarkSteelGeos, 0.05, 1.92, 0.05, medRackX + rx, 0.96, medRackZ + rz);
+      physics.addBox({
+        minX: medRackX + rx - 0.03,
+        maxX: medRackX + rx + 0.03,
+        minY: 0,
+        maxY: 1.92,
+        minZ: medRackZ + rz - 0.03,
+        maxZ: medRackZ + rz + 0.03,
+        surface: 'metal',
+      });
     }
   }
   for (const sy of [0.16, 0.74, 1.32, 1.88]) {
     pushQBox(qBrushedGeos, 0.56, 0.035, 1.72, medRackX, sy, medRackZ);
+    physics.addBox({
+      minX: medRackX - 0.28,
+      maxX: medRackX + 0.28,
+      minY: sy - 0.0175,
+      maxY: sy + 0.0175,
+      minZ: medRackZ - 0.86,
+      maxZ: medRackZ + 0.86,
+      surface: 'metal',
+    });
   }
   // White bio-containment Pelican trunks stacked on lower/mid tiers
   pushQBox(qMedWhiteGeos, 0.46, 0.34, 0.62, medRackX, 0.35, medRackZ - 0.36);
   pushQBox(qMedWhiteGeos, 0.44, 0.30, 0.56, medRackX, 0.91, medRackZ + 0.34);
-  physics.addBox({
-    minX: medRackX - 0.34,
-    maxX: medRackX + 0.34,
-    minY: 0,
-    maxY: 1.94,
-    minZ: medRackZ - 0.9,
-    maxZ: medRackZ + 0.9,
-    surface: 'metal',
-  });
 
   // Grounded logistics pallet in NW staging area (-8.8, -5.6, top Y = 0.14m)
   for (const pz of [-0.46, 0, 0.46]) {

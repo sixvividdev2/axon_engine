@@ -975,89 +975,7 @@ export function buildHideoutBunkerWorld(
   );
 
   // ============================================================================
-  // 5E. CQB DRYWALL, PLYWOOD BREACH PARTITIONS & VAULT OBSTACLE (RANGE STAGING)
-  // ============================================================================
-  const drywallMat = new THREE.MeshStandardMaterial({
-    color: 0xd4cfc4,
-    roughness: 0.92,
-    metalness: 0.02,
-  });
-  ownedMats.push(drywallMat);
-
-  const buildBreachPartition = (
-    id: string,
-    cx: number,
-    cz: number,
-    w: number,
-    h: number,
-    d: number,
-    kind: 'drywall' | 'plywood',
-    mat: THREE.Material,
-    title: string,
-    subtitle: string,
-    accentHex: string,
-  ): void => {
-    const panel = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(w, h, d)), mat);
-    panel.position.set(cx, h * 0.5, cz);
-    panel.castShadow = !isSoftwareGl;
-    panel.receiveShadow = true;
-    panel.userData.surfaceMaterial = kind === 'drywall' ? 'concrete' : 'wood';
-    panel.userData.ballisticMaterial = 'wood';
-    panel.userData.thicknessM = d;
-    root.add(panel);
-    raycastMeshes.push(panel);
-    penetrableSystem.registerSurface({
-      id,
-      mesh: panel,
-      kind,
-      width: w,
-      height: h,
-      thickness: d,
-      faceAxis: 'z',
-      floorY: 0,
-      maxHoles: 6,
-      hitsToBreach: 1,
-    });
-    // Steel side uprights & top header (colliders only on uprights so bullets/sightlines fly cleanly through carved holes)
-    for (const sx of [-1, 1]) {
-      addBoxStructure(cx + sx * (w * 0.5 + 0.045), h * 0.5, cz, 0.09, h, d + 0.05, materials.darkSteel, 'metal', true);
-    }
-    addBoxStructure(cx, h + 0.045, cz, w + 0.18, 0.09, d + 0.06, materials.darkSteel, 'metal', false);
-    makePlaque(cx, h + 0.34, cz + d * 0.5 + 0.03, 0, title, subtitle, accentHex);
-  };
-
-  buildBreachPartition(
-    'hideout_cqb_drywall',
-    10.4,
-    -7.8,
-    1.36,
-    2.16,
-    0.08,
-    'drywall',
-    drywallMat,
-    'DRYWALL BREACH',
-    'PUNCH / KICK SEE-THROUGH VOID',
-    '#e5e7eb',
-  );
-  buildBreachPartition(
-    'hideout_cqb_plywood',
-    13.1,
-    -7.8,
-    1.36,
-    2.16,
-    0.06,
-    'plywood',
-    materials.tableWood,
-    'PLYWOOD PANEL',
-    'SHOOT-THROUGH CARVED HOLE',
-    '#d97706',
-  );
-  // Dedicated 0.90m tactical vault barrier alongside breach panels (Space = Vault / 2x Space = 360 Spin)
-  addBoxStructure(16.0, 0.45, -7.8, 1.9, 0.9, 0.42, materials.ammoCrateBody, 'wood', true);
-  makePlaque(16.0, 1.28, -7.56, 0, 'VAULT BARRICADE 0.9M', 'SPACE VAULT · 2X SPACE SPIN', '#38bdf8');
-
-  // ============================================================================
-  // 5F. MERGED COLD-WAR BUNKER ARCHITECTURAL DRESSING & RANGE PLINKING SHELVES
+  // 5E. MERGED COLD-WAR BUNKER ARCHITECTURAL DRESSING
   // ============================================================================
   // Batch decorative architectural elements by material (zero extra draw calls per prop)
   const darkMetalGeos: THREE.BufferGeometry[] = [];
@@ -1138,20 +1056,29 @@ export function buildHideoutBunkerWorld(
   for (const sx of [-0.66, 0.66]) {
     for (const sz of [-0.21, 0.21]) {
       pushMergedBox(darkMetalGeos, 0.045, 1.88, 0.045, rackCx + sx, 0.94, rackCz + sz);
+      physics.addBox({
+        minX: rackCx + sx - 0.03,
+        maxX: rackCx + sx + 0.03,
+        minY: 0,
+        maxY: 1.88,
+        minZ: rackCz + sz - 0.03,
+        maxZ: rackCz + sz + 0.03,
+        surface: 'metal',
+      });
     }
   }
   for (const sy of [0.14, 0.66, 1.18, 1.72]) {
     pushMergedBox(brushedMetalGeos, 1.36, 0.035, 0.44, rackCx, sy, rackCz);
+    physics.addBox({
+      minX: rackCx - 0.68,
+      maxX: rackCx + 0.68,
+      minY: sy - 0.0175,
+      maxY: sy + 0.0175,
+      minZ: rackCz - 0.22,
+      maxZ: rackCz + 0.22,
+      surface: 'metal',
+    });
   }
-  physics.addBox({
-    minX: rackCx - 0.7,
-    maxX: rackCx + 0.7,
-    minY: 0,
-    maxY: 1.9,
-    minZ: rackCz - 0.25,
-    maxZ: rackCz + 0.25,
-    surface: 'metal',
-  });
 
   // Grounded timber logistics pallet in Ready Room SE corner (X = -7.65, Z = 4.05, top Y = 0.14)
   for (const pz of [-0.42, 0, 0.42]) {
@@ -1198,15 +1125,6 @@ export function buildHideoutBunkerWorld(
   flushMergedBucket(brushedMetalGeos, materials.brushedSteel, 'metal');
   flushMergedBucket(accentRedGeos, accentRedMat, 'metal');
   flushMergedBucket(woodTrimGeos, materials.tableWood, 'wood');
-
-  // Bay 1 downrange timber plinking shelves (top Y = 0.92m) for shatterable glass bottles & clattering cans
-  const addPlinkingShelf = (cx: number, cz: number, width: number): void => {
-    addBoxStructure(cx, 0.89, cz, width, 0.06, 0.42, materials.tableWood, 'wood', true, true, true);
-    addBoxStructure(cx - width * 0.42, 0.43, cz, 0.08, 0.86, 0.36, materials.darkSteel, 'metal', true);
-    addBoxStructure(cx + width * 0.42, 0.43, cz, 0.08, 0.86, 0.36, materials.darkSteel, 'metal', true);
-  };
-  addPlinkingShelf(10.8, 10.2, 2.2);
-  addPlinkingShelf(13.6, 16.4, 1.8);
 
   // Register static world, Gun Range & Ready Room raycast meshes BEFORE mounting dynamic doors
   physics.setRaycastMeshes(raycastMeshes);

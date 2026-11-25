@@ -17,6 +17,7 @@ import {
   createPdaMotionState,
   DEFAULT_BODYCAM_SDK_CONFIG,
   DynamicPhysicsPropSystem,
+  type DynamicPropSupportSample,
   GrenadeDetonationEvent,
   GrenadeHoldStage,
   LENS_PRESETS,
@@ -863,17 +864,7 @@ export class OpenWorldSessionEngine {
 
     // Unified chunk-streamed GPU-instanced physics props (FOB & settlement bottles, cans, wind papers, crates)
     const owIndoorScratch = { isIndoor: false, material: 'outdoor' as 'concrete' | 'wood' | 'metal' | 'outdoor' };
-    const owSupportRayHit = {
-      hit: false,
-      distance: Infinity,
-      pointX: 0,
-      pointY: 0,
-      pointZ: 0,
-      normalX: 0,
-      normalY: 1,
-      normalZ: 0,
-      surface: 'concrete' as const,
-    };
+    const owSupportScratch: DynamicPropSupportSample = { height: 0, surface: 'grass' };
     this.physicsProps = new DynamicPhysicsPropSystem({
       scene: this.scene,
       isSoftwareGl: this.isSoftwareGl,
@@ -881,29 +872,14 @@ export class OpenWorldSessionEngine {
       maxAniso: Math.min(4, this.renderer.capabilities.getMaxAnisotropy()),
       adapter: {
         sampleSupportHeight: (x, maxSurfaceY, z) => {
-          let bestY = this.streamer.sampleGroundHeight(x, z);
-          owSupportRayHit.hit = false;
-          owSupportRayHit.distance = 3.8;
-          if (
-            this.streamer.raycastActiveStructures(
-              x,
-              maxSurfaceY + 0.08,
-              z,
-              0,
-              -1,
-              0,
-              0.01,
-              owSupportRayHit,
-            ) &&
-            owSupportRayHit.normalY > 0.55
-          ) {
-            const hitY = maxSurfaceY + 0.08 - owSupportRayHit.distance;
-            if (hitY <= maxSurfaceY + 0.06 && hitY > bestY) {
-              bestY = hitY;
-            }
-          }
-          return bestY;
+          this.streamer.samplePropSupportSurface(x, maxSurfaceY, z, owSupportScratch);
+          return owSupportScratch.height;
         },
+        sampleSupportSurface: (x, maxSurfaceY, z, out) => {
+          this.streamer.samplePropSupportSurface(x, maxSurfaceY, z, out);
+        },
+        resolveSolidCollision: (x, y, z, radius, halfHeight, out) =>
+          this.streamer.resolvePropSolidCollision(x, y, z, radius, halfHeight, out),
         isIndoor: (x, y, z) => {
           this.streamer.sampleIndoorAt(x, y, z, owIndoorScratch);
           return owIndoorScratch.isIndoor;

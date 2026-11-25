@@ -749,7 +749,7 @@ export class ZombiesLobbyController {
     // Sandbag revetment & perimeter drum litter
     this.physicsProps.seedCluster('floor_trash', -9.2, 0.0, 3.4, 204);
     this.physicsProps.seedCluster('loading_dock', 8.8, 0.0, -4.4, 205);
-    this.physicsProps.seedCluster('range_ledge', -1.8, 0.69, -11.2, 206);
+    this.physicsProps.seedCluster('range_ledge', -4.1, 0.69, -6.84, 206);
   }
 
   private startElectronicHoldRepair(target: BrokenElectronicRepairTarget): void {

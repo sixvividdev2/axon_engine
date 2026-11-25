@@ -1100,22 +1100,6 @@ export class HideoutSessionController {
   }
 
   private seedHideoutDynamicProps(): void {
-    // Bay 1 downrange plinking shelves (top Y = 0.92m) — bottles & cans ready to shatter/clatter
-    this.physicsProps.seedCluster('range_ledge', 10.8, 0.92, 10.2, 101);
-    this.physicsProps.seedCluster('range_ledge', 13.6, 0.92, 16.4, 102);
-
-    // Bay 1 firing-line benches (top Y = 0.895m) — spare cans & range dossiers
-    this.physicsProps.spawnBatch([
-      { kind: 'soda_can', x: 9.75, y: 0.90, z: 3.05, yaw: 0.4 },
-      { kind: 'glass_bottle_amber', x: 10.12, y: 0.90, z: 3.12, yaw: 1.1 },
-      { kind: 'paper_sheet', x: 11.45, y: 0.90, z: 3.22, yaw: 0.25 },
-      { kind: 'soda_can', x: 13.55, y: 0.90, z: 3.14, yaw: -0.6 },
-      { kind: 'ration_tin', x: 13.82, y: 0.90, z: 3.28, yaw: 0.3 },
-    ]);
-
-    // Vault barricade top (X = 16.0, Z = -7.8, top Y = 0.90m) — plinkable bottles & cans
-    this.physicsProps.seedCluster('range_ledge', 16.0, 0.90, -7.8, 103);
-
     // Arsenal Prep Table (X = 2.45, Z = -1.05, top Y = 0.84m) & Gun Wall bench lip (top Y = 0.68m)
     this.physicsProps.spawnBatch([
       { kind: 'soda_can', x: 3.12, y: 0.85, z: -1.32, yaw: 0.7 },
@@ -1137,11 +1121,6 @@ export class HideoutSessionController {
       { kind: 'cardboard_box', x: 3.75, y: 1.74, z: 4.16, yaw: 0.04 },
     ]);
 
-    // Arsenal & Range floor corner boxes/trash (clear of doorways and walkways)
-    this.physicsProps.seedCluster('floor_trash', -4.25, 0.0, 3.65, 104);
-    this.physicsProps.seedCluster('bunker_mess', 4.4, 0.0, 2.25, 105);
-    this.physicsProps.seedCluster('floor_trash', 8.2, 0.0, -8.5, 106);
-
     // Ready Room briefing table corners (X = -11.4, Z = 0.0, top Y = 0.86m) & SE pallet (X = -7.65, Z = 4.05, top Y = 0.14m)
     this.physicsProps.spawnBatch([
       { kind: 'soda_can', x: -12.28, y: 0.87, z: -0.42, yaw: 0.9 },
@@ -1150,7 +1129,6 @@ export class HideoutSessionController {
       { kind: 'glass_bottle_amber', x: -12.34, y: 0.87, z: 0.38, yaw: 2.1 },
       { kind: 'cardboard_box', x: -7.88, y: 0.14, z: 4.08, yaw: 0.12 },
       { kind: 'plastic_crate', x: -7.35, y: 0.14, z: 3.98, yaw: -0.08 },
-      { kind: 'paper_sheet', x: -8.65, y: 0.01, z: 3.35, yaw: 0.65 },
     ]);
   }
 

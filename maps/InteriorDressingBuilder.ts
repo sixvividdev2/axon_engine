@@ -119,6 +119,33 @@ export function buildMergedInteriorDressing(
     return [spec.cx + lx, spec.cz + lz];
   };
 
+  const toWorldDims = (bw: number, bd: number): [number, number] =>
+    turns === 1 || turns === 3 ? [bd, bw] : [bw, bd];
+
+  const addFurnitureCollider = (
+    lx: number,
+    lyCenter: number,
+    lz: number,
+    bw: number,
+    bh: number,
+    bd: number,
+    surface: 'metal' | 'wood' | 'concrete',
+  ): void => {
+    const [wx, wz] = toWorldXZ(lx, lz);
+    const [ww, wd] = toWorldDims(bw, bd);
+    ctx.physics.addBox({
+      minX: wx - ww * 0.5,
+      maxX: wx + ww * 0.5,
+      minY: spec.floorY + lyCenter - bh * 0.5,
+      maxY: spec.floorY + lyCenter + bh * 0.5,
+      minZ: wz - wd * 0.5,
+      maxZ: wz + wd * 0.5,
+      surface,
+      blocksMovement: true,
+      blocksRaycast: false,
+    });
+  };
+
   const matSteelDark = trackMat(
     new THREE.MeshStandardMaterial({ color: 0x32383e, roughness: 0.46, metalness: 0.72 }),
   );
@@ -224,13 +251,14 @@ export function buildMergedInteriorDressing(
   const shelfHeights = [0.22, 0.78, 1.32, 1.86];
   for (const sy of shelfHeights) {
     pushBox(steelPainted, rackW, 0.035, rackD, rackX, sy, rackZ);
+    addFurnitureCollider(rackX, sy, rackZ, rackW, 0.035, rackD, 'metal');
   }
   // Static binders/toolboxes on top shelf + dynamic physics bottles/cans on mid shelf!
   pushBox(wood, 0.34, 0.24, 0.42, rackX, 1.46, rackZ - 0.42);
   pushBox(accentRed, 0.3, 0.2, 0.46, rackX, 0.9, rackZ + 0.45);
-  addProp('glass_bottle_green', rackX, 0.81, rackZ - 0.35, 0.4);
-  addProp('ration_tin', rackX, 0.81, rackZ - 0.05, 1.2);
-  addProp('soda_can', rackX, 1.35, rackZ + 0.25, 2.1);
+  addProp('glass_bottle_green', rackX, 0.80, rackZ - 0.35, 0.4);
+  addProp('ration_tin', rackX, 0.80, rackZ - 0.05, 1.2);
+  addProp('soda_can', rackX, 1.34, rackZ + 0.25, 2.1);
 
   // Corner B: South-West desk or industrial workbench + chair + wall tactical corkboard
   const deskX = -halfW + inset + 0.58;
@@ -248,12 +276,22 @@ export function buildMergedInteriorDressing(
     deskH,
     deskZ,
   );
+  addFurnitureCollider(
+    deskX,
+    deskH,
+    deskZ,
+    deskW,
+    0.055,
+    deskD,
+    spec.theme === 'industrial_garage' ? 'metal' : 'wood',
+  );
   for (const lx of [-deskW * 0.44, deskW * 0.44]) {
     for (const lz of [-deskD * 0.44, deskD * 0.44]) {
       pushBox(steelDark, 0.05, deskH - 0.03, 0.05, deskX + lx, (deskH - 0.03) * 0.5, deskZ + lz);
     }
   }
   pushBox(steelPainted, deskW - 0.12, 0.56, 0.46, deskX, 0.34, deskZ + deskD * 0.26);
+  addFurnitureCollider(deskX, 0.34, deskZ + deskD * 0.26, deskW - 0.12, 0.56, 0.46, 'metal');
   // Pushed-aside tactical folding chair facing desk
   const chairX = deskX + 0.72;
   const chairZ = deskZ - 0.15;
@@ -269,10 +307,10 @@ export function buildMergedInteriorDressing(
   pushBox(board, 0.03, 0.78, 1.24, -halfW + inset + 0.06, 1.56, deskZ);
 
   // Grounded interactive physics clutter on desk surface!
-  addProp('paper_sheet', deskX - 0.08, deskH + 0.035, deskZ - 0.32, 0.24);
-  addProp('paper_sheet', deskX + 0.06, deskH + 0.04, deskZ - 0.04, -0.45);
-  addProp('glass_bottle_amber', deskX - 0.12, deskH + 0.035, deskZ + 0.36, 0.9);
-  addProp('soda_can', deskX + 0.14, deskH + 0.035, deskZ + 0.54, 1.7);
+  addProp('paper_sheet', deskX - 0.08, deskH + 0.03, deskZ - 0.32, 0.24);
+  addProp('paper_sheet', deskX + 0.06, deskH + 0.03, deskZ - 0.04, -0.45);
+  addProp('glass_bottle_amber', deskX - 0.12, deskH + 0.03, deskZ + 0.36, 0.9);
+  addProp('soda_can', deskX + 0.14, deskH + 0.03, deskZ + 0.54, 1.7);
 
   // Corner C: Tall steel filing cabinet or fuel drum near South-East corner (clear of South doorway)
   const cabX = halfW - inset - 0.38;
@@ -280,17 +318,20 @@ export function buildMergedInteriorDressing(
   if (spec.theme === 'industrial_garage') {
     // Weathered steel oil drum + wooden pallet
     pushCylinder(accentRed, 0.29, 0.29, 0.88, 10, cabX, 0.44, cabZ);
+    addFurnitureCollider(cabX, 0.44, cabZ, 0.58, 0.88, 0.58, 'metal');
     pushBox(wood, 0.95, 0.12, 0.95, cabX - 0.2, 0.06, cabZ - 1.15);
-    addProp('cardboard_box', cabX - 0.2, 0.14, cabZ - 1.15, 0.32);
-    addProp('glass_bottle_green', cabX, 0.9, cabZ, 0.6);
+    addFurnitureCollider(cabX - 0.2, 0.06, cabZ - 1.15, 0.95, 0.12, 0.95, 'wood');
+    addProp('cardboard_box', cabX - 0.2, 0.12, cabZ - 1.15, 0.32);
+    addProp('glass_bottle_green', cabX, 0.88, cabZ, 0.6);
   } else {
     // 4-drawer Soviet steel filing cabinet
     pushBox(steelPainted, 0.52, 1.34, 0.56, cabX, 0.67, cabZ);
+    addFurnitureCollider(cabX, 0.67, cabZ, 0.52, 1.34, 0.56, 'metal');
     for (let d = 0; d < 4; d++) {
       pushBox(steelDark, 0.04, 0.04, 0.18, cabX - 0.27, 0.24 + d * 0.31, cabZ);
     }
-    addProp('paper_sheet', cabX, 1.36, cabZ, 0.5);
-    addProp('ration_tin', cabX - 0.08, 1.36, cabZ + 0.12, 2.2);
+    addProp('paper_sheet', cabX, 1.34, cabZ, 0.5);
+    addProp('ration_tin', cabX - 0.08, 1.34, cabZ + 0.12, 2.2);
   }
 
   // Loose floor clutter (papers, kicked cans, bottles) in safe off-center spots

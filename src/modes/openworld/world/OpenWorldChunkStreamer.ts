@@ -1,6 +1,10 @@
 import * as THREE from 'three';
 import type { BodycamInteriorSample, BodycamSurfaceMaterial } from '../../../../bodycam-sdk/types';
-import type { DynamicPropSpawnSpec } from '../../../../bodycam-sdk/physics/DynamicPhysicsPropSystem';
+import type {
+  DynamicPropSolidHit,
+  DynamicPropSpawnSpec,
+  DynamicPropSupportSample,
+} from '../../../../bodycam-sdk/physics/DynamicPhysicsPropSystem';
 import type { GraphicsQualityProfile } from '../../../../data/graphicsQuality';
 import { OpenWorldArchitectureBuilder } from './OpenWorldArchitectureBuilder';
 import { MACRO_OCCLUDER_LAYER } from './OpenWorldAtmosphere';
@@ -1268,6 +1272,9 @@ export class OpenWorldChunkStreamer {
     if (centerWant && !this.loadedChunks.has(centerKey)) {
       const built = this.buildChunkRecord(centerWant.cx, centerWant.cz, centerWant.lod);
       this.loadedChunks.set(centerKey, built);
+      if (built.lod === 'active') {
+        this.activeChunks.push(built);
+      }
       if (built.propSpawns.length > 0 && this.physicsPropCallbacks) {
         this.physicsPropCallbacks.onChunkLoad(built.key, built.propSpawns);
       }
@@ -1312,6 +1319,9 @@ export class OpenWorldChunkStreamer {
       }
       const built = this.buildChunkRecord(spec.cx, spec.cz, spec.lod);
       this.loadedChunks.set(spec.key, built);
+      if (built.lod === 'active') {
+        this.activeChunks.push(built);
+      }
       if (built.propSpawns.length > 0 && this.physicsPropCallbacks) {
         this.physicsPropCallbacks.onChunkLoad(built.key, built.propSpawns);
       }
@@ -2397,6 +2407,203 @@ export class OpenWorldChunkStreamer {
       crouchHeight,
       standHeight,
     );
+  }
+
+  /**
+   * Zero-GC exact support height and surface sampler for dynamic physics props.
+   * Evaluates terrain heightfield, river bridge decks, building/FOB walkable decks,
+   * and every solid OBB top face (tables, counters, shelves, crates, vehicles) at `(worldX, worldZ)`
+   * strictly at or below `maxSurfaceY + 0.08`, querying `loadedChunks` directly so props always
+   * settle flush even on the exact frame a chunk streams in.
+   */
+  public samplePropSupportSurface(
+    worldX: number,
+    maxSurfaceY: number,
+    worldZ: number,
+    out: DynamicPropSupportSample,
+  ): void {
+    let bestY = this.sampleTerrainHeightOnly(worldX, worldZ);
+    let bestSurface: BodycamSurfaceMaterial = isOnCivilizationClearance(worldX, worldZ) ? 'gravel' : 'grass';
+
+    const bridge = queryBridgeDeckHeight(worldX, worldZ);
+    if (bridge.onBridge && bridge.deckY <= maxSurfaceY + 0.08 && bridge.deckY > bestY) {
+      bestY = bridge.deckY;
+      bestSurface = 'asphalt';
+    }
+
+    const cx = worldToChunkCoord(worldX);
+    const cz = worldToChunkCoord(worldZ);
+    const centerX = chunkCoordToWorldCenter(cx);
+    const centerZ = chunkCoordToWorldCenter(cz);
+    const halfChunk = CHUNK_SIZE_M * 0.5;
+    const edgeMargin = 1.5;
+    const minDx = worldX - (centerX - halfChunk) < edgeMargin ? -1 : 0;
+    const maxDx = centerX + halfChunk - worldX < edgeMargin ? 1 : 0;
+    const minDz = worldZ - (centerZ - halfChunk) < edgeMargin ? -1 : 0;
+    const maxDz = centerZ + halfChunk - worldZ < edgeMargin ? 1 : 0;
+
+    for (let dz = minDz; dz <= maxDz; dz++) {
+      for (let dx = minDx; dx <= maxDx; dx++) {
+        const rec = this.loadedChunks.get(chunkKey(cx + dx, cz + dz));
+        if (!rec) continue;
+
+        const decks = rec.walkDecks;
+        for (let i = 0; i < decks.length; i++) {
+          const d = decks[i];
+          const ox = worldX - d.cx;
+          const oz = worldZ - d.cz;
+          const lx = ox * d.cosY - oz * d.sinY;
+          const lz = ox * d.sinY + oz * d.cosY;
+          if (Math.abs(lx) > d.hx || Math.abs(lz) > d.hz) continue;
+          const topY = d.baseY + lz * d.slopeAlongZ;
+          if (topY <= maxSurfaceY + 0.08 && topY > bestY) {
+            bestY = topY;
+            bestSurface = d.surface;
+          }
+        }
+
+        const obbs = rec.solidObbs;
+        for (let i = 0; i < obbs.length; i++) {
+          const b = obbs[i];
+          if (!b.blocksPlayer) continue;
+          const topY = b.cy + b.hy;
+          if (topY <= bestY || topY > maxSurfaceY + 0.08) continue;
+          const ox = worldX - b.cx;
+          const oz = worldZ - b.cz;
+          const lx = ox * b.cosY - oz * b.sinY;
+          const lz = ox * b.sinY + oz * b.cosY;
+          if (Math.abs(lx) <= b.hx && Math.abs(lz) <= b.hz) {
+            bestY = topY;
+            bestSurface = b.surface;
+          }
+        }
+      }
+    }
+
+    out.height = bestY;
+    out.surface = bestSurface;
+  }
+
+  /**
+   * Zero-GC 3D swept solid collision MTV resolver for dynamic physics props against all
+   * rotated `SolidObb` walls, roofs/ceilings, furniture, workbenches, vehicles, and barriers.
+   */
+  public resolvePropSolidCollision(
+    x: number,
+    y: number,
+    z: number,
+    radius: number,
+    halfHeight: number,
+    out: DynamicPropSolidHit,
+  ): boolean {
+    const cx = worldToChunkCoord(x);
+    const cz = worldToChunkCoord(z);
+    const centerX = chunkCoordToWorldCenter(cx);
+    const centerZ = chunkCoordToWorldCenter(cz);
+    const halfChunk = CHUNK_SIZE_M * 0.5;
+    const edgeMargin = Math.max(1.5, radius + 0.5);
+    const minDx = x - (centerX - halfChunk) < edgeMargin ? -1 : 0;
+    const maxDx = centerX + halfChunk - x < edgeMargin ? 1 : 0;
+    const minDz = z - (centerZ - halfChunk) < edgeMargin ? -1 : 0;
+    const maxDz = centerZ + halfChunk - z < edgeMargin ? 1 : 0;
+
+    const propMinY = y - halfHeight;
+    const propMaxY = y + halfHeight;
+    let bestPen = 0;
+    let hit = false;
+
+    for (let dz = minDz; dz <= maxDz; dz++) {
+      for (let dx = minDx; dx <= maxDx; dx++) {
+        const rec = this.loadedChunks.get(chunkKey(cx + dx, cz + dz));
+        if (!rec || rec.solidObbs.length === 0) continue;
+
+        const obbs = rec.solidObbs;
+        for (let i = 0; i < obbs.length; i++) {
+          const b = obbs[i];
+          if (!b.blocksPlayer) continue;
+
+          const bMinY = b.cy - b.hy;
+          const bMaxY = b.cy + b.hy;
+          if (propMaxY <= bMinY || propMinY >= bMaxY) continue;
+
+          const ox = x - b.cx;
+          const oz = z - b.cz;
+          const lx = ox * b.cosY - oz * b.sinY;
+          const lz = ox * b.sinY + oz * b.cosY;
+          if (Math.abs(lx) > b.hx + radius || Math.abs(lz) > b.hz + radius) continue;
+
+          const closestX = Math.max(-b.hx, Math.min(b.hx, lx));
+          const closestZ = Math.max(-b.hz, Math.min(b.hz, lz));
+          const diffX = lx - closestX;
+          const diffZ = lz - closestZ;
+          const distSq = diffX * diffX + diffZ * diffZ;
+          if (distSq >= radius * radius) continue;
+
+          let penH = 0;
+          let nLocalX = 0;
+          let nLocalZ = 0;
+          if (distSq > 1e-8) {
+            const dist = Math.sqrt(distSq);
+            penH = radius - dist;
+            nLocalX = diffX / dist;
+            nLocalZ = diffZ / dist;
+          } else {
+            const px = b.hx - Math.abs(lx) + radius;
+            const pz = b.hz - Math.abs(lz) + radius;
+            if (px < pz) {
+              penH = px;
+              nLocalX = lx >= 0 ? 1 : -1;
+            } else {
+              penH = pz;
+              nLocalZ = lz >= 0 ? 1 : -1;
+            }
+          }
+
+          const penUp = bMaxY - propMinY;
+          const penDown = propMaxY - bMinY;
+
+          let pushX = 0;
+          let pushY = 0;
+          let pushZ = 0;
+          let normalX = 0;
+          let normalY = 0;
+          let normalZ = 0;
+          let chosenPen = penH;
+
+          // Prefer vertical support landing when resting barely onto a tabletop/crate top
+          if (penUp <= penDown && (penUp <= penH || (penUp <= 0.04 && penUp <= penH * 1.15))) {
+            chosenPen = penUp;
+            pushY = penUp;
+            normalY = 1;
+          } else if (penDown < penH) {
+            chosenPen = penDown;
+            pushY = -penDown;
+            normalY = -1;
+          } else {
+            chosenPen = penH;
+            normalX = nLocalX * b.cosY + nLocalZ * b.sinY;
+            normalZ = -nLocalX * b.sinY + nLocalZ * b.cosY;
+            pushX = normalX * penH;
+            pushZ = normalZ * penH;
+          }
+
+          if (!hit || chosenPen > bestPen) {
+            hit = true;
+            bestPen = chosenPen;
+            out.pushX = pushX;
+            out.pushY = pushY;
+            out.pushZ = pushZ;
+            out.normalX = normalX;
+            out.normalY = normalY;
+            out.normalZ = normalZ;
+            out.surface = b.surface;
+          }
+        }
+      }
+    }
+
+    out.hit = hit;
+    return hit;
   }
 
   /**

@@ -577,7 +577,7 @@ export function buildTutorialWorld(
 
   // Tactical observation desk
   addBox(-3.2, 0.5, -39.2, 1.2, 1.0, 2.2, steelFrameMat, 'metal', true, true);
-  addBox(-3.2, 1.02, -39.2, 1.12, 0.06, 2.08, woodMat, 'wood', false, false);
+  addBox(-3.2, 1.02, -39.2, 1.12, 0.06, 2.08, woodMat, 'wood', true, true);
 
   // Final Fire Support Impact Zone with red marker ring & training blast VFX
   const fireSupportPitCenter = new THREE.Vector3(0, 0.05, -43.8);
@@ -654,22 +654,33 @@ export function buildTutorialWorld(
   for (const rx of [-0.22, 0.22]) {
     for (const rz of [-0.75, 0.75]) {
       pushTutBox(tutSteelGeos, 0.045, 1.84, 0.045, 5.65 + rx, 0.92, -7.8 + rz);
+      physics.addBox({
+        minX: 5.65 + rx - 0.03,
+        maxX: 5.65 + rx + 0.03,
+        minY: 0,
+        maxY: 1.84,
+        minZ: -7.8 + rz - 0.03,
+        maxZ: -7.8 + rz + 0.03,
+        surface: 'metal',
+        blocksMovement: true,
+        blocksRaycast: true,
+      });
     }
   }
   for (const sy of [0.16, 0.72, 1.28, 1.82]) {
     pushTutBox(tutSteelGeos, 0.48, 0.035, 1.56, 5.65, sy, -7.8);
+    physics.addBox({
+      minX: 5.65 - 0.24,
+      maxX: 5.65 + 0.24,
+      minY: sy - 0.0175,
+      maxY: sy + 0.0175,
+      minZ: -7.8 - 0.78,
+      maxZ: -7.8 + 0.78,
+      surface: 'metal',
+      blocksMovement: true,
+      blocksRaycast: true,
+    });
   }
-  physics.addBox({
-    minX: 5.36,
-    maxX: 5.94,
-    minY: 0,
-    maxY: 1.86,
-    minZ: -8.6,
-    maxZ: -7.0,
-    surface: 'metal',
-    blocksMovement: true,
-    blocksRaycast: true,
-  });
 
   // Bay 03 timber bottle/can plinking rail south of the steel targets (X = 5.1, Z = -1.65, top Y = 0.92m)
   addBox(5.1, 0.89, -1.65, 0.42, 0.06, 1.7, woodMat, 'wood', true, true);

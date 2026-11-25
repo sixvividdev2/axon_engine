@@ -5,6 +5,7 @@ import {
   resolvePhysicsPropBudget,
 } from '../../data/graphicsQuality';
 import type { BodycamPhysicsWorld } from '../BodycamPhysics';
+import type { BodycamSurfaceMaterial } from '../types';
 import type { PhysicsPropAudioKind } from '../BodycamAudio';
 
 export type DynamicPropArchetype =
@@ -38,13 +39,51 @@ export interface DynamicPropSpawnSpec {
   ownerTag?: string;
 }
 
+export interface DynamicPropSupportSample {
+  height: number;
+  surface: BodycamSurfaceMaterial;
+}
+
+export interface DynamicPropSolidHit {
+  hit: boolean;
+  pushX: number;
+  pushY: number;
+  pushZ: number;
+  normalX: number;
+  normalY: number;
+  normalZ: number;
+  surface: BodycamSurfaceMaterial;
+}
+
 export interface DynamicPropWorldAdapter {
   /**
    * Returns highest solid support Y at (x, z) that is <= maxSurfaceY (floor, tabletop, shelf, deck, or terrain).
    */
   sampleSupportHeight: (x: number, maxSurfaceY: number, z: number) => number;
   /**
-   * Optional horizontal wall/obstacle collision probe. Returns true and writes bounce normal if blocked.
+   * Optional richer support surface probe returning both exact Y and physical surface material
+   * (enables surface-hardness-aware glass shattering on concrete vs wood vs soft turf).
+   */
+  sampleSupportSurface?: (
+    x: number,
+    maxSurfaceY: number,
+    z: number,
+    out: DynamicPropSupportSample,
+  ) => void;
+  /**
+   * Full 3D exact minimum-translation-vector collision against all solid walls, ceilings,
+   * floors, furniture, shelf undersides, ramps, and hinged door slabs.
+   */
+  resolveSolidCollision?: (
+    x: number,
+    y: number,
+    z: number,
+    radius: number,
+    halfHeight: number,
+    out: DynamicPropSolidHit,
+  ) => boolean;
+  /**
+   * Legacy horizontal wall/obstacle collision probe fallback.
    */
   resolveHorizontalHit?: (
     x: number,
@@ -80,10 +119,20 @@ export interface DynamicPropBulletHitResult {
   point: THREE.Vector3;
 }
 
+type PropCollisionShape = 'cylinder' | 'box' | 'sheet';
+
 interface ArchetypeMetrics {
+  shape: PropCollisionShape;
   mass: number;
+  /** Exact cylindrical radius (or bounding XZ radius for box/sheet) matching rendered geometry */
   radius: number;
+  /** Exact half-width along local X matching rendered geometry */
+  hx: number;
+  /** Exact half-height along local Y matching rendered geometry */
   halfHeight: number;
+  /** Exact half-depth along local Z matching rendered geometry */
+  hz: number;
+  /** True-to-life material restitution (bounciness) */
   restitution: number;
   groundFriction: number;
   angularDamping: number;
@@ -104,13 +153,20 @@ const ARCHETYPES: readonly DynamicPropArchetype[] = [
   'plastic_crate',
 ];
 
+/**
+ * Exact geometry-aligned bounds & physically realistic material restitution/friction:
+ * paper (0.03) < cardboard (0.11) < glass (0.18) < ration tin (0.26) < plastic crate (0.32) < soda can (0.42)
+ */
 const ARCHETYPE_METRICS: Record<DynamicPropArchetype, ArchetypeMetrics> = {
   glass_bottle_green: {
+    shape: 'cylinder',
     mass: 0.42,
-    radius: 0.055,
+    radius: 0.04,
+    hx: 0.04,
     halfHeight: 0.135,
-    restitution: 0.24,
-    groundFriction: 0.82,
+    hz: 0.04,
+    restitution: 0.18,
+    groundFriction: 0.74,
     angularDamping: 0.94,
     windDrag: 0.02,
     windLift: 0.0,
@@ -119,11 +175,14 @@ const ARCHETYPE_METRICS: Record<DynamicPropArchetype, ArchetypeMetrics> = {
     audioBounceKind: 'glass_clink',
   },
   glass_bottle_amber: {
+    shape: 'cylinder',
     mass: 0.45,
-    radius: 0.058,
-    halfHeight: 0.14,
-    restitution: 0.24,
-    groundFriction: 0.82,
+    radius: 0.04,
+    hx: 0.04,
+    halfHeight: 0.135,
+    hz: 0.04,
+    restitution: 0.18,
+    groundFriction: 0.74,
     angularDamping: 0.94,
     windDrag: 0.02,
     windLift: 0.0,
@@ -132,11 +191,14 @@ const ARCHETYPE_METRICS: Record<DynamicPropArchetype, ArchetypeMetrics> = {
     audioBounceKind: 'glass_clink',
   },
   soda_can: {
-    mass: 0.12,
-    radius: 0.045,
-    halfHeight: 0.068,
-    restitution: 0.44,
-    groundFriction: 0.78,
+    shape: 'cylinder',
+    mass: 0.11,
+    radius: 0.034,
+    hx: 0.034,
+    halfHeight: 0.0625,
+    hz: 0.034,
+    restitution: 0.42,
+    groundFriction: 0.68,
     angularDamping: 0.95,
     windDrag: 0.35,
     windLift: 0.05,
@@ -145,11 +207,14 @@ const ARCHETYPE_METRICS: Record<DynamicPropArchetype, ArchetypeMetrics> = {
     audioBounceKind: 'can_clatter',
   },
   ration_tin: {
-    mass: 0.28,
-    radius: 0.058,
-    halfHeight: 0.055,
-    restitution: 0.34,
-    groundFriction: 0.84,
+    shape: 'cylinder',
+    mass: 0.32,
+    radius: 0.052,
+    hx: 0.052,
+    halfHeight: 0.0475,
+    hz: 0.052,
+    restitution: 0.26,
+    groundFriction: 0.80,
     angularDamping: 0.93,
     windDrag: 0.14,
     windLift: 0.02,
@@ -158,11 +223,14 @@ const ARCHETYPE_METRICS: Record<DynamicPropArchetype, ArchetypeMetrics> = {
     audioBounceKind: 'can_clatter',
   },
   paper_sheet: {
+    shape: 'sheet',
     mass: 0.015,
-    radius: 0.16,
-    halfHeight: 0.008,
-    restitution: 0.08,
-    groundFriction: 0.62,
+    radius: 0.12,
+    hx: 0.12,
+    halfHeight: 0.0015,
+    hz: 0.155,
+    restitution: 0.03,
+    groundFriction: 0.78,
     angularDamping: 0.89,
     windDrag: 2.85,
     windLift: 1.95,
@@ -171,32 +239,132 @@ const ARCHETYPE_METRICS: Record<DynamicPropArchetype, ArchetypeMetrics> = {
     audioBounceKind: 'paper_rustle',
   },
   cardboard_box: {
+    shape: 'box',
     mass: 0.95,
-    radius: 0.22,
-    halfHeight: 0.16,
-    restitution: 0.18,
-    groundFriction: 0.88,
-    angularDamping: 0.9,
-    windDrag: 0.16,
-    windLift: 0.02,
+    radius: 0.17,
+    hx: 0.18,
+    halfHeight: 0.14,
+    hz: 0.14,
+    restitution: 0.11,
+    groundFriction: 0.86,
+    angularDamping: 0.90,
+    windDrag: 0.14,
+    windLift: 0.01,
     shatterable: false,
     dentable: true,
     audioBounceKind: 'cardboard_thud',
   },
   plastic_crate: {
-    mass: 1.45,
-    radius: 0.24,
-    halfHeight: 0.15,
-    restitution: 0.24,
-    groundFriction: 0.86,
+    shape: 'box',
+    mass: 1.35,
+    radius: 0.19,
+    hx: 0.21,
+    halfHeight: 0.13,
+    hz: 0.16,
+    restitution: 0.32,
+    groundFriction: 0.76,
     angularDamping: 0.91,
-    windDrag: 0.06,
+    windDrag: 0.05,
     windLift: 0.0,
     shatterable: false,
     dentable: false,
     audioBounceKind: 'plastic_clack',
   },
 };
+
+/**
+ * Computes realistic glass bottle impact speed threshold (m/s) based on struck surface hardness.
+ * Under Earth gravity (9.81 m/s²), a 0.75m–0.85m desk/shelf fall reaches ~3.8–4.1 m/s:
+ *  - Hard surfaces (concrete, metal, asphalt, stone): shatters reliably from desk/shelf height (>= 3.3 m/s)
+ *  - Medium surfaces (wood): requires higher drop or forceful knock (>= 4.3 m/s)
+ *  - Soft surfaces (grass, dirt, mud, sand, snow): cushions typical table drops (>= 5.8 m/s)
+ */
+export function computeGlassShatterThreshold(surface: BodycamSurfaceMaterial): number {
+  switch (surface) {
+    case 'concrete':
+    case 'metal':
+    case 'asphalt':
+      return 3.3;
+    case 'gravel':
+      return 3.8;
+    case 'wood':
+      return 4.3;
+    case 'grass':
+    case 'puddle':
+      return 5.8;
+    default:
+      return 3.7;
+  }
+}
+
+/**
+ * Exact 3D vertical support half-extent from body center to lowest point under current quaternion.
+ * Ensures upright bottles, tipped-on-side cans, tilted crates, and flat sheets all rest flush on surfaces.
+ */
+function computeOrientedHalfExtentY(
+  metrics: ArchetypeMetrics,
+  qx: number,
+  qy: number,
+  qz: number,
+  qw: number,
+  scaleX: number,
+  scaleY: number,
+  scaleZ: number,
+): number {
+  // Middle row of 3x3 rotation matrix from unit quaternion (dot product of local axes with world +Y)
+  const r10 = 2 * (qx * qy + qw * qz);
+  const r11 = 1 - 2 * (qx * qx + qz * qz);
+  const r12 = 2 * (qy * qz - qw * qx);
+
+  if (metrics.shape === 'cylinder') {
+    const absUp = Math.min(1, Math.abs(r11));
+    const sinTilt = Math.sqrt(Math.max(0, 1 - absUp * absUp));
+    const radScale = Math.max(scaleX, scaleZ);
+    return absUp * metrics.halfHeight * scaleY + sinTilt * metrics.radius * radScale;
+  }
+
+  if (metrics.shape === 'sheet') {
+    const ext =
+      Math.abs(r10) * metrics.hx * scaleX +
+      Math.abs(r11) * metrics.halfHeight * scaleY +
+      Math.abs(r12) * metrics.hz * scaleZ;
+    return Math.max(0.0015, ext);
+  }
+
+  // Exact OBB vertical half-extent for boxes & crates
+  return (
+    Math.abs(r10) * metrics.hx * scaleX +
+    Math.abs(r11) * metrics.halfHeight * scaleY +
+    Math.abs(r12) * metrics.hz * scaleZ
+  );
+}
+
+/**
+ * Computes conservative horizontal bounding radius under current quaternion for wall/door/prop sweeps.
+ */
+function computeOrientedHorizRadius(
+  metrics: ArchetypeMetrics,
+  qx: number,
+  qy: number,
+  qz: number,
+  qw: number,
+  scaleX: number,
+  scaleY: number,
+  scaleZ: number,
+): number {
+  const r11 = 1 - 2 * (qx * qx + qz * qz);
+  if (metrics.shape === 'cylinder') {
+    const absUp = Math.min(1, Math.abs(r11));
+    const sinTilt = Math.sqrt(Math.max(0, 1 - absUp * absUp));
+    const r = metrics.radius * Math.max(scaleX, scaleZ);
+    const h = metrics.halfHeight * scaleY;
+    return Math.max(r, absUp * r + sinTilt * h * 0.82);
+  }
+  if (metrics.shape === 'sheet') {
+    return metrics.radius * Math.max(scaleX, scaleZ) * 0.85;
+  }
+  return Math.max(metrics.hx * scaleX, metrics.hz * scaleZ);
+}
 
 interface PropBody {
   id: number;
@@ -271,13 +439,25 @@ const _normal = new THREE.Vector3();
 const _hitPoint = new THREE.Vector3();
 const _tmpColor = new THREE.Color();
 const _zeroMatrix = new THREE.Matrix4().makeScale(0, 0, 0);
+const _supportScratch: DynamicPropSupportSample = { height: 0, surface: 'concrete' };
+const _solidHitScratch: DynamicPropSolidHit = {
+  hit: false,
+  pushX: 0,
+  pushY: 0,
+  pushZ: 0,
+  normalX: 0,
+  normalY: 1,
+  normalZ: 0,
+  surface: 'concrete',
+};
 
 const CELL_SIZE_M = 2.0;
 const INV_CELL_SIZE = 1.0 / CELL_SIZE_M;
-const GRAVITY = -16.8;
-const SLEEP_LIN_SQ = 0.018;
-const SLEEP_ANG_SQ = 0.04;
-const SLEEP_HOLD_SEC = 0.34;
+/** True Earth gravity (m/s²) for authentic drop arcs, bounces, and desk-height glass breakage */
+const GRAVITY = -9.81;
+const SLEEP_LIN_SQ = 0.012;
+const SLEEP_ANG_SQ = 0.035;
+const SLEEP_HOLD_SEC = 0.32;
 const MAX_SIM_DIST_M = 72.0;
 
 function packCellKey(cx: number, cz: number): number {
@@ -459,13 +639,13 @@ function buildCanGeometry(radius: number, height: number): THREE.LatheGeometry {
 function buildPaperSheetGeometry(): THREE.PlaneGeometry {
   const geo = new THREE.PlaneGeometry(0.24, 0.31, 3, 3);
   geo.rotateX(-Math.PI * 0.5);
-  // Subtle organic paper curl so resting sheets never look dead-flat or Z-fight
+  // Subtle corner curl starting cleanly from y = 0 at center so resting sheets sit razor-flush
   const pos = geo.attributes.position;
   for (let i = 0; i < pos.count; i++) {
     const x = pos.getX(i);
     const z = pos.getZ(i);
     const edgeDist = Math.hypot(x * 3.8, z * 3.0);
-    pos.setY(i, 0.004 + edgeDist * edgeDist * 0.006);
+    pos.setY(i, Math.min(0.0024, edgeDist * edgeDist * 0.0018));
   }
   geo.computeVertexNormals();
   return geo;
@@ -490,7 +670,7 @@ function applyPaperWindFlutterShader(
   material: THREE.MeshStandardMaterial,
   uniforms: PaperWindUniforms,
 ): void {
-  material.customProgramCacheKey = () => 'axon_dynamic_paper_flutter_v1';
+  material.customProgramCacheKey = () => 'axon_dynamic_paper_flutter_v2';
   material.onBeforeCompile = (shader) => {
     shader.uniforms.uTime = uniforms.uTime;
     shader.uniforms.uWindDir = uniforms.uWindDir;
@@ -514,9 +694,11 @@ function applyPaperWindFlutterShader(
         #else
           float phase = 0.0;
         #endif
-        float flutter = sin(uTime * (4.6 + uWindStrength * 5.5) + phase + position.x * 16.0 + position.z * 12.0);
-        float curl = cos(uTime * 2.4 + phase * 0.7 + position.z * 9.0);
-        transformed.y += (flutter * 0.014 + curl * 0.008) * edgeMask * (0.28 + uWindStrength * 1.25);
+        float windLift = clamp(uWindStrength, 0.0, 2.2);
+        float flutter = 0.5 + 0.5 * sin(uTime * (4.2 + windLift * 5.2) + phase + position.x * 16.0 + position.z * 12.0);
+        float curl = 0.5 + 0.5 * cos(uTime * 2.3 + phase * 0.7 + position.z * 9.0);
+        // Upward-only corner flutter proportional to wind so resting sheets stay flush on surfaces
+        transformed.y += (flutter * 0.009 + curl * 0.004) * edgeMask * windLift;
         `,
       );
   };
@@ -716,15 +898,15 @@ export class DynamicPhysicsPropSystem {
       this.freeSlots.set(kind, slots);
     }
 
-    // Pooled instanced glass shards
+    // Pooled instanced glass shards (white base mat so per-instance color matches green/amber bottle)
     const shardCap = Math.max(32, this.budget.maxGlassShards);
     const shardGeo = buildGlassShardGeometry();
     const shardMat = new THREE.MeshStandardMaterial({
-      color: 0xa6d8b5,
+      color: 0xffffff,
       roughness: 0.1,
       metalness: 0.15,
       transparent: true,
-      opacity: 0.82,
+      opacity: 0.84,
       side: THREE.DoubleSide,
     });
     this.ownedGeos.push(shardGeo);
@@ -800,6 +982,15 @@ export class DynamicPhysicsPropSystem {
     this.paperWindUniforms.uWindStrength.value = this.windStrength;
   }
 
+  private sampleSupport(x: number, maxSurfaceY: number, z: number, out: DynamicPropSupportSample): void {
+    if (this.adapter.sampleSupportSurface) {
+      this.adapter.sampleSupportSurface(x, maxSurfaceY, z, out);
+      return;
+    }
+    out.height = this.adapter.sampleSupportHeight(x, maxSurfaceY, z);
+    out.surface = 'concrete';
+  }
+
   public spawnProp(spec: DynamicPropSpawnSpec): number {
     if (this.activeCount >= this.budget.maxTotalProps) return -1;
     if (spec.kind === 'paper_sheet' && this.paperCount >= this.budget.maxWindPapers) return -1;
@@ -810,18 +1001,69 @@ export class DynamicPhysicsPropSystem {
 
     const metrics = ARCHETYPE_METRICS[spec.kind];
     const scale = THREE.MathUtils.clamp(spec.scale ?? 1.0, 0.72, 1.38);
-    const supportY = this.adapter.sampleSupportHeight(spec.x, spec.y + 0.35, spec.z);
-    const groundedY = Math.max(supportY, spec.y - 0.12) + metrics.halfHeight * scale;
-    const indoor = this.adapter.isIndoor
-      ? this.adapter.isIndoor(spec.x, groundedY + 0.25, spec.z)
-      : false;
 
     _euler.set(spec.pitch ?? 0, spec.yaw ?? 0, spec.roll ?? 0, 'YXZ');
     _quat.setFromEuler(_euler);
 
+    // Exact 3D orientation-aware vertical half-extent (fixes hovering tipped cans, boxes & papers)
+    const orientedHalfH = computeOrientedHalfExtentY(
+      metrics,
+      _quat.x,
+      _quat.y,
+      _quat.z,
+      _quat.w,
+      scale,
+      scale,
+      scale,
+    );
+    const orientedRad = computeOrientedHorizRadius(
+      metrics,
+      _quat.x,
+      _quat.y,
+      _quat.z,
+      _quat.w,
+      scale,
+      scale,
+      scale,
+    );
+
+    // True downward support probe — never holds props artificially floating above the surface!
+    let px = spec.x;
+    let pz = spec.z;
+    this.sampleSupport(px, spec.y + 0.24, pz, _supportScratch);
+    let groundedY = _supportScratch.height + orientedHalfH;
+
+    // Micro-depenetration on spawn so props placed near wall/shelf edges never start clipped inside geometry
+    if (this.adapter.resolveSolidCollision) {
+      for (let iter = 0; iter < 3; iter++) {
+        if (
+          !this.adapter.resolveSolidCollision(
+            px,
+            groundedY,
+            pz,
+            orientedRad,
+            orientedHalfH,
+            _solidHitScratch,
+          )
+        ) {
+          break;
+        }
+        px += _solidHitScratch.pushX;
+        groundedY += _solidHitScratch.pushY;
+        pz += _solidHitScratch.pushZ;
+      }
+      // Re-snap flush onto the true solid support below after any horizontal edge push-out
+      this.sampleSupport(px, groundedY - orientedHalfH + 0.14, pz, _supportScratch);
+      groundedY = _supportScratch.height + orientedHalfH;
+    }
+
+    const indoor = this.adapter.isIndoor
+      ? this.adapter.isIndoor(px, groundedY + 0.25, pz)
+      : false;
+
     const cellKey = packCellKey(
-      Math.floor(spec.x * INV_CELL_SIZE),
-      Math.floor(spec.z * INV_CELL_SIZE),
+      Math.floor(px * INV_CELL_SIZE),
+      Math.floor(pz * INV_CELL_SIZE),
     );
 
     let bodyId: number;
@@ -833,12 +1075,12 @@ export class DynamicPhysicsPropSystem {
       body.kind = spec.kind;
       body.instanceIdx = instanceIdx;
       body.ownerTag = spec.ownerTag ?? '';
-      body.x = spec.x;
+      body.x = px;
       body.y = groundedY;
-      body.z = spec.z;
-      body.spawnX = spec.x;
+      body.z = pz;
+      body.spawnX = px;
       body.spawnY = groundedY;
-      body.spawnZ = spec.z;
+      body.spawnZ = pz;
       body.vx = 0;
       body.vy = 0;
       body.vz = 0;
@@ -858,7 +1100,7 @@ export class DynamicPhysicsPropSystem {
       body.shattered = false;
       body.dented = false;
       body.indoor = indoor;
-      body.windPhase = (spec.x * 1.73 + spec.z * 2.19) % 6.283;
+      body.windPhase = (px * 1.73 + pz * 2.19) % 6.283;
       body.audioCooldown = 0;
       body.cellKey = cellKey;
     } else {
@@ -869,12 +1111,12 @@ export class DynamicPhysicsPropSystem {
         kind: spec.kind,
         instanceIdx,
         ownerTag: spec.ownerTag ?? '',
-        x: spec.x,
+        x: px,
         y: groundedY,
-        z: spec.z,
-        spawnX: spec.x,
+        z: pz,
+        spawnX: px,
         spawnY: groundedY,
-        spawnZ: spec.z,
+        spawnZ: pz,
         vx: 0,
         vy: 0,
         vz: 0,
@@ -894,7 +1136,7 @@ export class DynamicPhysicsPropSystem {
         shattered: false,
         dented: false,
         indoor,
-        windPhase: (spec.x * 1.73 + spec.z * 2.19) % 6.283,
+        windPhase: (px * 1.73 + pz * 2.19) % 6.283,
         audioCooldown: 0,
         cellKey,
       };
@@ -907,10 +1149,10 @@ export class DynamicPhysicsPropSystem {
 
     // Subtle per-instance color tint variation for organic realism
     const im = this.meshes.get(spec.kind)!;
-    const tint = 0.88 + (Math.abs(Math.sin(spec.x * 12.989 + spec.z * 78.233)) % 0.2);
+    const tint = 0.88 + (Math.abs(Math.sin(px * 12.989 + pz * 78.233)) % 0.2);
     if (spec.kind === 'soda_can') {
       const palette = [0xd84339, 0x3b72a6, 0x3a8c58, 0xd49b2f];
-      const pick = palette[Math.abs(Math.floor(spec.x * 3 + spec.z * 5)) % palette.length];
+      const pick = palette[Math.abs(Math.floor(px * 3 + pz * 5)) % palette.length];
       _tmpColor.setHex(pick).multiplyScalar(0.95);
     } else if (spec.kind === 'paper_sheet') {
       _tmpColor.setRGB(tint, tint * 0.98, tint * 0.93);
@@ -924,13 +1166,118 @@ export class DynamicPhysicsPropSystem {
     return bodyId;
   }
 
-  public spawnBatch(specs: readonly DynamicPropSpawnSpec[]): number {
-    let spawned = 0;
-    for (let i = 0; i < specs.length; i++) {
-      if (this.spawnProp(specs[i]) >= 0) spawned++;
+  /**
+   * Silent spawn-time overlap separation & flush grounding settle pass.
+   * Ensures clustered props never start intersecting each other or hovering above their support surface.
+   */
+  public settleSpawnedProps(bodyIds?: readonly number[]): void {
+    const count = bodyIds ? bodyIds.length : this.bodies.length;
+    for (let i = 0; i < count; i++) {
+      const b = this.bodies[bodyIds ? bodyIds[i] : i];
+      if (!b || !b.active || b.shattered || b.kind === 'paper_sheet') continue;
+
+      const mA = ARCHETYPE_METRICS[b.kind];
+      const rA = computeOrientedHorizRadius(
+        mA,
+        b.qx,
+        b.qy,
+        b.qz,
+        b.qw,
+        b.scale * b.dentScaleX,
+        b.scale * b.dentScaleY,
+        b.scale * b.dentScaleZ,
+      );
+      const hhA = computeOrientedHalfExtentY(
+        mA,
+        b.qx,
+        b.qy,
+        b.qz,
+        b.qw,
+        b.scale * b.dentScaleX,
+        b.scale * b.dentScaleY,
+        b.scale * b.dentScaleZ,
+      );
+
+      const cx = Math.floor(b.x * INV_CELL_SIZE);
+      const cz = Math.floor(b.z * INV_CELL_SIZE);
+      let moved = false;
+      for (let ox = -1; ox <= 1; ox++) {
+        for (let oz = -1; oz <= 1; oz++) {
+          const bucket = this.cellBuckets.get(packCellKey(cx + ox, cz + oz));
+          if (!bucket) continue;
+          for (let j = 0; j < bucket.length; j++) {
+            const other = this.bodies[bucket[j]];
+            if (other.id <= b.id || !other.active || other.shattered || other.kind === 'paper_sheet') {
+              continue;
+            }
+            const mB = ARCHETYPE_METRICS[other.kind];
+            const hhB = computeOrientedHalfExtentY(
+              mB,
+              other.qx,
+              other.qy,
+              other.qz,
+              other.qw,
+              other.scale * other.dentScaleX,
+              other.scale * other.dentScaleY,
+              other.scale * other.dentScaleZ,
+            );
+            if (Math.abs(b.y - other.y) >= hhA + hhB - 0.005) continue;
+
+            const rB = computeOrientedHorizRadius(
+              mB,
+              other.qx,
+              other.qy,
+              other.qz,
+              other.qw,
+              other.scale * other.dentScaleX,
+              other.scale * other.dentScaleY,
+              other.scale * other.dentScaleZ,
+            );
+            const dx = other.x - b.x;
+            const dz = other.z - b.z;
+            const minDist = rA + rB + 0.004;
+            const dSq = dx * dx + dz * dz;
+            if (dSq >= minDist * minDist) continue;
+
+            const dist = Math.sqrt(dSq);
+            const nx = dist > 1e-4 ? dx / dist : 1;
+            const nz = dist > 1e-4 ? dz / dist : 0;
+            const push = (minDist - dist) * 0.5;
+            b.x -= nx * push;
+            b.z -= nz * push;
+            other.x += nx * push;
+            other.z += nz * push;
+            moved = true;
+
+            this.sampleSupport(other.x, other.y - hhB + 0.12, other.z, _supportScratch);
+            other.y = _supportScratch.height + hhB;
+            this.updateBodyCell(other);
+            this.writeBodyMatrix(other);
+          }
+        }
+      }
+      if (moved) {
+        this.sampleSupport(b.x, b.y - hhA + 0.12, b.z, _supportScratch);
+        b.y = _supportScratch.height + hhA;
+        this.updateBodyCell(b);
+        this.writeBodyMatrix(b);
+      }
     }
     this.flushDirtyMatrices();
-    return spawned;
+  }
+
+  public spawnBatch(specs: readonly DynamicPropSpawnSpec[]): number {
+    const spawnedIds: number[] = [];
+    for (let i = 0; i < specs.length; i++) {
+      const id = this.spawnProp(specs[i]);
+      if (id >= 0) spawnedIds.push(id);
+    }
+    if (spawnedIds.length > 1) {
+      this.settleSpawnedProps(spawnedIds);
+    } else {
+      this.flushDirtyMatrices();
+    }
+    return spawnedIds.length;
   }
 
   /**
@@ -1331,8 +1678,9 @@ export class DynamicPhysicsPropSystem {
 
     this.triggerPropAudio(b, 'glass_shatter', 1.0);
 
-    const shardCount = this.isSoftwareGl ? 5 : 8;
+    const shardCount = this.isSoftwareGl ? 5 : 9;
     const shardCap = this.shards.length;
+    const shardHex = b.kind === 'glass_bottle_amber' ? 0xc97b2c : 0x5db874;
     for (let i = 0; i < shardCount; i++) {
       const idx = this.shardCursor % shardCap;
       this.shardCursor++;
@@ -1340,20 +1688,27 @@ export class DynamicPhysicsPropSystem {
       sh.active = true;
       sh.sleeping = false;
       sh.age = 0;
-      sh.x = b.x + (Math.random() - 0.5) * 0.06;
-      sh.y = b.y + (Math.random() - 0.5) * 0.12;
-      sh.z = b.z + (Math.random() - 0.5) * 0.06;
-      const spread = 1.4 + Math.random() * 2.4;
-      sh.vx = dirX * scatterSpeed * 0.48 + (Math.random() - 0.5) * spread;
-      sh.vy = Math.max(0.8, dirY * scatterSpeed * 0.35 + 1.2 + Math.random() * 2.1);
-      sh.vz = dirZ * scatterSpeed * 0.48 + (Math.random() - 0.5) * spread;
+      sh.x = b.x + (Math.random() - 0.5) * 0.05;
+      sh.y = b.y + (Math.random() - 0.5) * 0.08;
+      sh.z = b.z + (Math.random() - 0.5) * 0.05;
+      const spread = 1.1 + Math.random() * 2.1;
+      sh.vx = dirX * scatterSpeed * 0.42 + (Math.random() - 0.5) * spread;
+      sh.vy = Math.max(0.45, dirY * scatterSpeed * 0.3 + 0.8 + Math.random() * 1.6);
+      sh.vz = dirZ * scatterSpeed * 0.42 + (Math.random() - 0.5) * spread;
       sh.rx = Math.random() * Math.PI * 2;
       sh.ry = Math.random() * Math.PI * 2;
       sh.rz = Math.random() * Math.PI * 2;
-      sh.vrx = (Math.random() - 0.5) * 20;
-      sh.vry = (Math.random() - 0.5) * 20;
-      sh.vrz = (Math.random() - 0.5) * 20;
+      sh.vrx = (Math.random() - 0.5) * 18;
+      sh.vry = (Math.random() - 0.5) * 18;
+      sh.vrz = (Math.random() - 0.5) * 18;
       sh.scale = 0.72 + Math.random() * 0.85;
+
+      const shade = 0.85 + Math.random() * 0.3;
+      _tmpColor.setHex(shardHex).multiplyScalar(shade);
+      this.shardMesh.setColorAt(idx, _tmpColor);
+    }
+    if (this.shardMesh.instanceColor) {
+      this.shardMesh.instanceColor.needsUpdate = true;
     }
     this.shardsDirty = true;
   }
@@ -1367,7 +1722,124 @@ export class DynamicPhysicsPropSystem {
   }
 
   /**
-   * Main per-frame physics & aerodynamic wind update.
+   * Resolves prop-vs-prop overlaps and mass-weighted collision impulses using the 2m XZ spatial hash.
+   * Wakes sleeping hit neighbors for realistic domino cascades and prevents prop interpenetration.
+   */
+  private resolvePropToPropCollisions(b: PropBody, metrics: ArchetypeMetrics, radA: number, hhA: number): boolean {
+    if (b.kind === 'paper_sheet') return false;
+    const cx = Math.floor(b.x * INV_CELL_SIZE);
+    const cz = Math.floor(b.z * INV_CELL_SIZE);
+
+    for (let ox = -1; ox <= 1; ox++) {
+      for (let oz = -1; oz <= 1; oz++) {
+        const bucket = this.cellBuckets.get(packCellKey(cx + ox, cz + oz));
+        if (!bucket) continue;
+        for (let i = 0; i < bucket.length; i++) {
+          const other = this.bodies[bucket[i]];
+          if (other.id === b.id || !other.active || other.shattered || other.kind === 'paper_sheet') {
+            continue;
+          }
+
+          const mB = ARCHETYPE_METRICS[other.kind];
+          const hhB = computeOrientedHalfExtentY(
+            mB,
+            other.qx,
+            other.qy,
+            other.qz,
+            other.qw,
+            other.scale * other.dentScaleX,
+            other.scale * other.dentScaleY,
+            other.scale * other.dentScaleZ,
+          );
+          const dy = other.y - b.y;
+          const sumH = hhA + hhB;
+          if (Math.abs(dy) >= sumH) continue;
+
+          const radB = computeOrientedHorizRadius(
+            mB,
+            other.qx,
+            other.qy,
+            other.qz,
+            other.qw,
+            other.scale * other.dentScaleX,
+            other.scale * other.dentScaleY,
+            other.scale * other.dentScaleZ,
+          );
+          const dx = other.x - b.x;
+          const dz = other.z - b.z;
+          const minDist = radA + radB;
+          const dSq = dx * dx + dz * dz;
+          if (dSq >= minDist * minDist) continue;
+
+          const dist = Math.sqrt(dSq);
+          const nx = dist > 1e-4 ? dx / dist : 1;
+          const nz = dist > 1e-4 ? dz / dist : 0;
+          const pen = minDist - dist;
+
+          const invMassA = 1 / metrics.mass;
+          const invMassB = 1 / mB.mass;
+          const invMassSum = invMassA + invMassB;
+
+          // Position separation weighted by inverse mass
+          const sepA = pen * (invMassA / invMassSum);
+          const sepB = pen * (invMassB / invMassSum);
+          b.x -= nx * sepA;
+          b.z -= nz * sepA;
+          other.x += nx * sepB;
+          other.z += nz * sepB;
+
+          // Relative velocity along collision normal
+          const rvx = other.vx - b.vx;
+          const rvz = other.vz - b.vz;
+          const velAlongNormal = rvx * nx + rvz * nz;
+
+          if (velAlongNormal < 0) {
+            const impactSpeed = -velAlongNormal;
+            const e = Math.min(metrics.restitution, mB.restitution);
+            const j = (-(1 + e) * velAlongNormal) / invMassSum;
+
+            b.vx -= j * invMassA * nx;
+            b.vz -= j * invMassA * nz;
+            other.vx += j * invMassB * nx;
+            other.vz += j * invMassB * nz;
+
+            // Slight vertical hop & spin on brisk impact
+            if (impactSpeed > 0.6) {
+              other.vy = Math.max(other.vy, Math.min(1.4, impactSpeed * 0.22 * (invMassB / invMassSum)));
+              b.wy += (Math.random() - 0.5) * impactSpeed * 2.5;
+              other.wx += (Math.random() - 0.5) * impactSpeed * 3.0;
+              other.wz += (Math.random() - 0.5) * impactSpeed * 3.0;
+              this.triggerPropAudio(other, mB.audioBounceKind, Math.min(0.85, impactSpeed * 0.22));
+            }
+
+            if (other.sleeping && impactSpeed > 0.18) {
+              other.sleeping = false;
+              other.sleepTimer = 0;
+            }
+
+            // Heavy high-speed impact can shatter glass bottles on collision
+            if (metrics.shatterable && impactSpeed > 4.2 && mB.mass >= 0.35) {
+              this.shatterBottle(b, -nx, 0.25, -nz, impactSpeed * 0.55);
+              return true;
+            }
+            if (mB.shatterable && impactSpeed > 4.2 && metrics.mass >= 0.35) {
+              this.shatterBottle(other, nx, 0.25, nz, impactSpeed * 0.55);
+            }
+          } else if (other.sleeping && pen > 0.015) {
+            other.sleeping = false;
+            other.sleepTimer = 0;
+          }
+
+          this.updateBodyCell(other);
+          this.writeBodyMatrix(other);
+        }
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Main per-frame swept substepped 6-DOF physics, prop-to-prop collision & aerodynamic wind update.
    * Strictly bounded by `budget.maxActiveBodies`, distance-culled beyond 72m, zero GC.
    */
   public update(dt: number, listenerPos?: Readonly<THREE.Vector3>): void {
@@ -1407,7 +1879,7 @@ export class DynamicPhysicsPropSystem {
           if (gustCheck > 0.45) {
             b.sleeping = false;
             b.sleepTimer = 0;
-            b.vy += 0.24 + localWind * 0.55;
+            b.vy += 0.22 + localWind * 0.45;
             b.vx += this.windDirX * localWind * 0.72;
             b.vz += this.windDirZ * localWind * 0.72;
           }
@@ -1443,8 +1915,9 @@ export class DynamicPhysicsPropSystem {
       simulatedBodies++;
 
       const metrics = ARCHETYPE_METRICS[b.kind];
-      const halfH = metrics.halfHeight * b.scale;
-      const rad = metrics.radius * b.scale;
+      const sx = b.scale * b.dentScaleX;
+      const sy = b.scale * b.dentScaleY;
+      const sz = b.scale * b.dentScaleZ;
 
       // Refresh indoor shelter flag periodically when moving
       if (this.adapter.isIndoor) {
@@ -1457,144 +1930,251 @@ export class DynamicPhysicsPropSystem {
           : effectiveWind * 0.05
         : effectiveWind;
 
-      // Gravity + aerodynamic drag/lift (papers flutter, glide, and curl in wind!)
-      if (b.kind === 'paper_sheet') {
-        const airGravity = GRAVITY * 0.24;
-        b.vy += airGravity * stepDt;
+      // Velocity-adaptive swept substep count so fast props never tunnel through thin walls, doors, or shelves
+      const curHalfH = computeOrientedHalfExtentY(metrics, b.qx, b.qy, b.qz, b.qw, sx, sy, sz);
+      const curRad = computeOrientedHorizRadius(metrics, b.qx, b.qy, b.qz, b.qw, sx, sy, sz);
+      const speedEst = Math.hypot(b.vx, b.vy, b.vz);
+      const maxStepDisp = Math.max(0.032, Math.min(curRad, Math.max(curHalfH, 0.04)) * 0.85);
+      const substeps = Math.min(4, Math.max(1, Math.ceil((speedEst * stepDt) / maxStepDisp)));
+      const subDt = stepDt / substeps;
 
-        const swirl = Math.sin(this.elapsedSec * 3.1 + b.windPhase + b.x * 0.55);
-        const lateralX = -this.windDirZ;
-        const lateralZ = this.windDirX;
+      let onGround = false;
+      let destroyed = false;
 
-        if (localWind > 0.08) {
-          const targetVx = this.windDirX * localWind * metrics.windDrag + lateralX * swirl * localWind * 0.85;
-          const targetVz = this.windDirZ * localWind * metrics.windDrag + lateralZ * swirl * localWind * 0.85;
-          b.vx += (targetVx - b.vx) * Math.min(1, stepDt * 3.2);
-          b.vz += (targetVz - b.vz) * Math.min(1, stepDt * 3.2);
+      for (let sub = 0; sub < substeps; sub++) {
+        // 1. Earth gravity + aerodynamic drag/lift
+        if (b.kind === 'paper_sheet') {
+          const airGravity = GRAVITY * 0.22;
+          b.vy += airGravity * subDt;
 
-          // Aerodynamic lift during gusts
-          const liftImpulse = Math.max(0, swirl + 0.35) * localWind * metrics.windLift;
-          b.vy += liftImpulse * stepDt * 2.4;
-          b.wx += swirl * localWind * 4.5 * stepDt;
-          b.wy += (Math.cos(this.elapsedSec * 2.4 + b.windPhase) * 3.2) * localWind * stepDt;
-          b.wz += Math.cos(this.elapsedSec * 2.8 + b.windPhase) * localWind * 4.0 * stepDt;
-        }
+          const swirl = Math.sin(this.elapsedSec * 3.1 + b.windPhase + b.x * 0.55);
+          const lateralX = -this.windDirZ;
+          const lateralZ = this.windDirX;
 
-        // Terminal gentle flutter descent speed
-        if (b.vy < -1.85) b.vy = -1.85;
-        b.vx *= Math.pow(0.72, stepDt);
-        b.vz *= Math.pow(0.72, stepDt);
+          if (localWind > 0.08) {
+            const targetVx =
+              this.windDirX * localWind * metrics.windDrag + lateralX * swirl * localWind * 0.85;
+            const targetVz =
+              this.windDirZ * localWind * metrics.windDrag + lateralZ * swirl * localWind * 0.85;
+            b.vx += (targetVx - b.vx) * Math.min(1, subDt * 3.2);
+            b.vz += (targetVz - b.vz) * Math.min(1, subDt * 3.2);
 
-        // Soft spawn-zone leash so outdoor wind-blown papers swirl across courtyards without vanishing off-map
-        const leashDx = b.x - b.spawnX;
-        const leashDz = b.z - b.spawnZ;
-        if (leashDx * leashDx + leashDz * leashDz > 18 * 18) {
-          b.x = b.spawnX + (Math.random() - 0.5) * 1.4;
-          b.z = b.spawnZ + (Math.random() - 0.5) * 1.4;
-          b.y = b.spawnY + 0.25;
-          b.vx *= 0.25;
-          b.vy = 0.2;
-          b.vz *= 0.25;
-        }
-      } else {
-        b.vy += GRAVITY * stepDt;
-        if (localWind > 0.55 && metrics.windDrag > 0.1) {
-          b.vx += this.windDirX * localWind * metrics.windDrag * stepDt * 1.8;
-          b.vz += this.windDirZ * localWind * metrics.windDrag * stepDt * 1.8;
-        }
-      }
+            const liftImpulse = Math.max(0, swirl + 0.35) * localWind * metrics.windLift;
+            b.vy += liftImpulse * subDt * 1.9;
+            b.wx += swirl * localWind * 4.5 * subDt;
+            b.wy += Math.cos(this.elapsedSec * 2.4 + b.windPhase) * 3.2 * localWind * subDt;
+            b.wz += Math.cos(this.elapsedSec * 2.8 + b.windPhase) * 4.0 * localWind * subDt;
+          }
 
-      // Integrate position
-      b.x += b.vx * stepDt;
-      b.y += b.vy * stepDt;
-      b.z += b.vz * stepDt;
+          if (b.vy < -1.45) b.vy = -1.45;
+          const drag = Math.pow(0.72, subDt);
+          b.vx *= drag;
+          b.vz *= drag;
 
-      // Integrate orientation quaternion from angular velocity
-      const angSpeed = Math.hypot(b.wx, b.wy, b.wz);
-      if (angSpeed > 1e-4) {
-        const halfAngle = angSpeed * stepDt * 0.5;
-        const s = Math.sin(halfAngle) / angSpeed;
-        _deltaQuat.set(b.wx * s, b.wy * s, b.wz * s, Math.cos(halfAngle));
-        _quat.set(b.qx, b.qy, b.qz, b.qw).premultiply(_deltaQuat).normalize();
-        b.qx = _quat.x;
-        b.qy = _quat.y;
-        b.qz = _quat.z;
-        b.qw = _quat.w;
-      }
-
-      // Horizontal wall/obstacle bounce
-      if (this.adapter.resolveHorizontalHit) {
-        if (this.adapter.resolveHorizontalHit(b.x, b.y, b.z, rad, _normal)) {
-          const vn = b.vx * _normal.x + b.vz * _normal.z;
-          if (vn < 0) {
-            const impactSpeed = -vn;
-            if (metrics.shatterable && impactSpeed > 6.8) {
-              this.shatterBottle(b, _normal.x, 0.2, _normal.z, impactSpeed * 0.55);
-              continue;
-            }
-            const bounce = 1 + metrics.restitution;
-            b.vx -= bounce * vn * _normal.x;
-            b.vz -= bounce * vn * _normal.z;
-            b.x += _normal.x * 0.03;
-            b.z += _normal.z * 0.03;
-            b.wy += (Math.random() - 0.5) * impactSpeed * 2.0;
-            if (impactSpeed > 0.9) {
-              this.triggerPropAudio(b, metrics.audioBounceKind, Math.min(0.95, impactSpeed * 0.18));
-            }
+          // Soft spawn-zone leash so outdoor wind-blown papers swirl cleanly without leaving map bounds
+          const leashDx = b.x - b.spawnX;
+          const leashDz = b.z - b.spawnZ;
+          if (leashDx * leashDx + leashDz * leashDz > 18 * 18) {
+            b.x = b.spawnX + (Math.random() - 0.5) * 1.4;
+            b.z = b.spawnZ + (Math.random() - 0.5) * 1.4;
+            b.y = b.spawnY + 0.18;
+            b.vx *= 0.25;
+            b.vy = 0.12;
+            b.vz *= 0.25;
+          }
+        } else {
+          b.vy += GRAVITY * subDt;
+          if (localWind > 0.55 && metrics.windDrag > 0.1) {
+            b.vx += this.windDirX * localWind * metrics.windDrag * subDt * 1.5;
+            b.vz += this.windDirZ * localWind * metrics.windDrag * subDt * 1.5;
           }
         }
-      }
 
-      // Support floor / tabletop / shelf collision
-      const supportY = this.adapter.sampleSupportHeight(b.x, b.y + 0.14, b.z);
-      const minCenterY = supportY + halfH;
-      let onGround = false;
+        // 2. Integrate linear & angular motion
+        b.x += b.vx * subDt;
+        b.y += b.vy * subDt;
+        b.z += b.vz * subDt;
 
-      if (b.y <= minCenterY) {
-        onGround = true;
-        const impactVy = -b.vy;
-        b.y = minCenterY;
-
-        if (metrics.shatterable && impactVy > 6.2) {
-          this.shatterBottle(b, b.vx * 0.15, 0.35, b.vz * 0.15, impactVy * 0.5);
-          continue;
-        }
-
-        if (impactVy > 0.72) {
-          b.vy = impactVy * metrics.restitution;
-          b.wx += (Math.random() - 0.5) * impactVy * 1.4;
-          b.wz += (Math.random() - 0.5) * impactVy * 1.4;
-          this.triggerPropAudio(b, metrics.audioBounceKind, Math.min(0.9, impactVy * 0.17));
-        } else {
-          b.vy = 0;
-        }
-
-        // Ground friction & resting alignment
-        const fric = Math.pow(1 - metrics.groundFriction * 0.75, stepDt * 6);
-        b.vx *= fric;
-        b.vz *= fric;
-        b.wx *= metrics.angularDamping;
-        b.wy *= metrics.angularDamping;
-        b.wz *= metrics.angularDamping;
-
-        // Papers gently flatten flush onto the floor when settling
-        if (b.kind === 'paper_sheet') {
-          _euler.setFromQuaternion(_quat.set(b.qx, b.qy, b.qz, b.qw), 'YXZ');
-          const flatten = Math.min(1, stepDt * 8.5);
-          _euler.x = THREE.MathUtils.lerp(_euler.x, 0, flatten);
-          _euler.z = THREE.MathUtils.lerp(_euler.z, 0, flatten);
-          _quat.setFromEuler(_euler);
+        const angSpeed = Math.hypot(b.wx, b.wy, b.wz);
+        if (angSpeed > 1e-4) {
+          const halfAngle = angSpeed * subDt * 0.5;
+          const s = Math.sin(halfAngle) / angSpeed;
+          _deltaQuat.set(b.wx * s, b.wy * s, b.wz * s, Math.cos(halfAngle));
+          _quat.set(b.qx, b.qy, b.qz, b.qw).premultiply(_deltaQuat).normalize();
           b.qx = _quat.x;
           b.qy = _quat.y;
           b.qz = _quat.z;
           b.qw = _quat.w;
         }
-      } else {
-        const airAng = Math.pow(metrics.angularDamping, stepDt * 3);
-        b.wx *= airAng;
-        b.wy *= airAng;
-        b.wz *= airAng;
+
+        const halfH = computeOrientedHalfExtentY(metrics, b.qx, b.qy, b.qz, b.qw, sx, sy, sz);
+        const rad = computeOrientedHorizRadius(metrics, b.qx, b.qy, b.qz, b.qw, sx, sy, sz);
+
+        // 3. Full 3D solid world sweep (walls, ceilings, floors, furniture sides, shelf undersides, doors)
+        if (this.adapter.resolveSolidCollision) {
+          for (let pass = 0; pass < 3; pass++) {
+            if (!this.adapter.resolveSolidCollision(b.x, b.y, b.z, rad, halfH, _solidHitScratch)) {
+              break;
+            }
+            b.x += _solidHitScratch.pushX;
+            b.y += _solidHitScratch.pushY;
+            b.z += _solidHitScratch.pushZ;
+
+            const nx = _solidHitScratch.normalX;
+            const ny = _solidHitScratch.normalY;
+            const nz = _solidHitScratch.normalZ;
+            const vn = b.vx * nx + b.vy * ny + b.vz * nz;
+
+            if (ny > 0.6) {
+              onGround = true;
+            }
+
+            if (vn < 0) {
+              const impactSpeed = -vn;
+              if (metrics.shatterable) {
+                const threshold = computeGlassShatterThreshold(_solidHitScratch.surface);
+                // Horizontal wall impacts break slightly above vertical drop threshold due to glancing angles
+                const effectiveThreshold = Math.abs(ny) > 0.55 ? threshold : threshold * 1.08;
+                if (impactSpeed >= effectiveThreshold) {
+                  this.shatterBottle(b, nx, Math.max(0.15, ny * 0.5), nz, impactSpeed * 0.55);
+                  destroyed = true;
+                  break;
+                }
+              }
+
+              const rest = impactSpeed > 0.38 ? metrics.restitution : 0;
+              const bounce = 1 + rest;
+              b.vx -= bounce * vn * nx;
+              b.vy -= bounce * vn * ny;
+              b.vz -= bounce * vn * nz;
+
+              // Tangential friction on solid wall/ceiling/top contact
+              const tx = b.vx - (b.vx * nx + b.vy * ny + b.vz * nz) * nx;
+              const ty = b.vy - (b.vx * nx + b.vy * ny + b.vz * nz) * ny;
+              const tz = b.vz - (b.vx * nx + b.vy * ny + b.vz * nz) * nz;
+              const tangDrag = Math.min(0.45, metrics.groundFriction * 0.35);
+              b.vx -= tx * tangDrag;
+              b.vy -= ty * tangDrag;
+              b.vz -= tz * tangDrag;
+
+              if (impactSpeed > 0.55) {
+                b.wx += (Math.random() - 0.5) * impactSpeed * 1.6;
+                b.wy += (Math.random() - 0.5) * impactSpeed * 1.8;
+                b.wz += (Math.random() - 0.5) * impactSpeed * 1.6;
+                this.triggerPropAudio(b, metrics.audioBounceKind, Math.min(0.95, impactSpeed * 0.2));
+              }
+            }
+          }
+          if (destroyed) break;
+        } else if (this.adapter.resolveHorizontalHit) {
+          if (this.adapter.resolveHorizontalHit(b.x, b.y, b.z, rad, _normal)) {
+            const vn = b.vx * _normal.x + b.vz * _normal.z;
+            if (vn < 0) {
+              const impactSpeed = -vn;
+              if (metrics.shatterable && impactSpeed >= computeGlassShatterThreshold('concrete') * 1.08) {
+                this.shatterBottle(b, _normal.x, 0.2, _normal.z, impactSpeed * 0.55);
+                destroyed = true;
+                break;
+              }
+              const bounce = 1 + metrics.restitution;
+              b.vx -= bounce * vn * _normal.x;
+              b.vz -= bounce * vn * _normal.z;
+              b.x += _normal.x * (rad * 0.35);
+              b.z += _normal.z * (rad * 0.35);
+              b.wy += (Math.random() - 0.5) * impactSpeed * 2.0;
+              if (impactSpeed > 0.7) {
+                this.triggerPropAudio(b, metrics.audioBounceKind, Math.min(0.95, impactSpeed * 0.2));
+              }
+            }
+          }
+        }
+
+        // 4. Support terrain / ramp / floor / tabletop / shelf landing check (with surface material!)
+        this.sampleSupport(b.x, b.y - halfH + 0.16, b.z, _supportScratch);
+        const minCenterY = _supportScratch.height + halfH;
+
+        if (b.y <= minCenterY + 0.001) {
+          onGround = true;
+          const impactVy = -b.vy;
+          b.y = minCenterY;
+
+          if (metrics.shatterable && impactVy >= computeGlassShatterThreshold(_supportScratch.surface)) {
+            this.shatterBottle(b, b.vx * 0.18, 0.35, b.vz * 0.18, impactVy * 0.52);
+            destroyed = true;
+            break;
+          }
+
+          if (impactVy > 0.42 && metrics.restitution > 0.04) {
+            b.vy = impactVy * metrics.restitution;
+            const tumble = Math.min(6.0, impactVy * (1.25 - metrics.groundFriction * 0.4));
+            b.wx += (Math.random() - 0.5) * tumble;
+            b.wz += (Math.random() - 0.5) * tumble;
+            this.triggerPropAudio(b, metrics.audioBounceKind, Math.min(0.92, impactVy * 0.21));
+          } else {
+            b.vy = 0;
+          }
+
+          // Ground friction & resting angular damping
+          const fric = Math.pow(1 - metrics.groundFriction * 0.78, subDt * 6.5);
+          b.vx *= fric;
+          b.vz *= fric;
+          const angFric = Math.pow(metrics.angularDamping, subDt * 60);
+          b.wx *= angFric;
+          b.wy *= angFric;
+          b.wz *= angFric;
+
+          // Natural resting orientation settle when almost stationary on floor/table
+          const horizSpdSq = b.vx * b.vx + b.vz * b.vz;
+          if (b.kind === 'paper_sheet') {
+            _euler.setFromQuaternion(_quat.set(b.qx, b.qy, b.qz, b.qw), 'YXZ');
+            const flatten = Math.min(1, subDt * 10.0);
+            _euler.x = THREE.MathUtils.lerp(_euler.x, 0, flatten);
+            _euler.z = THREE.MathUtils.lerp(_euler.z, 0, flatten);
+            _quat.setFromEuler(_euler);
+            b.qx = _quat.x;
+            b.qy = _quat.y;
+            b.qz = _quat.z;
+            b.qw = _quat.w;
+          } else if (horizSpdSq < 0.35 && b.vy === 0) {
+            // Gently relax tilted bottles/cans onto upright or clean side rest, and boxes onto flat faces
+            const r11 = 1 - 2 * (b.qx * b.qx + b.qz * b.qz);
+            if (metrics.shape === 'cylinder') {
+              _euler.setFromQuaternion(_quat.set(b.qx, b.qy, b.qz, b.qw), 'YXZ');
+              const settleRate = Math.min(1, subDt * 6.0);
+              if (Math.abs(r11) > 0.72) {
+                _euler.x = THREE.MathUtils.lerp(_euler.x, 0, settleRate);
+                _euler.z = THREE.MathUtils.lerp(_euler.z, 0, settleRate);
+              } else {
+                // Tipped cylinder settles cleanly flat on its curved side (roll = +-PI/2)
+                const targetRoll = _euler.z >= 0 ? Math.PI * 0.5 : -Math.PI * 0.5;
+                _euler.x = THREE.MathUtils.lerp(_euler.x, 0, settleRate);
+                _euler.z = THREE.MathUtils.lerp(_euler.z, targetRoll, settleRate);
+              }
+              _quat.setFromEuler(_euler);
+              b.qx = _quat.x;
+              b.qy = _quat.y;
+              b.qz = _quat.z;
+              b.qw = _quat.w;
+              // Re-flush Y immediately for updated resting angle
+              const nextHalfH = computeOrientedHalfExtentY(metrics, b.qx, b.qy, b.qz, b.qw, sx, sy, sz);
+              b.y = _supportScratch.height + nextHalfH;
+            }
+          }
+        } else {
+          const airAng = Math.pow(metrics.angularDamping, subDt * 3);
+          b.wx *= airAng;
+          b.wy *= airAng;
+          b.wz *= airAng;
+        }
+
+        // 5. Spatial-hash prop-to-prop collision solver
+        if (this.resolvePropToPropCollisions(b, metrics, rad, halfH)) {
+          destroyed = true;
+          break;
+        }
       }
+
+      if (destroyed) continue;
 
       // Sleep state check
       const linSq = b.vx * b.vx + b.vy * b.vy + b.vz * b.vz;
@@ -1641,13 +2221,31 @@ export class DynamicPhysicsPropSystem {
       sh.ry += sh.vry * dt;
       sh.rz += sh.vrz * dt;
 
+      // Keep shattered glass shards bouncing cleanly inside rooms (no wall/ceiling clipping)
+      if (this.adapter.resolveSolidCollision) {
+        if (this.adapter.resolveSolidCollision(sh.x, sh.y, sh.z, 0.025, 0.012, _solidHitScratch)) {
+          sh.x += _solidHitScratch.pushX;
+          sh.y += _solidHitScratch.pushY;
+          sh.z += _solidHitScratch.pushZ;
+          const vn =
+            sh.vx * _solidHitScratch.normalX +
+            sh.vy * _solidHitScratch.normalY +
+            sh.vz * _solidHitScratch.normalZ;
+          if (vn < 0) {
+            sh.vx -= 1.25 * vn * _solidHitScratch.normalX;
+            sh.vy -= 1.25 * vn * _solidHitScratch.normalY;
+            sh.vz -= 1.25 * vn * _solidHitScratch.normalZ;
+          }
+        }
+      }
+
       const supportY = this.adapter.sampleSupportHeight(sh.x, sh.y + 0.12, sh.z);
-      if (sh.y <= supportY + 0.008) {
-        sh.y = supportY + 0.008;
-        if (-sh.vy > 0.55) {
-          sh.vy = -sh.vy * 0.28;
-          sh.vx *= 0.65;
-          sh.vz *= 0.65;
+      if (sh.y <= supportY + 0.005) {
+        sh.y = supportY + 0.005;
+        if (-sh.vy > 0.48) {
+          sh.vy = -sh.vy * 0.22;
+          sh.vx *= 0.64;
+          sh.vz *= 0.64;
           sh.vrx *= 0.6;
           sh.vry *= 0.6;
           sh.vrz *= 0.6;
@@ -1657,7 +2255,7 @@ export class DynamicPhysicsPropSystem {
           sh.vz *= 0.5;
           sh.rx = 0;
           sh.rz = 0;
-          if (sh.vx * sh.vx + sh.vz * sh.vz < 0.015) {
+          if (sh.vx * sh.vx + sh.vz * sh.vz < 0.012) {
             sh.sleeping = true;
           }
         }
@@ -1718,95 +2316,281 @@ export class DynamicPhysicsPropSystem {
 }
 
 /**
- * Lightweight zero-GC adapter binding any BodycamPhysicsWorld (Hideout, Zombies Outpost,
+ * Lightweight zero-GC analytical adapter binding any BodycamPhysicsWorld (Hideout, Zombies Outpost,
  * Combat/Infection maps, Calibration Gym, Killhouse Tutorial) to DynamicPhysicsPropSystem.
+ * Directly resolves all AABB boxes, sloped ramps, dynamic hinged door slabs, ceilings, and map bounds
+ * with exact minimum-translation-vector depenetration (zero dependency on stale scene raycast matrices).
  */
 export function createBodycamPhysicsPropAdapter(
   physics: BodycamPhysicsWorld,
   terrainHeightAt?: (x: number, z: number) => number,
+  terrainSurface: BodycamSurfaceMaterial = 'grass',
 ): DynamicPropWorldAdapter {
-  const interiorSample = { isIndoor: false, material: 'outdoor' as 'concrete' | 'wood' | 'metal' | 'outdoor' };
-  const rayOrigin = new THREE.Vector3();
-  const rayDown = new THREE.Vector3(0, -1, 0);
-  const rayHit = {
-    hit: false,
-    distance: Infinity,
-    pointX: 0,
-    pointY: 0,
-    pointZ: 0,
-    normalX: 0,
-    normalY: 1,
-    normalZ: 0,
-    surface: 'concrete' as const,
-    object: null as THREE.Object3D | null,
+  const interiorSample = {
+    isIndoor: false,
+    material: 'outdoor' as 'concrete' | 'wood' | 'metal' | 'outdoor',
+  };
+  const supportTmp: DynamicPropSupportSample = { height: 0, surface: 'concrete' };
+
+  const sampleSupportSurface = (
+    x: number,
+    maxSurfaceY: number,
+    z: number,
+    out: DynamicPropSupportSample,
+  ): void => {
+    let bestY = physics.baseFloorY;
+    let bestSurface: BodycamSurfaceMaterial = 'concrete';
+
+    if (terrainHeightAt) {
+      const ty = terrainHeightAt(x, z);
+      if (Number.isFinite(ty) && ty > bestY) {
+        bestY = ty;
+        bestSurface = terrainSurface;
+      }
+    }
+
+    // 1. Check all solid AABB box tops (floors, tables, benches, plinking ledges, shelf tiers, crates)
+    const boxes = physics.boxes;
+    for (let i = 0; i < boxes.length; i++) {
+      const bx = boxes[i];
+      if (bx.blocksMovement === false) continue;
+      if (x < bx.minX || x > bx.maxX || z < bx.minZ || z > bx.maxZ) continue;
+      if (bx.maxY <= maxSurfaceY + 0.04 && bx.maxY > bestY) {
+        bestY = bx.maxY;
+        bestSurface = bx.surface ?? 'concrete';
+      }
+    }
+
+    // 2. Check all sloped ramps
+    const ramps = physics.ramps;
+    for (let i = 0; i < ramps.length; i++) {
+      const rp = ramps[i];
+      if (x < rp.minX || x > rp.maxX || z < rp.minZ || z > rp.maxZ) continue;
+      let t = 0;
+      if (rp.riseAxis === '+x') t = (x - rp.minX) / Math.max(1e-4, rp.maxX - rp.minX);
+      else if (rp.riseAxis === '-x') t = (rp.maxX - x) / Math.max(1e-4, rp.maxX - rp.minX);
+      else if (rp.riseAxis === '+z') t = (z - rp.minZ) / Math.max(1e-4, rp.maxZ - rp.minZ);
+      else t = (rp.maxZ - z) / Math.max(1e-4, rp.maxZ - rp.minZ);
+      const ry = rp.baseY + (rp.topY - rp.baseY) * Math.max(0, Math.min(1, t));
+      if (ry <= maxSurfaceY + 0.06 && ry > bestY) {
+        bestY = ry;
+        bestSurface = rp.surface ?? 'concrete';
+      }
+    }
+
+    // 3. Apply authored surface zone material overrides on ground floor (e.g. grass/wood/metal pads)
+    const zones = physics.surfaceZones;
+    for (let i = 0; i < zones.length; i++) {
+      const sz = zones[i];
+      if (x < sz.minX || x > sz.maxX || z < sz.minZ || z > sz.maxZ) continue;
+      if (sz.minY !== undefined && bestY < sz.minY - 0.1) continue;
+      if (sz.maxY !== undefined && bestY > sz.maxY + 0.1) continue;
+      bestSurface = sz.surface;
+    }
+
+    out.height = bestY;
+    out.surface = bestSurface;
+  };
+
+  const resolveSolidCollision = (
+    x: number,
+    y: number,
+    z: number,
+    radius: number,
+    halfHeight: number,
+    out: DynamicPropSolidHit,
+  ): boolean => {
+    out.hit = false;
+    out.pushX = 0;
+    out.pushY = 0;
+    out.pushZ = 0;
+    out.normalX = 0;
+    out.normalY = 1;
+    out.normalZ = 0;
+    out.surface = 'concrete';
+
+    // 1. World perimeter walls
+    const margin = radius + 0.02;
+    if (x < physics.boundsMinX + margin) {
+      out.hit = true;
+      out.pushX = physics.boundsMinX + margin - x;
+      out.normalX = 1;
+      out.normalY = 0;
+      out.normalZ = 0;
+      return true;
+    }
+    if (x > physics.boundsMaxX - margin) {
+      out.hit = true;
+      out.pushX = physics.boundsMaxX - margin - x;
+      out.normalX = -1;
+      out.normalY = 0;
+      out.normalZ = 0;
+      return true;
+    }
+    if (z < physics.boundsMinZ + margin) {
+      out.hit = true;
+      out.pushZ = physics.boundsMinZ + margin - z;
+      out.normalX = 0;
+      out.normalY = 0;
+      out.normalZ = 1;
+      return true;
+    }
+    if (z > physics.boundsMaxZ - margin) {
+      out.hit = true;
+      out.pushZ = physics.boundsMaxZ - margin - z;
+      out.normalX = 0;
+      out.normalY = 0;
+      out.normalZ = -1;
+      return true;
+    }
+
+    // 2. Exact 3D AABB-vs-AABB minimum-translation-vector resolution against ALL solid boxes
+    //    (covers walls, ceilings, shelf tiers, shelf undersides, desks, crates, pillars, barricades)
+    const pMinX = x - radius;
+    const pMaxX = x + radius;
+    const pMinY = y - halfHeight;
+    const pMaxY = y + halfHeight;
+    const pMinZ = z - radius;
+    const pMaxZ = z + radius;
+
+    let bestPen = Infinity;
+    let bestPx = 0;
+    let bestPy = 0;
+    let bestPz = 0;
+    let bestNx = 0;
+    let bestNy = 0;
+    let bestNz = 0;
+    let bestSurface: BodycamSurfaceMaterial = 'concrete';
+
+    const boxes = physics.boxes;
+    for (let i = 0; i < boxes.length; i++) {
+      const bx = boxes[i];
+      if (bx.blocksMovement === false) continue;
+
+      const ox = Math.min(pMaxX, bx.maxX) - Math.max(pMinX, bx.minX);
+      if (ox <= 1e-4) continue;
+      const oy = Math.min(pMaxY, bx.maxY) - Math.max(pMinY, bx.minY);
+      if (oy <= 1e-4) continue;
+      const oz = Math.min(pMaxZ, bx.maxZ) - Math.max(pMinZ, bx.minZ);
+      if (oz <= 1e-4) continue;
+
+      // Determine minimum penetration axis
+      let pen: number;
+      let px = 0;
+      let py = 0;
+      let pz = 0;
+      let nx = 0;
+      let ny = 0;
+      let nz = 0;
+
+      if (oy <= ox && oy <= oz) {
+        pen = oy;
+        const boxCenterY = (bx.minY + bx.maxY) * 0.5;
+        if (y >= boxCenterY) {
+          py = oy;
+          ny = 1;
+        } else {
+          py = -oy;
+          ny = -1;
+        }
+      } else if (ox <= oz) {
+        pen = ox;
+        const boxCenterX = (bx.minX + bx.maxX) * 0.5;
+        if (x >= boxCenterX) {
+          px = ox;
+          nx = 1;
+        } else {
+          px = -ox;
+          nx = -1;
+        }
+      } else {
+        pen = oz;
+        const boxCenterZ = (bx.minZ + bx.maxZ) * 0.5;
+        if (z >= boxCenterZ) {
+          pz = oz;
+          nz = 1;
+        } else {
+          pz = -oz;
+          nz = -1;
+        }
+      }
+
+      if (pen < bestPen) {
+        bestPen = pen;
+        bestPx = px;
+        bestPy = py;
+        bestPz = pz;
+        bestNx = nx;
+        bestNy = ny;
+        bestNz = nz;
+        bestSurface = bx.surface ?? 'concrete';
+      }
+    }
+
+    // 3. Dynamic hinged doors (oriented 2D slabs)
+    const slabs = physics.slabs;
+    for (let i = 0; i < slabs.length; i++) {
+      const slab = slabs[i];
+      if (!slab.active) continue;
+      if (pMaxY <= slab.minY || pMinY >= slab.maxY) continue;
+
+      const relX = x - slab.originX;
+      const relZ = z - slab.originZ;
+      const proj = Math.max(0, Math.min(slab.length, relX * slab.dirX + relZ * slab.dirZ));
+      const closestX = slab.originX + slab.dirX * proj;
+      const closestZ = slab.originZ + slab.dirZ * proj;
+      const dx = x - closestX;
+      const dz = z - closestZ;
+      const minClear = slab.halfThickness + radius;
+      const dSq = dx * dx + dz * dz;
+      if (dSq >= minClear * minClear) continue;
+
+      const dist = Math.sqrt(dSq);
+      let nx: number;
+      let nz: number;
+      if (dist > 1e-4) {
+        nx = dx / dist;
+        nz = dz / dist;
+      } else {
+        nx = -slab.dirZ;
+        nz = slab.dirX;
+      }
+      const pen = minClear - dist;
+      if (pen < bestPen) {
+        bestPen = pen;
+        bestPx = nx * pen;
+        bestPy = 0;
+        bestPz = nz * pen;
+        bestNx = nx;
+        bestNy = 0;
+        bestNz = nz;
+        bestSurface = 'wood';
+      }
+    }
+
+    if (bestPen < Infinity) {
+      out.hit = true;
+      out.pushX = bestPx;
+      out.pushY = bestPy;
+      out.pushZ = bestPz;
+      out.normalX = bestNx;
+      out.normalY = bestNy;
+      out.normalZ = bestNz;
+      out.surface = bestSurface;
+      return true;
+    }
+
+    return false;
   };
 
   return {
     sampleSupportHeight(x: number, maxSurfaceY: number, z: number): number {
-      let bestY = terrainHeightAt ? terrainHeightAt(x, z) : physics.baseFloorY;
-
-      // Fast vertical probe downward against physics AABBs/ramps for tabletops, shelves, crates & upper floors
-      rayOrigin.set(x, maxSurfaceY + 0.08, z);
-      if (physics.raycast(rayOrigin, rayDown, 0.01, 4.2, rayHit)) {
-        if (rayHit.normalY > 0.55 && rayHit.pointY <= maxSurfaceY + 0.06 && rayHit.pointY > bestY) {
-          bestY = rayHit.pointY;
-        }
-      }
-      return bestY;
+      sampleSupportSurface(x, maxSurfaceY, z, supportTmp);
+      return supportTmp.height;
     },
 
-    resolveHorizontalHit(
-      x: number,
-      y: number,
-      z: number,
-      radius: number,
-      outNormal: THREE.Vector3,
-    ): boolean {
-      const margin = radius + 0.04;
-      if (x < physics.boundsMinX + margin) {
-        outNormal.set(1, 0, 0);
-        return true;
-      }
-      if (x > physics.boundsMaxX - margin) {
-        outNormal.set(-1, 0, 0);
-        return true;
-      }
-      if (z < physics.boundsMinZ + margin) {
-        outNormal.set(0, 0, 1);
-        return true;
-      }
-      if (z > physics.boundsMaxZ - margin) {
-        outNormal.set(0, 0, -1);
-        return true;
-      }
-      // Check horizontal box collisions via fast point-vs-box probe
-      const boxes = (physics as unknown as { boxes?: ReadonlyArray<{ minX: number; maxX: number; minY: number; maxY: number; minZ: number; maxZ: number; blocksMovement?: boolean }> }).boxes;
-      if (boxes) {
-        for (let i = 0; i < boxes.length; i++) {
-          const bx = boxes[i];
-          if (bx.blocksMovement === false) continue;
-          if (y < bx.minY + 0.02 || y > bx.maxY - 0.04) continue;
-          if (
-            x + radius > bx.minX &&
-            x - radius < bx.maxX &&
-            z + radius > bx.minZ &&
-            z - radius < bx.maxZ
-          ) {
-            const penLeft = Math.abs(x + radius - bx.minX);
-            const penRight = Math.abs(bx.maxX - (x - radius));
-            const penBack = Math.abs(z + radius - bx.minZ);
-            const penFront = Math.abs(bx.maxZ - (z - radius));
-            const minPen = Math.min(penLeft, penRight, penBack, penFront);
-            if (minPen === penLeft) outNormal.set(-1, 0, 0);
-            else if (minPen === penRight) outNormal.set(1, 0, 0);
-            else if (minPen === penBack) outNormal.set(0, 0, -1);
-            else outNormal.set(0, 0, 1);
-            return true;
-          }
-        }
-      }
-      return false;
-    },
+    sampleSupportSurface,
+    resolveSolidCollision,
 
     isIndoor(x: number, y: number, z: number): boolean {
       physics.sampleInterior(x, y, z, interiorSample);

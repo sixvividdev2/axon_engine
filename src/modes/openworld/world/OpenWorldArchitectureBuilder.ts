@@ -1671,28 +1671,28 @@ export class OpenWorldArchitectureBuilder {
         propSpawns.push({ kind, x: w.x, y: fob.baseY + ly, z: w.z, yaw: yaw + fob.yaw, roll, ownerTag });
       };
 
-      // Command Bunker tactical map table dossiers, coffee/soda cans & bottles
-      pushFobProp('paper_sheet', -3.6, 1.24, 2.35, 0.25);
-      pushFobProp('paper_sheet', -3.1, 1.24, 2.55, -0.4);
-      pushFobProp('soda_can', -2.7, 1.24, 2.15, 0.9);
-      pushFobProp('glass_bottle_amber', -2.5, 1.24, 2.68, 1.5);
-      // Armory gunsmith bench bottles, ration tins & cardboard ammo cartons
-      pushFobProp('glass_bottle_green', 18.6, 1.18, -5.25, 0.4);
-      pushFobProp('ration_tin', 19.3, 1.18, -5.15, 1.1);
-      pushFobProp('cardboard_box', 16.5, 0.25, -5.4, 0.2);
-      // Field Hospital medical supply clutter
+      // Command Bunker tactical map table (top Y = 1.18m, outside central raised holo console)
+      pushFobProp('paper_sheet', -4.35, 1.19, 2.05, 0.25);
+      pushFobProp('paper_sheet', -4.35, 1.19, 2.72, -0.4);
+      pushFobProp('soda_can', -2.22, 1.19, 2.05, 0.9);
+      pushFobProp('glass_bottle_amber', -2.22, 1.19, 2.75, 1.5);
+      // Armory gunsmith bench open ends (top Y = 1.14m, outside central ammo crate) & floor carton
+      pushFobProp('glass_bottle_green', 18.05, 1.15, -5.25, 0.4);
+      pushFobProp('ration_tin', 20.25, 1.15, -5.15, 1.1);
+      pushFobProp('cardboard_box', 16.5, 0.24, -5.4, 0.2);
+      // Field Hospital medical supply clutter (floor Y = 0.20m)
       pushFobProp('glass_bottle_amber', 14.5, 0.24, 11.4, 0.8);
       pushFobProp('paper_sheet', 17.8, 0.22, 9.2, 0.5);
-      // Barracks & Mess Tent bottles/cans/tins
-      pushFobProp('glass_bottle_green', -32.2, 1.14, 19.1, 0.3);
-      pushFobProp('soda_can', -32.6, 1.14, 19.35, 1.8);
-      pushFobProp('ration_tin', -31.8, 1.14, 18.95, 2.1);
-      // Shooting-range firing line shootable bottles & cans!
+      // Barracks & Mess Table (top Y = 1.10m)
+      pushFobProp('glass_bottle_green', -32.2, 1.11, 19.1, 0.3);
+      pushFobProp('soda_can', -32.6, 1.11, 19.35, 1.8);
+      pushFobProp('ration_tin', -31.8, 1.11, 18.95, 2.1);
+      // Shooting-range firing line wooden shelf (top Y = 1.01m) shootable bottles & cans!
       for (let b = 0; b < 5; b++) {
         pushFobProp(
           b % 3 === 0 ? 'glass_bottle_green' : b % 3 === 1 ? 'glass_bottle_amber' : 'soda_can',
           -20.5 + b * 0.48,
-          1.12,
+          1.02,
           -26.2,
           b * 0.8,
         );
@@ -3872,14 +3872,11 @@ export class OpenWorldArchitectureBuilder {
         batcher.addBox('concreteDark', gen.x, t.wy + 0.14, gen.z, 2.5, 0.16, 1.55, t.yaw, 0.42, 0.44, 0.45);
         batcher.addBox('steel', gen.x, t.wy + 0.78, gen.z, 2.15, 1.12, 1.12, t.yaw, 0.34, 0.42, 0.30);
         batcher.addBox('steel', gen.x, t.wy + 1.54, gen.z, 0.26, 0.44, 0.26, t.yaw, 0.24, 0.26, 0.28);
-        // Gun-range wooden shooting shelf at firing line (-19.5, -26.2)
-        const shelf = localToWorldXZ(t, -19.5, -26.2);
-        batcher.addBox('woodTrim', shelf.x, t.wy + 0.96, shelf.z, 3.2, 0.10, 0.72, t.yaw, 0.52, 0.40, 0.28);
-        const legL = localToWorldXZ(t, -20.85, -26.2);
-        const legR = localToWorldXZ(t, -18.15, -26.2);
-        batcher.addBox('steel', legL.x, t.wy + 0.48, legL.z, 0.12, 0.92, 0.62, t.yaw, 0.32, 0.35, 0.38);
-        batcher.addBox('steel', legR.x, t.wy + 0.48, legR.z, 0.12, 0.92, 0.62, t.yaw, 0.32, 0.35, 0.38);
       }
+      // Gun-range wooden shooting shelf at firing line (-19.5, -26.2, top Y = 1.01m) with solid OBBs
+      this.addSolidBox(t, batcher, outObbs, 'woodTrim', 'wood', -19.5, 0.96, -26.2, 3.2, 0.10, 0.72, 0.52, 0.40, 0.28);
+      this.addSolidBox(t, batcher, outObbs, 'steel', 'metal', -20.85, 0.455, -26.2, 0.12, 0.91, 0.62, 0.32, 0.35, 0.38);
+      this.addSolidBox(t, batcher, outObbs, 'steel', 'metal', -18.15, 0.455, -26.2, 0.12, 0.91, 0.62, 0.32, 0.35, 0.38);
       outObbs.push({
         cx: mp.x,
         cy: t.wy + mh,
