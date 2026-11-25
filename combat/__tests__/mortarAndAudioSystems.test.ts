@@ -36,12 +36,20 @@ import {
   MAX_SCORCH_DECAL_POOL,
   MORTAR_AI_RECLAIM_DELAY_SEC,
   MORTAR_CREW_REINFORCE_SEC,
+  MORTAR_DANGER_CLOSE_RADIUS_M,
   MORTAR_HQ_EXCLUSION_RADIUS_M,
+  MORTAR_KIA_COOLDOWN_REFUND_RATIO,
+  MORTAR_MISSION_CADENCE_SEC,
+  MORTAR_MISSION_CEP_M,
+  MORTAR_MISSION_ROUNDS,
   MORTAR_RELOAD_AI_LOADER_SEC,
   MORTAR_RELOAD_SOLO_SEC,
+  MORTAR_SWEEP_COOLDOWN_SEC,
   MortarEmplacementSystem,
+  MortarMissionEvent,
   MortarSiteConfig,
   computeMortarBlastDamageForActor,
+  evaluateMortarDangerClose,
 } from '../MortarEmplacementSystem';
 
 function createFlatWorldAdapter(): IBodycamWorldAdapter {
@@ -681,5 +689,360 @@ describe('gameRelayGuard Mortar Packet Security', () => {
     );
     expect(hostSync).not.toBeNull();
     expect((hostSync?.payload.pits as unknown[]).length).toBe(6);
+  });
+
+  it('validates Phase 3 fire_support_request, host-only fire_support_rejected, and sync teams/activeMissions', () => {
+    const lobby = createSampleLobbyState();
+    const matchState = createDefaultMatchState();
+
+    // Client mortar sweep request routes to host with sanitized finite coordinates
+    const req = validateAndSanitizeGameMessage(
+      {
+        type: 'game:fire_support_request',
+        kind: 'mortar_sweep',
+        targetX: 42.1234,
+        targetZ: -88.9876,
+      },
+      lobby,
+      matchState,
+      { userId: 'peer-2', username: 'BravoTwo' },
+    );
+    expect(req).not.toBeNull();
+    expect(req?.targetUserId).toBe('host-1');
+    expect(req?.payload.targetX).toBe(42.12);
+    expect(req?.payload.targetZ).toBe(-88.99);
+
+    // Invalid kind or NaN coords rejected
+    expect(
+      validateAndSanitizeGameMessage(
+        { type: 'game:fire_support_request', kind: 'invalid', targetX: 10, targetZ: 10 },
+        lobby,
+        matchState,
+        { userId: 'peer-2', username: 'BravoTwo' },
+      ),
+    ).toBeNull();
+    expect(
+      validateAndSanitizeGameMessage(
+        { type: 'game:fire_support_request', kind: 'mortar_sweep', targetX: Number.NaN, targetZ: 10 },
+        lobby,
+        matchState,
+        { userId: 'peer-2', username: 'BravoTwo' },
+      ),
+    ).toBeNull();
+
+    // Non-host forged fire_support_rejected blocked; host rejection routed directly to requester
+    expect(
+      validateAndSanitizeGameMessage(
+        {
+          type: 'game:fire_support_rejected',
+          targetUserId: 'host-1',
+          kind: 'mortar_sweep',
+          reason: 'forged',
+        },
+        lobby,
+        matchState,
+        { userId: 'peer-2', username: 'BravoTwo' },
+      ),
+    ).toBeNull();
+
+    const hostRej = validateAndSanitizeGameMessage(
+      {
+        type: 'game:fire_support_rejected',
+        targetUserId: 'peer-2',
+        kind: 'mortar_sweep',
+        reason: 'Target Inside 65m HQ No-Fire Zone',
+      },
+      lobby,
+      matchState,
+      { userId: 'host-1', username: 'AlphaLead' },
+    );
+    expect(hostRej).not.toBeNull();
+    expect(hostRej?.targetUserId).toBe('peer-2');
+    expect(hostRej?.payload.reason).toBe('Target Inside 65m HQ No-Fire Zone');
+
+    // Host fire_support_sync sanitizes teams tuple and caps activeMissions to 2
+    const syncWithMissions = validateAndSanitizeGameMessage(
+      {
+        type: 'game:fire_support_sync',
+        enabled: true,
+        pits: [],
+        teams: [
+          {
+            team: 'A',
+            airStrikeCooldownSec: 0,
+            airStrikeMaxCooldownSec: 150,
+            mortarStrikeCooldownSec: 71.4,
+            mortarStrikeMaxCooldownSec: 75,
+            activeBomberId: null,
+            activeMortarMissionId: 'fm_A_1',
+          },
+          {
+            team: 'B',
+            airStrikeCooldownSec: 0,
+            airStrikeMaxCooldownSec: 150,
+            mortarStrikeCooldownSec: 0,
+            mortarStrikeMaxCooldownSec: 75,
+            activeBomberId: null,
+            activeMortarMissionId: null,
+          },
+        ],
+        activeMissions: [
+          { missionId: 'm1', pitId: 'p1', team: 'A', targetX: 10, targetZ: 20, roundsRemaining: 4, totalRounds: 5, callerName: 'Alpha' },
+          { missionId: 'm2', pitId: 'p2', team: 'B', targetX: 30, targetZ: 40, roundsRemaining: 2, totalRounds: 5, callerName: 'Bravo' },
+          { missionId: 'm3', pitId: 'p3', team: 'A', targetX: 50, targetZ: 60, roundsRemaining: 1, totalRounds: 5, callerName: 'Extra' },
+        ],
+      },
+      lobby,
+      matchState,
+      { userId: 'host-1', username: 'AlphaLead' },
+    );
+    expect(syncWithMissions).not.toBeNull();
+    expect((syncWithMissions?.payload.teams as unknown[]).length).toBe(2);
+    expect((syncWithMissions?.payload.activeMissions as unknown[]).length).toBe(2);
+  });
+});
+
+describe('Phase 3 Conquest Fire Support — 1-Sweep 5-Round Mortar Overrides', () => {
+  function buildPhase3Sites(): MortarSiteConfig[] {
+    return [
+      {
+        pitId: 'mortar_hq_a',
+        ownerTeam: 'A',
+        sourceType: 'HQ',
+        sourceId: 'hq_a',
+        position: [-200, 0, 0],
+        zeroBearingRad: Math.PI * 0.5,
+        active: true,
+      },
+      {
+        pitId: 'mortar_hq_b',
+        ownerTeam: 'B',
+        sourceType: 'HQ',
+        sourceId: 'hq_b',
+        position: [200, 0, 0],
+        zeroBearingRad: Math.PI * 1.5,
+        active: true,
+      },
+    ];
+  }
+
+  it('executes 5-round 1.4s cadence 18m CEP fire mission with 75s cooldown, 65m HQ block, and 45m Danger Close warning', () => {
+    const scene = new THREE.Scene();
+    const launched: Array<{ callerId: string; callerTeam: string; ix: number; iz: number; t: number }> = [];
+    const events: MortarMissionEvent[] = [];
+    let simTime = 0;
+
+    const sys = new MortarEmplacementSystem({
+      scene,
+      isHost: true,
+      onLaunchBroadcast: (pkt) => {
+        launched.push({
+          callerId: pkt.callerId,
+          callerTeam: pkt.callerTeam,
+          ix: pkt.ix,
+          iz: pkt.iz,
+          t: simTime,
+        });
+      },
+      onMissionEvent: (ev) => events.push(ev),
+    });
+    sys.configureSites(buildPhase3Sites());
+
+    const exclusions = [
+      { x: -200, z: 0, radiusM: MORTAR_HQ_EXCLUSION_RADIUS_M, team: 'A' as const, kind: 'hq' as const },
+      { x: 200, z: 0, radiusM: MORTAR_HQ_EXCLUSION_RADIUS_M, team: 'B' as const, kind: 'hq' as const },
+    ];
+
+    // 1. Target inside 65m Enemy HQ exclusion is rejected without starting cooldown
+    const hqBlocked = sys.requestMortarFireMission({
+      callerId: 'p1',
+      callerName: 'Alpha1',
+      callerTeam: 'A',
+      targetX: 185,
+      targetZ: 10,
+      exclusionZones: exclusions,
+      friendlyPositions: [{ x: 0, z: 0 }],
+    });
+    expect(hqBlocked.ok).toBe(false);
+    expect(hqBlocked.reason).toContain('65m HQ');
+    expect(sys.getTeamFireSupportState('A').mortarStrikeCooldownSec).toBe(0);
+
+    // 2. Danger Close (<45m) helper & reticle evaluation accurately detect friendly proximity
+    const dcClose = evaluateMortarDangerClose(20, 10, [{ x: 5, z: 10 }], MORTAR_DANGER_CLOSE_RADIUS_M);
+    expect(dcClose.dangerClose).toBe(true);
+    expect(dcClose.minFriendlyDistM).toBeCloseTo(15, 2);
+
+    const evalClose = sys.evaluateFireMissionTarget({
+      team: 'A',
+      targetX: 20,
+      targetZ: 10,
+      exclusionZones: exclusions,
+      friendlyPositions: [{ x: 0, z: 10 }], // 20m away -> Danger Close
+    });
+    expect(evalClose.canCall).toBe(true);
+    expect(evalClose.dangerClose).toBe(true);
+
+    // 3. Call valid 5-round Mortar Sweep at (20, 10) with Danger Close warning
+    const callRes = sys.requestMortarFireMission({
+      callerId: 'p1',
+      callerName: 'Alpha1',
+      callerTeam: 'A',
+      targetX: 20,
+      targetZ: 10,
+      exclusionZones: exclusions,
+      friendlyPositions: [{ x: 0, z: 10 }],
+    });
+    expect(callRes.ok).toBe(true);
+    expect(callRes.dangerClose).toBe(true);
+    expect(sys.getPitState('mortar_hq_a')?.status).toBe('FIRE_MISSION');
+    expect(sys.getTeamFireSupportState('A').mortarStrikeCooldownSec).toBeCloseTo(MORTAR_SWEEP_COOLDOWN_SEC, 2);
+
+    // Concurrent request on Team A while active is rejected
+    const concurrent = sys.requestMortarFireMission({
+      callerId: 'p2',
+      callerName: 'Alpha2',
+      callerTeam: 'A',
+      targetX: 30,
+      targetZ: -20,
+      exclusionZones: exclusions,
+      friendlyPositions: [],
+    });
+    expect(concurrent.ok).toBe(false);
+
+    // Advance 8.0s in 0.05s steps -> all 5 rounds launch at ~1.4s cadence within ~18m CEP (+ small ballistic tolerance)
+    for (let i = 0; i < 160; i++) {
+      simTime += 0.05;
+      sys.update(0.05, {
+        localPlayerPos: new THREE.Vector3(0, 0, 0),
+        exclusionZones: exclusions,
+      });
+    }
+
+    expect(launched.length).toBe(MORTAR_MISSION_ROUNDS);
+    for (const r of launched) {
+      expect(r.callerId).toBe('p1');
+      expect(r.callerTeam).toBe('A');
+      const missFromTarget = Math.hypot(r.ix - 20, r.iz - 10);
+      expect(missFromTarget).toBeLessThanOrEqual(MORTAR_MISSION_CEP_M + 6.5);
+    }
+    // Check 1.4s cadence between consecutive shells
+    for (let i = 1; i < launched.length; i++) {
+      const gap = launched[i].t - launched[i - 1].t;
+      expect(gap).toBeGreaterThanOrEqual(MORTAR_MISSION_CADENCE_SEC - 0.1);
+      expect(gap).toBeLessThanOrEqual(MORTAR_MISSION_CADENCE_SEC + 0.1);
+    }
+
+    // Pit returns to ACTIVE_AI and team cooldown continues counting down from 75s
+    expect(sys.getPitState('mortar_hq_a')?.status).toBe('ACTIVE_AI');
+    expect(sys.getTeamFireSupportState('A').activeMortarMissionId).toBeNull();
+    expect(sys.getTeamFireSupportState('A').mortarStrikeCooldownSec).toBeGreaterThan(60);
+    expect(events.map((e) => e.kind)).toEqual(['started', 'completed']);
+
+    sys.dispose();
+  });
+
+  it('aborts active fire mission cleanly on mid-mission player [F] takeover without refunding 75s cooldown', () => {
+    const scene = new THREE.Scene();
+    const launched: string[] = [];
+    const events: MortarMissionEvent[] = [];
+
+    const sys = new MortarEmplacementSystem({
+      scene,
+      isHost: true,
+      onLaunchBroadcast: (pkt) => launched.push(pkt.shellId),
+      onMissionEvent: (ev) => events.push(ev),
+    });
+    sys.configureSites(buildPhase3Sites());
+
+    const res = sys.requestMortarFireMission({
+      callerId: 'p1',
+      callerName: 'Alpha1',
+      callerTeam: 'A',
+      targetX: 10,
+      targetZ: 0,
+      exclusionZones: [],
+      friendlyPositions: [],
+    });
+    expect(res.ok).toBe(true);
+
+    // Let 1 round launch (0.3s)
+    for (let i = 0; i < 6; i++) {
+      sys.update(0.05, { localPlayerPos: new THREE.Vector3(-200, 0, 0) });
+    }
+    expect(launched.length).toBe(1);
+
+    // Friendly player presses [F] to seize the mortar mid-mission
+    const seatRes = sys.requestSeat('mortar_hq_a', 'p2', 'Alpha2', 'A');
+    expect(seatRes.ok).toBe(true);
+    expect(sys.getPitState('mortar_hq_a')?.status).toBe('PLAYER_MANNED');
+    expect(sys.getPitState('mortar_hq_a')?.activeMissionId).toBeNull();
+    expect(sys.getTeamFireSupportState('A').activeMortarMissionId).toBeNull();
+    // Team 75s cooldown remains consumed (no refund on voluntary friendly takeover)
+    expect(sys.getTeamFireSupportState('A').mortarStrikeCooldownSec).toBeGreaterThan(72);
+
+    // Advance 5 more seconds -> zero additional AI sweep rounds fire
+    for (let i = 0; i < 100; i++) {
+      sys.update(0.05, { localPlayerPos: new THREE.Vector3(-200, 0, 0) });
+    }
+    expect(launched.length).toBe(1);
+    expect(events.some((e) => e.kind === 'aborted_takeover' && e.refundedCooldownSec === 0)).toBe(true);
+
+    sys.dispose();
+  });
+
+  it('aborts active fire mission and refunds 50% (37.5s) of 75s cooldown if enemy kills AI crew mid-sweep', () => {
+    const scene = new THREE.Scene();
+    const launched: string[] = [];
+    const events: MortarMissionEvent[] = [];
+
+    const sys = new MortarEmplacementSystem({
+      scene,
+      isHost: true,
+      onLaunchBroadcast: (pkt) => launched.push(pkt.shellId),
+      onMissionEvent: (ev) => events.push(ev),
+    });
+    sys.configureSites(buildPhase3Sites());
+
+    const res = sys.requestMortarFireMission({
+      callerId: 'p1',
+      callerName: 'Alpha1',
+      callerTeam: 'A',
+      targetX: 25,
+      targetZ: -15,
+      exclusionZones: [],
+      friendlyPositions: [],
+    });
+    expect(res.ok).toBe(true);
+
+    // Fire 1st round
+    for (let i = 0; i < 6; i++) {
+      sys.update(0.05, { localPlayerPos: new THREE.Vector3(0, 0, 0) });
+    }
+    expect(launched.length).toBe(1);
+    const cdBeforeKia = sys.getTeamFireSupportState('A').mortarStrikeCooldownSec;
+    expect(cdBeforeKia).toBeGreaterThan(74);
+
+    // Enemy kills both AI crewmen mid-mission -> immediate abort + 50% (37.5s) cooldown refund!
+    sys.damageCrewMember('mortar_hq_a', 'gunner', 120, true);
+    const secondKill = sys.damageCrewMember('mortar_hq_a', 'loader', 120, true);
+    const expectedRefund = MORTAR_SWEEP_COOLDOWN_SEC * MORTAR_KIA_COOLDOWN_REFUND_RATIO;
+
+    expect(secondKill?.bothCrewDead).toBe(true);
+    expect(secondKill?.abortedMissionRefundSec).toBeCloseTo(expectedRefund, 2);
+    expect(sys.getPitState('mortar_hq_a')?.status).toBe('KIA_REINFORCING');
+    expect(sys.getTeamFireSupportState('A').activeMortarMissionId).toBeNull();
+    expect(sys.getTeamFireSupportState('A').mortarStrikeCooldownSec).toBeCloseTo(
+      cdBeforeKia - expectedRefund,
+      1,
+    );
+    expect(events.some((e) => e.kind === 'aborted_crew_kia' && e.refundedCooldownSec === expectedRefund)).toBe(true);
+
+    // Advance 5 more seconds -> no remaining sweep rounds fire while KIA_REINFORCING
+    for (let i = 0; i < 100; i++) {
+      sys.update(0.05, { localPlayerPos: new THREE.Vector3(0, 0, 0) });
+    }
+    expect(launched.length).toBe(1);
+
+    sys.dispose();
   });
 });

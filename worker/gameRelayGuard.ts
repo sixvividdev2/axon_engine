@@ -52,6 +52,7 @@ const HOST_ONLY_GAME_TYPES = new Set<string>([
   'game:dogtag_event',
   'game:flag_event',
   'game:fire_support_sync',
+  'game:fire_support_rejected',
   'game:mortar_launch',
   'game:mortar_seat_rejected',
 ]);
@@ -74,6 +75,7 @@ const ALLOWED_GAME_TYPES = new Set<string>([
   'game:mortar_seat_request',
   'game:mortar_fire_request',
   'game:mortar_crew_damage',
+  'game:fire_support_request',
 ]);
 
 const VALID_DOOR_ACTIONS = new Set<string>([
@@ -978,6 +980,58 @@ export function validateAndSanitizeGameMessage(
     } else {
       safePayload.pits = [];
     }
+    if (Array.isArray(parsed.teams) && parsed.teams.length === 2) {
+      safePayload.teams = parsed.teams.slice(0, 2).map((rawTeam, idx) => {
+        const t = (rawTeam && typeof rawTeam === 'object' ? rawTeam : {}) as Record<string, unknown>;
+        return {
+          team: t.team === 'B' || (t.team !== 'A' && idx === 1) ? 'B' : 'A',
+          airStrikeCooldownSec: Number(clampFinite(t.airStrikeCooldownSec, 0, 300, 0).toFixed(1)),
+          airStrikeMaxCooldownSec: Number(clampFinite(t.airStrikeMaxCooldownSec, 1, 300, 150).toFixed(1)),
+          mortarStrikeCooldownSec: Number(clampFinite(t.mortarStrikeCooldownSec, 0, 300, 0).toFixed(1)),
+          mortarStrikeMaxCooldownSec: Number(clampFinite(t.mortarStrikeMaxCooldownSec, 1, 300, 75).toFixed(1)),
+          activeBomberId: typeof t.activeBomberId === 'string' ? t.activeBomberId.slice(0, 48) : null,
+          activeMortarMissionId:
+            typeof t.activeMortarMissionId === 'string' ? t.activeMortarMissionId.slice(0, 48) : null,
+        };
+      });
+    }
+    if (Array.isArray(parsed.activeMissions)) {
+      safePayload.activeMissions = parsed.activeMissions
+        .slice(0, 2)
+        .filter((m): m is Record<string, unknown> => Boolean(m && typeof m === 'object'))
+        .filter((m) => isFiniteCoord(m.targetX) && isFiniteCoord(m.targetZ))
+        .map((m) => ({
+          missionId: String(m.missionId ?? '').trim().slice(0, 48),
+          pitId: String(m.pitId ?? '').trim().slice(0, 48),
+          team: m.team === 'B' ? 'B' : 'A',
+          targetX: Number((m.targetX as number).toFixed(2)),
+          targetZ: Number((m.targetZ as number).toFixed(2)),
+          roundsRemaining: Math.floor(clampFinite(m.roundsRemaining, 0, 10, 0)),
+          totalRounds: Math.floor(clampFinite(m.totalRounds, 1, 10, 5)),
+          callerName: String(m.callerName ?? 'OPERATOR').trim().slice(0, 36) || 'OPERATOR',
+        }));
+    }
+  } else if (type === 'game:fire_support_request') {
+    const kind = parsed.kind;
+    if (
+      kind !== 'mortar_sweep' ||
+      !isFiniteCoord(parsed.targetX) ||
+      !isFiniteCoord(parsed.targetZ)
+    ) {
+      return null;
+    }
+    safePayload.kind = kind;
+    safePayload.targetX = Number(parsed.targetX.toFixed(2));
+    safePayload.targetZ = Number(parsed.targetZ.toFixed(2));
+    targetUserId = st.hostUserId;
+  } else if (type === 'game:fire_support_rejected') {
+    const rejTarget = String(parsed.targetUserId ?? '').trim();
+    const kind = parsed.kind;
+    if (!rejTarget || kind !== 'mortar_sweep') return null;
+    safePayload.targetUserId = rejTarget;
+    safePayload.kind = kind;
+    safePayload.reason = String(parsed.reason ?? 'Fire support unavailable').slice(0, 120);
+    targetUserId = rejTarget;
   }
 
   return {

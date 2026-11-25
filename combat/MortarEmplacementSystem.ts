@@ -5,11 +5,13 @@ import {
   TacticalUniformMaterialBundle,
 } from '../bodycam-sdk/TacticalUniforms';
 import {
+  ActiveMortarMissionSummary,
   ENABLE_CONQUEST_FIRE_SUPPORT,
   GameFireSupportSyncPacket,
   GameMortarLaunchPacket,
   MortarPitState,
   MortarPitStatus,
+  TeamFireSupportState,
 } from '../data/multiplayer';
 import {
   MORTAR_CHARGE_SPECS,
@@ -42,6 +44,13 @@ export const MORTAR_CREW_LOD_DIST_M = 35;
 export const MORTAR_INTERACT_RADIUS_M = 3.25;
 export const MORTAR_BLAST_RADIUS_M = 13.0;
 export const MORTAR_BLAST_MAX_DAMAGE = 138;
+export const MORTAR_SWEEP_COOLDOWN_SEC = 75;
+export const MORTAR_AIR_STRIKE_MAX_COOLDOWN_SEC = 150;
+export const MORTAR_MISSION_ROUNDS = 5;
+export const MORTAR_MISSION_CADENCE_SEC = 1.4;
+export const MORTAR_MISSION_CEP_M = 18;
+export const MORTAR_DANGER_CLOSE_RADIUS_M = 45;
+export const MORTAR_KIA_COOLDOWN_REFUND_RATIO = 0.5;
 
 export interface MortarSiteConfig {
   pitId: string;
@@ -126,6 +135,44 @@ export interface MortarCrewHitResult {
   killed: boolean;
   bothCrewDead: boolean;
   headshot: boolean;
+  abortedMissionRefundSec?: number;
+}
+
+export interface MortarFriendlyPosition {
+  x: number;
+  z: number;
+}
+
+export interface MortarMissionRequestResult {
+  ok: boolean;
+  missionId?: string;
+  pitId?: string;
+  dangerClose: boolean;
+  minFriendlyDistM: number;
+  reason?: string;
+}
+
+export interface MortarMissionEvent {
+  kind: 'started' | 'aborted_takeover' | 'aborted_crew_kia' | 'completed';
+  missionId: string;
+  pitId: string;
+  team: 'A' | 'B';
+  callerName: string;
+  targetX: number;
+  targetZ: number;
+  refundedCooldownSec: number;
+  dangerClose: boolean;
+}
+
+export interface MortarReticleEvaluation {
+  availableAiBatteries: number;
+  totalFriendlyBatteries: number;
+  inHqExclusion: boolean;
+  inRange: boolean;
+  dangerClose: boolean;
+  minFriendlyDistM: number;
+  canCall: boolean;
+  blockReason: string | null;
 }
 
 interface CrewActorVisual {
@@ -174,6 +221,15 @@ interface InternalMortarPit {
   recoilKick01: number;
   foAddDropM: number;
   foLeftRightM: number;
+  // Phase 3 PDA Fire Mission state
+  missionCallerId: string | null;
+  missionCallerName: string;
+  missionCallerTeam: 'A' | 'B';
+  missionTargetPos: THREE.Vector3;
+  missionRoundsRemaining: number;
+  missionTotalRounds: number;
+  missionNextRoundTimerSec: number;
+  missionDangerClose: boolean;
 }
 
 interface PooledMortarShell {
@@ -317,6 +373,7 @@ export class MortarEmplacementSystem {
   private readonly getGroundHeight: (x: number, z: number) => number;
   private readonly onImpact?: (event: MortarImpactEvent) => void;
   private readonly onLaunchBroadcast?: (packet: GameMortarLaunchPacket) => void;
+  private readonly onMissionEvent?: (event: MortarMissionEvent) => void;
 
   private readonly uniformLib = new TacticalUniformMaterialLibrary();
   private readonly disposables: Array<{ dispose: () => void }> = [];
@@ -341,6 +398,27 @@ export class MortarEmplacementSystem {
   private readonly geoScorchPlane: THREE.PlaneGeometry;
 
   private readonly pits = new Map<string, InternalMortarPit>();
+  private readonly teamStates: Record<'A' | 'B', TeamFireSupportState> = {
+    A: {
+      team: 'A',
+      airStrikeCooldownSec: 0,
+      airStrikeMaxCooldownSec: MORTAR_AIR_STRIKE_MAX_COOLDOWN_SEC,
+      mortarStrikeCooldownSec: 0,
+      mortarStrikeMaxCooldownSec: MORTAR_SWEEP_COOLDOWN_SEC,
+      activeBomberId: null,
+      activeMortarMissionId: null,
+    },
+    B: {
+      team: 'B',
+      airStrikeCooldownSec: 0,
+      airStrikeMaxCooldownSec: MORTAR_AIR_STRIKE_MAX_COOLDOWN_SEC,
+      mortarStrikeCooldownSec: 0,
+      mortarStrikeMaxCooldownSec: MORTAR_SWEEP_COOLDOWN_SEC,
+      activeBomberId: null,
+      activeMortarMissionId: null,
+    },
+  };
+  private remoteActiveMissions: ActiveMortarMissionSummary[] = [];
   private readonly shellPool: PooledMortarShell[] = [];
   private readonly scorchDecals: THREE.Mesh[] = [];
   private scorchFifoIndex = 0;
@@ -351,6 +429,7 @@ export class MortarEmplacementSystem {
   private windX = 1.8;
   private windZ = 0.6;
   private shellSeq = 1;
+  private missionSeq = 1;
   private lastTickActivePits = 0;
   private lastCpuMs = 0;
 
@@ -361,6 +440,7 @@ export class MortarEmplacementSystem {
     getGroundHeight?: (x: number, z: number) => number;
     onImpact?: (event: MortarImpactEvent) => void;
     onLaunchBroadcast?: (packet: GameMortarLaunchPacket) => void;
+    onMissionEvent?: (event: MortarMissionEvent) => void;
     enabled?: boolean;
   }) {
     this.isHost = opts.isHost;
@@ -368,6 +448,7 @@ export class MortarEmplacementSystem {
     this.getGroundHeight = opts.getGroundHeight ?? (() => 0);
     this.onImpact = opts.onImpact;
     this.onLaunchBroadcast = opts.onLaunchBroadcast;
+    this.onMissionEvent = opts.onMissionEvent;
     this.enabled = opts.enabled ?? ENABLE_CONQUEST_FIRE_SUPPORT;
 
     this.root.name = 'ConquestMortarEmplacements';
@@ -584,8 +665,14 @@ export class MortarEmplacementSystem {
         pit.state.seatedPlayerId = null;
         pit.state.seatedPlayerName = null;
         pit.state.seatedPlayerTeam = null;
+        pit.state.activeMissionId = null;
+        pit.missionRoundsRemaining = 0;
+        pit.missionCallerId = null;
         pit.state.status = 'INACTIVE';
       }
+      this.teamStates.A.activeMortarMissionId = null;
+      this.teamStates.B.activeMortarMissionId = null;
+      this.remoteActiveMissions = [];
       this.blastLight.visible = false;
       this.blastLight.intensity = 0;
       this.lastTickActivePits = 0;
@@ -673,7 +760,10 @@ export class MortarEmplacementSystem {
             this.applyCrewUniforms(pit, owner);
             this.resetCrewVisualsAlive(pit);
           } else if (teamChanged) {
-            // Sector flipped -> re-uniform AI crew and start reinforcement countdown if uncrewed
+            // Sector flipped -> abort any active mission on old team and re-uniform AI crew
+            if (pit.state.status === 'FIRE_MISSION' && pit.state.activeMissionId) {
+              this.abortPitFireMission(pit, 'fob_flip', false);
+            }
             this.applyCrewUniforms(pit, owner);
             if (pit.state.gunnerAiHp <= 0 && pit.state.loaderAiHp <= 0) {
               pit.state.respawnTimerSec = Math.min(pit.state.respawnTimerSec || MORTAR_CREW_REINFORCE_SEC, MORTAR_CREW_REINFORCE_SEC);
@@ -684,7 +774,10 @@ export class MortarEmplacementSystem {
           }
         }
       } else {
-        // Neutral FOB -> pit inactive (0ms tick)
+        // Neutral FOB -> abort any active fire mission & mark pit inactive (0ms tick)
+        if (pit.state.status === 'FIRE_MISSION' && pit.state.activeMissionId) {
+          this.abortPitFireMission(pit, 'fob_flip', false);
+        }
         pit.state.status = 'INACTIVE';
         pit.state.seatedPlayerId = null;
         pit.state.seatedPlayerName = null;
@@ -692,6 +785,240 @@ export class MortarEmplacementSystem {
         pit.root.visible = false;
       }
     }
+  }
+
+  public getTeamFireSupportState(team: 'A' | 'B'): TeamFireSupportState {
+    return { ...this.teamStates[team] };
+  }
+
+  public getTeamFireSupportStates(): [TeamFireSupportState, TeamFireSupportState] {
+    return [{ ...this.teamStates.A }, { ...this.teamStates.B }];
+  }
+
+  public getActiveMissionSummaries(): ActiveMortarMissionSummary[] {
+    if (!this.isHost) {
+      return this.remoteActiveMissions.map((m) => ({ ...m }));
+    }
+    const out: ActiveMortarMissionSummary[] = [];
+    for (const pit of this.pits.values()) {
+      if (
+        pit.state.status === 'FIRE_MISSION' &&
+        pit.state.activeMissionId &&
+        pit.missionRoundsRemaining > 0
+      ) {
+        out.push({
+          missionId: pit.state.activeMissionId,
+          pitId: pit.state.pitId,
+          team: pit.missionCallerTeam,
+          targetX: pit.missionTargetPos.x,
+          targetZ: pit.missionTargetPos.z,
+          roundsRemaining: pit.missionRoundsRemaining,
+          totalRounds: pit.missionTotalRounds,
+          callerName: pit.missionCallerName,
+        });
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Evaluates PDA reticle target coordinates for live Fire Support UI feedback
+   * (battery availability, 65m HQ exclusion, 81mm ballistic range, 45m Danger Close, team cooldown).
+   */
+  public evaluateFireMissionTarget(opts: {
+    team: 'A' | 'B';
+    targetX: number;
+    targetZ: number;
+    exclusionZones: readonly MortarExclusionZone[];
+    friendlyPositions: readonly MortarFriendlyPosition[];
+  }): MortarReticleEvaluation {
+    const dc = evaluateMortarDangerClose(opts.targetX, opts.targetZ, opts.friendlyPositions);
+    const inHqExclusion = this.isInsideHqExclusion(opts.targetX, opts.targetZ, opts.exclusionZones);
+    const teamState = this.teamStates[opts.team];
+
+    let totalFriendlyBatteries = 0;
+    let availableAiBatteries = 0;
+    let inRange = false;
+
+    const targetGroundY = this.getGroundHeight(opts.targetX, opts.targetZ);
+    const targetVec = _vB.set(opts.targetX, targetGroundY, opts.targetZ);
+
+    for (const pit of this.pits.values()) {
+      if (pit.state.ownerTeam !== opts.team || pit.state.status === 'INACTIVE') continue;
+      totalFriendlyBatteries++;
+      const crewAlive = pit.state.gunnerAiHp > 0 || pit.state.loaderAiHp > 0;
+      if (pit.state.status === 'ACTIVE_AI' && crewAlive) {
+        availableAiBatteries++;
+        const origin = _vA.set(pit.state.position[0], pit.state.position[1] + 1.15, pit.state.position[2]);
+        const table = solveMortarFiringTable(origin, targetVec, this.windX, this.windZ);
+        if (table.recommended?.inRange) {
+          inRange = true;
+        }
+      }
+    }
+
+    let blockReason: string | null = null;
+    if (!this.enabled) {
+      blockReason = 'Fire Support Offline';
+    } else if (teamState.activeMortarMissionId) {
+      blockReason = 'Mortar Sweep In Progress';
+    } else if (teamState.mortarStrikeCooldownSec > 0.05) {
+      blockReason = `Battery Cooling Down (${Math.ceil(teamState.mortarStrikeCooldownSec)}s)`;
+    } else if (inHqExclusion) {
+      blockReason = 'HQ 65m No-Fire Zone';
+    } else if (availableAiBatteries === 0) {
+      blockReason = 'No Friendly AI Battery Available';
+    } else if (!inRange) {
+      blockReason = 'Target Out of 81mm Range (35m–700m)';
+    }
+
+    return {
+      availableAiBatteries,
+      totalFriendlyBatteries,
+      inHqExclusion,
+      inRange,
+      dangerClose: dc.dangerClose,
+      minFriendlyDistM: dc.minFriendlyDistM,
+      canCall: blockReason === null,
+      blockReason,
+    };
+  }
+
+  /**
+   * Host-authoritative Phase 3 1-Sweep 5-Round Mortar Fire Mission Override:
+   *  - Team-wide 75s cooldown, 5 rounds at 1.4s cadence, 18m CEP
+   *  - Rejects targets inside either team's 65m HQ exclusion cylinder
+   *  - Computes 45m Danger Close warning when friendly units are nearby
+   *  - Transitions best eligible friendly ACTIVE_AI pit -> FIRE_MISSION
+   */
+  public requestMortarFireMission(opts: {
+    callerId: string;
+    callerName: string;
+    callerTeam: 'A' | 'B';
+    targetX: number;
+    targetZ: number;
+    exclusionZones: readonly MortarExclusionZone[];
+    friendlyPositions: readonly MortarFriendlyPosition[];
+  }): MortarMissionRequestResult {
+    const dc = evaluateMortarDangerClose(opts.targetX, opts.targetZ, opts.friendlyPositions);
+    if (!this.enabled) {
+      return {
+        ok: false,
+        dangerClose: dc.dangerClose,
+        minFriendlyDistM: dc.minFriendlyDistM,
+        reason: 'Fire support disabled',
+      };
+    }
+    const teamState = this.teamStates[opts.callerTeam];
+    if (teamState.activeMortarMissionId) {
+      return {
+        ok: false,
+        dangerClose: dc.dangerClose,
+        minFriendlyDistM: dc.minFriendlyDistM,
+        reason: 'Mortar Sweep Already Active',
+      };
+    }
+    if (teamState.mortarStrikeCooldownSec > 0.05) {
+      return {
+        ok: false,
+        dangerClose: dc.dangerClose,
+        minFriendlyDistM: dc.minFriendlyDistM,
+        reason: `Mortar Sweep Recharging (${Math.ceil(teamState.mortarStrikeCooldownSec)}s)`,
+      };
+    }
+    if (this.isInsideHqExclusion(opts.targetX, opts.targetZ, opts.exclusionZones)) {
+      return {
+        ok: false,
+        dangerClose: dc.dangerClose,
+        minFriendlyDistM: dc.minFriendlyDistM,
+        reason: 'Target Inside 65m HQ No-Fire Zone',
+      };
+    }
+
+    const targetGroundY = this.getGroundHeight(opts.targetX, opts.targetZ);
+    const targetVec = new THREE.Vector3(opts.targetX, targetGroundY, opts.targetZ);
+
+    let eligibleAiCount = 0;
+    let chosenPit: InternalMortarPit | null = null;
+    let chosenSolution: ReturnType<typeof solveMortarFiringTable>['recommended'] = null;
+    let bestScore = -Infinity;
+
+    for (const pit of this.pits.values()) {
+      if (pit.state.ownerTeam !== opts.callerTeam) continue;
+      if (pit.state.status !== 'ACTIVE_AI') continue;
+      if (pit.state.gunnerAiHp <= 0 && pit.state.loaderAiHp <= 0) continue;
+      eligibleAiCount++;
+
+      const origin = _vA.set(pit.state.position[0], pit.state.position[1] + 1.15, pit.state.position[2]);
+      const table = solveMortarFiringTable(origin, targetVec, this.windX, this.windZ);
+      if (!table.recommended?.inRange) continue;
+
+      // Prefer pit with both crew alive and shortest flight time / mid-range ballistic arc
+      const crewBonus = pit.state.gunnerAiHp > 0 && pit.state.loaderAiHp > 0 ? 50 : 0;
+      const score = crewBonus - table.recommended.flightTimeSec * 2 - Math.abs(table.horizontalRangeM - 240) * 0.05;
+      if (score > bestScore) {
+        bestScore = score;
+        chosenPit = pit;
+        chosenSolution = table.recommended;
+      }
+    }
+
+    if (!chosenPit || !chosenSolution) {
+      return {
+        ok: false,
+        dangerClose: dc.dangerClose,
+        minFriendlyDistM: dc.minFriendlyDistM,
+        reason:
+          eligibleAiCount === 0
+            ? 'No Friendly AI Mortar Battery Available'
+            : 'Target Out of 81mm Mortar Range',
+      };
+    }
+
+    const missionId = `fm_${opts.callerTeam}_${this.missionSeq++}`;
+    chosenPit.state.status = 'FIRE_MISSION';
+    chosenPit.state.activeMissionId = missionId;
+    chosenPit.aiSalvoRemaining = 0;
+    chosenPit.aiReclaimTimerSec = 0;
+    chosenPit.missionCallerId = opts.callerId;
+    chosenPit.missionCallerName = opts.callerName;
+    chosenPit.missionCallerTeam = opts.callerTeam;
+    chosenPit.missionTargetPos.copy(targetVec);
+    chosenPit.missionRoundsRemaining = MORTAR_MISSION_ROUNDS;
+    chosenPit.missionTotalRounds = MORTAR_MISSION_ROUNDS;
+    chosenPit.missionNextRoundTimerSec = 0.25;
+    chosenPit.missionDangerClose = dc.dangerClose;
+
+    // Immediately slew tube onto mission azimuth/elevation/charge
+    chosenPit.state.currentAzimuthRad = chosenSolution.azimuthRad;
+    chosenPit.state.currentElevationRad = chosenSolution.elevationRad;
+    chosenPit.state.currentChargeLevel = chosenSolution.charge;
+    this.syncChargeRingVisuals(chosenPit);
+    this.applyTubeTransform(chosenPit);
+
+    teamState.activeMortarMissionId = missionId;
+    teamState.mortarStrikeCooldownSec = MORTAR_SWEEP_COOLDOWN_SEC;
+    teamState.mortarStrikeMaxCooldownSec = MORTAR_SWEEP_COOLDOWN_SEC;
+
+    this.onMissionEvent?.({
+      kind: 'started',
+      missionId,
+      pitId: chosenPit.state.pitId,
+      team: opts.callerTeam,
+      callerName: opts.callerName,
+      targetX: opts.targetX,
+      targetZ: opts.targetZ,
+      refundedCooldownSec: 0,
+      dangerClose: dc.dangerClose,
+    });
+
+    return {
+      ok: true,
+      missionId,
+      pitId: chosenPit.state.pitId,
+      dangerClose: dc.dangerClose,
+      minFriendlyDistM: dc.minFriendlyDistM,
+    };
   }
 
   public getPitStates(): MortarPitState[] {
@@ -857,6 +1184,11 @@ export class MortarEmplacementSystem {
       }
     }
 
+    // Mid-mission player [F] takeover: abort active AI sweep cleanly (team 75s cooldown stays consumed)
+    if (pit.state.status === 'FIRE_MISSION' && pit.state.activeMissionId) {
+      this.abortPitFireMission(pit, 'aborted_takeover', false);
+    }
+
     pit.state.seatedPlayerId = playerId;
     pit.state.seatedPlayerName = playerName;
     pit.state.seatedPlayerTeam = playerTeam;
@@ -952,9 +1284,14 @@ export class MortarEmplacementSystem {
       }
     }
 
+    let abortedMissionRefundSec = 0;
     if (bothCrewDead) {
       pit.aiSalvoRemaining = 0;
       pit.state.respawnTimerSec = MORTAR_CREW_REINFORCE_SEC;
+      // Mid-mission crew KIA -> abort fire mission immediately & refund 50% of 75s cooldown (37.5s)
+      if (pit.state.status === 'FIRE_MISSION' && pit.state.activeMissionId && pit.missionRoundsRemaining > 0) {
+        abortedMissionRefundSec = this.abortPitFireMission(pit, 'aborted_crew_kia', true);
+      }
       if (!pit.state.seatedPlayerId) {
         pit.state.status = 'KIA_REINFORCING';
       }
@@ -970,6 +1307,7 @@ export class MortarEmplacementSystem {
       killed,
       bothCrewDead,
       headshot,
+      ...(abortedMissionRefundSec > 0 ? { abortedMissionRefundSec } : {}),
     };
   }
 
@@ -1177,6 +1515,20 @@ export class MortarEmplacementSystem {
       this.syncChargeRingVisuals(pit);
       this.applyTubeTransform(pit);
     }
+
+    if (packet.teams && packet.teams.length === 2) {
+      for (const incomingTeam of packet.teams) {
+        if (incomingTeam.team === 'A' || incomingTeam.team === 'B') {
+          Object.assign(this.teamStates[incomingTeam.team], incomingTeam);
+        }
+      }
+    }
+
+    if (Array.isArray(packet.activeMissions)) {
+      this.remoteActiveMissions = packet.activeMissions.map((m) => ({ ...m }));
+    } else {
+      this.remoteActiveMissions = [];
+    }
   }
 
   /** Computes gunner camera world position & lookAt target while seated (Over-Tube or Optical Sight). */
@@ -1294,6 +1646,17 @@ export class MortarEmplacementSystem {
     const safeDt = Math.min(Math.max(dt, 0), 0.1);
     let activeTicks = 0;
 
+    // Tick per-team fire support cooldown timers
+    for (const teamKey of ['A', 'B'] as const) {
+      const ts = this.teamStates[teamKey];
+      if (ts.mortarStrikeCooldownSec > 0) {
+        ts.mortarStrikeCooldownSec = Math.max(0, ts.mortarStrikeCooldownSec - safeDt);
+      }
+      if (ts.airStrikeCooldownSec > 0) {
+        ts.airStrikeCooldownSec = Math.max(0, ts.airStrikeCooldownSec - safeDt);
+      }
+    }
+
     for (const pit of this.pits.values()) {
       const status = pit.state.status;
       if (status === 'INACTIVE') continue;
@@ -1370,8 +1733,11 @@ export class MortarEmplacementSystem {
         this.updateCrewAnimations(pit, animDt);
       }
 
-      // Host-authoritative Autonomous ACTIVE_AI Salvos (3 rounds every 35s, 32m CEP)
-      if (this.isHost && status === 'ACTIVE_AI' && pit.aiReclaimTimerSec <= 0) {
+      // Host-authoritative Phase 3 PDA Fire Mission (5 rounds @ 1.4s cadence, 18m CEP)
+      if (this.isHost && status === 'FIRE_MISSION') {
+        this.updateActiveFireMission(pit, safeDt, opts.exclusionZones ?? []);
+      } else if (this.isHost && status === 'ACTIVE_AI' && pit.aiReclaimTimerSec <= 0) {
+        // Host-authoritative Autonomous ACTIVE_AI Salvos (3 rounds every 35s, 32m CEP)
         this.updateAutonomousAiSalvo(pit, safeDt, opts.targets ?? [], opts.exclusionZones ?? []);
       }
     }
@@ -1659,6 +2025,14 @@ export class MortarEmplacementSystem {
       recoilKick01: 0,
       foAddDropM: 0,
       foLeftRightM: 0,
+      missionCallerId: null,
+      missionCallerName: '',
+      missionCallerTeam: cfg.ownerTeam,
+      missionTargetPos: new THREE.Vector3(),
+      missionRoundsRemaining: 0,
+      missionTotalRounds: MORTAR_MISSION_ROUNDS,
+      missionNextRoundTimerSec: 0,
+      missionDangerClose: false,
     };
 
     this.syncChargeRingVisuals(pit);
@@ -1864,6 +2238,128 @@ export class MortarEmplacementSystem {
       loader.torsoGroup.rotation.x = 0.1 + reloadLift * 0.28 + Math.sin(loader.animPhase) * 0.025;
       loader.leftArm.rotation.x = -reloadLift * 0.9;
       loader.rightArm.rotation.x = -reloadLift * 0.9;
+    }
+  }
+
+  private abortPitFireMission(
+    pit: InternalMortarPit,
+    reason: 'aborted_takeover' | 'aborted_crew_kia' | 'fob_flip',
+    refundCooldown: boolean,
+  ): number {
+    const missionId = pit.state.activeMissionId;
+    const team = pit.missionCallerTeam;
+    const teamState = this.teamStates[team];
+
+    let refundedSec = 0;
+    if (refundCooldown) {
+      refundedSec = MORTAR_SWEEP_COOLDOWN_SEC * MORTAR_KIA_COOLDOWN_REFUND_RATIO;
+      teamState.mortarStrikeCooldownSec = Math.max(0, teamState.mortarStrikeCooldownSec - refundedSec);
+    }
+
+    if (teamState.activeMortarMissionId === missionId) {
+      teamState.activeMortarMissionId = null;
+    }
+    pit.state.activeMissionId = null;
+    pit.missionRoundsRemaining = 0;
+    pit.missionNextRoundTimerSec = 0;
+
+    if (missionId && (reason === 'aborted_takeover' || reason === 'aborted_crew_kia')) {
+      this.onMissionEvent?.({
+        kind: reason,
+        missionId,
+        pitId: pit.state.pitId,
+        team,
+        callerName: pit.missionCallerName,
+        targetX: pit.missionTargetPos.x,
+        targetZ: pit.missionTargetPos.z,
+        refundedCooldownSec: refundedSec,
+        dangerClose: pit.missionDangerClose,
+      });
+    }
+    pit.missionCallerId = null;
+    return refundedSec;
+  }
+
+  private updateActiveFireMission(
+    pit: InternalMortarPit,
+    dt: number,
+    exclusionZones: readonly MortarExclusionZone[],
+  ): void {
+    if (pit.missionRoundsRemaining <= 0 || !pit.state.activeMissionId) {
+      const mid = pit.state.activeMissionId;
+      const teamState = this.teamStates[pit.missionCallerTeam];
+      if (mid && teamState.activeMortarMissionId === mid) {
+        teamState.activeMortarMissionId = null;
+      }
+      pit.state.activeMissionId = null;
+      pit.state.status = 'ACTIVE_AI';
+      return;
+    }
+
+    pit.missionNextRoundTimerSec -= dt;
+    if (pit.missionNextRoundTimerSec > 0) return;
+
+    const origin = _vA.set(pit.state.position[0], pit.state.position[1] + 1.15, pit.state.position[2]);
+    // Sample tight 18m CEP scatter while staying outside both teams' 65m HQ exclusion cylinders
+    let aimX = pit.missionTargetPos.x;
+    let aimZ = pit.missionTargetPos.z;
+    for (let attempt = 0; attempt < 4; attempt++) {
+      const r = Math.sqrt(Math.random()) * MORTAR_MISSION_CEP_M;
+      const theta = Math.random() * Math.PI * 2;
+      const cx = pit.missionTargetPos.x + Math.cos(theta) * r;
+      const cz = pit.missionTargetPos.z + Math.sin(theta) * r;
+      if (!this.isInsideHqExclusion(cx, cz, exclusionZones)) {
+        aimX = cx;
+        aimZ = cz;
+        break;
+      }
+    }
+    const scattered = _vB.set(aimX, this.getGroundHeight(aimX, aimZ), aimZ);
+    const table = solveMortarFiringTable(origin, scattered, this.windX, this.windZ);
+    if (table.recommended?.inRange) {
+      pit.state.currentAzimuthRad = table.recommended.azimuthRad;
+      pit.state.currentElevationRad = table.recommended.elevationRad;
+      pit.state.currentChargeLevel = table.recommended.charge;
+      this.syncChargeRingVisuals(pit);
+      this.applyTubeTransform(pit);
+      this.launchMortarShell(
+        pit,
+        pit.missionCallerId ?? `ai_mortar_${pit.state.pitId}`,
+        pit.missionCallerTeam,
+        false,
+        table.recommended.azimuthRad,
+        table.recommended.elevationRad,
+        table.recommended.charge,
+      );
+      pit.recoilKick01 = 0.85;
+      pit.reloadDurationSec = MORTAR_MISSION_CADENCE_SEC;
+      pit.reloadTimerSec = MORTAR_MISSION_CADENCE_SEC;
+      pit.state.reloadProgress01 = 0;
+    }
+
+    pit.missionRoundsRemaining--;
+    if (pit.missionRoundsRemaining <= 0) {
+      const missionId = pit.state.activeMissionId;
+      const teamState = this.teamStates[pit.missionCallerTeam];
+      if (teamState.activeMortarMissionId === missionId) {
+        teamState.activeMortarMissionId = null;
+      }
+      pit.state.activeMissionId = null;
+      pit.state.status = 'ACTIVE_AI';
+      pit.missionCallerId = null;
+      this.onMissionEvent?.({
+        kind: 'completed',
+        missionId,
+        pitId: pit.state.pitId,
+        team: pit.missionCallerTeam,
+        callerName: pit.missionCallerName,
+        targetX: pit.missionTargetPos.x,
+        targetZ: pit.missionTargetPos.z,
+        refundedCooldownSec: 0,
+        dangerClose: pit.missionDangerClose,
+      });
+    } else {
+      pit.missionNextRoundTimerSec = MORTAR_MISSION_CADENCE_SEC;
     }
   }
 
@@ -2298,5 +2794,30 @@ export function computeMortarBlastDamageForActor(opts: {
     damage: Math.round(baseDamage * mult),
     suppression01: THREE.MathUtils.clamp(falloff * 1.15, 0, 1),
     isFriendlySplash: isTeammate,
+  };
+}
+
+/**
+ * Evaluates whether a mortar target coordinate falls within Danger Close radius (default 45m)
+ * of any friendly operator or allied bot.
+ */
+export function evaluateMortarDangerClose(
+  targetX: number,
+  targetZ: number,
+  friendlyPositions: readonly MortarFriendlyPosition[],
+  radiusM = MORTAR_DANGER_CLOSE_RADIUS_M,
+): { dangerClose: boolean; minFriendlyDistM: number; friendliesInZone: number } {
+  let minFriendlyDistM = Infinity;
+  let friendliesInZone = 0;
+  for (let i = 0; i < friendlyPositions.length; i++) {
+    const f = friendlyPositions[i];
+    const d = Math.hypot(f.x - targetX, f.z - targetZ);
+    if (d < minFriendlyDistM) minFriendlyDistM = d;
+    if (d <= radiusM) friendliesInZone++;
+  }
+  return {
+    dangerClose: friendliesInZone > 0,
+    minFriendlyDistM: Number.isFinite(minFriendlyDistM) ? minFriendlyDistM : Infinity,
+    friendliesInZone,
   };
 }

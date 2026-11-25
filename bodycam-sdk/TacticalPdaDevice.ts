@@ -91,6 +91,60 @@ export interface PdaMortarFiringTableTelemetry {
   foLeftRightM: number;
 }
 
+export type PdaTabMode = 'tac_map' | 'fire_support';
+
+export interface PdaMortarPitMarker {
+  pitId: string;
+  ownerTeam: 'A' | 'B';
+  friendly: boolean;
+  sourceType: 'HQ' | 'FOB';
+  x: number;
+  z: number;
+  status: 'INACTIVE' | 'ACTIVE_AI' | 'FIRE_MISSION' | 'PLAYER_MANNED' | 'KIA_REINFORCING';
+  respawnTimerSec: number;
+  seatedPlayerName: string | null;
+}
+
+export interface PdaActiveMortarMissionMarker {
+  missionId: string;
+  pitId: string;
+  team: 'A' | 'B';
+  friendly: boolean;
+  targetX: number;
+  targetZ: number;
+  roundsRemaining: number;
+  totalRounds: number;
+  callerName: string;
+}
+
+export interface PdaHqExclusionZone {
+  x: number;
+  z: number;
+  radiusM: number;
+  friendly: boolean;
+}
+
+export interface PdaFireSupportTelemetry {
+  enabled: boolean;
+  localTeam: 'A' | 'B';
+  mortarCooldownSec: number;
+  mortarMaxCooldownSec: number;
+  activeMortarMissionId: string | null;
+  availableAiBatteries: number;
+  totalFriendlyBatteries: number;
+  pits: readonly PdaMortarPitMarker[];
+  activeMissions: readonly PdaActiveMortarMissionMarker[];
+  hqExclusions: readonly PdaHqExclusionZone[];
+  reticleX: number;
+  reticleZ: number;
+  reticleDangerClose: boolean;
+  reticleMinFriendlyDistM: number;
+  reticleInHqExclusion: boolean;
+  reticleInRange: boolean;
+  canCallMortarSweep: boolean;
+  blockReason: string | null;
+}
+
 export interface PdaHudTelemetry {
   playerX: number;
   playerZ: number;
@@ -116,6 +170,7 @@ export interface PdaHudTelemetry {
   bankruptcyText?: string;
   batteryPct?: number;
   mortarTable?: PdaMortarFiringTableTelemetry | null;
+  fireSupport?: PdaFireSupportTelemetry | null;
 }
 
 export interface PdaOrthoCaptureOptions {
@@ -216,6 +271,9 @@ export class TacticalPdaDevice {
   private readonly screenTexture: THREE.CanvasTexture;
   private readonly screenCanvas: HTMLCanvasElement;
   private readonly screenCtx: CanvasRenderingContext2D;
+  // Split-rate offscreen cache: heavy map/sector/battery telemetry redraws strictly at <= 10 Hz
+  private readonly telemetryCacheCanvas: HTMLCanvasElement;
+  private readonly telemetryCacheCtx: CanvasRenderingContext2D;
 
   private readonly ledTopMat: THREE.MeshStandardMaterial;
   private readonly ledMidMat: THREE.MeshStandardMaterial;
@@ -273,7 +331,15 @@ export class TacticalPdaDevice {
   private strafeInertia = 0;
   private leanTilt = 0;
   private redrawAccum = 0;
+  private telemetryRedrawAccum = 0;
+  private telemetryCacheDirty = true;
   private screenDirty = true;
+  private activeTab: PdaTabMode = 'tac_map';
+  private cachedCenterU = 0.5;
+  private cachedCenterV = 0.5;
+  private cachedDrawSize = 540;
+  private telemetryRedrawCount = 0;
+  private overlayRedrawCount = 0;
 
   // Latest tactical telemetry snapshot
   private telemetry: PdaHudTelemetry = {
@@ -380,6 +446,13 @@ export class TacticalPdaDevice {
     const ctx = this.screenCanvas.getContext('2d');
     if (!ctx) throw new Error('Unable to acquire 2D canvas context for TacticalPdaDevice');
     this.screenCtx = ctx;
+
+    this.telemetryCacheCanvas = document.createElement('canvas');
+    this.telemetryCacheCanvas.width = SCREEN_W;
+    this.telemetryCacheCanvas.height = SCREEN_H;
+    const tCtx = this.telemetryCacheCanvas.getContext('2d');
+    if (!tCtx) throw new Error('Unable to acquire 2D telemetry cache context for TacticalPdaDevice');
+    this.telemetryCacheCtx = tCtx;
 
     this.screenTexture = new THREE.CanvasTexture(this.screenCanvas);
     this.screenTexture.colorSpace = THREE.SRGBColorSpace;
@@ -589,6 +662,38 @@ export class TacticalPdaDevice {
 
   public getMapZoom(): number {
     return this.mapZoom;
+  }
+
+  public getActiveTab(): PdaTabMode {
+    return this.activeTab;
+  }
+
+  public setActiveTab(tab: PdaTabMode): void {
+    const resolved: PdaTabMode =
+      tab === 'fire_support' && !this.telemetry.fireSupport?.enabled ? 'tac_map' : tab;
+    if (this.activeTab === resolved) return;
+    this.activeTab = resolved;
+    this.telemetryCacheDirty = true;
+    this.screenDirty = true;
+  }
+
+  public toggleTab(): PdaTabMode {
+    if (!this.telemetry.fireSupport?.enabled) {
+      this.activeTab = 'tac_map';
+      return this.activeTab;
+    }
+    const next: PdaTabMode = this.activeTab === 'tac_map' ? 'fire_support' : 'tac_map';
+    this.setActiveTab(next);
+    this.audio?.playPdaButtonClick();
+    return this.activeTab;
+  }
+
+  /** Diagnostic counters verifying split-rate 10 Hz telemetry vs 60+ FPS interactive reticle rendering. */
+  public getSplitRateStats(): { telemetryRedrawCount: number; overlayRedrawCount: number } {
+    return {
+      telemetryRedrawCount: this.telemetryRedrawCount,
+      overlayRedrawCount: this.overlayRedrawCount,
+    };
   }
 
   public setBatteryDrainEnabled(enabled: boolean, ratePerSec = 0.085): void {
@@ -885,11 +990,17 @@ export class TacticalPdaDevice {
     this.panCenterV = THREE.MathUtils.clamp(pUV.v, 0.02, 0.98);
     this.centerOnPlayer = true;
     this.audio?.playPdaButtonClick();
+    this.telemetryCacheDirty = true;
     this.screenDirty = true;
   }
 
   public setTelemetry(next: PdaHudTelemetry): void {
     this.telemetry = next;
+    if (this.activeTab === 'fire_support' && !next.fireSupport?.enabled) {
+      this.activeTab = 'tac_map';
+      this.telemetryCacheDirty = true;
+      this.screenDirty = true;
+    }
   }
 
   /** Captures a clean top-down orthographic map of the level once on match load. */
@@ -1352,12 +1463,33 @@ export class TacticalPdaDevice {
 
     this.deviceGroup.updateMatrixWorld(true);
 
-    // Throttled OLED canvas redraw (~16 Hz when screen active for crisp 60fps perf)
+    // Split-rate OLED rendering:
+    //  - Underlying sector/battery/map telemetry cache redraws strictly throttled to <= 10 Hz (0.10s)
+    //  - Interactive reticle, Danger Close 45m ring & Fire Support HUD composite at 60+ FPS (0.016s)
+    //    when on Fire Support tab or actively dragging/zooming, and ~16 Hz idle on Tac-Map.
+    this.telemetryRedrawAccum += clampedDt;
     this.redrawAccum += clampedDt;
-    if (this.screenDirty || (this.screenOn && this.redrawAccum >= 0.062)) {
+
+    const highRateInteractive =
+      this.screenOn && (this.activeTab === 'fire_support' || this.dragging || this.bootTimer < 0.28);
+    const overlayInterval = highRateInteractive ? 0.0155 : 0.062;
+
+    const shouldRefreshTelemetry =
+      this.screenOn &&
+      (this.telemetryCacheDirty || this.telemetryRedrawAccum >= 0.1);
+    if (shouldRefreshTelemetry) {
+      this.telemetryRedrawAccum = 0;
+      this.telemetryCacheDirty = false;
+      this.drawTelemetryBaseLayer(elapsed);
+      this.telemetryRedrawCount++;
+      this.screenDirty = true;
+    }
+
+    if (this.screenDirty || (this.screenOn && this.redrawAccum >= overlayInterval)) {
       this.redrawAccum = 0;
       this.screenDirty = false;
       this.drawScreenCanvas(elapsed);
+      this.overlayRedrawCount++;
       this.screenTexture.needsUpdate = true;
     }
   }
@@ -1422,42 +1554,14 @@ export class TacticalPdaDevice {
     };
   }
 
-  private drawScreenCanvas(elapsed: number): void {
-    const ctx = this.screenCtx;
+  /**
+   * 10 Hz cached telemetry layer: draws top telemetry bar, orthographic satellite map, contours,
+   * sectors, vehicles, grid, convoys, pings, allies, mortar battery icons, HQ 65m no-fire zones,
+   * comms blackout zones, local operator arrow, and bottom status strip onto `telemetryCacheCanvas`.
+   */
+  private drawTelemetryBaseLayer(elapsed: number): void {
+    const ctx = this.telemetryCacheCtx;
     ctx.clearRect(0, 0, SCREEN_W, SCREEN_H);
-
-    if (!this.screenOn) {
-      // Matte powered-off IPS panel with subtle reflection gradient
-      const offGrad = ctx.createLinearGradient(0, 0, SCREEN_W, SCREEN_H);
-      offGrad.addColorStop(0, '#0c1012');
-      offGrad.addColorStop(0.5, '#12181a');
-      offGrad.addColorStop(1, '#080b0c');
-      ctx.fillStyle = offGrad;
-      ctx.fillRect(0, 0, SCREEN_W, SCREEN_H);
-      if (this.isBatteryDepleted()) {
-        ctx.strokeStyle = 'rgba(239, 68, 68, 0.55)';
-        ctx.lineWidth = 3;
-        ctx.strokeRect(SCREEN_W * 0.5 - 46, SCREEN_H * 0.5 - 52, 86, 40);
-        ctx.fillStyle = 'rgba(239, 68, 68, 0.55)';
-        ctx.fillRect(SCREEN_W * 0.5 + 40, SCREEN_H * 0.5 - 42, 8, 20);
-        ctx.fillStyle = 'rgba(248, 113, 113, 0.78)';
-        ctx.font = 'bold 22px monospace';
-        ctx.textAlign = 'center';
-        ctx.fillText('BATTERY DEPLETED · 0%', SCREEN_W * 0.5, SCREEN_H * 0.5 + 24);
-        ctx.fillStyle = 'rgba(148, 163, 184, 0.55)';
-        ctx.font = 'bold 14px monospace';
-        ctx.fillText('SWAP CR123A CELL IN INVENTORY [TAB]', SCREEN_W * 0.5, SCREEN_H * 0.5 + 50);
-      } else {
-        ctx.fillStyle = 'rgba(148, 163, 184, 0.14)';
-        ctx.font = 'bold 20px monospace';
-        ctx.textAlign = 'center';
-        ctx.fillText('AXON TACTICAL PDA · STANDBY', SCREEN_W * 0.5, SCREEN_H * 0.5);
-      }
-      return;
-    }
-
-    // Boot animation overlay in first 0.25s
-    const bootProgress = THREE.MathUtils.clamp(this.bootTimer / 0.26, 0, 1);
 
     // 1. Base OS Background
     ctx.fillStyle = '#091114';
@@ -1491,7 +1595,7 @@ export class TacticalPdaDevice {
     // Center: Scrolling Magnetic Compass Tape
     const compCx = SCREEN_W * 0.52;
     const compW = 360;
-    const headingRad = -this.telemetry.playerYawRad; // Three.js +Y yaw: left turn is +yaw, map heading 0 = North (-Z)
+    const headingRad = -this.telemetry.playerYawRad;
     let headingDeg = (THREE.MathUtils.radToDeg(headingRad) % 360 + 360) % 360;
     if (headingDeg >= 360) headingDeg -= 360;
 
@@ -1551,7 +1655,7 @@ export class TacticalPdaDevice {
     ctx.font = '13px monospace';
     ctx.fillText(`ZOOM ${this.mapZoom.toFixed(1)}x`, SCREEN_W - 140, 48);
 
-    // Corner Battery Indicator (4 segmented cells + tabular %)
+    // Corner Battery Indicator
     const bx = SCREEN_W - 122;
     const by = 14;
     const bw = 46;
@@ -1615,8 +1719,13 @@ export class TacticalPdaDevice {
       : THREE.MathUtils.clamp(this.panCenterV, 0.02, 0.98);
 
     const drawSize = Math.min(mapW, mapH) * 1.15 * this.mapZoom;
+    this.cachedCenterU = centerU;
+    this.cachedCenterV = centerV;
+    this.cachedDrawSize = drawSize;
+
     const imgLeft = mapW * 0.5 - centerU * drawSize;
     const imgTop = mapTop + mapH * 0.5 - centerV * drawSize;
+    const worldSpanX = Math.max(1, this.mapAspectBounds.maxX - this.mapAspectBounds.minX);
 
     const uvToScreen = (u: number, v: number): { sx: number; sy: number } => ({
       sx: imgLeft + u * drawSize,
@@ -1630,14 +1739,12 @@ export class TacticalPdaDevice {
       ctx.fillRect(0, mapTop, mapW, mapH);
     }
 
-    // Cached topographic elevation contour overlay
     if (this.contourCacheCanvas) {
       ctx.drawImage(this.contourCacheCanvas, imgLeft, imgTop, drawSize, drawSize);
     }
 
     // Sector Border Polygons & Live Contest Progress Rings
     if (this.telemetry.sectors && this.telemetry.sectors.length > 0) {
-      const worldSpanX = Math.max(1, this.mapAspectBounds.maxX - this.mapAspectBounds.minX);
       for (const sec of this.telemetry.sectors) {
         const uv = this.worldToMapUV(sec.x, sec.z);
         const pt = uvToScreen(uv.u, uv.v);
@@ -1663,7 +1770,6 @@ export class TacticalPdaDevice {
                   ? 'rgba(251, 146, 60, 0.14)'
                   : 'rgba(148, 163, 184, 0.05)';
 
-        // Draw polygonal sector boundary (explicit polygon or 6-sided tactical hex)
         ctx.beginPath();
         if (sec.polygon && sec.polygon.length >= 3) {
           for (let k = 0; k < sec.polygon.length; k++) {
@@ -1691,7 +1797,6 @@ export class TacticalPdaDevice {
         ctx.stroke();
         ctx.setLineDash([]);
 
-        // Live Contest Progress Ring (when partially captured or actively contested)
         const absProg = THREE.MathUtils.clamp(Math.abs(sec.captureProgress) / 100, 0, 1);
         const isContestedRing =
           sec.owner === 'contested' || (absProg > 0.02 && absProg < 0.99);
@@ -1710,7 +1815,6 @@ export class TacticalPdaDevice {
           ctx.stroke();
         }
 
-        // Sector Code & Label
         ctx.fillStyle = ownerColor;
         ctx.font = 'bold 12px monospace';
         ctx.textAlign = 'center';
@@ -1718,6 +1822,32 @@ export class TacticalPdaDevice {
         ctx.fillStyle = 'rgba(226, 232, 240, 0.8)';
         ctx.font = '10px monospace';
         ctx.fillText(sec.name.slice(0, 14).toUpperCase(), pt.sx, pt.sy + 10);
+      }
+      ctx.textAlign = 'left';
+    }
+
+    // Conquest 65m HQ No-Fire Exclusion Cylinders (drawn clearly in Fire Support tab)
+    const fs = this.telemetry.fireSupport;
+    if (fs?.enabled && this.activeTab === 'fire_support' && fs.hqExclusions.length > 0) {
+      for (const hq of fs.hqExclusions) {
+        const uv = this.worldToMapUV(hq.x, hq.z);
+        const pt = uvToScreen(uv.u, uv.v);
+        const radPx = Math.max(18, (hq.radiusM / worldSpanX) * drawSize);
+        ctx.fillStyle = 'rgba(239, 68, 68, 0.08)';
+        ctx.beginPath();
+        ctx.arc(pt.sx, pt.sy, radPx, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.strokeStyle = 'rgba(248, 113, 113, 0.65)';
+        ctx.lineWidth = 1.8;
+        ctx.setLineDash([6, 5]);
+        ctx.beginPath();
+        ctx.arc(pt.sx, pt.sy, radPx, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle = '#fca5a5';
+        ctx.font = 'bold 11px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText(hq.friendly ? 'FRIENDLY HQ · NO-FIRE' : 'ENEMY HQ · NO-FIRE', pt.sx, pt.sy - radPx - 6);
       }
       ctx.textAlign = 'left';
     }
@@ -1779,7 +1909,56 @@ export class TacticalPdaDevice {
       }
     }
 
-    // Live Supply Convoys & Barges (only visible when not masked by Comms Fog-of-War)
+    // Friendly Mortar Battery Emplacement Telemetry (10 Hz layer)
+    if (fs?.enabled && fs.pits.length > 0) {
+      for (const pit of fs.pits) {
+        if (pit.status === 'INACTIVE' || !pit.friendly) continue;
+        const uv = this.worldToMapUV(pit.x, pit.z);
+        const pt = uvToScreen(uv.u, uv.v);
+        const col =
+          pit.status === 'FIRE_MISSION'
+            ? '#f59e0b'
+            : pit.status === 'PLAYER_MANNED'
+              ? '#38bdf8'
+              : pit.status === 'KIA_REINFORCING'
+                ? '#ef4444'
+                : '#34d399';
+        // Crisp military mortar tube + baseplate icon
+        ctx.save();
+        ctx.translate(pt.sx, pt.sy);
+        ctx.fillStyle = '#091114';
+        ctx.strokeStyle = col;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.arc(0, 0, 10, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(-4, 4);
+        ctx.lineTo(4, -4);
+        ctx.moveTo(-3, -4);
+        ctx.lineTo(4, -4);
+        ctx.lineTo(4, 3);
+        ctx.stroke();
+        ctx.restore();
+
+        const tag =
+          pit.status === 'FIRE_MISSION'
+            ? `${pit.sourceType} MTR · FIRING`
+            : pit.status === 'PLAYER_MANNED'
+              ? `${pit.sourceType} MTR · MANNED`
+              : pit.status === 'KIA_REINFORCING'
+                ? `${pit.sourceType} MTR · KIA ${Math.ceil(pit.respawnTimerSec)}s`
+                : `${pit.sourceType} MTR · READY`;
+        ctx.fillStyle = col;
+        ctx.font = 'bold 11px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText(tag, pt.sx, pt.sy + 21);
+      }
+      ctx.textAlign = 'left';
+    }
+
+    // Live Supply Convoys & Barges
     if (this.telemetry.convoys) {
       for (const cv of this.telemetry.convoys) {
         const uv = this.worldToMapUV(cv.x, cv.z);
@@ -1844,9 +2023,8 @@ export class TacticalPdaDevice {
       }
     }
 
-    // Phase 4 Regional Comms Tower Fog-of-War Static Overlays
+    // Regional Comms Tower Fog-of-War Static Overlays
     if (this.telemetry.commsBlackoutZones && this.telemetry.commsBlackoutZones.length > 0) {
-      const worldSpanX = Math.max(1, this.mapAspectBounds.maxX - this.mapAspectBounds.minX);
       for (const zone of this.telemetry.commsBlackoutZones) {
         const uv = this.worldToMapUV(zone.x, zone.z);
         const pt = uvToScreen(uv.u, uv.v);
@@ -1859,7 +2037,6 @@ export class TacticalPdaDevice {
         ctx.fillStyle = 'rgba(8, 12, 16, 0.72)';
         ctx.fillRect(pt.sx - radPx, pt.sy - radPx, radPx * 2, radPx * 2);
 
-        // Animated horizontal RF static scanlines
         ctx.strokeStyle = 'rgba(148, 163, 184, 0.22)';
         ctx.lineWidth = 1.5;
         const scanOffset = Math.floor(elapsed * 42) % 10;
@@ -1895,7 +2072,6 @@ export class TacticalPdaDevice {
     ctx.save();
     ctx.translate(pScreen.sx, pScreen.sy);
     ctx.rotate(-this.telemetry.playerYawRad);
-    // Vision cone (-Z = canvas up)
     const coneGrad = ctx.createRadialGradient(0, 0, 2, 0, 0, 62);
     coneGrad.addColorStop(0, 'rgba(245, 158, 11, 0.34)');
     coneGrad.addColorStop(1, 'rgba(245, 158, 11, 0.0)');
@@ -1906,7 +2082,6 @@ export class TacticalPdaDevice {
     ctx.closePath();
     ctx.fill();
 
-    // Operator triangle chevron
     ctx.fillStyle = '#f59e0b';
     ctx.strokeStyle = '#0f172a';
     ctx.lineWidth = 2;
@@ -1920,8 +2095,296 @@ export class TacticalPdaDevice {
     ctx.stroke();
     ctx.restore();
 
-    // Subtle pan reticle if zoomed/panned off player
-    if (!this.centerOnPlayer) {
+    ctx.restore();
+
+    // === 4. BOTTOM STATUS STRIP ===
+    ctx.fillStyle = '#0d1519';
+    ctx.fillRect(0, mapBot, SCREEN_W, SCREEN_H - mapBot);
+    ctx.strokeStyle = '#253941';
+    ctx.beginPath();
+    ctx.moveTo(0, mapBot);
+    ctx.lineTo(SCREEN_W, mapBot);
+    ctx.stroke();
+
+    ctx.fillStyle = '#94a3b8';
+    ctx.font = '13px monospace';
+    ctx.textAlign = 'left';
+    if (this.telemetry.characterCallsign) {
+      const cashStr =
+        typeof this.telemetry.cashUsd === 'number'
+          ? `$${this.telemetry.cashUsd.toLocaleString()}`
+          : '--';
+      const feeStr =
+        typeof this.telemetry.respawnFeeUsd === 'number'
+          ? `$${this.telemetry.respawnFeeUsd.toLocaleString()}`
+          : '--';
+      ctx.fillStyle = this.telemetry.bankruptcyWarning ? '#fca5a5' : '#cbd5e1';
+      ctx.fillText(
+        `${this.telemetry.characterCallsign.toUpperCase()} · ${this.telemetry.shardLabel ?? 'OW'} · ${this.telemetry.factionLabel ?? 'PMC'} · CASH ${cashStr} · MEDEVAC ${feeStr}`,
+        16,
+        SCREEN_H - 13,
+      );
+    } else if (fs?.enabled && this.activeTab === 'fire_support') {
+      ctx.fillStyle = '#fbbf24';
+      ctx.fillText(
+        `LMB+DRAG AIM · WHEEL ZOOM · [SPACE] CALL 81MM MORTAR SWEEP · [TAB] TAC-MAP · [R] CENTER`,
+        16,
+        SCREEN_H - 13,
+      );
+    } else {
+      const tabHint = fs?.enabled ? ' · [TAB] FIRE SUPPORT' : '';
+      ctx.fillText(
+        `GRID ${Math.round(this.telemetry.playerX)}E ${Math.round(-this.telemetry.playerZ)}N · LMB+DRAG PAN · WHEEL ZOOM · R CENTER${tabHint}`,
+        16,
+        SCREEN_H - 13,
+      );
+    }
+    ctx.textAlign = 'right';
+    ctx.fillStyle = this.telemetry.bankruptcyWarning
+      ? '#f87171'
+      : this.activeTab === 'fire_support'
+        ? '#f59e0b'
+        : this.centerOnPlayer
+          ? '#10b981'
+          : '#38bdf8';
+    ctx.fillText(
+      this.telemetry.bankruptcyWarning
+        ? 'MEDEVAC UNFUNDED'
+        : this.activeTab === 'fire_support'
+          ? 'FIRE SUPPORT'
+          : this.centerOnPlayer
+            ? 'GPS LOCKED'
+            : 'FREE PAN',
+      SCREEN_W - 16,
+      SCREEN_H - 13,
+    );
+  }
+
+  /**
+   * 60+ FPS interactive composite pass: blits the 10 Hz `telemetryCacheCanvas` with smooth pan/zoom
+   * interpolation and draws the live targeting reticle, 45m Danger Close ring, active mortar mission
+   * impact rings, tab strip, Fire Support command card, and seated mortar firing table on top.
+   */
+  private drawScreenCanvas(elapsed: number): void {
+    const ctx = this.screenCtx;
+    ctx.clearRect(0, 0, SCREEN_W, SCREEN_H);
+
+    if (!this.screenOn) {
+      const offGrad = ctx.createLinearGradient(0, 0, SCREEN_W, SCREEN_H);
+      offGrad.addColorStop(0, '#0c1012');
+      offGrad.addColorStop(0.5, '#12181a');
+      offGrad.addColorStop(1, '#080b0c');
+      ctx.fillStyle = offGrad;
+      ctx.fillRect(0, 0, SCREEN_W, SCREEN_H);
+      if (this.isBatteryDepleted()) {
+        ctx.strokeStyle = 'rgba(239, 68, 68, 0.55)';
+        ctx.lineWidth = 3;
+        ctx.strokeRect(SCREEN_W * 0.5 - 46, SCREEN_H * 0.5 - 52, 86, 40);
+        ctx.fillStyle = 'rgba(239, 68, 68, 0.55)';
+        ctx.fillRect(SCREEN_W * 0.5 + 40, SCREEN_H * 0.5 - 42, 8, 20);
+        ctx.fillStyle = 'rgba(248, 113, 113, 0.78)';
+        ctx.font = 'bold 22px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText('BATTERY DEPLETED · 0%', SCREEN_W * 0.5, SCREEN_H * 0.5 + 24);
+        ctx.fillStyle = 'rgba(148, 163, 184, 0.55)';
+        ctx.font = 'bold 14px monospace';
+        ctx.fillText('SWAP CR123A CELL IN INVENTORY [TAB]', SCREEN_W * 0.5, SCREEN_H * 0.5 + 50);
+      } else {
+        ctx.fillStyle = 'rgba(148, 163, 184, 0.14)';
+        ctx.font = 'bold 20px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText('AXON TACTICAL PDA · STANDBY', SCREEN_W * 0.5, SCREEN_H * 0.5);
+      }
+      return;
+    }
+
+    const bootProgress = THREE.MathUtils.clamp(this.bootTimer / 0.26, 0, 1);
+    const topBarH = 64;
+    const mapTop = topBarH;
+    const mapBot = SCREEN_H - 36;
+    const mapH = mapBot - mapTop;
+    const mapW = SCREEN_W;
+
+    // 1. Blit cached 10 Hz map region with smooth 60 FPS pan/zoom interpolation between 10 Hz rebakes
+    const pUV = this.worldToMapUV(this.telemetry.playerX, this.telemetry.playerZ);
+    const centerU = this.centerOnPlayer
+      ? THREE.MathUtils.clamp(pUV.u, 0.02, 0.98)
+      : THREE.MathUtils.clamp(this.panCenterU, 0.02, 0.98);
+    const centerV = this.centerOnPlayer
+      ? THREE.MathUtils.clamp(pUV.v, 0.02, 0.98)
+      : THREE.MathUtils.clamp(this.panCenterV, 0.02, 0.98);
+    const drawSize = Math.min(mapW, mapH) * 1.15 * this.mapZoom;
+    const imgLeft = mapW * 0.5 - centerU * drawSize;
+    const imgTop = mapTop + mapH * 0.5 - centerV * drawSize;
+    const worldSpanX = Math.max(1, this.mapAspectBounds.maxX - this.mapAspectBounds.minX);
+
+    const uvToScreen = (u: number, v: number): { sx: number; sy: number } => ({
+      sx: imgLeft + u * drawSize,
+      sy: imgTop + v * drawSize,
+    });
+
+    ctx.fillStyle = '#091114';
+    ctx.fillRect(0, 0, SCREEN_W, SCREEN_H);
+
+    // Map viewport blit (interpolated cleanly during live drag/zoom)
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(0, mapTop, mapW, mapH);
+    ctx.clip();
+
+    const scaleRatio = drawSize / Math.max(1, this.cachedDrawSize);
+    const shiftX = (this.cachedCenterU - centerU) * drawSize;
+    const shiftY = (this.cachedCenterV - centerV) * drawSize;
+    const mapCenterX = mapW * 0.5;
+    const mapCenterY = mapTop + mapH * 0.5;
+    if (Math.abs(scaleRatio - 1) < 0.0005 && Math.abs(shiftX) < 0.25 && Math.abs(shiftY) < 0.25) {
+      ctx.drawImage(this.telemetryCacheCanvas, 0, mapTop, mapW, mapH, 0, mapTop, mapW, mapH);
+    } else {
+      ctx.save();
+      ctx.translate(mapCenterX + shiftX, mapCenterY + shiftY);
+      ctx.scale(scaleRatio, scaleRatio);
+      ctx.drawImage(
+        this.telemetryCacheCanvas,
+        0,
+        mapTop,
+        mapW,
+        mapH,
+        -mapW * 0.5,
+        -mapH * 0.5,
+        mapW,
+        mapH,
+      );
+      ctx.restore();
+    }
+
+    // === 60+ FPS INTERACTIVE RETICLE, ACTIVE MORTAR MISSIONS & 45M DANGER CLOSE RING ===
+    const fs = this.telemetry.fireSupport;
+    if (fs?.enabled && fs.activeMissions.length > 0) {
+      const cepPx = Math.max(12, (18 / worldSpanX) * drawSize);
+      const pulse = 0.55 + 0.45 * Math.sin(elapsed * 8.5);
+      for (const m of fs.activeMissions) {
+        if (!m.friendly) continue;
+        const mUV = this.worldToMapUV(m.targetX, m.targetZ);
+        const mPt = uvToScreen(mUV.u, mUV.v);
+        ctx.fillStyle = `rgba(245, 158, 11, ${0.10 + pulse * 0.08})`;
+        ctx.beginPath();
+        ctx.arc(mPt.sx, mPt.sy, cepPx, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.strokeStyle = '#fbbf24';
+        ctx.lineWidth = 2.2;
+        ctx.setLineDash([6, 4]);
+        ctx.beginPath();
+        ctx.arc(mPt.sx, mPt.sy, cepPx, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        ctx.fillStyle = '#fde68a';
+        ctx.font = 'bold 12px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText(
+          `81MM SWEEP · ${m.roundsRemaining}/${m.totalRounds} RDS`,
+          mPt.sx,
+          mPt.sy - cepPx - 7,
+        );
+      }
+      ctx.textAlign = 'left';
+    }
+
+    // Interactive Fire Support Target Reticle + 45m Danger Close Ring (60+ FPS)
+    if (fs?.enabled && this.activeTab === 'fire_support') {
+      const rCx = mapW * 0.5 + this.joyTiltX * 14;
+      const rCy = mapTop + mapH * 0.5 - this.joyTiltY * 14;
+      const dangerClosePx = Math.max(24, (45 / worldSpanX) * drawSize);
+      const cepPx = Math.max(10, (18 / worldSpanX) * drawSize);
+      const warnPulse = 0.5 + 0.5 * Math.sin(elapsed * 9.0);
+
+      // 45m Danger Close radius ring
+      if (fs.reticleInHqExclusion) {
+        ctx.fillStyle = 'rgba(239, 68, 68, 0.14)';
+        ctx.beginPath();
+        ctx.arc(rCx, rCy, dangerClosePx, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.strokeStyle = '#ef4444';
+        ctx.lineWidth = 2.4;
+        ctx.setLineDash([8, 5]);
+        ctx.beginPath();
+        ctx.arc(rCx, rCy, dangerClosePx, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      } else if (fs.reticleDangerClose) {
+        ctx.fillStyle = `rgba(245, 158, 11, ${0.11 + warnPulse * 0.10})`;
+        ctx.beginPath();
+        ctx.arc(rCx, rCy, dangerClosePx, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.strokeStyle = warnPulse > 0.5 ? '#ef4444' : '#f59e0b';
+        ctx.lineWidth = 2.5;
+        ctx.setLineDash([9, 5]);
+        ctx.beginPath();
+        ctx.arc(rCx, rCy, dangerClosePx, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      } else {
+        ctx.strokeStyle = fs.canCallMortarSweep
+          ? 'rgba(56, 189, 248, 0.35)'
+          : 'rgba(148, 163, 184, 0.30)';
+        ctx.lineWidth = 1.4;
+        ctx.setLineDash([5, 6]);
+        ctx.beginPath();
+        ctx.arc(rCx, rCy, dangerClosePx, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+
+      // Inner 18m CEP dispersal circle
+      const reticleCol = fs.reticleInHqExclusion || !fs.reticleInRange
+        ? '#f87171'
+        : fs.reticleDangerClose
+          ? '#f59e0b'
+          : fs.canCallMortarSweep
+            ? '#34d399'
+            : '#94a3b8';
+      ctx.strokeStyle = reticleCol;
+      ctx.lineWidth = 1.8;
+      ctx.beginPath();
+      ctx.arc(rCx, rCy, cepPx, 0, Math.PI * 2);
+      ctx.stroke();
+
+      // Precision crosshair ticks
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(rCx - cepPx - 10, rCy);
+      ctx.lineTo(rCx - 5, rCy);
+      ctx.moveTo(rCx + 5, rCy);
+      ctx.lineTo(rCx + cepPx + 10, rCy);
+      ctx.moveTo(rCx, rCy - cepPx - 10);
+      ctx.lineTo(rCx, rCy - 5);
+      ctx.moveTo(rCx, rCy + 5);
+      ctx.lineTo(rCx, rCy + cepPx + 10);
+      ctx.stroke();
+
+      // Diegetic reticle ring tag (Danger Close / HQ No-Fire / 45m clearance)
+      ctx.textAlign = 'center';
+      ctx.font = 'bold 12px monospace';
+      if (fs.reticleInHqExclusion) {
+        ctx.fillStyle = '#fca5a5';
+        ctx.fillText('HQ 65M NO-FIRE ZONE', rCx, rCy - dangerClosePx - 8);
+      } else if (fs.reticleDangerClose) {
+        ctx.fillStyle = warnPulse > 0.5 ? '#fca5a5' : '#fcd34d';
+        ctx.fillText(
+          `! DANGER CLOSE · FRIENDLY ${Math.round(fs.reticleMinFriendlyDistM)}M`,
+          rCx,
+          rCy - dangerClosePx - 8,
+        );
+      } else if (!fs.reticleInRange) {
+        ctx.fillStyle = '#fca5a5';
+        ctx.fillText('OUT OF 81MM RANGE', rCx, rCy - dangerClosePx - 8);
+      } else {
+        ctx.fillStyle = '#a7f3d0';
+        ctx.fillText('18M CEP · 45M CLEARANCE', rCx, rCy - dangerClosePx - 8);
+      }
+      ctx.textAlign = 'left';
+    } else if (!this.centerOnPlayer) {
+      // Standard TAC-MAP free-pan reticle
       const rCx = mapW * 0.5 + this.joyTiltX * 14;
       const rCy = mapTop + mapH * 0.5 - this.joyTiltY * 14;
       ctx.strokeStyle = 'rgba(248, 250, 252, 0.55)';
@@ -1938,7 +2401,7 @@ export class TacticalPdaDevice {
       ctx.stroke();
     }
 
-    // 81mm Mortar Gun-Target Line & Target Crosshair when manning a mortar
+    // 81mm Mortar Gun-Target Line & Target Crosshair when seated in a mortar
     const mt = this.telemetry.mortarTable;
     if (mt) {
       const pitUV = this.worldToMapUV(mt.pitX, mt.pitZ);
@@ -1955,7 +2418,6 @@ export class TacticalPdaDevice {
       ctx.stroke();
       ctx.setLineDash([]);
 
-      // Target bracket crosshair
       ctx.strokeStyle = mt.inRange ? '#fbbf24' : '#f87171';
       ctx.lineWidth = 2;
       ctx.beginPath();
@@ -1975,7 +2437,167 @@ export class TacticalPdaDevice {
 
     ctx.restore();
 
-    // 81mm Ballistic Firing Table Card (Top-Right of PDA Map Canvas when manning a mortar)
+    // 2. Blit crisp cached top bar & bottom status strip directly from 10 Hz cache
+    ctx.drawImage(this.telemetryCacheCanvas, 0, 0, SCREEN_W, topBarH, 0, 0, SCREEN_W, topBarH);
+    ctx.drawImage(
+      this.telemetryCacheCanvas,
+      0,
+      mapBot,
+      SCREEN_W,
+      SCREEN_H - mapBot,
+      0,
+      mapBot,
+      SCREEN_W,
+      SCREEN_H - mapBot,
+    );
+
+    // 3. Conquest Tab Header Strip (Top-Left below top bar when Fire Support enabled)
+    if (fs?.enabled) {
+      const tabX = 14;
+      const tabY = mapTop + 12;
+      const tabW = 136;
+      const tabH = 30;
+      const isFs = this.activeTab === 'fire_support';
+
+      // Tab 1: TAC-MAP
+      ctx.fillStyle = !isFs ? 'rgba(14, 23, 27, 0.95)' : 'rgba(9, 17, 20, 0.78)';
+      ctx.fillRect(tabX, tabY, tabW, tabH);
+      ctx.strokeStyle = !isFs ? '#38bdf8' : '#334155';
+      ctx.lineWidth = !isFs ? 2 : 1;
+      ctx.strokeRect(tabX, tabY, tabW, tabH);
+      ctx.fillStyle = !isFs ? '#f8fafc' : '#94a3b8';
+      ctx.font = 'bold 12px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('TAC-MAP', tabX + tabW * 0.5, tabY + 19);
+
+      // Tab 2: FIRE SUPPORT
+      const tab2X = tabX + tabW + 6;
+      const tab2W = 178;
+      ctx.fillStyle = isFs ? 'rgba(28, 22, 12, 0.95)' : 'rgba(9, 17, 20, 0.78)';
+      ctx.fillRect(tab2X, tabY, tab2W, tabH);
+      ctx.strokeStyle = isFs ? '#f59e0b' : '#334155';
+      ctx.lineWidth = isFs ? 2 : 1;
+      ctx.strokeRect(tab2X, tabY, tab2W, tabH);
+      ctx.fillStyle = isFs ? '#fbbf24' : '#94a3b8';
+      ctx.fillText('[TAB] FIRE SUPPORT', tab2X + tab2W * 0.5, tabY + 19);
+      ctx.textAlign = 'left';
+    }
+
+    // 4. Fire Support Command Card (Top-Right when Fire Support tab active & not seated in mortar)
+    if (fs?.enabled && this.activeTab === 'fire_support' && !mt) {
+      const cardW = 326;
+      const cardH = fs.reticleDangerClose ? 228 : 202;
+      const cardX = SCREEN_W - cardW - 14;
+      const cardY = mapTop + 12;
+
+      ctx.fillStyle = 'rgba(10, 16, 20, 0.94)';
+      ctx.fillRect(cardX, cardY, cardW, cardH);
+      ctx.strokeStyle = fs.reticleDangerClose
+        ? '#f59e0b'
+        : fs.canCallMortarSweep
+          ? '#34d399'
+          : '#475569';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(cardX, cardY, cardW, cardH);
+
+      ctx.fillStyle = '#fbbf24';
+      ctx.font = 'bold 14px monospace';
+      ctx.textAlign = 'left';
+      ctx.fillText('CONQUEST FIRE SUPPORT', cardX + 12, cardY + 22);
+
+      ctx.fillStyle = '#e2e8f0';
+      ctx.font = 'bold 13px monospace';
+      ctx.fillText('81MM MORTAR SWEEP · 5 RDS · 18M CEP', cardX + 12, cardY + 44);
+
+      ctx.fillStyle = fs.availableAiBatteries > 0 ? '#34d399' : '#f87171';
+      ctx.font = '12px monospace';
+      ctx.fillText(
+        `AI BATTERIES READY: ${fs.availableAiBatteries}/${fs.totalFriendlyBatteries} · CADENCE 1.4S`,
+        cardX + 12,
+        cardY + 64,
+      );
+
+      // Cooldown / Active Mission Status Bar
+      const barX = cardX + 12;
+      const barY = cardY + 76;
+      const barW = cardW - 24;
+      const barH = 14;
+      ctx.fillStyle = '#132026';
+      ctx.fillRect(barX, barY, barW, barH);
+      const cdFrac = THREE.MathUtils.clamp(
+        1 - fs.mortarCooldownSec / Math.max(1, fs.mortarMaxCooldownSec),
+        0,
+        1,
+      );
+      ctx.fillStyle = fs.activeMortarMissionId
+        ? '#f59e0b'
+        : fs.mortarCooldownSec > 0.05
+          ? '#38bdf8'
+          : '#10b981';
+      ctx.fillRect(barX, barY, barW * (fs.activeMortarMissionId ? 1 : cdFrac), barH);
+      ctx.strokeStyle = '#334155';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(barX, barY, barW, barH);
+
+      ctx.fillStyle = '#cbd5e1';
+      ctx.font = 'bold 12px monospace';
+      const statusText = fs.activeMortarMissionId
+        ? 'FIRE MISSION IN PROGRESS — ROUNDS OUT'
+        : fs.mortarCooldownSec > 0.05
+          ? `COOLDOWN: ${Math.ceil(fs.mortarCooldownSec)}S / ${Math.round(fs.mortarMaxCooldownSec)}S`
+          : 'BATTERY READY — STANDING BY';
+      ctx.fillText(statusText, cardX + 12, cardY + 108);
+
+      ctx.fillStyle = '#94a3b8';
+      ctx.font = '12px monospace';
+      ctx.fillText(
+        `TGT GRID ${Math.round(fs.reticleX)}E ${Math.round(-fs.reticleZ)}N · 65M HQ SAFE`,
+        cardX + 12,
+        cardY + 128,
+      );
+
+      let nextY = cardY + 144;
+      if (fs.reticleDangerClose) {
+        ctx.fillStyle = 'rgba(180, 83, 9, 0.35)';
+        ctx.fillRect(cardX + 10, nextY - 6, cardW - 20, 24);
+        ctx.strokeStyle = '#f59e0b';
+        ctx.strokeRect(cardX + 10, nextY - 6, cardW - 20, 24);
+        ctx.fillStyle = '#fde68a';
+        ctx.font = 'bold 12px monospace';
+        ctx.fillText(
+          `! DANGER CLOSE (<45M): ALLY AT ${Math.round(fs.reticleMinFriendlyDistM)}M`,
+          cardX + 16,
+          nextY + 10,
+        );
+        nextY += 28;
+      }
+
+      // Action Prompt Box
+      ctx.fillStyle = fs.canCallMortarSweep
+        ? 'rgba(16, 185, 129, 0.22)'
+        : 'rgba(127, 29, 29, 0.30)';
+      ctx.fillRect(cardX + 10, nextY, cardW - 20, 28);
+      ctx.strokeStyle = fs.canCallMortarSweep ? '#34d399' : '#f87171';
+      ctx.lineWidth = 1.5;
+      ctx.strokeRect(cardX + 10, nextY, cardW - 20, 28);
+      ctx.fillStyle = fs.canCallMortarSweep ? '#ecfdf5' : '#fecaca';
+      ctx.font = 'bold 12px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText(
+        fs.canCallMortarSweep
+          ? '[SPACE] CALL 5-RD MORTAR SWEEP'
+          : (fs.blockReason ?? 'FIRE SUPPORT UNAVAILABLE').toUpperCase().slice(0, 38),
+        cardX + cardW * 0.5,
+        nextY + 18,
+      );
+
+      ctx.textAlign = 'left';
+      ctx.fillStyle = '#64748b';
+      ctx.font = '11px monospace';
+      ctx.fillText('AIR STRIKE CORRIDOR · PHASE 4 STANDBY', cardX + 12, cardY + cardH - 10);
+    }
+
+    // 5. 81mm Ballistic Firing Table Card (Top-Right when seated on a mortar)
     if (mt) {
       const cardW = 310;
       const cardH = 198;
@@ -2062,7 +2684,7 @@ export class TacticalPdaDevice {
       ctx.fillText('PAN MAP TO COMPUTE TARGET SOLUTION', cardX + 12, cardY + 192);
     }
 
-    // Diegetic Perimeter Operations Bankruptcy Warning Banner (never conveyed by color alone)
+    // 6. Diegetic Perimeter Operations Bankruptcy Warning Banner
     if (this.telemetry.bankruptcyWarning) {
       const warnH = 44;
       ctx.fillStyle = 'rgba(127, 29, 29, 0.94)';
@@ -2084,57 +2706,7 @@ export class TacticalPdaDevice {
       ctx.textAlign = 'left';
     }
 
-    // === 4. BOTTOM STATUS STRIP ===
-    ctx.fillStyle = '#0d1519';
-    ctx.fillRect(0, mapBot, SCREEN_W, SCREEN_H - mapBot);
-    ctx.strokeStyle = '#253941';
-    ctx.beginPath();
-    ctx.moveTo(0, mapBot);
-    ctx.lineTo(SCREEN_W, mapBot);
-    ctx.stroke();
-
-    ctx.fillStyle = '#94a3b8';
-    ctx.font = '13px monospace';
-    ctx.textAlign = 'left';
-    if (this.telemetry.characterCallsign) {
-      const cashStr =
-        typeof this.telemetry.cashUsd === 'number'
-          ? `$${this.telemetry.cashUsd.toLocaleString()}`
-          : '--';
-      const feeStr =
-        typeof this.telemetry.respawnFeeUsd === 'number'
-          ? `$${this.telemetry.respawnFeeUsd.toLocaleString()}`
-          : '--';
-      ctx.fillStyle = this.telemetry.bankruptcyWarning ? '#fca5a5' : '#cbd5e1';
-      ctx.fillText(
-        `${this.telemetry.characterCallsign.toUpperCase()} · ${this.telemetry.shardLabel ?? 'OW'} · ${this.telemetry.factionLabel ?? 'PMC'} · CASH ${cashStr} · MEDEVAC ${feeStr}`,
-        16,
-        SCREEN_H - 13,
-      );
-    } else {
-      ctx.fillText(
-        `GRID ${Math.round(this.telemetry.playerX)}E ${Math.round(-this.telemetry.playerZ)}N · LMB+DRAG PAN · WHEEL ZOOM · R/RMB CENTER`,
-        16,
-        SCREEN_H - 13,
-      );
-    }
-    ctx.textAlign = 'right';
-    ctx.fillStyle = this.telemetry.bankruptcyWarning
-      ? '#f87171'
-      : this.centerOnPlayer
-        ? '#10b981'
-        : '#38bdf8';
-    ctx.fillText(
-      this.telemetry.bankruptcyWarning
-        ? 'MEDEVAC UNFUNDED'
-        : this.centerOnPlayer
-          ? 'GPS LOCKED'
-          : 'FREE PAN',
-      SCREEN_W - 16,
-      SCREEN_H - 13,
-    );
-
-    // Boot scanline wipe effect
+    // 7. Boot scanline wipe effect
     if (bootProgress < 1) {
       ctx.fillStyle = `rgba(9, 17, 20, ${1 - bootProgress})`;
       ctx.fillRect(0, SCREEN_H * bootProgress, SCREEN_W, SCREEN_H * (1 - bootProgress));

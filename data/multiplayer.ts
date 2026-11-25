@@ -1268,6 +1268,17 @@ export interface GameMortarCrewDamagePacket {
   ts: number;
 }
 
+export interface ActiveMortarMissionSummary {
+  missionId: string;
+  pitId: string;
+  team: 'A' | 'B';
+  targetX: number;
+  targetZ: number;
+  roundsRemaining: number;
+  totalRounds: number;
+  callerName: string;
+}
+
 export interface GameFireSupportSyncPacket {
   type: 'game:fire_support_sync';
   senderUserId?: string;
@@ -1275,6 +1286,28 @@ export interface GameFireSupportSyncPacket {
   enabled: boolean;
   pits: MortarPitState[];
   teams?: [TeamFireSupportState, TeamFireSupportState];
+  activeMissions?: ActiveMortarMissionSummary[];
+  ts: number;
+}
+
+export interface GameFireSupportRequestPacket {
+  type: 'game:fire_support_request';
+  senderUserId?: string;
+  senderUsername?: string;
+  senderTeam?: LobbyTeamId;
+  kind: 'mortar_sweep';
+  targetX: number;
+  targetZ: number;
+  ts: number;
+}
+
+export interface GameFireSupportRejectedPacket {
+  type: 'game:fire_support_rejected';
+  senderUserId?: string;
+  senderIsHost?: boolean;
+  targetUserId: string;
+  kind: 'mortar_sweep';
+  reason: string;
   ts: number;
 }
 
@@ -1345,5 +1378,7 @@ export type GameSyncPacket =
   | GameMortarFireRequestPacket
   | GameMortarCrewDamagePacket
   | GameFireSupportSyncPacket
+  | GameFireSupportRequestPacket
+  | GameFireSupportRejectedPacket
   | GameMortarLaunchPacket
   | GameMortarSeatRejectedPacket;

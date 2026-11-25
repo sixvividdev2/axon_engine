@@ -114,6 +114,8 @@ import {
   GameDogtagEventPacket,
   GameDoorActionPacket,
   GameEnvSyncPacket,
+  GameFireSupportRejectedPacket,
+  GameFireSupportRequestPacket,
   GameFireSupportSyncPacket,
   GameFlagEventPacket,
   GameGlassShatterPacket,
@@ -151,9 +153,14 @@ import {
   SyncedHandlingAction,
   TacticalPingKind,
   TacticalPingTargetType,
-  TeamFireSupportState,
 } from '../data/multiplayer';
-import type { PdaMortarFiringTableTelemetry } from '../bodycam-sdk/TacticalPdaDevice';
+import type {
+  PdaActiveMortarMissionMarker,
+  PdaFireSupportTelemetry,
+  PdaHqExclusionZone,
+  PdaMortarFiringTableTelemetry,
+  PdaMortarPitMarker,
+} from '../bodycam-sdk/TacticalPdaDevice';
 import {
   BattleBotAI,
   BattleHumanTarget,
@@ -180,7 +187,9 @@ import {
   MORTAR_HQ_EXCLUSION_RADIUS_M,
   MortarEmplacementSystem,
   MortarExclusionZone,
+  MortarFriendlyPosition,
   MortarImpactEvent,
+  MortarMissionEvent,
   MortarPlayerHudTelemetry,
   MortarSiteConfig,
   MortarTargetCandidate,
@@ -490,6 +499,10 @@ export class CombatSessionEngine {
   private readonly _mortarCamLook = new THREE.Vector3();
   private readonly _mortarTargetsBuf: MortarTargetCandidate[] = [];
   private readonly _mortarExclusionsBuf: MortarExclusionZone[] = [];
+  private readonly _mortarFriendlyPosBuf: MortarFriendlyPosition[] = [];
+  private readonly _pdaMortarPitsBuf: PdaMortarPitMarker[] = [];
+  private readonly _pdaMortarMissionsBuf: PdaActiveMortarMissionMarker[] = [];
+  private readonly _pdaHqExclusionsBuf: PdaHqExclusionZone[] = [];
   private readonly _mortarFobOwnerMap = new Map<string, 'A' | 'B' | null>();
   private readonly _mortarOriginScratch = new THREE.Vector3();
   private readonly _mortarTargetScratch = new THREE.Vector3();
@@ -1758,11 +1771,104 @@ export class CombatSessionEngine {
           this.mp.sendMessage(pkt as unknown as Record<string, unknown>);
         }
       },
+      onMissionEvent: (ev) => this.handleMortarMissionEvent(ev),
       enabled: ENABLE_CONQUEST_FIRE_SUPPORT,
     });
     this.mortarSystem.configureSites(sites);
     installHorizonFogOnSubtree(this.mortarSystem.root, this.horizonFogUniforms);
     this.syncMortarFobOwnershipFromMode();
+  }
+
+  private handleMortarMissionEvent(ev: MortarMissionEvent): void {
+    const localTeam: 'A' | 'B' = this.localBattleTeam === 'B' ? 'B' : 'A';
+    if (ev.team === localTeam) {
+      if (ev.kind === 'started') {
+        this.audio.playPdaButtonClick();
+        this.showToast(
+          ev.dangerClose
+            ? 'DANGER CLOSE (<45m) — 5-RD 81mm Mortar Sweep Inbound!'
+            : '81mm Mortar Sweep Inbound — 5 Rounds On Target (18m CEP)',
+          3.4,
+        );
+      } else if (ev.kind === 'aborted_takeover') {
+        this.showToast('Mortar Fire Mission Aborted — Manual Operator Takeover', 2.8);
+      } else if (ev.kind === 'aborted_crew_kia') {
+        this.showToast(
+          `Battery Under Fire — Mission Aborted (${Math.round(ev.refundedCooldownSec)}s Cooldown Refunded)`,
+          3.4,
+        );
+      }
+    }
+    this.broadcastFireSupportSync();
+  }
+
+  private collectFriendlyPositionsForTeam(team: 'A' | 'B'): readonly MortarFriendlyPosition[] {
+    const buf = this._mortarFriendlyPosBuf;
+    buf.length = 0;
+    if (this.playerAlive && this.localBattleTeam === team) {
+      buf.push({ x: this.controller.position.x, z: this.controller.position.z });
+    }
+    if (this.remotePlayers) {
+      const humans = this.remotePlayers.getAliveHumanTargets();
+      for (let i = 0; i < humans.length; i++) {
+        const h = humans[i];
+        if (h.alive && h.team === team) {
+          buf.push({ x: h.pos.x, z: h.pos.z });
+        }
+      }
+    }
+    if (this.botAI) {
+      const botSnaps = this.botAI.exportSyncSnapshot().bots;
+      for (let i = 0; i < botSnaps.length; i++) {
+        const b = botSnaps[i];
+        if (b.alive && b.team === team) {
+          buf.push({ x: b.x, z: b.z });
+        }
+      }
+    }
+    return buf;
+  }
+
+  private triggerPdaMortarFireMission(): void {
+    if (!this.mortarSystem || !this.mortarSystem.isEnabled()) return;
+    if (!this.pdaDevice.isOpen() || this.pdaDevice.getActiveTab() !== 'fire_support') return;
+
+    const ret = this.pdaDevice.getReticleWorldCoords();
+    const localId = this.getLocalModeActorId();
+    const localName = this.mp?.localUsername ?? 'YOU';
+    const localTeam: 'A' | 'B' = this.localBattleTeam === 'B' ? 'B' : 'A';
+
+    if (this.mp && !this.isMpHost) {
+      const req: GameFireSupportRequestPacket = {
+        type: 'game:fire_support_request',
+        kind: 'mortar_sweep',
+        targetX: ret.x,
+        targetZ: ret.z,
+        ts: Date.now(),
+      };
+      this.mp.sendMessage(req as unknown as Record<string, unknown>);
+      this.audio.playPdaButtonClick();
+      this.showToast('Transmitting 81mm Mortar Fire Mission...', 1.8);
+      return;
+    }
+
+    const friendlies = this.collectFriendlyPositionsForTeam(localTeam);
+    const res = this.mortarSystem.requestMortarFireMission({
+      callerId: localId,
+      callerName: localName,
+      callerTeam: localTeam,
+      targetX: ret.x,
+      targetZ: ret.z,
+      exclusionZones: this._mortarExclusionsBuf,
+      friendlyPositions: friendlies,
+    });
+    if (!res.ok) {
+      this.audio.playPdaButtonClick();
+      this.showToast(res.reason ?? 'Mortar Sweep Unavailable', 2.4);
+      return;
+    }
+    this.broadcastFireSupportSync();
+    this.emitSnapshot();
   }
 
   private syncMortarFobOwnershipFromMode(): void {
@@ -1778,20 +1884,12 @@ export class CombatSessionEngine {
 
   private broadcastFireSupportSync(): void {
     if (!this.mp || !this.isMpHost || !this.mortarSystem) return;
-    const emptyTeamState = (team: 'A' | 'B'): TeamFireSupportState => ({
-      team,
-      airStrikeCooldownSec: 0,
-      airStrikeMaxCooldownSec: 120,
-      mortarStrikeCooldownSec: 0,
-      mortarStrikeMaxCooldownSec: 60,
-      activeBomberId: null,
-      activeMortarMissionId: null,
-    });
     const pkt: GameFireSupportSyncPacket = {
       type: 'game:fire_support_sync',
       enabled: this.mortarSystem.isEnabled(),
       pits: this.mortarSystem.getPitStates(),
-      teams: [emptyTeamState('A'), emptyTeamState('B')],
+      teams: this.mortarSystem.getTeamFireSupportStates(),
+      activeMissions: this.mortarSystem.getActiveMissionSummaries(),
       ts: Date.now(),
     };
     this.mp.sendMessage(pkt as unknown as Record<string, unknown>);
@@ -3360,6 +3458,47 @@ export class CombatSessionEngine {
       }
       this.showToast(pkt.reason, 2.4);
       this.emitSnapshot();
+      return;
+    }
+
+    if (type === 'game:fire_support_request' && this.mortarSystem && this.isMpHost) {
+      const pkt = raw as unknown as GameFireSupportRequestPacket;
+      const reqId = pkt.senderUserId ?? '';
+      const reqName = pkt.senderUsername ?? 'OPERATOR';
+      if (!reqId) return;
+      const member = this.mp.members.find((m) => m.userId === reqId);
+      const reqTeam: 'A' | 'B' = member?.team === 'B' ? 'B' : 'A';
+      if (pkt.kind === 'mortar_sweep') {
+        const friendlies = this.collectFriendlyPositionsForTeam(reqTeam);
+        const res = this.mortarSystem.requestMortarFireMission({
+          callerId: reqId,
+          callerName: reqName,
+          callerTeam: reqTeam,
+          targetX: pkt.targetX,
+          targetZ: pkt.targetZ,
+          exclusionZones: this._mortarExclusionsBuf,
+          friendlyPositions: friendlies,
+        });
+        if (!res.ok) {
+          const rej: GameFireSupportRejectedPacket = {
+            type: 'game:fire_support_rejected',
+            targetUserId: reqId,
+            kind: 'mortar_sweep',
+            reason: res.reason ?? 'Mortar Sweep Unavailable',
+            ts: Date.now(),
+          };
+          this.mp.sendMessage(rej as unknown as Record<string, unknown>);
+        } else {
+          this.broadcastFireSupportSync();
+        }
+      }
+      return;
+    }
+
+    if (type === 'game:fire_support_rejected' && this.mortarSystem && !this.isMpHost) {
+      const pkt = raw as unknown as GameFireSupportRejectedPacket;
+      if (!pkt.senderIsHost || pkt.targetUserId !== this.mp.localUserId) return;
+      this.showToast(pkt.reason, 2.5);
       return;
     }
 
@@ -6424,6 +6563,12 @@ export class CombatSessionEngine {
 
     if (e.code === 'Tab' && this.params.mode === 'battle' && this.pointerLocked) {
       e.preventDefault();
+      if (this.pdaDevice.isOpen() && this.mortarSystem?.isEnabled() && this.playerAlive) {
+        if (!e.repeat) {
+          this.pdaDevice.toggleTab();
+        }
+        return;
+      }
       if (!this.scoreboardOpen) {
         this.scoreboardOpen = true;
         this.emitSnapshot();
@@ -6646,7 +6791,15 @@ export class CombatSessionEngine {
       case 'Space':
         e.preventDefault();
         if (!e.repeat) {
-          this.input.vault = true;
+          if (
+            this.pdaDevice.isOpen() &&
+            this.pdaDevice.getActiveTab() === 'fire_support' &&
+            this.mortarSystem?.isEnabled()
+          ) {
+            this.triggerPdaMortarFireMission();
+          } else {
+            this.input.vault = true;
+          }
         }
         break;
     }
@@ -8800,6 +8953,95 @@ export class CombatSessionEngine {
       }
     }
 
+    let fireSupport: PdaFireSupportTelemetry | null = null;
+    if (this.mortarSystem && this.mortarSystem.isEnabled()) {
+      const localTeam: 'A' | 'B' = this.localBattleTeam === 'B' ? 'B' : 'A';
+      const ret = this.pdaDevice.getReticleWorldCoords();
+      const teamState = this.mortarSystem.getTeamFireSupportState(localTeam);
+      const friendlies = this.collectFriendlyPositionsForTeam(localTeam);
+      const evalRes = this.mortarSystem.evaluateFireMissionTarget({
+        team: localTeam,
+        targetX: ret.x,
+        targetZ: ret.z,
+        exclusionZones: this._mortarExclusionsBuf,
+        friendlyPositions: friendlies,
+      });
+
+      this._pdaMortarPitsBuf.length = 0;
+      const pitStates = this.mortarSystem.getPitStates();
+      for (let i = 0; i < pitStates.length; i++) {
+        const p = pitStates[i];
+        this._pdaMortarPitsBuf.push({
+          pitId: p.pitId,
+          ownerTeam: p.ownerTeam,
+          friendly: p.ownerTeam === localTeam,
+          sourceType: p.sourceType,
+          x: p.position[0],
+          z: p.position[2],
+          status: p.status,
+          respawnTimerSec: p.respawnTimerSec,
+          seatedPlayerName: p.seatedPlayerName,
+        });
+      }
+
+      this._pdaMortarMissionsBuf.length = 0;
+      const missions = this.mortarSystem.getActiveMissionSummaries();
+      for (let i = 0; i < missions.length; i++) {
+        const m = missions[i];
+        this._pdaMortarMissionsBuf.push({
+          missionId: m.missionId,
+          pitId: m.pitId,
+          team: m.team,
+          friendly: m.team === localTeam,
+          targetX: m.targetX,
+          targetZ: m.targetZ,
+          roundsRemaining: m.roundsRemaining,
+          totalRounds: m.totalRounds,
+          callerName: m.callerName,
+        });
+      }
+
+      this._pdaHqExclusionsBuf.length = 0;
+      const obj = this.map.battleObjectives;
+      if (obj?.hqA) {
+        this._pdaHqExclusionsBuf.push({
+          x: obj.hqA.position[0],
+          z: obj.hqA.position[2],
+          radiusM: MORTAR_HQ_EXCLUSION_RADIUS_M,
+          friendly: localTeam === 'A',
+        });
+      }
+      if (obj?.hqB) {
+        this._pdaHqExclusionsBuf.push({
+          x: obj.hqB.position[0],
+          z: obj.hqB.position[2],
+          radiusM: MORTAR_HQ_EXCLUSION_RADIUS_M,
+          friendly: localTeam === 'B',
+        });
+      }
+
+      fireSupport = {
+        enabled: true,
+        localTeam,
+        mortarCooldownSec: teamState.mortarStrikeCooldownSec,
+        mortarMaxCooldownSec: teamState.mortarStrikeMaxCooldownSec,
+        activeMortarMissionId: teamState.activeMortarMissionId,
+        availableAiBatteries: evalRes.availableAiBatteries,
+        totalFriendlyBatteries: evalRes.totalFriendlyBatteries,
+        pits: this._pdaMortarPitsBuf,
+        activeMissions: this._pdaMortarMissionsBuf,
+        hqExclusions: this._pdaHqExclusionsBuf,
+        reticleX: ret.x,
+        reticleZ: ret.z,
+        reticleDangerClose: evalRes.dangerClose,
+        reticleMinFriendlyDistM: evalRes.minFriendlyDistM,
+        reticleInHqExclusion: evalRes.inHqExclusion,
+        reticleInRange: evalRes.inRange,
+        canCallMortarSweep: evalRes.canCall,
+        blockReason: evalRes.blockReason,
+      };
+    }
+
     this.controller.writePdaMotionState(this._pdaMotionScratch);
     this.pdaDevice.setTelemetry({
       playerX: this.controller.position.x,
@@ -8813,6 +9055,7 @@ export class CombatSessionEngine {
       allies: this._pdaAllyBuf,
       pings: this._pdaPingBuf,
       mortarTable,
+      fireSupport,
     });
     this.pdaDevice.update(
       dt,
