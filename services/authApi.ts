@@ -1,3 +1,4 @@
+import { KeybindOverrides } from '../data/keybindStore';
 import {
   MatchProgressionSummary,
   MatchResultInput,
@@ -24,6 +25,7 @@ export interface AccountProfile {
   weaponProgress: Record<string, WeaponProgressRecord>;
   unlockedAttachments: string[];
   recentMatches: RecentMatchRecord[];
+  keybinds?: KeybindOverrides;
 }
 
 export class ApiError extends Error {
@@ -110,6 +112,14 @@ export async function resetAccountProgress(): Promise<AccountProfile> {
   const data = await apiRequest<{ user: AccountProfile; reset: boolean }>('/api/account/reset', {
     method: 'POST',
     body: JSON.stringify({ confirm: 'RESET_ALL_PROGRESS' }),
+  });
+  return data.user;
+}
+
+export async function updateAccountKeybinds(keybinds: KeybindOverrides): Promise<AccountProfile> {
+  const data = await apiRequest<{ user: AccountProfile }>('/api/account/keybinds', {
+    method: 'PUT',
+    body: JSON.stringify({ keybinds }),
   });
   return data.user;
 }

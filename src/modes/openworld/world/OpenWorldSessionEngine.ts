@@ -54,6 +54,13 @@ import {
   type GraphicsQualityProfile,
 } from '../../../../data/graphicsQuality';
 import {
+  formatFireModeLabel,
+  getEffectiveFireMode,
+  SelectableFireMode,
+  toggleWeaponFireMode,
+} from '../../../../data/fireModeControl';
+import { keybindStore } from '../../../../data/keybindStore';
+import {
   DEFAULT_TACTICAL_EQUIPMENT_ID,
   getTacticalEquipmentDef,
   TacticalEquipmentId,
@@ -732,6 +739,8 @@ export class OpenWorldSessionEngine {
   private tacticalEquipmentId: TacticalEquipmentId = DEFAULT_TACTICAL_EQUIPMENT_ID;
   private grenadeCount = 2;
   private shiftHeld = false;
+  private holdBreathHeld = false;
+  private fireModeOverrideByWeapon: Record<string, SelectableFireMode> = {};
   private killsThisSortie = 0;
   private damageFlashAlpha = 0;
   private hitMarkerAlpha = 0;
@@ -1284,6 +1293,7 @@ export class OpenWorldSessionEngine {
     this.input.ads = false;
     this.input.vault = false;
     this.shiftHeld = false;
+    this.holdBreathHeld = false;
     this.isFiring = false;
     this.semiTriggerConsumed = false;
     this.pdaDevice.setDragging(false);
@@ -1339,13 +1349,21 @@ export class OpenWorldSessionEngine {
   };
 
   private readonly onKeyDown = (e: KeyboardEvent): void => {
+    if (keybindStore.isCapturing()) return;
     const tag = (e.target as HTMLElement | null)?.tagName;
     if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
-    this.keysDown.add(e.code);
+
+    if (keybindStore.matchesKeyCode(e.code, 'hold_breath')) {
+      this.holdBreathHeld = true;
+    }
+
+    const code = keybindStore.resolveManagedInputCode(e.code);
+    if (!code) return;
+    this.keysDown.add(code);
 
     // Global open-world hotkeys
     if (!e.repeat) {
-      if (e.code === 'Tab') {
+      if (code === 'Tab') {
         e.preventDefault();
         if (this.activeModal === 'inventory' || this.activeModal === 'corpse_loot' || this.activeModal === 'event_loot') {
           this.closeActiveModal();
@@ -1354,38 +1372,38 @@ export class OpenWorldSessionEngine {
         }
         return;
       }
-      if (e.code === 'Escape' && this.activeModal !== null) {
+      if (code === 'Escape' && this.activeModal !== null) {
         this.closeActiveModal();
         return;
       }
       if (this.activeModal !== null) {
         return;
       }
-      if (e.code === 'KeyI') {
+      if (code === 'KeyI') {
         if (this.navMode === 'foot' && !this.pdaDevice.isBlockingWeaponActions() && !this.grenadeSystem.isDrawn()) {
           this.weaponRig.triggerInspect();
         }
         return;
       }
-      if (e.code === 'KeyV') {
+      if (code === 'KeyV') {
         this.setNavMode(this.navMode === 'foot' ? 'recon_flight' : 'foot');
         return;
       }
-      if (e.code === 'KeyL') {
+      if (code === 'KeyL' || code === 'KeyT') {
         this.toggleFlashlight();
         return;
       }
-      if (e.code === 'KeyN') {
+      if (code === 'KeyN' || code === 'KeyJ') {
         this.cycleNvgMode();
         return;
       }
-      if (e.code === 'KeyX') {
+      if (code === 'KeyX') {
         if (this.activeInteractable?.kind === 'convoy_hijack') {
           this.sabotageNearestConvoy();
         }
         return;
       }
-      if (e.code === 'KeyF') {
+      if (code === 'KeyF') {
         if (this.navMode === 'foot' && this.activeInteractable?.kind === 'electronic_repair' && this.nearbyElectronicRepair) {
           const target = this.nearbyElectronicRepair;
           this.isFiring = false;
@@ -1426,7 +1444,7 @@ export class OpenWorldSessionEngine {
 
     if (this.activeModal !== null || this.navMode !== 'foot') return;
 
-    switch (e.code) {
+    switch (code) {
       case 'KeyW':
         this.input.forward = true;
         break;
@@ -1469,6 +1487,7 @@ export class OpenWorldSessionEngine {
         if (!e.repeat) this.togglePda('tac_map');
         break;
       case 'KeyG':
+      case 'KeyH':
       case 'Digit4':
         if (!e.repeat && !this.pdaDevice.isBlockingWeaponActions()) {
           this.toggleGrenade();
@@ -1489,12 +1508,28 @@ export class OpenWorldSessionEngine {
       case 'KeyB':
         if (!e.repeat) this.cycleAimMode();
         break;
+      case 'KeyK':
+        if (!e.repeat && !this.isNonFirearmEquipped() && !this.pdaDevice.isBlockingWeaponActions() && !this.grenadeSystem.isDrawn()) {
+          const prof = resolveWeaponProfile(this.equippedWeaponId);
+          const res = toggleWeaponFireMode(prof, this.fireModeOverrideByWeapon);
+          if (res.toggled) {
+            this.audio.playWeaponCue('mode_toggle', { intensity: 0.55 });
+            this.showToast(`Fire Mode: ${res.label}`, 1.8);
+            this.emitSnapshot();
+          }
+        }
+        break;
     }
   };
 
   private readonly onKeyUp = (e: KeyboardEvent): void => {
-    this.keysDown.delete(e.code);
-    switch (e.code) {
+    if (keybindStore.matchesKeyCode(e.code, 'hold_breath')) {
+      this.holdBreathHeld = false;
+    }
+    const code = keybindStore.resolveManagedInputCode(e.code);
+    if (!code) return;
+    this.keysDown.delete(code);
+    switch (code) {
       case 'KeyW':
         this.input.forward = false;
         break;
@@ -1554,7 +1589,7 @@ export class OpenWorldSessionEngine {
 
   private readonly onMouseDown = (e: MouseEvent): void => {
     if (e.button === 1) e.preventDefault();
-    if (this.activeModal !== null) return;
+    if (this.activeModal !== null || keybindStore.isCapturing()) return;
     if (!this.pointerLocked) {
       if (e.target === this.renderer.domElement) {
         this.requestPointerLock();
@@ -1565,11 +1600,15 @@ export class OpenWorldSessionEngine {
 
     this.audio.ensureInitialized();
 
+    const isFireBtn = keybindStore.matchesMouseButton(e.button, 'fire');
+    const isAdsBtn = keybindStore.matchesMouseButton(e.button, 'ads');
+    const isPointAimBtn = keybindStore.matchesMouseButton(e.button, 'point_aim');
+
     // Tactical PDA Grab-Sheet Drag / GPS Recenter
     if (this.pdaDevice.isBlockingWeaponActions()) {
-      if (e.button === 0 && this.pdaDevice.isOpen()) {
+      if (isFireBtn && this.pdaDevice.isOpen()) {
         this.pdaDevice.setDragging(true);
-      } else if (e.button === 2 && this.pdaDevice.isOpen()) {
+      } else if (isAdsBtn && this.pdaDevice.isOpen()) {
         this.pdaDevice.recenterOnPlayer();
       }
       return;
@@ -1579,7 +1618,7 @@ export class OpenWorldSessionEngine {
     if (this.grenadeSystem.isDrawn()) {
       this.input.ads = false;
       const stage = this.grenadeSystem.getHoldStage();
-      if (e.button === 2) {
+      if (isAdsBtn) {
         if (stage === 'DRAWN') {
           this.grenadeSystem.pullPin();
           this.emitSnapshot();
@@ -1587,25 +1626,25 @@ export class OpenWorldSessionEngine {
           this.grenadeSystem.releaseLever();
           this.emitSnapshot();
         }
-      } else if (e.button === 0 && (stage === 'PIN_PULLED' || stage === 'LEVER_RELEASED')) {
+      } else if (isFireBtn && (stage === 'PIN_PULLED' || stage === 'LEVER_RELEASED')) {
         this.grenadeSystem.beginThrowInput();
         this.emitSnapshot();
       }
       return;
     }
 
-    if (e.button === 1) {
+    if (isPointAimBtn) {
       this.cycleAimMode();
       return;
     }
 
-    if (e.button === 2) {
+    if (isAdsBtn) {
       if (this.equippedWeaponId === 'combat_knife') {
         this.animator.triggerKnifeStab(this.controller);
         return;
       }
       this.input.ads = true;
-    } else if (e.button === 0) {
+    } else if (isFireBtn) {
       if (this.equippedWeaponId === 'combat_knife') {
         this.animator.triggerKnifeSlash(this.controller);
         return;
@@ -1620,7 +1659,7 @@ export class OpenWorldSessionEngine {
   };
 
   private readonly onMouseUp = (e: MouseEvent): void => {
-    if (e.button === 0) {
+    if (keybindStore.matchesMouseButton(e.button, 'fire')) {
       if (this.pdaDevice.isDragging()) {
         this.pdaDevice.setDragging(false);
       }
@@ -1630,7 +1669,8 @@ export class OpenWorldSessionEngine {
       }
       this.isFiring = false;
       this.semiTriggerConsumed = false;
-    } else if (e.button === 2) {
+    }
+    if (keybindStore.matchesMouseButton(e.button, 'ads')) {
       this.input.ads = false;
     }
   };
@@ -1870,7 +1910,8 @@ export class OpenWorldSessionEngine {
     }
 
     const prof = resolveWeaponProfile(this.equippedWeaponId);
-    const isSingle = prof.fireMode === 'semi' || prof.fireMode === 'bolt' || prof.fireMode === 'pump';
+    const effMode = getEffectiveFireMode(prof, this.fireModeOverrideByWeapon);
+    const isSingle = effMode === 'semi' || effMode === 'bolt' || effMode === 'pump';
     if (isSingle && this.semiTriggerConsumed) return;
 
     const char = this.getActiveCharacter();
@@ -3609,7 +3650,7 @@ export class OpenWorldSessionEngine {
       this.input.forward &&
       !this.input.ads;
     this.input.holdBreath =
-      !pdaBusy && this.shiftHeld && this.input.ads && !this.isNonFirearmEquipped();
+      !pdaBusy && this.holdBreathHeld && this.input.ads && !this.isNonFirearmEquipped();
 
     if (this.fireCooldown > 0) {
       this.fireCooldown = Math.max(0, this.fireCooldown - dt);
@@ -4040,7 +4081,9 @@ export class OpenWorldSessionEngine {
         rigQuickMagCount: reserveInfo.rigAndBeltMags,
         backpackReserveRounds: reserveInfo.backpackRounds,
         hasChestRig: Boolean(character?.tacticalInventory?.chestRig),
-        fireModeLabel: nonFirearm ? '' : prof.fireMode.toUpperCase(),
+        fireModeLabel: nonFirearm
+          ? ''
+          : formatFireModeLabel(getEffectiveFireMode(prof, this.fireModeOverrideByWeapon)),
         reloading: this.reloadTimer > 0,
         isAds: this.input.ads,
         armedAdsMode: this.armedAdsMode,

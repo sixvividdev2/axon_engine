@@ -35,12 +35,17 @@ export const CONTROL_BINDING_GROUPS: readonly ControlBindingGroup[] = [
       { id: 'hold_breath', keys: ['Shift'], action: 'Hold Breath (While ADS)' },
       { id: 'point_aim', keys: ['MMB'], action: 'Toggle Point Aim' },
       { id: 'canted', keys: ['B'], action: 'Toggle Canted Backup Optic' },
+      {
+        id: 'switch_fire_mode',
+        keys: ['K'],
+        action: 'Switch Fire Mode (Auto / Semi / Pump)',
+        detail: 'Select-fire Auto / Semi on rifles & SMGs · Pump / Semi on SPAS-12',
+      },
       { id: 'optic_zoom', keys: ['Wheel', '[ ]'], action: 'Variable Optic Magnification' },
       { id: 'reticle_illum', keys: ['N'], action: 'Toggle Optic Illumination' },
       { id: 'reload', keys: ['R'], action: 'Reload Weapon' },
       { id: 'suppressor', keys: ['G'], action: 'Attach / Detach Suppressor' },
       { id: 'inspect', keys: ['I'], action: 'Inspect Firearm' },
-      { id: 'shotgun_mode', keys: ['Z'], action: 'SPAS-12 Pump / Semi Toggle (Range)' },
     ],
   },
   {

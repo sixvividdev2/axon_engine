@@ -1233,6 +1233,31 @@ export interface TeamFireSupportState {
   mortarStrikeMaxCooldownSec: number;
   activeBomberId: string | null;
   activeMortarMissionId: string | null;
+  activeStrike?: boolean;
+  callerPlayerId?: string | null;
+  activeStrikeId?: string | null;
+}
+
+export interface ActiveAirStrikeSummary {
+  strikeId: string;
+  team: 'A' | 'B';
+  callerId: string;
+  callerName: string;
+  centerX: number;
+  centerZ: number;
+  headingRad: number;
+  corridorLengthM: number;
+  startX: number;
+  startZ: number;
+  endX: number;
+  endZ: number;
+  seed: number;
+  elapsedSec: number;
+  totalDurationSec: number;
+  dangerClose: boolean;
+  progress01?: number;
+  aircraftX?: number;
+  aircraftZ?: number;
 }
 
 export interface GameMortarSeatRequestPacket {
@@ -1287,6 +1312,7 @@ export interface GameFireSupportSyncPacket {
   pits: MortarPitState[];
   teams?: [TeamFireSupportState, TeamFireSupportState];
   activeMissions?: ActiveMortarMissionSummary[];
+  activeAirStrikes?: ActiveAirStrikeSummary[];
   ts: number;
 }
 
@@ -1295,9 +1321,10 @@ export interface GameFireSupportRequestPacket {
   senderUserId?: string;
   senderUsername?: string;
   senderTeam?: LobbyTeamId;
-  kind: 'mortar_sweep';
+  kind: 'mortar_sweep' | 'air_strike';
   targetX: number;
   targetZ: number;
+  headingRad?: number;
   ts: number;
 }
 
@@ -1306,8 +1333,30 @@ export interface GameFireSupportRejectedPacket {
   senderUserId?: string;
   senderIsHost?: boolean;
   targetUserId: string;
-  kind: 'mortar_sweep';
+  kind: 'mortar_sweep' | 'air_strike';
   reason: string;
+  ts: number;
+}
+
+export interface GameAirStrikeLaunchPacket {
+  type: 'game:air_strike_launch';
+  senderUserId?: string;
+  senderIsHost?: boolean;
+  strikeId: string;
+  team: 'A' | 'B';
+  callerId: string;
+  callerName: string;
+  centerX: number;
+  centerZ: number;
+  headingRad: number;
+  corridorLengthM: number;
+  startX: number;
+  startZ: number;
+  endX: number;
+  endZ: number;
+  seed: number;
+  totalDurationSec: number;
+  dangerClose: boolean;
   ts: number;
 }
 
@@ -1380,5 +1429,6 @@ export type GameSyncPacket =
   | GameFireSupportSyncPacket
   | GameFireSupportRequestPacket
   | GameFireSupportRejectedPacket
+  | GameAirStrikeLaunchPacket
   | GameMortarLaunchPacket
   | GameMortarSeatRejectedPacket;

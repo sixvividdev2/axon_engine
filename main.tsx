@@ -1,3 +1,4 @@
+/// <reference types="vite/client" />
 import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
 import App from './App';
@@ -11,3 +12,10 @@ if (rootEl) {
     </StrictMode>,
   );
 }
+
+if (import.meta.env.DEV) {
+  void import('./combat/FireSupportPerfBenchmark').then(({ installDevFireSupportBenchGlobal }) => {
+    installDevFireSupportBenchGlobal();
+  });
+}
+

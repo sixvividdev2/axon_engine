@@ -53,6 +53,13 @@ import {
   getDefaultAmmoVariant,
   resolveBaseCaliberId,
 } from '../data/calibers';
+import {
+  formatFireModeLabel,
+  getEffectiveFireMode as resolveEffectiveFireMode,
+  SelectableFireMode,
+  toggleWeaponFireMode,
+} from '../data/fireModeControl';
+import { keybindStore } from '../data/keybindStore';
 import { AdaptivePerformanceController, graphicsQualityStore } from '../data/graphicsQuality';
 import { loadoutStore } from '../data/loadoutStore';
 import {
@@ -231,7 +238,7 @@ export class HideoutSessionController {
   private localGear: OperatorGearConfig;
   private equippedWeaponId = 'm4a1';
   private magAmmoByWeapon: Record<string, number> = {};
-  private fireModeOverrideByWeapon: Record<string, 'auto' | 'semi'> = {};
+  private fireModeOverrideByWeapon: Record<string, SelectableFireMode> = {};
   private adsModeByWeapon: Record<string, AdsMode> = {};
   private tacticalEquipmentId: TacticalEquipmentId = DEFAULT_TACTICAL_EQUIPMENT_ID;
   private grenadeCount = 2;
@@ -249,6 +256,7 @@ export class HideoutSessionController {
   private disposed = false;
 
   private shiftHeld = false;
+  private holdBreathHeld = false;
   private keyFHeld = false;
   private stamina = 1.0;
   private heartRateBpm = 72;
@@ -1252,19 +1260,12 @@ export class HideoutSessionController {
   }
 
   private getEffectiveFireMode(prof: BodycamWeaponProfile): BodycamWeaponProfile['fireMode'] {
-    if (prof.fireMode === 'auto') {
-      return this.fireModeOverrideByWeapon[prof.id] ?? prof.fireMode;
-    }
-    return prof.fireMode;
+    return resolveEffectiveFireMode(prof, this.fireModeOverrideByWeapon);
   }
 
   private getFireModeLabel(prof: BodycamWeaponProfile): string {
     if (this.equippedWeaponId === 'unarmed') return '';
-    const mode = this.getEffectiveFireMode(prof);
-    if (mode === 'auto') return 'AUTO';
-    if (mode === 'bolt') return 'BOLT';
-    if (mode === 'pump') return 'PUMP';
-    return 'SEMI';
+    return formatFireModeLabel(this.getEffectiveFireMode(prof));
   }
 
   private resupplyAllWeapons(playLidPop = false): void {
@@ -2328,6 +2329,7 @@ export class HideoutSessionController {
     this.input.ads = false;
     this.input.vault = false;
     this.shiftHeld = false;
+    this.holdBreathHeld = false;
     this.keyFHeld = false;
     this.isFiring = false;
     this.semiTriggerConsumed = false;
@@ -2364,7 +2366,7 @@ export class HideoutSessionController {
     if (e.button === 1) {
       e.preventDefault();
     }
-    if (this.modalActive || this.pauseOpen) return;
+    if (this.modalActive || this.pauseOpen || keybindStore.isCapturing()) return;
     if (!this.pointerLocked) {
       if (e.target === this.renderer.domElement) {
         this.requestPointerLock();
@@ -2374,10 +2376,14 @@ export class HideoutSessionController {
     this.audio.ensureInitialized();
     this.audio.setInteriorAcoustics(true, 'concrete');
 
+    const isFireBtn = keybindStore.matchesMouseButton(e.button, 'fire');
+    const isAdsBtn = keybindStore.matchesMouseButton(e.button, 'ads');
+    const isPointAimBtn = keybindStore.matchesMouseButton(e.button, 'point_aim');
+
     if (this.pdaDevice.isBlockingWeaponActions()) {
-      if (e.button === 0 && this.pdaDevice.isOpen()) {
+      if (isFireBtn && this.pdaDevice.isOpen()) {
         this.pdaDevice.setDragging(true);
-      } else if (e.button === 2 && this.pdaDevice.isOpen()) {
+      } else if (isAdsBtn && this.pdaDevice.isOpen()) {
         this.pdaDevice.recenterOnPlayer();
       }
       return;
@@ -2387,7 +2393,7 @@ export class HideoutSessionController {
     if (this.grenadeSystem.isDrawn()) {
       this.input.ads = false;
       const stage = this.grenadeSystem.getHoldStage();
-      if (e.button === 2) {
+      if (isAdsBtn) {
         if (stage === 'DRAWN') {
           if (this.grenadeSystem.pullPin()) {
             this.emitSnapshot(true);
@@ -2397,22 +2403,22 @@ export class HideoutSessionController {
             this.emitSnapshot(true);
           }
         }
-      } else if (e.button === 0 && (stage === 'PIN_PULLED' || stage === 'LEVER_RELEASED')) {
+      } else if (isFireBtn && (stage === 'PIN_PULLED' || stage === 'LEVER_RELEASED')) {
         this.grenadeSystem.beginThrowInput();
         this.emitSnapshot(true);
       }
       return;
     }
 
-    if (e.button === 1) {
+    if (isPointAimBtn) {
       this.cycleAimMode();
       return;
     }
 
-    if (e.button === 2 && !this.swapChoreography.isActive()) {
+    if (isAdsBtn && !this.swapChoreography.isActive()) {
       this.animator.interruptInspect();
       this.input.ads = true;
-    } else if (e.button === 0 && !this.swapChoreography.isActive()) {
+    } else if (isFireBtn && !this.swapChoreography.isActive()) {
       if (this.equippedWeaponId === 'unarmed') {
         // Unarmed jab (hip) or heavy power hook (holding RMB ready fists) works anywhere in Hideout
         this.animator.interruptInspect();
@@ -2439,7 +2445,7 @@ export class HideoutSessionController {
   };
 
   private readonly onMouseUp = (e: MouseEvent): void => {
-    if (e.button === 0) {
+    if (keybindStore.matchesMouseButton(e.button, 'fire')) {
       if (this.pdaDevice.isDragging()) {
         this.pdaDevice.setDragging(false);
       }
@@ -2449,7 +2455,8 @@ export class HideoutSessionController {
       }
       this.isFiring = false;
       this.semiTriggerConsumed = false;
-    } else if (e.button === 2) {
+    }
+    if (keybindStore.matchesMouseButton(e.button, 'ads')) {
       this.input.ads = false;
     }
   };
@@ -2485,7 +2492,7 @@ export class HideoutSessionController {
   };
 
   private readonly onKeyDown = (e: KeyboardEvent): void => {
-    if (this.modalActive) return;
+    if (this.modalActive || keybindStore.isCapturing()) return;
 
     if (e.code === 'Escape' && !e.repeat) {
       if (this.pauseOpen) {
@@ -2500,7 +2507,14 @@ export class HideoutSessionController {
     if (!this.pointerLocked || this.pauseOpen) return;
     this.audio.ensureInitialized();
 
-    switch (e.code) {
+    if (keybindStore.matchesKeyCode(e.code, 'hold_breath')) {
+      this.holdBreathHeld = true;
+    }
+
+    const code = keybindStore.resolveManagedInputCode(e.code);
+    if (!code) return;
+
+    switch (code) {
       case 'KeyW':
         this.input.forward = true;
         break;
@@ -2628,15 +2642,24 @@ export class HideoutSessionController {
           !e.repeat &&
           this.equippedWeaponId !== 'unarmed' &&
           !this.swapChoreography.isActive() &&
+          !this.pdaDevice.isBlockingWeaponActions() &&
+          this.weaponRig.hasCantedOptic()
+        ) {
+          this.cycleAimMode();
+        }
+        break;
+      case 'KeyK':
+        if (
+          !e.repeat &&
+          this.equippedWeaponId !== 'unarmed' &&
+          !this.swapChoreography.isActive() &&
           !this.pdaDevice.isBlockingWeaponActions()
         ) {
           const prof = resolveWeaponProfile(this.equippedWeaponId);
-          if (prof.fireMode === 'auto') {
-            const cur = this.getEffectiveFireMode(prof);
-            const next: 'auto' | 'semi' = cur === 'semi' ? 'auto' : 'semi';
-            this.fireModeOverrideByWeapon[prof.id] = next;
+          const res = toggleWeaponFireMode(prof, this.fireModeOverrideByWeapon);
+          if (res.toggled) {
             this.audio.playWeaponCue('mode_toggle', { intensity: 0.55 });
-            this.showToast(next === 'auto' ? 'Fire Mode: Full Auto' : 'Fire Mode: Semi Auto');
+            this.showToast(`Fire Mode: ${res.label}`);
             this.emitSnapshot(true);
           }
         }
@@ -2723,7 +2746,12 @@ export class HideoutSessionController {
   };
 
   private readonly onKeyUp = (e: KeyboardEvent): void => {
-    switch (e.code) {
+    if (keybindStore.matchesKeyCode(e.code, 'hold_breath')) {
+      this.holdBreathHeld = false;
+    }
+    const code = keybindStore.resolveManagedInputCode(e.code);
+    if (!code) return;
+    switch (code) {
       case 'KeyW':
         this.input.forward = false;
         break;
@@ -2889,7 +2917,7 @@ export class HideoutSessionController {
       this.input.holdBreath =
         !suppBusy &&
         !pdaBusy &&
-        this.shiftHeld &&
+        this.holdBreathHeld &&
         this.input.ads &&
         this.equippedWeaponId !== 'unarmed' &&
         !swapping;

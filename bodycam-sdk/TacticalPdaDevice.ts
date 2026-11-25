@@ -124,9 +124,26 @@ export interface PdaHqExclusionZone {
   friendly: boolean;
 }
 
+export type PdaFireSupportMode = 'mortar_sweep' | 'air_strike';
+
+export interface PdaActiveAirStrikeMarker {
+  strikeId: string;
+  team: 'A' | 'B';
+  friendly: boolean;
+  centerX: number;
+  centerZ: number;
+  headingRad: number;
+  corridorLengthM: number;
+  progress01: number;
+  aircraftX: number;
+  aircraftZ: number;
+  callerName: string;
+}
+
 export interface PdaFireSupportTelemetry {
   enabled: boolean;
   localTeam: 'A' | 'B';
+  selectedMode?: PdaFireSupportMode;
   mortarCooldownSec: number;
   mortarMaxCooldownSec: number;
   activeMortarMissionId: string | null;
@@ -143,6 +160,20 @@ export interface PdaFireSupportTelemetry {
   reticleInRange: boolean;
   canCallMortarSweep: boolean;
   blockReason: string | null;
+  // Phase 4: Conquest Bomber Air Strike telemetry
+  airStrikeHeadingRad?: number;
+  airStrikeCooldownSec?: number;
+  airStrikeMaxCooldownSec?: number;
+  airStrikeActive?: boolean;
+  airStrikeSectorsHeld?: number;
+  airStrikeTotalSectors?: number;
+  airStrikeHasSectorControl?: boolean;
+  airStrikeInHqExclusion?: boolean;
+  airStrikeDangerClose?: boolean;
+  airStrikeMinFriendlyDistM?: number;
+  canCallAirStrike?: boolean;
+  airStrikeBlockReason?: string | null;
+  activeAirStrikes?: readonly PdaActiveAirStrikeMarker[];
 }
 
 export interface PdaHudTelemetry {
@@ -335,6 +366,8 @@ export class TacticalPdaDevice {
   private telemetryCacheDirty = true;
   private screenDirty = true;
   private activeTab: PdaTabMode = 'tac_map';
+  private fireSupportMode: PdaFireSupportMode = 'mortar_sweep';
+  private airStrikeHeadingRad = 0;
   private cachedCenterU = 0.5;
   private cachedCenterV = 0.5;
   private cachedDrawSize = 540;
@@ -696,6 +729,36 @@ export class TacticalPdaDevice {
     this.setActiveTab(next);
     this.audio?.playPdaButtonClick();
     return this.activeTab;
+  }
+
+  public getFireSupportMode(): PdaFireSupportMode {
+    return this.fireSupportMode;
+  }
+
+  public setFireSupportMode(mode: PdaFireSupportMode): void {
+    if (this.fireSupportMode === mode) return;
+    this.fireSupportMode = mode;
+    this.audio?.playPdaButtonClick();
+    this.telemetryCacheDirty = true;
+    this.screenDirty = true;
+  }
+
+  public getAirStrikeHeadingRad(): number {
+    return this.airStrikeHeadingRad;
+  }
+
+  public setAirStrikeHeadingRad(rad: number): void {
+    const twoPi = Math.PI * 2;
+    const normalized = ((rad % twoPi) + twoPi) % twoPi;
+    if (Math.abs(normalized - this.airStrikeHeadingRad) > 1e-5) {
+      this.airStrikeHeadingRad = normalized;
+      this.screenDirty = true;
+    }
+  }
+
+  public rotateAirStrikeHeading(deltaRad: number): void {
+    if (Math.abs(deltaRad) <= 1e-6) return;
+    this.setAirStrikeHeadingRad(this.airStrikeHeadingRad + deltaRad);
   }
 
   /** Diagnostic counters verifying split-rate 10 Hz telemetry vs 60+ FPS interactive reticle rendering. */
@@ -2142,11 +2205,12 @@ export class TacticalPdaDevice {
       );
     } else if (fs?.enabled && this.activeTab === 'fire_support') {
       ctx.fillStyle = '#fbbf24';
-      ctx.fillText(
-        `LMB+DRAG AIM · WHEEL ZOOM · [SPACE] CALL 81MM MORTAR SWEEP · [TAB] TAC-MAP · [R] CENTER`,
-        16,
-        SCREEN_H - 13,
-      );
+      const activeMode = fs.selectedMode ?? this.fireSupportMode;
+      const hintLine =
+        activeMode === 'air_strike'
+          ? 'LMB+DRAG AIM · [Q]/[E] ROTATE CORRIDOR · [1]/[2] STRIKE · [SPACE] CALL AIR STRIKE · [TAB] MAP'
+          : 'LMB+DRAG AIM · [1]/[2] STRIKE · WHEEL ZOOM · [SPACE] CALL MORTAR SWEEP · [TAB] MAP';
+      ctx.fillText(hintLine, 16, SCREEN_H - 13);
     } else {
       const tabHint = fs?.enabled ? ' · [TAB] FIRE SUPPORT' : '';
       ctx.fillText(
@@ -2306,99 +2370,281 @@ export class TacticalPdaDevice {
       ctx.textAlign = 'left';
     }
 
-    // Interactive Fire Support Target Reticle + 45m Danger Close Ring (60+ FPS)
+    // Active Friendly Bomber Air Strike Corridors & Live Aircraft Track (60+ FPS)
+    if (fs?.enabled && fs.activeAirStrikes && fs.activeAirStrikes.length > 0) {
+      const pulse = 0.55 + 0.45 * Math.sin(elapsed * 9.5);
+      for (const strike of fs.activeAirStrikes) {
+        if (!strike.friendly) continue;
+        const cUV = this.worldToMapUV(strike.centerX, strike.centerZ);
+        const cPt = uvToScreen(cUV.u, cUV.v);
+        const halfLenPx = Math.max(18, ((strike.corridorLengthM * 0.5) / worldSpanX) * drawSize);
+        const halfWPx = Math.max(7, (8.5 / worldSpanX) * drawSize);
+
+        ctx.save();
+        ctx.translate(cPt.sx, cPt.sy);
+        ctx.rotate(strike.headingRad);
+        ctx.fillStyle = `rgba(245, 158, 11, ${0.14 + pulse * 0.08})`;
+        ctx.fillRect(-halfWPx, -halfLenPx, halfWPx * 2, halfLenPx * 2);
+        ctx.strokeStyle = '#fbbf24';
+        ctx.lineWidth = 2.0;
+        ctx.setLineDash([6, 4]);
+        ctx.strokeRect(-halfWPx, -halfLenPx, halfWPx * 2, halfLenPx * 2);
+        ctx.setLineDash([]);
+        ctx.restore();
+
+        // Moving strike jet chevron along flight path
+        const jUV = this.worldToMapUV(strike.aircraftX, strike.aircraftZ);
+        const jPt = uvToScreen(jUV.u, jUV.v);
+        ctx.save();
+        ctx.translate(jPt.sx, jPt.sy);
+        ctx.rotate(strike.headingRad);
+        ctx.fillStyle = '#fde68a';
+        ctx.strokeStyle = '#0f172a';
+        ctx.lineWidth = 1.6;
+        ctx.beginPath();
+        ctx.moveTo(0, -11);
+        ctx.lineTo(10, 4);
+        ctx.lineTo(3, 3);
+        ctx.lineTo(3, 10);
+        ctx.lineTo(-3, 10);
+        ctx.lineTo(-3, 3);
+        ctx.lineTo(-10, 4);
+        ctx.closePath();
+        ctx.fill();
+        ctx.stroke();
+        ctx.restore();
+
+        ctx.fillStyle = '#fde68a';
+        ctx.font = 'bold 12px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText('EAGLE-1 INBOUND', cPt.sx, cPt.sy - halfLenPx - 9);
+      }
+      ctx.textAlign = 'left';
+    }
+
+    // Interactive Fire Support Target Reticle (Mortar 45m Circle OR Rotatable 65m Bomber Corridor + 45m Danger Close Capsule)
     if (fs?.enabled && this.activeTab === 'fire_support') {
       const rCx = mapW * 0.5 + this.joyTiltX * 14;
       const rCy = mapTop + mapH * 0.5 - this.joyTiltY * 14;
       const dangerClosePx = Math.max(24, (45 / worldSpanX) * drawSize);
-      const cepPx = Math.max(10, (18 / worldSpanX) * drawSize);
       const warnPulse = 0.5 + 0.5 * Math.sin(elapsed * 9.0);
+      const activeMode = fs.selectedMode ?? this.fireSupportMode;
 
-      // 45m Danger Close radius ring
-      if (fs.reticleInHqExclusion) {
-        ctx.fillStyle = 'rgba(239, 68, 68, 0.14)';
+      if (activeMode === 'air_strike') {
+        const headingRad = fs.airStrikeHeadingRad ?? this.airStrikeHeadingRad;
+        const halfLenPx = Math.max(22, (32.5 / worldSpanX) * drawSize);
+        const halfWPx = Math.max(9, (8.5 / worldSpanX) * drawSize);
+        const inHq = Boolean(fs.airStrikeInHqExclusion);
+        const dangerClose = Boolean(fs.airStrikeDangerClose);
+        const canCall = Boolean(fs.canCallAirStrike);
+        const headingDeg = Math.round(((THREE.MathUtils.radToDeg(headingRad) % 360) + 360) % 360) % 360;
+        const headingStr = String(headingDeg).padStart(3, '0');
+
+        ctx.save();
+        ctx.translate(rCx, rCy);
+        ctx.rotate(headingRad);
+
+        // 1. Exact 45m Danger Close stadium/capsule enveloping the entire 65m corridor segment
         ctx.beginPath();
-        ctx.arc(rCx, rCy, dangerClosePx, 0, Math.PI * 2);
+        ctx.arc(0, -halfLenPx, dangerClosePx, Math.PI, 0, false);
+        ctx.arc(0, halfLenPx, dangerClosePx, 0, Math.PI, false);
+        ctx.closePath();
+
+        if (inHq) {
+          ctx.fillStyle = 'rgba(239, 68, 68, 0.14)';
+          ctx.fill();
+          ctx.strokeStyle = '#ef4444';
+          ctx.lineWidth = 2.4;
+          ctx.setLineDash([8, 5]);
+          ctx.stroke();
+          ctx.setLineDash([]);
+        } else if (dangerClose) {
+          ctx.fillStyle = `rgba(245, 158, 11, ${0.11 + warnPulse * 0.11})`;
+          ctx.fill();
+          ctx.strokeStyle = warnPulse > 0.5 ? '#ef4444' : '#f59e0b';
+          ctx.lineWidth = 2.6;
+          ctx.setLineDash([9, 5]);
+          ctx.stroke();
+          ctx.setLineDash([]);
+        } else {
+          ctx.strokeStyle = canCall ? 'rgba(56, 189, 248, 0.36)' : 'rgba(148, 163, 184, 0.28)';
+          ctx.lineWidth = 1.4;
+          ctx.setLineDash([5, 6]);
+          ctx.stroke();
+          ctx.setLineDash([]);
+        }
+
+        // 2. Oriented 65m Bombing Corridor strip
+        const stripColor = inHq
+          ? '#f87171'
+          : dangerClose
+            ? '#f59e0b'
+            : canCall
+              ? '#34d399'
+              : '#94a3b8';
+        ctx.fillStyle = inHq
+          ? 'rgba(239, 68, 68, 0.20)'
+          : dangerClose
+            ? 'rgba(245, 158, 11, 0.18)'
+            : canCall
+              ? 'rgba(16, 185, 129, 0.16)'
+              : 'rgba(148, 163, 184, 0.12)';
+        ctx.fillRect(-halfWPx, -halfLenPx, halfWPx * 2, halfLenPx * 2);
+        ctx.strokeStyle = stripColor;
+        ctx.lineWidth = 2.1;
+        ctx.strokeRect(-halfWPx, -halfLenPx, halfWPx * 2, halfLenPx * 2);
+
+        // Centerline + 6 deterministic bomb-drop ticks along the 65m corridor
+        ctx.strokeStyle = 'rgba(248, 250, 252, 0.45)';
+        ctx.lineWidth = 1.1;
+        ctx.beginPath();
+        ctx.moveTo(0, halfLenPx);
+        ctx.lineTo(0, -halfLenPx);
+        ctx.stroke();
+
+        ctx.fillStyle = stripColor;
+        for (let b = 0; b < 6; b++) {
+          const yOff = halfLenPx - (b / 5) * (halfLenPx * 2);
+          ctx.beginPath();
+          ctx.moveTo(0, yOff - 3.5);
+          ctx.lineTo(3.5, yOff);
+          ctx.lineTo(0, yOff + 3.5);
+          ctx.lineTo(-3.5, yOff);
+          ctx.closePath();
+          ctx.fill();
+        }
+
+        // Bold ingress chevron arrow showing aircraft approach direction (-Y = nose)
+        ctx.fillStyle = stripColor;
+        ctx.beginPath();
+        ctx.moveTo(0, -halfLenPx - 14);
+        ctx.lineTo(7, -halfLenPx - 3);
+        ctx.lineTo(-7, -halfLenPx - 3);
+        ctx.closePath();
         ctx.fill();
-        ctx.strokeStyle = '#ef4444';
-        ctx.lineWidth = 2.4;
-        ctx.setLineDash([8, 5]);
+
+        // Tail approach chevrons
+        ctx.strokeStyle = stripColor;
+        ctx.lineWidth = 2;
         ctx.beginPath();
-        ctx.arc(rCx, rCy, dangerClosePx, 0, Math.PI * 2);
+        ctx.moveTo(-6, halfLenPx + 10);
+        ctx.lineTo(0, halfLenPx + 4);
+        ctx.lineTo(6, halfLenPx + 10);
+        ctx.moveTo(-6, halfLenPx + 17);
+        ctx.lineTo(0, halfLenPx + 11);
+        ctx.lineTo(6, halfLenPx + 17);
         ctx.stroke();
-        ctx.setLineDash([]);
-      } else if (fs.reticleDangerClose) {
-        ctx.fillStyle = `rgba(245, 158, 11, ${0.11 + warnPulse * 0.10})`;
-        ctx.beginPath();
-        ctx.arc(rCx, rCy, dangerClosePx, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.strokeStyle = warnPulse > 0.5 ? '#ef4444' : '#f59e0b';
-        ctx.lineWidth = 2.5;
-        ctx.setLineDash([9, 5]);
-        ctx.beginPath();
-        ctx.arc(rCx, rCy, dangerClosePx, 0, Math.PI * 2);
-        ctx.stroke();
-        ctx.setLineDash([]);
+
+        ctx.restore();
+
+        // Diegetic corridor banner & magnetic heading readout
+        const labelY = rCy - Math.max(dangerClosePx, halfLenPx) - 12;
+        ctx.textAlign = 'center';
+        ctx.font = 'bold 12px monospace';
+        if (inHq) {
+          ctx.fillStyle = '#fca5a5';
+          ctx.fillText(`HQ NO-FIRE ZONE (65M) · HDG ${headingStr}°`, rCx, labelY);
+        } else if (dangerClose) {
+          ctx.fillStyle = warnPulse > 0.5 ? '#fca5a5' : '#fcd34d';
+          ctx.fillText(
+            `! DANGER CLOSE · ALLY ${Math.round(fs.airStrikeMinFriendlyDistM ?? 0)}M · HDG ${headingStr}°`,
+            rCx,
+            labelY,
+          );
+        } else {
+          ctx.fillStyle = canCall ? '#a7f3d0' : '#cbd5e1';
+          ctx.fillText(`65M CORRIDOR · HDG ${headingStr}° · 6X MK-82`, rCx, labelY);
+        }
+        ctx.textAlign = 'left';
       } else {
-        ctx.strokeStyle = fs.canCallMortarSweep
-          ? 'rgba(56, 189, 248, 0.35)'
-          : 'rgba(148, 163, 184, 0.30)';
-        ctx.lineWidth = 1.4;
-        ctx.setLineDash([5, 6]);
+        const cepPx = Math.max(10, (18 / worldSpanX) * drawSize);
+
+        // 45m Danger Close radius ring
+        if (fs.reticleInHqExclusion) {
+          ctx.fillStyle = 'rgba(239, 68, 68, 0.14)';
+          ctx.beginPath();
+          ctx.arc(rCx, rCy, dangerClosePx, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.strokeStyle = '#ef4444';
+          ctx.lineWidth = 2.4;
+          ctx.setLineDash([8, 5]);
+          ctx.beginPath();
+          ctx.arc(rCx, rCy, dangerClosePx, 0, Math.PI * 2);
+          ctx.stroke();
+          ctx.setLineDash([]);
+        } else if (fs.reticleDangerClose) {
+          ctx.fillStyle = `rgba(245, 158, 11, ${0.11 + warnPulse * 0.10})`;
+          ctx.beginPath();
+          ctx.arc(rCx, rCy, dangerClosePx, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.strokeStyle = warnPulse > 0.5 ? '#ef4444' : '#f59e0b';
+          ctx.lineWidth = 2.5;
+          ctx.setLineDash([9, 5]);
+          ctx.beginPath();
+          ctx.arc(rCx, rCy, dangerClosePx, 0, Math.PI * 2);
+          ctx.stroke();
+          ctx.setLineDash([]);
+        } else {
+          ctx.strokeStyle = fs.canCallMortarSweep
+            ? 'rgba(56, 189, 248, 0.35)'
+            : 'rgba(148, 163, 184, 0.30)';
+          ctx.lineWidth = 1.4;
+          ctx.setLineDash([5, 6]);
+          ctx.beginPath();
+          ctx.arc(rCx, rCy, dangerClosePx, 0, Math.PI * 2);
+          ctx.stroke();
+          ctx.setLineDash([]);
+        }
+
+        // Inner 18m CEP dispersal circle
+        const reticleCol = fs.reticleInHqExclusion || !fs.reticleInRange
+          ? '#f87171'
+          : fs.reticleDangerClose
+            ? '#f59e0b'
+            : fs.canCallMortarSweep
+              ? '#34d399'
+              : '#94a3b8';
+        ctx.strokeStyle = reticleCol;
+        ctx.lineWidth = 1.8;
         ctx.beginPath();
-        ctx.arc(rCx, rCy, dangerClosePx, 0, Math.PI * 2);
+        ctx.arc(rCx, rCy, cepPx, 0, Math.PI * 2);
         ctx.stroke();
-        ctx.setLineDash([]);
+
+        // Precision crosshair ticks
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(rCx - cepPx - 10, rCy);
+        ctx.lineTo(rCx - 5, rCy);
+        ctx.moveTo(rCx + 5, rCy);
+        ctx.lineTo(rCx + cepPx + 10, rCy);
+        ctx.moveTo(rCx, rCy - cepPx - 10);
+        ctx.lineTo(rCx, rCy - 5);
+        ctx.moveTo(rCx, rCy + 5);
+        ctx.lineTo(rCx, rCy + cepPx + 10);
+        ctx.stroke();
+
+        // Diegetic reticle ring tag (Danger Close / HQ No-Fire / 45m clearance)
+        ctx.textAlign = 'center';
+        ctx.font = 'bold 12px monospace';
+        if (fs.reticleInHqExclusion) {
+          ctx.fillStyle = '#fca5a5';
+          ctx.fillText('HQ 65M NO-FIRE ZONE', rCx, rCy - dangerClosePx - 8);
+        } else if (fs.reticleDangerClose) {
+          ctx.fillStyle = warnPulse > 0.5 ? '#fca5a5' : '#fcd34d';
+          ctx.fillText(
+            `! DANGER CLOSE · FRIENDLY ${Math.round(fs.reticleMinFriendlyDistM)}M`,
+            rCx,
+            rCy - dangerClosePx - 8,
+          );
+        } else if (!fs.reticleInRange) {
+          ctx.fillStyle = '#fca5a5';
+          ctx.fillText('OUT OF 81MM RANGE', rCx, rCy - dangerClosePx - 8);
+        } else {
+          ctx.fillStyle = '#a7f3d0';
+          ctx.fillText('18M CEP · 45M CLEARANCE', rCx, rCy - dangerClosePx - 8);
+        }
+        ctx.textAlign = 'left';
       }
-
-      // Inner 18m CEP dispersal circle
-      const reticleCol = fs.reticleInHqExclusion || !fs.reticleInRange
-        ? '#f87171'
-        : fs.reticleDangerClose
-          ? '#f59e0b'
-          : fs.canCallMortarSweep
-            ? '#34d399'
-            : '#94a3b8';
-      ctx.strokeStyle = reticleCol;
-      ctx.lineWidth = 1.8;
-      ctx.beginPath();
-      ctx.arc(rCx, rCy, cepPx, 0, Math.PI * 2);
-      ctx.stroke();
-
-      // Precision crosshair ticks
-      ctx.lineWidth = 2;
-      ctx.beginPath();
-      ctx.moveTo(rCx - cepPx - 10, rCy);
-      ctx.lineTo(rCx - 5, rCy);
-      ctx.moveTo(rCx + 5, rCy);
-      ctx.lineTo(rCx + cepPx + 10, rCy);
-      ctx.moveTo(rCx, rCy - cepPx - 10);
-      ctx.lineTo(rCx, rCy - 5);
-      ctx.moveTo(rCx, rCy + 5);
-      ctx.lineTo(rCx, rCy + cepPx + 10);
-      ctx.stroke();
-
-      // Diegetic reticle ring tag (Danger Close / HQ No-Fire / 45m clearance)
-      ctx.textAlign = 'center';
-      ctx.font = 'bold 12px monospace';
-      if (fs.reticleInHqExclusion) {
-        ctx.fillStyle = '#fca5a5';
-        ctx.fillText('HQ 65M NO-FIRE ZONE', rCx, rCy - dangerClosePx - 8);
-      } else if (fs.reticleDangerClose) {
-        ctx.fillStyle = warnPulse > 0.5 ? '#fca5a5' : '#fcd34d';
-        ctx.fillText(
-          `! DANGER CLOSE · FRIENDLY ${Math.round(fs.reticleMinFriendlyDistM)}M`,
-          rCx,
-          rCy - dangerClosePx - 8,
-        );
-      } else if (!fs.reticleInRange) {
-        ctx.fillStyle = '#fca5a5';
-        ctx.fillText('OUT OF 81MM RANGE', rCx, rCy - dangerClosePx - 8);
-      } else {
-        ctx.fillStyle = '#a7f3d0';
-        ctx.fillText('18M CEP · 45M CLEARANCE', rCx, rCy - dangerClosePx - 8);
-      }
-      ctx.textAlign = 'left';
     } else if (!this.centerOnPlayer) {
       // Standard TAC-MAP free-pan reticle
       const rCx = mapW * 0.5 + this.joyTiltX * 14;
@@ -2501,116 +2747,243 @@ export class TacticalPdaDevice {
 
     // 4. Fire Support Command Card (Top-Right when Fire Support tab active & not seated in mortar)
     if (fs?.enabled && this.activeTab === 'fire_support' && !mt) {
-      const cardW = 326;
-      const cardH = fs.reticleDangerClose ? 228 : 202;
+      const activeMode = fs.selectedMode ?? this.fireSupportMode;
+      const isAir = activeMode === 'air_strike';
+      const isDanger = isAir ? Boolean(fs.airStrikeDangerClose) : fs.reticleDangerClose;
+      const isReady = isAir ? Boolean(fs.canCallAirStrike) : fs.canCallMortarSweep;
+
+      const cardW = 342;
+      const cardH = isDanger ? 254 : 226;
       const cardX = SCREEN_W - cardW - 14;
       const cardY = mapTop + 12;
 
       ctx.fillStyle = 'rgba(10, 16, 20, 0.94)';
       ctx.fillRect(cardX, cardY, cardW, cardH);
-      ctx.strokeStyle = fs.reticleDangerClose
-        ? '#f59e0b'
-        : fs.canCallMortarSweep
-          ? '#34d399'
-          : '#475569';
+      ctx.strokeStyle = isDanger ? '#f59e0b' : isReady ? '#34d399' : '#475569';
       ctx.lineWidth = 2;
       ctx.strokeRect(cardX, cardY, cardW, cardH);
 
       ctx.fillStyle = '#fbbf24';
       ctx.font = 'bold 14px monospace';
       ctx.textAlign = 'left';
-      ctx.fillText('CONQUEST FIRE SUPPORT', cardX + 12, cardY + 22);
+      ctx.fillText('CONQUEST FIRE SUPPORT', cardX + 12, cardY + 21);
 
-      ctx.fillStyle = '#e2e8f0';
-      ctx.font = 'bold 13px monospace';
-      ctx.fillText('81MM MORTAR SWEEP · 5 RDS · 18M CEP', cardX + 12, cardY + 44);
+      // [1] 81MM MORTAR / [2] BOMBER AIR STRIKE mode selector strip
+      const btnY = cardY + 30;
+      const btnH = 24;
+      const btnGap = 6;
+      const btn1W = 148;
+      const btn2W = cardW - 24 - btn1W - btnGap;
 
-      ctx.fillStyle = fs.availableAiBatteries > 0 ? '#34d399' : '#f87171';
-      ctx.font = '12px monospace';
-      ctx.fillText(
-        `AI BATTERIES READY: ${fs.availableAiBatteries}/${fs.totalFriendlyBatteries} · CADENCE 1.4S`,
-        cardX + 12,
-        cardY + 64,
-      );
-
-      // Cooldown / Active Mission Status Bar
-      const barX = cardX + 12;
-      const barY = cardY + 76;
-      const barW = cardW - 24;
-      const barH = 14;
-      ctx.fillStyle = '#132026';
-      ctx.fillRect(barX, barY, barW, barH);
-      const cdFrac = THREE.MathUtils.clamp(
-        1 - fs.mortarCooldownSec / Math.max(1, fs.mortarMaxCooldownSec),
-        0,
-        1,
-      );
-      ctx.fillStyle = fs.activeMortarMissionId
-        ? '#f59e0b'
-        : fs.mortarCooldownSec > 0.05
-          ? '#38bdf8'
-          : '#10b981';
-      ctx.fillRect(barX, barY, barW * (fs.activeMortarMissionId ? 1 : cdFrac), barH);
-      ctx.strokeStyle = '#334155';
-      ctx.lineWidth = 1;
-      ctx.strokeRect(barX, barY, barW, barH);
-
-      ctx.fillStyle = '#cbd5e1';
-      ctx.font = 'bold 12px monospace';
-      const statusText = fs.activeMortarMissionId
-        ? 'FIRE MISSION IN PROGRESS — ROUNDS OUT'
-        : fs.mortarCooldownSec > 0.05
-          ? `COOLDOWN: ${Math.ceil(fs.mortarCooldownSec)}S / ${Math.round(fs.mortarMaxCooldownSec)}S`
-          : 'BATTERY READY — STANDING BY';
-      ctx.fillText(statusText, cardX + 12, cardY + 108);
-
-      ctx.fillStyle = '#94a3b8';
-      ctx.font = '12px monospace';
-      ctx.fillText(
-        `TGT GRID ${Math.round(fs.reticleX)}E ${Math.round(-fs.reticleZ)}N · 65M HQ SAFE`,
-        cardX + 12,
-        cardY + 128,
-      );
-
-      let nextY = cardY + 144;
-      if (fs.reticleDangerClose) {
-        ctx.fillStyle = 'rgba(180, 83, 9, 0.35)';
-        ctx.fillRect(cardX + 10, nextY - 6, cardW - 20, 24);
-        ctx.strokeStyle = '#f59e0b';
-        ctx.strokeRect(cardX + 10, nextY - 6, cardW - 20, 24);
-        ctx.fillStyle = '#fde68a';
-        ctx.font = 'bold 12px monospace';
-        ctx.fillText(
-          `! DANGER CLOSE (<45M): ALLY AT ${Math.round(fs.reticleMinFriendlyDistM)}M`,
-          cardX + 16,
-          nextY + 10,
-        );
-        nextY += 28;
-      }
-
-      // Action Prompt Box
-      ctx.fillStyle = fs.canCallMortarSweep
-        ? 'rgba(16, 185, 129, 0.22)'
-        : 'rgba(127, 29, 29, 0.30)';
-      ctx.fillRect(cardX + 10, nextY, cardW - 20, 28);
-      ctx.strokeStyle = fs.canCallMortarSweep ? '#34d399' : '#f87171';
-      ctx.lineWidth = 1.5;
-      ctx.strokeRect(cardX + 10, nextY, cardW - 20, 28);
-      ctx.fillStyle = fs.canCallMortarSweep ? '#ecfdf5' : '#fecaca';
-      ctx.font = 'bold 12px monospace';
+      ctx.fillStyle = !isAir ? 'rgba(16, 185, 129, 0.24)' : 'rgba(15, 23, 30, 0.85)';
+      ctx.fillRect(cardX + 12, btnY, btn1W, btnH);
+      ctx.strokeStyle = !isAir ? '#34d399' : '#334155';
+      ctx.lineWidth = !isAir ? 1.8 : 1;
+      ctx.strokeRect(cardX + 12, btnY, btn1W, btnH);
+      ctx.fillStyle = !isAir ? '#ecfdf5' : '#94a3b8';
+      ctx.font = 'bold 11px monospace';
       ctx.textAlign = 'center';
-      ctx.fillText(
-        fs.canCallMortarSweep
-          ? '[SPACE] CALL 5-RD MORTAR SWEEP'
-          : (fs.blockReason ?? 'FIRE SUPPORT UNAVAILABLE').toUpperCase().slice(0, 38),
-        cardX + cardW * 0.5,
-        nextY + 18,
-      );
+      ctx.fillText('[1] 81MM MORTAR', cardX + 12 + btn1W * 0.5, btnY + 16);
 
+      const btn2X = cardX + 12 + btn1W + btnGap;
+      ctx.fillStyle = isAir ? 'rgba(245, 158, 11, 0.24)' : 'rgba(15, 23, 30, 0.85)';
+      ctx.fillRect(btn2X, btnY, btn2W, btnH);
+      ctx.strokeStyle = isAir ? '#fbbf24' : '#334155';
+      ctx.lineWidth = isAir ? 1.8 : 1;
+      ctx.strokeRect(btn2X, btnY, btn2W, btnH);
+      ctx.fillStyle = isAir ? '#fef3c7' : '#94a3b8';
+      ctx.fillText('[2] BOMBER STRIKE', btn2X + btn2W * 0.5, btnY + 16);
       ctx.textAlign = 'left';
-      ctx.fillStyle = '#64748b';
-      ctx.font = '11px monospace';
-      ctx.fillText('AIR STRIKE CORRIDOR · PHASE 4 STANDBY', cardX + 12, cardY + cardH - 10);
+
+      if (isAir) {
+        const sectorsHeld = fs.airStrikeSectorsHeld ?? 0;
+        const totalSectors = fs.airStrikeTotalSectors ?? 0;
+        const hasSectors = Boolean(fs.airStrikeHasSectorControl);
+        const headingRad = fs.airStrikeHeadingRad ?? this.airStrikeHeadingRad;
+        const headingDeg = Math.round(((THREE.MathUtils.radToDeg(headingRad) % 360) + 360) % 360) % 360;
+        const headingStr = String(headingDeg).padStart(3, '0');
+        const airCd = fs.airStrikeCooldownSec ?? 0;
+        const airMaxCd = Math.max(1, fs.airStrikeMaxCooldownSec ?? 150);
+        const airActive = Boolean(fs.airStrikeActive);
+
+        ctx.fillStyle = '#e2e8f0';
+        ctx.font = 'bold 12px monospace';
+        ctx.fillText('CAS BOMBER RUN · 65M CORRIDOR · 6X MK-82', cardX + 12, cardY + 72);
+
+        ctx.fillStyle = hasSectors ? '#34d399' : '#f87171';
+        ctx.font = '12px monospace';
+        ctx.fillText(
+          `SECTORS ${sectorsHeld}/${totalSectors} (>=50%) · HDG ${headingStr}° ([Q]/[E])`,
+          cardX + 12,
+          cardY + 91,
+        );
+
+        // Cooldown / Active Airspace bar
+        const barX = cardX + 12;
+        const barY = cardY + 102;
+        const barW = cardW - 24;
+        const barH = 14;
+        ctx.fillStyle = '#132026';
+        ctx.fillRect(barX, barY, barW, barH);
+        const cdFrac = THREE.MathUtils.clamp(1 - airCd / airMaxCd, 0, 1);
+        ctx.fillStyle = airActive ? '#f59e0b' : airCd > 0.05 ? '#38bdf8' : hasSectors ? '#10b981' : '#64748b';
+        ctx.fillRect(barX, barY, barW * (airActive ? 1 : cdFrac), barH);
+        ctx.strokeStyle = '#334155';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(barX, barY, barW, barH);
+
+        const mm = Math.floor(Math.ceil(airCd) / 60);
+        const ss = Math.ceil(airCd) % 60;
+        const cdMmSs = `${String(mm).padStart(2, '0')}:${String(ss).padStart(2, '0')}`;
+
+        ctx.fillStyle = '#cbd5e1';
+        ctx.font = 'bold 12px monospace';
+        const statusText = airActive
+          ? 'AIRSPACE BUSY — STRIKE INBOUND'
+          : airCd > 0.05
+            ? `COOLDOWN: ${cdMmSs} / 02:30`
+            : hasSectors
+              ? 'EAGLE-1 ON STATION — STANDING BY'
+              : `CONTROL LOCKED (${sectorsHeld}/${totalSectors} SECTORS)`;
+        ctx.fillText(statusText, cardX + 12, cardY + 134);
+
+        ctx.fillStyle = '#94a3b8';
+        ctx.font = '12px monospace';
+        ctx.fillText(
+          `TGT GRID ${Math.round(fs.reticleX)}E ${Math.round(-fs.reticleZ)}N · 65M HQ SAFE`,
+          cardX + 12,
+          cardY + 153,
+        );
+
+        let nextY = cardY + 168;
+        if (isDanger) {
+          ctx.fillStyle = 'rgba(180, 83, 9, 0.35)';
+          ctx.fillRect(cardX + 10, nextY - 6, cardW - 20, 24);
+          ctx.strokeStyle = '#f59e0b';
+          ctx.strokeRect(cardX + 10, nextY - 6, cardW - 20, 24);
+          ctx.fillStyle = '#fde68a';
+          ctx.font = 'bold 12px monospace';
+          ctx.fillText(
+            `! DANGER CLOSE (<45M): ALLY AT ${Math.round(fs.airStrikeMinFriendlyDistM ?? 0)}M`,
+            cardX + 16,
+            nextY + 10,
+          );
+          nextY += 28;
+        }
+
+        // Action Prompt Box
+        ctx.fillStyle = isReady ? 'rgba(16, 185, 129, 0.22)' : 'rgba(127, 29, 29, 0.30)';
+        ctx.fillRect(cardX + 10, nextY, cardW - 20, 28);
+        ctx.strokeStyle = isReady ? '#34d399' : '#f87171';
+        ctx.lineWidth = 1.5;
+        ctx.strokeRect(cardX + 10, nextY, cardW - 20, 28);
+        ctx.fillStyle = isReady ? '#ecfdf5' : '#fecaca';
+        ctx.font = 'bold 12px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText(
+          isReady
+            ? 'READY · [SPACE] CALL AIR STRIKE'
+            : (fs.airStrikeBlockReason ?? 'AIR STRIKE UNAVAILABLE').toUpperCase().slice(0, 40),
+          cardX + cardW * 0.5,
+          nextY + 18,
+        );
+
+        ctx.textAlign = 'left';
+        ctx.fillStyle = '#64748b';
+        ctx.font = '11px monospace';
+        ctx.fillText('[Q]/[E] ROTATE CORRIDOR · [1] MORTAR SWEEP', cardX + 12, cardY + cardH - 10);
+      } else {
+        ctx.fillStyle = '#e2e8f0';
+        ctx.font = 'bold 13px monospace';
+        ctx.fillText('81MM MORTAR SWEEP · 5 RDS · 18M CEP', cardX + 12, cardY + 72);
+
+        ctx.fillStyle = fs.availableAiBatteries > 0 ? '#34d399' : '#f87171';
+        ctx.font = '12px monospace';
+        ctx.fillText(
+          `AI BATTERIES READY: ${fs.availableAiBatteries}/${fs.totalFriendlyBatteries} · CADENCE 1.4S`,
+          cardX + 12,
+          cardY + 91,
+        );
+
+        // Cooldown / Active Mission Status Bar
+        const barX = cardX + 12;
+        const barY = cardY + 102;
+        const barW = cardW - 24;
+        const barH = 14;
+        ctx.fillStyle = '#132026';
+        ctx.fillRect(barX, barY, barW, barH);
+        const cdFrac = THREE.MathUtils.clamp(
+          1 - fs.mortarCooldownSec / Math.max(1, fs.mortarMaxCooldownSec),
+          0,
+          1,
+        );
+        ctx.fillStyle = fs.activeMortarMissionId
+          ? '#f59e0b'
+          : fs.mortarCooldownSec > 0.05
+            ? '#38bdf8'
+            : '#10b981';
+        ctx.fillRect(barX, barY, barW * (fs.activeMortarMissionId ? 1 : cdFrac), barH);
+        ctx.strokeStyle = '#334155';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(barX, barY, barW, barH);
+
+        ctx.fillStyle = '#cbd5e1';
+        ctx.font = 'bold 12px monospace';
+        const statusText = fs.activeMortarMissionId
+          ? 'FIRE MISSION IN PROGRESS — ROUNDS OUT'
+          : fs.mortarCooldownSec > 0.05
+            ? `COOLDOWN: ${Math.ceil(fs.mortarCooldownSec)}S / ${Math.round(fs.mortarMaxCooldownSec)}S`
+            : 'BATTERY READY — STANDING BY';
+        ctx.fillText(statusText, cardX + 12, cardY + 134);
+
+        ctx.fillStyle = '#94a3b8';
+        ctx.font = '12px monospace';
+        ctx.fillText(
+          `TGT GRID ${Math.round(fs.reticleX)}E ${Math.round(-fs.reticleZ)}N · 65M HQ SAFE`,
+          cardX + 12,
+          cardY + 153,
+        );
+
+        let nextY = cardY + 168;
+        if (fs.reticleDangerClose) {
+          ctx.fillStyle = 'rgba(180, 83, 9, 0.35)';
+          ctx.fillRect(cardX + 10, nextY - 6, cardW - 20, 24);
+          ctx.strokeStyle = '#f59e0b';
+          ctx.strokeRect(cardX + 10, nextY - 6, cardW - 20, 24);
+          ctx.fillStyle = '#fde68a';
+          ctx.font = 'bold 12px monospace';
+          ctx.fillText(
+            `! DANGER CLOSE (<45M): ALLY AT ${Math.round(fs.reticleMinFriendlyDistM)}M`,
+            cardX + 16,
+            nextY + 10,
+          );
+          nextY += 28;
+        }
+
+        // Action Prompt Box
+        ctx.fillStyle = fs.canCallMortarSweep
+          ? 'rgba(16, 185, 129, 0.22)'
+          : 'rgba(127, 29, 29, 0.30)';
+        ctx.fillRect(cardX + 10, nextY, cardW - 20, 28);
+        ctx.strokeStyle = fs.canCallMortarSweep ? '#34d399' : '#f87171';
+        ctx.lineWidth = 1.5;
+        ctx.strokeRect(cardX + 10, nextY, cardW - 20, 28);
+        ctx.fillStyle = fs.canCallMortarSweep ? '#ecfdf5' : '#fecaca';
+        ctx.font = 'bold 12px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText(
+          fs.canCallMortarSweep
+            ? '[SPACE] CALL 5-RD MORTAR SWEEP'
+            : (fs.blockReason ?? 'FIRE SUPPORT UNAVAILABLE').toUpperCase().slice(0, 40),
+          cardX + cardW * 0.5,
+          nextY + 18,
+        );
+
+        ctx.textAlign = 'left';
+        ctx.fillStyle = '#64748b';
+        ctx.font = '11px monospace';
+        ctx.fillText('[2] BOMBER AIR STRIKE · 65M CORRIDOR', cardX + 12, cardY + cardH - 10);
+      }
     }
 
     // 5. 81mm Ballistic Firing Table Card (Top-Right when seated on a mortar)

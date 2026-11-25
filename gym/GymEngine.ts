@@ -44,6 +44,12 @@ import {
   WeaponRig,
 } from '../bodycam-sdk';
 import {
+  getEffectiveFireMode,
+  SelectableFireMode,
+  toggleWeaponFireMode,
+} from '../data/fireModeControl';
+import { keybindStore } from '../data/keybindStore';
+import {
   AdaptivePerformanceController,
   graphicsQualityStore,
   type GraphicsQualityProfile,
@@ -231,6 +237,9 @@ export class GymEngine {
   private selectedAmmoVariantByWeapon: Record<string, AmmoVariantId> = {};
   private adsModeByWeapon: Record<string, AdsMode> = {};
   private spas12Mode: 'semi' | 'pump' = 'semi';
+  private fireModeOverrideByWeapon: Record<string, SelectableFireMode> = {
+    spas12: 'semi',
+  };
   private flashlightOn = false;
   private simulatedArmTrauma = false;
   private lookingAtBench = false;
@@ -246,6 +255,7 @@ export class GymEngine {
 
   private isFiring = false;
   private shiftHeld = false;
+  private holdBreathHeld = false;
   private altHeld = false;
   private fireCooldown = 0;
   private semiTriggerConsumed = false;
@@ -734,12 +744,18 @@ export class GymEngine {
 
   public toggleFireMode(): void {
     const prof = SDK_WEAPON_PROFILES[this.equippedWeaponId];
-    if (!prof || !prof.toggleablePumpSemi) return;
-    this.spas12Mode = this.spas12Mode === 'semi' ? 'pump' : 'semi';
+    if (!prof) return;
+    const res = toggleWeaponFireMode(prof, this.fireModeOverrideByWeapon);
+    if (!res.toggled) return;
+    if (prof.toggleablePumpSemi) {
+      this.spas12Mode = res.nextMode === 'pump' ? 'pump' : 'semi';
+    }
     this.syncRuntimeProfile();
     this.weaponRig.emitModeToggleCue();
     this.showToast(
-      `SPAS-12 Mode: ${this.spas12Mode === 'semi' ? 'SEMI-AUTO (Gas)' : 'PUMP ACTION'}`,
+      prof.toggleablePumpSemi
+        ? `SPAS-12 Mode: ${this.spas12Mode === 'semi' ? 'SEMI-AUTO (Gas)' : 'PUMP ACTION'}`
+        : `Fire Mode: ${res.label}`,
     );
     this.emitSnapshot();
   }
@@ -756,6 +772,7 @@ export class GymEngine {
     this._runtimeProfile.recoilPitchRad = base.recoilPitchRad * derived.recoilPitchMult;
     this._runtimeProfile.recoilYawRad = base.recoilYawRad * derived.recoilYawMult;
 
+    this._runtimeProfile.fireMode = getEffectiveFireMode(base, this.fireModeOverrideByWeapon);
     if (base.toggleablePumpSemi) {
       this._runtimeProfile.fireMode = this.spas12Mode;
       this._runtimeProfile.rpm = this.spas12Mode === 'semi' ? 240 : 85;
@@ -1768,6 +1785,7 @@ export class GymEngine {
     this.isFiring = false;
     this.semiTriggerConsumed = false;
     this.shiftHeld = false;
+    this.holdBreathHeld = false;
     this.altHeld = false;
     this.input.ads = false;
     this.input.forward = false;
@@ -1880,13 +1898,17 @@ export class GymEngine {
     if (e.button === 1) {
       e.preventDefault();
     }
-    if (!this.pointerLocked) return;
+    if (!this.pointerLocked || keybindStore.isCapturing()) return;
     this.audio.ensureInitialized();
 
+    const isFireBtn = keybindStore.matchesMouseButton(e.button, 'fire');
+    const isAdsBtn = keybindStore.matchesMouseButton(e.button, 'ads');
+    const isPointAimBtn = keybindStore.matchesMouseButton(e.button, 'point_aim');
+
     if (this.pdaDevice.isBlockingWeaponActions()) {
-      if (e.button === 0 && this.pdaDevice.isOpen()) {
+      if (isFireBtn && this.pdaDevice.isOpen()) {
         this.pdaDevice.setDragging(true);
-      } else if (e.button === 2 && this.pdaDevice.isOpen()) {
+      } else if (isAdsBtn && this.pdaDevice.isOpen()) {
         this.pdaDevice.recenterOnPlayer();
       }
       return;
@@ -1896,7 +1918,7 @@ export class GymEngine {
     if (this.grenadeSystem.isDrawn()) {
       this.input.ads = false;
       const stage = this.grenadeSystem.getHoldStage();
-      if (e.button === 2) {
+      if (isAdsBtn) {
         if (stage === 'DRAWN') {
           this.grenadeSystem.pullPin();
           this.emitSnapshot();
@@ -1904,23 +1926,23 @@ export class GymEngine {
           this.grenadeSystem.releaseLever();
           this.emitSnapshot();
         }
-      } else if (e.button === 0 && (stage === 'PIN_PULLED' || stage === 'LEVER_RELEASED')) {
+      } else if (isFireBtn && (stage === 'PIN_PULLED' || stage === 'LEVER_RELEASED')) {
         this.grenadeSystem.beginThrowInput();
         this.emitSnapshot();
       }
       return;
     }
 
-    if (e.button === 0) {
+    if (isFireBtn) {
       this.animator.interruptInspect();
       this.isFiring = true;
       this.semiTriggerConsumed = false;
       this.attemptFire();
-    } else if (e.button === 2) {
+    } else if (isAdsBtn) {
       this.animator.interruptInspect();
       this.input.ads = true;
-    } else if (e.button === 1) {
-      // Middle-click toggles Point Aim mode for RMB on every firearm (never initiates ADS on its own)
+    } else if (isPointAimBtn) {
+      // Toggles Point Aim mode for ADS on every firearm (never initiates ADS on its own)
       const prof = this.getWeaponProfile();
       if (prof.holdClass === 'unarmed') return;
       const cur = this.getArmedAdsMode(prof.id);
@@ -1928,7 +1950,9 @@ export class GymEngine {
       this.setArmedAdsMode(prof.id, next);
       this.audio.playGearRattle('weapon_swap', 0.45);
       this.showToast(
-        next === 'POINT_AIM' ? 'Point Aim Mode: ARMED (RMB)' : 'Primary Optic ADS (RMB)',
+        next === 'POINT_AIM'
+          ? `Point Aim Mode: ARMED (${keybindStore.getLabel('ads')})`
+          : `Primary Optic ADS (${keybindStore.getLabel('ads')})`,
       );
       this.emitSnapshot();
     }
@@ -1941,7 +1965,7 @@ export class GymEngine {
   };
 
   private readonly onMouseUp = (e: MouseEvent): void => {
-    if (e.button === 0) {
+    if (keybindStore.matchesMouseButton(e.button, 'fire')) {
       if (this.pdaDevice.isDragging()) {
         this.pdaDevice.setDragging(false);
       }
@@ -1954,7 +1978,8 @@ export class GymEngine {
       if (this.grenadeSystem.isDrawn()) {
         return;
       }
-    } else if (e.button === 2) {
+    }
+    if (keybindStore.matchesMouseButton(e.button, 'ads')) {
       this.input.ads = false;
     }
   };
@@ -1981,15 +2006,17 @@ export class GymEngine {
   };
 
   private readonly onKeyDown = (e: KeyboardEvent): void => {
+    if (keybindStore.isCapturing()) return;
+
     if (this.world.gunsmithBench.isOpen()) {
-      if (e.code === 'Escape' || (e.code === 'KeyF' && !e.repeat)) {
+      if (e.code === 'Escape' || (keybindStore.matchesKeyCode(e.code, 'interact') && !e.repeat)) {
         e.preventDefault();
         this.closeGunsmith();
       }
       return;
     }
 
-    if (e.code === 'F1') {
+    if (keybindStore.matchesKeyCode(e.code, 'tuner')) {
       e.preventDefault();
       this.toggleTuner();
       return;
@@ -1998,13 +2025,23 @@ export class GymEngine {
     if (!this.pointerLocked) return;
     this.audio.ensureInitialized();
 
-    const weaponKey = WEAPON_HOTKEYS[e.code];
+    if (keybindStore.matchesKeyCode(e.code, 'hold_breath')) {
+      this.holdBreathHeld = true;
+    }
+    if (e.code === 'AltLeft' || e.code === 'AltRight') {
+      this.altHeld = true;
+    }
+
+    const code = keybindStore.resolveManagedInputCode(e.code);
+    if (!code) return;
+
+    const weaponKey = WEAPON_HOTKEYS[code];
     if (weaponKey) {
       this.switchWeapon(weaponKey);
       return;
     }
 
-    switch (e.code) {
+    switch (code) {
       case 'KeyW':
         this.input.forward = true;
         break;
@@ -2020,10 +2057,6 @@ export class GymEngine {
       case 'ShiftLeft':
       case 'ShiftRight':
         this.shiftHeld = true;
-        break;
-      case 'AltLeft':
-      case 'AltRight':
-        this.altHeld = true;
         break;
       case 'KeyC':
         if (!e.repeat) this.controller.toggleCrouch();
@@ -2082,10 +2115,15 @@ export class GymEngine {
           this.setArmedAdsMode(prof.id, next);
           this.audio.playGearRattle('weapon_swap', 0.45);
           this.showToast(
-            next === 'CANTED' ? 'Canted Sight Mode: ARMED (RMB)' : 'Primary Optic ADS (RMB)',
+            next === 'CANTED'
+              ? `Canted Sight Mode: ARMED (${keybindStore.getLabel('ads')})`
+              : `Primary Optic ADS (${keybindStore.getLabel('ads')})`,
           );
           this.emitSnapshot();
         }
+        break;
+      case 'KeyK':
+        if (!e.repeat && !this.pdaDevice.isBlockingWeaponActions()) this.toggleFireMode();
         break;
       case 'KeyL':
         if (!e.repeat) {
@@ -2120,9 +2158,6 @@ export class GymEngine {
       case 'KeyX':
         if (!e.repeat && !this.pdaDevice.isBlockingWeaponActions()) this.triggerPushKick();
         break;
-      case 'KeyZ':
-        if (!e.repeat && !this.pdaDevice.isBlockingWeaponActions()) this.toggleFireMode();
-        break;
       case 'KeyJ':
         if (!e.repeat) this.toggleNvg();
         break;
@@ -2152,7 +2187,7 @@ export class GymEngine {
             this.handleGrenadeHolsterOrToss();
             this.emitSnapshot();
           } else if (this.grenadeCount <= 0) {
-            this.showToast('Ordnance Pouch Empty — Restock in [F1] Tactical Gear');
+            this.showToast(`Ordnance Pouch Empty — Restock in [${keybindStore.getLabel('tuner')}] Tactical Gear`);
           } else {
             this.isFiring = false;
             this.input.ads = false;
@@ -2160,7 +2195,9 @@ export class GymEngine {
             this.weaponRig.cancelZoomTwist();
             this.grenadeSystem.drawGrenade(this.tacticalEquipmentId);
             const def = getTacticalEquipmentDef(this.tacticalEquipmentId);
-            this.showToast(`${def.shortName} Drawn — [RMB] Pin · [RMB] Spoon · [LMB] Click Lob / Hold Throw`);
+            this.showToast(
+              `${def.shortName} Drawn — [${keybindStore.getLabel('ads')}] Pin · [${keybindStore.getLabel('fire')}] Throw`,
+            );
             this.emitSnapshot();
           }
         }
@@ -2175,7 +2212,15 @@ export class GymEngine {
   };
 
   private readonly onKeyUp = (e: KeyboardEvent): void => {
-    switch (e.code) {
+    if (keybindStore.matchesKeyCode(e.code, 'hold_breath')) {
+      this.holdBreathHeld = false;
+    }
+    if (e.code === 'AltLeft' || e.code === 'AltRight') {
+      this.altHeld = false;
+    }
+    const code = keybindStore.resolveManagedInputCode(e.code);
+    if (!code) return;
+    switch (code) {
       case 'KeyW':
         this.input.forward = false;
         break;
@@ -2191,10 +2236,6 @@ export class GymEngine {
       case 'ShiftLeft':
       case 'ShiftRight':
         this.shiftHeld = false;
-        break;
-      case 'AltLeft':
-      case 'AltRight':
-        this.altHeld = false;
         break;
       case 'KeyQ':
         this.input.leanLeft = false;
@@ -2366,7 +2407,7 @@ export class GymEngine {
       !pdaBusy &&
       this.input.ads &&
       prof.holdClass !== 'unarmed' &&
-      (this.shiftHeld || this.altHeld);
+      (this.holdBreathHeld || this.altHeld);
 
     let isVaultingNow = false;
     if (!benchBusy) {

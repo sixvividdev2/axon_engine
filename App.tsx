@@ -35,12 +35,14 @@ import { SocialInviteToast } from './ui/SocialInviteToast';
 import { UnifiedLoadoutWorkbench } from './ui/UnifiedLoadoutWorkbench';
 import { HideoutView } from './hideout/HideoutView';
 import { CharacterSlotId, OpenWorldView } from './src/modes/openworld';
+import { TutorialView } from './tutorial/TutorialView';
 
 type ActiveView =
   | { kind: 'hideout' }
   | { kind: 'openworld'; slotId: CharacterSlotId | null }
   | { kind: 'menu'; tab: HubTabId }
   | { kind: 'playground' }
+  | { kind: 'tutorial'; returnTo: 'hideout' | 'playground' | 'openworld'; openWorldSlotId?: CharacterSlotId | null }
   | { kind: 'combat'; params: CombatSessionParams; sessionKey: number; isMultiplayer: boolean };
 
 const DEFAULT_BATTLE_CONFIG: BattleMatchConfig = {
@@ -65,7 +67,13 @@ const DEFAULT_INFECTION_CONFIG: InfectionMatchConfig = {
   timeOfDayStart: 'auto',
 };
 
-function PlaygroundView({ onReturnToMenu }: { onReturnToMenu: () => void }) {
+function PlaygroundView({
+  onReturnToMenu,
+  onLaunchTutorial,
+}: {
+  onReturnToMenu: () => void;
+  onLaunchTutorial: () => void;
+}) {
   const { effectiveRank, isWeaponUnlocked, isAttachmentUnlocked, getWeaponProgress } = useAuth();
   const containerRef = useRef<HTMLDivElement | null>(null);
   const engineRef = useRef<GymEngine | null>(null);
@@ -100,6 +108,7 @@ function PlaygroundView({ onReturnToMenu }: { onReturnToMenu: () => void }) {
           onRequestLock={() => engine?.requestLock()}
           onOpenTuner={() => engine?.setTunerOpen(true)}
           onTeleportZone={(zone) => engine?.teleportToZone(zone)}
+          onLaunchTutorial={onLaunchTutorial}
           onReturnToMenu={onReturnToMenu}
         />
       )}
@@ -186,6 +195,7 @@ function CombatSessionView({
   multiplayerSession,
   onUpdateSoloBattleVisibility,
   onRestartInfection,
+  onLaunchTutorial,
   onReturnToMenu,
 }: {
   params: CombatSessionParams;
@@ -195,6 +205,7 @@ function CombatSessionView({
     hudEnabled?: boolean;
   }) => void;
   onRestartInfection: () => void;
+  onLaunchTutorial?: () => void;
   onReturnToMenu: (tab?: 'battle' | 'infection') => void;
 }) {
   const { user, commitMatch, openAuthModal } = useAuth();
@@ -358,6 +369,7 @@ function CombatSessionView({
               onRestartInfection();
             }
           }}
+          onLaunchTutorial={onLaunchTutorial}
           onReturnToMenu={onReturnToMenu}
         />
       )}
@@ -544,6 +556,7 @@ function AppShell() {
           onLaunchOpenWorld={(slotId) => setView({ kind: 'openworld', slotId })}
           onOpenClassicHub={(tab) => setView({ kind: 'menu', tab })}
           onLaunchPlayground={() => setView({ kind: 'playground' })}
+          onLaunchTutorial={() => setView({ kind: 'tutorial', returnTo: 'hideout' })}
         />
       )}
 
@@ -551,6 +564,13 @@ function AppShell() {
         <OpenWorldView
           slotId={view.slotId}
           onExitToHideout={() => setView({ kind: 'hideout' })}
+          onLaunchTutorial={() =>
+            setView({
+              kind: 'tutorial',
+              returnTo: 'openworld',
+              openWorldSlotId: view.slotId,
+            })
+          }
         />
       )}
 
@@ -593,6 +613,28 @@ function AppShell() {
       {view.kind === 'playground' && (
         <PlaygroundView
           onReturnToMenu={() => setView({ kind: 'hideout' })}
+          onLaunchTutorial={() => setView({ kind: 'tutorial', returnTo: 'playground' })}
+        />
+      )}
+
+      {view.kind === 'tutorial' && (
+        <TutorialView
+          returnLabel={
+            view.returnTo === 'playground'
+              ? 'Return to Calibration Gym'
+              : view.returnTo === 'openworld'
+                ? 'Return to Open World'
+                : 'Return to Hideout'
+          }
+          onExit={() => {
+            if (view.returnTo === 'playground') {
+              setView({ kind: 'playground' });
+            } else if (view.returnTo === 'openworld') {
+              setView({ kind: 'openworld', slotId: view.openWorldSlotId ?? null });
+            } else {
+              setView({ kind: 'hideout' });
+            }
+          }}
         />
       )}
 
@@ -611,6 +653,11 @@ function AppShell() {
               sessionKey: Date.now(),
               isMultiplayer: view.isMultiplayer,
             })
+          }
+          onLaunchTutorial={
+            !view.isMultiplayer
+              ? () => setView({ kind: 'tutorial', returnTo: 'hideout' })
+              : undefined
           }
           onReturnToMenu={(tab) =>
             setView(

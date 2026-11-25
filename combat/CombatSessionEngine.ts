@@ -61,6 +61,12 @@ import {
   resolveBaseCaliberId,
 } from '../data/calibers';
 import {
+  getEffectiveFireMode,
+  SelectableFireMode,
+  toggleWeaponFireMode,
+} from '../data/fireModeControl';
+import { keybindStore } from '../data/keybindStore';
+import {
   computeBeltGrenadeDetonationChance,
   getTacticalEquipmentDef,
   isTacticalEquipmentId,
@@ -104,6 +110,7 @@ import {
 import { PlayerInteractAnimator } from '../doors/PlayerInteractAnimator';
 import {
   ENABLE_CONQUEST_FIRE_SUPPORT,
+  GameAirStrikeLaunchPacket,
   GameBarrierRepairRequestPacket,
   GameBarrierUpdatePacket,
   GameBotCommsPacket,
@@ -155,6 +162,7 @@ import {
   TacticalPingTargetType,
 } from '../data/multiplayer';
 import type {
+  PdaActiveAirStrikeMarker,
   PdaActiveMortarMissionMarker,
   PdaFireSupportTelemetry,
   PdaHqExclusionZone,
@@ -196,6 +204,10 @@ import {
   MortarTargetCandidate,
   computeMortarBlastDamageForActor,
 } from './MortarEmplacementSystem';
+import {
+  AirStrikeRadioEvent,
+  BomberAirStrikeSystem,
+} from './BomberAirStrikeSystem';
 
 export type CombatSessionMode = 'battle' | 'infection';
 
@@ -485,9 +497,12 @@ export class CombatSessionEngine {
   private readonly modeSceneGroup = new THREE.Group();
   private modeSyncAccum = 0;
   private mortarSystem: MortarEmplacementSystem | null = null;
+  private bomberSystem: BomberAirStrikeSystem | null = null;
   private seatedMortarPitId: string | null = null;
   private mortarOpticalSight = false;
   private mortarLevelHeld = false;
+  private pdaRotateLeftHeld = false;
+  private pdaRotateRightHeld = false;
   private mortarSyncAccum = 0;
   private mortarHandwheelAudioAccum = 0;
   private nearbyMortarPrompt: {
@@ -503,6 +518,7 @@ export class CombatSessionEngine {
   private readonly _mortarFriendlyPosBuf: MortarFriendlyPosition[] = [];
   private readonly _pdaMortarPitsBuf: PdaMortarPitMarker[] = [];
   private readonly _pdaMortarMissionsBuf: PdaActiveMortarMissionMarker[] = [];
+  private readonly _pdaAirStrikesBuf: PdaActiveAirStrikeMarker[] = [];
   private readonly _pdaHqExclusionsBuf: PdaHqExclusionZone[] = [];
   private readonly _mortarFobOwnerMap = new Map<string, 'A' | 'B' | null>();
   private readonly _mortarOriginScratch = new THREE.Vector3();
@@ -645,7 +661,9 @@ export class CombatSessionEngine {
   // Weapon firing & animation timers
   private isFiring = false;
   private shiftHeld = false;
+  private holdBreathHeld = false;
   private altHeld = false;
+  private fireModeOverrideByWeapon: Record<string, SelectableFireMode> = {};
   private fireCooldown = 0;
   private semiTriggerConsumed = false;
   private reloadTimer = 0;
@@ -1692,9 +1710,13 @@ export class CombatSessionEngine {
   private initConquestMortarSystem(isClientReplica: boolean): void {
     this.mortarSystem?.dispose();
     this.mortarSystem = null;
+    this.bomberSystem?.dispose();
+    this.bomberSystem = null;
     this.seatedMortarPitId = null;
     this.mortarOpticalSight = false;
     this.mortarLevelHeld = false;
+    this.pdaRotateLeftHeld = false;
+    this.pdaRotateRightHeld = false;
     this.nearbyMortarPrompt = null;
 
     if (!ENABLE_CONQUEST_FIRE_SUPPORT) return;
@@ -1777,7 +1799,46 @@ export class CombatSessionEngine {
     });
     this.mortarSystem.configureSites(sites);
     installHorizonFogOnSubtree(this.mortarSystem.root, this.horizonFogUniforms);
+
+    this.bomberSystem = new BomberAirStrikeSystem({
+      scene: this.scene,
+      mortarSystem: this.mortarSystem,
+      isHost: !isClientReplica,
+      audio: this.audio,
+      getGroundHeight: (x, z) => (this.map.terrainHeightAt ? this.map.terrainHeightAt(x, z) : 0),
+      onLaunchBroadcast: (pkt) => {
+        if (this.mp && this.isMpHost) {
+          this.mp.sendMessage(pkt as unknown as Record<string, unknown>);
+        }
+      },
+      onRadioCallout: (ev) => this.handleAirStrikeRadioCallout(ev),
+      enabled: ENABLE_CONQUEST_FIRE_SUPPORT,
+    });
+    installHorizonFogOnSubtree(this.bomberSystem.root, this.horizonFogUniforms);
+
     this.syncMortarFobOwnershipFromMode();
+  }
+
+  private getConquestSectorCounts(team: 'A' | 'B'): { held: number; total: number } {
+    const pois = this.modeController?.getHudSnapshot().conquestPois ?? [];
+    let held = 0;
+    for (let i = 0; i < pois.length; i++) {
+      if (pois[i].owner === team) held++;
+    }
+    return { held, total: pois.length };
+  }
+
+  private handleAirStrikeRadioCallout(ev: AirStrikeRadioEvent): void {
+    const localTeam: 'A' | 'B' = this.localBattleTeam === 'B' ? 'B' : 'A';
+    if (ev.team === localTeam) {
+      this.audio.playPdaButtonClick();
+      this.showToast(
+        ev.dangerClose ? `DANGER CLOSE — ${ev.message}` : ev.message,
+        4.2,
+      );
+    } else {
+      this.showToast('WARNING: Hostile Strike Jet Inbound — Watch Smoke Flares!', 4.0);
+    }
   }
 
   private handleMortarMissionEvent(ev: MortarMissionEvent): void {
@@ -1872,6 +1933,54 @@ export class CombatSessionEngine {
     this.emitSnapshot();
   }
 
+  private triggerPdaAirStrike(): void {
+    if (!this.bomberSystem || !this.bomberSystem.isEnabled()) return;
+    if (!this.pdaDevice.isOpen() || this.pdaDevice.getActiveTab() !== 'fire_support') return;
+
+    const ret = this.pdaDevice.getReticleWorldCoords();
+    const headingRad = this.pdaDevice.getAirStrikeHeadingRad();
+    const localId = this.getLocalModeActorId();
+    const localName = this.mp?.localUsername ?? 'YOU';
+    const localTeam: 'A' | 'B' = this.localBattleTeam === 'B' ? 'B' : 'A';
+
+    if (this.mp && !this.isMpHost) {
+      const req: GameFireSupportRequestPacket = {
+        type: 'game:fire_support_request',
+        kind: 'air_strike',
+        targetX: ret.x,
+        targetZ: ret.z,
+        headingRad,
+        ts: Date.now(),
+      };
+      this.mp.sendMessage(req as unknown as Record<string, unknown>);
+      this.audio.playPdaButtonClick();
+      this.showToast('Transmitting Bomber Air Strike Request...', 1.8);
+      return;
+    }
+
+    const sectors = this.getConquestSectorCounts(localTeam);
+    const friendlies = this.collectFriendlyPositionsForTeam(localTeam);
+    const res = this.bomberSystem.requestAirStrike({
+      callerId: localId,
+      callerName: localName,
+      callerTeam: localTeam,
+      centerX: ret.x,
+      centerZ: ret.z,
+      headingRad,
+      sectorsHeld: sectors.held,
+      totalSectors: sectors.total,
+      exclusionZones: this._mortarExclusionsBuf,
+      friendlyPositions: friendlies,
+    });
+    if (!res.ok) {
+      this.audio.playPdaButtonClick();
+      this.showToast(res.reason ?? 'Air Strike Unavailable', 2.6);
+      return;
+    }
+    this.broadcastFireSupportSync();
+    this.emitSnapshot();
+  }
+
   private syncMortarFobOwnershipFromMode(): void {
     if (!this.mortarSystem || !this.modeController) return;
     const hud = this.modeController.getHudSnapshot();
@@ -1891,6 +2000,7 @@ export class CombatSessionEngine {
       pits: this.mortarSystem.getPitStates(),
       teams: this.mortarSystem.getTeamFireSupportStates(),
       activeMissions: this.mortarSystem.getActiveMissionSummaries(),
+      activeAirStrikes: this.bomberSystem?.getActiveAirStrikeSummaries() ?? [],
       ts: Date.now(),
     };
     this.mp.sendMessage(pkt as unknown as Record<string, unknown>);
@@ -1996,6 +2106,8 @@ export class CombatSessionEngine {
     const canApplyAuthorityDamage = this.isMpHost || !this.mp;
     const localActorId = this.getLocalModeActorId();
     const isLocalCaller = ev.callerId === localActorId;
+    const weaponId = ev.weaponKind ?? 'mortar_81mm';
+    const weaponName = ev.weaponName ?? '81mm MORTAR';
 
     // 0. Shatter nearby glass & damage breakable electronics inside blast envelope
     if (this.map.shatterBreakable) {
@@ -2053,7 +2165,7 @@ export class CombatSessionEngine {
         if (res.damage > 0) {
           this.applyPlayerDamage(
             res.damage,
-            '81mm MORTAR',
+            weaponName,
             ev.callerTeam,
             ev.callerId,
           );
@@ -2065,7 +2177,9 @@ export class CombatSessionEngine {
 
     // 3. Battle AI Bots AoE blast
     if (this.botAI) {
-      const attackerName = isLocalCaller ? (this.mp?.localUsername ?? 'YOU') : '81mm MORTAR';
+      const attackerName = isLocalCaller
+        ? (this.mp?.localUsername ?? 'YOU')
+        : (ev.callerName || weaponName);
       const botRes = this.botAI.applyAreaBlast(
         ev.position,
         ev.blastRadiusM,
@@ -2073,7 +2187,7 @@ export class CombatSessionEngine {
         'frag',
         attackerName,
         ev.callerTeam,
-        '81mm MORTAR',
+        weaponName,
         undefined,
         isLocalCaller && this.mp ? `human:${this.mp.localUserId}` : ev.callerId,
       );
@@ -2097,8 +2211,8 @@ export class CombatSessionEngine {
                 victimUserId: info.id,
                 victimName: info.name,
                 victimTeam: info.team,
-                weaponId: 'mortar_81mm',
-                weaponName: '81mm MORTAR',
+                weaponId,
+                weaponName,
                 headshot: false,
                 killMethod: 'grenade',
                 ts: Date.now(),
@@ -2141,7 +2255,7 @@ export class CombatSessionEngine {
           targetUserId: h.id,
           damage: dmgRes.damage,
           botId: ev.pitId,
-          botName: '81mm MORTAR',
+          botName: weaponName,
           botTeam: ev.callerTeam,
           ts: Date.now(),
         };
@@ -2245,6 +2359,13 @@ export class CombatSessionEngine {
       targets,
       exclusionZones: exclusions,
     });
+    if (this.bomberSystem) {
+      const localTeam: 'A' | 'B' = this.localBattleTeam === 'B' ? 'B' : 'A';
+      this.bomberSystem.update(dt, {
+        localPlayerPos: this.controller.position,
+        localPlayerTeam: localTeam,
+      });
+    }
 
     // Scan nearby interactable mortar pit when unseated
     const prevPromptId = this.nearbyMortarPrompt?.pitId ?? null;
@@ -3430,6 +3551,8 @@ export class CombatSessionEngine {
       const pkt = raw as unknown as GameFireSupportSyncPacket;
       if (!pkt.senderIsHost) return;
       this.mortarSystem.applyRemoteSyncPacket(pkt);
+      this.bomberSystem?.setEnabled(pkt.enabled);
+      this.bomberSystem?.applyRemoteSyncPacket(pkt.teams, pkt.activeAirStrikes);
       const localSeated = this.mortarSystem.getPitMannedBy(this.getLocalModeActorId());
       if (localSeated !== this.seatedMortarPitId) {
         this.seatedMortarPitId = localSeated;
@@ -3446,6 +3569,13 @@ export class CombatSessionEngine {
       const pkt = raw as unknown as GameMortarLaunchPacket;
       if (!pkt.senderIsHost) return;
       this.mortarSystem.applyRemoteLaunchPacket(pkt);
+      return;
+    }
+
+    if (type === 'game:air_strike_launch' && this.bomberSystem && !this.isMpHost) {
+      const pkt = raw as unknown as GameAirStrikeLaunchPacket;
+      if (!pkt.senderIsHost) return;
+      this.bomberSystem.applyRemoteLaunchPacket(pkt);
       return;
     }
 
@@ -3486,6 +3616,33 @@ export class CombatSessionEngine {
             targetUserId: reqId,
             kind: 'mortar_sweep',
             reason: res.reason ?? 'Mortar Sweep Unavailable',
+            ts: Date.now(),
+          };
+          this.mp.sendMessage(rej as unknown as Record<string, unknown>);
+        } else {
+          this.broadcastFireSupportSync();
+        }
+      } else if (pkt.kind === 'air_strike' && this.bomberSystem) {
+        const sectors = this.getConquestSectorCounts(reqTeam);
+        const friendlies = this.collectFriendlyPositionsForTeam(reqTeam);
+        const res = this.bomberSystem.requestAirStrike({
+          callerId: reqId,
+          callerName: reqName,
+          callerTeam: reqTeam,
+          centerX: pkt.targetX,
+          centerZ: pkt.targetZ,
+          headingRad: Number.isFinite(pkt.headingRad) ? (pkt.headingRad as number) : 0,
+          sectorsHeld: sectors.held,
+          totalSectors: sectors.total,
+          exclusionZones: this._mortarExclusionsBuf,
+          friendlyPositions: friendlies,
+        });
+        if (!res.ok) {
+          const rej: GameFireSupportRejectedPacket = {
+            type: 'game:fire_support_rejected',
+            targetUserId: reqId,
+            kind: 'air_strike',
+            reason: res.reason ?? 'Air Strike Unavailable',
             ts: Date.now(),
           };
           this.mp.sendMessage(rej as unknown as Record<string, unknown>);
@@ -6112,7 +6269,8 @@ export class CombatSessionEngine {
     }
     if (this.weaponRig.getReadOnlyRigState().pullbackRatio > 0.72) return;
 
-    const isSingle = prof.fireMode === 'semi' || prof.fireMode === 'bolt' || prof.fireMode === 'pump';
+    const effMode = getEffectiveFireMode(prof, this.fireModeOverrideByWeapon);
+    const isSingle = effMode === 'semi' || effMode === 'bolt' || effMode === 'pump';
     if (isSingle && this.semiTriggerConsumed) return;
 
     if (curAmmo <= 0) {
@@ -6125,7 +6283,8 @@ export class CombatSessionEngine {
 
     const remaining = curAmmo - 1;
     this.magAmmoByWeapon[prof.id] = remaining;
-    this.fireCooldown = 60 / Math.max(25, prof.rpm);
+    const effectiveRpm = prof.toggleablePumpSemi ? (effMode === 'semi' ? 240 : 85) : prof.rpm;
+    this.fireCooldown = 60 / Math.max(25, effectiveRpm);
     if (isSingle) this.semiTriggerConsumed = true;
 
     if (this.grenadeSystem.isDrawn()) return;
@@ -6147,7 +6306,8 @@ export class CombatSessionEngine {
     });
 
     this.modeController?.cancelSpawnProtection(this.getLocalModeActorId());
-    this.weaponRig.triggerFire(suppressed, remaining);
+    const cyclePump = prof.toggleablePumpSemi ? effMode === 'pump' : undefined;
+    this.weaponRig.triggerFire(suppressed, remaining, cyclePump);
     if (!suppressed) {
       this.postProcess.triggerNvgFlashSpike(0.55);
     }
@@ -6278,6 +6438,7 @@ export class CombatSessionEngine {
     this.isFiring = false;
     this.semiTriggerConsumed = false;
     this.shiftHeld = false;
+    this.holdBreathHeld = false;
     this.altHeld = false;
     this.scoreboardOpen = false;
     this.input.ads = false;
@@ -6288,6 +6449,8 @@ export class CombatSessionEngine {
     this.input.sprint = false;
     this.input.leanLeft = false;
     this.input.leanRight = false;
+    this.pdaRotateLeftHeld = false;
+    this.pdaRotateRightHeld = false;
     this.input.holdBreath = false;
     this.input.vault = false;
     this.interactKeyHeld = false;
@@ -6331,6 +6494,9 @@ export class CombatSessionEngine {
       this.isFiring = false;
       this.input.ads = false;
       this.reloadTimer = 0;
+    } else {
+      this.pdaRotateLeftHeld = false;
+      this.pdaRotateRightHeld = false;
     }
     this.pdaDevice.setOpen(next);
     this.emitSnapshot();
@@ -6413,8 +6579,14 @@ export class CombatSessionEngine {
   private readonly onMouseDown = (e: MouseEvent): void => {
     this.idleSinceInputSec = 0;
     if (e.button === 1) e.preventDefault();
+    if (keybindStore.isCapturing()) return;
+
+    const isFireBtn = keybindStore.matchesMouseButton(e.button, 'fire');
+    const isAdsBtn = keybindStore.matchesMouseButton(e.button, 'ads');
+    const isPointAimBtn = keybindStore.matchesMouseButton(e.button, 'point_aim');
+
     if (this.spectating && this.pointerLocked) {
-      if (e.button === 0) {
+      if (isFireBtn) {
         this.spectateTargetIdx += 1;
         this.emitSnapshot();
       }
@@ -6424,9 +6596,9 @@ export class CombatSessionEngine {
     this.audio.ensureInitialized();
 
     if (this.pdaDevice.isBlockingWeaponActions()) {
-      if (e.button === 0 && this.pdaDevice.isOpen()) {
+      if (isFireBtn && this.pdaDevice.isOpen()) {
         this.pdaDevice.setDragging(true);
-      } else if (e.button === 2 && this.pdaDevice.isOpen()) {
+      } else if (isAdsBtn && this.pdaDevice.isOpen()) {
         this.pdaDevice.recenterOnPlayer();
       }
       return;
@@ -6434,9 +6606,9 @@ export class CombatSessionEngine {
 
     // Seated 81mm Mortar manual firing [LMB] and elbow collimator optical sight [RMB]
     if (this.seatedMortarPitId && this.mortarSystem) {
-      if (e.button === 0) {
+      if (isFireBtn) {
         this.triggerLocalMortarFire();
-      } else if (e.button === 2) {
+      } else if (isAdsBtn) {
         this.mortarOpticalSight = true;
         this.audio.playTacticalSwitchClick(true);
         this.emitSnapshot();
@@ -6449,7 +6621,7 @@ export class CombatSessionEngine {
       this.input.ads = false;
       const stage = this.grenadeSystem.getHoldStage();
       const equipId = this.grenadeSystem.getCookingEquipmentId() ?? this.tacticalEquipmentId;
-      if (e.button === 2) {
+      if (isAdsBtn) {
         if (stage === 'DRAWN') {
           if (this.grenadeSystem.pullPin()) {
             this.camera.getWorldPosition(this._grenadeThrowOrigin);
@@ -6469,18 +6641,18 @@ export class CombatSessionEngine {
             this.emitSnapshot();
           }
         }
-      } else if (e.button === 0 && (stage === 'PIN_PULLED' || stage === 'LEVER_RELEASED')) {
+      } else if (isFireBtn && (stage === 'PIN_PULLED' || stage === 'LEVER_RELEASED')) {
         this.grenadeSystem.beginThrowInput();
         this.emitSnapshot();
       }
       return;
     }
 
-    if (e.button === 0) {
+    if (isFireBtn) {
       this.isFiring = true;
       this.semiTriggerConsumed = false;
       this.attemptFire();
-    } else if (e.button === 2) {
+    } else if (isAdsBtn) {
       if (this._runtimeProfile.holdClass === 'melee_1h') {
         if (!this.controller.isVaulting() && this.animator.triggerKnifeStab(this.controller)) {
           this.stamina = Math.max(0, this.stamina - 0.08);
@@ -6488,7 +6660,7 @@ export class CombatSessionEngine {
       } else {
         this.input.ads = true;
       }
-    } else if (e.button === 1) {
+    } else if (isPointAimBtn) {
       const prof = this._runtimeProfile;
       if (prof.holdClass === 'unarmed' || prof.holdClass === 'melee_1h') return;
       const cur = this.adsModeByWeapon[prof.id] ?? 'PRIMARY';
@@ -6496,7 +6668,11 @@ export class CombatSessionEngine {
       this.adsModeByWeapon[prof.id] = next;
       this.input.adsMode = next;
       this.audio.playGearRattle('weapon_swap', 0.4);
-      this.showToast(next === 'POINT_AIM' ? 'Point Aim Armed (RMB)' : 'Primary Optic ADS (RMB)');
+      this.showToast(
+        next === 'POINT_AIM'
+          ? `Point Aim Armed (${keybindStore.getLabel('ads')})`
+          : `Primary Optic ADS (${keybindStore.getLabel('ads')})`,
+      );
       this.emitSnapshot();
     }
   };
@@ -6506,7 +6682,7 @@ export class CombatSessionEngine {
   };
 
   private readonly onMouseUp = (e: MouseEvent): void => {
-    if (e.button === 0) {
+    if (keybindStore.matchesMouseButton(e.button, 'fire')) {
       if (this.pdaDevice.isDragging()) {
         this.pdaDevice.setDragging(false);
       }
@@ -6519,7 +6695,8 @@ export class CombatSessionEngine {
       if (this.grenadeSystem.isDrawn()) {
         return;
       }
-    } else if (e.button === 2) {
+    }
+    if (keybindStore.matchesMouseButton(e.button, 'ads')) {
       if (this.mortarOpticalSight) {
         this.mortarOpticalSight = false;
         this.emitSnapshot();
@@ -6566,13 +6743,19 @@ export class CombatSessionEngine {
   };
 
   private readonly onKeyDown = (e: KeyboardEvent): void => {
-    if (e.code === 'F1') {
+    if (keybindStore.isCapturing()) return;
+
+    if (keybindStore.matchesKeyCode(e.code, 'tuner')) {
       e.preventDefault();
       this.setTunerOpen(!this.tunerOpen);
       return;
     }
 
-    if (e.code === 'Tab' && this.params.mode === 'battle' && this.pointerLocked) {
+    if (
+      keybindStore.matchesKeyCode(e.code, 'scoreboard_inventory') &&
+      this.params.mode === 'battle' &&
+      this.pointerLocked
+    ) {
       e.preventDefault();
       if (this.pdaDevice.isOpen() && this.mortarSystem?.isEnabled() && this.playerAlive) {
         if (!e.repeat) {
@@ -6587,7 +6770,7 @@ export class CombatSessionEngine {
       return;
     }
 
-    if (this.spectating && e.code === 'Space' && this.pointerLocked) {
+    if (this.spectating && keybindStore.matchesKeyCode(e.code, 'vault') && this.pointerLocked) {
       e.preventDefault();
       this.spectateTargetIdx += 1;
       this.emitSnapshot();
@@ -6598,11 +6781,32 @@ export class CombatSessionEngine {
     this.idleSinceInputSec = 0;
     this.audio.ensureInitialized();
 
-    switch (e.code) {
+    if (keybindStore.matchesKeyCode(e.code, 'hold_breath')) {
+      this.holdBreathHeld = true;
+    }
+    if (e.code === 'AltLeft' || e.code === 'AltRight') {
+      this.altHeld = true;
+    }
+
+    const code = keybindStore.resolveManagedInputCode(e.code);
+    if (!code) return;
+
+    const pdaFireSupportOpen =
+      this.pdaDevice.isOpen() &&
+      this.pdaDevice.getActiveTab() === 'fire_support' &&
+      Boolean(this.mortarSystem?.isEnabled());
+
+    switch (code) {
       case 'Digit1':
         if (this.seatedMortarPitId && this.mortarSystem) {
           this.mortarSystem.setChargeLevel(this.seatedMortarPitId, 1);
           this.emitSnapshot();
+        } else if (pdaFireSupportOpen) {
+          if (!e.repeat) {
+            this.pdaDevice.setFireSupportMode('mortar_sweep');
+            this.pdaRotateLeftHeld = false;
+            this.pdaRotateRightHeld = false;
+          }
         } else {
           this.equipSlot(0);
         }
@@ -6611,6 +6815,10 @@ export class CombatSessionEngine {
         if (this.seatedMortarPitId && this.mortarSystem) {
           this.mortarSystem.setChargeLevel(this.seatedMortarPitId, 2);
           this.emitSnapshot();
+        } else if (pdaFireSupportOpen) {
+          if (!e.repeat) {
+            this.pdaDevice.setFireSupportMode('air_strike');
+          }
         } else {
           this.equipSlot(1);
         }
@@ -6676,6 +6884,13 @@ export class CombatSessionEngine {
             this.mortarSystem.cycleChargeLevel(this.seatedMortarPitId, -1);
             this.emitSnapshot();
           }
+        } else if (pdaFireSupportOpen && this.pdaDevice.getFireSupportMode() === 'air_strike') {
+          this.pdaRotateLeftHeld = true;
+          this.input.leanLeft = false;
+          this.input.leanRight = false;
+          if (!e.repeat) {
+            this.pdaDevice.rotateAirStrikeHeading(-THREE.MathUtils.degToRad(5));
+          }
         } else {
           this.input.leanLeft = true;
         }
@@ -6685,6 +6900,13 @@ export class CombatSessionEngine {
           if (!e.repeat) {
             this.mortarSystem.cycleChargeLevel(this.seatedMortarPitId, 1);
             this.emitSnapshot();
+          }
+        } else if (pdaFireSupportOpen && this.pdaDevice.getFireSupportMode() === 'air_strike') {
+          this.pdaRotateRightHeld = true;
+          this.input.leanLeft = false;
+          this.input.leanRight = false;
+          if (!e.repeat) {
+            this.pdaDevice.rotateAirStrikeHeading(THREE.MathUtils.degToRad(5));
           }
         } else {
           this.input.leanRight = true;
@@ -6747,6 +6969,17 @@ export class CombatSessionEngine {
           this.emitSnapshot();
         }
         break;
+      case 'KeyK':
+        if (!e.repeat && !this.pdaDevice.isBlockingWeaponActions() && !this.grenadeSystem.isDrawn()) {
+          const prof = this._runtimeProfile;
+          const res = toggleWeaponFireMode(prof, this.fireModeOverrideByWeapon);
+          if (res.toggled) {
+            this.weaponRig.emitModeToggleCue();
+            this.showToast(`Fire Mode: ${res.label}`);
+            this.emitSnapshot();
+          }
+        }
+        break;
       case 'KeyJ':
         if (!e.repeat) this.toggleNvg();
         break;
@@ -6805,12 +7038,12 @@ export class CombatSessionEngine {
       case 'Space':
         e.preventDefault();
         if (!e.repeat) {
-          if (
-            this.pdaDevice.isOpen() &&
-            this.pdaDevice.getActiveTab() === 'fire_support' &&
-            this.mortarSystem?.isEnabled()
-          ) {
-            this.triggerPdaMortarFireMission();
+          if (pdaFireSupportOpen) {
+            if (this.pdaDevice.getFireSupportMode() === 'air_strike') {
+              this.triggerPdaAirStrike();
+            } else {
+              this.triggerPdaMortarFireMission();
+            }
           } else {
             this.input.vault = true;
           }
@@ -7228,12 +7461,20 @@ export class CombatSessionEngine {
   }
 
   private readonly onKeyUp = (e: KeyboardEvent): void => {
-    if (e.code === 'Tab' && this.scoreboardOpen) {
+    if (keybindStore.matchesKeyCode(e.code, 'hold_breath')) {
+      this.holdBreathHeld = false;
+    }
+    if (e.code === 'AltLeft' || e.code === 'AltRight') {
+      this.altHeld = false;
+    }
+    if (keybindStore.matchesKeyCode(e.code, 'scoreboard_inventory') && this.scoreboardOpen) {
       this.scoreboardOpen = false;
       this.emitSnapshot();
       return;
     }
-    switch (e.code) {
+    const code = keybindStore.resolveManagedInputCode(e.code);
+    if (!code) return;
+    switch (code) {
       case 'KeyW':
         this.input.forward = false;
         break;
@@ -7250,14 +7491,12 @@ export class CombatSessionEngine {
       case 'ShiftRight':
         this.shiftHeld = false;
         break;
-      case 'AltLeft':
-      case 'AltRight':
-        this.altHeld = false;
-        break;
       case 'KeyQ':
+        this.pdaRotateLeftHeld = false;
         this.input.leanLeft = false;
         break;
       case 'KeyE':
+        this.pdaRotateRightHeld = false;
         this.input.leanRight = false;
         break;
       case 'KeyF':
@@ -7503,7 +7742,7 @@ export class CombatSessionEngine {
       prof.holdClass !== 'melee_1h' &&
       !grenadeDrawn;
     this.input.sprint = !suppBusy && !pdaBusy && this.shiftHeld && !firearmAdsBlocking;
-    this.input.holdBreath = !suppBusy && !pdaBusy && this.input.ads && (this.shiftHeld || this.altHeld);
+    this.input.holdBreath = !suppBusy && !pdaBusy && this.input.ads && (this.holdBreathHeld || this.altHeld);
 
     // In multiplayer or Conquest Redeploy/Spectate, world stays live continuously even when pointer lock is released
     const conquestOverlayActive =
@@ -8967,6 +9206,24 @@ export class CombatSessionEngine {
       }
     }
 
+    // Smooth 60+ FPS [Q]/[E] bombing corridor rotation without leaking lean to BodycamController
+    if (
+      this.pdaDevice.isOpen() &&
+      this.pdaDevice.getActiveTab() === 'fire_support' &&
+      this.pdaDevice.getFireSupportMode() === 'air_strike' &&
+      this.mortarSystem?.isEnabled()
+    ) {
+      const rotDir = (this.pdaRotateRightHeld ? 1 : 0) - (this.pdaRotateLeftHeld ? 1 : 0);
+      if (rotDir !== 0) {
+        this.pdaDevice.rotateAirStrikeHeading(rotDir * 1.65 * dt);
+      }
+      this.input.leanLeft = false;
+      this.input.leanRight = false;
+    } else if (this.pdaRotateLeftHeld || this.pdaRotateRightHeld) {
+      this.pdaRotateLeftHeld = false;
+      this.pdaRotateRightHeld = false;
+    }
+
     let fireSupport: PdaFireSupportTelemetry | null = null;
     if (this.mortarSystem && this.mortarSystem.isEnabled()) {
       const localTeam: 'A' | 'B' = this.localBattleTeam === 'B' ? 'B' : 'A';
@@ -9034,9 +9291,48 @@ export class CombatSessionEngine {
         });
       }
 
+      const selectedMode = this.pdaDevice.getFireSupportMode();
+      const airHeadingRad = this.pdaDevice.getAirStrikeHeadingRad();
+      const sectors = this.getConquestSectorCounts(localTeam);
+      const airState = this.bomberSystem?.getTeamAirStrikeState(localTeam);
+      const airEval = this.bomberSystem
+        ? this.bomberSystem.evaluateAirStrikeTarget({
+            team: localTeam,
+            centerX: ret.x,
+            centerZ: ret.z,
+            headingRad: airHeadingRad,
+            sectorsHeld: sectors.held,
+            totalSectors: sectors.total,
+            exclusionZones: this._mortarExclusionsBuf,
+            friendlyPositions: friendlies,
+          })
+        : null;
+
+      this._pdaAirStrikesBuf.length = 0;
+      if (this.bomberSystem) {
+        const strikes = this.bomberSystem.getActiveAirStrikeSummaries();
+        for (let i = 0; i < strikes.length; i++) {
+          const s = strikes[i];
+          this._pdaAirStrikesBuf.push({
+            strikeId: s.strikeId,
+            team: s.team,
+            friendly: s.team === localTeam,
+            centerX: s.centerX,
+            centerZ: s.centerZ,
+            headingRad: s.headingRad,
+            corridorLengthM: s.corridorLengthM,
+            progress01: s.progress01 ?? Math.min(1, s.elapsedSec / Math.max(0.1, s.totalDurationSec)),
+            aircraftX: s.aircraftX ?? s.centerX,
+            aircraftZ: s.aircraftZ ?? s.centerZ,
+            callerName: s.callerName,
+          });
+        }
+      }
+
       fireSupport = {
         enabled: true,
         localTeam,
+        selectedMode,
         mortarCooldownSec: teamState.mortarStrikeCooldownSec,
         mortarMaxCooldownSec: teamState.mortarStrikeMaxCooldownSec,
         activeMortarMissionId: teamState.activeMortarMissionId,
@@ -9053,6 +9349,19 @@ export class CombatSessionEngine {
         reticleInRange: evalRes.inRange,
         canCallMortarSweep: evalRes.canCall,
         blockReason: evalRes.blockReason,
+        airStrikeHeadingRad: airHeadingRad,
+        airStrikeCooldownSec: airState?.airStrikeCooldownSec ?? teamState.airStrikeCooldownSec,
+        airStrikeMaxCooldownSec: airState?.airStrikeMaxCooldownSec ?? teamState.airStrikeMaxCooldownSec,
+        airStrikeActive: airState?.activeStrike ?? Boolean(teamState.activeStrike),
+        airStrikeSectorsHeld: airEval?.sectorsHeld ?? sectors.held,
+        airStrikeTotalSectors: airEval?.totalSectors ?? sectors.total,
+        airStrikeHasSectorControl: airEval?.hasSectorControl ?? false,
+        airStrikeInHqExclusion: airEval?.inHqExclusion ?? false,
+        airStrikeDangerClose: airEval?.dangerClose ?? false,
+        airStrikeMinFriendlyDistM: airEval?.minFriendlyDistM ?? Infinity,
+        canCallAirStrike: airEval?.canCall ?? false,
+        airStrikeBlockReason: airEval?.blockReason ?? 'FIRE SUPPORT OFFLINE',
+        activeAirStrikes: this._pdaAirStrikesBuf,
       };
     }
 
@@ -9107,6 +9416,8 @@ export class CombatSessionEngine {
       document.exitPointerLock();
     }
     this.remotePlayers?.dispose();
+    this.bomberSystem?.dispose();
+    this.bomberSystem = null;
     this.mortarSystem?.dispose();
     this.mortarSystem = null;
     this.modeController?.dispose();

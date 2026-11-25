@@ -9,6 +9,7 @@ import {
 interface OpenWorldViewProps {
   slotId?: CharacterSlotId | null;
   onExitToHideout: () => void;
+  onLaunchTutorial?: () => void;
 }
 
 /**
@@ -19,6 +20,7 @@ interface OpenWorldViewProps {
 export const OpenWorldView: React.FC<OpenWorldViewProps> = ({
   slotId,
   onExitToHideout,
+  onLaunchTutorial,
 }) => {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const engineRef = useRef<OpenWorldSessionEngine | null>(null);
@@ -93,6 +95,14 @@ export const OpenWorldView: React.FC<OpenWorldViewProps> = ({
           onSetWeather={(w) => engineRef.current?.setWeather(w)}
           onSetAutoWeather={(enabled) => engineRef.current?.setAutoWeatherCycle(enabled)}
           onExfilToHideout={handleExfil}
+          onLaunchTutorial={
+            onLaunchTutorial
+              ? () => {
+                  engineRef.current?.commitExfilToHideout();
+                  onLaunchTutorial();
+                }
+              : undefined
+          }
           onTriggerFieldDeath={() => engineRef.current?.triggerFieldDeathAtCurrentPosition()}
         />
       )}

@@ -33,6 +33,7 @@ import {
 } from '../MortarBallistics';
 import {
   MAX_MORTAR_PITS,
+  MAX_MORTAR_SHELL_POOL,
   MAX_SCORCH_DECAL_POOL,
   MORTAR_AI_RECLAIM_DELAY_SEC,
   MORTAR_CREW_REINFORCE_SEC,
@@ -46,11 +47,41 @@ import {
   MORTAR_RELOAD_SOLO_SEC,
   MORTAR_SWEEP_COOLDOWN_SEC,
   MortarEmplacementSystem,
+  MortarImpactEvent,
   MortarMissionEvent,
   MortarSiteConfig,
   computeMortarBlastDamageForActor,
   evaluateMortarDangerClose,
 } from '../MortarEmplacementSystem';
+import {
+  AIR_STRIKE_BOMB_COUNT,
+  AIR_STRIKE_COOLDOWN_SEC,
+  AIR_STRIKE_CORRIDOR_LENGTH_M,
+  AIR_STRIKE_DANGER_CLOSE_RADIUS_M,
+  AIR_STRIKE_HQ_EXCLUSION_RADIUS_M,
+  AIR_STRIKE_MAX_TRIANGLES_PER_AIRCRAFT,
+  AirStrikeRadioEvent,
+  BomberAirStrikeSystem,
+  MAX_BOMBER_POOL,
+  buildStrikeJetRig,
+  computeBombPlanHash,
+  computeCorridorEndpoints,
+  computeDeterministicBombPlan,
+  evaluateCorridorDangerClose,
+  isCorridorInHqExclusion,
+  pointToSegmentDistance2D,
+} from '../BomberAirStrikeSystem';
+import {
+  BENCH_CPU_P95_BUDGET_MS,
+  BENCH_MAX_FIRE_SUPPORT_DRAW_CALLS,
+  BENCH_MAX_FIRE_SUPPORT_TRIANGLES,
+  BENCH_MAX_SHADOW_CASTERS,
+  buildWorstCaseBenchMortarSites,
+  computePercentile,
+  detectSoftwareRenderer,
+  evaluateFireSupportBenchReport,
+  measureFireSupportSceneMetrics,
+} from '../FireSupportPerfBenchmark';
 
 function createFlatWorldAdapter(): IBodycamWorldAdapter {
   return {
@@ -1046,3 +1077,563 @@ describe('Phase 3 Conquest Fire Support — 1-Sweep 5-Round Mortar Overrides', (
     sys.dispose();
   });
 });
+
+describe('Phase 4 Conquest Bomber Air Strikes', () => {
+  it('enforces exact 2D point-to-segment 45m Danger Close and 65m HQ exclusion along the full 65m corridor', () => {
+    // East-west corridor centered at (0, 0), heading = PI/2 -> runs from (-32.5, 0) to (+32.5, 0)
+    const ep = computeCorridorEndpoints(0, 0, Math.PI * 0.5, AIR_STRIKE_CORRIDOR_LENGTH_M);
+    expect(ep.startX).toBeCloseTo(-32.5, 3);
+    expect(ep.endX).toBeCloseTo(32.5, 3);
+    expect(ep.startZ).toBeCloseTo(0, 3);
+    expect(ep.endZ).toBeCloseTo(0, 3);
+
+    // Ally at (70, 0) is 70m from midpoint (> 45m!) but only 37.5m from corridor tip (+32.5, 0) -> MUST flag Danger Close!
+    const distTip = pointToSegmentDistance2D(70, 0, ep.startX, ep.startZ, ep.endX, ep.endZ);
+    expect(distTip).toBeCloseTo(37.5, 2);
+    const dcTip = evaluateCorridorDangerClose(
+      ep.startX,
+      ep.startZ,
+      ep.endX,
+      ep.endZ,
+      [{ x: 70, z: 0 }],
+      AIR_STRIKE_DANGER_CLOSE_RADIUS_M,
+    );
+    expect(dcTip.dangerClose).toBe(true);
+    expect(dcTip.minFriendlyDistM).toBeCloseTo(37.5, 2);
+
+    // Ally at (0, 50) is 50m perpendicular from corridor -> NOT Danger Close (> 45m)
+    const dcSafe = evaluateCorridorDangerClose(
+      ep.startX,
+      ep.startZ,
+      ep.endX,
+      ep.endZ,
+      [{ x: 0, z: 50 }],
+      AIR_STRIKE_DANGER_CLOSE_RADIUS_M,
+    );
+    expect(dcSafe.dangerClose).toBe(false);
+    expect(dcSafe.minFriendlyDistM).toBeCloseTo(50, 2);
+
+    // HQ at (90, 0) with 65m radius: corridor midpoint is 90m away (> 65m),
+    // but east corridor tip (+32.5, 0) is only 57.5m from HQ -> MUST be rejected!
+    const hqZone = [{ x: 90, z: 0, radiusM: AIR_STRIKE_HQ_EXCLUSION_RADIUS_M, team: 'B' as const, kind: 'hq' as const }];
+    expect(isCorridorInHqExclusion(ep.startX, ep.startZ, ep.endX, ep.endZ, hqZone)).toBe(true);
+
+    // Corridor rotated North-South (heading = 0) at (0, 0) stays 90m from HQ (90, 0) -> permitted!
+    const nsEp = computeCorridorEndpoints(0, 0, 0, AIR_STRIKE_CORRIDOR_LENGTH_M);
+    expect(isCorridorInHqExclusion(nsEp.startX, nsEp.startZ, nsEp.endX, nsEp.endZ, hqZone)).toBe(false);
+  });
+
+  it('enforces >= 50% sector gating, 150s cooldown, airspace busy rejection, and HQ exclusion without burning cooldown', () => {
+    const scene = new THREE.Scene();
+    const mortar = new MortarEmplacementSystem({ scene, isHost: true });
+    const radioLog: AirStrikeRadioEvent[] = [];
+    const bomber = new BomberAirStrikeSystem({
+      scene,
+      mortarSystem: mortar,
+      isHost: true,
+      onRadioCallout: (ev) => radioLog.push(ev),
+    });
+
+    const exclusions = [
+      { x: 100, z: 0, radiusM: AIR_STRIKE_HQ_EXCLUSION_RADIUS_M, team: 'B' as const, kind: 'hq' as const },
+    ];
+
+    // 1. Sector control < 50% (1/3 held) -> rejected, cooldown remains 0
+    const lowSectors = bomber.requestAirStrike({
+      callerId: 'p1',
+      callerName: 'Alpha1',
+      callerTeam: 'A',
+      centerX: 0,
+      centerZ: 0,
+      headingRad: 0,
+      sectorsHeld: 1,
+      totalSectors: 3,
+      exclusionZones: exclusions,
+      friendlyPositions: [],
+    });
+    expect(lowSectors.ok).toBe(false);
+    expect(lowSectors.reason).toContain('50%');
+    expect(bomber.getTeamAirStrikeState('A').airStrikeCooldownSec).toBe(0);
+
+    // 2. Corridor tip clips 65m HQ exclusion -> rejected, cooldown remains 0
+    const hqBlocked = bomber.requestAirStrike({
+      callerId: 'p1',
+      callerName: 'Alpha1',
+      callerTeam: 'A',
+      centerX: 10,
+      centerZ: 0,
+      headingRad: Math.PI * 0.5, // east tip at x=42.5 -> 57.5m from HQ at x=100
+      sectorsHeld: 2,
+      totalSectors: 4, // exactly 50%
+      exclusionZones: exclusions,
+      friendlyPositions: [],
+    });
+    expect(hqBlocked.ok).toBe(false);
+    expect(hqBlocked.reason).toContain('65m HQ');
+    expect(bomber.getTeamAirStrikeState('A').airStrikeCooldownSec).toBe(0);
+
+    // 3. Valid call at exactly 50% (2/4 sectors) succeeds, sets 150s cooldown, emits radio callout
+    const okRes = bomber.requestAirStrike({
+      callerId: 'p1',
+      callerName: 'Alpha1',
+      callerTeam: 'A',
+      centerX: 0,
+      centerZ: 0,
+      headingRad: 0,
+      sectorsHeld: 2,
+      totalSectors: 4,
+      exclusionZones: exclusions,
+      friendlyPositions: [{ x: 20, z: 0 }],
+      seed: 123456,
+    });
+    expect(okRes.ok).toBe(true);
+    expect(okRes.dangerClose).toBe(true);
+    expect(okRes.packet?.type).toBe('game:air_strike_launch');
+    expect(bomber.getTeamAirStrikeState('A').activeStrike).toBe(true);
+    expect(bomber.getTeamAirStrikeState('A').airStrikeCooldownSec).toBeCloseTo(AIR_STRIKE_COOLDOWN_SEC, 2);
+    expect(radioLog.length).toBe(1);
+    expect(radioLog[0].message).toContain('Eagle-1 inbound on heading 000°, corridor hot');
+
+    // Advance 1s (10 x 0.1s clamped steps) so cooldown drops to ~149s
+    for (let i = 0; i < 10; i++) {
+      bomber.update(0.1, { localPlayerTeam: 'A' });
+    }
+    const cdBeforeConcurrent = bomber.getTeamAirStrikeState('A').airStrikeCooldownSec;
+    expect(cdBeforeConcurrent).toBeCloseTo(149, 1);
+
+    // 4. Concurrent call while strike active rejects with exact "Airspace Busy — Strike Inbound" without resetting cooldown
+    const busy = bomber.requestAirStrike({
+      callerId: 'p2',
+      callerName: 'Alpha2',
+      callerTeam: 'A',
+      centerX: -30,
+      centerZ: 20,
+      headingRad: 0.4,
+      sectorsHeld: 3,
+      totalSectors: 4,
+      exclusionZones: exclusions,
+      friendlyPositions: [],
+    });
+    expect(busy.ok).toBe(false);
+    expect(busy.reason).toBe('Airspace Busy — Strike Inbound');
+    expect(bomber.getTeamAirStrikeState('A').airStrikeCooldownSec).toBeCloseTo(cdBeforeConcurrent, 3);
+
+    bomber.dispose();
+    mortar.dispose();
+  });
+
+  it('produces bit-identical 6-bomb corridors across host and client, respects <3,500 tris/jet & castShadow=false, and attributes kills to snapshotted caller', () => {
+    const jet = buildStrikeJetRig('A');
+    expect(jet.triangleCount).toBeGreaterThan(200);
+    expect(jet.triangleCount).toBeLessThan(AIR_STRIKE_MAX_TRIANGLES_PER_AIRCRAFT);
+    let anyJetShadow = false;
+    jet.root.traverse((obj) => {
+      if ((obj as THREE.Mesh).isMesh && obj.castShadow) anyJetShadow = true;
+    });
+    expect(anyJetShadow).toBe(false);
+    for (const d of jet.disposables) d.dispose();
+
+    // Verify deterministic Mulberry32 6-bomb plan produces bit-identical hash
+    const planHost = computeDeterministicBombPlan({
+      centerX: 14,
+      centerZ: -22,
+      headingRad: 1.15,
+      corridorLengthM: AIR_STRIKE_CORRIDOR_LENGTH_M,
+      baseGroundY: 0,
+      seed: 0xdeadbeef,
+    });
+    const planClient = computeDeterministicBombPlan({
+      centerX: 14,
+      centerZ: -22,
+      headingRad: 1.15,
+      corridorLengthM: AIR_STRIKE_CORRIDOR_LENGTH_M,
+      baseGroundY: 0,
+      seed: 0xdeadbeef,
+    });
+    expect(planHost.length).toBe(AIR_STRIKE_BOMB_COUNT);
+    expect(computeBombPlanHash(planHost)).toBe(computeBombPlanHash(planClient));
+
+    // Simulate full host & client air strike run through shared MortarEmplacementSystem pools
+    const hostScene = new THREE.Scene();
+    const clientScene = new THREE.Scene();
+    const hostImpacts: MortarImpactEvent[] = [];
+    const clientImpacts: MortarImpactEvent[] = [];
+
+    const hostMortar = new MortarEmplacementSystem({
+      scene: hostScene,
+      isHost: true,
+      onImpact: (ev) => hostImpacts.push(ev),
+    });
+    const clientMortar = new MortarEmplacementSystem({
+      scene: clientScene,
+      isHost: false,
+      onImpact: (ev) => clientImpacts.push(ev),
+    });
+    const hostBomber = new BomberAirStrikeSystem({
+      scene: hostScene,
+      mortarSystem: hostMortar,
+      isHost: true,
+    });
+    const clientBomber = new BomberAirStrikeSystem({
+      scene: clientScene,
+      mortarSystem: clientMortar,
+      isHost: false,
+    });
+
+    const res = hostBomber.requestAirStrike({
+      callerId: 'caller-snap-1',
+      callerName: 'HawkActual',
+      callerTeam: 'A',
+      centerX: 14,
+      centerZ: -22,
+      headingRad: 1.15,
+      sectorsHeld: 3,
+      totalSectors: 5,
+      exclusionZones: [],
+      friendlyPositions: [],
+      seed: 0xdeadbeef,
+    });
+    expect(res.ok).toBe(true);
+    expect(res.packet).toBeDefined();
+
+    // Client applies exact host launch packet
+    clientBomber.applyRemoteLaunchPacket(res.packet!);
+
+    // Step 7 seconds so all 6 bombs release & detonate and bomber completes egress
+    for (let i = 0; i < 140; i++) {
+      hostBomber.update(0.05, { localPlayerTeam: 'A' });
+      hostMortar.update(0.05, { localPlayerPos: new THREE.Vector3(0, 0, 0) });
+      clientBomber.update(0.05, { localPlayerTeam: 'A' });
+      clientMortar.update(0.05, { localPlayerPos: new THREE.Vector3(0, 0, 0) });
+    }
+
+    expect(hostImpacts.length).toBe(AIR_STRIKE_BOMB_COUNT);
+    expect(clientImpacts.length).toBe(AIR_STRIKE_BOMB_COUNT);
+    for (let i = 0; i < AIR_STRIKE_BOMB_COUNT; i++) {
+      expect(hostImpacts[i].weaponKind).toBe('bomber_air_strike');
+      expect(hostImpacts[i].weaponName).toBe('BOMBER AIR STRIKE');
+      expect(hostImpacts[i].callerId).toBe('caller-snap-1');
+      expect(hostImpacts[i].callerName).toBe('HawkActual');
+      expect(hostImpacts[i].position.x).toBeCloseTo(clientImpacts[i].position.x, 3);
+      expect(hostImpacts[i].position.z).toBeCloseTo(clientImpacts[i].position.z, 3);
+    }
+
+    // Pool invariants & idle state after completion
+    expect(hostBomber.getDiagnostics().maxPoolSize).toBe(MAX_BOMBER_POOL);
+    expect(hostBomber.getDiagnostics().activeAircraftCount).toBe(0);
+    expect(hostMortar.getDiagnostics().maxShellPool).toBe(MAX_MORTAR_SHELL_POOL);
+    expect(hostMortar.getDiagnostics().scorchDecalPoolSize).toBe(MAX_SCORCH_DECAL_POOL);
+    expect(hostMortar.getDiagnostics().activeScorchDecals).toBe(AIR_STRIKE_BOMB_COUNT);
+
+    // Kill-switch cleanly disables bomber system
+    hostBomber.setEnabled(false);
+    expect(hostBomber.isEnabled()).toBe(false);
+    const disabledAttempt = hostBomber.requestAirStrike({
+      callerId: 'p1',
+      callerName: 'Alpha1',
+      callerTeam: 'B',
+      centerX: 0,
+      centerZ: 0,
+      headingRad: 0,
+      sectorsHeld: 4,
+      totalSectors: 5,
+      exclusionZones: [],
+      friendlyPositions: [],
+    });
+    expect(disabledAttempt.ok).toBe(false);
+
+    hostBomber.dispose();
+    clientBomber.dispose();
+    hostMortar.dispose();
+    clientMortar.dispose();
+  });
+
+  it('meets RX 480 structural worst-case ceilings (<=28 draw calls, <=18,000 tris, <=1 shadow caster) with 6 active pits + mortar sweep + active bomber', () => {
+    const scene = new THREE.Scene();
+    const sun = new THREE.DirectionalLight(0xffffff, 2);
+    sun.castShadow = true;
+    scene.add(sun);
+
+    const mortar = new MortarEmplacementSystem({ scene, isHost: true });
+    mortar.configureSites(buildWorstCaseBenchMortarSites());
+    const bomber = new BomberAirStrikeSystem({ scene, mortarSystem: mortar, isHost: true });
+
+    // Trigger 5-round mortar sweep + simultaneous bomber air strike
+    mortar.requestMortarFireMission({
+      callerId: 'p1',
+      callerName: 'Alpha1',
+      callerTeam: 'A',
+      targetX: 25,
+      targetZ: -10,
+      exclusionZones: [],
+      friendlyPositions: [],
+    });
+    bomber.requestAirStrike({
+      callerId: 'p1',
+      callerName: 'Alpha1',
+      callerTeam: 'A',
+      centerX: 0,
+      centerZ: 0,
+      headingRad: 0.6,
+      sectorsHeld: 3,
+      totalSectors: 5,
+      exclusionZones: [],
+      friendlyPositions: [],
+      seed: 4242,
+    });
+
+    // Advance 3 seconds into peak bomb release + mortar salvo overlap
+    const actors = [
+      { id: 'e1', team: 'B' as const, x: 30, y: 0, z: 12, alive: true },
+      { id: 'e2', team: 'A' as const, x: -30, y: 0, z: -12, alive: true },
+    ];
+    for (let i = 0; i < 60; i++) {
+      mortar.update(0.05, { localPlayerPos: new THREE.Vector3(0, 1.7, 20), targets: actors });
+      bomber.update(0.05, { localPlayerTeam: 'A' });
+    }
+
+    // Crew raycast hitboxes remain discoverable even though their materials are invisible (0 draw calls)
+    expect(mortar.getAliveCrewHitMeshes().length).toBeGreaterThan(0);
+
+    const fireSupportRoots = scene.children.filter(
+      (c) => c.name === 'ConquestMortarEmplacements' || c.name === 'ConquestBomberAirStrikes',
+    );
+    expect(fireSupportRoots.length).toBe(2);
+
+    const metrics = measureFireSupportSceneMetrics(fireSupportRoots, scene);
+    expect(metrics.fireSupportDrawCalls).toBeLessThanOrEqual(BENCH_MAX_FIRE_SUPPORT_DRAW_CALLS);
+    expect(metrics.fireSupportTriangles).toBeLessThanOrEqual(BENCH_MAX_FIRE_SUPPORT_TRIANGLES);
+    expect(metrics.activeShadowCasters).toBeLessThanOrEqual(BENCH_MAX_SHADOW_CASTERS);
+
+    bomber.dispose();
+    mortar.dispose();
+  });
+
+  it('validates Phase 4 gameRelayGuard air_strike_launch (host-only), air_strike requests, and activeAirStrikes sync cap', () => {
+    const lobby = createSampleLobbyState();
+    const matchState = createDefaultMatchState();
+
+    // Non-host air_strike request with finite headingRad routes cleanly to host
+    const req = validateAndSanitizeGameMessage(
+      {
+        type: 'game:fire_support_request',
+        kind: 'air_strike',
+        targetX: 25.555,
+        targetZ: -14.444,
+        headingRad: 1.5708,
+      },
+      lobby,
+      matchState,
+      { userId: 'peer-2', username: 'BravoTwo' },
+    );
+    expect(req).not.toBeNull();
+    expect(req?.targetUserId).toBe('host-1');
+    expect(req?.payload.kind).toBe('air_strike');
+    expect(req?.payload.headingRad).toBeCloseTo(1.571, 2);
+
+    // Non-host forged air_strike_launch is blocked
+    expect(
+      validateAndSanitizeGameMessage(
+        {
+          type: 'game:air_strike_launch',
+          strikeId: 'forged_1',
+          team: 'B',
+          callerId: 'peer-2',
+          callerName: 'BravoTwo',
+          centerX: 0,
+          centerZ: 0,
+          headingRad: 0,
+          corridorLengthM: 65,
+          seed: 99,
+        },
+        lobby,
+        matchState,
+        { userId: 'peer-2', username: 'BravoTwo' },
+      ),
+    ).toBeNull();
+
+    // Host air_strike_launch with NaN centerX is rejected; valid payload succeeds
+    expect(
+      validateAndSanitizeGameMessage(
+        {
+          type: 'game:air_strike_launch',
+          strikeId: 'as_bad',
+          team: 'A',
+          callerId: 'host-1',
+          callerName: 'AlphaLead',
+          centerX: Number.NaN,
+          centerZ: 0,
+          headingRad: 0,
+          corridorLengthM: 65,
+          seed: 99,
+        },
+        lobby,
+        matchState,
+        { userId: 'host-1', username: 'AlphaLead' },
+      ),
+    ).toBeNull();
+
+    const validLaunch = validateAndSanitizeGameMessage(
+      {
+        type: 'game:air_strike_launch',
+        strikeId: 'as_A_1',
+        team: 'A',
+        callerId: 'host-1',
+        callerName: 'AlphaLead',
+        centerX: 10,
+        centerZ: -20,
+        startX: -12.98,
+        startZ: -42.98,
+        endX: 32.98,
+        endZ: 2.98,
+        headingRad: 0.7854,
+        corridorLengthM: 65,
+        seed: 7777,
+        totalDurationSec: 6.2,
+        dangerClose: false,
+      },
+      lobby,
+      matchState,
+      { userId: 'host-1', username: 'AlphaLead' },
+    );
+    expect(validLaunch).not.toBeNull();
+    expect(validLaunch?.payload.seed).toBe(7777);
+
+    // Host fire_support_sync caps activeAirStrikes at MAX_BOMBER_POOL (2)
+    const syncStrikes = validateAndSanitizeGameMessage(
+      {
+        type: 'game:fire_support_sync',
+        enabled: true,
+        pits: [],
+        activeAirStrikes: [
+          { strikeId: 's1', team: 'A', callerId: 'p1', callerName: 'A1', centerX: 0, centerZ: 0, startX: 0, startZ: 32.5, endX: 0, endZ: -32.5, headingRad: 0, corridorLengthM: 65, seed: 1, elapsedSec: 1.5, totalDurationSec: 6.2, dangerClose: false },
+          { strikeId: 's2', team: 'B', callerId: 'p2', callerName: 'B1', centerX: 5, centerZ: 5, startX: 5, startZ: 37.5, endX: 5, endZ: -27.5, headingRad: 1, corridorLengthM: 65, seed: 2, elapsedSec: 2.0, totalDurationSec: 6.2, dangerClose: true },
+          { strikeId: 's3', team: 'A', callerId: 'p3', callerName: 'A2', centerX: 9, centerZ: 9, startX: 9, startZ: 41.5, endX: 9, endZ: -23.5, headingRad: 2, corridorLengthM: 65, seed: 3, elapsedSec: 2.5, totalDurationSec: 6.2, dangerClose: false },
+        ],
+      },
+      lobby,
+      matchState,
+      { userId: 'host-1', username: 'AlphaLead' },
+    );
+    expect(syncStrikes).not.toBeNull();
+    expect((syncStrikes?.payload.activeAirStrikes as unknown[]).length).toBe(2);
+  });
+});
+
+describe('Phase 4 Two-Tier RX 480 Performance Benchmark Evaluator', () => {
+  const validPoolDetails = {
+    pitCount: 6,
+    maxShellPool: MAX_MORTAR_SHELL_POOL,
+    peakActiveShells: 12,
+    scorchDecalPoolSize: MAX_SCORCH_DECAL_POOL,
+    maxBomberPool: MAX_BOMBER_POOL,
+    trianglesPerAircraft: 1500,
+  };
+
+  it('classifies software renderers into TIER_A_SOFTWARE, skips GPU timing, and enforces CPU <= 1.5ms + pool invariants', () => {
+    expect(detectSoftwareRenderer('ANGLE (Google, Vulkan 1.3.0 (SwiftShader Device))')).toBe(true);
+    expect(detectSoftwareRenderer('Mesa llvmpipe (LLVM 15.0.7, 256 bits)')).toBe(true);
+    expect(detectSoftwareRenderer('AMD Radeon RX 480 Graphics')).toBe(false);
+    expect(computePercentile([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20], 0.95)).toBe(19);
+
+    const passA = evaluateFireSupportBenchReport({
+      rendererString: 'Google SwiftShader',
+      durationSec: 10,
+      framesSampled: 400,
+      cpuP95Ms: 0.92,
+      gpuTimerAvailable: false,
+      totalFrameP95Ms: 42.0, // Software renderer frame rate ignored on Tier A
+      peakAudioVoices: 12,
+      fireSupportDrawCalls: 22,
+      fireSupportTriangles: 14000,
+      activeShadowCasters: 1,
+      poolDetails: validPoolDetails,
+    });
+    expect(passA.tier).toBe('TIER_A_SOFTWARE');
+    expect(passA.gpuP95Ms).toBe('SKIPPED_SOFTWARE_RENDERER');
+    expect(passA.pass).toBe(true);
+
+    // Exceeding CPU budget on Tier A fails cleanly
+    const failA = evaluateFireSupportBenchReport({
+      rendererString: 'Google SwiftShader',
+      durationSec: 10,
+      framesSampled: 400,
+      cpuP95Ms: BENCH_CPU_P95_BUDGET_MS + 0.4,
+      gpuTimerAvailable: false,
+      totalFrameP95Ms: 30,
+      peakAudioVoices: 10,
+      fireSupportDrawCalls: 22,
+      fireSupportTriangles: 14000,
+      activeShadowCasters: 1,
+      poolDetails: validPoolDetails,
+    });
+    expect(failA.pass).toBe(false);
+    expect(failA.failures.some((f) => f.includes('CPU_P95'))).toBe(true);
+  });
+
+  it('enforces TIER_B_HARDWARE GPU timer query budget (<=1.0ms) and warns + enforces structural proxies when timer queries are unavailable', () => {
+    // 1. Hardware GPU with valid EXT_disjoint_timer_query_webgl2 samples
+    const passB = evaluateFireSupportBenchReport({
+      rendererString: 'AMD Radeon RX 480 Graphics',
+      durationSec: 10,
+      framesSampled: 600,
+      cpuP95Ms: 0.85,
+      gpuTimerAvailable: true,
+      gpuTimerDisjoint: false,
+      gpuTimerSamplesMs: [0.42, 0.55, 0.68, 0.74, 0.82],
+      totalFrameP95Ms: 14.2,
+      peakAudioVoices: 11,
+      fireSupportDrawCalls: 22,
+      fireSupportTriangles: 14200,
+      activeShadowCasters: 1,
+      poolDetails: validPoolDetails,
+    });
+    expect(passB.tier).toBe('TIER_B_HARDWARE');
+    expect(passB.gpuP95Ms).toBe(0.82);
+    expect(passB.pass).toBe(true);
+
+    // 2. Hardware GPU WITHOUT timer queries -> MUST log explicit warning & enforce structural proxies + frame P95
+    const warnings: string[] = [];
+    const fallbackPass = evaluateFireSupportBenchReport({
+      rendererString: 'AMD Radeon RX 480 Graphics',
+      durationSec: 10,
+      framesSampled: 600,
+      cpuP95Ms: 0.9,
+      gpuTimerAvailable: false,
+      totalFrameP95Ms: 15.8,
+      peakAudioVoices: 12,
+      fireSupportDrawCalls: 22,
+      fireSupportTriangles: 14200,
+      activeShadowCasters: 1,
+      poolDetails: validPoolDetails,
+      warnFn: (m) => warnings.push(m),
+    });
+    expect(fallbackPass.tier).toBe('TIER_B_HARDWARE');
+    expect(fallbackPass.gpuP95Ms).toBe('FALLBACK_STRUCTURAL_PROXY');
+    expect(fallbackPass.gpuWarning).toBeDefined();
+    expect(warnings.length).toBe(1);
+    expect(fallbackPass.pass).toBe(true);
+
+    // 3. Hardware GPU fallback MUST FAIL (never silently pass) when structural ceilings are exceeded
+    const fallbackFail = evaluateFireSupportBenchReport({
+      rendererString: 'AMD Radeon RX 480 Graphics',
+      durationSec: 10,
+      framesSampled: 600,
+      cpuP95Ms: 0.9,
+      gpuTimerAvailable: false,
+      totalFrameP95Ms: 15.0,
+      peakAudioVoices: 12,
+      fireSupportDrawCalls: BENCH_MAX_FIRE_SUPPORT_DRAW_CALLS + 4,
+      fireSupportTriangles: BENCH_MAX_FIRE_SUPPORT_TRIANGLES + 2500,
+      activeShadowCasters: BENCH_MAX_SHADOW_CASTERS + 1,
+      poolDetails: validPoolDetails,
+      warnFn: () => {},
+    });
+    expect(fallbackFail.gpuP95Ms).toBe('FALLBACK_STRUCTURAL_PROXY');
+    expect(fallbackFail.pass).toBe(false);
+    expect(fallbackFail.failures.some((f) => f.includes('STRUCTURAL_DRAW_CALLS'))).toBe(true);
+    expect(fallbackFail.failures.some((f) => f.includes('STRUCTURAL_TRIANGLES'))).toBe(true);
+    expect(fallbackFail.failures.some((f) => f.includes('STRUCTURAL_SHADOW_CASTERS'))).toBe(true);
+  });
+});
+

@@ -78,6 +78,7 @@ interface CombatHudProps {
   onCycleSpectateTarget?: (dir: 1 | -1) => void;
   onToggleSpectateOverview?: () => void;
   onRematch: () => void;
+  onLaunchTutorial?: () => void;
   onReturnToMenu: (tab?: 'battle' | 'infection') => void;
 }
 
@@ -117,6 +118,7 @@ export const CombatHud: React.FC<CombatHudProps> = ({
   onCycleSpectateTarget,
   onToggleSpectateOverview,
   onRematch,
+  onLaunchTutorial,
   onReturnToMenu,
 }) => {
   const isBattle = snapshot.mode === 'battle';
@@ -1664,6 +1666,15 @@ export const CombatHud: React.FC<CombatHudProps> = ({
                   </>
                 ) : (
                   <>
+                    {onLaunchTutorial && (
+                      <button
+                        type="button"
+                        onClick={onLaunchTutorial}
+                        className="w-full cursor-pointer border border-amber-500/50 bg-[#1b1812] py-2 font-mono-tabular text-xs font-semibold uppercase tracking-wider text-amber-200 transition-colors hover:border-amber-400 hover:bg-[#241f15]"
+                      >
+                        3D Walkthrough Tutorial
+                      </button>
+                    )}
                     {isBattle && (
                       <button
                         type="button"

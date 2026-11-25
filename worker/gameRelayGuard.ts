@@ -53,6 +53,7 @@ const HOST_ONLY_GAME_TYPES = new Set<string>([
   'game:flag_event',
   'game:fire_support_sync',
   'game:fire_support_rejected',
+  'game:air_strike_launch',
   'game:mortar_launch',
   'game:mortar_seat_rejected',
 ]);
@@ -983,15 +984,25 @@ export function validateAndSanitizeGameMessage(
     if (Array.isArray(parsed.teams) && parsed.teams.length === 2) {
       safePayload.teams = parsed.teams.slice(0, 2).map((rawTeam, idx) => {
         const t = (rawTeam && typeof rawTeam === 'object' ? rawTeam : {}) as Record<string, unknown>;
+        const activeBomberId =
+          typeof t.activeBomberId === 'string' ? t.activeBomberId.slice(0, 48) : null;
+        const activeStrikeId =
+          typeof t.activeStrikeId === 'string'
+            ? t.activeStrikeId.slice(0, 48)
+            : activeBomberId;
         return {
           team: t.team === 'B' || (t.team !== 'A' && idx === 1) ? 'B' : 'A',
           airStrikeCooldownSec: Number(clampFinite(t.airStrikeCooldownSec, 0, 300, 0).toFixed(1)),
           airStrikeMaxCooldownSec: Number(clampFinite(t.airStrikeMaxCooldownSec, 1, 300, 150).toFixed(1)),
           mortarStrikeCooldownSec: Number(clampFinite(t.mortarStrikeCooldownSec, 0, 300, 0).toFixed(1)),
           mortarStrikeMaxCooldownSec: Number(clampFinite(t.mortarStrikeMaxCooldownSec, 1, 300, 75).toFixed(1)),
-          activeBomberId: typeof t.activeBomberId === 'string' ? t.activeBomberId.slice(0, 48) : null,
+          activeBomberId,
           activeMortarMissionId:
             typeof t.activeMortarMissionId === 'string' ? t.activeMortarMissionId.slice(0, 48) : null,
+          activeStrike: Boolean(t.activeStrike ?? activeBomberId),
+          callerPlayerId:
+            typeof t.callerPlayerId === 'string' ? t.callerPlayerId.slice(0, 64) : null,
+          activeStrikeId,
         };
       });
     }
@@ -1011,10 +1022,45 @@ export function validateAndSanitizeGameMessage(
           callerName: String(m.callerName ?? 'OPERATOR').trim().slice(0, 36) || 'OPERATOR',
         }));
     }
+    if (Array.isArray(parsed.activeAirStrikes)) {
+      // Hard entity cap: max 2 simultaneous air strikes (1 per team)
+      safePayload.activeAirStrikes = parsed.activeAirStrikes
+        .slice(0, 2)
+        .filter((s): s is Record<string, unknown> => Boolean(s && typeof s === 'object'))
+        .filter(
+          (s) =>
+            isFiniteCoord(s.centerX) &&
+            isFiniteCoord(s.centerZ) &&
+            isFiniteCoord(s.startX) &&
+            isFiniteCoord(s.startZ) &&
+            isFiniteCoord(s.endX) &&
+            isFiniteCoord(s.endZ) &&
+            typeof s.headingRad === 'number' &&
+            Number.isFinite(s.headingRad),
+        )
+        .map((s) => ({
+          strikeId: String(s.strikeId ?? '').trim().slice(0, 48),
+          team: s.team === 'B' ? 'B' : 'A',
+          callerId: String(s.callerId ?? '').trim().slice(0, 64),
+          callerName: String(s.callerName ?? 'OPERATOR').trim().slice(0, 36) || 'OPERATOR',
+          centerX: Number((s.centerX as number).toFixed(2)),
+          centerZ: Number((s.centerZ as number).toFixed(2)),
+          headingRad: Number(clampFinite(s.headingRad, -Math.PI * 4, Math.PI * 4, 0).toFixed(4)),
+          corridorLengthM: Number(clampFinite(s.corridorLengthM, 20, 120, 65).toFixed(1)),
+          startX: Number((s.startX as number).toFixed(2)),
+          startZ: Number((s.startZ as number).toFixed(2)),
+          endX: Number((s.endX as number).toFixed(2)),
+          endZ: Number((s.endZ as number).toFixed(2)),
+          seed: Math.floor(clampFinite(s.seed, 0, 2_147_483_647, 1)),
+          elapsedSec: Number(clampFinite(s.elapsedSec, 0, 60, 0).toFixed(3)),
+          totalDurationSec: Number(clampFinite(s.totalDurationSec, 2, 30, 8.5).toFixed(3)),
+          dangerClose: Boolean(s.dangerClose),
+        }));
+    }
   } else if (type === 'game:fire_support_request') {
     const kind = parsed.kind;
     if (
-      kind !== 'mortar_sweep' ||
+      (kind !== 'mortar_sweep' && kind !== 'air_strike') ||
       !isFiniteCoord(parsed.targetX) ||
       !isFiniteCoord(parsed.targetZ)
     ) {
@@ -1023,15 +1069,59 @@ export function validateAndSanitizeGameMessage(
     safePayload.kind = kind;
     safePayload.targetX = Number(parsed.targetX.toFixed(2));
     safePayload.targetZ = Number(parsed.targetZ.toFixed(2));
+    if (kind === 'air_strike') {
+      if (typeof parsed.headingRad !== 'number' || !Number.isFinite(parsed.headingRad)) {
+        return null;
+      }
+      safePayload.headingRad = Number(
+        clampFinite(parsed.headingRad, -Math.PI * 4, Math.PI * 4, 0).toFixed(4),
+      );
+    } else {
+      delete safePayload.headingRad;
+    }
     targetUserId = st.hostUserId;
   } else if (type === 'game:fire_support_rejected') {
     const rejTarget = String(parsed.targetUserId ?? '').trim();
     const kind = parsed.kind;
-    if (!rejTarget || kind !== 'mortar_sweep') return null;
+    if (!rejTarget || (kind !== 'mortar_sweep' && kind !== 'air_strike')) return null;
     safePayload.targetUserId = rejTarget;
     safePayload.kind = kind;
     safePayload.reason = String(parsed.reason ?? 'Fire support unavailable').slice(0, 120);
     targetUserId = rejTarget;
+  } else if (type === 'game:air_strike_launch') {
+    const strikeId = String(parsed.strikeId ?? '').trim().slice(0, 48);
+    const callerId = String(parsed.callerId ?? '').trim().slice(0, 64);
+    if (
+      !strikeId ||
+      !callerId ||
+      !isFiniteCoord(parsed.centerX) ||
+      !isFiniteCoord(parsed.centerZ) ||
+      !isFiniteCoord(parsed.startX) ||
+      !isFiniteCoord(parsed.startZ) ||
+      !isFiniteCoord(parsed.endX) ||
+      !isFiniteCoord(parsed.endZ) ||
+      typeof parsed.headingRad !== 'number' ||
+      !Number.isFinite(parsed.headingRad)
+    ) {
+      return null;
+    }
+    safePayload.strikeId = strikeId;
+    safePayload.team = parsed.team === 'B' ? 'B' : 'A';
+    safePayload.callerId = callerId;
+    safePayload.callerName = String(parsed.callerName ?? 'OPERATOR').trim().slice(0, 36) || 'OPERATOR';
+    safePayload.centerX = Number(parsed.centerX.toFixed(2));
+    safePayload.centerZ = Number(parsed.centerZ.toFixed(2));
+    safePayload.headingRad = Number(
+      clampFinite(parsed.headingRad, -Math.PI * 4, Math.PI * 4, 0).toFixed(4),
+    );
+    safePayload.corridorLengthM = Number(clampFinite(parsed.corridorLengthM, 20, 120, 65).toFixed(1));
+    safePayload.startX = Number(parsed.startX.toFixed(2));
+    safePayload.startZ = Number(parsed.startZ.toFixed(2));
+    safePayload.endX = Number(parsed.endX.toFixed(2));
+    safePayload.endZ = Number(parsed.endZ.toFixed(2));
+    safePayload.seed = Math.floor(clampFinite(parsed.seed, 0, 2_147_483_647, 1));
+    safePayload.totalDurationSec = Number(clampFinite(parsed.totalDurationSec, 2, 30, 8.5).toFixed(3));
+    safePayload.dangerClose = Boolean(parsed.dangerClose);
   }
 
   return {

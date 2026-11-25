@@ -44,6 +44,7 @@ interface HideoutViewProps {
   onLaunchOpenWorld?: (slotId: CharacterSlotId) => void;
   onOpenClassicHub: (tab: HubTabId) => void;
   onLaunchPlayground: () => void;
+  onLaunchTutorial: () => void;
 }
 
 type ActiveHubScene = 'hideout' | 'zombies_outpost';
@@ -64,6 +65,7 @@ export const HideoutView: React.FC<HideoutViewProps> = ({
   onLaunchOpenWorld,
   onOpenClassicHub,
   onLaunchPlayground,
+  onLaunchTutorial,
 }) => {
   const {
     user,
@@ -380,6 +382,7 @@ export const HideoutView: React.FC<HideoutViewProps> = ({
           onGraphicsChange={() => hideoutControllerRef.current?.applyGraphicsQuality()}
           onOpenClassicHub={onOpenClassicHub}
           onLaunchPlayground={onLaunchPlayground}
+          onLaunchTutorial={onLaunchTutorial}
         />
       )}
 
@@ -396,6 +399,7 @@ export const HideoutView: React.FC<HideoutViewProps> = ({
             zombiesControllerRef.current?.setPauseOpen(false);
             zombiesControllerRef.current?.triggerReturnToHideout();
           }}
+          onLaunchTutorial={onLaunchTutorial}
           onVolumeChange={(v) => zombiesControllerRef.current?.setMasterVolume(v)}
           onGraphicsChange={() => zombiesControllerRef.current?.applyGraphicsQuality()}
         />

@@ -10,6 +10,7 @@ interface GymHudProps {
   onRequestLock: () => void;
   onOpenTuner: () => void;
   onTeleportZone: (zone: GymZoneId) => void;
+  onLaunchTutorial?: () => void;
   onReturnToMenu: () => void;
 }
 
@@ -56,6 +57,7 @@ export const GymHud: React.FC<GymHudProps> = ({
   onRequestLock,
   onOpenTuner,
   onTeleportZone,
+  onLaunchTutorial,
   onReturnToMenu,
 }) => {
   const {
@@ -330,6 +332,15 @@ export const GymHud: React.FC<GymHudProps> = ({
                 >
                   Settings &amp; Controls
                 </button>
+                {onLaunchTutorial && (
+                  <button
+                    type="button"
+                    onClick={onLaunchTutorial}
+                    className="cursor-pointer whitespace-nowrap shrink-0 border border-amber-500/50 bg-[#1b1812] px-4 py-2 font-mono-tabular text-xs font-semibold uppercase tracking-wider text-amber-200 transition-colors hover:border-amber-400 hover:bg-[#241f15]"
+                  >
+                    3D Walkthrough Tutorial
+                  </button>
+                )}
               </div>
               <button
                 type="button"

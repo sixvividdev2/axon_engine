@@ -28,6 +28,7 @@ import {
   VALID_ALL_MAP_IDS,
 } from './data/multiplayer';
 import { BattleRuleId, isValidBattleRule } from './maps/types';
+import { KeybindOverrides, sanitizeKeybindOverrides } from './data/keybindStore';
 import {
   appendRecentMatch,
   applyMatchProgression,
@@ -87,6 +88,7 @@ interface LocalUserRecord {
   weaponProgress: Record<string, WeaponProgressRecord>;
   unlockedAttachments: string[];
   recentMatches?: RecentMatchRecord[];
+  keybinds?: KeybindOverrides;
 }
 
 interface LocalSessionRecord {
@@ -461,6 +463,7 @@ function serializeAccount(u: LocalUserRecord) {
     weaponProgress: u.weaponProgress,
     unlockedAttachments: Array.from(unlockedSet),
     recentMatches,
+    keybinds: sanitizeKeybindOverrides(u.keybinds),
   };
 }
 
@@ -806,6 +809,29 @@ async function startServer() {
       const agg = getAggregatedPresence(user.id);
       if (agg) broadcastPresenceToFriends(user.id, agg);
     }
+
+    res.json({ user: serializeAccount(user) });
+  });
+
+  app.put('/api/account/keybinds', async (req, res) => {
+    const user = await getAuthenticatedUser(req);
+    if (!user) {
+      res.status(401).json({ error: 'Sign in to save account keybinds.' });
+      return;
+    }
+
+    const rawKeybinds = req.body?.keybinds;
+    if (
+      rawKeybinds !== undefined &&
+      (typeof rawKeybinds !== 'object' || rawKeybinds === null || Array.isArray(rawKeybinds))
+    ) {
+      res.status(400).json({ error: 'Invalid keybind map payload.' });
+      return;
+    }
+
+    user.keybinds = sanitizeKeybindOverrides(rawKeybinds ?? {});
+    user.updatedAt = Date.now();
+    persistStore();
 
     res.json({ user: serializeAccount(user) });
   });

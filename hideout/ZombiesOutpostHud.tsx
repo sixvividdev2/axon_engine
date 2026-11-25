@@ -1,5 +1,5 @@
 import React from 'react';
-import { ArrowLeft, Radio, Shield, Sliders, Volume2, Wrench } from 'lucide-react';
+import { ArrowLeft, Compass, Radio, Shield, Sliders, Volume2, Wrench } from 'lucide-react';
 import {
   GRAPHICS_QUALITY_ORDER,
   GRAPHICS_QUALITY_PROFILES,
@@ -17,6 +17,7 @@ interface ZombiesOutpostHudProps {
   onOpenGunsmith: () => void;
   onOpenOperatorGear: () => void;
   onReturnToHideout: () => void;
+  onLaunchTutorial?: () => void;
   onVolumeChange: (volume: number) => void;
   onGraphicsChange: (quality: GraphicsQualityId) => void;
 }
@@ -33,6 +34,7 @@ export const ZombiesOutpostHud: React.FC<ZombiesOutpostHudProps> = ({
   onOpenGunsmith,
   onOpenOperatorGear,
   onReturnToHideout,
+  onLaunchTutorial,
   onVolumeChange,
   onGraphicsChange,
 }) => {
@@ -193,6 +195,16 @@ export const ZombiesOutpostHud: React.FC<ZombiesOutpostHudProps> = ({
                   <span>Operator Gear</span>
                 </button>
               </div>
+              {onLaunchTutorial && (
+                <button
+                  type="button"
+                  onClick={onLaunchTutorial}
+                  className="flex cursor-pointer items-center gap-2.5 border border-amber-500/45 bg-[#1b1812] px-4 py-2 text-left text-xs font-semibold text-amber-200 transition-colors hover:border-amber-400 hover:bg-[#241f15]"
+                >
+                  <Compass className="h-4 w-4 text-amber-400" />
+                  <span>3D Walkthrough Tutorial</span>
+                </button>
+              )}
               <button
                 type="button"
                 onClick={onReturnToHideout}

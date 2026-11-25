@@ -1,16 +1,11 @@
 import * as THREE from 'three';
 import { BodycamAudio } from '../bodycam-sdk/BodycamAudio';
 import {
-  TacticalUniformMaterialLibrary,
-  TacticalUniformMaterialBundle,
-} from '../bodycam-sdk/TacticalUniforms';
-import {
   ActiveMortarMissionSummary,
   ENABLE_CONQUEST_FIRE_SUPPORT,
   GameFireSupportSyncPacket,
   GameMortarLaunchPacket,
   MortarPitState,
-  MortarPitStatus,
   TeamFireSupportState,
 } from '../data/multiplayer';
 import {
@@ -18,12 +13,9 @@ import {
   MORTAR_MAX_ELEVATION_RAD,
   MORTAR_MIN_ELEVATION_RAD,
   MortarChargeLevel,
-  NATO_MILS_PER_CIRCLE,
   RAD_TO_MILS,
-  computeBearingRad,
   radiansToNatoMils,
   sampleMortarArcPosition,
-  shortestAngleDeltaRad,
   simulateMortarImpact,
   solveMortarFiringTable,
 } from './MortarBallistics';
@@ -83,11 +75,32 @@ export interface MortarImpactEvent {
   shellId: string;
   pitId: string;
   callerId: string;
+  callerName?: string;
   callerTeam: 'A' | 'B';
   isPlayerManned: boolean;
+  weaponKind?: 'mortar_81mm' | 'bomber_air_strike';
+  weaponName?: string;
   position: THREE.Vector3;
   blastRadiusM: number;
   maxDamage: number;
+}
+
+export interface ExternalOrdnanceSpawnOptions {
+  shellId: string;
+  sourceId: string;
+  callerId: string;
+  callerName?: string;
+  callerTeam: 'A' | 'B';
+  weaponKind: 'mortar_81mm' | 'bomber_air_strike';
+  weaponName: string;
+  origin: Readonly<THREE.Vector3>;
+  vel: Readonly<THREE.Vector3>;
+  impactPos: Readonly<THREE.Vector3>;
+  flightTimeSec: number;
+  blastRadiusM: number;
+  maxDamage: number;
+  scaleMult?: number;
+  windAffected?: boolean;
 }
 
 export interface MortarSeatArbitrationResult {
@@ -189,18 +202,16 @@ interface CrewActorVisual {
 }
 
 interface InternalMortarPit {
+  slotIndex: number;
   state: MortarPitState;
   root: THREE.Group;
   turretYawGroup: THREE.Group;
   barrelPivotGroup: THREE.Group;
   barrelRecoilGroup: THREE.Group;
-  traverseWheel: THREE.Mesh;
-  elevateWheel: THREE.Mesh;
-  sightHousing: THREE.Group;
-  stagedShellGroup: THREE.Group;
-  chargeRingMeshes: THREE.Mesh[];
+  traverseWheelAngle: number;
+  elevateWheelAngle: number;
+  stagedShellVisible: boolean;
   muzzleTipLocal: THREE.Vector3;
-  muzzleFlashMesh: THREE.Mesh;
   muzzleFlashTimer: number;
   gunnerVisual: CrewActorVisual;
   loaderVisual: CrewActorVisual;
@@ -233,12 +244,19 @@ interface InternalMortarPit {
 }
 
 interface PooledMortarShell {
+  slotIndex: number;
   active: boolean;
   shellId: string;
   pitId: string;
   callerId: string;
+  callerName: string;
   callerTeam: 'A' | 'B';
   isPlayerManned: boolean;
+  weaponKind: 'mortar_81mm' | 'bomber_air_strike';
+  weaponName: string;
+  blastRadiusM: number;
+  maxDamage: number;
+  scaleMult: number;
   origin: THREE.Vector3;
   vel: THREE.Vector3;
   windX: number;
@@ -247,17 +265,23 @@ interface PooledMortarShell {
   elapsedSec: number;
   flightTimeSec: number;
   whistleTriggered: boolean;
-  mesh: THREE.Group;
 }
 
 interface PooledBlastVfx {
+  slotIndex: number;
   active: boolean;
   timerSec: number;
   durationSec: number;
+  scaleBoost: number;
   pos: THREE.Vector3;
-  plumeMesh: THREE.Mesh;
-  flashMesh: THREE.Mesh;
-  ringMesh: THREE.Mesh;
+}
+
+interface ColoredGeometryPart {
+  geo: THREE.BufferGeometry;
+  color: number;
+  pos?: [number, number, number];
+  rot?: [number, number, number];
+  scale?: [number, number, number];
 }
 
 // Reusable zero-GC scratch math objects
@@ -265,9 +289,78 @@ const _vA = new THREE.Vector3();
 const _vB = new THREE.Vector3();
 const _vC = new THREE.Vector3();
 const _mat4 = new THREE.Matrix4();
+const _mat4B = new THREE.Matrix4();
 const _quat = new THREE.Quaternion();
 const _scale = new THREE.Vector3();
 const _euler = new THREE.Euler();
+const _color = new THREE.Color();
+const _zeroMatrix = new THREE.Matrix4().makeScale(0, 0, 0);
+
+/**
+ * Merges multiple BufferGeometry primitives into a single vertex-colored non-indexed BufferGeometry
+ * so complex composite military props render in 1 GPU draw call with exact part shading.
+ */
+function mergeColoredParts(parts: readonly ColoredGeometryPart[]): THREE.BufferGeometry {
+  let totalVerts = 0;
+  const prepared: Array<{ geo: THREE.BufferGeometry; color: THREE.Color }> = [];
+  const tmpMat = new THREE.Matrix4();
+  const tmpPos = new THREE.Vector3();
+  const tmpQuat = new THREE.Quaternion();
+  const tmpScale = new THREE.Vector3();
+  const tmpEuler = new THREE.Euler();
+
+  for (let i = 0; i < parts.length; i++) {
+    const p = parts[i];
+    const cloned = p.geo.index ? p.geo.toNonIndexed() : p.geo.clone();
+    if (p.pos || p.rot || p.scale) {
+      tmpPos.set(p.pos?.[0] ?? 0, p.pos?.[1] ?? 0, p.pos?.[2] ?? 0);
+      tmpEuler.set(p.rot?.[0] ?? 0, p.rot?.[1] ?? 0, p.rot?.[2] ?? 0);
+      tmpQuat.setFromEuler(tmpEuler);
+      tmpScale.set(p.scale?.[0] ?? 1, p.scale?.[1] ?? 1, p.scale?.[2] ?? 1);
+      tmpMat.compose(tmpPos, tmpQuat, tmpScale);
+      cloned.applyMatrix4(tmpMat);
+    }
+    if (!cloned.getAttribute('normal')) {
+      cloned.computeVertexNormals();
+    }
+    const posAttr = cloned.getAttribute('position');
+    totalVerts += posAttr.count;
+    prepared.push({ geo: cloned, color: new THREE.Color(p.color) });
+  }
+
+  const positions = new Float32Array(totalVerts * 3);
+  const normals = new Float32Array(totalVerts * 3);
+  const colors = new Float32Array(totalVerts * 3);
+
+  let offset = 0;
+  for (let i = 0; i < prepared.length; i++) {
+    const { geo, color } = prepared[i];
+    const posAttr = geo.getAttribute('position');
+    const normAttr = geo.getAttribute('normal');
+    const count = posAttr.count;
+    for (let v = 0; v < count; v++) {
+      const idx = (offset + v) * 3;
+      positions[idx] = posAttr.getX(v);
+      positions[idx + 1] = posAttr.getY(v);
+      positions[idx + 2] = posAttr.getZ(v);
+      normals[idx] = normAttr.getX(v);
+      normals[idx + 1] = normAttr.getY(v);
+      normals[idx + 2] = normAttr.getZ(v);
+      colors[idx] = color.r;
+      colors[idx + 1] = color.g;
+      colors[idx + 2] = color.b;
+    }
+    offset += count;
+    geo.dispose();
+  }
+
+  const merged = new THREE.BufferGeometry();
+  merged.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  merged.setAttribute('normal', new THREE.BufferAttribute(normals, 3));
+  merged.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+  merged.computeBoundingSphere();
+  return merged;
+}
 
 function createScorchDecalTexture(): THREE.CanvasTexture | null {
   if (typeof document === 'undefined') return null;
@@ -375,27 +468,48 @@ export class MortarEmplacementSystem {
   private readonly onLaunchBroadcast?: (packet: GameMortarLaunchPacket) => void;
   private readonly onMissionEvent?: (event: MortarMissionEvent) => void;
 
-  private readonly uniformLib = new TacticalUniformMaterialLibrary();
   private readonly disposables: Array<{ dispose: () => void }> = [];
 
-  // Shared materials & geometries (strict triangle & draw-call budget)
+  // Shared materials & instanced GPU batches (strict RX 480 <=28 draw-call & <=18,000 tri budget)
   private readonly matSandbag: THREE.MeshStandardMaterial;
   private readonly matSteelDark: THREE.MeshStandardMaterial;
-  private readonly matSteelGunmetal: THREE.MeshStandardMaterial;
-  private readonly matBrass: THREE.MeshStandardMaterial;
+  private readonly matCompositeMetal: THREE.MeshStandardMaterial;
   private readonly matOliveCrate: THREE.MeshStandardMaterial;
-  private readonly matStakeRed: THREE.MeshStandardMaterial;
-  private readonly matStakeWhite: THREE.MeshStandardMaterial;
-  private readonly matShellOlive: THREE.MeshStandardMaterial;
-  private readonly matChargeRing: THREE.MeshStandardMaterial;
+  private readonly matVertexMatte: THREE.MeshStandardMaterial;
   private readonly matFlash: THREE.MeshBasicMaterial;
   private readonly matScorchDecal: THREE.MeshBasicMaterial;
+  private readonly matBlastPlume: THREE.MeshBasicMaterial;
+  private readonly matBlastFlash: THREE.MeshBasicMaterial;
+  private readonly matBlastRing: THREE.MeshBasicMaterial;
+  private readonly matCrewBody: THREE.MeshStandardMaterial;
+  private readonly matCrewHead: THREE.MeshStandardMaterial;
+  private readonly matHitboxInvisible: THREE.MeshBasicMaterial;
 
   private readonly geoSandbag: THREE.BoxGeometry;
-  private readonly geoShellBody: THREE.CylinderGeometry;
-  private readonly geoShellNose: THREE.ConeGeometry;
-  private readonly geoShellFin: THREE.BoxGeometry;
+  private readonly geoMergedShell: THREE.BufferGeometry;
   private readonly geoScorchPlane: THREE.PlaneGeometry;
+  private readonly geoHitTorso: THREE.BoxGeometry;
+  private readonly geoHitHead: THREE.SphereGeometry;
+
+  // Batched InstancedMesh pools for all 6 pits (10 draw calls total across all 6 pits!)
+  private readonly sandbagInst: THREE.InstancedMesh;
+  private readonly baseplateInst: THREE.InstancedMesh;
+  private readonly crateInst: THREE.InstancedMesh;
+  private readonly stakeInst: THREE.InstancedMesh;
+  private readonly bipodTurretInst: THREE.InstancedMesh;
+  private readonly barrelInst: THREE.InstancedMesh;
+  private readonly muzzleFlashInst: THREE.InstancedMesh;
+  private readonly stagedShellInst: THREE.InstancedMesh;
+  private readonly crewBodyInst: THREE.InstancedMesh;
+  private readonly crewHeadInst: THREE.InstancedMesh;
+
+  // Batched InstancedMesh pools for shared ordnance, scorch craters & blast VFX (5 draw calls!)
+  private readonly shellInst: THREE.InstancedMesh;
+  private readonly scorchInst: THREE.InstancedMesh;
+  private readonly blastPlumeInst: THREE.InstancedMesh;
+  private readonly blastFlashInst: THREE.InstancedMesh;
+  private readonly blastRingInst: THREE.InstancedMesh;
+  private scorchUsedCount = 0;
 
   private readonly pits = new Map<string, InternalMortarPit>();
   private readonly teamStates: Record<'A' | 'B', TeamFireSupportState> = {
@@ -407,6 +521,9 @@ export class MortarEmplacementSystem {
       mortarStrikeMaxCooldownSec: MORTAR_SWEEP_COOLDOWN_SEC,
       activeBomberId: null,
       activeMortarMissionId: null,
+      activeStrike: false,
+      callerPlayerId: null,
+      activeStrikeId: null,
     },
     B: {
       team: 'B',
@@ -416,15 +533,18 @@ export class MortarEmplacementSystem {
       mortarStrikeMaxCooldownSec: MORTAR_SWEEP_COOLDOWN_SEC,
       activeBomberId: null,
       activeMortarMissionId: null,
+      activeStrike: false,
+      callerPlayerId: null,
+      activeStrikeId: null,
     },
   };
   private remoteActiveMissions: ActiveMortarMissionSummary[] = [];
   private readonly shellPool: PooledMortarShell[] = [];
-  private readonly scorchDecals: THREE.Mesh[] = [];
   private scorchFifoIndex = 0;
   private readonly blastVfxPool: PooledBlastVfx[] = [];
   private readonly blastLight: THREE.PointLight;
   private blastLightTimerSec = 0;
+  private externalAirStrikeStateManaged = false;
 
   private windX = 1.8;
   private windZ = 0.6;
@@ -478,18 +598,12 @@ export class MortarEmplacementSystem {
         metalness: 0.78,
       }),
     );
-    this.matSteelGunmetal = track(
+    this.matCompositeMetal = track(
       new THREE.MeshStandardMaterial({
-        color: 0x41484d,
-        roughness: 0.44,
-        metalness: 0.84,
-      }),
-    );
-    this.matBrass = track(
-      new THREE.MeshStandardMaterial({
-        color: 0xc29b48,
-        roughness: 0.36,
-        metalness: 0.82,
+        color: 0xffffff,
+        vertexColors: true,
+        roughness: 0.46,
+        metalness: 0.76,
       }),
     );
     this.matOliveCrate = track(
@@ -499,32 +613,33 @@ export class MortarEmplacementSystem {
         metalness: 0.08,
       }),
     );
-    this.matStakeRed = track(
+    this.matVertexMatte = track(
       new THREE.MeshStandardMaterial({
-        color: 0xd93829,
-        roughness: 0.55,
-        metalness: 0.1,
+        color: 0xffffff,
+        vertexColors: true,
+        roughness: 0.62,
+        metalness: 0.24,
       }),
     );
-    this.matStakeWhite = track(
+    this.matCrewBody = track(
       new THREE.MeshStandardMaterial({
-        color: 0xf1f3f5,
-        roughness: 0.52,
-        metalness: 0.05,
+        color: 0xffffff,
+        vertexColors: true,
+        roughness: 0.88,
+        metalness: 0.06,
       }),
     );
-    this.matShellOlive = track(
+    this.matCrewHead = track(
       new THREE.MeshStandardMaterial({
-        color: 0x4b5836,
-        roughness: 0.55,
-        metalness: 0.38,
+        color: 0xffffff,
+        vertexColors: true,
+        roughness: 0.72,
+        metalness: 0.14,
       }),
     );
-    this.matChargeRing = track(
-      new THREE.MeshStandardMaterial({
-        color: 0xd9c7a3,
-        roughness: 0.82,
-        metalness: 0.04,
+    this.matHitboxInvisible = track(
+      new THREE.MeshBasicMaterial({
+        visible: false,
       }),
     );
     this.matFlash = track(
@@ -550,29 +665,187 @@ export class MortarEmplacementSystem {
         polygonOffsetUnits: -2,
       }),
     );
+    this.matBlastPlume = track(
+      new THREE.MeshBasicMaterial({
+        color: 0x3b352d,
+        transparent: true,
+        opacity: 0.56,
+        depthWrite: false,
+      }),
+    );
+    this.matBlastFlash = track(
+      new THREE.MeshBasicMaterial({
+        color: 0xffb84d,
+        transparent: true,
+        opacity: 0.88,
+        depthWrite: false,
+      }),
+    );
+    this.matBlastRing = track(
+      new THREE.MeshBasicMaterial({
+        color: 0xd6bfa2,
+        transparent: true,
+        opacity: 0.42,
+        side: THREE.DoubleSide,
+        depthWrite: false,
+      }),
+    );
 
-    // 12 tris per sandbag * 28 instances = 336 tris (well under 1,200 tri budget!)
+    // Core pit & ordnance geometries
     this.geoSandbag = track(new THREE.BoxGeometry(0.58, 0.24, 0.30));
-
-    // Shell mesh <= 96 tris each (well under 240 tri cap!)
-    this.geoShellBody = track(new THREE.CylinderGeometry(0.041, 0.036, 0.28, 8));
-    this.geoShellNose = track(new THREE.ConeGeometry(0.041, 0.11, 8));
-    this.geoShellFin = track(new THREE.BoxGeometry(0.095, 0.085, 0.008));
     this.geoScorchPlane = track(new THREE.PlaneGeometry(5.6, 5.6));
     this.geoScorchPlane.rotateX(-Math.PI * 0.5);
+    this.geoHitTorso = track(new THREE.BoxGeometry(0.42, 0.52, 0.30));
+    this.geoHitHead = track(new THREE.SphereGeometry(0.14, 6, 5));
 
-    // Initialize 16 pooled falling mortar shell meshes
+    // Merged composite falling shell / aerial bomb geometry (<= 88 tris per instance!)
+    const rawShellBody = new THREE.CylinderGeometry(0.041, 0.036, 0.28, 8);
+    const rawShellNose = new THREE.ConeGeometry(0.041, 0.11, 8);
+    const rawShellFin = new THREE.BoxGeometry(0.095, 0.085, 0.008);
+    this.geoMergedShell = track(
+      mergeColoredParts([
+        { geo: rawShellBody, color: 0x4b5836 },
+        { geo: rawShellNose, color: 0xc29b48, pos: [0, 0.195, 0] },
+        { geo: rawShellFin, color: 0x2a2f33, pos: [0, -0.145, 0] },
+        { geo: rawShellFin, color: 0x2a2f33, pos: [0, -0.145, 0], rot: [0, Math.PI * 0.5, 0] },
+      ]),
+    );
+    rawShellBody.dispose();
+    rawShellNose.dispose();
+    rawShellFin.dispose();
+
+    // Build shared composite geometries for batched 6-pit rendering
+    const geoBaseplate = track(new THREE.CylinderGeometry(0.46, 0.52, 0.09, 12));
+    const geoCrate = track(new THREE.BoxGeometry(0.64, 0.28, 0.34));
+
+    const rawStakePole = new THREE.CylinderGeometry(0.018, 0.018, 1.35, 6);
+    const rawStakeBand = new THREE.CylinderGeometry(0.021, 0.021, 0.22, 6);
+    const geoMergedStake = track(
+      mergeColoredParts([
+        { geo: rawStakePole, color: 0xf1f3f5, pos: [0, 0.675, 0] },
+        { geo: rawStakeBand, color: 0xd93829, pos: [0, 1.15, 0] },
+        { geo: rawStakeBand, color: 0xd93829, pos: [0, 0.72, 0] },
+      ]),
+    );
+    rawStakePole.dispose();
+    rawStakeBand.dispose();
+
+    const rawLeg = new THREE.CylinderGeometry(0.024, 0.028, 1.08, 6);
+    const rawScrew = new THREE.CylinderGeometry(0.02, 0.02, 0.44, 6);
+    const rawWheel = new THREE.TorusGeometry(0.062, 0.012, 5, 10);
+    const rawSightBody = new THREE.BoxGeometry(0.08, 0.16, 0.09);
+    const rawEyepiece = new THREE.CylinderGeometry(0.028, 0.026, 0.09, 6);
+    const geoMergedBipod = track(
+      mergeColoredParts([
+        { geo: rawLeg, color: 0x2a2f33, pos: [-0.26, 0.48, -0.52], rot: [0.22, 0, -0.26] },
+        { geo: rawLeg, color: 0x2a2f33, pos: [0.26, 0.48, -0.52], rot: [0.22, 0, 0.26] },
+        { geo: rawScrew, color: 0x41484d, pos: [0, 0.88, -0.44], rot: [0, 0, Math.PI * 0.5] },
+        { geo: rawWheel, color: 0xc29b48, pos: [-0.26, 0.88, -0.44], rot: [0, Math.PI * 0.5, 0] },
+        { geo: rawWheel, color: 0xc29b48, pos: [-0.14, 0.68, -0.48] },
+        { geo: rawSightBody, color: 0x2a2f33, pos: [-0.23, 1.01, -0.36] },
+        { geo: rawEyepiece, color: 0xc29b48, pos: [-0.23, 1.06, -0.30], rot: [Math.PI * 0.5, 0, 0] },
+      ]),
+    );
+    rawLeg.dispose();
+    rawScrew.dispose();
+    rawWheel.dispose();
+    rawSightBody.dispose();
+    rawEyepiece.dispose();
+
+    const rawBarrel = new THREE.CylinderGeometry(0.056, 0.064, 1.32, 10);
+    const rawCollar = new THREE.CylinderGeometry(0.078, 0.078, 0.14, 8);
+    const geoMergedBarrel = track(
+      mergeColoredParts([
+        { geo: rawBarrel, color: 0x454d52, pos: [0, 0.66, 0] },
+        { geo: rawCollar, color: 0x252a2e, pos: [0, 0.82, 0] },
+      ]),
+    );
+    rawBarrel.dispose();
+    rawCollar.dispose();
+
+    const geoFlash = track(new THREE.ConeGeometry(0.24, 0.55, 8));
+
+    // Merged kneeling crew body (legs + torso + plate carrier + arms) & head+helmet
+    const rawCrewLeg = new THREE.CylinderGeometry(0.085, 0.075, 0.44, 6);
+    const rawCrewTorso = new THREE.BoxGeometry(0.36, 0.48, 0.24);
+    const rawCrewVest = new THREE.BoxGeometry(0.39, 0.36, 0.28);
+    const rawCrewArm = new THREE.CylinderGeometry(0.055, 0.048, 0.46, 6);
+    const geoMergedCrewBody = track(
+      mergeColoredParts([
+        { geo: rawCrewLeg, color: 0x9c9a8d, pos: [-0.11, 0.22, 0.08], rot: [0.65, 0, 0] },
+        { geo: rawCrewLeg, color: 0x9c9a8d, pos: [0.11, 0.16, -0.06], rot: [-0.85, 0, 0] },
+        { geo: rawCrewTorso, color: 0xadb0a2, pos: [0, 0.68, 0] },
+        { geo: rawCrewVest, color: 0x6f745c, pos: [0, 0.71, 0] },
+        { geo: rawCrewArm, color: 0xadb0a2, pos: [-0.22, 0.68, -0.12], rot: [0.85, 0, 0] },
+        { geo: rawCrewArm, color: 0xadb0a2, pos: [0.22, 0.68, -0.12], rot: [0.85, 0, 0] },
+      ]),
+    );
+    rawCrewLeg.dispose();
+    rawCrewTorso.dispose();
+    rawCrewVest.dispose();
+    rawCrewArm.dispose();
+
+    const rawCrewHead = new THREE.SphereGeometry(0.115, 8, 6);
+    const rawCrewHelmet = new THREE.SphereGeometry(0.135, 8, 6, 0, Math.PI * 2, 0, Math.PI * 0.58);
+    const geoMergedCrewHead = track(
+      mergeColoredParts([
+        { geo: rawCrewHead, color: 0xd4a682, pos: [0, 0, 0.02] },
+        { geo: rawCrewHelmet, color: 0x3b4238, pos: [0, 0.02, 0.01] },
+      ]),
+    );
+    rawCrewHead.dispose();
+    rawCrewHelmet.dispose();
+
+    const makePoolInst = (
+      geo: THREE.BufferGeometry,
+      mat: THREE.Material,
+      count: number,
+      name: string,
+      optsInst?: { receiveShadow?: boolean; renderOrder?: number },
+    ): THREE.InstancedMesh => {
+      const inst = new THREE.InstancedMesh(geo, mat, count);
+      inst.name = name;
+      inst.castShadow = false;
+      inst.receiveShadow = Boolean(optsInst?.receiveShadow);
+      inst.frustumCulled = false;
+      if (optsInst?.renderOrder !== undefined) inst.renderOrder = optsInst.renderOrder;
+      for (let i = 0; i < count; i++) {
+        inst.setMatrixAt(i, _zeroMatrix);
+      }
+      inst.instanceMatrix.needsUpdate = true;
+      this.root.add(inst);
+      return inst;
+    };
+
+    // 10 batched InstancedMeshes for all 6 mortar pits
+    this.sandbagInst = makePoolInst(this.geoSandbag, this.matSandbag, MAX_MORTAR_PITS * 28, 'MortarSandbagsInst', { receiveShadow: true });
+    this.baseplateInst = makePoolInst(geoBaseplate, this.matSteelDark, MAX_MORTAR_PITS, 'MortarBaseplatesInst', { receiveShadow: true });
+    this.crateInst = makePoolInst(geoCrate, this.matOliveCrate, MAX_MORTAR_PITS * 2, 'MortarCratesInst', { receiveShadow: true });
+    this.stakeInst = makePoolInst(geoMergedStake, this.matVertexMatte, MAX_MORTAR_PITS * 2, 'MortarStakesInst');
+    this.bipodTurretInst = makePoolInst(geoMergedBipod, this.matCompositeMetal, MAX_MORTAR_PITS, 'MortarBipodsInst');
+    this.barrelInst = makePoolInst(geoMergedBarrel, this.matCompositeMetal, MAX_MORTAR_PITS, 'MortarBarrelsInst');
+    this.muzzleFlashInst = makePoolInst(geoFlash, this.matFlash, MAX_MORTAR_PITS, 'MortarMuzzleFlashesInst');
+    this.stagedShellInst = makePoolInst(this.geoMergedShell, this.matVertexMatte, MAX_MORTAR_PITS, 'MortarStagedShellsInst');
+    this.crewBodyInst = makePoolInst(geoMergedCrewBody, this.matCrewBody, MAX_MORTAR_PITS * 2, 'MortarCrewBodiesInst');
+    this.crewHeadInst = makePoolInst(geoMergedCrewHead, this.matCrewHead, MAX_MORTAR_PITS * 2, 'MortarCrewHeadsInst');
+
+    // Initialize 16 pooled falling mortar shell / aerial bomb instances (1 draw call!)
+    this.shellInst = makePoolInst(this.geoMergedShell, this.matVertexMatte, MAX_MORTAR_SHELL_POOL, 'MortarOrdnancePoolInst');
     for (let i = 0; i < MAX_MORTAR_SHELL_POOL; i++) {
-      const mesh = this.createShellMesh();
-      mesh.visible = false;
-      this.root.add(mesh);
       this.shellPool.push({
+        slotIndex: i,
         active: false,
         shellId: '',
         pitId: '',
         callerId: '',
+        callerName: '',
         callerTeam: 'A',
         isPlayerManned: false,
+        weaponKind: 'mortar_81mm',
+        weaponName: '81mm MORTAR',
+        blastRadiusM: MORTAR_BLAST_RADIUS_M,
+        maxDamage: MORTAR_BLAST_MAX_DAMAGE,
+        scaleMult: 1.0,
         origin: new THREE.Vector3(),
         vel: new THREE.Vector3(),
         windX: 0,
@@ -581,69 +854,33 @@ export class MortarEmplacementSystem {
         elapsedSec: 0,
         flightTimeSec: 1,
         whistleTriggered: false,
-        mesh,
       });
     }
 
-    // Initialize 24 pooled FIFO ground scorch decals
-    for (let i = 0; i < MAX_SCORCH_DECAL_POOL; i++) {
-      const decal = new THREE.Mesh(this.geoScorchPlane, this.matScorchDecal);
-      decal.visible = false;
-      decal.renderOrder = 2;
-      this.root.add(decal);
-      this.scorchDecals.push(decal);
-    }
+    // Initialize 24 pooled FIFO ground scorch decals (1 draw call!)
+    this.scorchInst = makePoolInst(this.geoScorchPlane, this.matScorchDecal, MAX_SCORCH_DECAL_POOL, 'MortarScorchDecalsInst', { renderOrder: 2 });
 
-    // Initialize 6 pooled lightweight detonation smoke/flash bursts
+    // Initialize 6 pooled lightweight detonation smoke/flash/ring bursts (3 draw calls!)
     const plumeGeo = track(new THREE.IcosahedronGeometry(1.1, 1));
     const ringGeo = track(new THREE.RingGeometry(0.6, 1.35, 16));
     ringGeo.rotateX(-Math.PI * 0.5);
+    this.blastPlumeInst = makePoolInst(plumeGeo, this.matBlastPlume, 6, 'MortarBlastPlumesInst');
+    this.blastFlashInst = makePoolInst(plumeGeo, this.matBlastFlash, 6, 'MortarBlastFlashesInst');
+    this.blastRingInst = makePoolInst(ringGeo, this.matBlastRing, 6, 'MortarBlastRingsInst');
     for (let i = 0; i < 6; i++) {
-      const plumeMat = track(
-        new THREE.MeshBasicMaterial({
-          color: 0x3b352d,
-          transparent: true,
-          opacity: 0.0,
-          depthWrite: false,
-        }),
-      );
-      const flashMat = track(
-        new THREE.MeshBasicMaterial({
-          color: 0xffb84d,
-          transparent: true,
-          opacity: 0.0,
-          depthWrite: false,
-        }),
-      );
-      const ringMat = track(
-        new THREE.MeshBasicMaterial({
-          color: 0xd6bfa2,
-          transparent: true,
-          opacity: 0.0,
-          side: THREE.DoubleSide,
-          depthWrite: false,
-        }),
-      );
-      const plumeMesh = new THREE.Mesh(plumeGeo, plumeMat);
-      const flashMesh = new THREE.Mesh(plumeGeo, flashMat);
-      const ringMesh = new THREE.Mesh(ringGeo, ringMat);
-      plumeMesh.visible = false;
-      flashMesh.visible = false;
-      ringMesh.visible = false;
-      this.root.add(plumeMesh, flashMesh, ringMesh);
       this.blastVfxPool.push({
+        slotIndex: i,
         active: false,
         timerSec: 0,
         durationSec: 1.4,
+        scaleBoost: 1.0,
         pos: new THREE.Vector3(),
-        plumeMesh,
-        flashMesh,
-        ringMesh,
       });
     }
 
-    // Single pooled dynamic explosion PointLight recycled to the latest blast
+    // Single pooled dynamic explosion PointLight recycled to the latest blast (never casts shadows!)
     this.blastLight = new THREE.PointLight(0xff9c40, 0, 32, 1.8);
+    this.blastLight.castShadow = false;
     this.blastLight.visible = false;
     this.root.add(this.blastLight);
   }
@@ -657,10 +894,20 @@ export class MortarEmplacementSystem {
     this.enabled = Boolean(enabled);
     this.root.visible = this.enabled;
     if (!this.enabled) {
-      for (const shell of this.shellPool) {
-        shell.active = false;
-        shell.mesh.visible = false;
+      for (let i = 0; i < this.shellPool.length; i++) {
+        this.shellPool[i].active = false;
+        this.shellInst.setMatrixAt(i, _zeroMatrix);
       }
+      this.shellInst.instanceMatrix.needsUpdate = true;
+      for (let i = 0; i < this.blastVfxPool.length; i++) {
+        this.blastVfxPool[i].active = false;
+        this.blastPlumeInst.setMatrixAt(i, _zeroMatrix);
+        this.blastFlashInst.setMatrixAt(i, _zeroMatrix);
+        this.blastRingInst.setMatrixAt(i, _zeroMatrix);
+      }
+      this.blastPlumeInst.instanceMatrix.needsUpdate = true;
+      this.blastFlashInst.instanceMatrix.needsUpdate = true;
+      this.blastRingInst.instanceMatrix.needsUpdate = true;
       for (const pit of this.pits.values()) {
         pit.state.seatedPlayerId = null;
         pit.state.seatedPlayerName = null;
@@ -672,10 +919,19 @@ export class MortarEmplacementSystem {
       }
       this.teamStates.A.activeMortarMissionId = null;
       this.teamStates.B.activeMortarMissionId = null;
+      this.teamStates.A.activeBomberId = null;
+      this.teamStates.B.activeBomberId = null;
+      this.teamStates.A.activeStrike = false;
+      this.teamStates.B.activeStrike = false;
+      this.teamStates.A.callerPlayerId = null;
+      this.teamStates.B.callerPlayerId = null;
+      this.teamStates.A.activeStrikeId = null;
+      this.teamStates.B.activeStrikeId = null;
       this.remoteActiveMissions = [];
       this.blastLight.visible = false;
       this.blastLight.intensity = 0;
       this.lastTickActivePits = 0;
+      this.syncAllPitInstances();
     }
   }
 
@@ -707,11 +963,13 @@ export class MortarEmplacementSystem {
     this.pits.clear();
 
     const capped = sites.slice(0, MAX_MORTAR_PITS);
-    for (const cfg of capped) {
-      const pit = this.buildMortarPit(cfg);
+    for (let i = 0; i < capped.length; i++) {
+      const cfg = capped[i];
+      const pit = this.buildMortarPit(cfg, i);
       this.pits.set(cfg.pitId, pit);
       this.root.add(pit.root);
     }
+    this.syncAllPitInstances();
   }
 
   /**
@@ -785,6 +1043,29 @@ export class MortarEmplacementSystem {
         pit.root.visible = false;
       }
     }
+    this.syncAllPitInstances();
+  }
+
+  /** Synchronizes Phase 4 Bomber Air Strike team cooldown & airspace lock state into shared team fire-support state. */
+  public syncTeamAirStrikeState(
+    team: 'A' | 'B',
+    patch: {
+      airStrikeCooldownSec: number;
+      airStrikeMaxCooldownSec: number;
+      activeBomberId: string | null;
+      activeStrike: boolean;
+      callerPlayerId: string | null;
+      activeStrikeId: string | null;
+    },
+  ): void {
+    this.externalAirStrikeStateManaged = true;
+    const ts = this.teamStates[team];
+    ts.airStrikeCooldownSec = Math.max(0, patch.airStrikeCooldownSec);
+    ts.airStrikeMaxCooldownSec = Math.max(1, patch.airStrikeMaxCooldownSec);
+    ts.activeBomberId = patch.activeBomberId;
+    ts.activeStrike = patch.activeStrike;
+    ts.callerPlayerId = patch.callerPlayerId;
+    ts.activeStrikeId = patch.activeStrikeId;
   }
 
   public getTeamFireSupportState(team: 'A' | 'B'): TeamFireSupportState {
@@ -1330,9 +1611,9 @@ export class MortarEmplacementSystem {
       MORTAR_MAX_ELEVATION_RAD,
     );
 
-    // Turning handwheels physically rotates the 3D crank wheels and corrects post-shot stake/bubble drift
-    pit.traverseWheel.rotation.z += deltaAzimuthRad * 16;
-    pit.elevateWheel.rotation.x += deltaElevationRad * 20;
+    // Turning handwheels physically rotates the crank angles and corrects post-shot stake/bubble drift
+    pit.traverseWheelAngle += deltaAzimuthRad * 16;
+    pit.elevateWheelAngle += deltaElevationRad * 20;
 
     if (Math.abs(deltaAzimuthRad) > 1e-5) {
       pit.stakeDriftMils = THREE.MathUtils.damp(pit.stakeDriftMils, 0, 12, Math.abs(deltaAzimuthRad) * 18);
@@ -1529,6 +1810,7 @@ export class MortarEmplacementSystem {
     } else {
       this.remoteActiveMissions = [];
     }
+    this.syncAllPitInstances();
   }
 
   /** Computes gunner camera world position & lookAt target while seated (Over-Tube or Optical Sight). */
@@ -1652,7 +1934,7 @@ export class MortarEmplacementSystem {
       if (ts.mortarStrikeCooldownSec > 0) {
         ts.mortarStrikeCooldownSec = Math.max(0, ts.mortarStrikeCooldownSec - safeDt);
       }
-      if (ts.airStrikeCooldownSec > 0) {
+      if (!this.externalAirStrikeStateManaged && ts.airStrikeCooldownSec > 0) {
         ts.airStrikeCooldownSec = Math.max(0, ts.airStrikeCooldownSec - safeDt);
       }
     }
@@ -1688,14 +1970,11 @@ export class MortarEmplacementSystem {
       } else {
         pit.state.reloadProgress01 = 1;
       }
-      pit.stagedShellGroup.visible = pit.state.reloadProgress01 > 0.55;
+      pit.stagedShellVisible = pit.state.reloadProgress01 > 0.55;
 
       // Muzzle flash & tube recoil recovery
       if (pit.muzzleFlashTimer > 0) {
         pit.muzzleFlashTimer = Math.max(0, pit.muzzleFlashTimer - safeDt);
-        pit.muzzleFlashMesh.visible = pit.muzzleFlashTimer > 0;
-        const fScale = 0.65 + (1 - pit.muzzleFlashTimer / 0.11) * 1.45;
-        pit.muzzleFlashMesh.scale.setScalar(fScale);
       }
       if (pit.recoilKick01 > 0.001) {
         pit.recoilKick01 = THREE.MathUtils.damp(pit.recoilKick01, 0, 12.5, safeDt);
@@ -1742,7 +2021,10 @@ export class MortarEmplacementSystem {
       }
     }
 
-    // Update pooled falling mortar shells
+    // Update dynamic instanced transforms for active mortar pits & crew
+    this.syncDynamicPitInstances();
+
+    // Update pooled falling mortar shells & bomber bombs
     this.updateActiveShells(safeDt);
 
     // Update pooled blast VFX & single dynamic PointLight
@@ -1757,7 +2039,9 @@ export class MortarEmplacementSystem {
     pitCount: number;
     activeTickedPits: number;
     activeShells: number;
+    maxShellPool: number;
     scorchDecalPoolSize: number;
+    activeScorchDecals: number;
     lastCpuMs: number;
   } {
     let activeShells = 0;
@@ -1769,7 +2053,9 @@ export class MortarEmplacementSystem {
       pitCount: this.pits.size,
       activeTickedPits: this.lastTickActivePits,
       activeShells,
-      scorchDecalPoolSize: this.scorchDecals.length,
+      maxShellPool: MAX_MORTAR_SHELL_POOL,
+      scorchDecalPoolSize: MAX_SCORCH_DECAL_POOL,
+      activeScorchDecals: this.scorchUsedCount,
       lastCpuMs: this.lastCpuMs,
     };
   }
@@ -1783,7 +2069,6 @@ export class MortarEmplacementSystem {
       d.dispose();
     }
     this.disposables.length = 0;
-    this.uniformLib.dispose();
     if (this.root.parent) {
       this.root.parent.remove(this.root);
     }
@@ -1793,90 +2078,15 @@ export class MortarEmplacementSystem {
   // Private: Pit Construction (<= 2,200 tris per pit)
   // ---------------------------------------------------------------------------
 
-  private buildMortarPit(cfg: MortarSiteConfig): InternalMortarPit {
+  private buildMortarPit(cfg: MortarSiteConfig, slotIndex: number): InternalMortarPit {
     const pitRoot = new THREE.Group();
     pitRoot.name = `MortarPit_${cfg.pitId}`;
     const groundY = this.getGroundHeight(cfg.position[0], cfg.position[2]);
     const worldPos: [number, number, number] = [cfg.position[0], groundY, cfg.position[2]];
     pitRoot.position.set(worldPos[0], worldPos[1], worldPos[2]);
 
-    // 1. InstancedMesh Burlap Sandbag Crescent Parapet (28 bags * 12 tris = 336 tris)
-    const bagCount = 28;
-    const sandbagInst = new THREE.InstancedMesh(this.geoSandbag, this.matSandbag, bagCount);
-    sandbagInst.castShadow = true;
-    sandbagInst.receiveShadow = true;
-    const radius = 1.95;
-    let idx = 0;
-    // Two stacked horseshoe tiers covering 270° (rear open for player [F] entry)
-    for (let tier = 0; tier < 2; tier++) {
-      const count = 14;
-      for (let i = 0; i < count && idx < bagCount; i++) {
-        const frac = i / (count - 1);
-        const angle = cfg.zeroBearingRad - Math.PI * 0.72 + frac * Math.PI * 1.44 + tier * 0.08;
-        const bx = Math.sin(angle) * (radius + (tier === 1 ? 0.04 : 0));
-        const bz = -Math.cos(angle) * (radius + (tier === 1 ? 0.04 : 0));
-        const by = 0.12 + tier * 0.23;
-        _euler.set(0, -angle, 0);
-        _quat.setFromEuler(_euler);
-        _scale.set(1.0 + (i % 2) * 0.06, 1.0, 1.0);
-        _mat4.compose(_vA.set(bx, by, bz), _quat, _scale);
-        sandbagInst.setMatrixAt(idx++, _mat4);
-      }
-    }
-    sandbagInst.instanceMatrix.needsUpdate = true;
-    sandbagInst.computeBoundingSphere();
-    pitRoot.add(sandbagInst);
-
-    // 2. Heavy Steel Baseplate + Rotating Turret Assembly (<= 650 tris)
-    const baseplateGeo = new THREE.CylinderGeometry(0.46, 0.52, 0.09, 12);
-    this.disposables.push(baseplateGeo);
-    const baseplate = new THREE.Mesh(baseplateGeo, this.matSteelDark);
-    baseplate.position.set(0, 0.045, 0);
-    baseplate.castShadow = true;
-    baseplate.receiveShadow = true;
-    pitRoot.add(baseplate);
-
     const turretYawGroup = new THREE.Group();
     pitRoot.add(turretYawGroup);
-
-    // Bipod legs & traversing screw
-    const legGeo = new THREE.CylinderGeometry(0.024, 0.028, 1.08, 6);
-    const screwGeo = new THREE.CylinderGeometry(0.02, 0.02, 0.44, 6);
-    const wheelGeo = new THREE.TorusGeometry(0.062, 0.012, 6, 12);
-    const barrelGeo = new THREE.CylinderGeometry(0.056, 0.064, 1.32, 12);
-    const collarGeo = new THREE.CylinderGeometry(0.078, 0.078, 0.14, 10);
-    const sightBodyGeo = new THREE.BoxGeometry(0.08, 0.16, 0.09);
-    const eyepieceGeo = new THREE.CylinderGeometry(0.028, 0.026, 0.09, 8);
-    const flashGeo = new THREE.ConeGeometry(0.24, 0.55, 8);
-    this.disposables.push(legGeo, screwGeo, wheelGeo, barrelGeo, collarGeo, sightBodyGeo, eyepieceGeo, flashGeo);
-
-    const leftLeg = new THREE.Mesh(legGeo, this.matSteelDark);
-    leftLeg.position.set(-0.26, 0.48, -0.52);
-    leftLeg.rotation.set(0.22, 0, -0.26);
-    const rightLeg = new THREE.Mesh(legGeo, this.matSteelDark);
-    rightLeg.position.set(0.26, 0.48, -0.52);
-    rightLeg.rotation.set(0.22, 0, 0.26);
-    const traverseBar = new THREE.Mesh(screwGeo, this.matSteelGunmetal);
-    traverseBar.rotation.z = Math.PI * 0.5;
-    traverseBar.position.set(0, 0.88, -0.44);
-    turretYawGroup.add(leftLeg, rightLeg, traverseBar);
-
-    const traverseWheel = new THREE.Mesh(wheelGeo, this.matBrass);
-    traverseWheel.position.set(-0.26, 0.88, -0.44);
-    traverseWheel.rotation.y = Math.PI * 0.5;
-    const elevateWheel = new THREE.Mesh(wheelGeo, this.matBrass);
-    elevateWheel.position.set(-0.14, 0.68, -0.48);
-    turretYawGroup.add(traverseWheel, elevateWheel);
-
-    // Optical elbow collimator sight mounted on left side of bipod
-    const sightHousing = new THREE.Group();
-    sightHousing.position.set(-0.23, 1.01, -0.36);
-    const sightBody = new THREE.Mesh(sightBodyGeo, this.matSteelDark);
-    const eyepiece = new THREE.Mesh(eyepieceGeo, this.matBrass);
-    eyepiece.rotation.x = Math.PI * 0.5;
-    eyepiece.position.set(0, 0.05, 0.06);
-    sightHousing.add(sightBody, eyepiece);
-    turretYawGroup.add(sightHousing);
 
     // Barrel pivot anchored in baseplate socket (tilts in high-angle 45°-80° band)
     const barrelPivotGroup = new THREE.Group();
@@ -1886,76 +2096,13 @@ export class MortarEmplacementSystem {
     const barrelRecoilGroup = new THREE.Group();
     barrelPivotGroup.add(barrelRecoilGroup);
 
-    const barrelMesh = new THREE.Mesh(barrelGeo, this.matSteelGunmetal);
-    barrelMesh.position.set(0, 0.66, 0);
-    barrelMesh.castShadow = true;
-    const shockCollar = new THREE.Mesh(collarGeo, this.matSteelDark);
-    shockCollar.position.set(0, 0.82, 0);
-    barrelRecoilGroup.add(barrelMesh, shockCollar);
-
-    const muzzleFlashMesh = new THREE.Mesh(flashGeo, this.matFlash);
-    muzzleFlashMesh.position.set(0, 1.56, 0);
-    muzzleFlashMesh.visible = false;
-    barrelRecoilGroup.add(muzzleFlashMesh);
-
-    // 3. Wooden Ammo Crates + Staged 81mm Round with 4 Propellant Charge Rings (<= 280 tris)
-    const crateGeo = new THREE.BoxGeometry(0.64, 0.28, 0.34);
-    const ringGeo = new THREE.TorusGeometry(0.044, 0.008, 5, 10);
-    const stakeGeo = new THREE.CylinderGeometry(0.018, 0.018, 1.35, 6);
-    const stakeBandGeo = new THREE.CylinderGeometry(0.020, 0.020, 0.22, 6);
-    this.disposables.push(crateGeo, ringGeo, stakeGeo, stakeBandGeo);
-
-    const crateA = new THREE.Mesh(crateGeo, this.matOliveCrate);
-    crateA.position.set(0.86, 0.14, 0.42);
-    crateA.rotation.y = 0.35;
-    crateA.castShadow = true;
-    crateA.receiveShadow = true;
-    const crateB = new THREE.Mesh(crateGeo, this.matOliveCrate);
-    crateB.position.set(0.88, 0.42, 0.44);
-    crateB.rotation.y = 0.24;
-    crateB.castShadow = true;
-    pitRoot.add(crateA, crateB);
-
-    const stagedShellGroup = this.createShellMesh();
-    stagedShellGroup.position.set(0.56, 0.62, 0.18);
-    stagedShellGroup.rotation.z = 0.28;
-    const chargeRingMeshes: THREE.Mesh[] = [];
-    for (let r = 0; r < 4; r++) {
-      const ring = new THREE.Mesh(ringGeo, this.matChargeRing);
-      ring.rotation.x = Math.PI * 0.5;
-      ring.position.set(0, -0.11 + r * 0.024, 0);
-      stagedShellGroup.add(ring);
-      chargeRingMeshes.push(ring);
-    }
-    pitRoot.add(stagedShellGroup);
-
-    // Twin Red-and-White Aiming Stakes planted 4.2m and 7.5m downrange along zeroBearingRad
-    const stakeDistances = [4.2, 7.5];
-    for (let s = 0; s < stakeDistances.length; s++) {
-      const dist = stakeDistances[s];
-      const sx = Math.sin(cfg.zeroBearingRad) * dist;
-      const sz = -Math.cos(cfg.zeroBearingRad) * dist;
-      const sy = this.getGroundHeight(worldPos[0] + sx, worldPos[2] + sz) - worldPos[1];
-      const stakeGroup = new THREE.Group();
-      stakeGroup.position.set(sx, sy, sz);
-
-      const pole = new THREE.Mesh(stakeGeo, this.matStakeWhite);
-      pole.position.y = 0.675;
-      const redBandTop = new THREE.Mesh(stakeBandGeo, this.matStakeRed);
-      redBandTop.position.y = 1.15;
-      const redBandMid = new THREE.Mesh(stakeBandGeo, this.matStakeRed);
-      redBandMid.position.y = 0.72;
-      stakeGroup.add(pole, redBandTop, redBandMid);
-      pitRoot.add(stakeGroup);
-    }
-
-    // 4. Killable 2-Man AI Mortar Crew (Gunner on left, Loader on right)
-    const uniformBundle = this.getCrewUniformBundle(cfg.ownerTeam);
-    const gunnerVisual = this.buildCrewVisual(cfg.pitId, 'gunner', uniformBundle);
-    const loaderVisual = this.buildCrewVisual(cfg.pitId, 'loader', uniformBundle);
+    // Killable 2-Man AI Mortar Crew transform rigs + raycastable invisible hitboxes
+    const gunnerVisual = this.buildCrewVisual(cfg.pitId, 'gunner');
+    const loaderVisual = this.buildCrewVisual(cfg.pitId, 'loader');
     turretYawGroup.add(gunnerVisual.root, loaderVisual.root);
 
-    // 5. Sandbag Parapet Colliders (compact AABB quadrants leaving rear entrance clear)
+    // Sandbag Parapet Colliders (compact AABB quadrants leaving rear entrance clear)
+    const radius = 1.95;
     const colliders: THREE.Box3[] = [];
     const wallAngles = [-0.95, 0, 0.95];
     for (const relAng of wallAngles) {
@@ -1995,25 +2142,23 @@ export class MortarEmplacementSystem {
     pitRoot.visible = cfg.active;
 
     const pit: InternalMortarPit = {
+      slotIndex,
       state,
       root: pitRoot,
       turretYawGroup,
       barrelPivotGroup,
       barrelRecoilGroup,
-      traverseWheel,
-      elevateWheel,
-      sightHousing,
-      stagedShellGroup,
-      chargeRingMeshes,
+      traverseWheelAngle: 0,
+      elevateWheelAngle: 0,
+      stagedShellVisible: true,
       muzzleTipLocal: new THREE.Vector3(0, 1.36, 0),
-      muzzleFlashMesh,
       muzzleFlashTimer: 0,
       gunnerVisual,
       loaderVisual,
       colliders,
       reloadTimerSec: 0,
       reloadDurationSec: MORTAR_RELOAD_AI_LOADER_SEC,
-      aiSalvoTimerSec: 12 + (this.pits.size % 3) * 6, // stagger initial salvos across theater
+      aiSalvoTimerSec: 12 + (slotIndex % 3) * 6,
       aiSalvoRemaining: 0,
       aiSalvoNextRoundTimerSec: 0,
       aiSalvoTargetPos: new THREE.Vector3(),
@@ -2035,76 +2180,41 @@ export class MortarEmplacementSystem {
       missionDangerClose: false,
     };
 
+    this.applyCrewUniforms(pit, cfg.ownerTeam);
     this.syncChargeRingVisuals(pit);
     this.applyTubeTransform(pit);
     return pit;
   }
 
-  private buildCrewVisual(
-    pitId: string,
-    role: 'gunner' | 'loader',
-    uniform: TacticalUniformMaterialBundle,
-  ): CrewActorVisual {
+  private buildCrewVisual(pitId: string, role: 'gunner' | 'loader'): CrewActorVisual {
     const root = new THREE.Group();
     const isGunner = role === 'gunner';
-    // Fixed kneeling positions beside the bipod (Gunner left, Loader right)
     root.position.set(isGunner ? -0.68 : 0.68, 0, 0.24);
     root.rotation.y = isGunner ? -0.45 : 0.45;
-
-    const legGeo = new THREE.CylinderGeometry(0.085, 0.075, 0.44, 6);
-    const torsoGeo = new THREE.BoxGeometry(0.36, 0.48, 0.24);
-    const vestGeo = new THREE.BoxGeometry(0.39, 0.36, 0.28);
-    const headGeo = new THREE.SphereGeometry(0.12, 8, 6);
-    const helmetGeo = new THREE.SphereGeometry(0.135, 8, 6, 0, Math.PI * 2, 0, Math.PI * 0.58);
-    const armGeo = new THREE.CylinderGeometry(0.055, 0.048, 0.46, 6);
-    this.disposables.push(legGeo, torsoGeo, vestGeo, headGeo, helmetGeo, armGeo);
-
-    // Kneeling legs
-    const leftLeg = new THREE.Mesh(legGeo, uniform.pantsMat);
-    leftLeg.position.set(-0.11, 0.22, 0.08);
-    leftLeg.rotation.x = 0.65;
-    const rightLeg = new THREE.Mesh(legGeo, uniform.pantsMat);
-    rightLeg.position.set(0.11, 0.16, -0.06);
-    rightLeg.rotation.x = -0.85;
-    root.add(leftLeg, rightLeg);
 
     const torsoGroup = new THREE.Group();
     torsoGroup.position.set(0, 0.46, 0);
     root.add(torsoGroup);
 
-    const torsoMesh = new THREE.Mesh(torsoGeo, uniform.sleeveMat);
-    torsoMesh.position.y = 0.22;
-    torsoMesh.castShadow = true;
-    const vestMesh = new THREE.Mesh(vestGeo, uniform.vestMat);
-    vestMesh.position.y = 0.25;
-
-    const headMesh = new THREE.Mesh(headGeo, uniform.skinMat);
+    // Lightweight invisible raycast hitboxes (material.visible = false => 0 GPU draw calls, full Raycaster support)
+    const torsoMesh = new THREE.Mesh(this.geoHitTorso, this.matHitboxInvisible);
+    torsoMesh.position.y = 0.24;
+    const headMesh = new THREE.Mesh(this.geoHitHead, this.matHitboxInvisible);
     headMesh.position.set(0, 0.56, 0.02);
-    const helmetMesh = new THREE.Mesh(helmetGeo, uniform.helmetMat);
-    helmetMesh.position.set(0, 0.58, 0.01);
 
     const leftArm = new THREE.Group();
     leftArm.position.set(-0.22, 0.38, 0.02);
-    const lArmMesh = new THREE.Mesh(armGeo, uniform.sleeveMat);
-    lArmMesh.position.set(0, -0.18, -0.14);
-    lArmMesh.rotation.x = 0.85;
-    leftArm.add(lArmMesh);
-
     const rightArm = new THREE.Group();
     rightArm.position.set(0.22, 0.38, 0.02);
-    const rArmMesh = new THREE.Mesh(armGeo, uniform.sleeveMat);
-    rArmMesh.position.set(0, -0.18, -0.14);
-    rArmMesh.rotation.x = 0.85;
-    rightArm.add(rArmMesh);
+    torsoGroup.add(torsoMesh, headMesh, leftArm, rightArm);
 
-    torsoGroup.add(torsoMesh, vestMesh, headMesh, helmetMesh, leftArm, rightArm);
-
-    // Tag raycast hitboxes with role + head/body zone for precise weapon hit registration
-    const hitMeshes = [torsoMesh, vestMesh, headMesh, helmetMesh];
+    const hitMeshes = [torsoMesh, headMesh];
     for (const m of hitMeshes) {
+      m.castShadow = false;
+      m.receiveShadow = false;
       m.userData.mortarCrewPitId = pitId;
       m.userData.mortarCrewRole = role;
-      m.userData.mortarHitZone = m === headMesh || m === helmetMesh ? 'head' : 'body';
+      m.userData.mortarHitZone = m === headMesh ? 'head' : 'body';
     }
 
     return {
@@ -2121,54 +2231,21 @@ export class MortarEmplacementSystem {
     };
   }
 
-  private getCrewUniformBundle(team: 'A' | 'B'): TacticalUniformMaterialBundle {
-    if (typeof document !== 'undefined') {
-      return this.uniformLib.getBundle(team === 'A' ? 'team_a' : 'team_b');
-    }
-    const baseColor = team === 'A' ? 0x4b5c42 : 0x5c4a3e;
-    const mat = new THREE.MeshStandardMaterial({ color: baseColor, roughness: 0.88, metalness: 0.05 });
-    const basicMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
-    this.disposables.push(mat, basicMat);
-    return {
-      id: team === 'A' ? 'team_a' : 'team_b',
-      sleeveMat: mat,
-      pantsMat: mat,
-      vestMat: this.matOliveCrate,
-      pouchMat: this.matOliveCrate,
-      gloveMat: this.matSteelDark,
-      bootMat: this.matSteelDark,
-      soleMat: this.matSteelDark,
-      knuckleMat: this.matSteelDark,
-      hardwareMat: this.matSteelGunmetal,
-      helmetMat: this.matSteelDark,
-      hoodMat: this.matSteelDark,
-      skinMat: this.matSandbag,
-      visorMat: this.matSteelGunmetal,
-      iffTrimMat: this.matBrass,
-      gunMat: this.matSteelDark,
-      gunAccentMat: this.matSteelGunmetal,
-      flashMat: basicMat,
-      laserMat: basicMat,
-      lightGlowMat: basicMat,
-      dispose: () => {},
-    };
-  }
-
   private applyCrewUniforms(pit: InternalMortarPit, team: 'A' | 'B'): void {
-    const bundle = this.getCrewUniformBundle(team);
-    const applyTo = (vis: CrewActorVisual) => {
-      vis.root.traverse((obj) => {
-        const mesh = obj as THREE.Mesh;
-        if (!mesh.isMesh) return;
-        if (mesh.userData.mortarHitZone === 'head') {
-          mesh.material = mesh === vis.headMesh ? bundle.skinMat : bundle.helmetMat;
-        } else {
-          mesh.material = bundle.vestMat;
-        }
-      });
-    };
-    applyTo(pit.gunnerVisual);
-    applyTo(pit.loaderVisual);
+    // Tint per-team instanced crew uniforms cleanly (NATO Ranger Olive vs Opfor Khaki-Tan)
+    _color.setHex(team === 'A' ? 0x8ea17d : 0xb59b7c);
+    const baseIdx = pit.slotIndex * 2;
+    this.crewBodyInst.setColorAt(baseIdx, _color);
+    this.crewBodyInst.setColorAt(baseIdx + 1, _color);
+    if (this.crewBodyInst.instanceColor) {
+      this.crewBodyInst.instanceColor.needsUpdate = true;
+    }
+    _color.setHex(team === 'A' ? 0xd0d8c8 : 0xd8cec0);
+    this.crewHeadInst.setColorAt(baseIdx, _color);
+    this.crewHeadInst.setColorAt(baseIdx + 1, _color);
+    if (this.crewHeadInst.instanceColor) {
+      this.crewHeadInst.instanceColor.needsUpdate = true;
+    }
   }
 
   private resetCrewVisualsAlive(pit: InternalMortarPit): void {
@@ -2178,25 +2255,154 @@ export class MortarEmplacementSystem {
     pit.loaderVisual.root.visible = true;
   }
 
-  private createShellMesh(): THREE.Group {
-    const g = new THREE.Group();
-    const body = new THREE.Mesh(this.geoShellBody, this.matShellOlive);
-    const nose = new THREE.Mesh(this.geoShellNose, this.matBrass);
-    nose.position.y = 0.195;
-    const finA = new THREE.Mesh(this.geoShellFin, this.matSteelDark);
-    finA.position.y = -0.145;
-    const finB = new THREE.Mesh(this.geoShellFin, this.matSteelDark);
-    finB.position.y = -0.145;
-    finB.rotation.y = Math.PI * 0.5;
-    g.add(body, nose, finA, finB);
-    return g;
+  private syncChargeRingVisuals(_pit: InternalMortarPit): void {
+    // Charge level is reflected in firing telemetry and tube elevation/staging state
   }
 
-  private syncChargeRingVisuals(pit: InternalMortarPit): void {
-    const lvl = pit.state.currentChargeLevel;
-    for (let i = 0; i < pit.chargeRingMeshes.length; i++) {
-      pit.chargeRingMeshes[i].visible = i < lvl;
+  /** Rebuilds static + dynamic InstancedMesh transforms across all configured mortar pits. */
+  private syncAllPitInstances(): void {
+    // Reset all static slots first
+    for (let i = 0; i < MAX_MORTAR_PITS * 28; i++) this.sandbagInst.setMatrixAt(i, _zeroMatrix);
+    for (let i = 0; i < MAX_MORTAR_PITS; i++) this.baseplateInst.setMatrixAt(i, _zeroMatrix);
+    for (let i = 0; i < MAX_MORTAR_PITS * 2; i++) {
+      this.crateInst.setMatrixAt(i, _zeroMatrix);
+      this.stakeInst.setMatrixAt(i, _zeroMatrix);
     }
+
+    const radius = 1.95;
+    const stakeDistances = [4.2, 7.5];
+
+    for (const pit of this.pits.values()) {
+      const visible = this.enabled && pit.root.visible && pit.state.status !== 'INACTIVE';
+      if (!visible) continue;
+
+      const s = pit.slotIndex;
+      const px = pit.state.position[0];
+      const py = pit.state.position[1];
+      const pz = pit.state.position[2];
+
+      // 28 instanced sandbags in 2 stacked horseshoe tiers
+      let bagOffset = s * 28;
+      for (let tier = 0; tier < 2; tier++) {
+        for (let i = 0; i < 14; i++) {
+          const frac = i / 13;
+          const angle = pit.state.zeroBearingRad - Math.PI * 0.72 + frac * Math.PI * 1.44 + tier * 0.08;
+          const bx = px + Math.sin(angle) * (radius + (tier === 1 ? 0.04 : 0));
+          const bz = pz - Math.cos(angle) * (radius + (tier === 1 ? 0.04 : 0));
+          const by = py + 0.12 + tier * 0.23;
+          _euler.set(0, -angle, 0);
+          _quat.setFromEuler(_euler);
+          _scale.set(1.0 + (i % 2) * 0.06, 1.0, 1.0);
+          _mat4.compose(_vA.set(bx, by, bz), _quat, _scale);
+          this.sandbagInst.setMatrixAt(bagOffset++, _mat4);
+        }
+      }
+
+      // Baseplate
+      _quat.identity();
+      _scale.set(1, 1, 1);
+      _mat4.compose(_vA.set(px, py + 0.045, pz), _quat, _scale);
+      this.baseplateInst.setMatrixAt(s, _mat4);
+
+      // 2 stacked ammo crates
+      _euler.set(0, 0.35, 0);
+      _quat.setFromEuler(_euler);
+      _mat4.compose(_vA.set(px + 0.86, py + 0.14, pz + 0.42), _quat, _scale);
+      this.crateInst.setMatrixAt(s * 2, _mat4);
+      _euler.set(0, 0.24, 0);
+      _quat.setFromEuler(_euler);
+      _mat4.compose(_vA.set(px + 0.88, py + 0.42, pz + 0.44), _quat, _scale);
+      this.crateInst.setMatrixAt(s * 2 + 1, _mat4);
+
+      // 2 red-and-white aiming stakes
+      _quat.identity();
+      for (let k = 0; k < 2; k++) {
+        const dist = stakeDistances[k];
+        const sx = px + Math.sin(pit.state.zeroBearingRad) * dist;
+        const sz = pz - Math.cos(pit.state.zeroBearingRad) * dist;
+        const sy = this.getGroundHeight(sx, sz);
+        _mat4.compose(_vA.set(sx, sy, sz), _quat, _scale);
+        this.stakeInst.setMatrixAt(s * 2 + k, _mat4);
+      }
+    }
+
+    this.sandbagInst.instanceMatrix.needsUpdate = true;
+    this.baseplateInst.instanceMatrix.needsUpdate = true;
+    this.crateInst.instanceMatrix.needsUpdate = true;
+    this.stakeInst.instanceMatrix.needsUpdate = true;
+
+    this.syncDynamicPitInstances();
+  }
+
+  /** Zero-GC per-frame update of rotating mortar tubes, muzzle flashes, staged shells, and crew poses. */
+  private syncDynamicPitInstances(): void {
+    for (let i = 0; i < MAX_MORTAR_PITS; i++) {
+      this.bipodTurretInst.setMatrixAt(i, _zeroMatrix);
+      this.barrelInst.setMatrixAt(i, _zeroMatrix);
+      this.muzzleFlashInst.setMatrixAt(i, _zeroMatrix);
+      this.stagedShellInst.setMatrixAt(i, _zeroMatrix);
+      this.crewBodyInst.setMatrixAt(i * 2, _zeroMatrix);
+      this.crewBodyInst.setMatrixAt(i * 2 + 1, _zeroMatrix);
+      this.crewHeadInst.setMatrixAt(i * 2, _zeroMatrix);
+      this.crewHeadInst.setMatrixAt(i * 2 + 1, _zeroMatrix);
+    }
+
+    if (this.enabled) {
+      for (const pit of this.pits.values()) {
+        if (!pit.root.visible || pit.state.status === 'INACTIVE') continue;
+        const s = pit.slotIndex;
+        pit.root.updateMatrixWorld(true);
+
+        // Bipod turret follows turretYawGroup
+        this.bipodTurretInst.setMatrixAt(s, pit.turretYawGroup.matrixWorld);
+
+        // Barrel follows barrelRecoilGroup
+        this.barrelInst.setMatrixAt(s, pit.barrelRecoilGroup.matrixWorld);
+
+        // Muzzle flash at barrel tip when firing
+        if (pit.muzzleFlashTimer > 0) {
+          const fScale = 0.65 + (1 - pit.muzzleFlashTimer / 0.11) * 1.45;
+          _quat.identity();
+          _scale.setScalar(fScale);
+          _mat4B.compose(_vA.set(0, 1.56, 0), _quat, _scale);
+          _mat4.multiplyMatrices(pit.barrelRecoilGroup.matrixWorld, _mat4B);
+          this.muzzleFlashInst.setMatrixAt(s, _mat4);
+        }
+
+        // Staged 81mm round beside ammo crates
+        if (pit.stagedShellVisible) {
+          _euler.set(0, 0, 0.28);
+          _quat.setFromEuler(_euler);
+          _scale.set(1, 1, 1);
+          _mat4.compose(
+            _vA.set(pit.state.position[0] + 0.56, pit.state.position[1] + 0.62, pit.state.position[2] + 0.18),
+            _quat,
+            _scale,
+          );
+          this.stagedShellInst.setMatrixAt(s, _mat4);
+        }
+
+        // Crew visuals (Gunner = s*2, Loader = s*2+1)
+        const crewList: [CrewActorVisual, number][] = [
+          [pit.gunnerVisual, s * 2],
+          [pit.loaderVisual, s * 2 + 1],
+        ];
+        for (let c = 0; c < 2; c++) {
+          const vis = crewList[c][0];
+          const idx = crewList[c][1];
+          if (vis.dead || !vis.root.visible) continue;
+          this.crewBodyInst.setMatrixAt(idx, vis.root.matrixWorld);
+          this.crewHeadInst.setMatrixAt(idx, vis.headMesh.matrixWorld);
+        }
+      }
+    }
+
+    this.bipodTurretInst.instanceMatrix.needsUpdate = true;
+    this.barrelInst.instanceMatrix.needsUpdate = true;
+    this.muzzleFlashInst.instanceMatrix.needsUpdate = true;
+    this.stagedShellInst.instanceMatrix.needsUpdate = true;
+    this.crewBodyInst.instanceMatrix.needsUpdate = true;
+    this.crewHeadInst.instanceMatrix.needsUpdate = true;
   }
 
   private applyTubeTransform(pit: InternalMortarPit): void {
@@ -2569,15 +2775,48 @@ export class MortarEmplacementSystem {
 
   private triggerMuzzleFlash(pit: InternalMortarPit): void {
     pit.muzzleFlashTimer = 0.11;
-    pit.muzzleFlashMesh.visible = true;
+  }
+
+  /**
+   * Public shared ordnance pool entry point used by BomberAirStrikeSystem so aerial bombs
+   * share the exact same 16-slot projectile pool, 24-slot FIFO scorch decals, 6-slot blast VFX,
+   * single dynamic blast PointLight, and priority-pooled audio system.
+   */
+  public spawnExternalOrdnance(opts: ExternalOrdnanceSpawnOptions): void {
+    if (!this.enabled) return;
+    this.spawnPooledShell({
+      shellId: opts.shellId,
+      pitId: opts.sourceId,
+      callerId: opts.callerId,
+      callerName: opts.callerName,
+      callerTeam: opts.callerTeam,
+      isPlayerManned: false,
+      weaponKind: opts.weaponKind,
+      weaponName: opts.weaponName,
+      blastRadiusM: opts.blastRadiusM,
+      maxDamage: opts.maxDamage,
+      scaleMult: opts.scaleMult ?? 1.45,
+      windAffected: opts.windAffected ?? false,
+      origin: opts.origin,
+      vel: opts.vel,
+      impactPos: opts.impactPos,
+      flightTimeSec: opts.flightTimeSec,
+    });
   }
 
   private spawnPooledShell(opts: {
     shellId: string;
     pitId: string;
     callerId: string;
+    callerName?: string;
     callerTeam: 'A' | 'B';
     isPlayerManned: boolean;
+    weaponKind?: 'mortar_81mm' | 'bomber_air_strike';
+    weaponName?: string;
+    blastRadiusM?: number;
+    maxDamage?: number;
+    scaleMult?: number;
+    windAffected?: boolean;
     origin: Readonly<THREE.Vector3>;
     vel: Readonly<THREE.Vector3>;
     impactPos: Readonly<THREE.Vector3>;
@@ -2603,21 +2842,33 @@ export class MortarEmplacementSystem {
     slot.shellId = opts.shellId;
     slot.pitId = opts.pitId;
     slot.callerId = opts.callerId;
+    slot.callerName = opts.callerName ?? '';
     slot.callerTeam = opts.callerTeam;
     slot.isPlayerManned = opts.isPlayerManned;
+    slot.weaponKind = opts.weaponKind ?? 'mortar_81mm';
+    slot.weaponName = opts.weaponName ?? '81mm MORTAR';
+    slot.blastRadiusM = opts.blastRadiusM ?? MORTAR_BLAST_RADIUS_M;
+    slot.maxDamage = opts.maxDamage ?? MORTAR_BLAST_MAX_DAMAGE;
+    slot.scaleMult = opts.scaleMult ?? 1.0;
     slot.origin.copy(opts.origin);
     slot.vel.copy(opts.vel);
-    slot.windX = this.windX;
-    slot.windZ = this.windZ;
+    const useWind = opts.windAffected !== false;
+    slot.windX = useWind ? this.windX : 0;
+    slot.windZ = useWind ? this.windZ : 0;
     slot.impactPos.copy(opts.impactPos);
     slot.elapsedSec = 0;
-    slot.flightTimeSec = Math.max(0.5, opts.flightTimeSec);
+    slot.flightTimeSec = Math.max(0.35, opts.flightTimeSec);
     slot.whistleTriggered = false;
-    slot.mesh.position.copy(opts.origin);
-    slot.mesh.visible = true;
+
+    _quat.identity();
+    _scale.setScalar(slot.scaleMult);
+    _mat4.compose(opts.origin, _quat, _scale);
+    this.shellInst.setMatrixAt(slot.slotIndex, _mat4);
+    this.shellInst.instanceMatrix.needsUpdate = true;
   }
 
   private updateActiveShells(dt: number): void {
+    let anyMatrixDirty = false;
     for (let i = 0; i < this.shellPool.length; i++) {
       const shell = this.shellPool[i];
       if (!shell.active) continue;
@@ -2633,7 +2884,8 @@ export class MortarEmplacementSystem {
 
       if (shell.elapsedSec >= shell.flightTimeSec) {
         shell.active = false;
-        shell.mesh.visible = false;
+        this.shellInst.setMatrixAt(shell.slotIndex, _zeroMatrix);
+        anyMatrixDirty = true;
         this.detonateShell(shell);
         continue;
       }
@@ -2664,24 +2916,39 @@ export class MortarEmplacementSystem {
         _vB,
       );
 
-      shell.mesh.position.copy(_vA);
-      _vC.subVectors(_vB, _vA).normalize();
-      if (_vC.lengthSq() > 0.001) {
-        shell.mesh.quaternion.setFromUnitVectors(THREE.Object3D.DEFAULT_UP, _vC);
+      _vC.subVectors(_vB, _vA);
+      if (_vC.lengthSq() > 1e-5) {
+        _vC.normalize();
+        _quat.setFromUnitVectors(THREE.Object3D.DEFAULT_UP, _vC);
+      } else {
+        _quat.identity();
       }
+      _scale.setScalar(shell.scaleMult);
+      _mat4.compose(_vA, _quat, _scale);
+      this.shellInst.setMatrixAt(shell.slotIndex, _mat4);
+      anyMatrixDirty = true;
+    }
+
+    if (anyMatrixDirty) {
+      this.shellInst.instanceMatrix.needsUpdate = true;
     }
   }
 
   private detonateShell(shell: PooledMortarShell): void {
     const pos = shell.impactPos.clone();
     pos.y = this.getGroundHeight(pos.x, pos.z);
+    const isBomb = shell.weaponKind === 'bomber_air_strike';
 
-    // 1. Place FIFO pooled scorch crater decal (max 24, ring-buffer overwrite)
-    const decal = this.scorchDecals[this.scorchFifoIndex];
+    // 1. Place FIFO pooled scorch crater decal (max 24, ring-buffer overwrite, 1 InstancedMesh draw call)
+    const decalSlot = this.scorchFifoIndex;
     this.scorchFifoIndex = (this.scorchFifoIndex + 1) % MAX_SCORCH_DECAL_POOL;
-    decal.position.set(pos.x, pos.y + 0.045, pos.z);
-    decal.rotation.y = (this.scorchFifoIndex * 2.399) % (Math.PI * 2);
-    decal.visible = true;
+    this.scorchUsedCount = Math.min(MAX_SCORCH_DECAL_POOL, this.scorchUsedCount + 1);
+    _euler.set(0, (this.scorchFifoIndex * 2.399) % (Math.PI * 2), 0);
+    _quat.setFromEuler(_euler);
+    _scale.setScalar(isBomb ? 1.28 : 1.0);
+    _mat4.compose(_vA.set(pos.x, pos.y + 0.045, pos.z), _quat, _scale);
+    this.scorchInst.setMatrixAt(decalSlot, _mat4);
+    this.scorchInst.instanceMatrix.needsUpdate = true;
 
     // 2. Spawn pooled explosion plume/flash/ring VFX
     let vfx = this.blastVfxPool[0];
@@ -2693,22 +2960,17 @@ export class MortarEmplacementSystem {
     }
     vfx.active = true;
     vfx.timerSec = 0;
-    vfx.durationSec = 1.55;
+    vfx.durationSec = isBomb ? 1.75 : 1.55;
+    vfx.scaleBoost = isBomb ? 1.32 : 1.0;
     vfx.pos.copy(pos);
-    vfx.plumeMesh.position.set(pos.x, pos.y + 0.6, pos.z);
-    vfx.flashMesh.position.set(pos.x, pos.y + 0.7, pos.z);
-    vfx.ringMesh.position.set(pos.x, pos.y + 0.12, pos.z);
-    vfx.plumeMesh.visible = true;
-    vfx.flashMesh.visible = true;
-    vfx.ringMesh.visible = true;
 
-    // 3. Re-center single pooled dynamic explosion PointLight
-    this.blastLight.position.set(pos.x, pos.y + 2.6, pos.z);
-    this.blastLight.intensity = 18;
+    // 3. Re-center single pooled dynamic explosion PointLight (never casts shadows)
+    this.blastLight.position.set(pos.x, pos.y + 2.8, pos.z);
+    this.blastLight.intensity = isBomb ? 24 : 18;
     this.blastLight.visible = true;
-    this.blastLightTimerSec = 0.34;
+    this.blastLightTimerSec = isBomb ? 0.42 : 0.34;
 
-    // 4. Priority-pooled 81mm overpressure detonation audio
+    // 4. Priority-pooled overpressure detonation audio
     this.audio?.playMortarExplosion(pos);
 
     // 5. Notify combat engine to apply 100% enemy / 100% caller self / 25% teammate splash + breakables
@@ -2716,51 +2978,75 @@ export class MortarEmplacementSystem {
       shellId: shell.shellId,
       pitId: shell.pitId,
       callerId: shell.callerId,
+      ...(shell.callerName ? { callerName: shell.callerName } : {}),
       callerTeam: shell.callerTeam,
       isPlayerManned: shell.isPlayerManned,
+      weaponKind: shell.weaponKind,
+      weaponName: shell.weaponName,
       position: pos,
-      blastRadiusM: MORTAR_BLAST_RADIUS_M,
-      maxDamage: MORTAR_BLAST_MAX_DAMAGE,
+      blastRadiusM: shell.blastRadiusM,
+      maxDamage: shell.maxDamage,
     });
   }
 
   private updateBlastVfx(dt: number): void {
     if (this.blastLightTimerSec > 0) {
       this.blastLightTimerSec = Math.max(0, this.blastLightTimerSec - dt);
-      const frac = this.blastLightTimerSec / 0.34;
+      const frac = Math.min(1, this.blastLightTimerSec / 0.34);
       this.blastLight.intensity = 18 * frac * frac;
       if (this.blastLightTimerSec <= 0) {
         this.blastLight.visible = false;
       }
     }
 
+    let dirty = false;
+    _quat.identity();
     for (let i = 0; i < this.blastVfxPool.length; i++) {
       const v = this.blastVfxPool[i];
       if (!v.active) continue;
+      dirty = true;
       v.timerSec += dt;
       const t = v.timerSec / v.durationSec;
       if (t >= 1) {
         v.active = false;
-        v.plumeMesh.visible = false;
-        v.flashMesh.visible = false;
-        v.ringMesh.visible = false;
+        this.blastPlumeInst.setMatrixAt(v.slotIndex, _zeroMatrix);
+        this.blastFlashInst.setMatrixAt(v.slotIndex, _zeroMatrix);
+        this.blastRingInst.setMatrixAt(v.slotIndex, _zeroMatrix);
         continue;
       }
 
-      const plumeScale = 1.2 + t * 5.2;
-      v.plumeMesh.scale.set(plumeScale * 0.85, plumeScale * 1.15, plumeScale * 0.85);
-      v.plumeMesh.position.y = v.pos.y + 0.6 + t * 4.4;
-      (v.plumeMesh.material as THREE.MeshBasicMaterial).opacity = Math.max(0, (1 - t) * 0.62);
+      const boost = v.scaleBoost;
+      const fadeOut = Math.sin(Math.min(1, 1 - t) * Math.PI * 0.5);
+      const plumeScale = (1.2 + t * 5.2) * boost * Math.max(0.05, fadeOut);
+      _scale.set(plumeScale * 0.85, plumeScale * 1.15, plumeScale * 0.85);
+      _mat4.compose(_vA.set(v.pos.x, v.pos.y + 0.6 + t * 4.4 * boost, v.pos.z), _quat, _scale);
+      this.blastPlumeInst.setMatrixAt(v.slotIndex, _mat4);
 
       const flashT = Math.min(1, t * 4.5);
-      v.flashMesh.scale.setScalar(1.1 + flashT * 3.2);
-      (v.flashMesh.material as THREE.MeshBasicMaterial).opacity = Math.max(0, (1 - flashT) * 0.92);
-      v.flashMesh.visible = flashT < 1;
+      if (flashT < 1) {
+        const flashScale = (1.1 + flashT * 3.2) * boost * (1 - flashT * 0.65);
+        _scale.setScalar(flashScale);
+        _mat4.compose(_vA.set(v.pos.x, v.pos.y + 0.7, v.pos.z), _quat, _scale);
+        this.blastFlashInst.setMatrixAt(v.slotIndex, _mat4);
+      } else {
+        this.blastFlashInst.setMatrixAt(v.slotIndex, _zeroMatrix);
+      }
 
       const ringT = Math.min(1, t * 2.2);
-      v.ringMesh.scale.setScalar(1.0 + ringT * 8.2);
-      (v.ringMesh.material as THREE.MeshBasicMaterial).opacity = Math.max(0, (1 - ringT) * 0.45);
-      v.ringMesh.visible = ringT < 1;
+      if (ringT < 1) {
+        const ringScale = (1.0 + ringT * 8.2) * boost;
+        _scale.set(ringScale, 1, ringScale);
+        _mat4.compose(_vA.set(v.pos.x, v.pos.y + 0.12, v.pos.z), _quat, _scale);
+        this.blastRingInst.setMatrixAt(v.slotIndex, _mat4);
+      } else {
+        this.blastRingInst.setMatrixAt(v.slotIndex, _zeroMatrix);
+      }
+    }
+
+    if (dirty) {
+      this.blastPlumeInst.instanceMatrix.needsUpdate = true;
+      this.blastFlashInst.instanceMatrix.needsUpdate = true;
+      this.blastRingInst.instanceMatrix.needsUpdate = true;
     }
   }
 }

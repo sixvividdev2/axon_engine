@@ -1,5 +1,6 @@
 import React from 'react';
 import {
+  Compass,
   Crosshair,
   Laptop,
   Shield,
@@ -35,6 +36,7 @@ interface HideoutHudProps {
   onGraphicsChange: (quality: GraphicsQualityId) => void;
   onOpenClassicHub: (tab: HubTabId) => void;
   onLaunchPlayground: () => void;
+  onLaunchTutorial: () => void;
 }
 
 /**
@@ -53,6 +55,7 @@ export const HideoutHud: React.FC<HideoutHudProps> = ({
   onGraphicsChange,
   onOpenClassicHub,
   onLaunchPlayground,
+  onLaunchTutorial,
 }) => {
   const { user, openAuthModal, openAccountSettings } = useAuth();
   const { openDrawer: openSocialDrawer, incomingRequests } = useSocial();
@@ -580,6 +583,14 @@ export const HideoutHud: React.FC<HideoutHudProps> = ({
                   Calibration Gym
                 </button>
               </div>
+              <button
+                type="button"
+                onClick={onLaunchTutorial}
+                className="flex w-full cursor-pointer items-center justify-center gap-2 border border-amber-500/45 bg-[#1b1812] px-3 py-2 text-xs font-semibold text-amber-200 transition-colors hover:border-amber-400 hover:bg-[#241f15] whitespace-nowrap"
+              >
+                <Compass className="h-3.5 w-3.5 text-amber-400" />
+                <span>3D Walkthrough Tutorial</span>
+              </button>
             </div>
 
             {/* Audio & Graphics Controls */}

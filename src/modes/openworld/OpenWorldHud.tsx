@@ -94,6 +94,7 @@ interface OpenWorldHudProps {
   onSetWeather: (weather: OpenWorldWeatherId) => void;
   onSetAutoWeather: (enabled: boolean) => void;
   onExfilToHideout: () => void;
+  onLaunchTutorial?: () => void;
   onTriggerFieldDeath: () => void;
 }
 
@@ -177,6 +178,7 @@ export const OpenWorldHud: React.FC<OpenWorldHudProps> = ({
   onSetWeather,
   onSetAutoWeather,
   onExfilToHideout,
+  onLaunchTutorial,
   onTriggerFieldDeath,
 }) => {
   const [dockOpen, setDockOpen] = useState(false);
@@ -222,6 +224,16 @@ export const OpenWorldHud: React.FC<OpenWorldHudProps> = ({
             >
               Click to Engage
             </button>
+            {onLaunchTutorial && (
+              <button
+                type="button"
+                onClick={onLaunchTutorial}
+                className="flex cursor-pointer items-center gap-1.5 border border-amber-500/45 bg-[#1b1812]/95 px-3.5 py-2 text-xs font-semibold text-amber-200 transition-colors hover:border-amber-400 hover:bg-[#241f15] whitespace-nowrap shrink-0"
+              >
+                <Compass className="h-3.5 w-3.5 text-amber-400" />
+                <span>3D Tutorial</span>
+              </button>
+            )}
             <button
               type="button"
               onClick={onExfilToHideout}
@@ -784,6 +796,15 @@ export const OpenWorldHud: React.FC<OpenWorldHudProps> = ({
                         >
                           Settings &amp; Controls
                         </button>
+                        {onLaunchTutorial && (
+                          <button
+                            type="button"
+                            onClick={onLaunchTutorial}
+                            className="cursor-pointer border border-amber-500/45 bg-[#1b1812] px-2.5 py-1 font-mono-tabular text-[10px] uppercase tracking-wider text-amber-200 hover:border-amber-400 hover:bg-[#241f15] whitespace-nowrap shrink-0"
+                          >
+                            3D Walkthrough Tutorial
+                          </button>
+                        )}
                       </div>
                       <div className="flex items-center gap-2">
                         <button

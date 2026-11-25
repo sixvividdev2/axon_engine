@@ -7,6 +7,7 @@ import {
   MatchResultInput,
   WeaponProgressRecord,
 } from '../data/progression';
+import { KeybindOverrides, keybindStore } from '../data/keybindStore';
 import {
   AccountProfile,
   commitMatchProgression,
@@ -15,6 +16,7 @@ import {
   logoutAccount,
   registerAccount,
   resetAccountProgress,
+  updateAccountKeybinds,
   updateAccountUsername,
 } from '../services/authApi';
 
@@ -67,6 +69,23 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   useEffect(() => {
     void refreshUser();
   }, [refreshUser]);
+
+  const persistAccountKeybinds = useCallback(async (overrides: KeybindOverrides) => {
+    const updatedUser = await updateAccountKeybinds(overrides);
+    setUser((prev) =>
+      prev && prev.id === updatedUser.id
+        ? { ...prev, keybinds: updatedUser.keybinds ?? {} }
+        : prev,
+    );
+  }, []);
+
+  useEffect(() => {
+    if (user) {
+      keybindStore.setActiveUser(user.id, user.keybinds ?? {}, persistAccountKeybinds);
+    } else {
+      keybindStore.setActiveUser(null, null, null);
+    }
+  }, [user?.id, persistAccountKeybinds]);
 
   const openAuthModal = useCallback((reason?: string | null) => {
     setAuthModalReason(reason ?? null);

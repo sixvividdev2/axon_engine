@@ -19,6 +19,7 @@ import {
 } from '../data/graphicsQuality';
 import { useKillfeedPreference } from '../data/killfeedSettings';
 import { useHeadshotSfxPreference } from '../data/audioSettings';
+import { keybindStore } from '../data/keybindStore';
 import { ControlsSettingsTab } from './ControlsSettingsTab';
 
 export const GameSettingsModal: React.FC = () => {
@@ -34,6 +35,7 @@ export const GameSettingsModal: React.FC = () => {
     if (!open) return;
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.code === 'Escape') {
+        if (keybindStore.isCapturing()) return;
         e.stopPropagation();
         closeGameSettings();
       }

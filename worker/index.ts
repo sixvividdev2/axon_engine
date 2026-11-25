@@ -18,6 +18,7 @@ import {
   WeatherPresetId,
 } from '../data/multiplayer';
 import { BattleRuleId, isValidBattleRule } from '../maps/types';
+import { sanitizeKeybindOverrides } from '../data/keybindStore';
 import {
   applyMatchProgression,
   buildRecentMatchRecord,
@@ -69,6 +70,7 @@ interface DbUserRow {
   highest_infection_round: number;
   created_at: number;
   updated_at: number;
+  keybinds_json?: string | null;
 }
 
 interface DbWeaponProgressRow {
@@ -304,6 +306,15 @@ async function loadAccountPayload(db: D1Database, userRow: DbUserRow) {
     }
   }
 
+  let keybinds = {};
+  if (typeof userRow.keybinds_json === 'string' && userRow.keybinds_json.trim().length > 0) {
+    try {
+      keybinds = sanitizeKeybindOverrides(JSON.parse(userRow.keybinds_json));
+    } catch {
+      keybinds = {};
+    }
+  }
+
   return {
     id: userRow.id,
     email: userRow.email,
@@ -323,6 +334,7 @@ async function loadAccountPayload(db: D1Database, userRow: DbUserRow) {
     weaponProgress,
     unlockedAttachments: Array.from(unlockedSet),
     recentMatches,
+    keybinds,
   };
 }
 
@@ -733,6 +745,34 @@ export default {
             })
             .catch(() => {}),
         );
+
+        const updated = await env.DB.prepare('SELECT * FROM users WHERE id = ?')
+          .bind(userRow.id)
+          .first<DbUserRow>();
+        const user = updated ? await loadAccountPayload(env.DB, updated) : null;
+        return json({ user }, 200);
+      }
+
+      if (path === '/api/account/keybinds' && method === 'PUT') {
+        const userRow = await authenticateRequest(request, env.DB);
+        if (!userRow) return json({ error: 'Sign in to save account keybinds.' }, 401);
+
+        const body = await readJsonBody<{ keybinds?: unknown }>(request);
+        const rawKeybinds = body?.keybinds;
+        if (
+          rawKeybinds !== undefined &&
+          (typeof rawKeybinds !== 'object' || rawKeybinds === null || Array.isArray(rawKeybinds))
+        ) {
+          return json({ error: 'Invalid keybind map payload.' }, 400);
+        }
+
+        const sanitized = sanitizeKeybindOverrides(rawKeybinds ?? {});
+        const serialized = Object.keys(sanitized).length > 0 ? JSON.stringify(sanitized) : null;
+        const now = Date.now();
+
+        await env.DB.prepare('UPDATE users SET keybinds_json = ?, updated_at = ? WHERE id = ?')
+          .bind(serialized, now, userRow.id)
+          .run();
 
         const updated = await env.DB.prepare('SELECT * FROM users WHERE id = ?')
           .bind(userRow.id)

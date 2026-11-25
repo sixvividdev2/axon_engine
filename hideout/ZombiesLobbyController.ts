@@ -31,7 +31,13 @@ import {
   WeaponAttachments,
 } from '../data/attachments';
 import { getDefaultAmmoVariant, resolveBaseCaliberId } from '../data/calibers';
+import {
+  getEffectiveFireMode,
+  SelectableFireMode,
+  toggleWeaponFireMode,
+} from '../data/fireModeControl';
 import { AdaptivePerformanceController, graphicsQualityStore } from '../data/graphicsQuality';
+import { keybindStore } from '../data/keybindStore';
 import { loadoutStore } from '../data/loadoutStore';
 import { HoldRepairController } from '../doors/HoldRepairController';
 import { PlayerInteractAnimator } from '../doors/PlayerInteractAnimator';
@@ -130,6 +136,8 @@ export class ZombiesLobbyController {
   };
 
   private shiftHeld = false;
+  private holdBreathHeld = false;
+  private fireModeOverrideByWeapon: Record<string, SelectableFireMode> = {};
   private keyFHeld = false;
   private stamina = 1.0;
   private heartRateBpm = 72;
@@ -620,7 +628,8 @@ export class ZombiesLobbyController {
     ) {
       return;
     }
-    const isSingle = prof.fireMode === 'semi' || prof.fireMode === 'bolt' || prof.fireMode === 'pump';
+    const effectiveMode = getEffectiveFireMode(prof, this.fireModeOverrideByWeapon);
+    const isSingle = effectiveMode === 'semi' || effectiveMode === 'bolt' || effectiveMode === 'pump';
     if (isSingle && this.semiTriggerConsumed) return;
 
     if (currentAmmo <= 0) {
@@ -1040,6 +1049,7 @@ export class ZombiesLobbyController {
     this.input.ads = false;
     this.input.vault = false;
     this.shiftHeld = false;
+    this.holdBreathHeld = false;
     this.keyFHeld = false;
     this.isFiring = false;
     this.semiTriggerConsumed = false;
@@ -1068,7 +1078,9 @@ export class ZombiesLobbyController {
   };
 
   private readonly onMouseDown = (e: MouseEvent): void => {
-    if (this.modalActive || this.pauseOpen || this.returnTransitionActive) return;
+    if (this.modalActive || this.pauseOpen || this.returnTransitionActive || keybindStore.isCapturing()) {
+      return;
+    }
     if (!this.pointerLocked) {
       if (e.target === this.renderer.domElement) {
         this.requestPointerLock();
@@ -1076,10 +1088,12 @@ export class ZombiesLobbyController {
       return;
     }
     this.audio.ensureInitialized();
-    if (e.button === 2 && !this.swapChoreography.isActive()) {
+    const isFireBtn = keybindStore.matchesMouseButton(e.button, 'fire');
+    const isAdsBtn = keybindStore.matchesMouseButton(e.button, 'ads');
+    if (isAdsBtn && !this.swapChoreography.isActive()) {
       this.animator.interruptInspect();
       this.input.ads = true;
-    } else if (e.button === 0 && !this.swapChoreography.isActive()) {
+    } else if (isFireBtn && !this.swapChoreography.isActive()) {
       if (this.equippedWeaponId === 'unarmed') {
         this.animator.triggerUnarmedPunch(this.controller, this.input.ads);
       } else {
@@ -1090,10 +1104,11 @@ export class ZombiesLobbyController {
   };
 
   private readonly onMouseUp = (e: MouseEvent): void => {
-    if (e.button === 0) {
+    if (keybindStore.matchesMouseButton(e.button, 'fire')) {
       this.isFiring = false;
       this.semiTriggerConsumed = false;
-    } else if (e.button === 2) {
+    }
+    if (keybindStore.matchesMouseButton(e.button, 'ads')) {
       this.input.ads = false;
     }
   };
@@ -1116,7 +1131,7 @@ export class ZombiesLobbyController {
   };
 
   private readonly onKeyDown = (e: KeyboardEvent): void => {
-    if (this.modalActive || this.returnTransitionActive) return;
+    if (this.modalActive || this.returnTransitionActive || keybindStore.isCapturing()) return;
     if (e.code === 'Escape' && !e.repeat) {
       if (this.pauseOpen) {
         this.requestPointerLock();
@@ -1129,7 +1144,14 @@ export class ZombiesLobbyController {
     if (!this.pointerLocked || this.pauseOpen) return;
     this.audio.ensureInitialized();
 
-    switch (e.code) {
+    if (keybindStore.matchesKeyCode(e.code, 'hold_breath')) {
+      this.holdBreathHeld = true;
+    }
+
+    const code = keybindStore.resolveManagedInputCode(e.code);
+    if (!code) return;
+
+    switch (code) {
       case 'KeyW':
         this.input.forward = true;
         break;
@@ -1164,6 +1186,17 @@ export class ZombiesLobbyController {
       case 'KeyI':
         if (!e.repeat && this.equippedWeaponId !== 'unarmed' && !this.swapChoreography.isActive()) {
           this.weaponRig.weaponAnimator.triggerInspect();
+        }
+        break;
+      case 'KeyK':
+        if (!e.repeat && this.equippedWeaponId !== 'unarmed' && !this.swapChoreography.isActive()) {
+          const prof = resolveWeaponProfile(this.equippedWeaponId);
+          const res = toggleWeaponFireMode(prof, this.fireModeOverrideByWeapon);
+          if (res.toggled) {
+            this.audio.playWeaponCue('mode_toggle', { intensity: 0.55 });
+            this.showToast(`Fire Mode: ${res.label}`);
+            this.emitSnapshot(true);
+          }
         }
         break;
       case 'KeyR':
@@ -1205,7 +1238,12 @@ export class ZombiesLobbyController {
   };
 
   private readonly onKeyUp = (e: KeyboardEvent): void => {
-    switch (e.code) {
+    if (keybindStore.matchesKeyCode(e.code, 'hold_breath')) {
+      this.holdBreathHeld = false;
+    }
+    const code = keybindStore.resolveManagedInputCode(e.code);
+    if (!code) return;
+    switch (code) {
       case 'KeyW':
         this.input.forward = false;
         break;
@@ -1324,7 +1362,7 @@ export class ZombiesLobbyController {
       const profile = this.getWeaponProfile(this.equippedWeaponId);
       const firearmAdsBlocking = this.input.ads && this.equippedWeaponId !== 'unarmed';
       this.input.sprint = this.shiftHeld && this.input.forward && !firearmAdsBlocking && !swapping;
-      this.input.holdBreath = this.shiftHeld && this.input.ads && this.equippedWeaponId !== 'unarmed' && !swapping;
+      this.input.holdBreath = this.holdBreathHeld && this.input.ads && this.equippedWeaponId !== 'unarmed' && !swapping;
 
       if (this.fireCooldown > 0) this.fireCooldown = Math.max(0, this.fireCooldown - dt);
       if (this.reloadTimer > 0) {
