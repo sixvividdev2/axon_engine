@@ -4,9 +4,16 @@ import { AdsMode, BodycamMeleeHitEvent } from '../bodycam-sdk/types';
 import { ScopePassParams, ScopeRenderer } from '../bodycam-sdk/weapons/ScopeRenderer';
 import { createBareAttachments, normalizeWeaponAttachments } from '../data/attachments';
 import { CALIBERS, CaliberId } from '../data/calibers';
+import { graphicsQualityStore } from '../data/graphicsQuality';
 import { ITEMS } from '../data/items';
 import { LIMB_CONFIGS, LimbId } from '../data/traumaConfig';
 import { EquipSlotKind, WEAPONS, WeaponId, WeaponSpec } from '../data/weapons';
+import { HoldRepairController } from '../doors/HoldRepairController';
+import { PlayerInteractAnimator } from '../doors/PlayerInteractAnimator';
+import {
+  BrokenElectronicRepairTarget,
+  HideoutElectronicsSystem,
+} from '../hideout/HideoutElectronicsSystem';
 import { ZombieManager } from './ai/ZombieManager';
 import { AudioEngine } from './audio/AudioEngine';
 import { BallisticsSystem } from './ballistics/BallisticsSystem';
@@ -56,6 +63,11 @@ import {
 } from './types';
 import { ThrowableSystem } from './weapons/ThrowableSystem';
 import { WeaponRig } from './weapons/WeaponRig';
+import {
+  createHorizonFogUniforms,
+  HorizonFogUniforms,
+  updateHorizonFogUniforms,
+} from './world/HorizonFog';
 import { SurvivalWorldAdapter } from './world/SurvivalWorldAdapter';
 import { buildWorld, BuiltWorld, ContainerEntity, DoorEntity, SurfaceType } from './world/WorldBuilder';
 
@@ -88,6 +100,11 @@ export class GameEngine {
   private trauma: LimbTraumaSystem;
   private inventoryManager: InventoryManager;
   private vitals: VitalsSystem;
+  private electronics: HideoutElectronicsSystem;
+  private interactAnimator: PlayerInteractAnimator;
+  private holdRepair: HoldRepairController;
+  private horizonFogUniforms: HorizonFogUniforms;
+  private unsubDistance: (() => void) | null = null;
   private world: BuiltWorld;
   private worldAdapter: SurvivalWorldAdapter;
 
@@ -120,6 +137,7 @@ export class GameEngine {
   private activeContainer: ContainerEntity | null = null;
   private hoveredDoor: DoorEntity | null = null;
   private hoveredContainer: ContainerEntity | null = null;
+  private nearbyBrokenElectronic: BrokenElectronicRepairTarget | null = null;
   private magCheckReadout: MagCheckReadout | null = null;
   private toastMessage: string | null = null;
   private toastExpiresAtMs = 0;
@@ -129,6 +147,7 @@ export class GameEngine {
   private pointerLocked = false;
   private shiftHeld = false;
   private altHeld = false;
+  private keyFHeld = false;
   private input: PlayerInputState = {
     forward: false,
     backward: false,
@@ -209,7 +228,14 @@ export class GameEngine {
 
     const w = container.clientWidth || window.innerWidth;
     const h = container.clientHeight || window.innerHeight;
-    this.camera = new THREE.PerspectiveCamera(72, w / Math.max(1, h), 0.08, 180);
+    const distSettings = graphicsQualityStore.getDistanceSettings();
+    this.camera = new THREE.PerspectiveCamera(
+      72,
+      w / Math.max(1, h),
+      0.08,
+      Math.max(180, distSettings.renderDistanceM + 18),
+    );
+    this.horizonFogUniforms = createHorizonFogUniforms(distSettings.renderDistanceM);
 
     this.textures = new ProceduralTextureLibrary(this.renderer, this.worldSeed);
     this.audio = new AudioEngine();
@@ -305,6 +331,9 @@ export class GameEngine {
     this.trauma = new LimbTraumaSystem(this.scene);
     this.inventoryManager = new InventoryManager();
     this.vitals = new VitalsSystem();
+    this.electronics = new HideoutElectronicsSystem(this.scene);
+    this.interactAnimator = new PlayerInteractAnimator();
+    this.holdRepair = new HoldRepairController();
 
     this.world = this.mountWorld(this.worldSeed, -4.2, 16.5);
     this.worldAdapter = new SurvivalWorldAdapter(this.world, this.acoustic, this.trauma);
@@ -312,6 +341,11 @@ export class GameEngine {
       () => this.zombies.getHitMeshes(),
       (ev) => this.handleCombatMeleeHit(ev),
     );
+    this.unsubDistance = graphicsQualityStore.subscribeDistanceSettings((ds) => {
+      this.camera.far = Math.max(180, ds.renderDistanceM + 18);
+      this.camera.updateProjectionMatrix();
+      updateHorizonFogUniforms(this.horizonFogUniforms, ds.renderDistanceM, this.scene);
+    });
 
     if (!this.isSoftwareGl) {
       this.camera.layers.enable(VIEWMODEL_LAYER);
@@ -518,6 +552,17 @@ export class GameEngine {
       throwableStatusLabel:
         this.characterAnimator.getThrowableStatusLabel(WEAPONS[this.equippedWeaponId]) || undefined,
       throwableLiveFuse: this.characterAnimator.isThrowableLiveFuse() || undefined,
+      repairPromptLabel: (() => {
+        const activeRepair = this.holdRepair.getState();
+        if (activeRepair) {
+          return `Repairing ${activeRepair.label}...`;
+        }
+        if (this.nearbyBrokenElectronic) {
+          return `Hold [F] Repair ${this.nearbyBrokenElectronic.label}`;
+        }
+        return null;
+      })(),
+      repairProgress: this.holdRepair.getState()?.progress01 ?? 0,
       magCheckReadout: this.magCheckReadout ? { ...this.magCheckReadout } : null,
       toastMessage: this.toastMessage,
       recordingStartMs: this.recordingStartMs,
@@ -784,12 +829,26 @@ export class GameEngine {
       savedDoors,
     );
     this.zombies.resetForWorld(built, savedZombies);
+    built.chunkManager.applyHorizonFog(this.horizonFogUniforms);
+    updateHorizonFogUniforms(
+      this.horizonFogUniforms,
+      graphicsQualityStore.getDistanceSettings().renderDistanceM,
+      this.scene,
+    );
+    built.chunkManager.onChunkMounted = (chunkKey, chunkGroup, raycastMeshes) => {
+      this.electronics.autoRegisterSceneElectronics(chunkGroup, {
+        idPrefix: `surv_${chunkKey}`,
+        raycastMeshes,
+      });
+    };
     built.chunkManager.onChunkZombiesReady = (chunkKey, spawns, killedIds) => {
       this.zombies.onChunkReady(built, chunkKey, spawns, killedIds);
     };
     built.chunkManager.onChunkUnloaded = (chunkKey) => {
       this.zombies.onChunkUnloaded(chunkKey, built.chunkManager.originX, built.chunkManager.originZ);
+      this.electronics.removeNodesByPrefix(`surv_${chunkKey}_`);
     };
+    built.chunkManager.emitLoadedChunkElectronics();
     built.chunkManager.emitLoadedChunkZombies();
     return built;
   }
@@ -803,6 +862,9 @@ export class GameEngine {
     savedDoors?: Record<string, DoorSaveState>,
     savedZombies?: ZombieSaveState[],
   ): void {
+    this.holdRepair.cancel(this.interactAnimator);
+    this.nearbyBrokenElectronic = null;
+    this.electronics.removeNodesByPrefix('surv_');
     this.world.dispose();
     this.world = this.mountWorld(
       seed,
@@ -2161,6 +2223,7 @@ export class GameEngine {
     if (this.mode !== 'playing') {
       this.hoveredDoor = null;
       this.hoveredContainer = null;
+      this.nearbyBrokenElectronic = null;
       return;
     }
 
@@ -2196,6 +2259,16 @@ export class GameEngine {
           }
         }
       }
+    }
+
+    if (!this.hoveredDoor && !this.hoveredContainer) {
+      this.nearbyBrokenElectronic = this.electronics.findBrokenRepairTarget(
+        this.camera.position,
+        this._tmpLook,
+        2.8,
+      );
+    } else {
+      this.nearbyBrokenElectronic = null;
     }
   }
 
@@ -2303,6 +2376,14 @@ export class GameEngine {
       return;
     }
 
+    if (obj) {
+      this.electronics.handleImpact(
+        obj,
+        ev.point as THREE.Vector3,
+        ev.normal as THREE.Vector3,
+        this.camera.position,
+      );
+    }
     if (ev.hitZone !== 'glass') {
       const particleKind: 'metal' | 'wood' | 'concrete' =
         ev.surface === 'metal' ? 'metal' : ev.surface === 'wood' ? 'wood' : 'concrete';
@@ -2414,6 +2495,7 @@ export class GameEngine {
       return;
     }
 
+    this.electronics.handleImpact(obj, bestHit.point, normal, this.camera.position);
     const surf = (obj.userData.surface as SurfaceType) ?? 'concrete';
     const audioMat = surf === 'metal' ? 'metal' : surf === 'wood' ? 'wood' : 'concrete';
     this.audio.playImpact(bestHit.point, audioMat);
@@ -2473,9 +2555,17 @@ export class GameEngine {
       }
     }
     this.controller.setGrenadeTension(0, false, 'underhand');
-    this.throwables.detonateAt(handWorldPos, this.world, this.controller.position, (dmg, bleed, orig) => {
-      this.applyPlayerBlastDamage(dmg, bleed, orig);
-    });
+    this.throwables.detonateAt(
+      handWorldPos,
+      this.world,
+      this.controller.position,
+      (dmg, bleed, orig) => {
+        this.applyPlayerBlastDamage(dmg, bleed, orig);
+      },
+      (orig, r) => {
+        this.electronics.handleExplosion(orig, r, this.camera.position);
+      },
+    );
     this.controller.applyRecoil(0.28, (Math.random() - 0.5) * 0.32, 0.055, {
       stanceCoupled: false,
     });
@@ -2524,6 +2614,32 @@ export class GameEngine {
       this.clearMovementInputs();
       this.exitLock();
       this.audio.playPickup();
+      this.emitSnapshot(true);
+      return;
+    }
+
+    if (this.nearbyBrokenElectronic && !this.holdRepair.isActive()) {
+      const target = this.nearbyBrokenElectronic;
+      this.holdRepair.start(
+        {
+          kind: 'ELECTRONICS_REPAIR',
+          targetId: target.id,
+          label: target.label,
+          durationSec: 2.0,
+          anchorPos: target.anchorPos,
+          onWorkTick: (phase) => {
+            this.audio.playTacticalSwitchClick(phase % 2 === 0);
+          },
+          onComplete: () => {
+            if (this.electronics.repairNode(target.id, this.camera.position)) {
+              this.audio.playPickup();
+              this.showToast(`Repaired ${target.label}`);
+              this.emitSnapshot(true);
+            }
+          },
+        },
+        this.interactAnimator,
+      );
       this.emitSnapshot(true);
     }
   }
@@ -2719,6 +2835,7 @@ export class GameEngine {
           tTension.liveCook,
           tTension.throwStyle,
         );
+        this.controller.setHeartRateBpm(this.vitals.heartRateBpm);
 
         this.controller.update(
           delta,
@@ -2773,8 +2890,26 @@ export class GameEngine {
           this.throwables.shiftOrigin(sx, sz);
           this.acoustic.shiftOrigin(sx, sz);
           this.trauma.shiftOrigin(sx, sz);
+          this.electronics.shiftOrigin(sx, sz);
+          this.holdRepair.cancel(this.interactAnimator);
         });
         this.world.updateStreaming(this.controller.position.x, this.controller.position.z, delta);
+
+        // Step Hold [F] two-handed electronic repair & feed IK override into 1P skeleton
+        this.holdRepair.step(
+          delta,
+          this.keyFHeld && this.pointerLocked,
+          this.camera.position,
+          this.camera,
+          this.interactAnimator,
+          3.45,
+        );
+        if (!this.holdRepair.isActive()) {
+          this.interactAnimator.update(delta, this.camera);
+        }
+        this.characterAnimator.setExternalHandOverride(
+          this.interactAnimator.isActive() ? this.interactAnimator.ikOverride : null,
+        );
 
         // Read-only controller kinematics -> Layered Full-Body Skeleton + 2-Bone Analytic IK Animator
         const driverState = this.stateReader.read(this.controller, this.weaponRig, this.camera);
@@ -2825,10 +2960,22 @@ export class GameEngine {
               this.handlePlayerDeath();
             }
           },
+          (obj, pt, n) => {
+            this.electronics.handleImpact(obj, pt, n, this.camera.position);
+          },
         );
-        this.throwables.update(delta, this.world, this.controller.position, (dmg, bleed, orig) => {
-          this.applyPlayerBlastDamage(dmg, bleed, orig);
-        });
+        this.throwables.update(
+          delta,
+          this.world,
+          this.controller.position,
+          (dmg, bleed, orig) => {
+            this.applyPlayerBlastDamage(dmg, bleed, orig);
+          },
+          (orig, r) => {
+            this.electronics.handleExplosion(orig, r, this.camera.position);
+          },
+        );
+        this.electronics.update(delta, this.camera.position);
         this.acoustic.update(delta);
 
         for (const d of this.world.doors) {
@@ -3021,6 +3168,7 @@ export class GameEngine {
         this.input.leanRight = true;
         break;
       case 'KeyF':
+        this.keyFHeld = true;
         if (!e.repeat) {
           this.interact();
         }
@@ -3146,6 +3294,9 @@ export class GameEngine {
       case 'KeyE':
         this.input.leanRight = false;
         break;
+      case 'KeyF':
+        this.keyFHeld = false;
+        break;
     }
   };
 
@@ -3163,7 +3314,9 @@ export class GameEngine {
     this.input.vault = false;
     this.shiftHeld = false;
     this.altHeld = false;
+    this.keyFHeld = false;
     this.firingHeld = false;
+    this.holdRepair.cancel(this.interactAnimator);
   }
 
   private onMouseMove = (e: MouseEvent): void => {
@@ -3352,6 +3505,10 @@ export class GameEngine {
     canvas.removeEventListener('webglcontextlost', this.onContextLost);
 
     this.exitLock();
+    this.unsubDistance?.();
+    this.unsubDistance = null;
+    this.holdRepair.cancel(this.interactAnimator);
+    this.electronics.dispose();
     this.trauma.dispose();
     this.world.dispose();
     this.textures.dispose();

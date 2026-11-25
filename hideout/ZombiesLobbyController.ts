@@ -33,7 +33,9 @@ import {
 import { getDefaultAmmoVariant, resolveBaseCaliberId } from '../data/calibers';
 import { AdaptivePerformanceController, graphicsQualityStore } from '../data/graphicsQuality';
 import { loadoutStore } from '../data/loadoutStore';
+import { HoldRepairController } from '../doors/HoldRepairController';
 import { PlayerInteractAnimator } from '../doors/PlayerInteractAnimator';
+import type { BrokenElectronicRepairTarget } from './HideoutElectronicsSystem';
 import { GunWallSwapChoreography } from './GunWallSwapChoreography';
 import type { HideoutPromptOption, HideoutPromptState, InteractReticleState } from './HideoutSessionController';
 import {
@@ -98,6 +100,7 @@ export class ZombiesLobbyController {
   private readonly scopeRenderer: ScopeRenderer;
   private readonly swapChoreography: GunWallSwapChoreography;
   private readonly interactAnimator = new PlayerInteractAnimator();
+  private readonly holdRepair = new HoldRepairController();
   private readonly unsubOperatorId: () => void;
   private readonly unsubOperatorGear: () => void;
   private readonly unsubLoadout: () => void;
@@ -127,6 +130,9 @@ export class ZombiesLobbyController {
   };
 
   private shiftHeld = false;
+  private keyFHeld = false;
+  private stamina = 1.0;
+  private heartRateBpm = 72;
   private pointerLocked = false;
   private pauseOpen = false;
   private modalActive = false;
@@ -142,6 +148,7 @@ export class ZombiesLobbyController {
   private readonly magAmmoByWeapon: Record<string, number> = {};
 
   private activeMeta: ZombiesOutpostInteractMeta | null = null;
+  private activeElectronicRepair: BrokenElectronicRepairTarget | null = null;
   private activePrompt: HideoutPromptState | null = null;
   private interactReticleState: InteractReticleState = 'hidden';
   private lastTargetKeyId = '';
@@ -668,12 +675,58 @@ export class ZombiesLobbyController {
   }
 
   private handleBallisticImpact(ev: Readonly<BallisticImpactEvent>): void {
+    this.camera.getWorldPosition(this._camPos);
+    const elecHit = this.world.electronics.handleImpact(
+      ev.object,
+      ev.point,
+      ev.normal,
+      this._camPos,
+    );
+    if (elecHit) {
+      if (!elecHit.alreadyBroken) {
+        this.showToast(`${elecHit.label} Damaged — Hold [F] to Repair`);
+      }
+      return;
+    }
     const matType =
       ev.surface === 'metal' ? 'metal' : ev.surface === 'wood' ? 'wood' : 'concrete';
     this.audio.playImpact(ev.point, matType);
   }
 
+  private startElectronicHoldRepair(target: BrokenElectronicRepairTarget): void {
+    this.isFiring = false;
+    this.input.ads = false;
+    this.holdRepair.start(
+      {
+        kind: 'ELECTRONICS_REPAIR',
+        targetId: target.id,
+        label: `Repairing ${target.label}`,
+        durationSec: target.durationSec,
+        anchorPos: target.anchorPos,
+        dynamicAnchorProvider: (out) =>
+          this.world.electronics.getRepairAnchorWorldPos(target.id, out),
+        onWorkTick: (phaseIndex, pos) => {
+          this.world.electronics.playRepairWorkTick(pos, phaseIndex);
+        },
+        onComplete: () => {
+          this.camera.getWorldPosition(this._camPos);
+          if (this.world.electronics.repairNode(target.id, this._camPos)) {
+            this.showToast(`${target.label} Repaired`);
+            this.emitSnapshot(true);
+          }
+        },
+      },
+      this.interactAnimator,
+    );
+    this.emitSnapshot(true);
+  }
+
   private executeSelectedInteract(): void {
+    if (this.activeElectronicRepair && !this.activeMeta) {
+      this.startElectronicHoldRepair(this.activeElectronicRepair);
+      return;
+    }
+
     const meta = this.activeMeta;
     const prompt = this.activePrompt;
     if (!meta || !prompt || prompt.options.length === 0) return;
@@ -691,6 +744,20 @@ export class ZombiesLobbyController {
       }
       case 'outpost_ops_board':
       case 'outpost_field_radio': {
+        if (this.world.electronics.isInteractiveLinkBroken(meta.kind)) {
+          const linked = this.world.electronics.getNodeByLinkId(meta.kind);
+          if (linked && linked.broken) {
+            this.startElectronicHoldRepair({
+              id: linked.id,
+              label: linked.label,
+              anchorPos: linked.anchorPos,
+              durationSec: linked.durationSec,
+              distanceM: 1.5,
+              interactiveLinkId: meta.kind,
+            });
+          }
+          break;
+        }
         if (this.world.getPropInteractPos(meta.kind, this._ikTargetPos)) {
           this.interactAnimator.trigger('PROP_INTERACT', this._ikTargetPos);
         }
@@ -790,8 +857,54 @@ export class ZombiesLobbyController {
       break;
     }
 
+    const activeRep = this.holdRepair.getState();
+    if (activeRep) {
+      this.activeMeta = null;
+      this.activeElectronicRepair = null;
+      this.interactReticleState = 'ready';
+      this.activePrompt = {
+        key: 'F',
+        targetLabel: activeRep.label,
+        options: [
+          {
+            id: 'repair_active',
+            label: `${activeRep.label} (${Math.round(activeRep.progress01 * 100)}%)`,
+            hint: 'Hold [F]',
+          },
+        ],
+        selectedIndex: 0,
+        holdProgress: activeRep.progress01,
+        holdLabel: activeRep.label,
+      };
+      return;
+    }
+
     this.activeMeta = matched;
+    this.activeElectronicRepair = null;
     if (!matched) {
+      const brokenElec = this.world.electronics.findBrokenRepairTarget(
+        this._camPos,
+        this._lookDir,
+        3.2,
+      );
+      if (brokenElec) {
+        this.activeElectronicRepair = brokenElec;
+        this.interactReticleState = 'ready';
+        this.activePrompt = {
+          key: 'F',
+          targetLabel: brokenElec.label,
+          options: [
+            {
+              id: 'repair_electronic',
+              label: `Repair ${brokenElec.label}`,
+              hint: 'Hold [F]',
+            },
+          ],
+          selectedIndex: 0,
+          holdProgress: 0,
+        };
+        return;
+      }
       this.activePrompt = null;
       this.lastTargetKeyId = '';
       this.selectedOptionIndex = 0;
@@ -831,6 +944,16 @@ export class ZombiesLobbyController {
     }
 
     if (matched.kind === 'outpost_ops_board') {
+      if (this.world.electronics.isInteractiveLinkBroken('outpost_ops_board')) {
+        this.activePrompt = {
+          key: 'F',
+          targetLabel: 'Zombies Operations Map Board',
+          options: [{ id: 'repair_ops_board', label: 'Repair Operations Map Board', hint: 'Hold [F]' }],
+          selectedIndex: 0,
+          holdProgress: 0,
+        };
+        return;
+      }
       this.activePrompt = {
         key: 'F',
         targetLabel: 'Zombies Operations Map Board',
@@ -841,6 +964,16 @@ export class ZombiesLobbyController {
     }
 
     if (matched.kind === 'outpost_field_radio') {
+      if (this.world.electronics.isInteractiveLinkBroken('outpost_field_radio')) {
+        this.activePrompt = {
+          key: 'F',
+          targetLabel: 'Tactical Field Radio',
+          options: [{ id: 'repair_radio', label: 'Repair Tactical Field Radio', hint: 'Hold [F]' }],
+          selectedIndex: 0,
+          holdProgress: 0,
+        };
+        return;
+      }
       this.activePrompt = {
         key: 'F',
         targetLabel: 'Tactical Field Radio',
@@ -907,8 +1040,10 @@ export class ZombiesLobbyController {
     this.input.ads = false;
     this.input.vault = false;
     this.shiftHeld = false;
+    this.keyFHeld = false;
     this.isFiring = false;
     this.semiTriggerConsumed = false;
+    this.holdRepair.cancel(this.interactAnimator);
   }
 
   private readonly onPointerLockChange = (): void => {
@@ -1021,7 +1156,8 @@ export class ZombiesLobbyController {
         this.input.leanRight = true;
         break;
       case 'KeyF':
-        if (!e.repeat && this.activeMeta) {
+        this.keyFHeld = true;
+        if (!e.repeat && !this.holdRepair.isActive() && (this.activeMeta || this.activeElectronicRepair)) {
           this.executeSelectedInteract();
         }
         break;
@@ -1094,6 +1230,13 @@ export class ZombiesLobbyController {
         break;
       case 'Space':
         this.input.vault = false;
+        break;
+      case 'KeyF':
+        this.keyFHeld = false;
+        if (this.holdRepair.isActive()) {
+          this.holdRepair.cancel(this.interactAnimator);
+          this.emitSnapshot(true);
+        }
         break;
     }
   };
@@ -1202,6 +1345,32 @@ export class ZombiesLobbyController {
         }
       }
 
+      const repairing = this.holdRepair.isActive();
+      if (repairing) {
+        this.input.ads = false;
+        this.input.sprint = false;
+        this.isFiring = false;
+      }
+
+      const isMoving =
+        this.input.forward || this.input.backward || this.input.left || this.input.right;
+      if (this.controller.isSprinting && isMoving) {
+        this.stamina = Math.max(0, this.stamina - dt * 0.145);
+      } else if (this.controller.isHoldBreathActive()) {
+        this.stamina = Math.max(0, this.stamina - dt * 0.14);
+      } else {
+        const regenRate = !isMoving ? (this.input.crouch ? 0.16 : 0.13) : 0.08;
+        this.stamina = Math.min(1.0, this.stamina + dt * regenRate);
+      }
+      const targetHr = THREE.MathUtils.clamp(
+        68 + (this.controller.isSprinting ? 34 : isMoving ? 12 : 0) + (1 - this.stamina) * 30,
+        64,
+        155,
+      );
+      const hrLerp = targetHr > this.heartRateBpm ? dt * 2.0 : dt * 0.6;
+      this.heartRateBpm += (targetHr - this.heartRateBpm) * Math.min(1, hrLerp);
+      this.controller.setHeartRateBpm(this.heartRateBpm);
+
       this.controller.update(
         dt,
         this.elapsedSec,
@@ -1209,16 +1378,33 @@ export class ZombiesLobbyController {
         this.adapter,
         profile,
         this.config,
-        1.0,
+        this.stamina,
         100,
+        (drainAmt) => {
+          this.stamina = Math.max(0, this.stamina - drainAmt);
+        },
       );
-      this.world.update(dt);
+      this.camera.getWorldPosition(this._camPos);
+      this.world.update(dt, this._camPos);
 
       if (swapping) {
+        this.holdRepair.cancel(this.interactAnimator);
         this.interactAnimator.cancel();
         this.swapChoreography.update(dt, this.camera);
         this.animator.setExternalHandOverride(
           this.swapChoreography.isActive() ? this.swapChoreography.ikOverride : null,
+        );
+      } else if (this.holdRepair.isActive()) {
+        this.holdRepair.step(
+          dt,
+          this.keyFHeld,
+          this.controller.position,
+          this.camera,
+          this.interactAnimator,
+          3.45,
+        );
+        this.animator.setExternalHandOverride(
+          this.interactAnimator.isActive() ? this.interactAnimator.ikOverride : null,
         );
       } else if (this.interactAnimator.isActive()) {
         const still = this.interactAnimator.update(dt, this.camera);

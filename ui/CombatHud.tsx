@@ -1140,6 +1140,21 @@ export const CombatHud: React.FC<CombatHudProps> = ({
                         </div>
                       </div>
                     )}
+                  {snapshot.nearbyPrompt.isHoldAction &&
+                    typeof snapshot.nearbyPrompt.planksRemaining !== 'number' &&
+                    (snapshot.nearbyPrompt.holdProgress ?? 0) > 0 && (
+                      <div className="mt-1.5 h-1.5 w-full overflow-hidden bg-neutral-800">
+                        <div
+                          className="h-full bg-amber-400 transition-all duration-75"
+                          style={{
+                            width: `${Math.min(
+                              100,
+                              Math.round((snapshot.nearbyPrompt.holdProgress ?? 0) * 100),
+                            )}%`,
+                          }}
+                        />
+                      </div>
+                    )}
                   {snapshot.nearbyPrompt.blockedReason && (
                     <div className="mt-0.5 text-[10px] uppercase tracking-wider text-red-400">
                       {snapshot.nearbyPrompt.blockedReason}

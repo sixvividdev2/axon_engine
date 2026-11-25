@@ -9,7 +9,12 @@ import {
 import {
   GRAPHICS_QUALITY_ORDER,
   GRAPHICS_QUALITY_PROFILES,
+  HORIZON_FOG_LEAD_M,
+  OPEN_WORLD_RENDER_DISTANCE_LIMITS,
+  REDUCE_ANIMATION_DISTANCE_LIMITS,
+  RENDER_DISTANCE_LIMITS,
   useAdaptiveScaling,
+  useDistancePerformanceSettings,
   useGraphicsQuality,
 } from '../data/graphicsQuality';
 import { useKillfeedPreference } from '../data/killfeedSettings';
@@ -20,6 +25,7 @@ export const GameSettingsModal: React.FC = () => {
   const { user, openAccountSettings, openAuthModal } = useAuth();
   const [graphicsQuality, setGraphicsQuality] = useGraphicsQuality();
   const [adaptiveScaling, setAdaptiveScaling] = useAdaptiveScaling();
+  const [distanceSettings, distanceActions] = useDistancePerformanceSettings();
   const [personalKillfeed, setPersonalKillfeed] = useKillfeedPreference();
 
   useEffect(() => {
@@ -165,6 +171,87 @@ export const GameSettingsModal: React.FC = () => {
                   >
                     {adaptiveScaling ? 'ON (Dynamic DPR)' : 'OFF (Fixed Native)'}
                   </button>
+                </div>
+
+                {/* Distance & Animation LOD Sliders */}
+                <div className="mt-4 flex flex-col gap-3.5 border-t border-neutral-800/80 pt-3.5">
+                  <div>
+                    <div className="flex items-center justify-between gap-2">
+                      <div>
+                        <div className="text-xs font-medium text-neutral-200">
+                          Render Distance (Conquest &amp; Maps)
+                        </div>
+                        <div className="text-[11px] text-neutral-400">
+                          Horizon distance fog begins {HORIZON_FOG_LEAD_M} m before clip ({Math.max(12, distanceSettings.renderDistanceM - HORIZON_FOG_LEAD_M)} m–{distanceSettings.renderDistanceM} m) for seamless blending.
+                        </div>
+                      </div>
+                      <span className="font-mono-tabular text-xs font-semibold text-amber-400">
+                        {distanceSettings.renderDistanceM} m
+                      </span>
+                    </div>
+                    <input
+                      type="range"
+                      min={RENDER_DISTANCE_LIMITS.min}
+                      max={RENDER_DISTANCE_LIMITS.max}
+                      step={RENDER_DISTANCE_LIMITS.step}
+                      value={distanceSettings.renderDistanceM}
+                      onChange={(e) => distanceActions.setRenderDistanceM(Number(e.target.value))}
+                      aria-label="Render Distance"
+                      className="mt-2 h-1.5 w-full cursor-pointer accent-amber-400"
+                    />
+                  </div>
+
+                  <div>
+                    <div className="flex items-center justify-between gap-2">
+                      <div>
+                        <div className="text-xs font-medium text-neutral-200">
+                          Open World Render Distance
+                        </div>
+                        <div className="text-[11px] text-neutral-400">
+                          Controls 4 km theater draw distance and AAA horizon fog ramp ({Math.max(12, distanceSettings.openWorldRenderDistanceM - HORIZON_FOG_LEAD_M)} m–{distanceSettings.openWorldRenderDistanceM} m).
+                        </div>
+                      </div>
+                      <span className="font-mono-tabular text-xs font-semibold text-amber-400">
+                        {distanceSettings.openWorldRenderDistanceM} m
+                      </span>
+                    </div>
+                    <input
+                      type="range"
+                      min={OPEN_WORLD_RENDER_DISTANCE_LIMITS.min}
+                      max={OPEN_WORLD_RENDER_DISTANCE_LIMITS.max}
+                      step={OPEN_WORLD_RENDER_DISTANCE_LIMITS.step}
+                      value={distanceSettings.openWorldRenderDistanceM}
+                      onChange={(e) => distanceActions.setOpenWorldRenderDistanceM(Number(e.target.value))}
+                      aria-label="Open World Render Distance"
+                      className="mt-2 h-1.5 w-full cursor-pointer accent-amber-400"
+                    />
+                  </div>
+
+                  <div>
+                    <div className="flex items-center justify-between gap-2">
+                      <div>
+                        <div className="text-xs font-medium text-neutral-200">
+                          Reduced Animation Distance
+                        </div>
+                        <div className="text-[11px] text-neutral-400">
+                          Operators, zombies, and wildlife beyond this distance animate at half rate to boost CPU FPS.
+                        </div>
+                      </div>
+                      <span className="font-mono-tabular text-xs font-semibold text-sky-300">
+                        {distanceSettings.reduceAnimationDistanceM} m
+                      </span>
+                    </div>
+                    <input
+                      type="range"
+                      min={REDUCE_ANIMATION_DISTANCE_LIMITS.min}
+                      max={REDUCE_ANIMATION_DISTANCE_LIMITS.max}
+                      step={REDUCE_ANIMATION_DISTANCE_LIMITS.step}
+                      value={distanceSettings.reduceAnimationDistanceM}
+                      onChange={(e) => distanceActions.setReduceAnimationDistanceM(Number(e.target.value))}
+                      aria-label="Reduced Animation Distance"
+                      className="mt-2 h-1.5 w-full cursor-pointer accent-sky-400"
+                    />
+                  </div>
                 </div>
               </section>
 

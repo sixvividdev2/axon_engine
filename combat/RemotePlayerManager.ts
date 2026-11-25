@@ -17,6 +17,7 @@ import {
   unpackSyncedWeaponAttachments,
 } from '../data/multiplayer';
 import { WeaponAttachments } from '../data/attachments';
+import { graphicsQualityStore } from '../data/graphicsQuality';
 import {
   DEFAULT_TACTICAL_EQUIPMENT_ID,
   isTacticalEquipmentId,
@@ -800,6 +801,8 @@ export class RemotePlayerManager {
     tr.mesh.visible = true;
   }
 
+  private animFrameTick = 0;
+
   public update(
     dt: number,
     localCameraPos: Readonly<THREE.Vector3>,
@@ -810,6 +813,9 @@ export class RemotePlayerManager {
       far: number,
     ) => number,
   ): void {
+    this.animFrameTick = (this.animFrameTick + 1) & 0x7fffffff;
+    const reduceAnimDistM = graphicsQualityStore.getReduceAnimationDistanceM();
+
     // Update pooled tracers
     for (let i = 0; i < this.tracers.length; i++) {
       const tr = this.tracers[i];
@@ -825,7 +831,9 @@ export class RemotePlayerManager {
     const rotAlpha = 1 - Math.exp(-20 * dt);
     const poseAlpha = 1 - Math.exp(-15 * dt);
 
+    let playerSlotIdx = 0;
     for (const op of this.players.values()) {
+      const pIdx = playerSlotIdx++;
       if (!op.hasInitialState || !op.alive) {
         op.rig.root.visible = false;
         continue;
@@ -1000,7 +1008,11 @@ export class RemotePlayerManager {
             : op.isFiring
               ? 'alert'
               : 'calm';
-      rig.applyCombatPose(pose);
+      const beyondReduceAnim = distToCam > reduceAnimDistM;
+      if (!beyondReduceAnim || ((pIdx + this.animFrameTick) & 1) === 0) {
+        pose.dt = beyondReduceAnim ? dt * 2.0 : dt;
+        rig.applyCombatPose(pose);
+      }
 
       // Muzzle flash, belt grenade visibility/type, laser & tactical light
       const grenadeBusy = op.handlingAction.startsWith('GRENADE_');

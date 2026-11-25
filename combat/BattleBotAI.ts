@@ -20,6 +20,7 @@ import {
   normalizeOperatorId,
   OperatorId,
 } from '../bodycam-sdk/operator/OperatorTypes';
+import { graphicsQualityStore } from '../data/graphicsQuality';
 import {
   BotDifficultyId,
   BattleRuleId,
@@ -3157,6 +3158,8 @@ export class BattleBotAI {
     return true;
   }
 
+  private animFrameTick = 0;
+
   public update(
     dt: number,
     playerPos: Readonly<THREE.Vector3>,
@@ -3177,6 +3180,8 @@ export class BattleBotAI {
     infectionEconomy?: InfectionBotEconomyContext,
   ): void {
     this.elapsedClockSec += dt;
+    this.animFrameTick = (this.animFrameTick + 1) & 0x7fffffff;
+    const reduceAnimDistM = graphicsQualityStore.getReduceAnimationDistanceM();
     if (this.globalCommsCooldown > 0) {
       this.globalCommsCooldown = Math.max(0, this.globalCommsCooldown - dt);
     }
@@ -3511,7 +3516,9 @@ export class BattleBotAI {
       let targetZombie: BattleZombieTarget | null = null;
 
       if (bot.losTimer <= 0) {
-        bot.losTimer = 0.14 + Math.random() * 0.06;
+        const distFromCamSq = bot.pos.distanceToSquared(playerPos);
+        const distantBot = distFromCamSq > reduceAnimDistM * reduceAnimDistM;
+        bot.losTimer = distantBot ? 0.24 + Math.random() * 0.08 : 0.14 + Math.random() * 0.06;
         this._tmpOrigin.set(bot.pos.x, bot.pos.y + BOT_EYE_Y - bot.crouchBlend * 0.42, bot.pos.z);
 
         let bestId: string | null = null;
@@ -4356,11 +4363,18 @@ export class BattleBotAI {
                 ? 'alert'
                 : 'calm';
 
+      const distToCam = bot.pos.distanceTo(playerPos);
+      const beyondReduceAnim = distToCam > reduceAnimDistM;
       bot.bodyPivot.rotation.set(0, 0, 0);
       bot.bodyPivot.position.set(0, 0, 0);
       bot.root.position.copy(bot.pos);
       bot.root.rotation.set(0, bot.yaw, 0);
-      bot.rig.applyCombatPose(pose);
+      // Half-rate skeletal pose updates past the user's Reduce Animation Distance setting
+      if (!beyondReduceAnim || ((i + this.animFrameTick) & 1) === 0) {
+        pose.dt = beyondReduceAnim ? dt * 2.0 : dt;
+        pose.distanceToCameraM = distToCam;
+        bot.rig.applyCombatPose(pose);
+      }
     }
   }
 

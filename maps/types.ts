@@ -6,6 +6,7 @@ import { TacticalEquipmentId } from '../data/tacticalEquipment';
 import type { TimeOfDayStartSetting, WeatherPresetId } from '../data/multiplayer';
 import type { DestructibleDoorSystem } from '../doors/DestructibleDoorSystem';
 import type { PenetrableSurfaceSystem } from '../doors/PenetrableSurfaceSystem';
+import type { HideoutElectronicsSystem } from '../hideout/HideoutElectronicsSystem';
 import type { WaterShaderUniforms } from '../engine/world/WaterShader';
 import type { NightLightEntry, WettableSurfaceEntry } from '../engine/world/WeatherTimeSystem';
 import type { WindShaderUniforms } from '../engine/world/WindFoliageShader';
@@ -360,6 +361,8 @@ export interface BuiltMapInstance {
   doorSystem?: DestructibleDoorSystem;
   /** Optional melee-penetrable interior drywall / plywood / panel system */
   penetrableSystem?: PenetrableSurfaceSystem;
+  /** Universal breakable & repairable electronics system (lights, terminals, perk machines, power switches) */
+  electronicsSystem?: HideoutElectronicsSystem;
   /** Shatters a breakable glass pane/window and disables its paired physics collider */
   shatterBreakable?: (
     objOrId: THREE.Object3D | string,

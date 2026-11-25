@@ -441,6 +441,16 @@ export const HideoutHud: React.FC<HideoutHudProps> = ({
                   );
                 })}
               </div>
+              {snapshot.prompt.holdProgress !== undefined && snapshot.prompt.holdProgress > 0 && (
+                <div className="mt-2 h-1.5 w-full overflow-hidden bg-white/10">
+                  <div
+                    className="h-full bg-amber-400 transition-[width] duration-75"
+                    style={{
+                      width: `${Math.min(100, Math.round(snapshot.prompt.holdProgress * 100))}%`,
+                    }}
+                  />
+                </div>
+              )}
             </div>
           )}
         </div>

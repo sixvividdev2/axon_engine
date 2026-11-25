@@ -57,6 +57,12 @@ import {
   getTacticalEquipmentDef,
   TacticalEquipmentId,
 } from '../../../../data/tacticalEquipment';
+import { HoldRepairController } from '../../../../doors/HoldRepairController';
+import { PlayerInteractAnimator } from '../../../../doors/PlayerInteractAnimator';
+import {
+  type BrokenElectronicRepairTarget,
+  HideoutElectronicsSystem,
+} from '../../../../hideout/HideoutElectronicsSystem';
 import { characterRoster } from '../CharacterRoster';
 import {
   cloneCorpseLootSnapshot,
@@ -620,6 +626,9 @@ export class OpenWorldSessionEngine {
   private readonly eventDirector: OpenWorldEventDirector;
   private readonly aiDirector: OpenWorldAiDirector;
   private readonly fobDynamicProps: OpenWorldFobDynamicProps;
+  private readonly electronicsSystem: HideoutElectronicsSystem;
+  private readonly interactAnimator = new PlayerInteractAnimator();
+  private readonly holdRepair = new HoldRepairController();
   private readonly bodycamAdapter: OpenWorldBodycamAdapter;
 
   // Shared Axon Bodycam Core subsystems
@@ -732,6 +741,9 @@ export class OpenWorldSessionEngine {
   private lastPlayerX = 0;
   private lastPlayerZ = 0;
   private smoothPlayerSpeedMps = 0;
+  private stamina = 1.0;
+  private heartRateBpm = 74;
+  private nearbyElectronicRepair: BrokenElectronicRepairTarget | null = null;
   private toastMessage: string | null = null;
   private toastTimerSec = 0;
   private activeInteractable: OpenWorldInteractableContext | null = null;
@@ -756,6 +768,7 @@ export class OpenWorldSessionEngine {
   private unsubShards: (() => void) | null = null;
   private unsubQuality: (() => void) | null = null;
   private unsubAdaptive: (() => void) | null = null;
+  private unsubDistance: (() => void) | null = null;
   private readonly adaptivePerf: AdaptivePerformanceController;
   private qualityProfile: GraphicsQualityProfile;
 
@@ -932,7 +945,13 @@ export class OpenWorldSessionEngine {
       this.isSoftwareGl,
     );
     this.fobDynamicProps = new OpenWorldFobDynamicProps(this.scene);
+    this.electronicsSystem = new HideoutElectronicsSystem(this.scene);
+    this.electronicsSystem.autoRegisterSceneElectronics(this.sectorManager.rootGroup, {
+      idPrefix: 'ow_sector',
+      lightMatchRadiusM: 4.5,
+    });
     this.bodycamAdapter.setFobDynamicProps(this.fobDynamicProps);
+    this.bodycamAdapter.setElectronicsSystem(this.electronicsSystem);
     this.bodycamAdapter.setWildlifeManager(this.wildlifeManager);
     this.bodycamAdapter.setConvoyDirector(this.convoyDirector);
     this.bodycamAdapter.setEventDirector(this.eventDirector);
@@ -1076,10 +1095,22 @@ export class OpenWorldSessionEngine {
         this.applyEffectiveDprAndEffects();
       }
     });
+    this.unsubDistance = graphicsQualityStore.subscribeDistanceSettings(() => {
+      this.applyDistancePerformanceSettings();
+    });
+    this.applyDistancePerformanceSettings();
 
     this.lastNowMs = performance.now();
     this.emitSnapshot();
     this.scheduleNextFrame();
+  }
+
+  private applyDistancePerformanceSettings(): void {
+    const renderDistM = graphicsQualityStore.getOpenWorldRenderDistanceM();
+    this.camera.far = renderDistM + 18;
+    this.camera.updateProjectionMatrix();
+    this.atmosphere.setRenderDistance(renderDistM, this.camera.far);
+    this.streamer.setRenderDistance(renderDistM);
   }
 
   private applyGraphicsQuality(profile: GraphicsQualityProfile, rebuildChunks: boolean): void {
@@ -1091,6 +1122,7 @@ export class OpenWorldSessionEngine {
     }
     this.atmosphere.setQualityProfile(profile, this.adaptivePerf.state);
     this.streamer.applyQualityProfile(profile, rebuildChunks);
+    this.applyDistancePerformanceSettings();
     this.applyEffectiveDprAndEffects();
   }
 
@@ -1254,6 +1286,7 @@ export class OpenWorldSessionEngine {
     this.isFiring = false;
     this.semiTriggerConsumed = false;
     this.pdaDevice.setDragging(false);
+    this.holdRepair.cancel(this.interactAnimator);
   }
 
   private readonly onWindowBlur = (): void => {
@@ -1352,6 +1385,35 @@ export class OpenWorldSessionEngine {
         return;
       }
       if (e.code === 'KeyF') {
+        if (this.navMode === 'foot' && this.activeInteractable?.kind === 'electronic_repair' && this.nearbyElectronicRepair) {
+          const target = this.nearbyElectronicRepair;
+          this.isFiring = false;
+          this.input.ads = false;
+          this.holdRepair.start(
+            {
+              kind: 'ELECTRONICS_REPAIR',
+              targetId: target.id,
+              label: `Repairing ${target.label}`,
+              durationSec: target.durationSec,
+              anchorPos: target.anchorPos,
+              dynamicAnchorProvider: (out) =>
+                this.electronicsSystem.getRepairAnchorWorldPos(target.id, out),
+              onWorkTick: (phaseIndex, anchorPos) => {
+                this.electronicsSystem.playRepairWorkTick(anchorPos, phaseIndex);
+              },
+              onComplete: () => {
+                this.camera.getWorldPosition(_camPos);
+                if (this.electronicsSystem.repairNode(target.id, _camPos)) {
+                  this.showToast(`${target.label} Repaired & Online`, 3.2);
+                  this.emitSnapshot();
+                }
+              },
+            },
+            this.interactAnimator,
+          );
+          this.emitSnapshot();
+          return;
+        }
         if (this.activeInteractable) {
           this.executeFieldInteraction();
         } else {
@@ -1453,6 +1515,12 @@ export class OpenWorldSessionEngine {
         break;
       case 'Space':
         this.input.vault = false;
+        break;
+      case 'KeyF':
+        if (this.holdRepair.isActive()) {
+          this.holdRepair.cancel(this.interactAnimator);
+          this.emitSnapshot();
+        }
         break;
     }
   };
@@ -1860,6 +1928,7 @@ export class OpenWorldSessionEngine {
 
     this.weaponRig.triggerFire(suppressed, nextAmmo);
     this.weaponRig.setAmmoState(nextAmmo, true);
+    this.heartRateBpm = Math.min(168, this.heartRateBpm + 1.8);
     this.controller.applyRecoil(
       prof.recoilPitchRad,
       prof.recoilYawRad,
@@ -1926,6 +1995,15 @@ export class OpenWorldSessionEngine {
     const hitObj = ev.object;
     if (!hitObj) return;
 
+    this.camera.getWorldPosition(_camPos);
+    const elecMelee = this.electronicsSystem.handleImpact(hitObj, ev.point, ev.normal, _camPos);
+    if (elecMelee) {
+      if (!elecMelee.alreadyBroken) {
+        this.showToast(`${elecMelee.label} Damaged — Hold [F] to Repair`, 3.0);
+      }
+      return;
+    }
+
     const rangeTargetId = hitObj.userData?.openWorldRangeTargetId as string | undefined;
     if (rangeTargetId) {
       this.fobDynamicProps.triggerTargetHit(
@@ -1969,6 +2047,18 @@ export class OpenWorldSessionEngine {
     this.wildlifeManager.notifyBulletPass(ev.point.x, ev.point.z, 7.5);
 
     const char = this.getActiveCharacter();
+
+    // 0a. Breakable Open World electronics (FOB terminals, black-market consoles, contract laptops, beacons)
+    if (ev.object) {
+      this.camera.getWorldPosition(_camPos);
+      const elecHit = this.electronicsSystem.handleImpact(ev.object, ev.point, ev.normal, _camPos);
+      if (elecHit) {
+        if (!elecHit.alreadyBroken) {
+          this.showToast(`${elecHit.label} Damaged — Hold [F] to Repair`, 3.2);
+        }
+        return;
+      }
+    }
 
     // 0. FOB Barracks Gun Range & CQB Shoot-House reactive steel target hit
     const rangeTargetId = ev.object?.userData?.openWorldRangeTargetId as string | undefined;
@@ -2062,6 +2152,8 @@ export class OpenWorldSessionEngine {
     for (const k of kills) {
       this.handleAiElimination(k);
     }
+    this.camera.getWorldPosition(_camPos);
+    this.electronicsSystem.handleExplosion(ev.position, Math.max(8, ev.radiusM), _camPos);
     this.aiDirector.notifyPlayerGunshot(ev.position.x, ev.position.z, 175);
     this.ambienceAudio.onBallisticImpulse(
       ev.position.x,
@@ -2840,6 +2932,9 @@ export class OpenWorldSessionEngine {
       this.armorDurability = this.maxArmorDurability;
       this.bleedingRemainingSec = 0;
       this.sprintSlowRemainingSec = 0;
+      this.stamina = 1.0;
+      this.heartRateBpm = 74;
+      this.holdRepair.cancel(this.interactAnimator);
       this.aiDirector.resetProvocations();
       const respawnLandmark =
         outcome.updatedCharacter.pmcFaction === 'pmc_bravo'
@@ -3234,11 +3329,59 @@ export class OpenWorldSessionEngine {
       this.sectorManager.markSectorContested(spawnedEvent.sectorId);
     }
 
-    // Update nearest contextual 3D interactable (FOB Terminal, Convoys, Event Crates, Corpses, Contracts & Wildlife)
+    this.camera.getWorldPosition(_camPos);
+    this.camera.getWorldDirection(_lookDir).normalize();
+    this.electronicsSystem.update(dt, _camPos);
+
+    // Update nearest contextual 3D interactable (FOB Terminal, Convoys, Event Crates, Corpses, Contracts, Wildlife & Electronic Repairs)
     if (this.navMode === 'foot' && this.activeModal === null) {
       const candidates: OpenWorldInteractableContext[] = [];
+      const activeRep = this.holdRepair.getState();
+      this.nearbyElectronicRepair = this.electronicsSystem.findBrokenRepairTarget(
+        _camPos,
+        _lookDir,
+        3.25,
+      );
+
+      if (activeRep) {
+        candidates.push({
+          kind: 'electronic_repair',
+          id: activeRep.targetId,
+          label: `${activeRep.label} (${Math.round(activeRep.progress01 * 100)}%)`,
+          sublabel: 'Hold [F] to complete electrical repair',
+          distanceM: 0.1,
+          canExecute: true,
+          holdToRepair: true,
+          repairProgress: activeRep.progress01,
+        });
+      } else if (this.nearbyElectronicRepair) {
+        candidates.push({
+          kind: 'electronic_repair',
+          id: this.nearbyElectronicRepair.id,
+          label: `Repair ${this.nearbyElectronicRepair.label}`,
+          sublabel: `Hold [F] (${this.nearbyElectronicRepair.durationSec.toFixed(1)}s) to restore electronics`,
+          distanceM: Math.max(0.15, this.nearbyElectronicRepair.distanceM - 0.5),
+          canExecute: true,
+          holdToRepair: true,
+          repairProgress: 0,
+        });
+      }
+
       const sectorInter = this.sectorManager.findNearestInteractable(px, pz, activeChar);
-      if (sectorInter) candidates.push(sectorInter);
+      if (sectorInter) {
+        const linkKey =
+          sectorInter.kind === 'fob_terminal' ||
+          sectorInter.kind === 'subfaction_black_market' ||
+          sectorInter.kind === 'contract'
+            ? `${sectorInter.kind}:${sectorInter.id}`
+            : null;
+        if (linkKey && this.electronicsSystem.isInteractiveLinkBroken(linkKey)) {
+          sectorInter.canExecute = false;
+          sectorInter.blockedReason = 'Terminal damaged — look at screen and Hold [F] to repair.';
+          sectorInter.sublabel = 'ELECTRONICS DAMAGED · Hold [F] on terminal screen to repair';
+        }
+        candidates.push(sectorInter);
+      }
 
       const harvestPrompt = this.wildlifeManager.findNearestHarvestableCarcass(px, pz);
       if (harvestPrompt) {
@@ -3281,6 +3424,7 @@ export class OpenWorldSessionEngine {
       candidates.sort((a, b) => a.distanceM - b.distanceM);
       this.activeInteractable = candidates[0] ?? null;
     } else {
+      this.nearbyElectronicRepair = null;
       this.activeInteractable = null;
     }
 
@@ -3493,6 +3637,38 @@ export class OpenWorldSessionEngine {
     }
 
     const prof = resolveWeaponProfile(this.equippedWeaponId);
+    const repairActive = this.holdRepair.isActive();
+    if (repairActive) {
+      this.input.ads = false;
+      this.input.sprint = false;
+      this.isFiring = false;
+    }
+
+    // Stamina drain/regen & heart-rate biomechanics coupled to weapon stability
+    const isMoving =
+      this.input.forward || this.input.backward || this.input.left || this.input.right;
+    if (this.controller.isSprinting && isMoving) {
+      this.stamina = Math.max(0, this.stamina - dt * 0.145);
+    } else if (this.controller.isHoldBreathActive()) {
+      this.stamina = Math.max(0, this.stamina - dt * 0.14);
+    } else {
+      const regenRate = !isMoving ? (this.input.crouch ? 0.15 : 0.125) : 0.075;
+      this.stamina = Math.min(1.0, this.stamina + dt * regenRate);
+    }
+
+    const hpStress = Math.max(0, 1 - this.playerHp / this.playerMaxHp) * 34;
+    const bleedStress = this.bleedingRemainingSec > 0 ? 18 : 0;
+    const exertionStress =
+      (this.controller.isSprinting ? 38 : isMoving ? 14 : 0) + (1 - this.stamina) * 32;
+    const targetHr = THREE.MathUtils.clamp(
+      68 + exertionStress + hpStress + bleedStress + this.damageFlashAlpha * 28,
+      64,
+      172,
+    );
+    const hrLerp = targetHr > this.heartRateBpm ? dt * 2.2 : dt * 0.55;
+    this.heartRateBpm += (targetHr - this.heartRateBpm) * Math.min(1, hrLerp);
+    this.controller.setHeartRateBpm(this.heartRateBpm);
+
     this.controller.update(
       dt,
       this.elapsedSec,
@@ -3500,13 +3676,36 @@ export class OpenWorldSessionEngine {
       this.bodycamAdapter,
       prof,
       this.config,
-      1.0,
+      this.stamina,
       this.playerHp,
+      (drainAmt) => {
+        this.stamina = Math.max(0, this.stamina - drainAmt);
+      },
     );
 
-    // Update physical 3D Tactical GPS PDA telemetry (60Hz when open, 2Hz when holstered)
+    // Step Hold [F] two-handed repair IK before full-body animator
+    if (this.holdRepair.isActive()) {
+      this.holdRepair.step(
+        dt,
+        this.keysDown.has('KeyF'),
+        this.controller.position,
+        this.camera,
+        this.interactAnimator,
+        3.55,
+      );
+      this.animator.setExternalHandOverride(
+        this.interactAnimator.isActive() ? this.interactAnimator.ikOverride : null,
+      );
+    } else if (this.interactAnimator.isActive()) {
+      const active = this.interactAnimator.update(dt, this.camera);
+      this.animator.setExternalHandOverride(active ? this.interactAnimator.ikOverride : null);
+    } else {
+      this.animator.setExternalHandOverride(null);
+    }
+
+    // Update physical 3D Tactical GPS PDA telemetry (60Hz when open, 1Hz when holstered)
     this.pdaTelemetryAccum += dt;
-    if (this.pdaDevice.isOpen() || this.pdaTelemetryAccum >= 0.5) {
+    if (this.pdaDevice.isOpen() || this.pdaTelemetryAccum >= 1.0) {
       this.pdaTelemetryAccum = 0;
       this.updatePdaTelemetry(activeChar);
     }
@@ -3543,7 +3742,7 @@ export class OpenWorldSessionEngine {
     this.audio.updateListener(_camPos, _lookDir, _camUp);
 
     // Automatic fire hold
-    if (this.isFiring && this.pointerLocked) {
+    if (this.isFiring && this.pointerLocked && !this.holdRepair.isActive()) {
       this.tryFireShot();
     }
   }
@@ -3897,6 +4096,8 @@ export class OpenWorldSessionEngine {
     this.unsubShards?.();
     this.unsubQuality?.();
     this.unsubAdaptive?.();
+    this.unsubDistance?.();
+    this.holdRepair.cancel(this.interactAnimator);
     this.listeners.clear();
 
     for (const g of this.corpseGeometries) g.dispose();
@@ -3906,6 +4107,7 @@ export class OpenWorldSessionEngine {
     this.scopeRenderer.dispose();
     this.aiDirector.dispose();
     this.fobDynamicProps.dispose();
+    this.electronicsSystem.dispose();
     this.convoyDirector.dispose();
     this.eventDirector.dispose();
     this.wildlifeManager.dispose();

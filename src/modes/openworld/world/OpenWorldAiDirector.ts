@@ -19,6 +19,7 @@ import {
 } from '../../../../combat/TacticalOperatorRig';
 import { getOwnedSuppressorDef, normalizeWeaponAttachments, WeaponAttachments } from '../../../../data/attachments';
 import { getDefaultAmmoVariant, resolveBaseCaliberId } from '../../../../data/calibers';
+import { graphicsQualityStore } from '../../../../data/graphicsQuality';
 import { TacticalEquipmentId } from '../../../../data/tacticalEquipment';
 import {
   getStandingTier,
@@ -2205,19 +2206,13 @@ export class OpenWorldAiDirector {
       a.rig.root.rotation.set(0, a.yaw, 0);
 
       // Strictly skip expensive 2-bone IK + facial animation whenever rig is hidden (LOD2 or behind camera)
+      const reduceAnimDistM = graphicsQualityStore.getReduceAnimationDistanceM();
+      const beyondReduceAnim = distHoriz > reduceAnimDistM;
       const updatePoseNow =
         a.rig.root.visible &&
-        (a.lodTier === 0
-          ? distHoriz <= 55 ||
-            a.reloading ||
-            a.muzzleFlashTimer > 0 ||
-            a.alerted ||
-            a.neutralAlertStage === 'warned' ||
-            (i & 1) === this.frameParity
-          : a.reloading ||
-            a.muzzleFlashTimer > 0 ||
-            (i + this.frameTick) % 3 === 0);
+        (!beyondReduceAnim || (i & 1) === this.frameParity);
       if (updatePoseNow) {
+        const poseDt = beyondReduceAnim ? dt * 2.0 : dt;
         const reloadProgress = a.reloading
           ? THREE.MathUtils.clamp(a.reloadTimer / Math.max(0.1, a.reloadDuration), 0, 1)
           : 0;
@@ -2244,7 +2239,7 @@ export class OpenWorldAiDirector {
         _poseScratch.headPitchOffset = a.headPitchOffset;
         _poseScratch.headRollOffset = a.headRollOffset;
         _poseScratch.torsoYawOffset = a.speedMps > 0.25 ? Math.sin(a.walkCycle) * 0.045 : 0;
-        _poseScratch.dt = dt;
+        _poseScratch.dt = poseDt;
         _poseScratch.distanceToCameraM = distHoriz;
         _poseScratch.gazeTargetWorld =
           a.alerted || a.neutralAlertStage !== 'calm' ? _playerGazeTarget : null;

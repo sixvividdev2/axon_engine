@@ -1070,9 +1070,15 @@ export class HideoutLongRangeGallery {
         hitMeshes: [chronoBody, chronoScreen, ...chronoCanopies],
         emissiveMaterials: [diffuserMat, chronoScreenMat],
         sparkOrigin: new THREE.Vector3(28.55, 1.12, 4.25),
+        repairable: true,
+        repairDurationSec: 1.95,
         onBreak: () => {
           this.chronoBroken = true;
           this.drawBrokenChronoScreen();
+        },
+        onRepair: () => {
+          this.chronoBroken = false;
+          this.redrawChronoScreen();
         },
       },
       raycastMeshes,
@@ -1132,9 +1138,15 @@ export class HideoutLongRangeGallery {
         emissiveMaterials: [monMat],
         sparkOrigin: new THREE.Vector3(30.38, benchH + 0.44, 3.12),
         isLightFixture: true,
+        repairable: true,
+        repairDurationSec: 2.0,
         onBreak: () => {
           this.monitorBroken = true;
           this.drawBrokenMonitor();
+        },
+        onRepair: () => {
+          this.monitorBroken = false;
+          this.redrawMonitor();
         },
       },
       raycastMeshes,
@@ -1198,8 +1210,14 @@ export class HideoutLongRangeGallery {
         hitMeshes: [conBox, conFace, ...conBtns],
         emissiveMaterials: conBtnMats,
         sparkOrigin: new THREE.Vector3(26.72, benchH + 0.2, 2.92),
+        interactiveLinkId: 'ballistics_console',
+        repairable: true,
+        repairDurationSec: 2.0,
         onBreak: () => {
           this.consoleBroken = true;
+        },
+        onRepair: () => {
+          this.consoleBroken = false;
         },
       },
       raycastMeshes,
@@ -1430,9 +1448,14 @@ export class HideoutLongRangeGallery {
             emissiveMaterials: [beaconMat],
             sparkOrigin: new THREE.Vector3(x, postH + 0.11, z),
             isLightFixture: true,
+            repairable: true,
+            repairDurationSec: 1.85,
             onBreak: () => {
               entry.beaconBroken = true;
               entry.beaconTimerSec = 0;
+            },
+            onRepair: () => {
+              entry.beaconBroken = false;
             },
           },
           raycastMeshes,
@@ -1561,9 +1584,14 @@ export class HideoutLongRangeGallery {
             emissiveMaterials: [beaconMat],
             sparkOrigin: new THREE.Vector3(x + 0.42, 1.92, z + 0.08),
             isLightFixture: true,
+            repairable: true,
+            repairDurationSec: 1.85,
             onBreak: () => {
               entry.beaconBroken = true;
               entry.beaconTimerSec = 0;
+            },
+            onRepair: () => {
+              entry.beaconBroken = false;
             },
           },
           raycastMeshes,

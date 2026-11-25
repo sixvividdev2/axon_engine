@@ -176,10 +176,18 @@ export const GymHud: React.FC<GymHudProps> = ({
         </div>
       )}
 
-      {/* Gunsmithing Bench Interaction Prompt */}
-      {pointerLocked && lookingAtBench && !gunsmithOpen && (
+      {/* Gunsmithing Bench / Broken Electronic Repair Prompt */}
+      {pointerLocked && !gunsmithOpen && (lookingAtBench || snapshot.repairPromptLabel) && (
         <div className="fixed top-1/2 left-1/2 -translate-x-1/2 translate-y-12 border border-amber-400/80 bg-neutral-950/92 px-4 py-1.5 font-mono-tabular text-xs font-medium uppercase tracking-wider text-amber-200">
-          [F] Open Gunsmithing Bench
+          <div>{lookingAtBench ? '[F] Open Gunsmithing Bench' : snapshot.repairPromptLabel}</div>
+          {!lookingAtBench && snapshot.repairProgress > 0 && (
+            <div className="mt-1.5 h-1 w-full overflow-hidden bg-neutral-800">
+              <div
+                className="h-full bg-amber-400 transition-[width] duration-75"
+                style={{ width: `${Math.round(snapshot.repairProgress * 100)}%` }}
+              />
+            </div>
+          )}
         </div>
       )}
 

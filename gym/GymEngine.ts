@@ -72,6 +72,15 @@ import {
   resolveBaseCaliberId,
 } from '../data/calibers';
 import { SaveManager } from '../engine/persistence/SaveManager';
+import {
+  createHorizonFogUniforms,
+  installHorizonFogOnSubtree,
+  updateHorizonFogUniforms,
+  type HorizonFogUniforms,
+} from '../engine/world/HorizonFog';
+import { HoldRepairController } from '../doors/HoldRepairController';
+import { PlayerInteractAnimator } from '../doors/PlayerInteractAnimator';
+import type { BrokenElectronicRepairTarget } from '../hideout/HideoutElectronicsSystem';
 import { GymBallisticHitInfo, GymBallistics } from './GymBallistics';
 import { buildGymWorld, GYM_ZONE_PRESETS, GymWorldHandle, GymZoneId } from './GymWorld';
 
@@ -137,6 +146,8 @@ export interface GymSnapshot {
   nvgMount: NvgMountId;
   nvgActive: boolean;
   irIlluminatorOn: boolean;
+  repairPromptLabel: string | null;
+  repairProgress: number;
 }
 
 type Listener = (snap: GymSnapshot) => void;
@@ -179,7 +190,15 @@ export class GymEngine {
   private readonly unsubOperatorGear: () => void;
   private readonly unsubQuality: () => void;
   private readonly unsubAdaptive: () => void;
+  private readonly unsubDistance: () => void;
   private readonly adaptivePerf: AdaptivePerformanceController;
+  private readonly horizonFogUniforms: HorizonFogUniforms;
+  private readonly _fogColorScratch = new THREE.Color(0x9ca7af);
+  private readonly interactAnimator = new PlayerInteractAnimator();
+  private readonly holdRepair = new HoldRepairController();
+  private readonly _repairAnchorScratch = new THREE.Vector3();
+  private keyFHeld = false;
+  private nearbyBrokenElectronic: BrokenElectronicRepairTarget | null = null;
   private qualityProfile: GraphicsQualityProfile;
   private localGear: OperatorGearConfig;
   private nvgFlipped = false;
@@ -332,11 +351,24 @@ export class GymEngine {
     container.appendChild(this.renderer.domElement);
 
     this.scene = new THREE.Scene();
-    this.camera = new THREE.PerspectiveCamera(72, width / height, 0.08, 160);
+    const initialDistSettings = graphicsQualityStore.getDistanceSettings();
+    this.camera = new THREE.PerspectiveCamera(
+      72,
+      width / height,
+      0.08,
+      Math.max(160, initialDistSettings.renderDistanceM + 18),
+    );
     this.scene.add(this.camera);
 
     // Build calibration gym world & portable adapter
     this.world = buildGymWorld(this.scene, this.renderer, this.isSoftwareGl);
+    this.horizonFogUniforms = createHorizonFogUniforms(initialDistSettings.renderDistanceM);
+    updateHorizonFogUniforms(
+      this.horizonFogUniforms,
+      initialDistSettings.renderDistanceM,
+      this.scene,
+    );
+    installHorizonFogOnSubtree(this.scene, this.horizonFogUniforms);
     this.adapter = this.world.physics.createAdapter({
       getTraumaModifiers: () => this.getActiveTraumaModifiers(),
       shatterBreakable: (obj, pt, dir) => this.world.shatterBreakable(obj, pt, dir),
@@ -506,6 +538,11 @@ export class GymEngine {
         this.adaptivePerf.reset(this.qualityProfile);
         this.applyAdaptiveDpr();
       }
+    });
+    this.unsubDistance = graphicsQualityStore.subscribeDistanceSettings((ds) => {
+      this.camera.far = Math.max(160, ds.renderDistanceM + 18);
+      this.camera.updateProjectionMatrix();
+      updateHorizonFogUniforms(this.horizonFogUniforms, ds.renderDistanceM, this.scene);
     });
 
     // Initialize bare weapon attachments (or restore saved Gunsmith loadout) & magazine counts
@@ -996,6 +1033,7 @@ export class GymEngine {
         }
       }
       if (ev.kind === 'frag') {
+        this.world.electronics.handleExplosion(ev.position, ev.radiusM * 1.05, this.camera.position);
         const glassList = this.world.raycastMeshes.filter(
           (m) => m.userData?.breakableGlass && !m.userData.shattered,
         );
@@ -1097,6 +1135,7 @@ export class GymEngine {
       this.handleGrenadeHolsterOrToss();
     }
     this.audio.ensureInitialized();
+    this.holdRepair.cancel(this.interactAnimator);
     this.weaponRig.cancelAction();
     this.tunerOpen = false;
     this.isFiring = false;
@@ -1552,6 +1591,7 @@ export class GymEngine {
   }
 
   private handleMeleeHit(ev: Readonly<BodycamMeleeHitEvent>): void {
+    this.world.electronics.handleImpact(ev.object, ev.point, ev.normal, this.camera.position);
     const ud = ev.object?.userData;
     const penSurfaceId = ud?.penetrableSurfaceId as string | undefined;
     if (penSurfaceId) {
@@ -1738,6 +1778,8 @@ export class GymEngine {
     this.input.leanRight = false;
     this.input.holdBreath = false;
     this.input.vault = false;
+    this.keyFHeld = false;
+    this.holdRepair.cancel(this.interactAnimator);
     this.grenadeSystem.resetHeldInputOnFocusLoss();
     this.pdaDevice.setDragging(false);
   }
@@ -1982,9 +2024,33 @@ export class GymEngine {
         this.input.leanRight = true;
         break;
       case 'KeyF':
+        this.keyFHeld = true;
         if (!e.repeat) {
           if (this.lookingAtBench) {
             this.openGunsmith();
+          } else if (this.nearbyBrokenElectronic && !this.holdRepair.isActive()) {
+            const target = this.nearbyBrokenElectronic;
+            this.isFiring = false;
+            this.input.ads = false;
+            this.world.electronics.getRepairAnchorWorldPos(target.id, this._repairAnchorScratch);
+            this.holdRepair.start(
+              {
+                kind: 'ELECTRONICS_REPAIR',
+                targetId: target.id,
+                label: target.label,
+                durationSec: target.durationSec,
+                anchorPos: this._repairAnchorScratch,
+                onWorkTick: (phase, pos) => this.world.electronics.playRepairWorkTick(pos, phase),
+                onComplete: () => {
+                  if (this.world.electronics.repairNode(target.id, this.camera.position)) {
+                    this.showToast(`Repaired ${target.label}`);
+                  }
+                  this.emitSnapshot();
+                },
+              },
+              this.interactAnimator,
+            );
+            this.emitSnapshot();
           } else {
             this.toggleFlashlight();
           }
@@ -2121,6 +2187,9 @@ export class GymEngine {
         break;
       case 'KeyE':
         this.input.leanRight = false;
+        break;
+      case 'KeyF':
+        this.keyFHeld = false;
         break;
       case 'Space':
         this.input.vault = false;
@@ -2287,6 +2356,7 @@ export class GymEngine {
 
     let isVaultingNow = false;
     if (!benchBusy) {
+      this.controller.setHeartRateBpm(this.heartRateBpm);
       this.controller.setGrenadeTension(
         this.grenadeSystem.getCharge01(),
         this.grenadeSystem.isLeverReleased(),
@@ -2319,6 +2389,20 @@ export class GymEngine {
       }
       this.wasVaulting = isVaultingNow;
 
+      // Update Hold [F] electronics repair & procedural two-handed 1P interact IK
+      if (this.holdRepair.isActive()) {
+        this.holdRepair.step(
+          dt,
+          this.keyFHeld && this.pointerLocked,
+          this.controller.position,
+          this.camera,
+          this.interactAnimator,
+          3.4,
+        );
+      } else {
+        this.interactAnimator.update(dt, this.camera);
+      }
+
       // Update 3D Physical PDA Device before IK animator consumes wrist sockets
       this.pdaDevice.setTelemetry({
         playerX: this.controller.position.x,
@@ -2341,6 +2425,9 @@ export class GymEngine {
       );
 
       // 2. Step Full-Body Procedural IK Character Animator
+      this.animator.setExternalHandOverride(
+        this.interactAnimator.isActive() ? this.interactAnimator.ikOverride : null,
+      );
       this.animator.update(dt, this.elapsedSec, this.controller, this.adapter, prof, this.input.ads);
       this.animator.applyCameraAdditiveOverlay(this.camera);
 
@@ -2350,7 +2437,7 @@ export class GymEngine {
         !this.grenadeSystem.isWeaponHidden() && !this.pdaDevice.isWeaponHidden();
       this.skeleton.root.visible = true;
 
-      // Bench interaction look-at raycast
+      // Bench & broken electronics look-at raycast
       if (this.pointerLocked) {
         this.camera.getWorldDirection(this._lookDir);
         this._benchRaycaster.set(this.camera.position, this._lookDir);
@@ -2358,8 +2445,13 @@ export class GymEngine {
         this._benchRaycaster.far = 2.85;
         const hits = this._benchRaycaster.intersectObjects(this.world.raycastMeshes, false);
         this.lookingAtBench = Boolean(hits.length > 0 && hits[0].object?.userData?.isGunsmithBench);
+        this.nearbyBrokenElectronic =
+          !this.lookingAtBench && !this.holdRepair.isActive()
+            ? this.world.electronics.findBrokenRepairTarget(this.camera.position, this._lookDir, 3.0)
+            : null;
       } else {
         this.lookingAtBench = false;
+        this.nearbyBrokenElectronic = null;
       }
     } else {
       this.controller.setGrenadeTension(0, false, 'underhand');
@@ -2404,6 +2496,14 @@ export class GymEngine {
           this.controller.applyBallisticMicroFlinch(flinchDeg, sideSign);
         },
       },
+      (rawEv) => {
+        this.world.electronics.handleImpact(
+          rawEv.object,
+          rawEv.point,
+          rawEv.normal,
+          this._fpsCamPos,
+        );
+      },
     );
     const wasLiveBefore = this.grenadeSystem.isLeverReleased();
     this.grenadeSystem.update(dt, this.camera.position);
@@ -2424,7 +2524,7 @@ export class GymEngine {
     if (this.flashBlindAlpha > 0) {
       this.flashBlindAlpha = Math.max(0, this.flashBlindAlpha - dt * 0.42);
     }
-    this.world.updateDynamicTargets(dt);
+    this.world.updateDynamicTargets(dt, this._fpsCamPos);
 
     // 4. Step AAA Bodycam Post-Process
     this.controller.getWhipVelocity(this._whipVel);
@@ -2595,6 +2695,15 @@ export class GymEngine {
       nvgMount: this.localGear.nvgMount,
       nvgActive: this.nvgFlipped && this.localGear.nvgMount !== 'none',
       irIlluminatorOn: this.irIlluminatorOn && this.nvgFlipped,
+      repairPromptLabel: (() => {
+        const repairState = this.holdRepair.getState();
+        if (repairState) return `Repairing ${repairState.label}`;
+        if (this.nearbyBrokenElectronic) {
+          return `Hold [F] Repair ${this.nearbyBrokenElectronic.label}`;
+        }
+        return null;
+      })(),
+      repairProgress: this.holdRepair.getState()?.progress01 ?? 0,
     };
   }
 
@@ -2615,6 +2724,8 @@ export class GymEngine {
     this.unsubOperatorGear();
     this.unsubQuality();
     this.unsubAdaptive();
+    this.unsubDistance();
+    this.holdRepair.cancel(this.interactAnimator);
     this.camera.remove(this.irIlluminatorLight, this.irIlluminatorTarget);
     this.pdaDevice.dispose();
     this.grenadeSystem.dispose();

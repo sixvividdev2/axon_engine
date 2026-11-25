@@ -665,6 +665,9 @@ export class HideoutReadyRoom {
         emissiveMeshes: [keyboardDeck],
         linkedLights: [{ light: laptopScreenLight, dropFraction: 1.0 }],
         sparkOrigin: new THREE.Vector3(-10.82, 1.02, 0.04),
+        interactiveLinkId: 'ops_laptop',
+        repairable: true,
+        repairDurationSec: 2.1,
         onBreak: () => {
           this.laptopBroken = true;
           this.laptopScreenMat.emissiveIntensity = 0.14;
@@ -673,9 +676,14 @@ export class HideoutReadyRoom {
             this.laptopCanvas.width,
             this.laptopCanvas.height,
             'SIGNAL LOST',
-            'TERMINAL DAMAGED · RELOAD',
+            'TERMINAL DAMAGED · HOLD [F] TO REPAIR',
           );
           this.laptopTex.needsUpdate = true;
+        },
+        onRepair: () => {
+          this.laptopBroken = false;
+          this.laptopScreenMat.emissiveIntensity = 0.85;
+          this.redrawLaptopScreen();
         },
       },
       raycastMeshes,
@@ -787,6 +795,7 @@ export class HideoutReadyRoom {
       posZ: number,
       yawInward: number,
       onBreakCb: () => void,
+      onRepairCb?: () => void,
     ): {
       canvas: HTMLCanvasElement;
       ctx: CanvasRenderingContext2D;
@@ -847,7 +856,10 @@ export class HideoutReadyRoom {
           hitMeshes: [housing, screenPlane],
           emissiveMeshes: [],
           sparkOrigin: new THREE.Vector3(-16.0, 1.92, posZ),
+          repairable: true,
+          repairDurationSec: 2.0,
           onBreak: onBreakCb,
+          onRepair: onRepairCb,
         },
         raycastMeshes,
       );
@@ -868,9 +880,14 @@ export class HideoutReadyRoom {
           this.loadoutMonCanvas.width,
           this.loadoutMonCanvas.height,
           'NO SIGNAL',
-          'DISPLAY DAMAGED',
+          'DISPLAY DAMAGED · HOLD [F]',
         );
         this.loadoutMonTex.needsUpdate = true;
+      },
+      () => {
+        this.loadoutMonBroken = false;
+        this.loadoutMonMat.emissiveIntensity = 0.78;
+        this.redrawLoadoutMonitor();
       },
     );
     this.loadoutMonCanvas = loadoutMon.canvas;
@@ -891,9 +908,14 @@ export class HideoutReadyRoom {
           this.commsMonCanvas.width,
           this.commsMonCanvas.height,
           'LINK DOWN',
-          'DISPLAY DAMAGED',
+          'DISPLAY DAMAGED · HOLD [F]',
         );
         this.commsMonTex.needsUpdate = true;
+      },
+      () => {
+        this.commsMonBroken = false;
+        this.commsMonMat.emissiveIntensity = 0.78;
+        this.redrawCommsMonitor();
       },
     );
     this.commsMonCanvas = commsMon.canvas;
@@ -959,8 +981,14 @@ export class HideoutReadyRoom {
         hitMeshes: [rackBody, ...radioFaceMeshes],
         emissiveMeshes: radioFaceMeshes,
         sparkOrigin: new THREE.Vector3(rackX, 1.25, rackZ + 0.42),
+        repairable: true,
+        repairDurationSec: 2.1,
         onBreak: () => {
           this.radioBroken = true;
+          this.redrawCommsMonitor();
+        },
+        onRepair: () => {
+          this.radioBroken = false;
           this.redrawCommsMonitor();
         },
       },

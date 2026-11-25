@@ -3,6 +3,7 @@ import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment
 import { GunsmithBench } from '../arena/GunsmithBench';
 import { BodycamPhysicsWorld, BodycamSurfaceMaterial } from '../bodycam-sdk';
 import { PenetrableSurfaceSystem } from '../doors/PenetrableSurfaceSystem';
+import { HideoutElectronicsSystem } from '../hideout/HideoutElectronicsSystem';
 import { createGymTextures, createStencilSignTexture, GymTextureSet } from './GymTextures';
 
 export type GymZoneId =
@@ -60,12 +61,13 @@ export interface GymWorldHandle {
   paperTargets: PaperShootingTarget[];
   gunsmithBench: GunsmithBench;
   penetrableSurfaces: PenetrableSurfaceSystem;
+  electronics: HideoutElectronicsSystem;
   shatterBreakable: (
     object: THREE.Object3D,
     impactPoint: Readonly<THREE.Vector3>,
     impactDir: Readonly<THREE.Vector3>,
   ) => boolean;
-  updateDynamicTargets: (dt: number) => void;
+  updateDynamicTargets: (dt: number, listenerPos?: THREE.Vector3) => void;
   dispose: () => void;
 }
 
@@ -98,6 +100,7 @@ export function buildGymWorld(
   const steelTargets: ReactiveSteelTarget[] = [];
   const paperTargets: PaperShootingTarget[] = [];
   const penetrableSurfaces = new PenetrableSurfaceSystem(scene, { isSoftwareGl });
+  const electronics = new HideoutElectronicsSystem(scene);
 
   const trackGeo = <T extends THREE.BufferGeometry>(g: T): T => {
     ownedGeos.push(g);
@@ -711,13 +714,34 @@ export function buildGymWorld(
     material: 'concrete',
   });
 
-  // Dim red glowing EXIT sign above interior doorway
+  // Dim red glowing EXIT sign above interior doorway (breakable & repairable electronic)
   const exitMat = trackMat(
-    new THREE.MeshBasicMaterial({ color: 0xff3022 }),
+    new THREE.MeshStandardMaterial({
+      color: 0xff3022,
+      emissive: new THREE.Color(0xff2c1f),
+      emissiveIntensity: 1.6,
+      roughness: 0.35,
+    }),
   );
   const exitBar = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(0.72, 0.22, 0.08)), exitMat);
+  exitBar.name = 'gym_darkroom_exit_light';
   exitBar.position.set(-10.8, 2.68, -10.82);
   scene.add(exitBar);
+  electronics.registerNode(
+    {
+      id: 'gym_darkroom_exit_sign',
+      label: 'Darkroom Exit Light',
+      hitMeshes: [exitBar],
+      sparkOrigin: new THREE.Vector3(-10.8, 2.68, -10.82),
+      repairAnchor: new THREE.Vector3(-10.8, 1.55, -10.82),
+      emissiveMeshes: [exitBar],
+      linkedLights: [{ light: exitLight, dropFraction: 1.0 }],
+      isLightFixture: true,
+      repairable: true,
+      repairDurationSec: 1.9,
+    },
+    raycastMeshes,
+  );
 
   // Darkroom exterior sign + interior instructions
   addSign('HDR EXPOSURE DARKROOM', 'STEP INSIDE & LOOK OUT FOR IRIS + LENS DIRT FLARE', -10.8, 3.05, -10.18, 0, 3.9, 0.96, '#e0a938');
@@ -796,9 +820,41 @@ export function buildGymWorld(
   addSolidBox(3.2, 1.9, -22.5, 0.45, 3.8, 36.0, concreteWallMat, 'concrete'); // West range berm wall
   addSign('BALLISTICS RANGE', '9X19 · 5.45 · 5.56 · 7.62 REAL DROP & DRAG', 12.2, 3.9, -5.5, 0, 5.4, 1.15, '#e06c38');
 
-  // Overhead range baffle beams
+  // Overhead range baffle beams + breakable fluorescent worklamps
+  const worklampHousingGeo = trackGeo(new THREE.BoxGeometry(1.42, 0.09, 0.26));
+  const worklampTubeGeo = trackGeo(new THREE.BoxGeometry(1.32, 0.055, 0.16));
   for (const bz of [-8, -16, -24, -32]) {
     addSolidBox(13.5, 4.4, bz, 20.5, 0.45, 0.55, steelBeamMat, 'metal', false);
+    const tubeMat = trackMat(
+      new THREE.MeshStandardMaterial({
+        color: 0xe6f2ff,
+        emissive: new THREE.Color(0xd9e8f5),
+        emissiveIntensity: 1.5,
+        roughness: 0.25,
+      }),
+    );
+    const housing = new THREE.Mesh(worklampHousingGeo, steelBeamMat);
+    housing.position.set(12.0, 4.13, bz);
+    scene.add(housing);
+    const tube = new THREE.Mesh(worklampTubeGeo, tubeMat);
+    tube.name = `gym_range_worklamp_${Math.abs(bz)}`;
+    tube.position.set(12.0, 4.07, bz);
+    scene.add(tube);
+    electronics.registerNode(
+      {
+        id: `gym_range_lamp_${Math.abs(bz)}`,
+        label: 'Range Worklamp',
+        hitMeshes: [housing, tube],
+        sparkOrigin: new THREE.Vector3(12.0, 4.07, bz),
+        repairAnchor: new THREE.Vector3(12.0, 1.55, bz),
+        emissiveMeshes: [tube],
+        linkedLights: bz === -8 ? [{ light: rangeLight, dropFraction: 1.0 }] : [],
+        isLightFixture: true,
+        repairable: true,
+        repairDurationSec: 1.9,
+      },
+      raycastMeshes,
+    );
   }
 
   // Firing bench dividers (low tables at z = -5.4, height 0.92m with open gaps to walk downrange)
@@ -1064,6 +1120,12 @@ export function buildGymWorld(
   });
   addFloorPlaque('GUNSMITHING BENCH', 'LOOK + [F]: MODIFY FIREARM', 3.15, 16.55, '#e0a938');
 
+  electronics.autoRegisterSceneElectronics(scene, {
+    idPrefix: 'gym_auto_elec',
+    raycastMeshes,
+    lightMatchRadiusM: 6.0,
+  });
+
   physics.setRaycastMeshes(raycastMeshes);
 
   // Tumbling glass shards spawned when breakable windows shatter
@@ -1147,9 +1209,10 @@ export function buildGymWorld(
     return true;
   };
 
-  // Pendulum spring update for reactive AR500 steel plates + glass shards
-  const updateDynamicTargets = (dt: number) => {
+  // Pendulum spring update for reactive AR500 steel plates + glass shards + electronics
+  const updateDynamicTargets = (dt: number, listenerPos?: THREE.Vector3) => {
     const clampedDt = Math.min(dt, 0.05);
+    electronics.update(clampedDt, listenerPos);
     for (let i = 0; i < steelTargets.length; i++) {
       const st = steelTargets[i];
       // Damped harmonic pendulum return with realistic hinge stop
@@ -1204,9 +1267,11 @@ export function buildGymWorld(
     paperTargets,
     gunsmithBench,
     penetrableSurfaces,
+    electronics,
     shatterBreakable,
     updateDynamicTargets,
     dispose: () => {
+      electronics.dispose();
       penetrableSurfaces.dispose();
       for (const sh of glassShards) scene.remove(sh.mesh);
       glassShards.length = 0;

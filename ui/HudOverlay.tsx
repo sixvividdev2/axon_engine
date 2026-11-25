@@ -60,12 +60,28 @@ export const HudOverlay: React.FC<HudOverlayProps> = ({
 
       {/* Center Minimalist [F] Interaction Dot (no text clutter, no crosshair) */}
       <div className="pointer-events-none fixed inset-0 flex items-center justify-center">
-        {snapshot.mode === 'playing' && snapshot.interactionDotVisible && (
+        {snapshot.mode === 'playing' && snapshot.interactionDotVisible && !snapshot.repairPromptLabel && (
           <div className="flex items-center gap-1.5 text-[11px] font-mono-tabular text-neutral-100/90">
             <span className="h-1.5 w-1.5 rounded-full bg-amber-400" />
             <span className="rounded-xs bg-neutral-950/75 px-1.5 py-0.5 border border-white/15">
               F
             </span>
+          </div>
+        )}
+
+        {snapshot.mode === 'playing' && snapshot.pointerLocked && snapshot.repairPromptLabel && (
+          <div className="mt-16 flex flex-col items-center gap-1.5">
+            <div className="border border-amber-400/50 bg-neutral-950/85 px-2.5 py-1 text-[11px] font-mono-tabular uppercase tracking-wider text-amber-200">
+              {snapshot.repairPromptLabel}
+            </div>
+            {(snapshot.repairProgress ?? 0) > 0 && (
+              <div className="h-1.5 w-40 overflow-hidden bg-neutral-950/90 border border-amber-500/40">
+                <div
+                  className="h-full bg-amber-400 transition-[width] duration-75"
+                  style={{ width: `${Math.round((snapshot.repairProgress ?? 0) * 100)}%` }}
+                />
+              </div>
+            )}
           </div>
         )}
 

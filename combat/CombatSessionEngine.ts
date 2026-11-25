@@ -75,8 +75,16 @@ import {
 import { killfeedPreferenceStore } from '../data/killfeedSettings';
 import { loadoutStore } from '../data/loadoutStore';
 import { CombatantMatchStats } from '../data/progression';
+import { HoldRepairController } from '../doors/HoldRepairController';
 import { SaveManager } from '../engine/persistence/SaveManager';
+import {
+  createHorizonFogUniforms,
+  HorizonFogUniforms,
+  installHorizonFogOnSubtree,
+  updateHorizonFogUniforms,
+} from '../engine/world/HorizonFog';
 import { WeatherTimeSystem } from '../engine/world/WeatherTimeSystem';
+import type { BrokenElectronicRepairTarget } from '../hideout/HideoutElectronicsSystem';
 import { getMapDefinitionById } from '../maps/MapRegistry';
 import {
   BattleMatchConfig,
@@ -186,7 +194,7 @@ export interface SquadCommsMessage {
 
 export interface NearbyInteractPrompt {
   id: string;
-  kind: MapInteractable['kind'];
+  kind: MapInteractable['kind'] | 'electronic_repair' | 'door_repair';
   label: string;
   actionText: string;
   cost: number;
@@ -403,6 +411,15 @@ export class CombatSessionEngine {
   private readonly grenadeSystem: TacticalGrenadeSystem;
   private readonly pdaDevice: TacticalPdaDevice;
   private readonly interactAnimator = new PlayerInteractAnimator();
+  private readonly holdRepair = new HoldRepairController();
+  private nearbyBrokenElectronic: BrokenElectronicRepairTarget | null = null;
+  private readonly horizonFogUniforms: HorizonFogUniforms = createHorizonFogUniforms(220);
+  private unsubDistanceSettings: (() => void) | null = null;
+  private conquestSunLight: THREE.DirectionalLight | null = null;
+  private conquestShadowLastX = Number.NaN;
+  private conquestShadowLastZ = Number.NaN;
+  private conquestShadowAccumSec = 0;
+  private pdaHolsteredAccumSec = 0;
   private activeDoorId: string | null = null;
   private activeDoorPrompt: CombatDoorPromptState | null = null;
   private doorSelectedOptionIndex = 0;
@@ -694,9 +711,34 @@ export class CombatSessionEngine {
     this.map = mapDef.build(this.scene, this.renderer, this.isSoftwareGl, activeQuality, {
       battleRule: params.mode === 'battle' ? params.battleConfig.rule : undefined,
     });
-    if (this.map.isExpandedConquest) {
-      this.camera.far = 540;
-      this.camera.updateProjectionMatrix();
+    // Install AAA 15m horizon distance fog dissolve & apply user Render Distance setting
+    installHorizonFogOnSubtree(this.map.sceneGroup, this.horizonFogUniforms);
+    this.applyUserRenderDistance(graphicsQualityStore.getRenderDistanceM());
+    this.unsubDistanceSettings = graphicsQualityStore.subscribeDistanceSettings((settings) => {
+      this.applyUserRenderDistance(settings.renderDistanceM);
+    });
+
+    // Conquest & large outdoor map GPU shadow optimization:
+    // Tight camera-tracked shadow frustum + throttled delta refresh cuts per-frame shadow rasterization cost
+    if (this.map.isExpandedConquest && this.renderer.shadowMap.enabled) {
+      let foundSun: THREE.DirectionalLight | null = null;
+      this.scene.traverse((obj) => {
+        if (!foundSun && obj instanceof THREE.DirectionalLight && obj.castShadow) {
+          foundSun = obj;
+        }
+      });
+      if (foundSun) {
+        this.conquestSunLight = foundSun;
+        const sun = foundSun as THREE.DirectionalLight;
+        const halfExtent = 74;
+        sun.shadow.camera.left = -halfExtent;
+        sun.shadow.camera.right = halfExtent;
+        sun.shadow.camera.top = halfExtent;
+        sun.shadow.camera.bottom = -halfExtent;
+        sun.shadow.camera.updateProjectionMatrix();
+        this.renderer.shadowMap.autoUpdate = false;
+        this.renderer.shadowMap.needsUpdate = true;
+      }
     }
 
     // Audio
@@ -1015,6 +1057,10 @@ export class CombatSessionEngine {
         };
         this.mp.sendMessage(pkt as unknown as Record<string, unknown>);
       });
+    }
+
+    if (this.map.electronicsSystem) {
+      this.map.electronicsSystem.setAudioVolume(this.config.masterVolume);
     }
 
     this.syncBeltEquipmentMesh();
@@ -3295,6 +3341,16 @@ export class CombatSessionEngine {
       }
     }
 
+    // 0b. Break nearby electronics (light fixtures, monitors, consoles, perk machines) inside blast radius
+    if (
+      this.map.electronicsSystem &&
+      !ev.isTick &&
+      (ev.kind === 'frag' || ev.kind === 'thermite' || ev.kind === 'flash')
+    ) {
+      const elecBlastR = Math.max(ev.radiusM * 0.85, 5.5);
+      this.map.electronicsSystem.handleExplosion(ev.position, elecBlastR, this.camera.position);
+    }
+
     // 1. Battle AI Bots AoE blast (with 44-ray cover-occluded M67 fragmentation evaluator)
     if (this.params.mode === 'battle' && this.botAI && canApplyAuthorityDamage) {
       const attackerName = ev.sourceIsBot ? (ev.sourceName ?? 'BOT') : (this.mp?.localUsername ?? 'YOU');
@@ -3918,6 +3974,19 @@ export class CombatSessionEngine {
       }
       return;
     }
+    // Breakable & repairable map electronics (light fixtures, monitors, perk machines, power switches)
+    if (this.map.electronicsSystem && obj) {
+      const elecHit = this.map.electronicsSystem.handleImpact(
+        obj,
+        ev.point,
+        ev.normal ?? null,
+        this.camera.position,
+      );
+      if (elecHit) {
+        this.emitSnapshot();
+        return;
+      }
+    }
     if (ud?.destructibleDoorId && this.map.doorSystem) {
       this.map.doorSystem.applyBulletImpact(
         String(ud.destructibleDoorId),
@@ -3987,6 +4056,20 @@ export class CombatSessionEngine {
               ? 68
               : 52;
     const kbSpeed = isKick ? 7.8 : isKnife ? 3.2 : 4.6;
+
+    // Breakable map electronics melee bash
+    if (this.map.electronicsSystem && ev.object) {
+      const elecHit = this.map.electronicsSystem.handleImpact(
+        ev.object,
+        ev.point,
+        ev.normal ?? null,
+        this.camera.position,
+      );
+      if (elecHit) {
+        this.emitSnapshot();
+        return;
+      }
+    }
 
     // Physical Destructible Doors: melee bash/punch/kick -> exact geometric punch-through holes + hinge velocity
     if (ud?.destructibleDoorId && this.map.doorSystem) {
@@ -4613,8 +4696,54 @@ export class CombatSessionEngine {
   }
 
   private buildNearbyPrompt(): NearbyInteractPrompt | null {
+    // 1. Active Hold [F] two-handed repair (electronics or door) always takes top HUD priority
+    const activeRep = this.holdRepair.getState();
+    if (activeRep) {
+      return {
+        id: activeRep.targetId,
+        kind: activeRep.kind === 'DOOR_REPAIR' ? 'door_repair' : 'electronic_repair',
+        label: activeRep.label,
+        actionText: `Repairing ${activeRep.label}`,
+        cost: 0,
+        canAfford: true,
+        blockedReason: null,
+        isHoldAction: true,
+        holdProgress: activeRep.progress01,
+      };
+    }
+
+    // 2. Broken nearby electronic device (light fixture, terminal, perk machine, power switch)
+    if (this.nearbyBrokenElectronic) {
+      return {
+        id: this.nearbyBrokenElectronic.id,
+        kind: 'electronic_repair',
+        label: this.nearbyBrokenElectronic.label,
+        actionText: `Repair ${this.nearbyBrokenElectronic.label}`,
+        cost: 0,
+        canAfford: true,
+        blockedReason: null,
+        isHoldAction: true,
+        holdProgress: 0,
+      };
+    }
+
     const it = this.nearbyInteractable;
     if (!it) return null;
+
+    // If this interactive station's electronics are broken, require Hold [F] repair before use
+    if (this.map.electronicsSystem?.isInteractiveLinkBroken(it.id)) {
+      return {
+        id: it.id,
+        kind: 'electronic_repair',
+        label: it.label,
+        actionText: `Repair Damaged ${it.label}`,
+        cost: 0,
+        canAfford: true,
+        blockedReason: 'Electronics Damaged — Hold [F] to Repair',
+        isHoldAction: true,
+        holdProgress: 0,
+      };
+    }
 
     if (it.kind === 'buyable_door') {
       return {
@@ -4775,6 +4904,10 @@ export class CombatSessionEngine {
   private triggerInteract(): void {
     const it = this.nearbyInteractable;
     if (!it || this.params.mode !== 'infection') return;
+    if (this.map.electronicsSystem?.isInteractiveLinkBroken(it.id)) {
+      this.showToast(`${it.label} damaged — Hold [F] to repair`);
+      return;
+    }
 
     if (it.kind === 'buyable_door') {
       if (this.points < it.cost) {
@@ -5562,7 +5695,9 @@ export class CombatSessionEngine {
       case 'KeyF':
         this.interactKeyHeld = true;
         if (!e.repeat) {
-          if (this.activeDoorId && this.activeDoorPrompt) {
+          if (this.tryStartHoldRepair()) {
+            // Started realistic two-handed Hold [F] electronics or door repair
+          } else if (this.activeDoorId && this.activeDoorPrompt) {
             this.executeSelectedDoorOption();
           } else if (this.params.mode === 'infection' && this.nearbyInteractable) {
             // Window barriers use continuous Hold [F] repair; all other interactables trigger on press
@@ -6115,6 +6250,10 @@ export class CombatSessionEngine {
         this.repairingBarrierId = null;
         this.barrierRepairProgress = 0;
         this.barrierRepairPendingRequest = false;
+        if (this.holdRepair.isActive()) {
+          this.holdRepair.cancel(this.interactAnimator);
+          this.emitSnapshot();
+        }
         break;
       case 'Space':
         this.input.vault = false;
@@ -6383,6 +6522,11 @@ export class CombatSessionEngine {
 
     // Step player controller, 3D PDA telemetry + choreography, & IK animator
     if (this.playerAlive) {
+      if (this.holdRepair.isActive()) {
+        this.input.ads = false;
+        this.input.sprint = false;
+      }
+      this.controller.setHeartRateBpm(this.heartRateBpm);
       this.controller.setGrenadeTension(
         this.grenadeSystem.getCharge01(),
         this.grenadeSystem.isLeverReleased(),
@@ -6406,7 +6550,22 @@ export class CombatSessionEngine {
       if (this.lastKickHandlingTimer > 0) {
         this.lastKickHandlingTimer = Math.max(0, this.lastKickHandlingTimer - dt);
       }
-      if (this.interactAnimator.isActive()) {
+      // Step active Hold [F] electronics or door two-handed repair
+      if (this.holdRepair.isActive()) {
+        const completed = this.holdRepair.step(
+          dt,
+          this.interactKeyHeld && this.pointerLocked,
+          this.camera.position,
+          this.camera,
+          this.interactAnimator,
+        );
+        this.animator.setExternalHandOverride(
+          this.interactAnimator.isActive() ? this.interactAnimator.ikOverride : null,
+        );
+        if (completed) {
+          this.emitSnapshot();
+        }
+      } else if (this.interactAnimator.isActive()) {
         const active = this.interactAnimator.update(dt, this.camera);
         this.animator.setExternalHandOverride(active ? this.interactAnimator.ikOverride : null);
       } else {
@@ -6544,15 +6703,35 @@ export class CombatSessionEngine {
       this.remotePlayers.update(dt, this.camera.position, this.worldOnlyRaycastFn ?? undefined);
     }
 
-    // Step map animated fixtures, physical destructible doors & dynamic 5x weather/day-night system
+    // Step map animated fixtures, physical destructible doors, breakable electronics & dynamic 5x weather/day-night system
     this.map.update?.(dt, this.elapsedSec);
     this.map.penetrableSystem?.update(dt, this.camera.position);
+    if (this.map.electronicsSystem) {
+      this.map.electronicsSystem.update(dt, this.camera.position);
+      this.camera.getWorldPosition(this._doorCamPos);
+      this.camera.getWorldDirection(this._doorCamDir).normalize();
+      this.nearbyBrokenElectronic =
+        this.playerAlive && !this.holdRepair.isActive()
+          ? this.map.electronicsSystem.findBrokenRepairTarget(this._doorCamPos, this._doorCamDir, 2.95)
+          : null;
+    } else {
+      this.nearbyBrokenElectronic = null;
+    }
     if (this.map.doorSystem) {
       this.map.doorSystem.update(dt, this.camera.position);
       this.updateDoorInteractScan();
     }
     if (this.weatherTime) {
       this.weatherTime.update(dt, this.camera.position, this.isMpHost || !this.mp);
+    }
+    // Sync AAA 15m horizon fog color with active scene fog + step throttled Conquest directional shadow camera
+    updateHorizonFogUniforms(
+      this.horizonFogUniforms,
+      graphicsQualityStore.getRenderDistanceM(),
+      this.scene,
+    );
+    this.updateConquestShadowCamera(dt);
+    if (this.weatherTime) {
       if (this.mp && this.isMpHost) {
         this.envSyncAccum += dt;
         if (this.envSyncAccum >= 1.0) {
@@ -7422,6 +7601,11 @@ export class CombatSessionEngine {
     const optId = opts[idx].id as DoorInteractOptionId;
     const doorId = this.activeDoorId;
 
+    if (optId === 'repair') {
+      this.startDoorHoldRepair(doorId, this.activeDoorPrompt.targetLabel);
+      return;
+    }
+
     this.camera.getWorldPosition(this._doorCamPos);
     this.camera.getWorldDirection(this._doorCamDir).normalize();
     this.controller.getVelocity(this._doorVelScratch);
@@ -7483,7 +7667,148 @@ export class CombatSessionEngine {
     this.emitSnapshot();
   }
 
+  private applyUserRenderDistance(renderDistM: number): void {
+    const clamped = THREE.MathUtils.clamp(renderDistM, 100, 400);
+    // Keep camera.far slightly beyond renderDist so the 15m AAA horizon fog smoothly finishes fading before the far plane
+    this.camera.far = clamped + 14;
+    this.camera.updateProjectionMatrix();
+    updateHorizonFogUniforms(this.horizonFogUniforms, clamped, this.scene);
+  }
+
+  private updateConquestShadowCamera(dt: number): void {
+    if (!this.conquestSunLight || !this.renderer.shadowMap.enabled) return;
+    this.conquestShadowAccumSec += dt;
+    const px = this.controller.position.x;
+    const pz = this.controller.position.z;
+    const moved =
+      Number.isNaN(this.conquestShadowLastX) ||
+      Math.hypot(px - this.conquestShadowLastX, pz - this.conquestShadowLastZ) >= 2.0;
+
+    if ((moved && this.conquestShadowAccumSec >= 0.085) || this.conquestShadowAccumSec >= 0.45) {
+      this.conquestShadowAccumSec = 0;
+      this.conquestShadowLastX = px;
+      this.conquestShadowLastZ = pz;
+      const sun = this.conquestSunLight;
+      // Preserve directional sun angle while centering the shadow frustum around the player
+      const ox = sun.position.x - sun.target.position.x;
+      const oy = sun.position.y - sun.target.position.y;
+      const oz = sun.position.z - sun.target.position.z;
+      sun.target.position.set(px, 0, pz);
+      sun.position.set(px + ox, oy, pz + oz);
+      sun.target.updateMatrixWorld();
+      this.renderer.shadowMap.needsUpdate = true;
+    }
+  }
+
+  private tryStartHoldRepair(): boolean {
+    if (!this.playerAlive || this.holdRepair.isActive()) return false;
+
+    // Priority 1: Selected door 'repair' option
+    if (this.activeDoorId && this.activeDoorPrompt && this.map.doorSystem) {
+      const opts = this.activeDoorPrompt.options;
+      const idx = THREE.MathUtils.clamp(this.doorSelectedOptionIndex, 0, Math.max(0, opts.length - 1));
+      if (opts[idx]?.id === 'repair') {
+        this.startDoorHoldRepair(this.activeDoorId, this.activeDoorPrompt.targetLabel);
+        return true;
+      }
+    }
+
+    // Priority 2: Broken interactive station in Infection (power switch, perk machine, mystery crate)
+    const it = this.nearbyInteractable;
+    if (it && this.map.electronicsSystem?.isInteractiveLinkBroken(it.id)) {
+      const node = this.map.electronicsSystem.getNodeByLinkId(it.id);
+      if (node && node.broken) {
+        this.startElectronicsHoldRepair(node.id, node.label, node.anchorPos, node.durationSec);
+        return true;
+      }
+    }
+
+    // Priority 3: Any nearby broken electronic device (light fixture, monitor, console)
+    if (this.nearbyBrokenElectronic && this.map.electronicsSystem) {
+      const target = this.nearbyBrokenElectronic;
+      this.startElectronicsHoldRepair(target.id, target.label, target.anchorPos, target.durationSec);
+      return true;
+    }
+
+    return false;
+  }
+
+  private startElectronicsHoldRepair(
+    nodeId: string,
+    label: string,
+    anchorPos: Readonly<THREE.Vector3>,
+    durationSec: number,
+  ): void {
+    if (!this.map.electronicsSystem) return;
+    this.animator.interruptInspect();
+    this.input.ads = false;
+    this.holdRepair.start(
+      {
+        kind: 'ELECTRONICS_REPAIR',
+        targetId: nodeId,
+        label,
+        durationSec,
+        anchorPos,
+        dynamicAnchorProvider: (out) =>
+          Boolean(this.map.electronicsSystem?.getRepairAnchorWorldPos(nodeId, out)),
+        onWorkTick: (phaseIdx, pos) => {
+          this.map.electronicsSystem?.playRepairWorkTick(pos, phaseIdx);
+        },
+        onComplete: () => {
+          if (this.map.electronicsSystem?.repairNode(nodeId, this.camera.position)) {
+            this.showToast(`Repaired ${label}`);
+          }
+        },
+      },
+      this.interactAnimator,
+    );
+    this.emitSnapshot();
+  }
+
+  private startDoorHoldRepair(doorId: string, label: string): void {
+    if (!this.map.doorSystem) return;
+    this.animator.interruptInspect();
+    this.input.ads = false;
+    const anchor = this._doorIkPos;
+    if (!this.map.doorSystem.getRepairAnchorWorldPos(doorId, anchor)) {
+      this.camera.getWorldPosition(anchor);
+    }
+    this.holdRepair.start(
+      {
+        kind: 'DOOR_REPAIR',
+        targetId: doorId,
+        label: label || 'Door',
+        durationSec: 2.3,
+        anchorPos: anchor,
+        dynamicAnchorProvider: (out) =>
+          Boolean(this.map.doorSystem?.getRepairAnchorWorldPos(doorId, out)),
+        onWorkTick: () => {
+          this.map.doorSystem?.playRepairWorkTick(doorId);
+        },
+        onComplete: () => {
+          this.map.doorSystem?.executeOption(doorId, 'repair', {
+            actorPos: this.camera.position,
+            actorTeam: this.localBattleTeam,
+          });
+          this.showToast(`Repaired ${label || 'Door'}`);
+        },
+      },
+      this.interactAnimator,
+    );
+    this.emitSnapshot();
+  }
+
   private updatePdaTelemetry(dt: number): void {
+    // Throttle PDA telemetry assembly to 1 Hz while holstered to eliminate per-frame GC in Conquest
+    if (!this.pdaDevice.isOpen()) {
+      this.pdaHolsteredAccumSec += dt;
+      if (this.pdaHolsteredAccumSec < 1.0) {
+        return;
+      }
+      this.pdaHolsteredAccumSec = 0;
+    } else {
+      this.pdaHolsteredAccumSec = 0;
+    }
     this._pdaAllyBuf.length = 0;
     if (this.botAI) {
       const allyBots = this.botAI.getAliveAllyTargets();
@@ -7566,6 +7891,9 @@ export class CombatSessionEngine {
     this.unsubOperatorGear = null;
     this.unsubAdaptiveScaling?.();
     this.unsubAdaptiveScaling = null;
+    this.unsubDistanceSettings?.();
+    this.unsubDistanceSettings = null;
+    this.holdRepair.cancel(this.interactAnimator);
     this.camera.remove(this.irIlluminatorLight);
     this.camera.remove(this.irIlluminatorTarget);
     if (document.pointerLockElement === this.renderer.domElement) {

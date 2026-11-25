@@ -465,7 +465,9 @@ export type SyncedHandlingAction =
   | 'DOOR_CLOSE_PUSH'
   | 'DOOR_CLOSE_SOFT'
   | 'DOOR_KICK'
-  | 'PROP_INTERACT';
+  | 'PROP_INTERACT'
+  | 'ELECTRONICS_REPAIR'
+  | 'DOOR_REPAIR';
 
 export const VALID_SYNCED_HANDLING_ACTIONS: ReadonlySet<SyncedHandlingAction> = new Set([
   'NONE',
@@ -493,6 +495,8 @@ export const VALID_SYNCED_HANDLING_ACTIONS: ReadonlySet<SyncedHandlingAction> = 
   'DOOR_CLOSE_SOFT',
   'DOOR_KICK',
   'PROP_INTERACT',
+  'ELECTRONICS_REPAIR',
+  'DOOR_REPAIR',
 ]);
 
 export interface SyncedWeaponAttachments {

@@ -9,6 +9,7 @@ import {
 } from '../../bodycam-sdk/character/FacialExpressionController';
 import { BodycamMeleeHitEvent } from '../../bodycam-sdk/types';
 import { AI_ARCHETYPES, AiArchetypeId, AiArchetypeSpec } from '../../data/aiArchetypes';
+import { graphicsQualityStore } from '../../data/graphicsQuality';
 import { LimbId } from '../../data/traumaConfig';
 import { AudioEngine } from '../audio/AudioEngine';
 import { AcousticEvent, AcousticSystem } from '../stealth/AcousticSystem';
@@ -744,6 +745,8 @@ export class ZombieManager {
     }
   }
 
+  private animFrameTick = 0;
+
   public update(
     delta: number,
     nowMs: number,
@@ -756,8 +759,11 @@ export class ZombieManager {
   ): void {
     this.lastWorldRef = world;
     const dt = Math.min(delta, 0.05);
+    this.animFrameTick = (this.animFrameTick + 1) & 0x7fffffff;
+    const reduceAnimDistM = graphicsQualityStore.getReduceAnimationDistanceM();
 
-    for (const z of this.zombies) {
+    for (let zIdx = 0; zIdx < this.zombies.length; zIdx++) {
+      const z = this.zombies[zIdx];
       if (z.state === 'DEAD') {
         if (z.deathProgress < 1) {
           z.deathProgress = Math.min(1, z.deathProgress + dt * 3.8);
@@ -973,29 +979,36 @@ export class ZombieManager {
             });
           }
         }
-        const leftAmp = 0.52 * (1 - mod.leftLegImpairment * 0.58);
-        const rightAmp = 0.52 * (1 - mod.rightLegImpairment * 0.58);
+        const beyondReduceAnim = distToPlayer > reduceAnimDistM;
+        const animateLimbsNow = !beyondReduceAnim || ((zIdx + this.animFrameTick) & 1) === 0;
         const swingPhase = Math.sin(z.gaitPhase);
-        z.leftLeg.rotation.x = swingPhase * leftAmp;
-        z.rightLeg.rotation.x = -swingPhase * rightAmp;
-        z.leftArm.rotation.x = baseArmPitchL + Math.cos(z.gaitPhase) * armAmpL + armTremor;
-        z.rightArm.rotation.x = baseArmPitchR - Math.cos(z.gaitPhase) * armAmpR - armTremor;
+        if (animateLimbsNow) {
+          const leftAmp = 0.52 * (1 - mod.leftLegImpairment * 0.58);
+          const rightAmp = 0.52 * (1 - mod.rightLegImpairment * 0.58);
+          z.leftLeg.rotation.x = swingPhase * leftAmp;
+          z.rightLeg.rotation.x = -swingPhase * rightAmp;
+          z.leftArm.rotation.x = baseArmPitchL + Math.cos(z.gaitPhase) * armAmpL + armTremor;
+          z.rightArm.rotation.x = baseArmPitchR - Math.cos(z.gaitPhase) * armAmpR - armTremor;
+        }
 
         // Asymmetric limp lean & hip drop synced to injured side stance
         const limpStanceWeight = Math.max(0, -mod.asymmetricLimpDip * swingPhase);
         limpDropY = -limpStanceWeight * 0.095;
-        z.group.rotation.z = THREE.MathUtils.damp(
-          z.group.rotation.z,
-          mod.asymmetricLimpDip * 0.18 * (0.6 + 0.4 * Math.abs(swingPhase)),
-          10,
-          dt,
-        );
-      } else {
-        z.leftLeg.rotation.x = THREE.MathUtils.damp(z.leftLeg.rotation.x, 0, 8, dt);
-        z.rightLeg.rotation.x = THREE.MathUtils.damp(z.rightLeg.rotation.x, 0, 8, dt);
-        z.leftArm.rotation.x = THREE.MathUtils.damp(z.leftArm.rotation.x, baseArmPitchL + armTremor, 8, dt);
-        z.rightArm.rotation.x = THREE.MathUtils.damp(z.rightArm.rotation.x, baseArmPitchR - armTremor, 8, dt);
-        z.group.rotation.z = THREE.MathUtils.damp(z.group.rotation.z, mod.asymmetricLimpDip * 0.08, 8, dt);
+        if (animateLimbsNow) {
+          z.group.rotation.z = THREE.MathUtils.damp(
+            z.group.rotation.z,
+            mod.asymmetricLimpDip * 0.18 * (0.6 + 0.4 * Math.abs(swingPhase)),
+            10,
+            beyondReduceAnim ? dt * 2.0 : dt,
+          );
+        }
+      } else if (distToPlayer <= reduceAnimDistM || ((zIdx + this.animFrameTick) & 1) === 0) {
+        const idleAnimDt = distToPlayer > reduceAnimDistM ? dt * 2.0 : dt;
+        z.leftLeg.rotation.x = THREE.MathUtils.damp(z.leftLeg.rotation.x, 0, 8, idleAnimDt);
+        z.rightLeg.rotation.x = THREE.MathUtils.damp(z.rightLeg.rotation.x, 0, 8, idleAnimDt);
+        z.leftArm.rotation.x = THREE.MathUtils.damp(z.leftArm.rotation.x, baseArmPitchL + armTremor, 8, idleAnimDt);
+        z.rightArm.rotation.x = THREE.MathUtils.damp(z.rightArm.rotation.x, baseArmPitchR - armTremor, 8, idleAnimDt);
+        z.group.rotation.z = THREE.MathUtils.damp(z.group.rotation.z, mod.asymmetricLimpDip * 0.08, 8, idleAnimDt);
       }
 
       // Expressive stagger body language: head-snap vs kick stumble recovery

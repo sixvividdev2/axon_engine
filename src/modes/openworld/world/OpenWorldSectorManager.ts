@@ -137,7 +137,8 @@ export interface OpenWorldInteractableContext {
     | 'corpse'
     | 'wildlife_harvest'
     | 'convoy_hijack'
-    | 'world_event_crate';
+    | 'world_event_crate'
+    | 'electronic_repair';
   id: string;
   label: string;
   sublabel: string;
@@ -145,6 +146,8 @@ export interface OpenWorldInteractableContext {
   canExecute: boolean;
   blockedReason?: string;
   subFactionId?: SubFactionId;
+  holdToRepair?: boolean;
+  repairProgress?: number;
 }
 
 const SECTOR_CAPTURE_RADIUS_M = 48;
@@ -478,6 +481,11 @@ export class OpenWorldSectorManager {
 
       const beaconMesh = new THREE.Mesh(beaconGeo, beaconMat);
       beaconMesh.position.y = lm.poiRole === 'comms_tower' ? 24.4 : 12.23;
+      beaconMesh.name = `sector_beacon_lamp_${lm.id}`;
+      beaconMesh.userData.electronicKind = 'beacon';
+      beaconMesh.userData.electronicLabel = `${lm.shortLabel} Sector Beacon`;
+      beaconMesh.userData.electronicHp = 28;
+      beaconMesh.userData.repairable = true;
 
       const radioCrate = new THREE.Mesh(crateGeo, crateMat);
       radioCrate.position.set(1.4, 0.705, 0.8);
@@ -524,8 +532,17 @@ export class OpenWorldSectorManager {
 
         const desk = new THREE.Mesh(fobConsoleDeskGeo, caseMat);
         desk.position.y = 0.48;
-        const screen = new THREE.Mesh(fobScreenGeo, fobScreenMat);
+        const localFobScreenMat = fobScreenMat.clone();
+        this.sharedMaterials.push(localFobScreenMat);
+        const screen = new THREE.Mesh(fobScreenGeo, localFobScreenMat);
+        screen.name = `fob_terminal_screen_${lm.id}`;
         screen.position.set(0, 1.32, -0.18);
+        screen.userData.electronicKind = 'screen';
+        screen.userData.electronicLabel = `${lm.shortLabel} FOB Command Terminal`;
+        screen.userData.electronicHp = 45;
+        screen.userData.interactiveLinkId = `fob_terminal:${lm.id}`;
+        screen.userData.repairable = true;
+        screen.userData.repairDurationSec = 2.2;
         const ant = new THREE.Mesh(antennaGeo, steelMat);
         ant.position.set(0.95, 1.65, -0.2);
         termGroup.add(desk, screen, ant);
@@ -625,8 +642,17 @@ export class OpenWorldSectorManager {
         marketGroup.position.set(subFactionMarketX, marketY, subFactionMarketZ);
         const bmDesk = new THREE.Mesh(caseGeo, caseMat);
         bmDesk.position.y = 0.28;
-        const bmScreen = new THREE.Mesh(laptopLidGeo, blackMarketScreenMat);
+        const localBmMat = blackMarketScreenMat.clone();
+        this.sharedMaterials.push(localBmMat);
+        const bmScreen = new THREE.Mesh(laptopLidGeo, localBmMat);
+        bmScreen.name = `black_market_screen_${lm.id}`;
         bmScreen.position.set(0, 0.74, -0.14);
+        bmScreen.userData.electronicKind = 'screen';
+        bmScreen.userData.electronicLabel = `${lm.shortLabel} Black-Market Terminal`;
+        bmScreen.userData.electronicHp = 35;
+        bmScreen.userData.interactiveLinkId = `subfaction_black_market:${lm.id}`;
+        bmScreen.userData.repairable = true;
+        bmScreen.userData.repairDurationSec = 2.0;
         marketGroup.add(bmDesk, bmScreen);
         this.rootGroup.add(marketGroup);
       }
@@ -652,8 +678,15 @@ export class OpenWorldSectorManager {
         });
         this.sharedMaterials.push(contractScreenMat);
         const lid = new THREE.Mesh(laptopLidGeo, contractScreenMat);
+        lid.name = `contract_terminal_screen_${contractId}`;
         lid.position.set(0, 0.72, -0.18);
         lid.rotation.x = -0.22;
+        lid.userData.electronicKind = 'screen';
+        lid.userData.electronicLabel = `${lm.shortLabel} Contract Terminal`;
+        lid.userData.electronicHp = 35;
+        lid.userData.interactiveLinkId = `contract:${contractId}`;
+        lid.userData.repairable = true;
+        lid.userData.repairDurationSec = 2.0;
         const ant = new THREE.Mesh(antennaGeo, steelMat);
         ant.position.set(0.36, 0.9, -0.22);
 

@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { BodycamAudio } from '../bodycam-sdk';
+import { graphicsQualityStore } from '../data/graphicsQuality';
 import {
   BuiltMapInstance,
   findNavPath,
@@ -1385,6 +1386,8 @@ export class InfectionZombieAI {
     return true;
   }
 
+  private animFrameTick = 0;
+
   public update(
     dt: number,
     playerPos: Readonly<THREE.Vector3>,
@@ -1396,6 +1399,8 @@ export class InfectionZombieAI {
     onBarrierChanged?: (barrierId: string, planksRemaining: number) => void,
   ): void {
     this.elapsedSec += dt;
+    this.animFrameTick = (this.animFrameTick + 1) & 0x7fffffff;
+    const reduceAnimDistM = graphicsQualityStore.getReduceAnimationDistanceM();
 
     // 1. Update blood burst InstancedMesh
     let anyBloodMoved = false;
@@ -2160,26 +2165,30 @@ export class InfectionZombieAI {
       // Solve ground plane (floor normal + bone-height root lift + oriented capsule) & apply root transform
       this.applyActorRootTransform(z, dt);
 
-      this._poseInput.mode =
-        windupProgress > 0.01 ? 'windup' : staggerRatio > 0.05 ? 'stagger' : 'locomote';
-      this._poseInput.walkCycle = z.walkCycle;
-      this._poseInput.speedMps = isCrawler && crawlerActivelyMoving ? Math.max(spd, z.speed * 0.65) : spd;
-      this._poseInput.tearPhase = 0;
-      this._poseInput.vaultT = 0;
-      this._poseInput.windupProgress = windupProgress;
-      this._poseInput.staggerRatio = staggerRatio;
-      this._poseInput.deathProgress = 0;
-      this._poseInput.elapsedSec = this.elapsedSec;
-      this._poseInput.dt = dt;
-      this._poseInput.gazeTargetWorld = nearestTarget ? nearestTarget.pos : playerPos;
-      this._poseInput.distanceToCameraM = Math.hypot(
+      const distToCam = Math.hypot(
         z.pos.x - playerPos.x,
         z.pos.y - playerPos.y,
         z.pos.z - playerPos.z,
       );
-      this._poseInput.isVisible = z.root.visible;
-      this._poseInput.variant = z.variant;
-      this.rigLib.applyPose(z.rig, this._poseInput);
+      const beyondReduceAnim = distToCam > reduceAnimDistM;
+      if (!beyondReduceAnim || ((i + this.animFrameTick) & 1) === 0) {
+        this._poseInput.mode =
+          windupProgress > 0.01 ? 'windup' : staggerRatio > 0.05 ? 'stagger' : 'locomote';
+        this._poseInput.walkCycle = z.walkCycle;
+        this._poseInput.speedMps = isCrawler && crawlerActivelyMoving ? Math.max(spd, z.speed * 0.65) : spd;
+        this._poseInput.tearPhase = 0;
+        this._poseInput.vaultT = 0;
+        this._poseInput.windupProgress = windupProgress;
+        this._poseInput.staggerRatio = staggerRatio;
+        this._poseInput.deathProgress = 0;
+        this._poseInput.elapsedSec = this.elapsedSec;
+        this._poseInput.dt = beyondReduceAnim ? dt * 2.0 : dt;
+        this._poseInput.gazeTargetWorld = nearestTarget ? nearestTarget.pos : playerPos;
+        this._poseInput.distanceToCameraM = distToCam;
+        this._poseInput.isVisible = z.root.visible;
+        this._poseInput.variant = z.variant;
+        this.rigLib.applyPose(z.rig, this._poseInput);
+      }
     }
 
     // 4. Distance-prioritized horror-mix spatial audio scheduler (6 closest zombies)

@@ -290,4 +290,6 @@ export interface GameSnapshot {
   };
   throwableStatusLabel?: string;
   throwableLiveFuse?: boolean;
+  repairPromptLabel?: string | null;
+  repairProgress?: number;
 }

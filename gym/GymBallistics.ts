@@ -83,12 +83,14 @@ export class GymBallistics {
     adapter: IBodycamWorldAdapter,
     onHit?: (info: GymBallisticHitInfo) => void,
     flybyCtx?: BallisticFlybyContext,
+    onRawImpact?: (ev: Readonly<BallisticImpactEvent>) => void,
   ): void {
     const clampedDt = Math.min(dt, 0.05);
     this.solver.update(
       clampedDt,
       adapter,
       (ev) => {
+        if (onRawImpact) onRawImpact(ev);
         this.handleSolverImpact(ev, onHit);
       },
       flybyCtx,

@@ -544,7 +544,7 @@ export class DestructibleDoorSystem {
       height: rawSpec.height ?? 2.24,
       thickness: rawSpec.thickness ?? 0.07,
       maxOpenRad: rawSpec.maxOpenRad ?? THREE.MathUtils.degToRad(104),
-      repairable: rawSpec.repairable ?? false,
+      repairable: rawSpec.repairable ?? true,
       style: rawSpec.style ?? 'bunker_wood',
       addFrameJamb: rawSpec.addFrameJamb ?? true,
     };
@@ -1034,8 +1034,11 @@ export class DestructibleDoorSystem {
     if (!d) return [];
 
     if (d.hingeMode !== 'attached') {
-      return d.spec.repairable ? [{ id: 'repair', label: 'Repair Door' }] : [];
+      return d.spec.repairable ? [{ id: 'repair', label: 'Repair Door', hint: 'Hold [F]' }] : [];
     }
+
+    const damagedRepairable =
+      d.spec.repairable && (d.damageState > 0 || d.chipDamage >= 12);
 
     if (d.latched) {
       const smash = isSprinting || horizontalSpeedMps >= SPRINT_DESTROY_SPEED_MPS;
@@ -1048,11 +1051,15 @@ export class DestructibleDoorSystem {
       } else {
         kickHint = smash ? 'Shatter' : 'Rattle Frame';
       }
-      return [
+      const opts: DoorInteractOption[] = [
         { id: 'open', label: 'Open' },
         { id: 'peek', label: 'Peek', hint: 'Quiet' },
         { id: 'kick', label: 'Kick', hint: kickHint },
       ];
+      if (damagedRepairable) {
+        opts.push({ id: 'repair', label: 'Repair Door', hint: 'Hold [F]' });
+      }
+      return opts;
     }
 
     // Door is open / unlatched: Close (fast push), Close (Soft doorknob), plus Open ONLY if not already fully open
@@ -1064,7 +1071,37 @@ export class DestructibleDoorSystem {
     if (openRatio < 0.82) {
       opts.push({ id: 'open', label: 'Open' });
     }
+    if (damagedRepairable) {
+      opts.push({ id: 'repair', label: 'Repair Door', hint: 'Hold [F]' });
+    }
     return opts;
+  }
+
+  public isDoorNeedsRepair(doorId: string): boolean {
+    const d = this.doors.get(doorId);
+    if (!d || !d.spec.repairable) return false;
+    return d.hingeMode !== 'attached' || d.damageState > 0 || d.chipDamage >= 12;
+  }
+
+  public getRepairAnchorWorldPos(doorId: string, outPos: THREE.Vector3): boolean {
+    const d = this.doors.get(doorId);
+    if (!d) return false;
+    const worldYaw = d.spec.closedYawRad + (d.hingeMode === 'attached' ? d.angleRad : 0);
+    outPos.set(
+      d.spec.hingePos[0] + Math.cos(worldYaw) * (d.spec.width * 0.42),
+      d.spec.hingePos[1] + Math.min(1.28, d.spec.height * 0.56),
+      d.spec.hingePos[2] - Math.sin(worldYaw) * (d.spec.width * 0.42),
+    );
+    return true;
+  }
+
+  public playRepairWorkTick(doorId: string): void {
+    const d = this.doors.get(doorId);
+    if (!d) return;
+    const centerPos = this._tmpV3;
+    this.getRepairAnchorWorldPos(doorId, centerPos);
+    const distM = centerPos.distanceTo(this.listenerPos);
+    this.synth.play(d.spec.style === 'tactical_reinforced' ? 'latch_soft' : 'repair', distM);
   }
 
   /** Returns the world position of the doorknob facing the actor (for 1P/3P IK) */

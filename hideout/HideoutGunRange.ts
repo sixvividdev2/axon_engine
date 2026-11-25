@@ -794,11 +794,17 @@ export class HideoutGunRange {
         hitMeshes: [consoleChassis, consoleBezel, startBtn, resetBtn],
         emissiveMaterials: [startBtnMat, resetBtnMat],
         sparkOrigin: new THREE.Vector3(8.45, 1.14, 2.86),
+        interactiveLinkId: 'range_console',
+        repairable: true,
+        repairDurationSec: 2.0,
         onBreak: () => {
           this.consoleBroken = true;
           if (this.isCourseRunning()) {
             this.abortCourse();
           }
+        },
+        onRepair: () => {
+          this.consoleBroken = false;
         },
       },
       raycastMeshes,
@@ -937,9 +943,15 @@ export class HideoutGunRange {
         hitMeshes: [casing, screen],
         sparkOrigin: new THREE.Vector3(19.2, 3.64, 8.28),
         isLightFixture: true,
+        repairable: true,
+        repairDurationSec: 2.1,
         onBreak: () => {
           this.scoreboardBroken = true;
           this.drawBrokenScoreboard();
+        },
+        onRepair: () => {
+          this.scoreboardBroken = false;
+          this.redrawScoreboard(true);
         },
       },
       raycastMeshes,

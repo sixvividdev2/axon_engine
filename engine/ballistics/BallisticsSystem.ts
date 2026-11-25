@@ -106,6 +106,11 @@ export class BallisticsSystem {
       dir: THREE.Vector3,
       pos: THREE.Vector3,
     ) => void,
+    onWorldImpact?: (
+      obj: THREE.Object3D,
+      point: THREE.Vector3,
+      normal: THREE.Vector3,
+    ) => void,
   ): void {
     const dt = Math.min(delta, 0.04);
     const targets = playerSelfHitMeshes && playerSelfHitMeshes.length > 0
@@ -218,6 +223,9 @@ export class BallisticsSystem {
         }
 
         // Stop on solid obstacle
+        if (onWorldImpact) {
+          onWorldImpact(obj, hit.point, normal);
+        }
         const audioMat = surface === 'metal' ? 'metal' : surface === 'wood' ? 'wood' : 'concrete';
         this.audio.playImpact(hit.point, audioMat);
         this.spawnImpactParticles(hit.point, normal, surface);

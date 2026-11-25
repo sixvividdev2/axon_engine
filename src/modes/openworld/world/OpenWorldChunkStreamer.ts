@@ -1095,6 +1095,12 @@ export class OpenWorldChunkStreamer {
     }
   }
 
+  private renderDistanceM = 300;
+
+  public setRenderDistance(renderDistM: number): void {
+    this.renderDistanceM = THREE.MathUtils.clamp(renderDistM, 120, 700);
+  }
+
   public applyQualityProfile(profile: GraphicsQualityProfile, rebuildExisting = false): void {
     const prevShadows = this.shadowsEnabled;
     const prevDensity = this.propDensityScale;
@@ -2060,16 +2066,26 @@ export class OpenWorldChunkStreamer {
     let occludedChunks = 0;
     let occludedObjects = 0;
 
+    const maxChunkDist = this.renderDistanceM + 16.0;
+    const microCutoff = Math.min(140.0, this.renderDistanceM * 0.52);
+    const shadowCutoff = Math.min(95.0, this.renderDistanceM * 0.36);
+
     for (const rec of this.loadedChunks.values()) {
       const dx = Math.max(0, Math.abs(playerX - rec.centerX) - halfChunk);
       const dz = Math.max(0, Math.abs(playerZ - rec.centerZ) - halfChunk);
       const nearDist = Math.hypot(dx, dz);
 
+      if (nearDist > maxChunkDist) {
+        rec.group.visible = false;
+        culledChunks++;
+        continue;
+      }
+
       _paddedBox.min.set(rec.bounds.min.x - 18, rec.bounds.min.y - 4, rec.bounds.min.z - 18);
       _paddedBox.max.set(rec.bounds.max.x + 18, rec.bounds.max.y + 8, rec.bounds.max.z + 18);
 
       const inSafetyHalo = nearDist <= 22.0;
-      const inShadowRange = keepShadowHalo && rec.lod === 'active' && nearDist <= 105.0;
+      const inShadowRange = keepShadowHalo && rec.lod === 'active' && nearDist <= shadowCutoff;
       const inFrustum = inSafetyHalo || inShadowRange || _cullFrustum.intersectsBox(_paddedBox);
 
       let occluded = false;
@@ -2082,7 +2098,7 @@ export class OpenWorldChunkStreamer {
       if (visible) {
         visibleChunks++;
         if (rec.lod === 'active') {
-          const showMicro = nearDist <= 140.0;
+          const showMicro = nearDist <= microCutoff;
           for (let i = 0; i < rec.microMeshes.length; i++) {
             rec.microMeshes[i].visible = showMicro;
           }
@@ -2101,7 +2117,7 @@ export class OpenWorldChunkStreamer {
               if (!batch.isMicro) batch.obj.visible = true;
             }
           }
-          const castShadow = this.shadowsEnabled && nearDist <= 105.0;
+          const castShadow = this.shadowsEnabled && nearDist <= shadowCutoff;
           for (let i = 0; i < rec.shadowCasterMeshes.length; i++) {
             rec.shadowCasterMeshes[i].castShadow = castShadow;
           }
@@ -2115,6 +2131,7 @@ export class OpenWorldChunkStreamer {
     }
 
     // Horizon landmark occlusion culling (Dam, Port, Quarry, Railyard, distant FOB silhouettes)
+    const maxLandmarkDist = this.renderDistanceM + 24.0;
     for (let i = 0; i < this.horizonOccludables.length; i++) {
       const item = this.horizonOccludables[i];
       let baseVisible = true;
@@ -2125,6 +2142,12 @@ export class OpenWorldChunkStreamer {
         baseVisible = !(rec && rec.lod === 'active');
       }
       if (!baseVisible) {
+        item.obj.visible = false;
+        continue;
+      }
+      const ldx = Math.max(0, Math.max(item.box.min.x - playerX, playerX - item.box.max.x));
+      const ldz = Math.max(0, Math.max(item.box.min.z - playerZ, playerZ - item.box.max.z));
+      if (Math.hypot(ldx, ldz) > maxLandmarkDist) {
         item.obj.visible = false;
         continue;
       }

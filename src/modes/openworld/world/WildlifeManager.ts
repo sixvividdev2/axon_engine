@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import type { BodycamInteriorSample } from '../../../../bodycam-sdk/types';
+import { graphicsQualityStore } from '../../../../data/graphicsQuality';
 import { OpenWorldAmbienceAudio, isHourInWindow } from './OpenWorldAmbienceAudio';
 import {
   createRoadQueryResult,
@@ -1488,8 +1489,11 @@ export class WildlifeManager {
   // MAIN PER-FRAME ECOSYSTEM UPDATE (<= 0.5ms BUDGET)
   // ============================================================================
 
+  private animFrameTick = 0;
+
   public update(ctx: WildlifeUpdateContext): void {
     const dt = Math.min(0.05, Math.max(0.001, ctx.dt));
+    this.animFrameTick = (this.animFrameTick + 1) & 0x7fffffff;
     this.butterflyTimeUniform.value = ctx.elapsedSec;
     this.insectTimeUniform.value = ctx.elapsedSec;
 
@@ -2103,12 +2107,16 @@ export class WildlifeManager {
         d.rig.root.position.set(d.x, d.y + bound, d.z);
         d.rig.root.rotation.y = d.yaw;
 
-        if (!deerHidden) {
+        const reduceAnimDistM = graphicsQualityStore.getReduceAnimationDistanceM();
+        const deerBeyondReduce = dDistPlayer > reduceAnimDistM;
+        const animateDeerNow = !deerHidden && (!deerBeyondReduce || ((i + this.animFrameTick) & 1) === 0);
+        if (animateDeerNow) {
+          const animDt = deerBeyondReduce ? dt * 2.0 : dt;
           // Articulated bounding gait + ear twitch + white flagging tail
-          d.gaitPhase += dt * (speed > 3 ? 13.5 : speed * 4.2);
-          d.earTwitchPhase += dt * 3.1;
+          d.gaitPhase += animDt * (speed > 3 ? 13.5 : speed * 4.2);
+          d.earTwitchPhase += animDt * 3.1;
           const targetGraze = herd.state === 'GRAZE' && speed < 0.5 ? 1.0 : 0.0;
-          d.grazeBlend += (targetGraze - d.grazeBlend) * Math.min(1, dt * 3.5);
+          d.grazeBlend += (targetGraze - d.grazeBlend) * Math.min(1, animDt * 3.5);
 
           const swing = Math.min(1, speed / 4.5) * 0.65;
           const fSwing = Math.sin(d.gaitPhase) * swing;
@@ -2476,9 +2484,13 @@ export class WildlifeManager {
         w.rig.root.position.set(w.x, w.y, w.z);
         w.rig.root.rotation.y = w.yaw;
 
-        if (!wolfHidden) {
+        const reduceAnimDistM = graphicsQualityStore.getReduceAnimationDistanceM();
+        const wolfBeyondReduce = wDistPlayer > reduceAnimDistM;
+        const animateWolfNow = !wolfHidden && (!wolfBeyondReduce || ((i + this.animFrameTick) & 1) === 0);
+        if (animateWolfNow) {
+          const animDt = wolfBeyondReduce ? dt * 2.0 : dt;
           // Procedural 4-leg gait + jaw snap + head-tilt howl animation
-          w.gaitPhase += dt * (speed > 4 ? 13.0 : speed * 3.8);
+          w.gaitPhase += animDt * (speed > 4 ? 13.0 : speed * 3.8);
           const legAmp = Math.min(0.72, speed * 0.11);
           w.rig.legFL.rotation.x = Math.sin(w.gaitPhase) * legAmp;
           w.rig.legFR.rotation.x = Math.sin(w.gaitPhase + Math.PI) * legAmp;
@@ -2486,9 +2498,9 @@ export class WildlifeManager {
           w.rig.legBR.rotation.x = Math.sin(w.gaitPhase - Math.PI * 0.15) * legAmp;
 
           const targetNeckPitch = w.howlTimer > 0 ? -0.78 : pack.state === 'STALK' ? 0.25 : 0.0;
-          w.rig.neckPivot.rotation.x += (targetNeckPitch - w.rig.neckPivot.rotation.x) * Math.min(1, dt * 6.0);
+          w.rig.neckPivot.rotation.x += (targetNeckPitch - w.rig.neckPivot.rotation.x) * Math.min(1, animDt * 6.0);
           const targetJaw = w.lungeTimer > 0 ? 0.72 : jawOpen;
-          w.rig.jawPivot.rotation.x += (targetJaw - w.rig.jawPivot.rotation.x) * Math.min(1, dt * 10.0);
+          w.rig.jawPivot.rotation.x += (targetJaw - w.rig.jawPivot.rotation.x) * Math.min(1, animDt * 10.0);
           w.rig.tailPivot.rotation.y = Math.sin(ctx.elapsedSec * 4.0 + i) * 0.22;
         }
       }

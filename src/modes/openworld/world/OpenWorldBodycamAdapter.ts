@@ -14,6 +14,7 @@ import type { OpenWorldConvoyDirector } from './OpenWorldConvoyDirector';
 import type { OpenWorldEventDirector } from './OpenWorldEventDirector';
 import type { WildlifeManager } from './WildlifeManager';
 import type { OpenWorldFobDynamicProps } from './OpenWorldFobDynamicProps';
+import type { HideoutElectronicsSystem } from '../../../../hideout/HideoutElectronicsSystem';
 import {
   createObbRaycastHit,
   createRoadQueryResult,
@@ -57,6 +58,7 @@ export class OpenWorldBodycamAdapter implements IBodycamWorldAdapter {
   private convoyDirector: OpenWorldConvoyDirector | null = null;
   private eventDirector: OpenWorldEventDirector | null = null;
   private fobDynamicProps: OpenWorldFobDynamicProps | null = null;
+  private electronicsSystem: HideoutElectronicsSystem | null = null;
   public onMeleeHit?: (event: Readonly<BodycamMeleeHitEvent>) => void;
 
   constructor(
@@ -85,6 +87,10 @@ export class OpenWorldBodycamAdapter implements IBodycamWorldAdapter {
 
   public setFobDynamicProps(props: OpenWorldFobDynamicProps | null): void {
     this.fobDynamicProps = props;
+  }
+
+  public setElectronicsSystem(system: HideoutElectronicsSystem | null): void {
+    this.electronicsSystem = system;
   }
 
   public getGroundHeight(x: number, z: number, referenceY: number): number {
@@ -471,6 +477,43 @@ export class OpenWorldBodycamAdapter implements IBodycamWorldAdapter {
         outResult.normalZ = _targetHitNormalScratch.z;
         outResult.surface = 'metal';
         outResult.object = targetHit.object;
+      }
+    }
+
+    // 2c. Breakable Open World electronics (FOB terminals, black-market consoles, contract laptops, beacons, lights)
+    if (this.electronicsSystem) {
+      const elecTargets = this.electronicsSystem.getRaycastTargets();
+      if (elecTargets.length > 0) {
+        _raycaster.set(origin, direction);
+        _raycaster.near = near;
+        _raycaster.far = bestDist;
+        _hits.length = 0;
+        _raycaster.intersectObjects(elecTargets as THREE.Object3D[], false, _hits);
+        for (let i = 0; i < _hits.length; i++) {
+          const h = _hits[i];
+          if (h.distance < bestDist) {
+            bestDist = h.distance;
+            foundHit = true;
+            outResult.hit = true;
+            outResult.distance = h.distance;
+            outResult.pointX = h.point.x;
+            outResult.pointY = h.point.y;
+            outResult.pointZ = h.point.z;
+            if (h.face) {
+              _tmpNormal.copy(h.face.normal).transformDirection(h.object.matrixWorld).normalize();
+              outResult.normalX = _tmpNormal.x;
+              outResult.normalY = _tmpNormal.y;
+              outResult.normalZ = _tmpNormal.z;
+            } else {
+              outResult.normalX = -direction.x;
+              outResult.normalY = -direction.y;
+              outResult.normalZ = -direction.z;
+            }
+            outResult.surface = 'metal';
+            outResult.object = h.object;
+            break;
+          }
+        }
       }
     }
 

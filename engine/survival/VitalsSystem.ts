@@ -164,7 +164,7 @@ export class VitalsSystem {
       !opts.isSprinting &&
       this.holdBreathLockoutSec <= 0 &&
       hasReserve &&
-      opts.stamina > 0.12;
+      opts.stamina >= 0.20;
 
     if (canEngageHold) {
       if (!this.holdBreathActive) {

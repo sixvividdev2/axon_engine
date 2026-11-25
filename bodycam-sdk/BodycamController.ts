@@ -95,6 +95,10 @@ const BREATH_SWAY_CONFIG = {
   adsWeaponDriftScale: 0.48,
 } as const;
 
+const SPRINT_EXHAUST_THRESHOLD = 0.05;
+const SPRINT_RECOVERY_THRESHOLD = 0.20;
+const HOLD_BREATH_MIN_STAMINA = 0.20;
+
 function saturatingCurve(x: number, k: number): number {
   const clamped = THREE.MathUtils.clamp(x, 0, 1);
   if (k <= 0.001) return clamped;
@@ -153,6 +157,10 @@ export class BodycamController {
   public wantCrouch = false;
   public standBlockedByCeiling = false;
   public isSprinting = false;
+  /** Latches true when stamina drops below 5% and clears only once stamina recovers to >= 20% */
+  public sprintExhausted = false;
+  /** Dedicated upper-body / arm aiming stamina (0..1); drains in any aim stance & slightly per shot */
+  public armStamina = 1.0;
   public isAds = false;
   public isCanted = false;
   public isPointAim = false;
@@ -248,6 +256,11 @@ export class BodycamController {
   private holdBreathCooldownSec = 0;
   private holdBreathReboundSec = 0;
   private lowBreathPulseTimer = 0;
+  private exhaustedBreathTimer = 0;
+  private heartRateBpm = 74;
+  private cardiacPhase = 0;
+  private lastWeaponMassKg = 3.1;
+  private lastBodyStamina = 1.0;
   private breathVignette = 0;
   private holdBreathBlend = 0;
   private lastBreathX = 0;
@@ -432,9 +445,30 @@ export class BodycamController {
     this.crouched = false;
     this.wantCrouch = false;
     this.wasCrouched = false;
+    this.isSprinting = false;
+    this.sprintExhausted = false;
+    this.armStamina = 1.0;
+    this.exhaustedBreathTimer = 0;
     this.currentHeight = STAND_EYE_HEIGHT;
     this.setAngles(yaw, pitch);
     this.resetBreathingToRest();
+  }
+
+  /** Wires live physiological heart rate (BPM) into weapon stability & cardiac pulse sway. */
+  public setHeartRateBpm(bpm: number): void {
+    this.heartRateBpm = THREE.MathUtils.clamp(bpm, 55, 195);
+  }
+
+  public getHeartRateBpm(): number {
+    return this.heartRateBpm;
+  }
+
+  public getArmStamina(): number {
+    return this.armStamina;
+  }
+
+  public isSprintExhausted(): boolean {
+    return this.sprintExhausted;
   }
 
   public toggleCrouch(): void {
@@ -740,11 +774,25 @@ export class BodycamController {
       this.aimPitch = Math.min(0.24, maxAimForStop, this.aimPitch + pitchRad * 0.22);
     }
 
-    // Exertion bump
+    // Exertion bump & per-shot arm stamina fatigue (scaled by weapon mass, recoil energy & body stamina)
     this.exertion = Math.min(
       BREATH_SWAY_CONFIG.exertionMax,
       this.exertion + BREATH_SWAY_CONFIG.exertionRecoilGain,
     );
+    if (stanceCoupled) {
+      const massScale = THREE.MathUtils.clamp(this.lastWeaponMassKg / 3.2, 0.45, 2.25);
+      const shotEnergy = THREE.MathUtils.clamp(
+        (Math.abs(pitchRad) / 0.032 + kickBackM / 0.022) * 0.5,
+        0.45,
+        2.3,
+      );
+      const bodyFatigue = 1.0 + (1 - this.lastBodyStamina) * 0.72 + (this.sprintExhausted ? 0.25 : 0);
+      const aimFactor = this.isAds || this.isCanted || this.isPointAim ? 1.0 : 0.42;
+      this.armStamina = Math.max(
+        0,
+        this.armStamina - 0.015 * shotEnergy * massScale * bodyFatigue * aimFactor,
+      );
+    }
   }
 
   /**
@@ -1291,15 +1339,29 @@ export class BodycamController {
         moveZ /= len;
       }
 
+      // Sprint exhaustion hysteresis: reaching below 5% stamina locks sprint until stamina >= 20%
+      this.lastBodyStamina = stamina;
+      this.lastWeaponMassKg = Math.max(0.45, weaponProfile.massKg || 3.0);
+      if (stamina < SPRINT_EXHAUST_THRESHOLD) {
+        if (!this.sprintExhausted) {
+          this.sprintExhausted = true;
+          this.exhaustedBreathTimer = 0.06;
+          this.audio.playBreathCue?.('exhale_depleted', 0.92);
+        }
+      } else if (this.sprintExhausted && stamina >= SPRINT_RECOVERY_THRESHOLD) {
+        this.sprintExhausted = false;
+      }
+
       const canSprintTrauma =
         (trauma ? trauma.canSprint : true) && (survivalMods ? survivalMods.canSprint : true);
       wantsSprint =
         canSprintTrauma &&
+        !this.sprintExhausted &&
         input.sprint &&
         hasMoveInput &&
         !this.crouched &&
         !isAiming &&
-        stamina > 0.08 &&
+        stamina >= SPRINT_EXHAUST_THRESHOLD &&
         moveZ < 0.2;
       this.isSprinting = wantsSprint;
       if (wantsSprint && onStaminaDrain) {
@@ -1838,10 +1900,54 @@ export class BodycamController {
       this.holdBreathReboundSec = Math.max(0, this.holdBreathReboundSec - dt);
     }
 
+    // Keep exhaustion hysteresis synced even during vaulting
+    this.lastBodyStamina = stamina;
+    this.lastWeaponMassKg = Math.max(0.45, weaponProfile.massKg || 3.0);
+    if (stamina < SPRINT_EXHAUST_THRESHOLD) {
+      if (!this.sprintExhausted) {
+        this.sprintExhausted = true;
+        this.exhaustedBreathTimer = 0.06;
+        this.audio.playBreathCue?.('exhale_depleted', 0.92);
+      }
+    } else if (this.sprintExhausted && stamina >= SPRINT_RECOVERY_THRESHOLD) {
+      this.sprintExhausted = false;
+    }
+
     const inAimStance = this.isAds || this.isCanted || this.isPointAim;
+    const isFirearmAim =
+      inAimStance && weaponProfile.holdClass !== 'unarmed' && weaponProfile.holdClass !== 'melee_1h';
+    const hrStress01 = THREE.MathUtils.clamp((this.heartRateBpm - 74) / 108, 0, 1);
+
+    // Dedicated Arm Stamina: drains continuously in any aim mode (not hip-fire), scaled by weapon mass,
+    // body stamina fatigue, posture, movement, and heart rate; recovers in hip-fire / low-ready.
+    if (health > 0) {
+      if (isFirearmAim) {
+        const massKg = this.lastWeaponMassKg;
+        const massFactor = THREE.MathUtils.clamp(0.42 + (massKg / 3.2) * 0.68, 0.45, 2.45);
+        const bodyFatigueMult =
+          1.0 +
+          (1 - stamina) * 0.92 +
+          (this.sprintExhausted ? 0.35 : 0) +
+          hrStress01 * 0.28;
+        const stanceFactor =
+          (this.crouched ? 0.72 : 1.0) *
+          (isMoving ? 1.18 : 1.0) *
+          (this.isPointAim ? 0.85 : this.isCanted ? 0.95 : 1.0);
+        const drainRate = 0.064 * massFactor * bodyFatigueMult * stanceFactor;
+        this.armStamina = Math.max(0, this.armStamina - drainRate * dt);
+      } else {
+        const regenRate =
+          (0.19 + stamina * 0.15) *
+          (this.sprintExhausted ? 0.65 : 1.0) *
+          (1.0 - hrStress01 * 0.22);
+        this.armStamina = Math.min(1.0, this.armStamina + regenRate * dt);
+      }
+    }
+
     const hasBreathReserve = this.holdBreathActive
       ? this.holdBreathRemainingSec > 0.001
       : this.holdBreathRemainingSec > 0.15;
+    // Hold Breath requires at least 20% regular stamina
     const canHoldBreath =
       health > 0 &&
       inAimStance &&
@@ -1849,7 +1955,7 @@ export class BodycamController {
       !wantsSprint &&
       this.holdBreathCooldownSec <= 0 &&
       hasBreathReserve &&
-      stamina > 0.12;
+      stamina >= HOLD_BREATH_MIN_STAMINA;
 
     if (canHoldBreath) {
       if (!this.holdBreathActive) {
@@ -1949,20 +2055,41 @@ export class BodycamController {
         this.exertion = Math.max(0, this.exertion - BREATH_SWAY_CONFIG.exertionIdleDecayRate * dt);
       }
 
+      // Heavy labored breathing audio while exhausted (<5% -> 20% recovery window)
+      if (this.sprintExhausted && !this.holdBreathActive) {
+        this.exhaustedBreathTimer -= dt;
+        if (this.exhaustedBreathTimer <= 0) {
+          const exhaustionUrgency = THREE.MathUtils.clamp(
+            (SPRINT_RECOVERY_THRESHOLD - stamina) / SPRINT_RECOVERY_THRESHOLD,
+            0.25,
+            1.0,
+          );
+          this.audio.playBreathCue?.(
+            exhaustionUrgency > 0.6 ? 'exhale_depleted' : 'exhale',
+            0.52 + exhaustionUrgency * 0.42,
+          );
+          this.exhaustedBreathTimer = THREE.MathUtils.lerp(1.38, 0.88, exhaustionUrgency);
+        }
+      } else {
+        this.exhaustedBreathTimer = Math.max(0, this.exhaustedBreathTimer - dt);
+      }
+
       const satExertion = saturatingCurve(
         this.exertion / BREATH_SWAY_CONFIG.exertionMax,
         BREATH_SWAY_CONFIG.falloffShapeK,
       );
 
+      const exhaustedFreqBoost = this.sprintExhausted ? 0.24 : 0;
       const targetFreqHz = Math.min(
-        BREATH_SWAY_CONFIG.maxFreqHz,
+        BREATH_SWAY_CONFIG.maxFreqHz * 1.12,
         BREATH_SWAY_CONFIG.baseFreqHz +
-          satExertion * (BREATH_SWAY_CONFIG.maxFreqHz - BREATH_SWAY_CONFIG.baseFreqHz),
+          satExertion * (BREATH_SWAY_CONFIG.maxFreqHz - BREATH_SWAY_CONFIG.baseFreqHz) +
+          exhaustedFreqBoost,
       );
       this.smoothedFreqHz = THREE.MathUtils.clamp(
         THREE.MathUtils.damp(this.smoothedFreqHz, targetFreqHz, BREATH_SWAY_CONFIG.freqSmoothingLambda, dt),
         BREATH_SWAY_CONFIG.baseFreqHz,
-        BREATH_SWAY_CONFIG.maxFreqHz,
+        BREATH_SWAY_CONFIG.maxFreqHz * 1.12,
       );
 
       const staminaDepletion = THREE.MathUtils.clamp(1 - stamina, 0, 1);
@@ -1976,15 +2103,16 @@ export class BodycamController {
         BREATH_SWAY_CONFIG.staminaWeight +
         BREATH_SWAY_CONFIG.healthWeight;
       const satStress = saturatingCurve(rawStress / maxPossibleStress, BREATH_SWAY_CONFIG.falloffShapeK);
+      const exhaustedAmpBoost = this.sprintExhausted ? 1.42 : 1.0;
       const targetAmpMult = Math.min(
-        BREATH_SWAY_CONFIG.maxCombinedAmpMult,
-        1.0 + satStress * (BREATH_SWAY_CONFIG.maxCombinedAmpMult - 1.0),
+        BREATH_SWAY_CONFIG.maxCombinedAmpMult * 1.35,
+        (1.0 + satStress * (BREATH_SWAY_CONFIG.maxCombinedAmpMult - 1.0)) * exhaustedAmpBoost,
       );
 
       this.smoothedAmpMult = THREE.MathUtils.clamp(
         THREE.MathUtils.damp(this.smoothedAmpMult, targetAmpMult, BREATH_SWAY_CONFIG.ampSmoothingLambda, dt),
         1.0,
-        BREATH_SWAY_CONFIG.maxCombinedAmpMult,
+        BREATH_SWAY_CONFIG.maxCombinedAmpMult * 1.35,
       );
 
       this.swayEnvelope = THREE.MathUtils.damp(
@@ -1994,11 +2122,13 @@ export class BodycamController {
         dt,
       );
 
-      // Phase-continuous integration
+      // Phase-continuous respiratory & cardiac integration
       this.breathPhase += dt * TWO_PI * this.smoothedFreqHz;
       if (this.breathPhase > TWO_PI * 1000) this.breathPhase %= TWO_PI * 1000;
       this.weaponDriftPhase += dt * TWO_PI * (this.smoothedFreqHz * BREATH_SWAY_CONFIG.weaponDriftFreqRatio);
       if (this.weaponDriftPhase > TWO_PI * 1000) this.weaponDriftPhase %= TWO_PI * 1000;
+      this.cardiacPhase += dt * TWO_PI * (this.heartRateBpm / 60);
+      if (this.cardiacPhase > TWO_PI * 1000) this.cardiacPhase %= TWO_PI * 1000;
     }
 
     const bp = this.breathPhase;
@@ -2014,7 +2144,28 @@ export class BodycamController {
       Math.sin(bp * 0.79 + 1.18) * 0.72 +
       Math.cos(bp * 1.93 + 2.41) * 0.28;
 
-    // Breath sway reaches exact 0% when breath is held; locomotion headbob remains 100% intact.
+    // Heart Rate -> Weapon Stability coupling:
+    // Calm BPM (~65-78) stabilizes arms (~0.76x); stressed BPM (90-188) amplifies sway up to ~1.82x
+    // plus adds a realistic rhythmic systolic cardiac pulse bump.
+    const hrCalmOrStressMult =
+      this.heartRateBpm <= 82
+        ? THREE.MathUtils.lerp(0.76, 1.0, THREE.MathUtils.clamp((this.heartRateBpm - 62) / 20, 0, 1))
+        : THREE.MathUtils.lerp(1.0, 1.82, THREE.MathUtils.clamp((this.heartRateBpm - 82) / 102, 0, 1));
+    const systolicWave = Math.pow(Math.max(0, Math.sin(this.cardiacPhase)), 6);
+    const dicroticWave = Math.pow(Math.max(0, Math.sin(this.cardiacPhase - 0.85)), 8) * 0.35;
+    const cardiacPulse = (systolicWave + dicroticWave) * (0.14 + hrStress01 * 0.86);
+
+    // Arm Stamina Fatigue: stays aimed at 0% arm stamina, injecting progressive wide shoulder drift
+    // and high-frequency muscular tremor (persists even if holding breath).
+    const armFatigue = isFirearmAim
+      ? THREE.MathUtils.clamp((0.45 - this.armStamina) / 0.45, 0, 1)
+      : 0;
+    const armDepleted = isFirearmAim
+      ? THREE.MathUtils.clamp((0.15 - this.armStamina) / 0.15, 0, 1)
+      : 0;
+    const armSwayAmplifier = 1.0 + armFatigue * 1.25 + armDepleted * 1.35;
+
+    // Breath sway reaches exact 0% when breath is held; locomotion headbob & muscular arm fatigue remain physical.
     // Releasing/depleting injects temporary post-hold rebound sway.
     const holdBreathFactor = Math.max(0, 1 - this.holdBreathBlend);
     const reboundMult =
@@ -2025,6 +2176,7 @@ export class BodycamController {
       (trauma ? trauma.swayAmpMult : 1.0) *
       (survivalMods ? survivalMods.swayAmpMult : 1.0) *
       reboundMult *
+      hrCalmOrStressMult *
       holdBreathFactor;
     const camSwayScale =
       this.swayEnvelope *
@@ -2038,48 +2190,77 @@ export class BodycamController {
             ? 0.72
             : 1.0);
 
-    const tremorAmp = trauma ? Math.min(MAX_TRAUMA_TREMOR_RAD, trauma.tremorAmp) : 0;
+    // Combined trauma tremor + arm-stamina exhaustion tremor + cardiac pulse kick
+    const armTremorRad = (armFatigue * 0.0024 + armDepleted * 0.0052) * hrCalmOrStressMult;
+    const traumaTremorRad = trauma ? Math.min(MAX_TRAUMA_TREMOR_RAD, trauma.tremorAmp) : 0;
+    const totalTremorAmp = traumaTremorRad + armTremorRad;
+    const cardiacPitchKick =
+      inAimStance ? cardiacPulse * (0.00055 + hrStress01 * 0.00145) : 0;
+    const cardiacYawKick =
+      inAimStance ? cardiacPulse * Math.cos(this.cardiacPhase * 0.5) * (0.00028 + hrStress01 * 0.00085) : 0;
+
+    // Slow, wide figure-8 shoulder wander when arms are severely fatigued (even while holding breath)
+    const armWanderPitch =
+      armFatigue > 0.02
+        ? (Math.sin(elapsed * 1.65) * 0.62 + Math.cos(elapsed * 2.83) * 0.38) *
+          (armFatigue * 0.0042 + armDepleted * 0.0075)
+        : 0;
+    const armWanderYaw =
+      armFatigue > 0.02
+        ? (Math.cos(elapsed * 1.29 + 0.7) * 0.65 + Math.sin(elapsed * 2.41) * 0.35) *
+          (armFatigue * 0.0048 + armDepleted * 0.0082)
+        : 0;
+
     const tremorPitch =
-      tremorAmp > 0
-        ? Math.sin(elapsed * 19.3) * tremorAmp * 0.65 + Math.cos(elapsed * 29.7) * tremorAmp * 0.35
+      totalTremorAmp > 0
+        ? Math.sin(elapsed * 23.3) * totalTremorAmp * 0.62 + Math.cos(elapsed * 37.7) * totalTremorAmp * 0.38
         : 0;
     const tremorYaw =
-      tremorAmp > 0
-        ? Math.cos(elapsed * 21.1 + 0.8) * tremorAmp * 0.65 + Math.sin(elapsed * 33.4) * tremorAmp * 0.35
+      totalTremorAmp > 0
+        ? Math.cos(elapsed * 25.1 + 0.8) * totalTremorAmp * 0.62 + Math.sin(elapsed * 41.4) * totalTremorAmp * 0.38
         : 0;
 
     const swayPosX = THREE.MathUtils.clamp(
       camOscX * BREATH_SWAY_CONFIG.camBasePosXMeters * camSwayScale,
-      -BREATH_SWAY_CONFIG.camMaxPosMeters,
-      BREATH_SWAY_CONFIG.camMaxPosMeters,
+      -BREATH_SWAY_CONFIG.camMaxPosMeters * 1.35,
+      BREATH_SWAY_CONFIG.camMaxPosMeters * 1.35,
     );
     const swayPosY = THREE.MathUtils.clamp(
       camOscY * BREATH_SWAY_CONFIG.camBasePosYMeters * camSwayScale,
-      -BREATH_SWAY_CONFIG.camMaxPosMeters,
-      BREATH_SWAY_CONFIG.camMaxPosMeters,
+      -BREATH_SWAY_CONFIG.camMaxPosMeters * 1.35,
+      BREATH_SWAY_CONFIG.camMaxPosMeters * 1.35,
     );
+    const maxRotLimit = BREATH_SWAY_CONFIG.camMaxRotRad * 1.85 + MAX_TRAUMA_TREMOR_RAD;
     const swayPitch = THREE.MathUtils.clamp(
-      camOscY * BREATH_SWAY_CONFIG.camBaseRotPitchRad * camSwayScale + tremorPitch,
-      -BREATH_SWAY_CONFIG.camMaxRotRad - MAX_TRAUMA_TREMOR_RAD,
-      BREATH_SWAY_CONFIG.camMaxRotRad + MAX_TRAUMA_TREMOR_RAD,
+      camOscY * BREATH_SWAY_CONFIG.camBaseRotPitchRad * camSwayScale +
+        tremorPitch +
+        armWanderPitch +
+        cardiacPitchKick,
+      -maxRotLimit,
+      maxRotLimit,
     );
     const swayYaw = THREE.MathUtils.clamp(
-      camOscX * BREATH_SWAY_CONFIG.camBaseRotYawRad * camSwayScale + tremorYaw,
-      -BREATH_SWAY_CONFIG.camMaxRotRad - MAX_TRAUMA_TREMOR_RAD,
-      BREATH_SWAY_CONFIG.camMaxRotRad + MAX_TRAUMA_TREMOR_RAD,
+      camOscX * BREATH_SWAY_CONFIG.camBaseRotYawRad * camSwayScale +
+        tremorYaw +
+        armWanderYaw +
+        cardiacYawKick,
+      -maxRotLimit,
+      maxRotLimit,
     );
     const swayRoll = THREE.MathUtils.clamp(
-      camOscRoll * BREATH_SWAY_CONFIG.camBaseRotRollRad * camSwayScale,
-      -BREATH_SWAY_CONFIG.camMaxRotRad,
-      BREATH_SWAY_CONFIG.camMaxRotRad,
+      camOscRoll * BREATH_SWAY_CONFIG.camBaseRotRollRad * camSwayScale +
+        armWanderYaw * 0.45,
+      -BREATH_SWAY_CONFIG.camMaxRotRad * 1.4,
+      BREATH_SWAY_CONFIG.camMaxRotRad * 1.4,
     );
 
-    // Separate lower-frequency, phase-offset weapon drift
+    // Separate lower-frequency, phase-offset weapon drift (amplified by heart rate & arm fatigue)
     const wp = this.weaponDriftPhase;
     const wepScale =
       this.swayEnvelope *
       this.smoothedAmpMult *
       swayMult *
+      armSwayAmplifier *
       (this.isAds
         ? BREATH_SWAY_CONFIG.adsWeaponDriftScale
         : this.isCanted
@@ -2087,19 +2268,35 @@ export class BodycamController {
           : this.isPointAim
             ? 0.68
             : 1.0);
+    // Fatigue weapon drift component that persists even when holding breath
+    const armDriftX =
+      armFatigue > 0.02
+        ? (Math.cos(elapsed * 1.45) * 0.0038 + Math.sin(elapsed * 29.4) * 0.0014) *
+          (armFatigue + armDepleted * 1.4)
+        : 0;
+    const armDriftY =
+      armFatigue > 0.02
+        ? (Math.sin(elapsed * 1.92) * 0.0036 + Math.cos(elapsed * 33.1) * 0.0013 - armDepleted * 0.0022) *
+          (armFatigue + armDepleted * 1.4)
+        : 0;
+    const cardiacDriftY = inAimStance ? cardiacPulse * (0.0005 + hrStress01 * 0.0016) : 0;
+
     const breathX = THREE.MathUtils.clamp(
       (Math.sin(wp + 1.73) * 0.65 + Math.cos(wp * 1.61 + 0.52) * 0.35) *
         BREATH_SWAY_CONFIG.weaponBaseDriftXMeters *
-        wepScale,
-      -BREATH_SWAY_CONFIG.weaponMaxDriftMeters * 1.6,
-      BREATH_SWAY_CONFIG.weaponMaxDriftMeters * 1.6,
+        wepScale +
+        armDriftX,
+      -BREATH_SWAY_CONFIG.weaponMaxDriftMeters * 2.4,
+      BREATH_SWAY_CONFIG.weaponMaxDriftMeters * 2.4,
     );
     const breathY = THREE.MathUtils.clamp(
       (Math.sin(wp * 0.89 + 2.89) * 0.70 + Math.sin(wp * 2.19 + 1.11) * 0.30) *
         BREATH_SWAY_CONFIG.weaponBaseDriftYMeters *
-        wepScale,
-      -BREATH_SWAY_CONFIG.weaponMaxDriftMeters * 1.6,
-      BREATH_SWAY_CONFIG.weaponMaxDriftMeters * 1.6,
+        wepScale +
+        armDriftY +
+        cardiacDriftY,
+      -BREATH_SWAY_CONFIG.weaponMaxDriftMeters * 2.4,
+      BREATH_SWAY_CONFIG.weaponMaxDriftMeters * 2.4,
     );
     this.lastBreathX = breathX;
     this.lastBreathY = breathY;

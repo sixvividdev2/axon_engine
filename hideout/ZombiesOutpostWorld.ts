@@ -9,6 +9,7 @@ import {
 } from '../bodycam-sdk';
 import { loadoutStore } from '../data/loadoutStore';
 import { createHideoutMaterials, HideoutMaterialLibrary } from './HideoutMaterials';
+import { HideoutElectronicsSystem } from './HideoutElectronicsSystem';
 import type { GunWallSlotAnchor } from './HideoutBunkerWorld';
 
 export type ZombiesOutpostInteractKind =
@@ -58,7 +59,8 @@ export interface ZombiesOutpostWorldHandle {
   triggerAmmoCratePop: () => void;
   triggerReturnSeal: () => void;
   setBriefingState: (state: ZombiesOutpostBriefingState) => void;
-  update: (dt: number) => void;
+  electronics: HideoutElectronicsSystem;
+  update: (dt: number, listenerPos?: THREE.Vector3) => void;
   dispose: () => void;
 }
 
@@ -227,6 +229,7 @@ export function buildZombiesOutpostWorld(
   const root = new THREE.Group();
   root.name = 'ZombiesQuarantineOutpostWorld';
   scene.add(root);
+  const electronics = new HideoutElectronicsSystem(root);
 
   const physics = new BodycamPhysicsWorld();
   physics.boundsMinX = -12.6;
@@ -1010,20 +1013,8 @@ export function buildZombiesOutpostWorld(
   root.add(returnRampProxy);
   interactableMeshes.push(returnRampProxy);
 
-  physics.setRaycastMeshes(raycastMeshes);
-
-  // Animation state
-  let elapsedSec = 0;
-  let cratePopTimer = 0;
-  let returnRampTarget = 0;
-  let returnRampAngle = 0;
-
-  const setBriefingState = (state: ZombiesOutpostBriefingState): void => {
-    drawOpsMapCanvas(opsCtx, state);
-    opsTex.needsUpdate = true;
-  };
-
-  setBriefingState({
+  // Register Ops Board, Field Radio, and all Outpost floodlights/beacons as breakable & repairable electronics
+  let lastBriefingState: ZombiesOutpostBriefingState = {
     mapName: 'Der Lichtspielhaus',
     mapSubtitle: 'Quarantine Theater Sector',
     difficultyLabel: 'Standard',
@@ -1035,7 +1026,84 @@ export function buildZombiesOutpostWorld(
     lobbyMembersCount: 0,
     lobbyMaxPlayers: 4,
     bestRound: 0,
+  };
+
+  electronics.registerNode(
+    {
+      id: 'zoutpost_ops_board',
+      label: 'Zombies Operations Map Board',
+      hitMeshes: [opsBoardScreen],
+      emissiveMaterials: [opsScreenMat],
+      sparkOrigin: opsBoardPos.clone(),
+      interactiveLinkId: 'outpost_ops_board',
+      repairable: true,
+      repairDurationSec: 2.1,
+      onBreak: () => {
+        opsCtx.fillStyle = '#07090c';
+        opsCtx.fillRect(0, 0, opsCanvas.width, opsCanvas.height);
+        opsCtx.strokeStyle = 'rgba(200,215,230,0.35)';
+        opsCtx.lineWidth = 2;
+        for (let i = 0; i < 8; i++) {
+          const ang = (i / 8) * Math.PI * 2 + 0.3;
+          opsCtx.beginPath();
+          opsCtx.moveTo(opsCanvas.width * 0.5, opsCanvas.height * 0.5);
+          opsCtx.lineTo(
+            opsCanvas.width * 0.5 + Math.cos(ang) * 320,
+            opsCanvas.height * 0.5 + Math.sin(ang) * 210,
+          );
+          opsCtx.stroke();
+        }
+        opsCtx.fillStyle = '#ef4444';
+        opsCtx.font = '700 28px "IBM Plex Mono", monospace';
+        opsCtx.fillText('DISPLAY DAMAGED · HOLD [F] TO REPAIR', 72, opsCanvas.height * 0.52);
+        opsTex.needsUpdate = true;
+      },
+      onRepair: () => {
+        drawOpsMapCanvas(opsCtx, lastBriefingState);
+        opsTex.needsUpdate = true;
+      },
+    },
+    raycastMeshes,
+  );
+
+  electronics.registerNode(
+    {
+      id: 'zoutpost_field_radio',
+      label: 'Tactical Field Radio',
+      hitMeshes: [radioChassis, radioLed, radioAntenna],
+      emissiveMeshes: [radioLed],
+      sparkOrigin: radioPos.clone(),
+      interactiveLinkId: 'outpost_field_radio',
+      repairable: true,
+      repairDurationSec: 2.0,
+    },
+    raycastMeshes,
+  );
+
+  electronics.autoRegisterSceneElectronics(root, {
+    idPrefix: 'zoutpost_elec',
+    raycastMeshes,
+    lightMatchRadiusM: 4.5,
   });
+
+  physics.setRaycastMeshes(raycastMeshes);
+
+  // Animation state
+  let elapsedSec = 0;
+  let cratePopTimer = 0;
+  let returnRampTarget = 0;
+  let returnRampAngle = 0;
+  const fallbackListenerPos = new THREE.Vector3();
+
+  const setBriefingState = (state: ZombiesOutpostBriefingState): void => {
+    lastBriefingState = state;
+    if (!electronics.isInteractiveLinkBroken('outpost_ops_board')) {
+      drawOpsMapCanvas(opsCtx, state);
+      opsTex.needsUpdate = true;
+    }
+  };
+
+  setBriefingState(lastBriefingState);
 
   const getPropInteractPos = (kind: ZombiesOutpostInteractKind, outPos: THREE.Vector3): boolean => {
     if (kind === 'outpost_ops_board') {
@@ -1072,15 +1140,20 @@ export function buildZombiesOutpostWorld(
     returnRampTarget = 1;
   };
 
-  const update = (dt: number): void => {
+  const update = (dt: number, listenerPos?: THREE.Vector3): void => {
     const clampedDt = Math.min(dt, 0.05);
     elapsedSec += clampedDt;
+    electronics.update(clampedDt, listenerPos ?? fallbackListenerPos);
 
     // Flickering crimson road flares
     const flicker =
       0.78 + 0.16 * Math.sin(elapsedSec * 19.3) + 0.12 * Math.sin(elapsedSec * 31.7 + 1.2);
-    flareLight.intensity = 2.6 * flicker;
-    flareEmissiveMat.emissiveIntensity = 2.5 + flicker * 1.4;
+    if (!flareLight.userData?.electronicBroken) {
+      flareLight.intensity = 2.6 * flicker;
+    }
+    if (!flareEmissiveMat.userData?.electronicBroken) {
+      flareEmissiveMat.emissiveIntensity = 2.5 + flicker * 1.4;
+    }
     for (let i = 0; i < flareEmbers.length; i++) {
       const s = 0.88 + 0.24 * Math.sin(elapsedSec * 23 + i * 1.9);
       flareEmbers[i].scale.setScalar(s);
@@ -1089,7 +1162,9 @@ export function buildZombiesOutpostWorld(
     // Subtle APC diesel idle vibration & amber return beacon pulse
     apcGroup.position.y = Math.sin(elapsedSec * 26.0) * 0.003;
     const beaconPulse = 0.5 + 0.5 * Math.sin(elapsedSec * 5.6);
-    amberEmissiveMat.emissiveIntensity = 1.4 + beaconPulse * 2.2;
+    if (!amberEmissiveMat.userData?.electronicBroken) {
+      amberEmissiveMat.emissiveIntensity = 1.4 + beaconPulse * 2.2;
+    }
 
     // Ammo crate lid pop
     if (cratePopTimer > 0) {
@@ -1125,8 +1200,10 @@ export function buildZombiesOutpostWorld(
     triggerAmmoCratePop,
     triggerReturnSeal,
     setBriefingState,
+    electronics,
     update,
     dispose: () => {
+      electronics.dispose();
       for (const slot of gunWallSlots) {
         if (slot.assembly) {
           slot.mountGroup.remove(slot.assembly.group);

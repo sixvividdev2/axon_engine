@@ -10,6 +10,7 @@ import {
   createRaycastResult,
   IBodycamWorldAdapter,
 } from '../../bodycam-sdk/types';
+import { ExternalHandIkOverride } from '../../doors/PlayerInteractAnimator';
 import { TraumaModifiers } from '../../data/traumaConfig';
 import { HoldClass, WeaponId, WeaponSpec } from '../../data/weapons';
 import { WeaponRig } from '../weapons/WeaponRig';
@@ -127,6 +128,11 @@ export class CharacterAnimator {
   private equipBlendTimer = 0;
   private leftActionReturnTimer = 0;
   private wasLeftOverridden = false;
+  private externalHandOverride: Readonly<ExternalHandIkOverride> | null = null;
+  private readonly _extRPosRoot = new THREE.Vector3();
+  private readonly _extRQuatRoot = new THREE.Quaternion();
+  private readonly _extLPosRoot = new THREE.Vector3();
+  private readonly _extLQuatRoot = new THREE.Quaternion();
 
   // Gait tracking derived purely from read-only controller state
   private prevPos = new THREE.Vector3();
@@ -353,6 +359,14 @@ export class CharacterAnimator {
 
   public setCallbacks(callbacks: CharacterActionCallbacks): void {
     this.callbacks = callbacks;
+  }
+
+  public setExternalHandOverride(override: Readonly<ExternalHandIkOverride> | null): void {
+    this.externalHandOverride = override;
+  }
+
+  public clearExternalHandOverride(): void {
+    this.externalHandOverride = null;
   }
 
   public getActiveAction(): CharacterActionType {
@@ -1969,6 +1983,18 @@ export class CharacterAnimator {
       this._actionRotOffset.z += Math.sin(elapsed * 23.1) * rotScale * 0.8;
     }
 
+    const extIkAction =
+      this.externalHandOverride && this.externalHandOverride.active
+        ? this.externalHandOverride
+        : null;
+    if (extIkAction && extIkAction.rightWeight > 0.1 && extIkAction.leftWeight > 0.1) {
+      const tuck = Math.min(extIkAction.rightWeight, extIkAction.leftWeight);
+      this._actionPosOffset.y -= 0.28 * tuck;
+      this._actionPosOffset.z += 0.12 * tuck;
+      this._actionRotOffset.x -= 0.72 * tuck;
+      this._actionRotOffset.z += 0.35 * tuck;
+    }
+
     this.weaponRig.applyCharacterActionPose(
       this._actionPosOffset,
       this._actionRotOffset,
@@ -2287,13 +2313,32 @@ export class CharacterAnimator {
       rightGripCurl = gWhip > 0.24 || this.throwCooldownHideTimer > 0 ? 0.35 : 0.92;
     }
 
-    if (this.equipBlendTimer > 0 || vaultPinR > 0.001 || isThrowable) {
+    const extIk =
+      this.externalHandOverride && this.externalHandOverride.active
+        ? this.externalHandOverride
+        : null;
+    const extRightW = extIk ? THREE.MathUtils.clamp(extIk.rightWeight, 0, 1) : 0;
+    if (extIk && extRightW > 0.001) {
+      this._extRPosRoot.copy(extIk.rightWorldPos);
+      this.skeleton.root.worldToLocal(this._extRPosRoot);
+      this._extRQuatRoot.copy(extIk.rightWorldQuat).premultiply(this._rootWorldQuatInv);
+      this._rDesiredRoot.lerp(this._extRPosRoot, extRightW);
+      if (isUnarmed) {
+        this._rDesiredQuatRoot.copy(this._extRQuatRoot);
+      } else {
+        this._rDesiredQuatRoot.slerp(this._extRQuatRoot, extRightW);
+      }
+      rightGripCurl = THREE.MathUtils.lerp(rightGripCurl, extIk.rightGripCurl, extRightW);
+    }
+    const useExtRightQuat = extRightW > 0.05;
+
+    if (this.equipBlendTimer > 0 || vaultPinR > 0.001 || isThrowable || useExtRightQuat) {
       this.rightHandBlender.blendTo(
         this._rDesiredRoot,
-        isUnarmed ? this.rightHandBlender.quaternion : this._rDesiredQuatRoot,
+        isUnarmed && !useExtRightQuat ? this.rightHandBlender.quaternion : this._rDesiredQuatRoot,
         rightGripCurl,
         1,
-        vaultPinR > 0.001 ? 36 : 32,
+        useExtRightQuat ? 42 : vaultPinR > 0.001 ? 36 : 32,
         dt,
       );
     } else {
@@ -2375,6 +2420,9 @@ export class CharacterAnimator {
       } else {
         this.rightHandBlender.quaternion.copy(this._handAlignedQuat);
       }
+      if (useExtRightQuat) {
+        this.rightHandBlender.quaternion.slerp(this._extRQuatRoot, extRightW);
+      }
       this._rQuatRoot.copy(this.rightHandBlender.quaternion);
     }
     this.orientForearmToHand(
@@ -2425,7 +2473,7 @@ export class CharacterAnimator {
         : 0;
     const hardLockW = 1 - aimLockWeightPost;
 
-    if (!isUnarmed && vaultPinR < 0.12 && hardLockW > 0.001) {
+    if (!isUnarmed && vaultPinR < 0.12 && !useExtRightQuat && hardLockW > 0.001) {
       armR.hand.root.getWorldPosition(this._solvedHandRWorldPos);
       armR.hand.root.getWorldQuaternion(this._solvedHandRWorldQuat);
       this.weaponRig.rightHandSocketAnchor.getWorldPosition(this._currSocketRWorldPos);
@@ -2754,6 +2802,22 @@ export class CharacterAnimator {
       leftGripCurl = 0.88;
     }
 
+    const extLeftW = extIk ? THREE.MathUtils.clamp(extIk.leftWeight, 0, 1) : 0;
+    if (extIk && extLeftW > 0.001) {
+      leftOverridden = true;
+      this._extLPosRoot.copy(extIk.leftWorldPos);
+      this.skeleton.root.worldToLocal(this._extLPosRoot);
+      this._extLQuatRoot.copy(extIk.leftWorldQuat).premultiply(this._rootWorldQuatInv);
+      this._lDesiredRoot.lerp(this._extLPosRoot, extLeftW);
+      if (isUnarmed) {
+        this._lDesiredQuatRoot.copy(this._extLQuatRoot);
+      } else {
+        this._lDesiredQuatRoot.slerp(this._extLQuatRoot, extLeftW);
+      }
+      leftGripCurl = THREE.MathUtils.lerp(leftGripCurl, extIk.leftGripCurl, extLeftW);
+    }
+    const useExtLeftQuat = extLeftW > 0.05;
+
     if (this.wasLeftOverridden && !leftOverridden) {
       this.leftActionReturnTimer = 0.14;
     }
@@ -2763,10 +2827,10 @@ export class CharacterAnimator {
     }
 
     if (leftOverridden || this.equipBlendTimer > 0 || this.leftActionReturnTimer > 0) {
-      const leftLambda = vaultPinL > 0.001 ? 38 : leftOverridden ? 28 : 34;
+      const leftLambda = useExtLeftQuat ? 42 : vaultPinL > 0.001 ? 38 : leftOverridden ? 28 : 34;
       this.leftHandBlender.blendTo(
         this._lDesiredRoot,
-        isUnarmed ? this.leftHandBlender.quaternion : this._lDesiredQuatRoot,
+        isUnarmed && !useExtLeftQuat ? this.leftHandBlender.quaternion : this._lDesiredQuatRoot,
         leftGripCurl,
         1,
         leftLambda,
@@ -2797,6 +2861,9 @@ export class CharacterAnimator {
         this.leftHandBlender.quaternion.slerp(this._handAlignedQuat, alpha);
       } else {
         this.leftHandBlender.quaternion.copy(this._handAlignedQuat);
+      }
+      if (useExtLeftQuat) {
+        this.leftHandBlender.quaternion.slerp(this._extLQuatRoot, extLeftW);
       }
       this._lQuatRoot.copy(this.leftHandBlender.quaternion);
     }

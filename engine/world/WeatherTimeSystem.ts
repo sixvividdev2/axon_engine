@@ -604,17 +604,26 @@ export class WeatherTimeSystem {
       this.renderer.toneMappingExposure = THREE.MathUtils.lerp(0.86, 1.0, dayWeight);
     }
 
-    // Activate map streetlamps / runway beacons smoothly as dusk arrives
+    // Activate map streetlamps / runway beacons smoothly as dusk arrives (skip shot-out fixtures until repaired)
     const lampAlpha = THREE.MathUtils.smoothstep(nightWeight, 0.25, 0.75);
     for (let i = 0; i < this.nightLights.length; i++) {
       const nl = this.nightLights[i];
       if (nl.light && nl.baseLightIntensity !== undefined) {
-        const nextIntensity = nl.baseLightIntensity * lampAlpha;
-        nl.light.intensity = nextIntensity;
-        nl.light.visible = nextIntensity > 0.01;
+        if (nl.light.userData?.electronicBroken) {
+          nl.light.intensity = 0;
+          nl.light.visible = false;
+        } else {
+          const nextIntensity = nl.baseLightIntensity * lampAlpha;
+          nl.light.intensity = nextIntensity;
+          nl.light.visible = nextIntensity > 0.01;
+        }
       }
       if (nl.emissiveMat && nl.baseEmissiveIntensity !== undefined) {
-        nl.emissiveMat.emissiveIntensity = THREE.MathUtils.lerp(0.08, nl.baseEmissiveIntensity, lampAlpha);
+        if (nl.emissiveMat.userData?.electronicBroken) {
+          nl.emissiveMat.emissiveIntensity = 0;
+        } else {
+          nl.emissiveMat.emissiveIntensity = THREE.MathUtils.lerp(0.08, nl.baseEmissiveIntensity, lampAlpha);
+        }
       }
     }
   }

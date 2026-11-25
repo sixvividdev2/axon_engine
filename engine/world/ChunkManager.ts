@@ -31,6 +31,7 @@ import {
 import type { BoxCollider, ContainerEntity, DoorEntity, SurfaceType } from './WorldBuilder';
 import { makeChunkKey, WorldColliderIndex, worldToChunkCoord } from './WorldColliderIndex';
 import { hashChunk, mulberry32, sampleTerrainBase, WATER_LEVEL } from './WorldNoise';
+import { applyHorizonDistanceFogToMaterial, type HorizonFogUniforms } from './HorizonFog';
 
 const VISUAL_RADIUS = 2; // 5x5 chunks
 const ACTIVE_RADIUS = 1; // 3x3 chunks
@@ -84,6 +85,7 @@ interface LoadedChunk {
   worldZ0: number;
   group: THREE.Group;
   chunkGeos: THREE.BufferGeometry[];
+  chunkMats: THREE.Material[];
   instancedMeshes: THREE.InstancedMesh[];
   raycastMeshes: THREE.Object3D[];
   doors: DoorEntity[];
@@ -190,9 +192,11 @@ export class ChunkManager {
   private deltas = new Map<string, ChunkDelta>();
   private glassShards: GlassShard[] = [];
 
-  // Callbacks to sync zombies as chunks activate/deactivate
+  // Callbacks to sync zombies & breakable electronics as chunks activate/deactivate
   public onChunkZombiesReady?: (chunkKey: string, spawns: ChunkZombieSpawn[], killedIds: Set<string>) => void;
+  public onChunkMounted?: (chunkKey: string, group: THREE.Group, raycastMeshes: THREE.Object3D[]) => void;
   public onChunkUnloaded?: (chunkKey: string) => void;
+  private horizonFogUniforms: HorizonFogUniforms | null = null;
 
   // Shared immutable materials & prototype geometries (disposed only in ChunkManager.dispose)
   private materials: THREE.Material[] = [];
@@ -480,6 +484,25 @@ export class ChunkManager {
     this.shardGeo = trackProto(new THREE.BoxGeometry(0.09, 0.11, 0.015));
   }
 
+  public applyHorizonFog(uniforms: HorizonFogUniforms): void {
+    this.horizonFogUniforms = uniforms;
+    for (let i = 0; i < this.materials.length; i++) {
+      applyHorizonDistanceFogToMaterial(this.materials[i], uniforms);
+    }
+    for (const chunk of this.loadedChunks.values()) {
+      for (let i = 0; i < chunk.chunkMats.length; i++) {
+        applyHorizonDistanceFogToMaterial(chunk.chunkMats[i], uniforms);
+      }
+    }
+  }
+
+  public emitLoadedChunkElectronics(): void {
+    if (!this.onChunkMounted) return;
+    for (const [key, chunk] of this.loadedChunks.entries()) {
+      this.onChunkMounted(key, chunk.group, chunk.raycastMeshes);
+    }
+  }
+
   public getOrCreateDelta(chunkKey: string): ChunkDelta {
     let d = this.deltas.get(chunkKey);
     if (!d) {
@@ -730,9 +753,19 @@ export class ChunkManager {
       };
     }
 
+    chunk.group.traverse((o) => {
+      const owned = o.userData?.ownedChunkMat as THREE.Material | undefined;
+      if (owned) {
+        owned.dispose();
+        delete o.userData.ownedChunkMat;
+      }
+    });
     this.worldGroup.remove(chunk.group);
     for (const g of chunk.chunkGeos) {
       g.dispose();
+    }
+    for (const m of chunk.chunkMats) {
+      m.dispose();
     }
     for (const inst of chunk.instancedMeshes) {
       inst.dispose();
@@ -753,6 +786,7 @@ export class ChunkManager {
     this.worldGroup.add(group);
 
     const chunkGeos: THREE.BufferGeometry[] = [];
+    const chunkMats: THREE.Material[] = [];
     const instancedMeshes: THREE.InstancedMesh[] = [];
     const raycastMeshes: THREE.Object3D[] = [];
     const worldColliders: BoxCollider[] = [];
@@ -1069,6 +1103,7 @@ export class ChunkManager {
       worldZ0,
       group,
       chunkGeos,
+      chunkMats,
       instancedMeshes,
       raycastMeshes,
       doors,
@@ -1082,6 +1117,7 @@ export class ChunkManager {
 
     const killedSet = new Set<string>(delta?.killedZombieIds ?? []);
     this.onChunkZombiesReady?.(key, zombieSpawns, killedSet);
+    this.onChunkMounted?.(key, group, raycastMeshes);
   }
 
   private buildChunkRoads(
@@ -1501,12 +1537,41 @@ export class ChunkManager {
       );
     }
 
-    // Optional subtle interior bounce light for deep dark bunkers/stores
+    // Optional subtle interior bounce light + breakable fluorescent fixture for dark bunkers/stores
     if (tpl.dimLightOffset) {
       const lo = rotateLocalOffset(tpl.dimLightOffset[0], tpl.dimLightOffset[2], turns);
-      const l = new THREE.PointLight(0x6e808a, 0.28, 12, 1.9);
-      l.position.set(poi.centerX + lo.x - worldX0, poi.baseY + tpl.dimLightOffset[1], poi.centerZ + lo.z - worldZ0);
+      const lx = poi.centerX + lo.x - worldX0;
+      const ly = poi.baseY + tpl.dimLightOffset[1];
+      const lz = poi.centerZ + lo.z - worldZ0;
+      const l = new THREE.PointLight(0x88a2b2, 0.52, 13, 1.8);
+      l.position.set(lx, ly - 0.12, lz);
       group.add(l);
+
+      const housingGeo = new THREE.BoxGeometry(0.92, 0.06, 0.18);
+      const tubeGeo = new THREE.BoxGeometry(0.84, 0.04, 0.10);
+      chunkGeos.push(housingGeo, tubeGeo);
+      const tubeMat = new THREE.MeshStandardMaterial({
+        color: 0xcfe4f0,
+        emissive: new THREE.Color(0x9fc2d4),
+        emissiveIntensity: 1.35,
+        roughness: 0.28,
+      });
+      if (this.horizonFogUniforms) {
+        applyHorizonDistanceFogToMaterial(tubeMat, this.horizonFogUniforms);
+      }
+      // Track tubeMat via userData so unloadChunk can dispose it via group traversal or chunkMats
+      const housing = new THREE.Mesh(housingGeo, this.darkSteelMat);
+      housing.position.set(lx, ly + 0.04, lz);
+      housing.userData.surface = 'metal';
+      group.add(housing);
+      const tube = new THREE.Mesh(tubeGeo, tubeMat);
+      tube.name = `poi_interior_light_${poi.id}`;
+      tube.position.set(lx, ly - 0.01, lz);
+      tube.userData.surface = 'glass';
+      tube.userData.electronicLabel = 'Ceiling Light';
+      tube.userData.ownedChunkMat = tubeMat;
+      group.add(tube);
+      raycastMeshes.push(housing, tube);
     }
 
     // Deterministic POI zombie spawns

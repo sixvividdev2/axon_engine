@@ -184,8 +184,9 @@ export class ThrowableSystem {
     world: BuiltWorld,
     playerPos: THREE.Vector3,
     onPlayerBlastDamage: (damage: number, bleedChance: number, origin: THREE.Vector3) => void,
+    onDetonation?: (origin: THREE.Vector3, radiusM: number) => void,
   ): void {
-    this.detonateFrag(origin, world, playerPos, onPlayerBlastDamage);
+    this.detonateFrag(origin, world, playerPos, onPlayerBlastDamage, onDetonation);
   }
 
   public update(
@@ -193,6 +194,7 @@ export class ThrowableSystem {
     world: BuiltWorld,
     playerPos: THREE.Vector3,
     onPlayerBlastDamage: (damage: number, bleedChance: number, origin: THREE.Vector3) => void,
+    onDetonation?: (origin: THREE.Vector3, radiusM: number) => void,
   ): void {
     const dt = Math.min(delta, 0.05);
     const targets = [...world.raycastMeshes, ...this.zombies.getHitMeshes()];
@@ -204,7 +206,7 @@ export class ThrowableSystem {
       if (it.kind === 'rgd5_frag') {
         it.fuseRemaining -= dt;
         if (it.fuseRemaining <= 0) {
-          this.detonateFrag(it.pos, world, playerPos, onPlayerBlastDamage);
+          this.detonateFrag(it.pos, world, playerPos, onPlayerBlastDamage, onDetonation);
           this.scene.remove(it.mesh);
           this.items.splice(i, 1);
           continue;
@@ -384,10 +386,14 @@ export class ThrowableSystem {
     world: BuiltWorld,
     playerPos: THREE.Vector3,
     onPlayerBlastDamage: (damage: number, bleedChance: number, origin: THREE.Vector3) => void,
+    onDetonation?: (origin: THREE.Vector3, radiusM: number) => void,
   ): void {
     // 1. Massive 200m acoustic spike + mic-clipping explosion audio
     this.audio.playExplosion(origin);
     this.acoustic.emitNoise(origin, 200, 'explosion');
+    if (onDetonation) {
+      onDetonation(origin, 8.5);
+    }
 
     // 2. Shrapnel / kinetic blast against zombies (9.5m lethal radius)
     this.zombies.applyExplosion(origin, 9.5, 4200, world);

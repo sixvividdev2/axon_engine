@@ -761,6 +761,34 @@ export class OpenWorldAtmosphere {
   }
 
   /**
+   * Synchronizes the 15m AAA horizon distance fog dissolve, keeps the sky dome safely inside
+   * `camera.far` (since SKY_VERTEX_SHADER normalizes local position, scaling is visually lossless),
+   * and tightens the directional shadow frustum proportionally.
+   */
+  public setRenderDistance(renderDistM: number, cameraFarM?: number): void {
+    const clampedDist = Math.max(40, renderDistM);
+    const fogStart = Math.max(15, clampedDist - 15);
+    this.fogUniforms.uAtmoRenderDist.value.set(fogStart, clampedDist);
+
+    const effFar = Math.max(clampedDist + 16, cameraFarM ?? clampedDist + 18);
+    // Keep the 4300m-radius sky dome comfortably inside camera.far so it never clips
+    const targetSkyRadius = Math.min(4300, Math.max(90, effFar * 0.92));
+    this.skyDome.scale.setScalar(targetSkyRadius / 4300);
+
+    if (!this.isSoftwareGl && this.sunLight.castShadow) {
+      const shadowHalf = THREE.MathUtils.clamp(clampedDist * 0.28, 52, 85);
+      if (Math.abs(this.sunLight.shadow.camera.right - shadowHalf) > 2) {
+        this.sunLight.shadow.camera.left = -shadowHalf;
+        this.sunLight.shadow.camera.right = shadowHalf;
+        this.sunLight.shadow.camera.top = shadowHalf;
+        this.sunLight.shadow.camera.bottom = -shadowHalf;
+        this.sunLight.shadow.camera.updateProjectionMatrix();
+        this.shadowDirty = true;
+      }
+    }
+  }
+
+  /**
    * On hardware GPUs at High/Ultra presets, renders a quarter-res occlusion mask & radial scatter pass.
    * Performance and Balanced presets skip this extra full-world pass completely (relying on the
    * zero-cost single-pass Mie solar aureole & corona inside the sky shader).

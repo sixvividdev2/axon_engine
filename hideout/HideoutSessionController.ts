@@ -60,7 +60,9 @@ import {
   TacticalEquipmentId,
 } from '../data/tacticalEquipment';
 import { DoorInteractOptionId } from '../doors/DestructibleDoorSystem';
+import { HoldRepairController } from '../doors/HoldRepairController';
 import { PlayerInteractAnimator } from '../doors/PlayerInteractAnimator';
+import type { BrokenElectronicRepairTarget } from './HideoutElectronicsSystem';
 import { GunWallSwapChoreography } from './GunWallSwapChoreography';
 import {
   buildHideoutBunkerWorld,
@@ -89,11 +91,14 @@ export interface HideoutPromptState {
   targetLabel?: string;
   options: HideoutPromptOption[];
   selectedIndex: number;
+  holdProgress?: number;
+  holdLabel?: string;
 }
 
 type ActiveInteractTarget =
   | { source: 'prop'; meta: HideoutInteractableMeta; keyId: string }
-  | { source: 'door'; doorId: string; keyId: string };
+  | { source: 'door'; doorId: string; keyId: string }
+  | { source: 'electronic'; target: BrokenElectronicRepairTarget; keyId: string };
 
 export interface HideoutSnapshot {
   pointerLocked: boolean;
@@ -198,6 +203,7 @@ export class HideoutSessionController {
   private readonly irIlluminatorLight: THREE.SpotLight;
   private readonly irIlluminatorTarget: THREE.Object3D;
   private readonly interactAnimator = new PlayerInteractAnimator();
+  private readonly holdRepair = new HoldRepairController();
   private readonly unsubOperatorId: () => void;
   private readonly unsubOperatorGear: () => void;
   private readonly unsubLoadout: () => void;
@@ -242,6 +248,9 @@ export class HideoutSessionController {
   private disposed = false;
 
   private shiftHeld = false;
+  private keyFHeld = false;
+  private stamina = 1.0;
+  private heartRateBpm = 72;
   private currentRoomId: HideoutRoomId = 'arsenal';
   private currentRoomLabel = 'Arsenal Room';
   private activeTarget: ActiveInteractTarget | null = null;
@@ -1552,6 +1561,48 @@ export class HideoutSessionController {
         return;
       }
 
+      if (optId === 'repair') {
+        const anchor = new THREE.Vector3();
+        if (!this.world.doorSystem.getRepairAnchorWorldPos(target.doorId, anchor)) {
+          this.world.doorSystem.getDoorCenterWorldPos(target.doorId, anchor);
+        }
+        const doorObj = this.world.doorSystem.getDoor(target.doorId);
+        const doorLabel = doorObj?.label ?? 'Door';
+        this.isFiring = false;
+        this.input.ads = false;
+        this.holdRepair.start(
+          {
+            kind: 'DOOR_REPAIR',
+            targetId: target.doorId,
+            label: `Repairing ${doorLabel}`,
+            durationSec: 2.3,
+            anchorPos: anchor,
+            dynamicAnchorProvider: (out) =>
+              this.world.doorSystem.getRepairAnchorWorldPos(target.doorId, out),
+            onWorkTick: () => {
+              this.world.doorSystem.playRepairWorkTick(target.doorId);
+            },
+            onComplete: () => {
+              this.camera.getWorldPosition(this._camPos);
+              this.camera.getWorldDirection(this._lookDir).normalize();
+              const repaired = this.world.doorSystem.executeOption(target.doorId, 'repair', {
+                actorPos: this._camPos,
+                actorForward: this._lookDir,
+                horizontalSpeedMps: 0,
+                isSprinting: false,
+              });
+              if (repaired) {
+                this.showToast(`${doorLabel} Repaired`);
+                this.emitSnapshot(true);
+              }
+            },
+          },
+          this.interactAnimator,
+        );
+        this.emitSnapshot(true);
+        return;
+      }
+
       const ok = this.world.doorSystem.executeOption(target.doorId, optId, {
         actorPos: this._camPos,
         actorForward: this._lookDir,
@@ -1579,13 +1630,13 @@ export class HideoutSessionController {
             this.world.doorSystem.getPushFaceWorldPos(target.doorId, this._camPos, out),
           );
         }
-      } else if (optId === 'repair') {
-        if (this.world.doorSystem.getDoorCenterWorldPos(target.doorId, this._ikTargetPos)) {
-          this.interactAnimator.trigger('PROP_INTERACT', this._ikTargetPos);
-        }
-        this.showToast('Door Repaired');
       }
       this.emitSnapshot(true);
+      return;
+    }
+
+    if (target.source === 'electronic') {
+      this.startElectronicHoldRepair(target.target);
       return;
     }
 
@@ -1643,8 +1694,17 @@ export class HideoutSessionController {
       }
       case 'range_console': {
         if (this.world.gunRange.isConsoleBroken()) {
-          this.audio.playWeaponCue('dryfire', { intensity: 0.45 });
-          this.showToast('Range Console Damaged — Reload Hideout to Repair');
+          const linked = this.world.electronics.getNodeByLinkId('range_console');
+          if (linked && linked.broken) {
+            this.startElectronicHoldRepair({
+              id: linked.id,
+              label: linked.label,
+              anchorPos: linked.anchorPos,
+              durationSec: linked.durationSec,
+              distanceM: 1.4,
+              interactiveLinkId: 'range_console',
+            });
+          }
           break;
         }
         if (this.world.getPropInteractPos('range_console', this._ikTargetPos)) {
@@ -1670,8 +1730,17 @@ export class HideoutSessionController {
       }
       case 'ballistics_console': {
         if (this.world.longRangeGallery.isConsoleBroken()) {
-          this.audio.playWeaponCue('dryfire', { intensity: 0.45 });
-          this.showToast('Ballistics Console Damaged — Reload Hideout to Repair');
+          const linked = this.world.electronics.getNodeByLinkId('ballistics_console');
+          if (linked && linked.broken) {
+            this.startElectronicHoldRepair({
+              id: linked.id,
+              label: linked.label,
+              anchorPos: linked.anchorPos,
+              durationSec: linked.durationSec,
+              distanceM: 1.4,
+              interactiveLinkId: 'ballistics_console',
+            });
+          }
           break;
         }
         if (this.world.getPropInteractPos('ballistics_console', this._ikTargetPos)) {
@@ -1699,8 +1768,17 @@ export class HideoutSessionController {
       }
       case 'ops_laptop': {
         if (this.world.readyRoom.isLaptopBroken()) {
-          this.audio.playWeaponCue('dryfire', { intensity: 0.45 });
-          this.showToast('Ops Command Laptop Damaged — Reload Hideout to Repair');
+          const linked = this.world.electronics.getNodeByLinkId('ops_laptop');
+          if (linked && linked.broken) {
+            this.startElectronicHoldRepair({
+              id: linked.id,
+              label: linked.label,
+              anchorPos: linked.anchorPos,
+              durationSec: linked.durationSec,
+              distanceM: 1.4,
+              interactiveLinkId: 'ops_laptop',
+            });
+          }
           break;
         }
         if (this.world.getPropInteractPos('ops_laptop', this._ikTargetPos)) {
@@ -1732,7 +1810,7 @@ export class HideoutSessionController {
           this.showToast(`Staged Sector: ${nextMapName}`);
         } else if (chosen.id === 'open_ops_from_board') {
           if (this.world.readyRoom.isLaptopBroken()) {
-            this.showToast('Ops Command Laptop Damaged — Reload Hideout to Repair');
+            this.showToast('Ops Command Laptop Damaged — Hold [F] on Laptop to Repair');
             break;
           }
           this.setModalActive(true);
@@ -1748,6 +1826,34 @@ export class HideoutSessionController {
         break;
       }
     }
+  }
+
+  private startElectronicHoldRepair(target: BrokenElectronicRepairTarget): void {
+    this.isFiring = false;
+    this.input.ads = false;
+    this.holdRepair.start(
+      {
+        kind: 'ELECTRONICS_REPAIR',
+        targetId: target.id,
+        label: `Repairing ${target.label}`,
+        durationSec: target.durationSec,
+        anchorPos: target.anchorPos,
+        dynamicAnchorProvider: (out) =>
+          this.world.electronics.getRepairAnchorWorldPos(target.id, out),
+        onWorkTick: (phaseIndex, pos) => {
+          this.world.electronics.playRepairWorkTick(pos, phaseIndex);
+        },
+        onComplete: () => {
+          this.camera.getWorldPosition(this._camPos);
+          if (this.world.electronics.repairNode(target.id, this._camPos)) {
+            this.showToast(`${target.label} Repaired`);
+            this.emitSnapshot(true);
+          }
+        },
+      },
+      this.interactAnimator,
+    );
+    this.emitSnapshot(true);
   }
 
   public triggerAirlockDeployment(): void {
@@ -1889,6 +1995,41 @@ export class HideoutSessionController {
       break;
     }
 
+    const activeRep = this.holdRepair.getState();
+    if (activeRep) {
+      this.interactReticleState = 'ready';
+      this.activePrompt = {
+        key: 'F',
+        targetLabel: activeRep.label,
+        options: [
+          {
+            id: 'repair_active',
+            label: `${activeRep.label} (${Math.round(activeRep.progress01 * 100)}%)`,
+            hint: 'Hold [F]',
+          },
+        ],
+        selectedIndex: 0,
+        holdProgress: activeRep.progress01,
+        holdLabel: activeRep.label,
+      };
+      return;
+    }
+
+    if (!matched) {
+      const brokenElec = this.world.electronics.findBrokenRepairTarget(
+        this._camPos,
+        this._lookDir,
+        3.05,
+      );
+      if (brokenElec) {
+        matched = {
+          source: 'electronic',
+          target: brokenElec,
+          keyId: `elec:${brokenElec.id}`,
+        };
+      }
+    }
+
     this.activeTarget = matched;
     if (!matched) {
       this.activePrompt = null;
@@ -1904,6 +2045,24 @@ export class HideoutSessionController {
     }
 
     this.interactReticleState = 'ready';
+
+    if (matched.source === 'electronic') {
+      this.selectedOptionIndex = 0;
+      this.activePrompt = {
+        key: 'F',
+        targetLabel: matched.target.label,
+        options: [
+          {
+            id: 'repair_electronic',
+            label: `Repair ${matched.target.label}`,
+            hint: 'Hold [F]',
+          },
+        ],
+        selectedIndex: 0,
+        holdProgress: 0,
+      };
+      return;
+    }
 
     if (matched.source === 'door') {
       this.controller.getVelocity(this._velScratch);
@@ -2013,8 +2172,9 @@ export class HideoutSessionController {
         this.activePrompt = {
           key: 'F',
           targetLabel: 'Range Control Console',
-          options: [{ id: 'broken_console', label: 'Console Damaged', hint: 'Reload to Repair' }],
+          options: [{ id: 'repair_console', label: 'Repair Range Console', hint: 'Hold [F]' }],
           selectedIndex: 0,
+          holdProgress: 0,
         };
         return;
       }
@@ -2042,8 +2202,9 @@ export class HideoutSessionController {
         this.activePrompt = {
           key: 'F',
           targetLabel: 'Ballistics Control Console',
-          options: [{ id: 'broken_console', label: 'Console Damaged', hint: 'Reload to Repair' }],
+          options: [{ id: 'repair_console', label: 'Repair Ballistics Console', hint: 'Hold [F]' }],
           selectedIndex: 0,
+          holdProgress: 0,
         };
         return;
       }
@@ -2077,8 +2238,9 @@ export class HideoutSessionController {
         this.activePrompt = {
           key: 'F',
           targetLabel: 'Ops Command Laptop',
-          options: [{ id: 'broken_laptop', label: 'Terminal Damaged', hint: 'Reload to Repair' }],
+          options: [{ id: 'repair_laptop', label: 'Repair Ops Laptop', hint: 'Hold [F]' }],
           selectedIndex: 0,
+          holdProgress: 0,
         };
         return;
       }
@@ -2155,9 +2317,11 @@ export class HideoutSessionController {
     this.input.ads = false;
     this.input.vault = false;
     this.shiftHeld = false;
+    this.keyFHeld = false;
     this.isFiring = false;
     this.semiTriggerConsumed = false;
     this.pdaDevice.setDragging(false);
+    this.holdRepair.cancel(this.interactAnimator);
   }
 
   private readonly onPointerLockChange = (): void => {
@@ -2353,7 +2517,8 @@ export class HideoutSessionController {
         this.input.leanRight = true;
         break;
       case 'KeyF':
-        if (!e.repeat && !this.pdaDevice.isBlockingWeaponActions() && this.activeTarget) {
+        this.keyFHeld = true;
+        if (!e.repeat && !this.pdaDevice.isBlockingWeaponActions() && !this.holdRepair.isActive() && this.activeTarget) {
           this.executeSelectedInteract();
         }
         break;
@@ -2568,6 +2733,13 @@ export class HideoutSessionController {
       case 'Space':
         this.input.vault = false;
         break;
+      case 'KeyF':
+        this.keyFHeld = false;
+        if (this.holdRepair.isActive()) {
+          this.holdRepair.cancel(this.interactAnimator);
+          this.emitSnapshot(true);
+        }
+        break;
     }
   };
 
@@ -2730,6 +2902,33 @@ export class HideoutSessionController {
         }
       }
 
+      const repairing = this.holdRepair.isActive();
+      if (repairing) {
+        this.input.ads = false;
+        this.input.sprint = false;
+        this.isFiring = false;
+      }
+
+      // Stamina & resting/exertion heart-rate biomechanics coupled to weapon stability
+      const isMoving =
+        this.input.forward || this.input.backward || this.input.left || this.input.right;
+      if (this.controller.isSprinting && isMoving) {
+        this.stamina = Math.max(0, this.stamina - dt * 0.145);
+      } else if (this.controller.isHoldBreathActive()) {
+        this.stamina = Math.max(0, this.stamina - dt * 0.14);
+      } else {
+        const regenRate = !isMoving ? (this.input.crouch ? 0.16 : 0.13) : 0.08;
+        this.stamina = Math.min(1.0, this.stamina + dt * regenRate);
+      }
+      const targetHr = THREE.MathUtils.clamp(
+        68 + (this.controller.isSprinting ? 34 : isMoving ? 12 : 0) + (1 - this.stamina) * 30,
+        64,
+        155,
+      );
+      const hrLerp = targetHr > this.heartRateBpm ? dt * 2.0 : dt * 0.6;
+      this.heartRateBpm += (targetHr - this.heartRateBpm) * Math.min(1, hrLerp);
+      this.controller.setHeartRateBpm(this.heartRateBpm);
+
       // Update player first-person movement, breathing sway & weapon rig
       this.controller.update(
         dt,
@@ -2738,8 +2937,11 @@ export class HideoutSessionController {
         this.adapter,
         profile,
         this.config,
-        1.0,
+        this.stamina,
         100,
+        (drainAmt) => {
+          this.stamina = Math.max(0, this.stamina - drainAmt);
+        },
       );
 
       // Update interactive Arsenal props, Gun Range targets/course, destructible electronics & doors
@@ -2747,12 +2949,25 @@ export class HideoutSessionController {
       this.world.updateProps(dt, this._camPos);
       this.world.doorSystem.update(dt, this._camPos);
 
-      // Update Gun Wall two-handed swap choreography or 1P left-hand interact IK BEFORE CharacterAnimator
+      // Update Gun Wall swap choreography, Hold [F] two-handed repair IK, or 1P interact IK BEFORE CharacterAnimator
       if (swapping) {
+        this.holdRepair.cancel(this.interactAnimator);
         this.interactAnimator.cancel();
         this.swapChoreography.update(dt, this.camera);
         this.animator.setExternalHandOverride(
           this.swapChoreography.isActive() ? this.swapChoreography.ikOverride : null,
+        );
+      } else if (this.holdRepair.isActive()) {
+        this.holdRepair.step(
+          dt,
+          this.keyFHeld,
+          this.controller.position,
+          this.camera,
+          this.interactAnimator,
+          3.45,
+        );
+        this.animator.setExternalHandOverride(
+          this.interactAnimator.isActive() ? this.interactAnimator.ikOverride : null,
         );
       } else if (this.interactAnimator.isActive()) {
         const stillActive = this.interactAnimator.update(dt, this.camera);
@@ -2976,6 +3191,7 @@ export class HideoutSessionController {
 
   public dispose(): void {
     this.disposed = true;
+    this.holdRepair.cancel(this.interactAnimator);
     cancelAnimationFrame(this.rafId);
     window.clearTimeout(this.softwareTimerId);
     if (this.toastTimeout !== null) window.clearTimeout(this.toastTimeout);

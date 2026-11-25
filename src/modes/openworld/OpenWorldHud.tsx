@@ -264,19 +264,31 @@ export const OpenWorldHud: React.FC<OpenWorldHudProps> = ({
               <button
                 type="button"
                 onClick={onExecuteInteract}
-                className={`flex cursor-pointer items-center gap-3 border px-4 py-1.5 text-left text-xs ${
+                className={`flex cursor-pointer flex-col gap-1.5 border px-4 py-1.5 text-left text-xs ${
                   snapshot.interactable.canExecute
                     ? 'border-amber-400/70 bg-[#12161d]/95 text-neutral-100 hover:border-amber-300'
                     : 'border-red-500/50 bg-[#1b1114]/95 text-red-100'
                 }`}
               >
-                <span className="border border-amber-400/60 bg-amber-500/20 px-1.5 py-0.5 font-mono-tabular font-semibold text-amber-200">
-                  F
-                </span>
-                <div>
-                  <div className="font-semibold">{snapshot.interactable.label}</div>
-                  <div className="text-[11px] text-neutral-400">{snapshot.interactable.sublabel}</div>
+                <div className="flex items-center gap-3">
+                  <span className="border border-amber-400/60 bg-amber-500/20 px-1.5 py-0.5 font-mono-tabular font-semibold text-amber-200 whitespace-nowrap">
+                    {snapshot.interactable.holdToRepair ? 'HOLD F' : 'F'}
+                  </span>
+                  <div>
+                    <div className="font-semibold">{snapshot.interactable.label}</div>
+                    <div className="text-[11px] text-neutral-400">{snapshot.interactable.sublabel}</div>
+                  </div>
                 </div>
+                {snapshot.interactable.holdToRepair && (snapshot.interactable.repairProgress ?? 0) > 0 && (
+                  <div className="h-1.5 w-full overflow-hidden bg-white/10">
+                    <div
+                      className="h-full bg-amber-400 transition-[width] duration-75"
+                      style={{
+                        width: `${Math.min(100, Math.round((snapshot.interactable.repairProgress ?? 0) * 100))}%`,
+                      }}
+                    />
+                  </div>
+                )}
               </button>
 
               {snapshot.interactable.kind === 'convoy_hijack' && snapshot.interactable.canExecute && (

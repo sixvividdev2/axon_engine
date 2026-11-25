@@ -2963,6 +2963,11 @@ export class CharacterAnimator {
         ? 0
         : (1 - aimLockWeightPost) * (1 - smoothstep(0.02, 0.25, Math.max(pdaIkW, grenadeIkW)));
 
+    if (!isUnarmed && extIk?.suppressWeaponHardLock && extRightW > 0.05) {
+      // Sling weapon down cleanly against the chest so two-handed repair animations are unobstructed
+      this.weaponRig.root.position.y -= 0.42 * extRightW;
+    }
+
     if (!isUnarmed && vaultPinR < 0.12 && boltHandW < 0.02 && hardLockW > 0.001) {
       armR.hand.root.getWorldPosition(this._solvedHandRWorldPos);
       armR.hand.root.getWorldQuaternion(this._solvedHandRWorldQuat);

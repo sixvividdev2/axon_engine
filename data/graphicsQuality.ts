@@ -105,17 +105,66 @@ export function getGraphicsQualityProfile(id: GraphicsQualityId | undefined): Gr
   return GRAPHICS_QUALITY_PROFILES[id && isValidGraphicsQuality(id) ? id : 'balanced'];
 }
 
+export interface DistancePerformanceSettings {
+  /** Standard / Battle / Conquest / Survival render distance in meters (default 220m) */
+  renderDistanceM: number;
+  /** 4km Open World render distance in meters (default 300m) */
+  openWorldRenderDistanceM: number;
+  /** Distance beyond which remote/AI/zombie/wildlife skeletal animations run at half rate (default 75m) */
+  reduceAnimationDistanceM: number;
+}
+
+export const RENDER_DISTANCE_LIMITS = {
+  min: 100,
+  max: 400,
+  step: 10,
+  default: 220,
+} as const;
+
+export const OPEN_WORLD_RENDER_DISTANCE_LIMITS = {
+  min: 140,
+  max: 650,
+  step: 10,
+  default: 300,
+} as const;
+
+export const REDUCE_ANIMATION_DISTANCE_LIMITS = {
+  min: 25,
+  max: 180,
+  step: 5,
+  default: 75,
+} as const;
+
+/** AAA distance fog begins this many meters before the active render distance */
+export const HORIZON_FOG_LEAD_M = 15;
+
 const STORAGE_KEY = 'axon_graphics_quality_v1';
 const ADAPTIVE_SCALING_STORAGE_KEY = 'axon_adaptive_scaling_v1';
+const RENDER_DIST_STORAGE_KEY = 'axon_render_distance_m_v1';
+const OW_RENDER_DIST_STORAGE_KEY = 'axon_ow_render_distance_m_v1';
+const REDUCE_ANIM_DIST_STORAGE_KEY = 'axon_reduce_anim_distance_m_v1';
 
 type QualityListener = (quality: GraphicsQualityId) => void;
 type AdaptiveScalingListener = (enabled: boolean) => void;
+type DistanceSettingsListener = (settings: Readonly<DistancePerformanceSettings>) => void;
+
+function clampStep(val: number, min: number, max: number, step: number, fallback: number): number {
+  if (!Number.isFinite(val)) return fallback;
+  const clamped = Math.max(min, Math.min(max, val));
+  return Math.round(clamped / step) * step;
+}
 
 class GraphicsQualityStore {
   private current: GraphicsQualityId = 'balanced';
   private adaptiveScalingEnabled = false;
+  private distanceSettings: DistancePerformanceSettings = {
+    renderDistanceM: RENDER_DISTANCE_LIMITS.default,
+    openWorldRenderDistanceM: OPEN_WORLD_RENDER_DISTANCE_LIMITS.default,
+    reduceAnimationDistanceM: REDUCE_ANIMATION_DISTANCE_LIMITS.default,
+  };
   private readonly listeners = new Set<QualityListener>();
   private readonly adaptiveListeners = new Set<AdaptiveScalingListener>();
+  private readonly distanceListeners = new Set<DistanceSettingsListener>();
 
   constructor() {
     this.load();
@@ -132,6 +181,36 @@ class GraphicsQualityStore {
         this.adaptiveScalingEnabled = true;
       } else {
         this.adaptiveScalingEnabled = false;
+      }
+      const rdRaw = window.localStorage.getItem(RENDER_DIST_STORAGE_KEY);
+      if (rdRaw !== null) {
+        this.distanceSettings.renderDistanceM = clampStep(
+          Number(rdRaw),
+          RENDER_DISTANCE_LIMITS.min,
+          RENDER_DISTANCE_LIMITS.max,
+          RENDER_DISTANCE_LIMITS.step,
+          RENDER_DISTANCE_LIMITS.default,
+        );
+      }
+      const owRdRaw = window.localStorage.getItem(OW_RENDER_DIST_STORAGE_KEY);
+      if (owRdRaw !== null) {
+        this.distanceSettings.openWorldRenderDistanceM = clampStep(
+          Number(owRdRaw),
+          OPEN_WORLD_RENDER_DISTANCE_LIMITS.min,
+          OPEN_WORLD_RENDER_DISTANCE_LIMITS.max,
+          OPEN_WORLD_RENDER_DISTANCE_LIMITS.step,
+          OPEN_WORLD_RENDER_DISTANCE_LIMITS.default,
+        );
+      }
+      const animRaw = window.localStorage.getItem(REDUCE_ANIM_DIST_STORAGE_KEY);
+      if (animRaw !== null) {
+        this.distanceSettings.reduceAnimationDistanceM = clampStep(
+          Number(animRaw),
+          REDUCE_ANIMATION_DISTANCE_LIMITS.min,
+          REDUCE_ANIMATION_DISTANCE_LIMITS.max,
+          REDUCE_ANIMATION_DISTANCE_LIMITS.step,
+          REDUCE_ANIMATION_DISTANCE_LIMITS.default,
+        );
       }
     } catch {
       // Ignore storage access errors
@@ -189,6 +268,90 @@ class GraphicsQualityStore {
     return () => {
       this.adaptiveListeners.delete(fn);
     };
+  }
+
+  public getDistanceSettings(): Readonly<DistancePerformanceSettings> {
+    return this.distanceSettings;
+  }
+
+  public getRenderDistanceM(): number {
+    return this.distanceSettings.renderDistanceM;
+  }
+
+  public getOpenWorldRenderDistanceM(): number {
+    return this.distanceSettings.openWorldRenderDistanceM;
+  }
+
+  public getReduceAnimationDistanceM(): number {
+    return this.distanceSettings.reduceAnimationDistanceM;
+  }
+
+  public setRenderDistanceM(val: number): void {
+    const next = clampStep(
+      val,
+      RENDER_DISTANCE_LIMITS.min,
+      RENDER_DISTANCE_LIMITS.max,
+      RENDER_DISTANCE_LIMITS.step,
+      RENDER_DISTANCE_LIMITS.default,
+    );
+    if (next === this.distanceSettings.renderDistanceM) return;
+    this.distanceSettings = { ...this.distanceSettings, renderDistanceM: next };
+    try {
+      window.localStorage.setItem(RENDER_DIST_STORAGE_KEY, String(next));
+    } catch {
+      // Ignore storage errors
+    }
+    this.notifyDistanceListeners();
+  }
+
+  public setOpenWorldRenderDistanceM(val: number): void {
+    const next = clampStep(
+      val,
+      OPEN_WORLD_RENDER_DISTANCE_LIMITS.min,
+      OPEN_WORLD_RENDER_DISTANCE_LIMITS.max,
+      OPEN_WORLD_RENDER_DISTANCE_LIMITS.step,
+      OPEN_WORLD_RENDER_DISTANCE_LIMITS.default,
+    );
+    if (next === this.distanceSettings.openWorldRenderDistanceM) return;
+    this.distanceSettings = { ...this.distanceSettings, openWorldRenderDistanceM: next };
+    try {
+      window.localStorage.setItem(OW_RENDER_DIST_STORAGE_KEY, String(next));
+    } catch {
+      // Ignore storage errors
+    }
+    this.notifyDistanceListeners();
+  }
+
+  public setReduceAnimationDistanceM(val: number): void {
+    const next = clampStep(
+      val,
+      REDUCE_ANIMATION_DISTANCE_LIMITS.min,
+      REDUCE_ANIMATION_DISTANCE_LIMITS.max,
+      REDUCE_ANIMATION_DISTANCE_LIMITS.step,
+      REDUCE_ANIMATION_DISTANCE_LIMITS.default,
+    );
+    if (next === this.distanceSettings.reduceAnimationDistanceM) return;
+    this.distanceSettings = { ...this.distanceSettings, reduceAnimationDistanceM: next };
+    try {
+      window.localStorage.setItem(REDUCE_ANIM_DIST_STORAGE_KEY, String(next));
+    } catch {
+      // Ignore storage errors
+    }
+    this.notifyDistanceListeners();
+  }
+
+  public subscribeDistanceSettings(fn: DistanceSettingsListener): () => void {
+    this.distanceListeners.add(fn);
+    return () => {
+      this.distanceListeners.delete(fn);
+    };
+  }
+
+  private notifyDistanceListeners(): void {
+    const snap = this.distanceSettings;
+    for (const fn of this.distanceListeners) {
+      fn(snap);
+    }
   }
 }
 
@@ -324,4 +487,30 @@ export function useAdaptiveScaling(): [boolean, (enabled: boolean) => void] {
   }, []);
 
   return [enabled, (next) => graphicsQualityStore.setAdaptiveScalingEnabled(next)];
+}
+
+export function useDistancePerformanceSettings(): [
+  Readonly<DistancePerformanceSettings>,
+  {
+    setRenderDistanceM: (val: number) => void;
+    setOpenWorldRenderDistanceM: (val: number) => void;
+    setReduceAnimationDistanceM: (val: number) => void;
+  },
+] {
+  const [settings, setSettings] = useState<Readonly<DistancePerformanceSettings>>(() =>
+    graphicsQualityStore.getDistanceSettings(),
+  );
+
+  useEffect(() => {
+    return graphicsQualityStore.subscribeDistanceSettings((next) => setSettings(next));
+  }, []);
+
+  return [
+    settings,
+    {
+      setRenderDistanceM: (val) => graphicsQualityStore.setRenderDistanceM(val),
+      setOpenWorldRenderDistanceM: (val) => graphicsQualityStore.setOpenWorldRenderDistanceM(val),
+      setReduceAnimationDistanceM: (val) => graphicsQualityStore.setReduceAnimationDistanceM(val),
+    },
+  ];
 }
