@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import {
   BodycamPhysicsWorld,
   BodycamSurfaceMaterial,
@@ -1054,6 +1055,158 @@ export function buildHideoutBunkerWorld(
   // Dedicated 0.90m tactical vault barrier alongside breach panels (Space = Vault / 2x Space = 360 Spin)
   addBoxStructure(16.0, 0.45, -7.8, 1.9, 0.9, 0.42, materials.ammoCrateBody, 'wood', true);
   makePlaque(16.0, 1.28, -7.56, 0, 'VAULT BARRICADE 0.9M', 'SPACE VAULT · 2X SPACE SPIN', '#38bdf8');
+
+  // ============================================================================
+  // 5F. MERGED COLD-WAR BUNKER ARCHITECTURAL DRESSING & RANGE PLINKING SHELVES
+  // ============================================================================
+  // Batch decorative architectural elements by material (zero extra draw calls per prop)
+  const darkMetalGeos: THREE.BufferGeometry[] = [];
+  const brushedMetalGeos: THREE.BufferGeometry[] = [];
+  const accentRedGeos: THREE.BufferGeometry[] = [];
+  const woodTrimGeos: THREE.BufferGeometry[] = [];
+
+  const pushMergedBox = (
+    bucket: THREE.BufferGeometry[],
+    w: number,
+    h: number,
+    d: number,
+    cx: number,
+    cy: number,
+    cz: number,
+  ): void => {
+    const g = new THREE.BoxGeometry(w, h, d);
+    g.translate(cx, cy, cz);
+    bucket.push(g);
+  };
+  const pushMergedCyl = (
+    bucket: THREE.BufferGeometry[],
+    rTop: number,
+    rBot: number,
+    len: number,
+    segs: number,
+    cx: number,
+    cy: number,
+    cz: number,
+    rotX = 0,
+    rotZ = 0,
+  ): void => {
+    const g = new THREE.CylinderGeometry(rTop, rBot, len, segs);
+    if (rotX !== 0) g.rotateX(rotX);
+    if (rotZ !== 0) g.rotateZ(rotZ);
+    g.translate(cx, cy, cz);
+    bucket.push(g);
+  };
+
+  // Overhead riveted HVAC trunk duct & twin insulated ceiling pipes across Arsenal & Ready Room
+  pushMergedBox(brushedMetalGeos, 10.6, 0.24, 0.42, 0, H_HUB - 0.14, 3.65);
+  for (const fx of [-4.2, -2.1, 0, 2.1, 4.2]) {
+    pushMergedBox(darkMetalGeos, 0.06, 0.28, 0.48, fx, H_HUB - 0.14, 3.65);
+  }
+  pushMergedCyl(brushedMetalGeos, 0.045, 0.045, 10.6, 8, 0, H_HUB - 0.12, -3.55, 0, Math.PI * 0.5);
+  pushMergedCyl(darkMetalGeos, 0.032, 0.032, 10.6, 8, 0, H_HUB - 0.22, -3.72, 0, Math.PI * 0.5);
+  // Valve wheels along Arsenal North pipe run
+  for (const vx of [-3.4, 3.4]) {
+    pushMergedCyl(accentRedGeos, 0.085, 0.085, 0.024, 10, vx, H_HUB - 0.28, -3.72, Math.PI * 0.5, 0);
+  }
+  // Ready Room ceiling HVAC trunk + conduit pipe
+  pushMergedBox(brushedMetalGeos, 9.4, 0.22, 0.38, -11.5, H_HUB - 0.13, -4.15);
+  pushMergedCyl(darkMetalGeos, 0.036, 0.036, 9.4, 8, -11.5, H_HUB - 0.14, 4.15, 0, Math.PI * 0.5);
+  // Gun Range foyer overhead steel pipe & duct header
+  pushMergedBox(brushedMetalGeos, 17.6, 0.28, 0.48, 15.5, H_RANGE - 0.16, -8.8);
+  pushMergedCyl(darkMetalGeos, 0.05, 0.05, 17.6, 8, 15.5, H_RANGE - 0.22, -1.8, 0, Math.PI * 0.5);
+
+  // Electrical breaker cabinet + twin vertical conduit risers on Arsenal SW wall (clear of doors)
+  pushMergedBox(darkMetalGeos, 0.58, 0.78, 0.18, -3.55, 1.56, 4.38);
+  pushMergedBox(brushedMetalGeos, 0.48, 0.66, 0.03, -3.55, 1.56, 4.28);
+  pushMergedCyl(brushedMetalGeos, 0.022, 0.022, 1.82, 6, -3.72, 2.86, 4.41);
+  pushMergedCyl(brushedMetalGeos, 0.022, 0.022, 1.82, 6, -3.38, 2.86, 4.41);
+
+  // Wall-mounted red fire extinguisher on Arsenal NW pilaster
+  pushMergedCyl(accentRedGeos, 0.075, 0.075, 0.48, 10, -5.06, 1.18, -3.75);
+  pushMergedCyl(darkMetalGeos, 0.028, 0.035, 0.11, 8, -5.06, 1.47, -3.75);
+
+  // Cast-iron bunker radiator on Arsenal East-South wall (clear of Gun Range doorway)
+  for (let fin = 0; fin < 8; fin++) {
+    pushMergedBox(darkMetalGeos, 0.14, 0.64, 0.05, 5.26, 0.44, 2.18 + fin * 0.11);
+  }
+  pushMergedCyl(brushedMetalGeos, 0.024, 0.024, 0.96, 6, 5.26, 0.72, 2.57, Math.PI * 0.5, 0);
+  pushMergedCyl(brushedMetalGeos, 0.024, 0.024, 0.96, 6, 5.26, 0.16, 2.57, Math.PI * 0.5, 0);
+
+  // Heavy 4-tier Arsenal supply shelving rack in SE corner (X = 3.75, Z = 4.18, flush against South wall)
+  const rackCx = 3.75;
+  const rackCz = 4.18;
+  for (const sx of [-0.66, 0.66]) {
+    for (const sz of [-0.21, 0.21]) {
+      pushMergedBox(darkMetalGeos, 0.045, 1.88, 0.045, rackCx + sx, 0.94, rackCz + sz);
+    }
+  }
+  for (const sy of [0.14, 0.66, 1.18, 1.72]) {
+    pushMergedBox(brushedMetalGeos, 1.36, 0.035, 0.44, rackCx, sy, rackCz);
+  }
+  physics.addBox({
+    minX: rackCx - 0.7,
+    maxX: rackCx + 0.7,
+    minY: 0,
+    maxY: 1.9,
+    minZ: rackCz - 0.25,
+    maxZ: rackCz + 0.25,
+    surface: 'metal',
+  });
+
+  // Grounded timber logistics pallet in Ready Room SE corner (X = -7.65, Z = 4.05, top Y = 0.14)
+  for (const pz of [-0.42, 0, 0.42]) {
+    pushMergedBox(woodTrimGeos, 1.18, 0.09, 0.11, -7.65, 0.045, 4.05 + pz);
+  }
+  for (let sl = 0; sl < 5; sl++) {
+    pushMergedBox(woodTrimGeos, 1.22, 0.04, 0.14, -7.65, 0.115, 4.05 - 0.42 + sl * 0.21);
+  }
+  physics.addBox({
+    minX: -8.28,
+    maxX: -7.02,
+    minY: 0,
+    maxY: 0.14,
+    minZ: 3.55,
+    maxZ: 4.55,
+    surface: 'wood',
+  });
+
+  const accentRedMat = new THREE.MeshStandardMaterial({
+    color: 0x9b2226,
+    roughness: 0.42,
+    metalness: 0.28,
+  });
+  ownedMats.push(accentRedMat);
+
+  const flushMergedBucket = (
+    geos: THREE.BufferGeometry[],
+    mat: THREE.Material,
+    surface: BodycamSurfaceMaterial,
+  ): void => {
+    if (geos.length === 0) return;
+    const merged = mergeGeometries(geos, false);
+    for (const g of geos) g.dispose();
+    if (!merged) return;
+    trackGeo(merged);
+    const mesh = new THREE.Mesh(merged, mat);
+    mesh.receiveShadow = true;
+    mesh.castShadow = !isSoftwareGl;
+    mesh.userData.surfaceMaterial = surface;
+    root.add(mesh);
+    raycastMeshes.push(mesh);
+  };
+  flushMergedBucket(darkMetalGeos, materials.darkSteel, 'metal');
+  flushMergedBucket(brushedMetalGeos, materials.brushedSteel, 'metal');
+  flushMergedBucket(accentRedGeos, accentRedMat, 'metal');
+  flushMergedBucket(woodTrimGeos, materials.tableWood, 'wood');
+
+  // Bay 1 downrange timber plinking shelves (top Y = 0.92m) for shatterable glass bottles & clattering cans
+  const addPlinkingShelf = (cx: number, cz: number, width: number): void => {
+    addBoxStructure(cx, 0.89, cz, width, 0.06, 0.42, materials.tableWood, 'wood', true, true, true);
+    addBoxStructure(cx - width * 0.42, 0.43, cz, 0.08, 0.86, 0.36, materials.darkSteel, 'metal', true);
+    addBoxStructure(cx + width * 0.42, 0.43, cz, 0.08, 0.86, 0.36, materials.darkSteel, 'metal', true);
+  };
+  addPlinkingShelf(10.8, 10.2, 2.2);
+  addPlinkingShelf(13.6, 16.4, 1.8);
 
   // Register static world, Gun Range & Ready Room raycast meshes BEFORE mounting dynamic doors
   physics.setRaycastMeshes(raycastMeshes);

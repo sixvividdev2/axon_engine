@@ -1,5 +1,10 @@
 import * as THREE from 'three';
-import { BodycamPhysicsWorld, BodycamSurfaceMaterial } from '../bodycam-sdk';
+import {
+  BodycamPhysicsWorld,
+  BodycamSurfaceMaterial,
+  DynamicPropSpawnSpec,
+} from '../bodycam-sdk';
+import { buildMergedInteriorDressing, InteriorDressingTheme } from './InteriorDressingBuilder';
 import { PropFactoryContext } from './MapPropFactory';
 import {
   createCabinWoodTexture,
@@ -54,6 +59,8 @@ export interface BuiltCoverBuilding {
   interiorPos: [number, number, number];
   /** World-space exterior entry points just outside each doorway for AI NavGraph stitching */
   entryPoints: Array<[number, number, number]>;
+  /** Surface-grounded dynamic physics prop spawns emitted inside this building */
+  propSpawns: DynamicPropSpawnSpec[];
 }
 
 /**
@@ -341,6 +348,44 @@ export function buildEnterableCoverBuilding(
   addStructBox(W * 0.28, floorTop, -D * 0.22, 1.25, 1.15, 1.25, mats.crate, 'wood');
   addStructBox(W * 0.25, floorTop + 1.15, -D * 0.22, 0.8, 0.65, 0.8, mats.crate, 'wood');
 
+  // 8. Merged architectural interior dressing (desks, shelving, ceiling joists/conduits,
+  //    radiators, breaker panel, fire extinguisher, corkboard) + grounded physics prop spawns
+  const dressingTheme: InteriorDressingTheme =
+    spec.preset === 'industrial_garage'
+      ? 'industrial_garage'
+      : spec.preset === 'timber_cabin'
+        ? 'timber_cabin'
+        : spec.preset === 'soviet_annex'
+          ? 'soviet_office'
+          : 'rural_farmhouse';
+  let seedHash = 313;
+  for (let i = 0; i < spec.id.length; i++) {
+    seedHash = ((seedHash * 31) ^ spec.id.charCodeAt(i)) | 0;
+  }
+  const dressing = buildMergedInteriorDressing(ctx, {
+    theme: dressingTheme,
+    cx: spec.x,
+    floorY: spec.y + floorTop,
+    cz: spec.z,
+    width: W,
+    depth: D,
+    height: H,
+    rotQuarterTurns: turns,
+    seed: Math.abs(seedHash) + 17,
+  });
+  group.add(dressing.group);
+
+  // Also add bottles/cans resting right on top of the interior cover crate!
+  const [crateWx, crateWz] = toWorldXZ(-W * 0.26, D * 0.22);
+  dressing.propSpawns.push(
+    { kind: 'glass_bottle_green', x: crateWx - 0.22, y: spec.y + floorTop + 1.07, z: crateWz + 0.1 },
+    { kind: 'soda_can', x: crateWx + 0.18, y: spec.y + floorTop + 1.07, z: crateWz - 0.12 },
+  );
+  if (ctx.propSpawns) {
+    ctx.propSpawns.push(...dressing.propSpawns);
+  }
+  group.userData.propSpawns = dressing.propSpawns;
+
   // Register interior acoustic zone so weapon/footstep reverb shifts realistically indoors
   const [iwx, iwz] = toWorldXZ(0, 0);
   const [iww, iwd] = toWorldDims(W - 0.6, D - 0.6);
@@ -373,5 +418,6 @@ export function buildEnterableCoverBuilding(
     group,
     interiorPos: [inX, spec.y + floorTop + 0.04, inZ],
     entryPoints,
+    propSpawns: dressing.propSpawns,
   };
 }

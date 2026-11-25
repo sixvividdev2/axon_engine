@@ -11,9 +11,11 @@ import {
   CharacterAnimator,
   CharacterSkeleton,
   computeTargetHingeAngularImpulse,
+  createBodycamPhysicsPropAdapter,
   createPdaMotionState,
   DEFAULT_BODYCAM_SDK_CONFIG,
   DEFAULT_TRAUMA_MODIFIERS,
+  DynamicPhysicsPropSystem,
   GrenadeHoldStage,
   IBodycamWorldAdapter,
   IR_LAYER,
@@ -146,6 +148,7 @@ export class TutorialEngine {
   private readonly scopeRenderer: ScopeRenderer;
   private readonly ballistics: GymBallistics;
   private readonly grenadeSystem: TacticalGrenadeSystem;
+  private readonly physicsProps: DynamicPhysicsPropSystem;
   private readonly course: TutorialCourseStateMachine;
 
   private readonly config: BodycamSDKConfig = { ...DEFAULT_BODYCAM_SDK_CONFIG };
@@ -365,13 +368,29 @@ export class TutorialEngine {
         maxZ: this.world.physics.boundsMaxZ,
       },
       audio: this.audio,
-      onDetonate: () => {
+      onDetonate: (ev) => {
+        // Blast shatters bottles and sends cans, boxes & papers flying in Bay 07 pit!
+        if (ev.kind !== 'smoke') {
+          this.physicsProps.handleBlast(ev.position, 8.5, 18.0);
+        }
         // Safe training detonation — no self-damage, restock if empty
         if (this.grenadeCount <= 1) this.grenadeCount = 6;
         this.emitSnapshot();
       },
     });
     this.animator.setGrenadeSystem(this.grenadeSystem);
+
+    this.physicsProps = new DynamicPhysicsPropSystem({
+      scene: this.scene,
+      adapter: createBodycamPhysicsPropAdapter(this.world.physics),
+      isSoftwareGl: this.isSoftwareGl,
+      graphicsQuality: qProfile.id,
+      maxAniso,
+      onImpactAudio: (kind, pos, intensity) => {
+        this.audio.playPhysicsPropImpact(kind, pos, intensity);
+      },
+    });
+    this.seedTutorialDynamicProps();
 
     this.course = new TutorialCourseStateMachine({
       onTaskComplete: (label) => {
@@ -524,6 +543,7 @@ export class TutorialEngine {
       document.exitPointerLock();
     }
     this.ballistics.dispose();
+    this.physicsProps.dispose();
     this.grenadeSystem.dispose();
     this.pdaDevice.dispose();
     this.scopeRenderer.dispose();
@@ -765,6 +785,9 @@ export class TutorialEngine {
 
     this.weaponRig.getMuzzleWorldTransform(this._muzzlePos, this._muzzleDir, true);
     this.ballistics.fireRound(this._muzzlePos, this._muzzleDir, prof, ammo, derived.velocityMult);
+    const muzzleVel = ammo.baseVelocityMs * (prof.barrelVelocityMult ?? 1.0) * derived.velocityMult;
+    const shotImpulse = THREE.MathUtils.clamp((ammo.bulletMassGrams * muzzleVel) / 4500, 0.75, 1.65);
+    this.physicsProps.handleBulletRay(this._muzzlePos, this._muzzleDir, 70, shotImpulse);
     this.weaponRig.triggerFire(suppressed, current - 1);
     if (!suppressed) this.postProcess.triggerNvgFlashSpike(0.45);
 
@@ -810,6 +833,7 @@ export class TutorialEngine {
     const pit = this.world.fireSupportPitCenter;
     if (source === 'strike') {
       this.world.triggerTrainingStrikeBlast(pit.x, pit.z);
+      this.physicsProps.handleBlast(pit, 11.5, 22.0);
       this.audio.playMortarExplosion(pit);
       this.showToast('Training Fire Support Impact Confirmed!');
     } else {
@@ -818,6 +842,56 @@ export class TutorialEngine {
     }
     this.course.recordEvent('pda_action');
     this.emitSnapshot();
+  }
+
+  private seedTutorialDynamicProps(): void {
+    // Bay 01 staging pallet (-4.8, 0.14, 22.8) & wind-blown range notices
+    this.physicsProps.spawnBatch([
+      { kind: 'cardboard_box', x: -5.0, y: 0.14, z: 22.9, yaw: 0.08 },
+      { kind: 'plastic_crate', x: -4.5, y: 0.14, z: 22.65, yaw: -0.06 },
+      { kind: 'soda_can', x: -4.45, y: 0.14, z: 23.08, yaw: 0.4 },
+    ]);
+    this.physicsProps.seedCluster('wind_street_papers', 1.2, 0.0, 20.5, 401);
+
+    // Bay 03 Marksmanship firing bench (0.9, 1.04, 1.8) & east bottle/can plinking rail (5.1, 0.92, -1.65)
+    this.physicsProps.spawnBatch([
+      { kind: 'soda_can', x: 0.9, y: 1.05, z: 0.35, yaw: 0.5 },
+      { kind: 'paper_sheet', x: 0.9, y: 1.05, z: 3.15, yaw: -0.2 },
+      { kind: 'glass_bottle_green', x: 5.1, y: 0.93, z: -2.15, yaw: 0.2 },
+      { kind: 'glass_bottle_amber', x: 5.1, y: 0.93, z: -1.85, yaw: 1.1 },
+      { kind: 'soda_can', x: 5.1, y: 0.93, z: -1.55, yaw: -0.4 },
+      { kind: 'glass_bottle_green', x: 5.1, y: 0.93, z: -1.25, yaw: 0.7 },
+      { kind: 'ration_tin', x: 5.1, y: 0.93, z: -1.0, yaw: 0.3 },
+    ]);
+
+    // Bay 04 Weapon Handling bench (3.4, 0.90, -7.8) & rack (5.65, -7.8)
+    this.physicsProps.spawnBatch([
+      { kind: 'soda_can', x: 3.42, y: 0.91, z: -7.72, yaw: 0.6 },
+      { kind: 'glass_bottle_amber', x: 3.32, y: 0.91, z: -8.68, yaw: 1.4 },
+      { kind: 'cardboard_box', x: 5.65, y: 0.74, z: -8.1, yaw: 0.04 },
+      { kind: 'plastic_crate', x: 5.65, y: 1.30, z: -7.5, yaw: -0.04 },
+    ]);
+
+    // Bay 05 CQB Breach room floor litter
+    this.physicsProps.seedCluster('floor_trash', -3.6, 0.0, -14.2, 402);
+
+    // Bay 07 Grenade Throwing Pit (3.6, 0.0, -32.2) — frag blast shatters glass & launches cans/papers!
+    this.physicsProps.seedCluster('bar_bottles', 3.6, 0.0, -32.2, 403);
+    this.physicsProps.seedCluster('floor_trash', 3.4, 0.0, -31.8, 404);
+    this.physicsProps.spawnBatch([
+      { kind: 'cardboard_box', x: 4.2, y: 0.0, z: -32.6, yaw: 0.3 },
+      { kind: 'plastic_crate', x: 2.8, y: 0.0, z: -32.8, yaw: -0.2 },
+    ]);
+
+    // Bay 08 Observation Desk (-3.2, 1.05, -39.2) & Fire Support Impact Pit (0, 0.0, -43.8)
+    this.physicsProps.spawnBatch([
+      { kind: 'paper_sheet', x: -3.2, y: 1.06, z: -39.5, yaw: 0.25 },
+      { kind: 'soda_can', x: -3.1, y: 1.06, z: -38.6, yaw: -0.4 },
+      { kind: 'cardboard_box', x: -0.6, y: 0.0, z: -43.5, yaw: 0.22 },
+      { kind: 'plastic_crate', x: 0.75, y: 0.0, z: -44.1, yaw: -0.18 },
+    ]);
+    this.physicsProps.seedCluster('bar_bottles', 0.0, 0.0, -43.8, 405);
+    this.physicsProps.seedCluster('wind_street_papers', 0.0, 0.0, -43.4, 406);
   }
 
   // ---------------------------------------------------------------------------
@@ -1454,8 +1528,17 @@ export class TutorialEngine {
       this.emitSnapshot();
     }
 
-    // Step Tutorial World & Course Auto-Advance
+    // Step Tutorial World, Dynamic Physics Props & Course Auto-Advance
     this.world.update(dt, this.elapsedSec);
+    const tutWindStrength = 0.65 + 0.32 * Math.sin(this.elapsedSec * 0.38);
+    this.physicsProps.setWind(0.7, 0.7, tutWindStrength);
+    this.controller.getVelocity(this._playerVelScratch);
+    this.physicsProps.applyActorFootstepWake(
+      this.controller.position,
+      this._playerVelScratch,
+      this.controller.isSprinting ? 0.65 : 0.52,
+    );
+    this.physicsProps.update(dt, this.camera.position);
     if (this.course.tick(dt, this.pointerLocked)) {
       this.syncWaypoint();
       if (this.course.isCourseComplete() && document.pointerLockElement === this.renderer.domElement) {

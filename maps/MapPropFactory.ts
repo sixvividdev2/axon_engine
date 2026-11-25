@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { BodycamPhysicsWorld } from '../bodycam-sdk';
+import { BodycamPhysicsWorld, DynamicPropSpawnSpec } from '../bodycam-sdk';
 import {
   applyWindFoliageShader,
   assignHeightSwayAttribute,
@@ -30,6 +30,8 @@ export interface PropFactoryContext {
   trackTex?: TrackTexFn;
   windUniforms?: WindShaderUniforms | null;
   maxAniso?: number;
+  /** Optional collector for dynamic physics prop spawns emitted by buildings & prop builders */
+  propSpawns?: DynamicPropSpawnSpec[];
 }
 
 export interface VehicleMaterials {

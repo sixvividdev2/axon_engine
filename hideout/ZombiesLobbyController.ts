@@ -11,9 +11,11 @@ import {
   BodycamWeaponProfile,
   CharacterAnimator,
   CharacterSkeleton,
+  createBodycamPhysicsPropAdapter,
   createRaycastResult,
   DEFAULT_BODYCAM_SDK_CONFIG,
   DEFAULT_TRAUMA_MODIFIERS,
+  DynamicPhysicsPropSystem,
   IBodycamWorldAdapter,
   operatorAssetLoader,
   OperatorGearConfig,
@@ -105,6 +107,7 @@ export class ZombiesLobbyController {
   private readonly postProcess: BodycamPostProcess;
   private readonly scopeRenderer: ScopeRenderer;
   private readonly swapChoreography: GunWallSwapChoreography;
+  private readonly physicsProps: DynamicPhysicsPropSystem;
   private readonly interactAnimator = new PlayerInteractAnimator();
   private readonly holdRepair = new HoldRepairController();
   private readonly unsubOperatorId: () => void;
@@ -195,6 +198,7 @@ export class ZombiesLobbyController {
   private readonly _startWeaponPos = new THREE.Vector3();
   private readonly _startWeaponQuat = new THREE.Quaternion();
   private readonly _ikTargetPos = new THREE.Vector3();
+  private readonly _velScratch = new THREE.Vector3();
   private readonly _runtimeProfile: BodycamWeaponProfile;
   private readonly _scopePassParams: ScopePassParams;
 
@@ -248,6 +252,18 @@ export class ZombiesLobbyController {
       this.config.gearRattleGain,
     );
     this.audio.setInteriorAcoustics(false, 'concrete');
+
+    this.physicsProps = new DynamicPhysicsPropSystem({
+      scene: this.scene,
+      adapter: createBodycamPhysicsPropAdapter(this.world.physics),
+      isSoftwareGl: this.isSoftwareGl,
+      graphicsQuality: gfx.id,
+      maxAniso: Math.min(8, this.renderer.capabilities.getMaxAnisotropy()),
+      onImpactAudio: (kind, pos, intensity) => {
+        this.audio.playPhysicsPropImpact(kind, pos, intensity);
+      },
+    });
+    this.seedOutpostDynamicProps();
 
     this.weaponRig = new WeaponRig(this.scene, this.isSoftwareGl, this.audio);
     this.weaponRig.flashlight.intensity = 0;
@@ -660,6 +676,9 @@ export class ZombiesLobbyController {
       weaponSpreadMOA: Math.hypot(prof.spreadMOA, ammo.spreadMOA),
       audio: this.audio,
     });
+    const muzzleVel = ammo.baseVelocityMs * (prof.barrelVelocityMult ?? 1.0) * derived.velocityMult;
+    const shotImpulse = THREE.MathUtils.clamp((ammo.bulletMassGrams * muzzleVel) / 4500, 0.75, 1.65);
+    this.physicsProps.handleBulletRay(this._muzzlePos, this._muzzleDir, 85, shotImpulse);
     this.weaponRig.triggerFire(derived.isSuppressed, remaining);
     this.weaponRig.setAmmoState(remaining, true);
     this.controller.applyRecoil(
@@ -700,6 +719,37 @@ export class ZombiesLobbyController {
     const matType =
       ev.surface === 'metal' ? 'metal' : ev.surface === 'wood' ? 'wood' : 'concrete';
     this.audio.playImpact(ev.point, matType);
+  }
+
+  private seedOutpostDynamicProps(): void {
+    // Wind-blown quarantine evacuation notices & tactical dossiers across the night tarmac yard
+    this.physicsProps.seedCluster('wind_street_papers', 0.0, 0.0, -0.8, 201);
+    this.physicsProps.seedCluster('wind_street_papers', -4.5, 0.0, 3.2, 202);
+    this.physicsProps.seedCluster('wind_street_papers', 4.8, 0.0, 2.8, 203);
+
+    // Shootable glass bottles & cans lined along the Field Weapon Rack bench lip & Field Med Bench
+    this.physicsProps.spawnBatch([
+      { kind: 'glass_bottle_green', x: -6.35, y: 0.69, z: -6.82, yaw: 0.3 },
+      { kind: 'glass_bottle_amber', x: -6.08, y: 0.69, z: -6.86, yaw: 1.2 },
+      { kind: 'soda_can', x: -1.92, y: 0.69, z: -6.84, yaw: -0.5 },
+      { kind: 'ration_tin', x: -1.68, y: 0.69, z: -6.88, yaw: 0.4 },
+      // East Field Med Bench (7.6, 0.88, 0.8)
+      { kind: 'glass_bottle_amber', x: 7.45, y: 0.89, z: -0.15, yaw: 0.8 },
+      { kind: 'soda_can', x: 7.72, y: 0.89, z: 0.08, yaw: -0.2 },
+      { kind: 'paper_sheet', x: 7.55, y: 0.89, z: 1.48, yaw: 0.4 },
+      // Field Radio Command Table (5.65, 0.84, -5.45)
+      { kind: 'soda_can', x: 5.18, y: 0.85, z: -5.22, yaw: 1.1 },
+      { kind: 'paper_sheet', x: 6.08, y: 0.85, z: -5.65, yaw: -0.35 },
+      // NW timber staging pallet (-8.8, 0.14, -5.6)
+      { kind: 'cardboard_box', x: -9.05, y: 0.14, z: -5.75, yaw: 0.08 },
+      { kind: 'plastic_crate', x: -8.52, y: 0.14, z: -5.42, yaw: -0.1 },
+      { kind: 'glass_bottle_green', x: -8.85, y: 0.14, z: -5.22, yaw: 0.5 },
+    ]);
+
+    // Sandbag revetment & perimeter drum litter
+    this.physicsProps.seedCluster('floor_trash', -9.2, 0.0, 3.4, 204);
+    this.physicsProps.seedCluster('loading_dock', 8.8, 0.0, -4.4, 205);
+    this.physicsProps.seedCluster('range_ledge', -1.8, 0.69, -11.2, 206);
   }
 
   private startElectronicHoldRepair(target: BrokenElectronicRepairTarget): void {
@@ -1424,6 +1474,17 @@ export class ZombiesLobbyController {
       );
       this.camera.getWorldPosition(this._camPos);
       this.world.update(dt, this._camPos);
+      // Nighttime quarantine wind gusts sweeping flyers & cans across the rain-damp tarmac
+      const gustStrength = 0.85 + 0.45 * Math.sin(this.elapsedSec * 0.42) + 0.22 * Math.sin(this.elapsedSec * 1.15);
+      const windAngle = 0.55 + 0.25 * Math.sin(this.elapsedSec * 0.19);
+      this.physicsProps.setWind(Math.cos(windAngle), Math.sin(windAngle), gustStrength);
+      this.controller.getVelocity(this._velScratch);
+      this.physicsProps.applyActorFootstepWake(
+        this.controller.position,
+        this._velScratch,
+        this.controller.isSprinting ? 0.65 : 0.52,
+      );
+      this.physicsProps.update(dt, this._camPos);
 
       if (swapping) {
         this.holdRepair.cancel(this.interactAnimator);
@@ -1586,6 +1647,7 @@ export class ZombiesLobbyController {
     this.unsubAdaptiveScaling?.();
     this.unsubAdaptiveScaling = null;
 
+    this.physicsProps.dispose();
     this.ballistics.dispose();
     this.scene.remove(this.ballistics.group);
     this.swapChoreography.dispose();

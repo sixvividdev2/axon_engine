@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { BodycamPhysicsWorld } from '../bodycam-sdk';
+import { BodycamPhysicsWorld, DynamicPropSpawnSpec } from '../bodycam-sdk';
 import { GraphicsQualityId } from '../data/graphicsQuality';
 import { TacticalEquipmentId } from '../data/tacticalEquipment';
 
@@ -363,6 +363,8 @@ export interface BuiltMapInstance {
   penetrableSystem?: PenetrableSurfaceSystem;
   /** Universal breakable & repairable electronics system (lights, terminals, perk machines, power switches) */
   electronicsSystem?: HideoutElectronicsSystem;
+  /** Optional map-authored surface-grounded dynamic physics prop spawn points */
+  propSpawns?: DynamicPropSpawnSpec[];
   /** Shatters a breakable glass pane/window and disables its paired physics collider */
   shatterBreakable?: (
     objOrId: THREE.Object3D | string,

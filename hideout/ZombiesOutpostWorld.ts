@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import {
   BodycamPhysicsWorld,
   resolveWeaponProfile,
@@ -1012,6 +1013,131 @@ export function buildZombiesOutpostWorld(
   } satisfies ZombiesOutpostInteractMeta;
   root.add(returnRampProxy);
   interactableMeshes.push(returnRampProxy);
+
+  // --------------------------------------------------------------------------
+  // 7B. MERGED QUARANTINE STAGING PROPS (Field Generator, Med Shelf, Pallet)
+  // --------------------------------------------------------------------------
+  const qDarkSteelGeos: THREE.BufferGeometry[] = [];
+  const qBrushedGeos: THREE.BufferGeometry[] = [];
+  const qMedWhiteGeos: THREE.BufferGeometry[] = [];
+  const qWoodGeos: THREE.BufferGeometry[] = [];
+
+  const pushQBox = (
+    bucket: THREE.BufferGeometry[],
+    w: number,
+    h: number,
+    d: number,
+    cx: number,
+    cy: number,
+    cz: number,
+  ): void => {
+    const g = new THREE.BoxGeometry(w, h, d);
+    g.translate(cx, cy, cz);
+    bucket.push(g);
+  };
+  const pushQCyl = (
+    bucket: THREE.BufferGeometry[],
+    rTop: number,
+    rBot: number,
+    len: number,
+    segs: number,
+    cx: number,
+    cy: number,
+    cz: number,
+  ): void => {
+    const g = new THREE.CylinderGeometry(rTop, rBot, len, segs);
+    g.translate(cx, cy, cz);
+    bucket.push(g);
+  };
+
+  // Caged portable diesel field generator in SW staging yard (-9.4, 6.2)
+  const genX = -9.4;
+  const genZ = 6.2;
+  pushQBox(qDarkSteelGeos, 1.38, 0.86, 0.78, genX, 0.48, genZ);
+  pushQBox(qBrushedGeos, 0.42, 0.36, 0.04, genX + 0.38, 0.56, genZ + 0.41);
+  // Tubular protective steel roll cage + exhaust stack
+  for (const gx of [-0.74, 0.74]) {
+    for (const gz of [-0.44, 0.44]) {
+      pushQBox(qBrushedGeos, 0.045, 1.04, 0.045, genX + gx, 0.52, genZ + gz);
+    }
+  }
+  pushQBox(qBrushedGeos, 1.52, 0.045, 0.045, genX, 1.04, genZ - 0.44);
+  pushQBox(qBrushedGeos, 1.52, 0.045, 0.045, genX, 1.04, genZ + 0.44);
+  pushQBox(qBrushedGeos, 0.045, 0.045, 0.92, genX - 0.74, 1.04, genZ);
+  pushQBox(qBrushedGeos, 0.045, 0.045, 0.92, genX + 0.74, 1.04, genZ);
+  pushQCyl(qDarkSteelGeos, 0.045, 0.055, 0.82, 8, genX - 0.52, 1.32, genZ - 0.24);
+  physics.addBox({
+    minX: genX - 0.8,
+    maxX: genX + 0.8,
+    minY: 0,
+    maxY: 1.1,
+    minZ: genZ - 0.5,
+    maxZ: genZ + 0.5,
+    surface: 'metal',
+  });
+
+  // 3-tier Quarantine Bio-Containment Medical Supply Rack behind East Field Bench (10.4, 1.2)
+  const medRackX = 10.4;
+  const medRackZ = 1.2;
+  for (const rx of [-0.26, 0.26]) {
+    for (const rz of [-0.84, 0.84]) {
+      pushQBox(qDarkSteelGeos, 0.05, 1.92, 0.05, medRackX + rx, 0.96, medRackZ + rz);
+    }
+  }
+  for (const sy of [0.16, 0.74, 1.32, 1.88]) {
+    pushQBox(qBrushedGeos, 0.56, 0.035, 1.72, medRackX, sy, medRackZ);
+  }
+  // White bio-containment Pelican trunks stacked on lower/mid tiers
+  pushQBox(qMedWhiteGeos, 0.46, 0.34, 0.62, medRackX, 0.35, medRackZ - 0.36);
+  pushQBox(qMedWhiteGeos, 0.44, 0.30, 0.56, medRackX, 0.91, medRackZ + 0.34);
+  physics.addBox({
+    minX: medRackX - 0.34,
+    maxX: medRackX + 0.34,
+    minY: 0,
+    maxY: 1.94,
+    minZ: medRackZ - 0.9,
+    maxZ: medRackZ + 0.9,
+    surface: 'metal',
+  });
+
+  // Grounded logistics pallet in NW staging area (-8.8, -5.6, top Y = 0.14m)
+  for (const pz of [-0.46, 0, 0.46]) {
+    pushQBox(qWoodGeos, 1.32, 0.09, 0.11, -8.8, 0.045, -5.6 + pz);
+  }
+  for (let s = 0; s < 5; s++) {
+    pushQBox(qWoodGeos, 1.36, 0.04, 0.15, -8.8, 0.115, -5.6 - 0.44 + s * 0.22);
+  }
+  physics.addBox({
+    minX: -9.5,
+    maxX: -8.1,
+    minY: 0,
+    maxY: 0.14,
+    minZ: -6.15,
+    maxZ: -5.05,
+    surface: 'wood',
+  });
+
+  const flushQBucket = (
+    geos: THREE.BufferGeometry[],
+    mat: THREE.Material,
+    surface: 'concrete' | 'metal' | 'wood',
+  ): void => {
+    if (geos.length === 0) return;
+    const merged = mergeGeometries(geos, false);
+    for (const g of geos) g.dispose();
+    if (!merged) return;
+    trackGeo(merged);
+    const mesh = new THREE.Mesh(merged, mat);
+    mesh.castShadow = !isSoftwareGl;
+    mesh.receiveShadow = true;
+    mesh.userData.surfaceMaterial = surface;
+    root.add(mesh);
+    raycastMeshes.push(mesh);
+  };
+  flushQBucket(qDarkSteelGeos, materials.darkSteel, 'metal');
+  flushQBucket(qBrushedGeos, materials.brushedSteel, 'metal');
+  flushQBucket(qMedWhiteGeos, medWhiteMat, 'metal');
+  flushQBucket(qWoodGeos, materials.tableWood, 'wood');
 
   // Register Ops Board, Field Radio, and all Outpost floodlights/beacons as breakable & repairable electronics
   let lastBriefingState: ZombiesOutpostBriefingState = {

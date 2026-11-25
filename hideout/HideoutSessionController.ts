@@ -13,11 +13,13 @@ import {
   BodycamWeaponProfile,
   CharacterAnimator,
   CharacterSkeleton,
+  createBodycamPhysicsPropAdapter,
   createBodycamTelemetry,
   createPdaMotionState,
   createRaycastResult,
   DEFAULT_BODYCAM_SDK_CONFIG,
   DEFAULT_TRAUMA_MODIFIERS,
+  DynamicPhysicsPropSystem,
   GrenadeDetonationEvent,
   GrenadeHoldStage,
   IBodycamWorldAdapter,
@@ -194,6 +196,7 @@ export class HideoutSessionController {
   private readonly scopeRenderer: ScopeRenderer;
   private readonly swapChoreography: GunWallSwapChoreography;
   private readonly grenadeSystem: TacticalGrenadeSystem;
+  private readonly physicsProps: DynamicPhysicsPropSystem;
   private readonly pdaDevice: TacticalPdaDevice;
   private readonly _pdaMotionScratch = createPdaMotionState();
   private readonly _pdaTelemetryScratch: PdaHudTelemetry = {
@@ -507,6 +510,8 @@ export class HideoutSessionController {
             this.emitSnapshot(true);
           }
         }
+        // Also kick nearby dynamic physics props on close melee strike
+        this.physicsProps.handleBlast(ev.point, 1.5, 4.5);
       },
     });
 
@@ -518,6 +523,20 @@ export class HideoutSessionController {
       this.config.gearRattleGain,
     );
     this.audio.setInteriorAcoustics(true, 'concrete');
+
+    // Unified GPU-instanced dynamic physics props (bottles, cans, dossiers, cartons)
+    this.physicsProps = new DynamicPhysicsPropSystem({
+      scene: this.scene,
+      adapter: createBodycamPhysicsPropAdapter(this.world.physics),
+      isSoftwareGl: this.isSoftwareGl,
+      graphicsQuality: gfx.id,
+      indoorVentilationDraft: true,
+      maxAniso: Math.min(8, this.renderer.capabilities.getMaxAnisotropy()),
+      onImpactAudio: (kind, pos, intensity) => {
+        this.audio.playPhysicsPropImpact(kind, pos, intensity);
+      },
+    });
+    this.seedHideoutDynamicProps();
 
     this.weaponRig = new WeaponRig(this.scene, this.isSoftwareGl, this.audio);
     this.weaponRig.flashlight.intensity = 0;
@@ -1069,7 +1088,70 @@ export class HideoutSessionController {
           : `${broken.length} Electronic Fixtures Destroyed`,
       );
     }
+    // Blast scatters & shatters nearby bottles, cans, papers & cartons
+    if (ev.kind !== 'smoke') {
+      this.physicsProps.handleBlast(
+        ev.position,
+        ev.kind === 'flash' ? 4.5 : 8.5,
+        ev.kind === 'flash' ? 7.5 : 16.0,
+      );
+    }
     this.emitSnapshot(true);
+  }
+
+  private seedHideoutDynamicProps(): void {
+    // Bay 1 downrange plinking shelves (top Y = 0.92m) — bottles & cans ready to shatter/clatter
+    this.physicsProps.seedCluster('range_ledge', 10.8, 0.92, 10.2, 101);
+    this.physicsProps.seedCluster('range_ledge', 13.6, 0.92, 16.4, 102);
+
+    // Bay 1 firing-line benches (top Y = 0.895m) — spare cans & range dossiers
+    this.physicsProps.spawnBatch([
+      { kind: 'soda_can', x: 9.75, y: 0.90, z: 3.05, yaw: 0.4 },
+      { kind: 'glass_bottle_amber', x: 10.12, y: 0.90, z: 3.12, yaw: 1.1 },
+      { kind: 'paper_sheet', x: 11.45, y: 0.90, z: 3.22, yaw: 0.25 },
+      { kind: 'soda_can', x: 13.55, y: 0.90, z: 3.14, yaw: -0.6 },
+      { kind: 'ration_tin', x: 13.82, y: 0.90, z: 3.28, yaw: 0.3 },
+    ]);
+
+    // Vault barricade top (X = 16.0, Z = -7.8, top Y = 0.90m) — plinkable bottles & cans
+    this.physicsProps.seedCluster('range_ledge', 16.0, 0.90, -7.8, 103);
+
+    // Arsenal Prep Table (X = 2.45, Z = -1.05, top Y = 0.84m) & Gun Wall bench lip (top Y = 0.68m)
+    this.physicsProps.spawnBatch([
+      { kind: 'soda_can', x: 3.12, y: 0.85, z: -1.32, yaw: 0.7 },
+      { kind: 'glass_bottle_green', x: 1.72, y: 0.85, z: -1.36, yaw: -0.3 },
+      { kind: 'paper_sheet', x: 2.78, y: 0.85, z: -0.78, yaw: 0.45 },
+      { kind: 'ration_tin', x: -2.85, y: 0.69, z: -4.16, yaw: 0.2 },
+      { kind: 'glass_bottle_amber', x: 2.75, y: 0.69, z: -4.18, yaw: 1.3 },
+      { kind: 'soda_can', x: 2.98, y: 0.69, z: -4.12, yaw: -0.5 },
+    ]);
+
+    // Arsenal SE supply shelving rack (X = 3.75, Z = 4.18, shelves at Y = 0.68, 1.20, 1.74)
+    this.physicsProps.spawnBatch([
+      { kind: 'cardboard_box', x: 3.42, y: 0.68, z: 4.16, yaw: 0.06 },
+      { kind: 'ration_tin', x: 3.98, y: 0.68, z: 4.15, yaw: 0.4 },
+      { kind: 'ration_tin', x: 4.15, y: 0.68, z: 4.19, yaw: -0.2 },
+      { kind: 'plastic_crate', x: 3.95, y: 1.20, z: 4.16, yaw: -0.05 },
+      { kind: 'glass_bottle_green', x: 3.32, y: 1.20, z: 4.14, yaw: 0.2 },
+      { kind: 'glass_bottle_amber', x: 3.48, y: 1.20, z: 4.18, yaw: 1.8 },
+      { kind: 'cardboard_box', x: 3.75, y: 1.74, z: 4.16, yaw: 0.04 },
+    ]);
+
+    // Arsenal & Range floor corner boxes/trash (clear of doorways and walkways)
+    this.physicsProps.seedCluster('floor_trash', -4.25, 0.0, 3.65, 104);
+    this.physicsProps.seedCluster('bunker_mess', 4.4, 0.0, 2.25, 105);
+    this.physicsProps.seedCluster('floor_trash', 8.2, 0.0, -8.5, 106);
+
+    // Ready Room briefing table corners (X = -11.4, Z = 0.0, top Y = 0.86m) & SE pallet (X = -7.65, Z = 4.05, top Y = 0.14m)
+    this.physicsProps.spawnBatch([
+      { kind: 'soda_can', x: -12.28, y: 0.87, z: -0.42, yaw: 0.9 },
+      { kind: 'paper_sheet', x: -11.95, y: 0.87, z: 0.36, yaw: -0.18 },
+      { kind: 'paper_sheet', x: -10.52, y: 0.87, z: -0.45, yaw: 0.32 },
+      { kind: 'glass_bottle_amber', x: -12.34, y: 0.87, z: 0.38, yaw: 2.1 },
+      { kind: 'cardboard_box', x: -7.88, y: 0.14, z: 4.08, yaw: 0.12 },
+      { kind: 'plastic_crate', x: -7.35, y: 0.14, z: 3.98, yaw: -0.08 },
+      { kind: 'paper_sheet', x: -8.65, y: 0.01, z: 3.35, yaw: 0.65 },
+    ]);
   }
 
   private syncNvgRuntime(): void {
@@ -1366,6 +1448,8 @@ export class HideoutSessionController {
       weaponSpreadMOA: effectiveSpreadMOA,
       audio: this.audio,
     });
+    const shotImpulse = THREE.MathUtils.clamp((activeAmmo.bulletMassGrams * muzzleVelocityMs) / 4500, 0.75, 1.65);
+    this.physicsProps.handleBulletRay(this._muzzlePos, this._muzzleDir, 85, shotImpulse);
 
     // Capture live velocity & ballistic energy on Bay 3's Optical Chronograph
     if (
@@ -2988,10 +3072,17 @@ export class HideoutSessionController {
         },
       );
 
-      // Update interactive Arsenal props, Gun Range targets/course, destructible electronics & doors
+      // Update interactive Arsenal props, Gun Range targets/course, destructible electronics, doors & physics props
       this.camera.getWorldPosition(this._camPos);
       this.world.updateProps(dt, this._camPos);
       this.world.doorSystem.update(dt, this._camPos);
+      this.controller.getVelocity(this._velScratch);
+      this.physicsProps.applyActorFootstepWake(
+        this.controller.position,
+        this._velScratch,
+        this.controller.isSprinting ? 0.65 : 0.52,
+      );
+      this.physicsProps.update(dt, this._camPos);
 
       // Update Gun Wall swap choreography, Hold [F] two-handed repair IK, or 1P interact IK BEFORE CharacterAnimator
       if (swapping) {
@@ -3263,6 +3354,7 @@ export class HideoutSessionController {
     this.unsubAdaptiveScaling = null;
     this.camera.remove(this.pdaDevice.root);
     this.pdaDevice.dispose();
+    this.physicsProps.dispose();
     this.grenadeSystem.dispose();
     this.ballistics.dispose();
     this.scene.remove(this.ballistics.group);

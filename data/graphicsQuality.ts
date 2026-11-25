@@ -17,6 +17,32 @@ export interface GraphicsQualityProfile {
   fogDensityScale: number;
   envIntensityScale: number;
   anisotropyCap: number;
+  /** Maximum total instanced physics props (bottles, cans, papers, boxes) */
+  physicsPropBudget: number;
+  /** Maximum simultaneous awake rigid/aerodynamic physics bodies per frame */
+  maxActivePhysicsBodies: number;
+  /** Maximum wind-driven fluttering paper sheets */
+  windPaperBudget: number;
+  /** Interior architectural dressing density tier (0 = lean, 1 = balanced, 2 = rich, 3 = maximum) */
+  interiorDressingTier: 0 | 1 | 2 | 3;
+}
+
+export type PhysicsPropsQualityId = 'auto' | 'low' | 'medium' | 'high' | 'ultra';
+
+export const PHYSICS_PROPS_QUALITY_ORDER: readonly PhysicsPropsQualityId[] = [
+  'auto',
+  'low',
+  'medium',
+  'high',
+  'ultra',
+];
+
+export interface PhysicsPropBudgetSpec {
+  maxTotalProps: number;
+  maxActiveBodies: number;
+  maxWindPapers: number;
+  maxGlassShards: number;
+  enablePropShadows: boolean;
 }
 
 export const GRAPHICS_QUALITY_ORDER: readonly GraphicsQualityId[] = [
@@ -43,6 +69,10 @@ export const GRAPHICS_QUALITY_PROFILES: Record<GraphicsQualityId, GraphicsQualit
     fogDensityScale: 1.12,
     envIntensityScale: 0.9,
     anisotropyCap: 2,
+    physicsPropBudget: 52,
+    maxActivePhysicsBodies: 14,
+    windPaperBudget: 18,
+    interiorDressingTier: 0,
   },
   balanced: {
     id: 'balanced',
@@ -60,6 +90,10 @@ export const GRAPHICS_QUALITY_PROFILES: Record<GraphicsQualityId, GraphicsQualit
     fogDensityScale: 1.0,
     envIntensityScale: 1.0,
     anisotropyCap: 4,
+    physicsPropBudget: 128,
+    maxActivePhysicsBodies: 32,
+    windPaperBudget: 46,
+    interiorDressingTier: 1,
   },
   high: {
     id: 'high',
@@ -77,6 +111,10 @@ export const GRAPHICS_QUALITY_PROFILES: Record<GraphicsQualityId, GraphicsQualit
     fogDensityScale: 0.92,
     envIntensityScale: 1.05,
     anisotropyCap: 8,
+    physicsPropBudget: 230,
+    maxActivePhysicsBodies: 52,
+    windPaperBudget: 86,
+    interiorDressingTier: 2,
   },
   ultra: {
     id: 'ultra',
@@ -94,6 +132,10 @@ export const GRAPHICS_QUALITY_PROFILES: Record<GraphicsQualityId, GraphicsQualit
     fogDensityScale: 0.85,
     envIntensityScale: 1.1,
     anisotropyCap: 16,
+    physicsPropBudget: 360,
+    maxActivePhysicsBodies: 78,
+    windPaperBudget: 136,
+    interiorDressingTier: 3,
   },
 };
 
@@ -103,6 +145,38 @@ export function isValidGraphicsQuality(val: unknown): val is GraphicsQualityId {
 
 export function getGraphicsQualityProfile(id: GraphicsQualityId | undefined): GraphicsQualityProfile {
   return GRAPHICS_QUALITY_PROFILES[id && isValidGraphicsQuality(id) ? id : 'balanced'];
+}
+
+export function isValidPhysicsPropsQuality(val: unknown): val is PhysicsPropsQualityId {
+  return val === 'auto' || val === 'low' || val === 'medium' || val === 'high' || val === 'ultra';
+}
+
+export function resolvePhysicsPropBudget(
+  graphicsQuality?: GraphicsQualityId,
+  override?: PhysicsPropsQualityId,
+): PhysicsPropBudgetSpec {
+  const effectiveOverride = override ?? graphicsQualityStore.getPhysicsPropsQuality();
+  let effectiveQuality: GraphicsQualityId = graphicsQuality ?? graphicsQualityStore.getQuality();
+  if (effectiveOverride === 'low') effectiveQuality = 'performance';
+  else if (effectiveOverride === 'medium') effectiveQuality = 'balanced';
+  else if (effectiveOverride === 'high') effectiveQuality = 'high';
+  else if (effectiveOverride === 'ultra') effectiveQuality = 'ultra';
+
+  const profile = getGraphicsQualityProfile(effectiveQuality);
+  return {
+    maxTotalProps: profile.physicsPropBudget,
+    maxActiveBodies: profile.maxActivePhysicsBodies,
+    maxWindPapers: profile.windPaperBudget,
+    maxGlassShards:
+      effectiveQuality === 'performance'
+        ? 48
+        : effectiveQuality === 'balanced'
+          ? 96
+          : effectiveQuality === 'high'
+            ? 160
+            : 240,
+    enablePropShadows: effectiveQuality === 'high' || effectiveQuality === 'ultra',
+  };
 }
 
 export interface DistancePerformanceSettings {
@@ -143,10 +217,12 @@ const ADAPTIVE_SCALING_STORAGE_KEY = 'axon_adaptive_scaling_v1';
 const RENDER_DIST_STORAGE_KEY = 'axon_render_distance_m_v1';
 const OW_RENDER_DIST_STORAGE_KEY = 'axon_ow_render_distance_m_v1';
 const REDUCE_ANIM_DIST_STORAGE_KEY = 'axon_reduce_anim_distance_m_v1';
+const PHYSICS_PROPS_QUALITY_STORAGE_KEY = 'axon_physics_props_quality_v1';
 
 type QualityListener = (quality: GraphicsQualityId) => void;
 type AdaptiveScalingListener = (enabled: boolean) => void;
 type DistanceSettingsListener = (settings: Readonly<DistancePerformanceSettings>) => void;
+type PhysicsPropsQualityListener = (quality: PhysicsPropsQualityId) => void;
 
 function clampStep(val: number, min: number, max: number, step: number, fallback: number): number {
   if (!Number.isFinite(val)) return fallback;
@@ -156,6 +232,7 @@ function clampStep(val: number, min: number, max: number, step: number, fallback
 
 class GraphicsQualityStore {
   private current: GraphicsQualityId = 'balanced';
+  private physicsPropsQuality: PhysicsPropsQualityId = 'auto';
   private adaptiveScalingEnabled = false;
   private distanceSettings: DistancePerformanceSettings = {
     renderDistanceM: RENDER_DISTANCE_LIMITS.default,
@@ -165,6 +242,7 @@ class GraphicsQualityStore {
   private readonly listeners = new Set<QualityListener>();
   private readonly adaptiveListeners = new Set<AdaptiveScalingListener>();
   private readonly distanceListeners = new Set<DistanceSettingsListener>();
+  private readonly physicsPropsListeners = new Set<PhysicsPropsQualityListener>();
 
   constructor() {
     this.load();
@@ -212,6 +290,10 @@ class GraphicsQualityStore {
           REDUCE_ANIMATION_DISTANCE_LIMITS.default,
         );
       }
+      const physRaw = window.localStorage.getItem(PHYSICS_PROPS_QUALITY_STORAGE_KEY);
+      if (isValidPhysicsPropsQuality(physRaw)) {
+        this.physicsPropsQuality = physRaw;
+      }
     } catch {
       // Ignore storage access errors
     }
@@ -242,6 +324,30 @@ class GraphicsQualityStore {
     this.listeners.add(fn);
     return () => {
       this.listeners.delete(fn);
+    };
+  }
+
+  public getPhysicsPropsQuality(): PhysicsPropsQualityId {
+    return this.physicsPropsQuality;
+  }
+
+  public setPhysicsPropsQuality(next: PhysicsPropsQualityId): void {
+    if (!isValidPhysicsPropsQuality(next) || next === this.physicsPropsQuality) return;
+    this.physicsPropsQuality = next;
+    try {
+      window.localStorage.setItem(PHYSICS_PROPS_QUALITY_STORAGE_KEY, next);
+    } catch {
+      // Ignore storage errors
+    }
+    for (const fn of this.physicsPropsListeners) {
+      fn(this.physicsPropsQuality);
+    }
+  }
+
+  public subscribePhysicsPropsQuality(fn: PhysicsPropsQualityListener): () => void {
+    this.physicsPropsListeners.add(fn);
+    return () => {
+      this.physicsPropsListeners.delete(fn);
     };
   }
 
@@ -513,4 +619,19 @@ export function useDistancePerformanceSettings(): [
       setReduceAnimationDistanceM: (val) => graphicsQualityStore.setReduceAnimationDistanceM(val),
     },
   ];
+}
+
+export function usePhysicsPropsQuality(): [
+  PhysicsPropsQualityId,
+  (q: PhysicsPropsQualityId) => void,
+] {
+  const [quality, setQualityState] = useState<PhysicsPropsQualityId>(() =>
+    graphicsQualityStore.getPhysicsPropsQuality(),
+  );
+
+  useEffect(() => {
+    return graphicsQualityStore.subscribePhysicsPropsQuality((next) => setQualityState(next));
+  }, []);
+
+  return [quality, (q) => graphicsQualityStore.setPhysicsPropsQuality(q)];
 }

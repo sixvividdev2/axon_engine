@@ -11,11 +11,15 @@ import {
   GRAPHICS_QUALITY_PROFILES,
   HORIZON_FOG_LEAD_M,
   OPEN_WORLD_RENDER_DISTANCE_LIMITS,
+  PHYSICS_PROPS_QUALITY_ORDER,
+  PhysicsPropsQualityId,
   REDUCE_ANIMATION_DISTANCE_LIMITS,
   RENDER_DISTANCE_LIMITS,
+  resolvePhysicsPropBudget,
   useAdaptiveScaling,
   useDistancePerformanceSettings,
   useGraphicsQuality,
+  usePhysicsPropsQuality,
 } from '../data/graphicsQuality';
 import { useKillfeedPreference } from '../data/killfeedSettings';
 import { useHeadshotSfxPreference } from '../data/audioSettings';
@@ -26,10 +30,12 @@ export const GameSettingsModal: React.FC = () => {
   const { open, tab } = useGameSettingsModal();
   const { user, openAccountSettings, openAuthModal } = useAuth();
   const [graphicsQuality, setGraphicsQuality] = useGraphicsQuality();
+  const [physicsPropsQuality, setPhysicsPropsQuality] = usePhysicsPropsQuality();
   const [adaptiveScaling, setAdaptiveScaling] = useAdaptiveScaling();
   const [distanceSettings, distanceActions] = useDistancePerformanceSettings();
   const [personalKillfeed, setPersonalKillfeed] = useKillfeedPreference();
   const [headshotSfx, setHeadshotSfx] = useHeadshotSfxPreference();
+  const resolvedPhysicsBudget = resolvePhysicsPropBudget(graphicsQuality, physicsPropsQuality);
 
   useEffect(() => {
     if (!open) return;
@@ -153,6 +159,41 @@ export const GameSettingsModal: React.FC = () => {
                       </button>
                     );
                   })}
+                </div>
+
+                <div className="mt-4 border-t border-neutral-800/80 pt-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <div>
+                      <div className="text-xs font-medium text-neutral-200">
+                        Dynamic Physics Props &amp; Wind Debris
+                      </div>
+                      <div className="text-[11px] text-neutral-400">
+                        GPU-instanced bottles, cans, wind-blown papers &amp; crates ({resolvedPhysicsBudget.maxTotalProps} max props · {resolvedPhysicsBudget.maxActiveBodies} active bodies).
+                      </div>
+                    </div>
+                    <span className="font-mono-tabular text-xs font-semibold uppercase text-emerald-400">
+                      {physicsPropsQuality === 'auto' ? `AUTO (${graphicsQuality})` : physicsPropsQuality}
+                    </span>
+                  </div>
+                  <div className="mt-2 grid grid-cols-5 gap-1.5">
+                    {PHYSICS_PROPS_QUALITY_ORDER.map((pid: PhysicsPropsQualityId) => {
+                      const active = physicsPropsQuality === pid;
+                      return (
+                        <button
+                          key={pid}
+                          type="button"
+                          onClick={() => setPhysicsPropsQuality(pid)}
+                          className={`cursor-pointer whitespace-nowrap border py-1.5 font-mono-tabular text-[11px] font-semibold uppercase transition-colors ${
+                            active
+                              ? 'border-emerald-400 bg-emerald-500/20 text-emerald-200'
+                              : 'border-neutral-800 bg-neutral-950 text-neutral-400 hover:border-neutral-600 hover:text-neutral-200'
+                          }`}
+                        >
+                          {pid === 'auto' ? 'Auto' : pid}
+                        </button>
+                      );
+                    })}
+                  </div>
                 </div>
 
                 <div className="mt-4 flex items-center justify-between gap-4 border-t border-neutral-800/80 pt-3">

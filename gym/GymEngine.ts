@@ -16,10 +16,12 @@ import {
   CharacterAnimator,
   CharacterSkeleton,
   computeTargetHingeAngularImpulse,
+  createBodycamPhysicsPropAdapter,
   createBodycamTelemetry,
   createPdaMotionState,
   DEFAULT_BODYCAM_SDK_CONFIG,
   DEFAULT_TRAUMA_MODIFIERS,
+  DynamicPhysicsPropSystem,
   GrenadeDetonationEvent,
   GrenadeHoldStage,
   GrenadeThrowStyle,
@@ -189,6 +191,7 @@ export class GymEngine {
   private readonly scopeRenderer: ScopeRenderer;
   private readonly ballistics: GymBallistics;
   private readonly grenadeSystem: TacticalGrenadeSystem;
+  private readonly physicsProps: DynamicPhysicsPropSystem;
   private readonly pdaDevice: TacticalPdaDevice;
   private readonly _pdaMotionScratch = createPdaMotionState();
   private readonly irIlluminatorLight: THREE.SpotLight;
@@ -516,6 +519,18 @@ export class GymEngine {
       },
     });
     this.animator.setGrenadeSystem(this.grenadeSystem);
+
+    this.physicsProps = new DynamicPhysicsPropSystem({
+      scene: this.scene,
+      adapter: createBodycamPhysicsPropAdapter(this.world.physics),
+      isSoftwareGl: this.isSoftwareGl,
+      graphicsQuality: this.qualityProfile.id,
+      maxAniso: Math.min(8, this.renderer.capabilities.getMaxAnisotropy()),
+      onImpactAudio: (kind, pos, intensity) => {
+        this.audio.playPhysicsPropImpact(kind, pos, intensity);
+      },
+    });
+    this.seedGymDynamicProps();
 
     this.syncBeltEquipmentMesh();
     this.unsubTacticalEquipment = tacticalEquipmentStore.subscribe((sel) => {
@@ -1002,7 +1017,14 @@ export class GymEngine {
       this.showToast(`Over-cooked ${ev.def.shortName} detonated in hand!`, 3.2);
     }
 
-    // Kick reactive AR500 steel targets & shatter nearby glass in Gym!
+    // Kick reactive AR500 steel targets & shatter nearby glass & dynamic props in Gym!
+    if (!ev.isTick && ev.kind !== 'smoke') {
+      this.physicsProps.handleBlast(
+        ev.position,
+        ev.kind === 'flash' ? 5.0 : 9.5,
+        ev.kind === 'flash' ? 8.5 : 18.0,
+      );
+    }
     if (!ev.isTick && (ev.kind === 'frag' || ev.kind === 'flash')) {
       for (let i = 0; i < this.world.steelTargets.length; i++) {
         const st = this.world.steelTargets[i];
@@ -1734,6 +1756,9 @@ export class GymEngine {
       activeAmmo,
       derived.velocityMult,
     );
+    const muzzleVel = activeAmmo.baseVelocityMs * (prof.barrelVelocityMult ?? 1.0) * derived.velocityMult;
+    const shotImpulse = THREE.MathUtils.clamp((activeAmmo.bulletMassGrams * muzzleVel) / 4500, 0.75, 1.65);
+    this.physicsProps.handleBulletRay(this._muzzlePos, this._muzzleDir, 80, shotImpulse);
 
     // Visual muzzle flash + articulated blowback / bolt-action cycle / revolver cylinder indexing + brass
     const cyclePump = prof.toggleablePumpSemi ? this.spas12Mode === 'pump' : undefined;
@@ -2580,6 +2605,16 @@ export class GymEngine {
       this.flashBlindAlpha = Math.max(0, this.flashBlindAlpha - dt * 0.42);
     }
     this.world.updateDynamicTargets(dt, this._fpsCamPos);
+    const gymWindStrength = 0.65 + 0.35 * Math.sin(this.elapsedSec * 0.35);
+    const gymWindAngle = 0.4 + 0.2 * Math.sin(this.elapsedSec * 0.17);
+    this.physicsProps.setWind(Math.cos(gymWindAngle), Math.sin(gymWindAngle), gymWindStrength);
+    this.controller.getVelocity(this._playerVelScratch);
+    this.physicsProps.applyActorFootstepWake(
+      this.controller.position,
+      this._playerVelScratch,
+      this.controller.isSprinting ? 0.65 : 0.52,
+    );
+    this.physicsProps.update(dt, this._fpsCamPos);
 
     // 4. Step AAA Bodycam Post-Process
     this.controller.getWhipVelocity(this._whipVel);
@@ -2783,6 +2818,7 @@ export class GymEngine {
     this.holdRepair.cancel(this.interactAnimator);
     this.camera.remove(this.irIlluminatorLight, this.irIlluminatorTarget);
     this.pdaDevice.dispose();
+    this.physicsProps.dispose();
     this.grenadeSystem.dispose();
     this.ballistics.dispose();
     this.scopeRenderer.dispose();
@@ -2796,5 +2832,38 @@ export class GymEngine {
       this.container.removeChild(this.renderer.domElement);
     }
     this.listeners.clear();
+  }
+
+  private seedGymDynamicProps(): void {
+    // 10m & 20m Ballistics Range plinking ledges (top Y = 0.90m) — bottles & cans lined up for plinking
+    this.physicsProps.seedCluster('range_ledge', 11.0, 0.90, -13.2, 301);
+    this.physicsProps.seedCluster('range_ledge', 13.1, 0.90, -22.2, 302);
+
+    // Firing benches (z = -5.4, top Y = 0.92m) & concrete block / container ledges
+    this.physicsProps.spawnBatch([
+      { kind: 'soda_can', x: 6.2, y: 0.93, z: -5.3, yaw: 0.4 },
+      { kind: 'glass_bottle_green', x: 7.4, y: 0.93, z: -5.45, yaw: 1.2 },
+      { kind: 'paper_sheet', x: 6.8, y: 0.93, z: -5.25, yaw: -0.2 },
+      { kind: 'soda_can', x: 15.1, y: 0.93, z: -5.35, yaw: -0.5 },
+      { kind: 'ration_tin', x: 16.2, y: 0.93, z: -5.42, yaw: 0.6 },
+      // Shipping container roof ledge (6.2, 1.85, 11.2)
+      { kind: 'glass_bottle_amber', x: 5.5, y: 1.86, z: 11.4, yaw: 0.3 },
+      { kind: 'soda_can', x: 6.1, y: 1.86, z: 11.3, yaw: 1.5 },
+      { kind: 'cardboard_box', x: 6.9, y: 1.86, z: 10.9, yaw: 0.14 },
+      // South workshop rack (8.4, 20.6) & pallet (11.2, 19.6)
+      { kind: 'cardboard_box', x: 8.1, y: 0.74, z: 20.6, yaw: 0.04 },
+      { kind: 'ration_tin', x: 8.75, y: 0.74, z: 20.58, yaw: 0.5 },
+      { kind: 'plastic_crate', x: 8.5, y: 1.30, z: 20.6, yaw: -0.05 },
+      { kind: 'glass_bottle_green', x: 7.95, y: 1.30, z: 20.55, yaw: 0.2 },
+      { kind: 'cardboard_box', x: 10.95, y: 0.14, z: 19.65, yaw: 0.1 },
+      { kind: 'plastic_crate', x: 11.55, y: 0.14, z: 19.55, yaw: -0.08 },
+    ]);
+
+    // Wind-blown range sheets & courtyard trash + CQB corridor cans
+    this.physicsProps.seedCluster('wind_street_papers', 0.0, 0.0, 15.5, 303);
+    this.physicsProps.seedCluster('wind_street_papers', 11.5, 0.0, -9.5, 304);
+    this.physicsProps.seedCluster('floor_trash', 12.2, 0.0, 8.2, 305);
+    this.physicsProps.seedCluster('floor_trash', 12.4, 0.0, 4.8, 306);
+    this.physicsProps.seedCluster('loading_dock', -18.5, 0.0, 16.5, 307);
   }
 }

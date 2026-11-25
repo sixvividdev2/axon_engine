@@ -28,6 +28,7 @@ export * from './character/FacialExpressionController';
 export * from './physics/SecondaryPhysicsSolver';
 export * from './physics/SecondaryPhysicsRigApplier';
 export * from './physics/ArticulatedRagdoll';
+export * from './physics/DynamicPhysicsPropSystem';
 export * from './equipment/TacticalEquipmentStore';
 export * from './equipment/TacticalEquipmentMesh';
 export * from './equipment/TacticalGrenadeSystem';

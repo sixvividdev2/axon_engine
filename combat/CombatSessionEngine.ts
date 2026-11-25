@@ -17,11 +17,13 @@ import {
   BodycamWeaponProfile,
   CharacterAnimator,
   CharacterSkeleton,
+  createBodycamPhysicsPropAdapter,
   createBodycamTelemetry,
   createPdaMotionState,
   createRaycastResult,
   DEFAULT_BODYCAM_SDK_CONFIG,
   DEFAULT_TRAUMA_MODIFIERS,
+  DynamicPhysicsPropSystem,
   GrenadeDetonationEvent,
   GrenadeHoldStage,
   GrenadeThrowStyle,
@@ -481,6 +483,8 @@ export class CombatSessionEngine {
   private readonly _doorVelScratch = new THREE.Vector3();
   private readonly _doorOcclHit: BodycamRaycastResult = createRaycastResult();
   private readonly weatherTime: WeatherTimeSystem | null = null;
+  private readonly physicsProps: DynamicPhysicsPropSystem;
+  private readonly _propActorVelScratch = new THREE.Vector3();
   private envSyncAccum = 0;
   private readonly _pdaAllyBuf: PdaAllyMarker[] = [];
   private readonly _pdaPingBuf: PdaPingMarker[] = [];
@@ -1047,6 +1051,21 @@ export class CombatSessionEngine {
       });
       this.weatherTime.update(0.016, this.camera.position, this.isMpHost || !this.mp);
     }
+
+    // Unified GPU-instanced dynamic physics props (bottles, cans, wind papers, crates)
+    this.physicsProps = new DynamicPhysicsPropSystem({
+      scene: this.scene,
+      adapter: createBodycamPhysicsPropAdapter(this.map.physics, this.map.terrainHeightAt),
+      isSoftwareGl: this.isSoftwareGl,
+      graphicsQuality: activeQuality,
+      maxAniso: Math.min(4, this.renderer.capabilities.getMaxAnisotropy()),
+      indoorVentilationDraft: !this.map.supportsDynamicWeatherTime,
+      onImpactAudio: (kind, pos, intensity) => {
+        this.audio.playPhysicsPropImpact(kind, pos, intensity);
+      },
+    });
+    this.seedMapDynamicProps();
+
     this.postProcess = new BodycamPostProcess(
       this.renderer,
       this.scene,
@@ -2129,6 +2148,7 @@ export class CombatSessionEngine {
         this.camera.position,
       );
     }
+    this.physicsProps.handleBlast(ev.position, Math.max(ev.blastRadiusM, 11.0), 15.5);
 
     // 1. Report Conquest fire heat
     if (this.modeController) {
@@ -4308,6 +4328,13 @@ export class CombatSessionEngine {
       const elecBlastR = Math.max(ev.radiusM * 0.85, 5.5);
       this.map.electronicsSystem.handleExplosion(ev.position, elecBlastR, this.camera.position);
     }
+    if (!ev.isTick && (ev.kind === 'frag' || ev.kind === 'thermite' || ev.kind === 'flash')) {
+      this.physicsProps.handleBlast(
+        ev.position,
+        Math.max(ev.radiusM * 1.15, 7.5),
+        ev.kind === 'frag' ? 14.0 : 8.5,
+      );
+    }
 
     // 1. Battle AI Bots AoE blast (with 44-ray cover-occluded M67 fragmentation evaluator)
     if (this.params.mode === 'battle' && this.botAI && canApplyAuthorityDamage) {
@@ -5081,6 +5108,7 @@ export class CombatSessionEngine {
         return;
       }
     }
+    this.physicsProps.handleBlast(ev.point, 1.45, isKick ? 7.2 : 4.6);
 
     // Physical Destructible Doors: melee bash/punch/kick -> exact geometric punch-through holes + hinge velocity
     if (ud?.destructibleDoorId && this.map.doorSystem) {
@@ -6304,6 +6332,7 @@ export class CombatSessionEngine {
       weaponSpreadMOA: prof.spreadMOA,
       audio: this.audio,
     });
+    this.physicsProps.handleBulletRay(this._muzzlePos, this._muzzleDir, 75, 1.15);
 
     this.modeController?.cancelSpawnProtection(this.getLocalModeActorId());
     const cyclePump = prof.toggleablePumpSemi ? effMode === 'pump' : undefined;
@@ -8026,7 +8055,19 @@ export class CombatSessionEngine {
     }
     if (this.weatherTime) {
       this.weatherTime.update(dt, this.camera.position, this.isMpHost || !this.mp);
+      const wAng = this.weatherTime.getWindAngleRad();
+      const wSpd = this.weatherTime.getWindSpeedMps();
+      this.physicsProps.setWind(Math.cos(wAng), Math.sin(wAng), Math.min(2.2, wSpd * 0.14));
     }
+    if (this.playerAlive) {
+      this.controller.getVelocity(this._propActorVelScratch);
+      this.physicsProps.applyActorFootstepWake(
+        this.controller.position,
+        this._propActorVelScratch,
+        0.54,
+      );
+    }
+    this.physicsProps.update(dt, this.camera.position);
     // Sync AAA 15m horizon fog color with active scene fog + step throttled Conquest directional shadow camera
     updateHorizonFogUniforms(
       this.horizonFogUniforms,
@@ -9389,6 +9430,61 @@ export class CombatSessionEngine {
     );
   }
 
+  private seedMapDynamicProps(): void {
+    // 1. Harvest map-authored prop spawns & cover building tabletop/shelf spawns
+    if (this.map.propSpawns && this.map.propSpawns.length > 0) {
+      this.physicsProps.spawnBatch(this.map.propSpawns);
+    }
+    this.map.sceneGroup.traverse((obj) => {
+      const list = obj.userData?.propSpawns;
+      if (Array.isArray(list) && list.length > 0) {
+        this.physicsProps.spawnBatch(list);
+      }
+    });
+
+    // 2. Seed rich interior room clutter across all map interior zones (desks, corners, bottles, cans, papers)
+    const interiors = this.map.physics.getInteriorZones();
+    for (let i = 0; i < interiors.length; i++) {
+      const z = interiors[i];
+      const cx = (z.minX + z.maxX) * 0.5;
+      const cz = (z.minZ + z.maxZ) * 0.5;
+      const floorY = z.minY + 0.08;
+      this.physicsProps.seedCluster(
+        i % 2 === 0 ? 'bunker_mess' : 'floor_trash',
+        cx + (i % 3 === 0 ? 1.1 : -1.1),
+        floorY,
+        cz + (i % 2 === 0 ? 0.9 : -0.9),
+        1401 + i * 73,
+      );
+      if (z.maxX - z.minX > 6.5 && z.maxZ - z.minZ > 6.5) {
+        this.physicsProps.seedCluster(
+          'loading_dock',
+          z.minX + 1.35,
+          floorY,
+          z.minZ + 1.35,
+          2903 + i * 41,
+        );
+      }
+    }
+
+    // 3. Seed outdoor wind-swept street papers, cans, bottles & crates along walkable map lanes
+    const nodes = this.map.navGraph?.nodes ?? [];
+    const stride = Math.max(1, Math.floor(nodes.length / 18));
+    for (let i = 0; i < nodes.length; i += stride) {
+      const n = nodes[i];
+      const nx = n.position[0];
+      const ny = n.position[1];
+      const nz = n.position[2];
+      const preset =
+        i % 3 === 0
+          ? 'wind_street_papers'
+          : i % 3 === 1
+            ? 'floor_trash'
+            : 'loading_dock';
+      this.physicsProps.seedCluster(preset, nx + 1.3, ny + 0.04, nz - 1.1, 5113 + i * 37);
+    }
+  }
+
   private emitSnapshot(): void {
     const snap = this.buildSnapshot();
     this.listeners.forEach((fn) => fn(snap));
@@ -9427,6 +9523,7 @@ export class CombatSessionEngine {
     this.zombieAI?.dispose();
     this.grenadeSystem.dispose();
     this.pdaDevice.dispose();
+    this.physicsProps.dispose();
     this.weatherTime?.dispose();
     this.ballistics.dispose();
     this.scopeRenderer.dispose();

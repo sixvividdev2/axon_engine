@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import type { BodycamSurfaceMaterial } from '../../../../bodycam-sdk/types';
+import type { DynamicPropSpawnSpec } from '../../../../bodycam-sdk/physics/DynamicPhysicsPropSystem';
 import type { GraphicsQualityProfile } from '../../../../data/graphicsQuality';
 import { MACRO_OCCLUDER_LAYER } from './OpenWorldAtmosphere';
 import {
@@ -878,6 +879,7 @@ const _color = new THREE.Color();
 export interface ChunkArchitectureOutput {
   instanceCount: number;
   meshCount: number;
+  propSpawns: DynamicPropSpawnSpec[];
 }
 
 /**
@@ -1635,7 +1637,122 @@ export class OpenWorldArchitectureBuilder {
       outShadowCasters,
     );
 
-    return { instanceCount, meshCount };
+    // 5. Emit deterministic chunk-streamed dynamic physics props (bottles, cans, wind-blown papers, cartons)
+    const propSpawns: DynamicPropSpawnSpec[] = [];
+    const ownerTag = `${cx},${cz}`;
+    const randProp = mulberry32(chunkHash(cx * 31 + 7, cz * 47 + 19));
+
+    // 5a. FOB Compound tables, range benches, courtyard wind papers & storage crates
+    for (let i = 0; i < overlappingFobs.length; i++) {
+      const fob = overlappingFobs[i];
+      const ownsFob =
+        fob.worldX >= centerX - halfChunk &&
+        fob.worldX < centerX + halfChunk &&
+        fob.worldZ >= centerZ - halfChunk &&
+        fob.worldZ < centerZ + halfChunk;
+      if (!ownsFob) continue;
+      const ft: LocalTransform = {
+        wx: fob.worldX,
+        wy: fob.baseY,
+        wz: fob.worldZ,
+        yaw: fob.yaw,
+        cosY: fob.cosY,
+        sinY: fob.sinY,
+      };
+      const pushFobProp = (
+        kind: DynamicPropSpawnSpec['kind'],
+        lx: number,
+        ly: number,
+        lz: number,
+        yaw = 0,
+        roll = 0,
+      ) => {
+        const w = localToWorldXZ(ft, lx, lz);
+        propSpawns.push({ kind, x: w.x, y: fob.baseY + ly, z: w.z, yaw: yaw + fob.yaw, roll, ownerTag });
+      };
+
+      // Command Bunker tactical map table dossiers, coffee/soda cans & bottles
+      pushFobProp('paper_sheet', -3.6, 1.24, 2.35, 0.25);
+      pushFobProp('paper_sheet', -3.1, 1.24, 2.55, -0.4);
+      pushFobProp('soda_can', -2.7, 1.24, 2.15, 0.9);
+      pushFobProp('glass_bottle_amber', -2.5, 1.24, 2.68, 1.5);
+      // Armory gunsmith bench bottles, ration tins & cardboard ammo cartons
+      pushFobProp('glass_bottle_green', 18.6, 1.18, -5.25, 0.4);
+      pushFobProp('ration_tin', 19.3, 1.18, -5.15, 1.1);
+      pushFobProp('cardboard_box', 16.5, 0.25, -5.4, 0.2);
+      // Field Hospital medical supply clutter
+      pushFobProp('glass_bottle_amber', 14.5, 0.24, 11.4, 0.8);
+      pushFobProp('paper_sheet', 17.8, 0.22, 9.2, 0.5);
+      // Barracks & Mess Tent bottles/cans/tins
+      pushFobProp('glass_bottle_green', -32.2, 1.14, 19.1, 0.3);
+      pushFobProp('soda_can', -32.6, 1.14, 19.35, 1.8);
+      pushFobProp('ration_tin', -31.8, 1.14, 18.95, 2.1);
+      // Shooting-range firing line shootable bottles & cans!
+      for (let b = 0; b < 5; b++) {
+        pushFobProp(
+          b % 3 === 0 ? 'glass_bottle_green' : b % 3 === 1 ? 'glass_bottle_amber' : 'soda_can',
+          -20.5 + b * 0.48,
+          1.12,
+          -26.2,
+          b * 0.8,
+        );
+      }
+      // Outdoor wind-swept papers & floor cans across the FOB courtyard tarmac & helipad edge
+      for (let p = 0; p < 8; p++) {
+        const px = -14 + randProp() * 28;
+        const pz = -14 + randProp() * 30;
+        pushFobProp(p < 6 ? 'paper_sheet' : 'soda_can', px, 0.14, pz, randProp() * 6.28, p >= 6 ? Math.PI * 0.5 : 0);
+      }
+    }
+
+    // 5b. Settlement buildings (bungalows, convenience stores, barns, checkpoints)
+    for (let i = 0; i < chunkSites.length; i++) {
+      const site = chunkSites[i];
+      if (
+        site.x < centerX - halfChunk ||
+        site.x >= centerX + halfChunk ||
+        site.z < centerZ - halfChunk ||
+        site.z >= centerZ + halfChunk
+      ) {
+        continue;
+      }
+      const sy = site.groundY + 0.22;
+      propSpawns.push(
+        { kind: 'glass_bottle_green', x: site.x - 1.2 + randProp() * 2.4, y: sy, z: site.z - 1.2 + randProp() * 2.4, yaw: randProp() * 6.28, ownerTag },
+        { kind: 'soda_can', x: site.x - 1.4 + randProp() * 2.8, y: sy, z: site.z - 1.4 + randProp() * 2.8, yaw: randProp() * 6.28, roll: Math.PI * 0.5, ownerTag },
+        { kind: 'paper_sheet', x: site.x + (randProp() - 0.5) * 4.5, y: sy, z: site.z + (randProp() - 0.5) * 4.5, yaw: randProp() * 6.28, ownerTag },
+        { kind: 'paper_sheet', x: site.x + (randProp() - 0.5) * 7.5, y: site.groundY + 0.08, z: site.z + (randProp() - 0.5) * 7.5, yaw: randProp() * 6.28, ownerTag },
+        { kind: i % 2 === 0 ? 'cardboard_box' : 'ration_tin', x: site.x + 1.8, y: sy, z: site.z - 1.4, yaw: randProp() * 1.4, ownerTag },
+      );
+    }
+
+    // 5c. Roadside wind-blown paper & litter along paved highways
+    if (roadSegments.length > 0 && propSpawns.length < 18) {
+      const seg = roadSegments[Math.floor(randProp() * roadSegments.length)];
+      const mx = (seg.ax + seg.bx) * 0.5;
+      const mz = (seg.az + seg.bz) * 0.5;
+      if (
+        mx >= centerX - halfChunk &&
+        mx < centerX + halfChunk &&
+        mz >= centerZ - halfChunk &&
+        mz < centerZ + halfChunk
+      ) {
+        const my = evaluateOpenWorldHeight(mx, mz) + 0.1;
+        for (let k = 0; k < 3; k++) {
+          propSpawns.push({
+            kind: k < 2 ? 'paper_sheet' : 'soda_can',
+            x: mx + (randProp() - 0.5) * 6.0,
+            y: my,
+            z: mz + (randProp() - 0.5) * 6.0,
+            yaw: randProp() * 6.28,
+            roll: k === 2 ? Math.PI * 0.5 : 0,
+            ownerTag,
+          });
+        }
+      }
+    }
+
+    return { instanceCount, meshCount, propSpawns };
   }
 
   /**
@@ -2501,6 +2618,21 @@ export class OpenWorldArchitectureBuilder {
       false,
       true,
     );
+    // Upgraded bungalow lived-in interior dressing: dining chairs, kitchen counter, wall cabinet & exposed timber rafters
+    if (batcher) {
+      const c1 = localToWorldXZ(t, -hx + 2.28, hz - 1.55);
+      batcher.addBox('woodTrim', c1.x, t.wy + floorTopY + 0.26, c1.z, 0.44, 0.52, 0.44, t.yaw + 0.22, 0.44, 0.34, 0.24);
+      const c2 = localToWorldXZ(t, -hx + 1.35, hz - 2.38);
+      batcher.addBox('woodTrim', c2.x, t.wy + floorTopY + 0.26, c2.z, 0.44, 0.52, 0.44, t.yaw - 0.18, 0.44, 0.34, 0.24);
+      // Upper wall cupboard mounted cleanly above the right-rear kitchen counter
+      const kPos = localToWorldXZ(t, hx - 1.35, -hz + 0.72);
+      batcher.addBox('steel', kPos.x, t.wy + floorTopY + 1.82, kPos.z, 1.12, 0.62, 0.40, t.yaw, 0.62, 0.64, 0.62);
+      // Exposed overhead ceiling rafters
+      for (const rz of [-hz * 0.45, 0, hz * 0.45]) {
+        const rp = localToWorldXZ(t, 0, rz);
+        batcher.addBox('woodTrim', rp.x, t.wy + floorTopY + wallH - 0.12, rp.z, widthX - 0.5, 0.14, 0.14, t.yaw, 0.34, 0.26, 0.19);
+      }
+    }
     this.addSolidBox(
       t,
       batcher,
@@ -2729,6 +2861,24 @@ export class OpenWorldArchitectureBuilder {
     this.addSolidBox(t, batcher, outObbs, 'steel', 'metal', 4.5, storeFloorY + 1.02, storeZ - shz + 0.84, 1.9, 2.04, 0.72, 0.72, 0.78, 0.82);
     // Back storage room supply rack
     this.addSolidBox(t, batcher, outObbs, 'woodTrim', 'wood', -4.2, storeFloorY + 0.85, storeZ - 2.65, 1.75, 1.70, 0.62, 0.46, 0.38, 0.28);
+    // Upgraded store interior dressing: stocked merchandise layers, ceiling conduit beams & backroom pallet stack
+    if (batcher) {
+      for (const sx of [1.4, 3.9]) {
+        for (const szOff of [-0.75, 0.1, 0.85]) {
+          const mp = localToWorldXZ(t, sx, storeZ + 0.6 + szOff);
+          batcher.addBox('fasciaTint', mp.x, t.wy + storeFloorY + 1.78, mp.z, 0.44, 0.26, 0.56, t.yaw, 0.68, 0.34, 0.24);
+        }
+      }
+      // Overhead steel ceiling beams & electrical tray
+      for (const bz of [storeZ - 1.8, storeZ + 0.4, storeZ + 2.4]) {
+        const bp = localToWorldXZ(t, 0, bz);
+        batcher.addBox('steel', bp.x, t.wy + storeFloorY + storeH - 0.1, bp.z, storeW - 0.6, 0.12, 0.14, t.yaw, 0.36, 0.40, 0.44);
+      }
+      // Backroom wooden supply pallet
+      const pal = localToWorldXZ(t, -2.5, storeZ - 2.6);
+      batcher.addBox('woodTrim', pal.x, t.wy + storeFloorY + 0.08, pal.z, 1.05, 0.16, 1.05, t.yaw, 0.54, 0.42, 0.28);
+      batcher.addBox('woodTrim', pal.x, t.wy + storeFloorY + 0.42, pal.z, 0.72, 0.52, 0.68, t.yaw + 0.14, 0.48, 0.38, 0.26);
+    }
     // Back storage room partition with open pass-through
     this.addWallAlongX(t, batcher, outObbs, 'concrete', 'concrete', -shx + wt, 0.4, storeZ - 1.5, storeFloorY, storeH - 0.1, 0.18, 0.74, 0.74, 0.72, {
       kind: 'door',
@@ -3705,6 +3855,31 @@ export class OpenWorldArchitectureBuilder {
           this.addSolidBox(t, batcher, outObbs, 'steel', 'metal', mx + sx, 0.10 + (mh - 0.21) * 0.5, mz + sz, 0.24, mh - 0.21, 0.24, 0.38, 0.41, 0.44);
         }
       }
+      // FOB Courtyard Staging Upgrades: Fuel drum bund beside motorpool, diesel generator cage beside HQ,
+      // and raised wooden gun-range shooting bench shelf (hosts shootable physics bottles & cans!)
+      if (batcher) {
+        // Fuel drum pallet + 4 oil drums beside motorpool (-X flank)
+        const bund = localToWorldXZ(t, mx - mw * 0.5 - 1.55, mz - 2.2);
+        batcher.addBox('concreteDark', bund.x, t.wy + 0.14, bund.z, 1.85, 0.14, 1.85, t.yaw, 0.36, 0.38, 0.40);
+        for (const ox of [-0.42, 0.42]) {
+          for (const oz of [-0.42, 0.42]) {
+            const dp = localToWorldXZ(t, mx - mw * 0.5 - 1.55 + ox, mz - 2.2 + oz);
+            batcher.addBox('fasciaTint', dp.x, t.wy + 0.65, dp.z, 0.58, 0.88, 0.58, t.yaw, 0.62, 0.24, 0.20);
+          }
+        }
+        // Caged diesel generator beside Command Bunker (-X flank)
+        const gen = localToWorldXZ(t, -12.6, 4.2);
+        batcher.addBox('concreteDark', gen.x, t.wy + 0.14, gen.z, 2.5, 0.16, 1.55, t.yaw, 0.42, 0.44, 0.45);
+        batcher.addBox('steel', gen.x, t.wy + 0.78, gen.z, 2.15, 1.12, 1.12, t.yaw, 0.34, 0.42, 0.30);
+        batcher.addBox('steel', gen.x, t.wy + 1.54, gen.z, 0.26, 0.44, 0.26, t.yaw, 0.24, 0.26, 0.28);
+        // Gun-range wooden shooting shelf at firing line (-19.5, -26.2)
+        const shelf = localToWorldXZ(t, -19.5, -26.2);
+        batcher.addBox('woodTrim', shelf.x, t.wy + 0.96, shelf.z, 3.2, 0.10, 0.72, t.yaw, 0.52, 0.40, 0.28);
+        const legL = localToWorldXZ(t, -20.85, -26.2);
+        const legR = localToWorldXZ(t, -18.15, -26.2);
+        batcher.addBox('steel', legL.x, t.wy + 0.48, legL.z, 0.12, 0.92, 0.62, t.yaw, 0.32, 0.35, 0.38);
+        batcher.addBox('steel', legR.x, t.wy + 0.48, legR.z, 0.12, 0.92, 0.62, t.yaw, 0.32, 0.35, 0.38);
+      }
       outObbs.push({
         cx: mp.x,
         cy: t.wy + mh,
@@ -3930,15 +4105,41 @@ export class OpenWorldArchitectureBuilder {
       }
     }
 
-    // Station-specific interior props & micro-clutter (zero coplanar faces)
+    // Station-specific interior props & architectural dressing (zero coplanar faces, merged into chunk batcher)
+    if (batcher) {
+      // Overhead steel ceiling joists & electrical cable tray across every concrete FOB bunker
+      for (const jz of [-hz * 0.5, 0, hz * 0.5]) {
+        const jp = localToWorldXZ(t, cx, cz + jz);
+        batcher.addBox('steel', jp.x, t.wy + floorY + wallH - 0.12, jp.z, widthX - 0.7, 0.14, 0.14, t.yaw, 0.30, 0.34, 0.38);
+      }
+      const trayP = localToWorldXZ(t, cx - hx + 1.15, cz);
+      batcher.addBox('steel', trayP.x, t.wy + floorY + wallH - 0.24, trayP.z, 0.26, 0.08, depthZ - 1.0, t.yaw, 0.26, 0.29, 0.32);
+    }
+
     if (opts.stationKind === 'command') {
-      // Tactical map briefing table + raised holo console, radio comms cabinet & supply footlocker
+      // Tactical map briefing table + raised holo console, dual server racks, wall situation board, 4 chairs & footlocker
       this.addSolidBox(t, batcher, outObbs, 'steel', 'metal', cx + 2.2, floorY + 0.48, cz - 1.6, 2.6, 0.96, 1.3, 0.34, 0.38, 0.42);
       this.addSolidBox(t, batcher, outObbs, 'steel', 'metal', cx + 2.2, floorY + 0.96 + 0.12, cz - 1.6, 1.8, 0.24, 0.86, 0.22, 0.28, 0.34, false, true);
       this.addSolidBox(t, batcher, outObbs, 'steel', 'metal', cx - 3.6, floorY + 1.05, cz - 2.6, 1.4, 2.1, 0.75, 0.30, 0.34, 0.36);
       this.addSolidBox(t, batcher, outObbs, 'woodTrim', 'wood', cx + 3.5, floorY + 0.36, cz + 1.8, 1.3, 0.72, 0.74, 0.38, 0.42, 0.28);
+      if (batcher) {
+        // Secondary server rack + glowing green telemetry LED bar
+        const srv2 = localToWorldXZ(t, cx - 2.0, cz - 2.6);
+        batcher.addBox('steel', srv2.x, t.wy + floorY + 1.05, srv2.z, 1.2, 2.1, 0.72, t.yaw, 0.26, 0.30, 0.34);
+        batcher.addBox('emissiveCanopy', srv2.x, t.wy + floorY + 1.68, srv2.z + 0.38 * t.cosY, 0.85, 0.08, 0.05, t.yaw, 0.28, 0.88, 0.46);
+        // Wall situation briefing board mounted on rear wall
+        const boardP = localToWorldXZ(t, cx + 1.8, cz - hz + 0.46);
+        batcher.addBox('concreteDark', boardP.x, t.wy + floorY + 1.72, boardP.z, 2.8, 1.35, 0.09, t.yaw, 0.22, 0.26, 0.30);
+        // 4 folding chairs flanking the central sand-table
+        for (const chx of [cx + 1.35, cx + 3.05]) {
+          const chF = localToWorldXZ(t, chx, cz - 0.55);
+          batcher.addBox('woodTrim', chF.x, t.wy + floorY + 0.26, chF.z, 0.44, 0.52, 0.44, t.yaw + 0.15, 0.36, 0.38, 0.32);
+          const chB = localToWorldXZ(t, chx, cz - 2.65);
+          batcher.addBox('woodTrim', chB.x, t.wy + floorY + 0.26, chB.z, 0.44, 0.52, 0.44, t.yaw - 0.12, 0.36, 0.38, 0.32);
+        }
+      }
     } else if (opts.stationKind === 'armory') {
-      // 5 Steel Player Stash Lockers along back/right interior walls + Weapon Rack + Gunsmith Bench + Ammo Cases
+      // 5 Steel Player Stash Lockers along back/right interior walls + Weapon Rack + Gunsmith Bench + Toolboard + Ammo Pallets
       for (let k = 0; k < 5; k++) {
         const lx = cx - 3.2 + k * 1.45;
         this.addSolidBox(t, batcher, outObbs, 'steel', 'metal', lx, floorY + 1.05, cz - hz + 0.75, 1.15, 2.1, 0.72, 0.28, 0.34, 0.30);
@@ -3948,13 +4149,32 @@ export class OpenWorldArchitectureBuilder {
       this.addSolidBox(t, batcher, outObbs, 'woodTrim', 'wood', cx + 1.2, floorY + 0.92 + 0.22, cz + 1.8, 1.15, 0.44, 0.62, 0.34, 0.40, 0.26, false, true);
       this.addSolidBox(t, batcher, outObbs, 'steel', 'metal', cx - 2.4, floorY + 0.38, cz + 1.9, 1.1, 0.76, 0.78, 0.30, 0.34, 0.36);
       this.addSolidBox(t, batcher, outObbs, 'steel', 'metal', cx + hx - 0.85, floorY + 0.95, cz - 0.4, 0.65, 1.9, 3.4, 0.32, 0.36, 0.38);
+      if (batcher) {
+        // Wall tool pegboard mounted over gunsmith bench + steel cage divider post
+        const pegP = localToWorldXZ(t, cx + 1.2, cz + hz - 0.46);
+        batcher.addBox('steel', pegP.x, t.wy + floorY + 1.66, pegP.z, 2.6, 1.05, 0.08, t.yaw, 0.32, 0.36, 0.38);
+        // Stacked olive ammo tins atop steel storage case
+        const tinP = localToWorldXZ(t, cx - 2.4, cz + 1.9);
+        batcher.addBox('fasciaTint', tinP.x, t.wy + floorY + 0.92, tinP.z, 0.62, 0.28, 0.44, t.yaw + 0.18, 0.32, 0.42, 0.26);
+      }
     } else {
-      // Barracks: double bunk frames, footlockers & field briefing table
+      // Barracks: double bunk frames with mattress pads, footlockers, field mess table & benches
       for (const bx of [cx - 3.8, cx - 1.2, cx + 1.4]) {
         this.addSolidBox(t, batcher, outObbs, 'steel', 'metal', bx, floorY + 0.85, cz - 2.6, 1.1, 1.7, 2.1, 0.36, 0.38, 0.34);
         this.addSolidBox(t, batcher, outObbs, 'woodTrim', 'wood', bx, floorY + 0.28, cz + 2.4, 0.95, 0.56, 0.55, 0.36, 0.38, 0.26);
+        if (batcher) {
+          // Olive bunk mattresses (lower & upper) + pillow blocks
+          const mp = localToWorldXZ(t, bx, cz - 2.6);
+          batcher.addBox('wallSiding', mp.x, t.wy + floorY + 0.52, mp.z, 0.96, 0.16, 1.92, t.yaw, 0.44, 0.48, 0.38);
+          batcher.addBox('wallSiding', mp.x, t.wy + floorY + 1.48, mp.z, 0.96, 0.16, 1.92, t.yaw, 0.44, 0.48, 0.38);
+        }
       }
       this.addSolidBox(t, batcher, outObbs, 'woodTrim', 'wood', cx - 3.5, floorY + 0.44, cz + 0.2, 1.75, 0.88, 1.05, 0.48, 0.38, 0.28);
+      if (batcher) {
+        // Mess bench beside barracks table
+        const bench = localToWorldXZ(t, cx - 3.5, cz + 1.05);
+        batcher.addBox('woodTrim', bench.x, t.wy + floorY + 0.24, bench.z, 1.55, 0.44, 0.34, t.yaw, 0.44, 0.35, 0.25);
+      }
     }
 
     outIndoor.push({
@@ -4049,15 +4269,37 @@ export class OpenWorldArchitectureBuilder {
     }
 
     if (opts.isMedicalHospital) {
-      // Field Hospital surgical beds/cots & trauma supply cabinets
+      // Field Hospital surgical beds/cots, stainless IV poles, surgical trolley, privacy screen & trauma supply cabinets
       for (const mx of [cx - 3.6, cx - 1.2, cx + 1.2, cx + 3.6]) {
         this.addSolidBox(t, batcher, outObbs, 'steel', 'metal', mx, floorY + 0.35, cz - 2.3, 1.0, 0.7, 2.0, 0.75, 0.78, 0.78);
+        if (batcher) {
+          // Pillow + stainless IV stand pole beside each surgical cot
+          const pil = localToWorldXZ(t, mx, cz - 3.02);
+          batcher.addBox('wallSiding', pil.x, t.wy + floorY + 0.78, pil.z, 0.66, 0.12, 0.34, t.yaw, 0.88, 0.90, 0.92);
+          const ivp = localToWorldXZ(t, mx + 0.64, cz - 2.85);
+          batcher.addBox('steel', ivp.x, t.wy + floorY + 0.96, ivp.z, 0.05, 1.92, 0.05, t.yaw, 0.76, 0.80, 0.82);
+          batcher.addBox('steel', ivp.x, t.wy + floorY + 1.94, ivp.z, 0.34, 0.04, 0.04, t.yaw, 0.76, 0.80, 0.82);
+        }
       }
       this.addSolidBox(t, batcher, outObbs, 'steel', 'metal', cx - 3.5, floorY + 0.85, cz + 2.5, 2.2, 1.7, 0.65, 0.80, 0.82, 0.84);
+      if (batcher) {
+        // Wheeled stainless instrument trolley & crimson medical privacy screen
+        const cart = localToWorldXZ(t, cx + 2.8, cz + 2.2);
+        batcher.addBox('steel', cart.x, t.wy + floorY + 0.45, cart.z, 0.95, 0.88, 0.62, t.yaw + 0.14, 0.74, 0.78, 0.80);
+        const scr = localToWorldXZ(t, cx, cz - 2.3);
+        batcher.addBox('wallSiding', scr.x, t.wy + floorY + 0.96, scr.z, 0.08, 1.85, 1.9, t.yaw, 0.68, 0.78, 0.76);
+      }
     } else {
-      // Supply crates & field tables inside logistics/billeting tent
+      // Supply crates, field mess tables, benches & storage racks inside logistics/billeting tent
       this.addSolidBox(t, batcher, outObbs, 'woodTrim', 'wood', cx - 2.5, floorY + 0.55, cz - 1.6, 1.6, 1.1, 1.2, 0.44, 0.38, 0.28);
       this.addSolidBox(t, batcher, outObbs, 'woodTrim', 'wood', cx + 2.4, floorY + 0.55, cz - 1.6, 1.6, 1.1, 1.2, 0.38, 0.42, 0.30);
+      if (batcher) {
+        // Folding field mess table + benches + corner storage rack
+        const mt = localToWorldXZ(t, cx, cz + 1.4);
+        batcher.addBox('woodTrim', mt.x, t.wy + floorY + 0.42, mt.z, 2.2, 0.82, 0.85, t.yaw, 0.48, 0.39, 0.28);
+        const mb = localToWorldXZ(t, cx, cz + 2.15);
+        batcher.addBox('woodTrim', mb.x, t.wy + floorY + 0.22, mb.z, 2.0, 0.42, 0.32, t.yaw, 0.44, 0.35, 0.26);
+      }
     }
 
     outIndoor.push({

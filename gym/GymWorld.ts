@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import { GunsmithBench } from '../arena/GunsmithBench';
 import { BodycamPhysicsWorld, BodycamSurfaceMaterial } from '../bodycam-sdk';
 import { PenetrableSurfaceSystem } from '../doors/PenetrableSurfaceSystem';
@@ -1119,6 +1120,112 @@ export function buildGymWorld(
     woodRoughness: textures.woodRoughness,
   });
   addFloorPlaque('GUNSMITHING BENCH', 'LOOK + [F]: MODIFY FIREARM', 3.15, 16.55, '#e0a938');
+
+  // =========================================================================
+  // MERGED FACILITY ARCHITECTURAL DRESSING & BALLISTICS PLINKING LEDGES
+  // =========================================================================
+  const gymSteelGeos: THREE.BufferGeometry[] = [];
+  const gymWoodGeos: THREE.BufferGeometry[] = [];
+  const pushGymBox = (
+    bucket: THREE.BufferGeometry[],
+    w: number,
+    h: number,
+    d: number,
+    cx: number,
+    cy: number,
+    cz: number,
+  ): void => {
+    const g = new THREE.BoxGeometry(w, h, d);
+    g.translate(cx, cy, cz);
+    bucket.push(g);
+  };
+  const pushGymCyl = (
+    bucket: THREE.BufferGeometry[],
+    r: number,
+    len: number,
+    cx: number,
+    cy: number,
+    cz: number,
+    rotX = 0,
+    rotZ = 0,
+  ): void => {
+    const g = new THREE.CylinderGeometry(r, r, len, 8);
+    if (rotX !== 0) g.rotateX(rotX);
+    if (rotZ !== 0) g.rotateZ(rotZ);
+    g.translate(cx, cy, cz);
+    bucket.push(g);
+  };
+
+  // Longitudinal overhead conduit pipes running down the Ballistics Range ceiling baffles
+  for (const px of [5.8, 18.8]) {
+    pushGymCyl(gymSteelGeos, 0.045, 28.0, px, 4.12, -20.0, Math.PI * 0.5, 0);
+  }
+  // CQB hallway ceiling conduit run + wall electrical box
+  pushGymCyl(gymSteelGeos, 0.032, 9.4, 11.1, 3.48, 6.5, Math.PI * 0.5, 0);
+  pushGymBox(gymSteelGeos, 0.16, 0.62, 0.44, 10.76, 1.55, 8.2);
+  // 3-tier industrial workshop supply rack along South courtyard wall (X = 8.4, Z = 20.6)
+  for (const rx of [-0.72, 0.72]) {
+    for (const rz of [-0.22, 0.22]) {
+      pushGymBox(gymSteelGeos, 0.05, 1.88, 0.05, 8.4 + rx, 0.94, 20.6 + rz);
+    }
+  }
+  for (const sy of [0.16, 0.72, 1.28, 1.84]) {
+    pushGymBox(gymSteelGeos, 1.5, 0.035, 0.48, 8.4, sy, 20.6);
+  }
+  physics.addBox({
+    minX: 7.6,
+    maxX: 9.2,
+    minY: 0,
+    maxY: 1.9,
+    minZ: 20.32,
+    maxZ: 20.88,
+    surface: 'metal',
+  });
+  // Staging timber pallet beside the South workshop rack (X = 11.2, Z = 19.6, top Y = 0.14m)
+  for (const pz of [-0.42, 0, 0.42]) {
+    pushGymBox(gymWoodGeos, 1.24, 0.09, 0.11, 11.2, 0.045, 19.6 + pz);
+  }
+  for (let s = 0; s < 5; s++) {
+    pushGymBox(gymWoodGeos, 1.28, 0.04, 0.15, 11.2, 0.115, 19.6 - 0.42 + s * 0.21);
+  }
+  physics.addBox({
+    minX: 10.52,
+    maxX: 11.88,
+    minY: 0,
+    maxY: 0.14,
+    minZ: 19.05,
+    maxZ: 20.15,
+    surface: 'wood',
+  });
+
+  const flushGymBucket = (
+    geos: THREE.BufferGeometry[],
+    mat: THREE.Material,
+    surface: BodycamSurfaceMaterial,
+  ): void => {
+    if (geos.length === 0) return;
+    const merged = mergeGeometries(geos, false);
+    for (const g of geos) g.dispose();
+    if (!merged) return;
+    trackGeo(merged);
+    const m = new THREE.Mesh(merged, mat);
+    m.castShadow = !isSoftwareGl;
+    m.receiveShadow = !isSoftwareGl;
+    m.userData.surfaceMaterial = surface;
+    scene.add(m);
+    raycastMeshes.push(m);
+  };
+  flushGymBucket(gymSteelGeos, steelBeamMat, 'metal');
+  flushGymBucket(gymWoodGeos, woodMat, 'wood');
+
+  // Dedicated wooden bottle/can plinking ledges at 10m & 20m inside the Ballistics Range (top Y = 0.90m)
+  const addRangePlinkingLedge = (cx: number, cz: number, w: number): void => {
+    addSolidBox(cx, 0.87, cz, w, 0.06, 0.42, woodMat, 'wood', true);
+    addSolidBox(cx - w * 0.42, 0.42, cz, 0.08, 0.84, 0.36, steelBeamMat, 'metal', true);
+    addSolidBox(cx + w * 0.42, 0.42, cz, 0.08, 0.84, 0.36, steelBeamMat, 'metal', true);
+  };
+  addRangePlinkingLedge(11.0, -13.2, 2.0);
+  addRangePlinkingLedge(13.1, -22.2, 2.2);
 
   electronics.autoRegisterSceneElectronics(scene, {
     idPrefix: 'gym_auto_elec',

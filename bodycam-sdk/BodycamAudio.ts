@@ -15,6 +15,16 @@ export const OPEN_WORLD_SHARP_GUNSHOT_RANGE_M = 300;
 export const OPEN_WORLD_MAX_GUNSHOT_RANGE_M = 650;
 export const FIRE_SUPPORT_MAX_VOICES = 12;
 export const FIRE_SUPPORT_CULL_RADIUS_M = 350;
+export const PHYSICS_PROP_MAX_VOICES = 8;
+export const PHYSICS_PROP_CULL_RADIUS_M = 28;
+
+export type PhysicsPropAudioKind =
+  | 'glass_shatter'
+  | 'glass_clink'
+  | 'can_clatter'
+  | 'paper_rustle'
+  | 'cardboard_thud'
+  | 'plastic_clack';
 
 export type FireSupportVoicePriority = 0 | 1 | 2;
 
@@ -395,6 +405,7 @@ export class BodycamAudio implements IBodycamAudioSource {
   private activeZombieSteps = 0;
   private activeFlybyVoices = 0;
   private activeDistantGunshots = 0;
+  private activePhysicsPropVoices = 0;
   private readonly fireSupportPool = new FireSupportVoicePool(
     FIRE_SUPPORT_MAX_VOICES,
     FIRE_SUPPORT_CULL_RADIUS_M,
@@ -1434,6 +1445,170 @@ export class BodycamAudio implements IBodycamAudioSource {
       osc.start(t + delay);
       osc.stop(t + delay + 0.095);
     }
+  }
+
+  /**
+   * Voice-capped (max 8 concurrent, 28m culled) 3D spatial collision audio for physical props:
+   *  - glass_shatter: bottle burst + sparkling shard tinkles
+   *  - glass_clink: resonant narrowband bottle tap/roll
+   *  - can_clatter: hollow aluminum/tin multi-mode ring
+   *  - paper_rustle: filtered airy brush flutter
+   *  - cardboard_thud: damped low-mid hollow carton thump
+   *  - plastic_clack: snappy polymer tote knock
+   */
+  public playPhysicsPropImpact(
+    kind: PhysicsPropAudioKind,
+    pos: Readonly<THREE.Vector3>,
+    intensity = 0.75,
+  ): void {
+    if (this.activePhysicsPropVoices >= PHYSICS_PROP_MAX_VOICES) return;
+    const dx = pos.x - this.listenerPos.x;
+    const dy = pos.y - this.listenerPos.y;
+    const dz = pos.z - this.listenerPos.z;
+    const distSq = dx * dx + dy * dy + dz * dz;
+    if (distSq > PHYSICS_PROP_CULL_RADIUS_M * PHYSICS_PROP_CULL_RADIUS_M) return;
+
+    this.ensureInitialized();
+    if (!this.ctx || !this.noiseBuffer || !this.dryBus || !this.wetBus) return;
+    const ctx = this.ctx;
+    const t = ctx.currentTime;
+    const amp = THREE.MathUtils.clamp(intensity, 0.14, 1.35);
+
+    const panner = this.createHRTFPanner(pos, 1.1, PHYSICS_PROP_CULL_RADIUS_M);
+    if (!panner) return;
+    panner.connect(this.dryBus);
+    panner.connect(this.wetBus);
+    if (this.interiorWetBus) {
+      panner.connect(this.interiorWetBus);
+    }
+
+    this.activePhysicsPropVoices++;
+    let voiceDurMs = 180;
+
+    if (kind === 'glass_shatter') {
+      voiceDurMs = 360;
+      const burst = ctx.createBufferSource();
+      burst.buffer = this.noiseBuffer;
+      const hp = ctx.createBiquadFilter();
+      hp.type = 'highpass';
+      hp.frequency.value = 2850;
+      const bg = ctx.createGain();
+      bg.gain.setValueAtTime(0.46 * amp, t);
+      bg.gain.exponentialRampToValueAtTime(0.001, t + 0.18);
+      burst.connect(hp);
+      hp.connect(bg);
+      bg.connect(panner);
+      burst.start(t, Math.random() * 0.7, 0.2);
+
+      for (let i = 0; i < 6; i++) {
+        const delay = 0.01 + i * 0.026 + Math.random() * 0.035;
+        const osc = ctx.createOscillator();
+        osc.type = 'sine';
+        const freq = 3200 + Math.random() * 4400;
+        osc.frequency.setValueAtTime(freq, t + delay);
+        osc.frequency.exponentialRampToValueAtTime(freq * 0.94, t + delay + 0.065);
+        const sg = ctx.createGain();
+        sg.gain.setValueAtTime(Math.max(0.015, (0.11 - i * 0.012) * amp), t + delay);
+        sg.gain.exponentialRampToValueAtTime(0.001, t + delay + 0.07);
+        osc.connect(sg);
+        sg.connect(panner);
+        osc.start(t + delay);
+        osc.stop(t + delay + 0.075);
+      }
+    } else if (kind === 'glass_clink') {
+      voiceDurMs = 150;
+      const baseFreq = 2150 + Math.random() * 950;
+      for (let i = 0; i < 2; i++) {
+        const osc = ctx.createOscillator();
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(baseFreq * (i === 0 ? 1.0 : 1.48), t);
+        const g = ctx.createGain();
+        g.gain.setValueAtTime((i === 0 ? 0.12 : 0.06) * amp, t);
+        g.gain.exponentialRampToValueAtTime(0.0008, t + (i === 0 ? 0.11 : 0.07));
+        osc.connect(g);
+        g.connect(panner);
+        osc.start(t);
+        osc.stop(t + 0.12);
+      }
+    } else if (kind === 'can_clatter') {
+      voiceDurMs = 210;
+      const pitchJitter = 0.88 + Math.random() * 0.26;
+      const modes = [940, 1890, 3140];
+      for (let i = 0; i < modes.length; i++) {
+        const osc = ctx.createOscillator();
+        osc.type = i === 0 ? 'triangle' : 'sine';
+        osc.frequency.setValueAtTime(modes[i] * pitchJitter, t);
+        osc.frequency.exponentialRampToValueAtTime(modes[i] * pitchJitter * 0.96, t + 0.14);
+        const g = ctx.createGain();
+        g.gain.setValueAtTime((0.11 / (i + 1)) * amp, t);
+        g.gain.exponentialRampToValueAtTime(0.0008, t + (0.14 - i * 0.028));
+        osc.connect(g);
+        g.connect(panner);
+        osc.start(t);
+        osc.stop(t + 0.15);
+      }
+      const click = ctx.createBufferSource();
+      click.buffer = this.noiseBuffer;
+      const bp = ctx.createBiquadFilter();
+      bp.type = 'bandpass';
+      bp.frequency.value = 2400 * pitchJitter;
+      bp.Q.value = 3.2;
+      const cg = ctx.createGain();
+      cg.gain.setValueAtTime(0.16 * amp, t);
+      cg.gain.exponentialRampToValueAtTime(0.001, t + 0.045);
+      click.connect(bp);
+      bp.connect(cg);
+      cg.connect(panner);
+      click.start(t, Math.random() * 0.8, 0.055);
+    } else if (kind === 'paper_rustle') {
+      voiceDurMs = 170;
+      const src = ctx.createBufferSource();
+      src.buffer = this.noiseBuffer;
+      const bp = ctx.createBiquadFilter();
+      bp.type = 'bandpass';
+      bp.frequency.setValueAtTime(1750 + Math.random() * 900, t);
+      bp.Q.value = 1.4;
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0.001, t);
+      g.gain.linearRampToValueAtTime(0.085 * amp, t + 0.032);
+      g.gain.exponentialRampToValueAtTime(0.0008, t + 0.14);
+      src.connect(bp);
+      bp.connect(g);
+      g.connect(panner);
+      src.start(t, Math.random() * 0.9, 0.155);
+    } else if (kind === 'cardboard_thud') {
+      voiceDurMs = 150;
+      const osc = ctx.createOscillator();
+      osc.type = 'triangle';
+      osc.frequency.setValueAtTime(148 + Math.random() * 34, t);
+      osc.frequency.exponentialRampToValueAtTime(64, t + 0.09);
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0.22 * amp, t);
+      g.gain.exponentialRampToValueAtTime(0.001, t + 0.11);
+      osc.connect(g);
+      g.connect(panner);
+      osc.start(t);
+      osc.stop(t + 0.12);
+    } else {
+      // plastic_clack
+      voiceDurMs = 135;
+      const osc = ctx.createOscillator();
+      osc.type = 'triangle';
+      const f = 540 + Math.random() * 240;
+      osc.frequency.setValueAtTime(f, t);
+      osc.frequency.exponentialRampToValueAtTime(f * 0.58, t + 0.06);
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0.16 * amp, t);
+      g.gain.exponentialRampToValueAtTime(0.001, t + 0.075);
+      osc.connect(g);
+      g.connect(panner);
+      osc.start(t);
+      osc.stop(t + 0.085);
+    }
+
+    window.setTimeout(() => {
+      this.activePhysicsPropVoices = Math.max(0, this.activePhysicsPropVoices - 1);
+    }, voiceDurMs);
   }
 
   /**

@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import type { BodycamInteriorSample, BodycamSurfaceMaterial } from '../../../../bodycam-sdk/types';
+import type { DynamicPropSpawnSpec } from '../../../../bodycam-sdk/physics/DynamicPhysicsPropSystem';
 import type { GraphicsQualityProfile } from '../../../../data/graphicsQuality';
 import { OpenWorldArchitectureBuilder } from './OpenWorldArchitectureBuilder';
 import { MACRO_OCCLUDER_LAYER } from './OpenWorldAtmosphere';
@@ -88,6 +89,7 @@ interface StreamedChunkRecord {
   readonly treeRoosts: FoliageAnchorPoint[];
   readonly logAnchors: FoliageAnchorPoint[];
   readonly rockAnchors: FoliageAnchorPoint[];
+  readonly propSpawns: DynamicPropSpawnSpec[];
   readonly collider: ActiveHeightfieldCollider | null;
   readonly instanceCount: number;
 }
@@ -410,6 +412,10 @@ export class OpenWorldChunkStreamer {
   private readonly activeRockAnchors: FoliageAnchorPoint[] = [];
   private readonly isSoftwareGl: boolean;
   private readonly archBuilder: OpenWorldArchitectureBuilder;
+  private physicsPropCallbacks: {
+    onChunkLoad: (chunkKey: string, spawns: readonly DynamicPropSpawnSpec[]) => void;
+    onChunkUnload: (chunkKey: string) => void;
+  } | null = null;
   private readonly foliageBuilder: OpenWorldFoliageBuilder;
 
   // Shared reusable materials & base geometries (disposed on streamer teardown)
@@ -1262,6 +1268,9 @@ export class OpenWorldChunkStreamer {
     if (centerWant && !this.loadedChunks.has(centerKey)) {
       const built = this.buildChunkRecord(centerWant.cx, centerWant.cz, centerWant.lod);
       this.loadedChunks.set(centerKey, built);
+      if (built.propSpawns.length > 0 && this.physicsPropCallbacks) {
+        this.physicsPropCallbacks.onChunkLoad(built.key, built.propSpawns);
+      }
       this.chunksGroup.add(built.group);
     }
 
@@ -1303,6 +1312,9 @@ export class OpenWorldChunkStreamer {
       }
       const built = this.buildChunkRecord(spec.cx, spec.cz, spec.lod);
       this.loadedChunks.set(spec.key, built);
+      if (built.propSpawns.length > 0 && this.physicsPropCallbacks) {
+        this.physicsPropCallbacks.onChunkLoad(built.key, built.propSpawns);
+      }
       this.chunksGroup.add(built.group);
       builtAny = true;
 
@@ -1378,6 +1390,7 @@ export class OpenWorldChunkStreamer {
     const treeRoosts: FoliageAnchorPoint[] = [];
     let logAnchors: FoliageAnchorPoint[] = [];
     let rockAnchors: FoliageAnchorPoint[] = [];
+    let propSpawns: DynamicPropSpawnSpec[] = [];
     let instanceCount = 0;
 
     if (lod === 'active') {
@@ -1395,6 +1408,7 @@ export class OpenWorldChunkStreamer {
         shadowCasterMeshes,
       );
       instanceCount += archRes.instanceCount;
+      propSpawns = archRes.propSpawns;
       const fastSampleScratch = { height: 0, slope: 0 };
       const fastHeightSlope = collider
         ? (wx: number, wz: number, out: { height: number; slope: number }) =>
@@ -1477,6 +1491,7 @@ export class OpenWorldChunkStreamer {
       treeRoosts,
       logAnchors,
       rockAnchors,
+      propSpawns,
       collider,
       instanceCount,
     };
@@ -2479,7 +2494,25 @@ export class OpenWorldChunkStreamer {
     return { active, mid };
   }
 
+  public setPhysicsPropCallbacks(
+    callbacks: {
+      onChunkLoad: (chunkKey: string, spawns: readonly DynamicPropSpawnSpec[]) => void;
+      onChunkUnload: (chunkKey: string) => void;
+    } | null,
+  ): void {
+    this.physicsPropCallbacks = callbacks;
+    if (!callbacks) return;
+    for (const rec of this.loadedChunks.values()) {
+      if (rec.lod === 'active' && rec.propSpawns.length > 0) {
+        callbacks.onChunkLoad(rec.key, rec.propSpawns);
+      }
+    }
+  }
+
   private disposeChunkRecord(rec: StreamedChunkRecord): void {
+    if (this.physicsPropCallbacks && rec.lod === 'active') {
+      this.physicsPropCallbacks.onChunkUnload(rec.key);
+    }
     this.chunksGroup.remove(rec.group);
     for (const inst of rec.instancedMeshes) {
       inst.dispose();

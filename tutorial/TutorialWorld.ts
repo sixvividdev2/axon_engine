@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import {
   BodycamPhysicsWorld,
   BodycamSurfaceMaterial,
@@ -589,6 +590,111 @@ export function buildTutorialWorld(
   strikeRingInner.rotation.x = -Math.PI * 0.5;
   strikeRingInner.position.set(fireSupportPitCenter.x, 0.025, fireSupportPitCenter.z);
   root.add(strikeRingInner);
+
+  // =========================================================================
+  // MERGED KILLHOUSE ARCHITECTURAL TRIM, SHELVING & BAY 03 PLINKING RAIL
+  // =========================================================================
+  const tutSteelGeos: THREE.BufferGeometry[] = [];
+  const tutWoodGeos: THREE.BufferGeometry[] = [];
+  const pushTutBox = (
+    bucket: THREE.BufferGeometry[],
+    w: number,
+    h: number,
+    d: number,
+    cx: number,
+    cy: number,
+    cz: number,
+  ): void => {
+    const g = new THREE.BoxGeometry(w, h, d);
+    g.translate(cx, cy, cz);
+    bucket.push(g);
+  };
+  const pushTutCyl = (
+    bucket: THREE.BufferGeometry[],
+    r: number,
+    len: number,
+    cx: number,
+    cy: number,
+    cz: number,
+    rotX = 0,
+  ): void => {
+    const g = new THREE.CylinderGeometry(r, r, len, 8);
+    if (rotX !== 0) g.rotateX(rotX);
+    g.translate(cx, cy, cz);
+    bucket.push(g);
+  };
+
+  // Overhead steel cross-gantries & dual wall conduit runs along killhouse length
+  for (const gz of [21.5, 11.2, -0.8, -11.4, -31.8, -41.5]) {
+    pushTutBox(tutSteelGeos, 12.6, 0.22, 0.28, 0, 4.18, gz);
+  }
+  pushTutCyl(tutSteelGeos, 0.04, 68.0, -6.18, 3.65, -10.5, Math.PI * 0.5);
+  pushTutCyl(tutSteelGeos, 0.04, 68.0, 6.18, 3.65, -10.5, Math.PI * 0.5);
+
+  // Bay 01 corner logistics pallet (-4.8, 22.8, top Y = 0.14m)
+  for (const pz of [-0.4, 0, 0.4]) {
+    pushTutBox(tutWoodGeos, 1.18, 0.09, 0.11, -4.8, 0.045, 22.8 + pz);
+  }
+  for (let s = 0; s < 5; s++) {
+    pushTutBox(tutWoodGeos, 1.22, 0.04, 0.14, -4.8, 0.115, 22.8 - 0.4 + s * 0.2);
+  }
+  physics.addBox({
+    minX: -5.44,
+    maxX: -4.16,
+    minY: 0,
+    maxY: 0.14,
+    minZ: 22.28,
+    maxZ: 23.32,
+    surface: 'wood',
+    blocksMovement: true,
+    blocksRaycast: true,
+  });
+
+  // Bay 04 east-wall 3-tier armory shelving rack (5.65, -7.8)
+  for (const rx of [-0.22, 0.22]) {
+    for (const rz of [-0.75, 0.75]) {
+      pushTutBox(tutSteelGeos, 0.045, 1.84, 0.045, 5.65 + rx, 0.92, -7.8 + rz);
+    }
+  }
+  for (const sy of [0.16, 0.72, 1.28, 1.82]) {
+    pushTutBox(tutSteelGeos, 0.48, 0.035, 1.56, 5.65, sy, -7.8);
+  }
+  physics.addBox({
+    minX: 5.36,
+    maxX: 5.94,
+    minY: 0,
+    maxY: 1.86,
+    minZ: -8.6,
+    maxZ: -7.0,
+    surface: 'metal',
+    blocksMovement: true,
+    blocksRaycast: true,
+  });
+
+  // Bay 03 timber bottle/can plinking rail south of the steel targets (X = 5.1, Z = -1.65, top Y = 0.92m)
+  addBox(5.1, 0.89, -1.65, 0.42, 0.06, 1.7, woodMat, 'wood', true, true);
+  addBox(5.1, 0.43, -2.35, 0.36, 0.86, 0.08, steelFrameMat, 'metal', true, true);
+  addBox(5.1, 0.43, -0.95, 0.36, 0.86, 0.08, steelFrameMat, 'metal', true, true);
+
+  const flushTutBucket = (
+    geos: THREE.BufferGeometry[],
+    mat: THREE.Material,
+    surface: BodycamSurfaceMaterial,
+  ): void => {
+    if (geos.length === 0) return;
+    const merged = mergeGeometries(geos, false);
+    for (const g of geos) g.dispose();
+    if (!merged) return;
+    trackGeo(merged);
+    const m = new THREE.Mesh(merged, mat);
+    m.castShadow = !isSoftwareGl;
+    m.receiveShadow = true;
+    m.userData.surface = surface;
+    root.add(m);
+    raycastMeshes.push(m);
+  };
+  flushTutBucket(tutSteelGeos, steelFrameMat, 'metal');
+  flushTutBucket(tutWoodGeos, woodMat, 'wood');
 
   // Reusable training strike blast VFX (zero allocation on detonation)
   const blastPlumeMat = trackMat(

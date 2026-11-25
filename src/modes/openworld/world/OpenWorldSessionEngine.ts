@@ -16,6 +16,7 @@ import {
   CharacterSkeleton,
   createPdaMotionState,
   DEFAULT_BODYCAM_SDK_CONFIG,
+  DynamicPhysicsPropSystem,
   GrenadeDetonationEvent,
   GrenadeHoldStage,
   LENS_PRESETS,
@@ -781,6 +782,8 @@ export class OpenWorldSessionEngine {
   private unsubDistance: (() => void) | null = null;
   private readonly adaptivePerf: AdaptivePerformanceController;
   private qualityProfile: GraphicsQualityProfile;
+  private readonly physicsProps: DynamicPhysicsPropSystem;
+  private readonly _propActorVelScratch = new THREE.Vector3();
 
   constructor(container: HTMLElement, slotId?: CharacterSlotId | null) {
     this.container = container;
@@ -857,6 +860,67 @@ export class OpenWorldSessionEngine {
     );
     this.atmosphere.setQualityProfile(this.qualityProfile, this.adaptivePerf.state);
     this.streamer.applyQualityProfile(this.qualityProfile, false);
+
+    // Unified chunk-streamed GPU-instanced physics props (FOB & settlement bottles, cans, wind papers, crates)
+    const owIndoorScratch = { isIndoor: false, material: 'outdoor' as 'concrete' | 'wood' | 'metal' | 'outdoor' };
+    const owSupportRayHit = {
+      hit: false,
+      distance: Infinity,
+      pointX: 0,
+      pointY: 0,
+      pointZ: 0,
+      normalX: 0,
+      normalY: 1,
+      normalZ: 0,
+      surface: 'concrete' as const,
+    };
+    this.physicsProps = new DynamicPhysicsPropSystem({
+      scene: this.scene,
+      isSoftwareGl: this.isSoftwareGl,
+      graphicsQuality: this.qualityProfile.id,
+      maxAniso: Math.min(4, this.renderer.capabilities.getMaxAnisotropy()),
+      adapter: {
+        sampleSupportHeight: (x, maxSurfaceY, z) => {
+          let bestY = this.streamer.sampleGroundHeight(x, z);
+          owSupportRayHit.hit = false;
+          owSupportRayHit.distance = 3.8;
+          if (
+            this.streamer.raycastActiveStructures(
+              x,
+              maxSurfaceY + 0.08,
+              z,
+              0,
+              -1,
+              0,
+              0.01,
+              owSupportRayHit,
+            ) &&
+            owSupportRayHit.normalY > 0.55
+          ) {
+            const hitY = maxSurfaceY + 0.08 - owSupportRayHit.distance;
+            if (hitY <= maxSurfaceY + 0.06 && hitY > bestY) {
+              bestY = hitY;
+            }
+          }
+          return bestY;
+        },
+        isIndoor: (x, y, z) => {
+          this.streamer.sampleIndoorAt(x, y, z, owIndoorScratch);
+          return owIndoorScratch.isIndoor;
+        },
+      },
+      onImpactAudio: (kind, pos, intensity) => {
+        this.audio.playPhysicsPropImpact(kind, pos, intensity);
+      },
+    });
+    this.streamer.setPhysicsPropCallbacks({
+      onChunkLoad: (_chunkKey, spawns) => {
+        this.physicsProps.spawnBatch(spawns);
+      },
+      onChunkUnload: (chunkKey) => {
+        this.physicsProps.removePropsByOwner(chunkKey);
+      },
+    });
 
     const maxAniso = Math.min(8, this.renderer.capabilities.getMaxAnisotropy());
     // Phase 3 & 4 Dynamic Sector Control, Supply-Coupled Logistics, Convoys & Dynamic Events
@@ -1980,6 +2044,7 @@ export class OpenWorldSessionEngine {
       weaponSpreadMOA: Math.hypot(prof.spreadMOA, activeAmmo.spreadMOA),
       audio: this.audio,
     });
+    this.physicsProps.handleBulletRay(_muzzlePos, _muzzleDir, 75, 1.15);
 
     this.weaponRig.triggerFire(suppressed, nextAmmo);
     this.weaponRig.setAmmoState(nextAmmo, true);
@@ -2212,6 +2277,9 @@ export class OpenWorldSessionEngine {
     }
     this.camera.getWorldPosition(_camPos);
     this.electronicsSystem.handleExplosion(ev.position, Math.max(8, ev.radiusM), _camPos);
+    if (!ev.isTick && (ev.kind === 'frag' || ev.kind === 'thermite' || ev.kind === 'flash')) {
+      this.physicsProps.handleBlast(ev.position, Math.max(8.5, ev.radiusM * 1.15), ev.kind === 'frag' ? 14.5 : 8.5);
+    }
     this.aiDirector.notifyPlayerGunshot(ev.position.x, ev.position.z, 175);
     this.ambienceAudio.onBallisticImpulse(
       ev.position.x,
@@ -3158,6 +3226,13 @@ export class OpenWorldSessionEngine {
     );
     const windSpeedMps = baseWindMps + altitudeWindBoost + gust01 * 3.8;
     const wetness01 = atmoTel.weather === 'mountain_rain' ? 0.92 : atmoTel.weather === 'coastal_fog' ? 0.35 : 0.0;
+    const windAng = 0.56 + Math.sin(this.elapsedSec * 0.07) * 0.25;
+    this.physicsProps.setWind(Math.cos(windAng), Math.sin(windAng), Math.min(2.3, windSpeedMps * 0.14));
+    if (this.navMode === 'foot' && this.playerHp > 0) {
+      this.controller.getVelocity(this._propActorVelScratch);
+      this.physicsProps.applyActorFootstepWake(this.controller.position, this._propActorVelScratch, 0.54);
+    }
+    this.physicsProps.update(dt, this.camera.position);
 
     this.camera.updateMatrixWorld();
     this.camera.getWorldPosition(_camPos);
@@ -4178,6 +4253,8 @@ export class OpenWorldSessionEngine {
     this.ballistics.dispose();
     this.weaponRig.dispose();
     this.skeleton.dispose();
+    this.streamer.setPhysicsPropCallbacks(null);
+    this.physicsProps.dispose();
     this.audio.dispose();
     this.streamer.dispose();
     this.atmosphere.dispose();
