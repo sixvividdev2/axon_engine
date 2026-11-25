@@ -51,6 +51,9 @@ const HOST_ONLY_GAME_TYPES = new Set<string>([
   'game:mode_state',
   'game:dogtag_event',
   'game:flag_event',
+  'game:fire_support_sync',
+  'game:mortar_launch',
+  'game:mortar_seat_rejected',
 ]);
 
 const ALLOWED_GAME_TYPES = new Set<string>([
@@ -68,6 +71,9 @@ const ALLOWED_GAME_TYPES = new Set<string>([
   'game:glass_shatter',
   'game:grenade_event',
   'game:door_action',
+  'game:mortar_seat_request',
+  'game:mortar_fire_request',
+  'game:mortar_crew_damage',
 ]);
 
 const VALID_DOOR_ACTIONS = new Set<string>([
@@ -847,6 +853,130 @@ export function validateAndSanitizeGameMessage(
       };
       matchState.updatedAt = Date.now();
       matchStateChanged = true;
+    }
+  } else if (type === 'game:mortar_seat_request') {
+    const pitId = String(parsed.pitId ?? '').trim().slice(0, 48);
+    const action = parsed.action;
+    if (!pitId || (action !== 'mount' && action !== 'exit')) {
+      return null;
+    }
+    safePayload.pitId = pitId;
+    safePayload.action = action;
+    targetUserId = st.hostUserId;
+  } else if (type === 'game:mortar_fire_request') {
+    const pitId = String(parsed.pitId ?? '').trim().slice(0, 48);
+    const az = Number(parsed.azimuthRad);
+    const el = Number(parsed.elevationRad);
+    const ch = Math.round(Number(parsed.chargeLevel));
+    if (
+      !pitId ||
+      !Number.isFinite(az) ||
+      !Number.isFinite(el) ||
+      ch < 1 ||
+      ch > 4
+    ) {
+      return null;
+    }
+    // Clamp high-angle mortar elevation strictly to [45°, 80°]
+    const minEl = (45 * Math.PI) / 180;
+    const maxEl = (80 * Math.PI) / 180;
+    safePayload.pitId = pitId;
+    safePayload.azimuthRad = Number(clampFinite(az, -Math.PI * 4, Math.PI * 4, 0).toFixed(4));
+    safePayload.elevationRad = Number(clampFinite(el, minEl, maxEl, (65 * Math.PI) / 180).toFixed(4));
+    safePayload.chargeLevel = ch as 1 | 2 | 3 | 4;
+    targetUserId = st.hostUserId;
+  } else if (type === 'game:mortar_crew_damage') {
+    const pitId = String(parsed.pitId ?? '').trim().slice(0, 48);
+    const role = parsed.role;
+    const rawDmg = Number(parsed.damage ?? 0);
+    if (!pitId || (role !== 'gunner' && role !== 'loader') || !Number.isFinite(rawDmg) || rawDmg <= 0) {
+      return null;
+    }
+    safePayload.pitId = pitId;
+    safePayload.role = role;
+    safePayload.damage = Math.max(1, Math.min(350, Math.round(rawDmg)));
+    safePayload.headshot = Boolean(parsed.headshot);
+    targetUserId = st.hostUserId;
+  } else if (type === 'game:mortar_seat_rejected') {
+    const rejTarget = String(parsed.targetUserId ?? '').trim();
+    const pitId = String(parsed.pitId ?? '').trim().slice(0, 48);
+    if (!rejTarget || !pitId) return null;
+    safePayload.targetUserId = rejTarget;
+    safePayload.pitId = pitId;
+    safePayload.reason = String(parsed.reason ?? 'Mortar unavailable').slice(0, 96);
+    targetUserId = rejTarget;
+  } else if (type === 'game:mortar_launch') {
+    const pitId = String(parsed.pitId ?? '').trim().slice(0, 48);
+    const shellId = String(parsed.shellId ?? '').trim().slice(0, 48);
+    const ch = Math.round(Number(parsed.chargeLevel));
+    if (
+      !pitId ||
+      !shellId ||
+      ch < 1 ||
+      ch > 4 ||
+      !isFiniteCoord(parsed.ox) ||
+      !isFiniteCoord(parsed.oy) ||
+      !isFiniteCoord(parsed.oz) ||
+      !isFiniteCoord(parsed.ix) ||
+      !isFiniteCoord(parsed.iy) ||
+      !isFiniteCoord(parsed.iz)
+    ) {
+      return null;
+    }
+    safePayload.pitId = pitId;
+    safePayload.shellId = shellId;
+    safePayload.callerId = String(parsed.callerId ?? 'ai_mortar').slice(0, 64);
+    safePayload.callerTeam = parsed.callerTeam === 'B' ? 'B' : 'A';
+    safePayload.isPlayerManned = Boolean(parsed.isPlayerManned);
+    safePayload.ox = Number(parsed.ox.toFixed(3));
+    safePayload.oy = Number(parsed.oy.toFixed(3));
+    safePayload.oz = Number(parsed.oz.toFixed(3));
+    safePayload.ix = Number(parsed.ix.toFixed(3));
+    safePayload.iy = Number(parsed.iy.toFixed(3));
+    safePayload.iz = Number(parsed.iz.toFixed(3));
+    safePayload.azimuthRad = Number(clampFinite(parsed.azimuthRad, -Math.PI * 4, Math.PI * 4, 0).toFixed(4));
+    safePayload.elevationRad = Number(
+      clampFinite(parsed.elevationRad, (45 * Math.PI) / 180, (80 * Math.PI) / 180, (65 * Math.PI) / 180).toFixed(4),
+    );
+    safePayload.chargeLevel = ch as 1 | 2 | 3 | 4;
+    safePayload.flightTimeSec = Number(clampFinite(parsed.flightTimeSec, 0.5, 45, 8).toFixed(3));
+  } else if (type === 'game:fire_support_sync') {
+    safePayload.enabled = Boolean(parsed.enabled);
+    const validStatuses = new Set(['INACTIVE', 'ACTIVE_AI', 'FIRE_MISSION', 'PLAYER_MANNED', 'KIA_REINFORCING']);
+    if (Array.isArray(parsed.pits)) {
+      // Hard entity cap: max 6 mortar pits per theater
+      safePayload.pits = parsed.pits.slice(0, 6).map((rawPit) => {
+        const p = (rawPit && typeof rawPit === 'object' ? rawPit : {}) as Record<string, unknown>;
+        const pos = isValidVec3(p.position)
+          ? [Number(p.position[0].toFixed(2)), Number(p.position[1].toFixed(2)), Number(p.position[2].toFixed(2))]
+          : [0, 0, 0];
+        const status = typeof p.status === 'string' && validStatuses.has(p.status) ? p.status : 'INACTIVE';
+        const ch = Math.floor(clampFinite(p.currentChargeLevel, 1, 4, 2));
+        return {
+          pitId: String(p.pitId ?? '').trim().slice(0, 48),
+          ownerTeam: p.ownerTeam === 'B' ? 'B' : 'A',
+          sourceType: p.sourceType === 'FOB' ? 'FOB' : 'HQ',
+          sourceId: String(p.sourceId ?? '').trim().slice(0, 48),
+          position: pos,
+          zeroBearingRad: Number(clampFinite(p.zeroBearingRad, -Math.PI * 4, Math.PI * 4, 0).toFixed(4)),
+          status,
+          seatedPlayerId: typeof p.seatedPlayerId === 'string' ? p.seatedPlayerId.slice(0, 64) : null,
+          seatedPlayerName: typeof p.seatedPlayerName === 'string' ? p.seatedPlayerName.slice(0, 48) : null,
+          seatedPlayerTeam: p.seatedPlayerTeam === 'A' || p.seatedPlayerTeam === 'B' ? p.seatedPlayerTeam : null,
+          gunnerAiHp: Math.round(clampFinite(p.gunnerAiHp, 0, 200, 0)),
+          loaderAiHp: Math.round(clampFinite(p.loaderAiHp, 0, 200, 0)),
+          respawnTimerSec: Number(clampFinite(p.respawnTimerSec, 0, 120, 0).toFixed(1)),
+          reloadProgress01: Number(clampFinite(p.reloadProgress01, 0, 1, 1).toFixed(2)),
+          currentAzimuthRad: Number(clampFinite(p.currentAzimuthRad, -Math.PI * 4, Math.PI * 4, 0).toFixed(4)),
+          currentElevationRad: Number(
+            clampFinite(p.currentElevationRad, (45 * Math.PI) / 180, (80 * Math.PI) / 180, (65 * Math.PI) / 180).toFixed(4),
+          ),
+          currentChargeLevel: (ch >= 1 && ch <= 4 ? ch : 2) as 1 | 2 | 3 | 4,
+          activeMissionId: typeof p.activeMissionId === 'string' ? p.activeMissionId.slice(0, 48) : null,
+        };
+      });
+    } else {
+      safePayload.pits = [];
     }
   }
 

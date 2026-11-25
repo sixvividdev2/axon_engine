@@ -69,6 +69,28 @@ export interface PdaVehicleMarker {
   owned?: boolean;
 }
 
+export interface PdaMortarFiringTableTelemetry {
+  pitId: string;
+  pitX: number;
+  pitZ: number;
+  currentDeflectionMils: number;
+  currentElevationMils: number;
+  currentElevationDeg: number;
+  currentChargeLevel: 1 | 2 | 3 | 4;
+  targetX: number;
+  targetZ: number;
+  targetRangeM: number;
+  recommendedCharge: 1 | 2 | 3 | 4 | null;
+  solutionDeflectionMils: number;
+  solutionElevationMils: number;
+  solutionElevationDeg: number;
+  solutionFlightTimeSec: number;
+  windLeadMils: number;
+  inRange: boolean;
+  foAddDropM: number;
+  foLeftRightM: number;
+}
+
 export interface PdaHudTelemetry {
   playerX: number;
   playerZ: number;
@@ -93,6 +115,7 @@ export interface PdaHudTelemetry {
   bankruptcyWarning?: boolean;
   bankruptcyText?: string;
   batteryPct?: number;
+  mortarTable?: PdaMortarFiringTableTelemetry | null;
 }
 
 export interface PdaOrthoCaptureOptions {
@@ -547,6 +570,17 @@ export class TacticalPdaDevice {
       };
     }
     return { u: this.panCenterU, v: this.panCenterV };
+  }
+
+  /** Converts current PDA center reticle UV back into world (x, z) meters for Mortar Ballistic Firing Table lookup. */
+  public getReticleWorldCoords(): { x: number; z: number } {
+    const uv = this.getPanCenterUV();
+    const spanX = Math.max(1, this.mapAspectBounds.maxX - this.mapAspectBounds.minX);
+    const spanZ = Math.max(1, this.mapAspectBounds.maxZ - this.mapAspectBounds.minZ);
+    return {
+      x: this.mapAspectBounds.minX + uv.u * spanX,
+      z: this.mapAspectBounds.minZ + uv.v * spanZ,
+    };
   }
 
   public isCenteredOnPlayer(): boolean {
@@ -1904,7 +1938,129 @@ export class TacticalPdaDevice {
       ctx.stroke();
     }
 
+    // 81mm Mortar Gun-Target Line & Target Crosshair when manning a mortar
+    const mt = this.telemetry.mortarTable;
+    if (mt) {
+      const pitUV = this.worldToMapUV(mt.pitX, mt.pitZ);
+      const tgtUV = this.worldToMapUV(mt.targetX, mt.targetZ);
+      const pitPt = uvToScreen(pitUV.u, pitUV.v);
+      const tgtPt = uvToScreen(tgtUV.u, tgtUV.v);
+
+      ctx.strokeStyle = mt.inRange ? 'rgba(245, 158, 11, 0.85)' : 'rgba(248, 113, 113, 0.78)';
+      ctx.lineWidth = 2;
+      ctx.setLineDash([7, 5]);
+      ctx.beginPath();
+      ctx.moveTo(pitPt.sx, pitPt.sy);
+      ctx.lineTo(tgtPt.sx, tgtPt.sy);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      // Target bracket crosshair
+      ctx.strokeStyle = mt.inRange ? '#fbbf24' : '#f87171';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(tgtPt.sx, tgtPt.sy, 11, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(tgtPt.sx - 16, tgtPt.sy);
+      ctx.lineTo(tgtPt.sx - 6, tgtPt.sy);
+      ctx.moveTo(tgtPt.sx + 6, tgtPt.sy);
+      ctx.lineTo(tgtPt.sx + 16, tgtPt.sy);
+      ctx.moveTo(tgtPt.sx, tgtPt.sy - 16);
+      ctx.lineTo(tgtPt.sx, tgtPt.sy - 6);
+      ctx.moveTo(tgtPt.sx, tgtPt.sy + 6);
+      ctx.lineTo(tgtPt.sx, tgtPt.sy + 16);
+      ctx.stroke();
+    }
+
     ctx.restore();
+
+    // 81mm Ballistic Firing Table Card (Top-Right of PDA Map Canvas when manning a mortar)
+    if (mt) {
+      const cardW = 310;
+      const cardH = 198;
+      const cardX = SCREEN_W - cardW - 14;
+      const cardY = mapTop + 14;
+
+      ctx.fillStyle = 'rgba(10, 16, 20, 0.93)';
+      ctx.fillRect(cardX, cardY, cardW, cardH);
+      ctx.strokeStyle = mt.inRange ? '#f59e0b' : '#f87171';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(cardX, cardY, cardW, cardH);
+
+      ctx.fillStyle = '#fbbf24';
+      ctx.font = 'bold 14px monospace';
+      ctx.textAlign = 'left';
+      ctx.fillText('81MM BALLISTIC FIRING TABLE', cardX + 12, cardY + 22);
+
+      ctx.fillStyle = '#94a3b8';
+      ctx.font = '12px monospace';
+      ctx.fillText(
+        `RNG ${Math.round(mt.targetRangeM)}m · WIND LEAD ${mt.windLeadMils >= 0 ? '+' : ''}${mt.windLeadMils} MIL`,
+        cardX + 12,
+        cardY + 42,
+      );
+
+      ctx.strokeStyle = 'rgba(148, 163, 184, 0.25)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(cardX + 10, cardY + 52);
+      ctx.lineTo(cardX + cardW - 10, cardY + 52);
+      ctx.stroke();
+
+      if (mt.inRange && mt.recommendedCharge) {
+        ctx.fillStyle = '#34d399';
+        ctx.font = 'bold 16px monospace';
+        ctx.fillText(
+          `CHG ${mt.recommendedCharge} · DEF ${String(mt.solutionDeflectionMils).padStart(4, '0')} MIL`,
+          cardX + 12,
+          cardY + 76,
+        );
+        ctx.fillStyle = '#38bdf8';
+        ctx.fillText(
+          `ELV ${String(mt.solutionElevationMils).padStart(4, '0')} MIL (${mt.solutionElevationDeg.toFixed(1)}°)`,
+          cardX + 12,
+          cardY + 100,
+        );
+        ctx.fillStyle = '#e2e8f0';
+        ctx.font = '13px monospace';
+        ctx.fillText(
+          `EST TOF ${mt.solutionFlightTimeSec.toFixed(1)}s`,
+          cardX + 12,
+          cardY + 122,
+        );
+      } else {
+        ctx.fillStyle = '#f87171';
+        ctx.font = 'bold 15px monospace';
+        ctx.fillText('TARGET OUT OF 81MM ARC', cardX + 12, cardY + 86);
+        ctx.fillStyle = '#cbd5e1';
+        ctx.font = '12px monospace';
+        ctx.fillText('PAN RETICLE 35m–700m FROM PIT', cardX + 12, cardY + 108);
+      }
+
+      ctx.strokeStyle = 'rgba(148, 163, 184, 0.25)';
+      ctx.beginPath();
+      ctx.moveTo(cardX + 10, cardY + 134);
+      ctx.lineTo(cardX + cardW - 10, cardY + 134);
+      ctx.stroke();
+
+      ctx.fillStyle = '#cbd5e1';
+      ctx.font = '12px monospace';
+      ctx.fillText(
+        `TUBE: CHG ${mt.currentChargeLevel} · DEF ${String(mt.currentDeflectionMils).padStart(4, '0')} · ELV ${mt.currentElevationDeg.toFixed(1)}°`,
+        cardX + 12,
+        cardY + 156,
+      );
+      ctx.fillStyle = '#94a3b8';
+      ctx.fillText(
+        `FO CORR: ADD/DRP ${mt.foAddDropM >= 0 ? '+' : ''}${mt.foAddDropM}m · L/R ${mt.foLeftRightM >= 0 ? '+' : ''}${mt.foLeftRightM}m`,
+        cardX + 12,
+        cardY + 176,
+      );
+      ctx.fillStyle = '#64748b';
+      ctx.font = '11px monospace';
+      ctx.fillText('PAN MAP TO COMPUTE TARGET SOLUTION', cardX + 12, cardY + 192);
+    }
 
     // Diegetic Perimeter Operations Bankruptcy Warning Banner (never conveyed by color alone)
     if (this.telemetry.bankruptcyWarning) {

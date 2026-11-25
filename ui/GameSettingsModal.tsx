@@ -18,6 +18,7 @@ import {
   useGraphicsQuality,
 } from '../data/graphicsQuality';
 import { useKillfeedPreference } from '../data/killfeedSettings';
+import { useHeadshotSfxPreference } from '../data/audioSettings';
 import { ControlsSettingsTab } from './ControlsSettingsTab';
 
 export const GameSettingsModal: React.FC = () => {
@@ -27,6 +28,7 @@ export const GameSettingsModal: React.FC = () => {
   const [adaptiveScaling, setAdaptiveScaling] = useAdaptiveScaling();
   const [distanceSettings, distanceActions] = useDistancePerformanceSettings();
   const [personalKillfeed, setPersonalKillfeed] = useKillfeedPreference();
+  const [headshotSfx, setHeadshotSfx] = useHeadshotSfxPreference();
 
   useEffect(() => {
     if (!open) return;
@@ -277,6 +279,28 @@ export const GameSettingsModal: React.FC = () => {
                     }`}
                   >
                     {personalKillfeed ? 'ON' : 'OFF'}
+                  </button>
+                </div>
+
+                <div className="mt-4 flex items-center justify-between gap-4 border-t border-neutral-800/80 pt-3.5">
+                  <div>
+                    <div className="text-xs font-medium text-neutral-200">
+                      Headshot Indicator SFX
+                    </div>
+                    <div className="text-[11px] text-neutral-400">
+                      Fleshy thud &amp; blood splat audio cue on headshots (10% quieter). Disabled by default for full immersion.
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setHeadshotSfx(!headshotSfx)}
+                    className={`cursor-pointer whitespace-nowrap shrink-0 border px-3.5 py-1.5 font-mono-tabular text-xs font-semibold uppercase transition-colors ${
+                      headshotSfx
+                        ? 'border-amber-400/80 bg-amber-950/50 text-amber-200'
+                        : 'border-neutral-700 bg-neutral-950 text-neutral-400 hover:text-neutral-200'
+                    }`}
+                  >
+                    {headshotSfx ? 'ON' : 'OFF'}
                   </button>
                 </div>
               </section>

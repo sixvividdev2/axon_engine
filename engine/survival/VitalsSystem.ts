@@ -50,12 +50,15 @@ export class VitalsSystem {
   public holdBreathActive = false;
   public holdBreathRemainingSec = HOLD_BREATH_MAX_SEC;
   public holdBreathReboundSec = 0;
+  /** Latches true when breath reserve depletes to 0%; clears ONLY once reserve fully recovers to 100%. */
+  public holdBreathDepletedLock = false;
 
   public heartRateBpm = 84;
   public heartStress = 0; // 0..1 normalized cardiovascular stress
 
   private holdBreathHeldDurationSec = 0;
   private holdBreathLockoutSec = 0;
+  private holdBreathReleaseDebounceSec = 0;
   private lowBreathPulseTimerSec = 0;
   private breathVignette = 0;
   private breathVignettePhase = 0;
@@ -73,10 +76,12 @@ export class VitalsSystem {
     this.holdBreathActive = false;
     this.holdBreathRemainingSec = HOLD_BREATH_MAX_SEC;
     this.holdBreathReboundSec = 0;
+    this.holdBreathDepletedLock = false;
     this.heartRateBpm = 84;
     this.heartStress = 0;
     this.holdBreathHeldDurationSec = 0;
     this.holdBreathLockoutSec = 0;
+    this.holdBreathReleaseDebounceSec = 0;
     this.lowBreathPulseTimerSec = 0;
     this.breathVignette = 0;
     this.breathVignettePhase = 0;
@@ -140,9 +145,12 @@ export class VitalsSystem {
     this.hunger = Math.max(0, this.hunger - hungerRate * delta);
     this.hydration = Math.max(0, this.hydration - hydrationRate * delta);
 
-    // 2. Hold-Breath across all aim stances (Primary ADS, Canted, Point Aim — up to 7.0s, 3.0s depletion cooldown)
+    // 2. Hold-Breath across all aim stances (full recovery lockout on depletion + 0.65s release debounce)
     if (this.holdBreathLockoutSec > 0) {
       this.holdBreathLockoutSec = Math.max(0, this.holdBreathLockoutSec - delta);
+    }
+    if (this.holdBreathReleaseDebounceSec > 0) {
+      this.holdBreathReleaseDebounceSec = Math.max(0, this.holdBreathReleaseDebounceSec - delta);
     }
     if (this.holdBreathReboundSec > 0) {
       this.holdBreathReboundSec = Math.max(0, this.holdBreathReboundSec - delta);
@@ -162,6 +170,8 @@ export class VitalsSystem {
       opts.isAds &&
       opts.wantsHoldBreath &&
       !opts.isSprinting &&
+      !this.holdBreathDepletedLock &&
+      (this.holdBreathActive || this.holdBreathReleaseDebounceSec <= 0) &&
       this.holdBreathLockoutSec <= 0 &&
       hasReserve &&
       opts.stamina >= 0.20;
@@ -187,8 +197,9 @@ export class VitalsSystem {
       }
 
       if (this.holdBreathRemainingSec <= 0.001) {
-        // Depleted full 7.0s breath hold -> sharp gasp + exertion rebound + 3.0s cooldown lockout
+        // Depleted full 7.0s breath hold -> sharp gasp + full recovery lockout until lung reserve hits 100%
         this.holdBreathActive = false;
+        this.holdBreathDepletedLock = true;
         this.holdBreathLockoutSec = HOLD_BREATH_COOLDOWN_SEC;
         this.holdBreathReboundSec = HOLD_BREATH_REBOUND_DURATION_SEC;
         exertionReboundImpulse = 0.32;
@@ -198,8 +209,9 @@ export class VitalsSystem {
       }
     } else {
       if (this.holdBreathActive) {
-        // Released early -> soft exhale + mild proportional rebound if held >= 0.35s
+        // Released early -> soft exhale + 0.65s anti-spam debounce + proportional rebound if held >= 0.35s
         this.holdBreathActive = false;
+        this.holdBreathReleaseDebounceSec = 0.65;
         if (this.holdBreathHeldDurationSec >= 0.35) {
           const frac = THREE.MathUtils.clamp(this.holdBreathHeldDurationSec / HOLD_BREATH_MAX_SEC, 0.15, 1.0);
           this.holdBreathReboundSec = HOLD_BREATH_REBOUND_DURATION_SEC * (0.35 + 0.65 * frac);
@@ -210,13 +222,17 @@ export class VitalsSystem {
         this.holdBreathHeldDurationSec = 0;
       }
 
-      // Recover breath reserve smoothly (slower during post-depletion cooldown, faster once breathing stabilizes)
-      const baseRate = this.holdBreathLockoutSec > 0 ? 0.52 : 0.92;
+      // Recover breath reserve smoothly (slower during post-depletion recovery until full catch-up)
+      const baseRate = this.holdBreathDepletedLock || this.holdBreathLockoutSec > 0 ? 0.52 : 0.92;
       const recoveryRate = (baseRate + 0.38 * opts.stamina) * (this.hydration < 25 ? 0.72 : 1.0);
       this.holdBreathRemainingSec = Math.min(
         HOLD_BREATH_MAX_SEC,
         this.holdBreathRemainingSec + recoveryRate * delta,
       );
+      if (this.holdBreathDepletedLock && this.holdBreathRemainingSec >= HOLD_BREATH_MAX_SEC - 0.001) {
+        this.holdBreathRemainingSec = HOLD_BREATH_MAX_SEC;
+        this.holdBreathDepletedLock = false;
+      }
     }
 
     // Subtle diegetic edge vignette (focus darkening -> low-O2 gentle edge pulse -> cooldown taper)
@@ -227,8 +243,10 @@ export class VitalsSystem {
       const lowUrgency = reserveFrac < 0.35 ? THREE.MathUtils.clamp((0.35 - reserveFrac) / 0.35, 0, 1) : 0;
       const lowPulse = lowUrgency * (0.28 + 0.24 * (0.5 + 0.5 * Math.sin(this.breathVignettePhase * 7.2)));
       targetBreathVignette = THREE.MathUtils.clamp(0.38 + lowPulse, 0, 0.92);
-    } else if (this.holdBreathLockoutSec > 0) {
-      const cdFrac = this.holdBreathLockoutSec / HOLD_BREATH_COOLDOWN_SEC;
+    } else if (this.holdBreathLockoutSec > 0 || this.holdBreathDepletedLock) {
+      const cdFrac = this.holdBreathLockoutSec > 0
+        ? this.holdBreathLockoutSec / HOLD_BREATH_COOLDOWN_SEC
+        : Math.max(0, 1 - this.holdBreathRemainingSec / HOLD_BREATH_MAX_SEC) * 0.45;
       targetBreathVignette = cdFrac * (0.22 + 0.16 * (0.5 + 0.5 * Math.sin(this.breathVignettePhase * 5.6)));
     }
     this.breathVignette = THREE.MathUtils.damp(this.breathVignette, targetBreathVignette, 7.0, delta);

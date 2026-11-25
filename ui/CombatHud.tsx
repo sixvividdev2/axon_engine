@@ -35,6 +35,7 @@ import {
 import { ControlsSettingsTab } from './ControlsSettingsTab';
 import { HeartRateIndicator } from './HeartRateIndicator';
 import { KillfeedOverlay } from './KillfeedOverlay';
+import { MortarSightOverlay } from './MortarSightOverlay';
 
 const HUD_SLIDE_TRANSITION = { duration: 0.26, ease: [0.22, 1, 0.36, 1] as const };
 const MODAL_TRANSITION = { duration: 0.22, ease: [0.22, 1, 0.36, 1] as const };
@@ -1089,82 +1090,6 @@ export const CombatHud: React.FC<CombatHudProps> = ({
             )}
           </AnimatePresence>
 
-          {/* Center-Bottom [F] Interact / Hold [F] Barrier Repair Prompt */}
-          <AnimatePresence>
-            {showMatchHud && snapshot.pointerLocked && snapshot.nearbyPrompt && (
-              <div className="fixed bottom-24 left-1/2 min-w-[260px] -translate-x-1/2">
-                <motion.div
-                  key="hud-infection-prompt"
-                  initial={{ opacity: 0, y: 14 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={{ opacity: 0, y: 14 }}
-                  transition={HUD_SLIDE_TRANSITION}
-                  className="border border-neutral-700 bg-neutral-950/92 px-4 py-2 text-center font-mono-tabular text-xs"
-                >
-                  <div className="flex items-center justify-center gap-2 font-semibold uppercase tracking-wider text-neutral-50">
-                    <span>
-                      {snapshot.nearbyPrompt.isHoldAction ? 'HOLD [F]' : '[F]'}{' '}
-                      {snapshot.nearbyPrompt.actionText}
-                    </span>
-                    {snapshot.nearbyPrompt.cost > 0 && (
-                      <span
-                        className={
-                          snapshot.nearbyPrompt.canAfford ? 'text-amber-300' : 'text-red-400'
-                        }
-                      >
-                        {snapshot.nearbyPrompt.cost} PTS
-                      </span>
-                    )}
-                  </div>
-                  {snapshot.nearbyPrompt.isHoldAction &&
-                    typeof snapshot.nearbyPrompt.planksRemaining === 'number' &&
-                    typeof snapshot.nearbyPrompt.maxPlanks === 'number' && (
-                      <div className="mt-1.5 flex flex-col gap-1">
-                        <div className="flex items-center justify-between text-[10px] uppercase tracking-wider text-neutral-300">
-                          <span>
-                            Planks: {snapshot.nearbyPrompt.planksRemaining} /{' '}
-                            {snapshot.nearbyPrompt.maxPlanks}
-                          </span>
-                          <span className="text-amber-300">+5 PTS / Plank</span>
-                        </div>
-                        <div className="h-1.5 w-full overflow-hidden bg-neutral-800">
-                          <div
-                            className="h-full bg-amber-400 transition-all duration-75"
-                            style={{
-                              width: `${Math.min(
-                                100,
-                                Math.round((snapshot.nearbyPrompt.holdProgress ?? 0) * 100),
-                              )}%`,
-                            }}
-                          />
-                        </div>
-                      </div>
-                    )}
-                  {snapshot.nearbyPrompt.isHoldAction &&
-                    typeof snapshot.nearbyPrompt.planksRemaining !== 'number' &&
-                    (snapshot.nearbyPrompt.holdProgress ?? 0) > 0 && (
-                      <div className="mt-1.5 h-1.5 w-full overflow-hidden bg-neutral-800">
-                        <div
-                          className="h-full bg-amber-400 transition-all duration-75"
-                          style={{
-                            width: `${Math.min(
-                              100,
-                              Math.round((snapshot.nearbyPrompt.holdProgress ?? 0) * 100),
-                            )}%`,
-                          }}
-                        />
-                      </div>
-                    )}
-                  {snapshot.nearbyPrompt.blockedReason && (
-                    <div className="mt-0.5 text-[10px] uppercase tracking-wider text-red-400">
-                      {snapshot.nearbyPrompt.blockedReason}
-                    </div>
-                  )}
-                </motion.div>
-              </div>
-            )}
-          </AnimatePresence>
-
           {/* Points Counter & Floating +PTS Popups (Bottom-Right above Weapon Block) */}
           <AnimatePresence>
             {showMatchHud && (
@@ -1197,6 +1122,87 @@ export const CombatHud: React.FC<CombatHudProps> = ({
             )}
           </AnimatePresence>
         </>
+      )}
+
+      {/* Center-Bottom Unified [F] Interact / Hold [F] Repair / [F] Man Mortar Prompt (All Modes) */}
+      <AnimatePresence>
+        {showMatchHud && snapshot.pointerLocked && snapshot.nearbyPrompt && (
+          <div className="fixed bottom-24 left-1/2 min-w-[260px] -translate-x-1/2">
+            <motion.div
+              key="hud-interact-prompt"
+              initial={{ opacity: 0, y: 14 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: 14 }}
+              transition={HUD_SLIDE_TRANSITION}
+              className="border border-neutral-700 bg-neutral-950/92 px-4 py-2 text-center font-mono-tabular text-xs"
+            >
+              <div className="flex items-center justify-center gap-2 font-semibold uppercase tracking-wider text-neutral-50">
+                <span>
+                  {snapshot.nearbyPrompt.isHoldAction ? 'HOLD [F]' : '[F]'}{' '}
+                  {snapshot.nearbyPrompt.actionText}
+                </span>
+                {snapshot.nearbyPrompt.cost > 0 && (
+                  <span
+                    className={
+                      snapshot.nearbyPrompt.canAfford ? 'text-amber-300' : 'text-red-400'
+                    }
+                  >
+                    {snapshot.nearbyPrompt.cost} PTS
+                  </span>
+                )}
+              </div>
+              {snapshot.nearbyPrompt.isHoldAction &&
+                typeof snapshot.nearbyPrompt.planksRemaining === 'number' &&
+                typeof snapshot.nearbyPrompt.maxPlanks === 'number' && (
+                  <div className="mt-1.5 flex flex-col gap-1">
+                    <div className="flex items-center justify-between text-[10px] uppercase tracking-wider text-neutral-300">
+                      <span>
+                        Planks: {snapshot.nearbyPrompt.planksRemaining} /{' '}
+                        {snapshot.nearbyPrompt.maxPlanks}
+                      </span>
+                      <span className="text-amber-300">+5 PTS / Plank</span>
+                    </div>
+                    <div className="h-1.5 w-full overflow-hidden bg-neutral-800">
+                      <div
+                        className="h-full bg-amber-400 transition-all duration-75"
+                        style={{
+                          width: `${Math.min(
+                            100,
+                            Math.round((snapshot.nearbyPrompt.holdProgress ?? 0) * 100),
+                          )}%`,
+                        }}
+                      />
+                    </div>
+                  </div>
+                )}
+              {snapshot.nearbyPrompt.isHoldAction &&
+                typeof snapshot.nearbyPrompt.planksRemaining !== 'number' &&
+                (snapshot.nearbyPrompt.holdProgress ?? 0) > 0 && (
+                  <div className="mt-1.5 h-1.5 w-full overflow-hidden bg-neutral-800">
+                    <div
+                      className="h-full bg-amber-400 transition-all duration-75"
+                      style={{
+                        width: `${Math.min(
+                          100,
+                          Math.round((snapshot.nearbyPrompt.holdProgress ?? 0) * 100),
+                        )}%`,
+                      }}
+                    />
+                  </div>
+                )}
+              {snapshot.nearbyPrompt.blockedReason && (
+                <div className="mt-0.5 text-[10px] uppercase tracking-wider text-red-400">
+                  {snapshot.nearbyPrompt.blockedReason}
+                </div>
+              )}
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* Conquest 81mm Mortar Diegetic Optical Collimator Eyepiece & Instrument Strip */}
+      {snapshot.playerAlive && snapshot.pointerLocked && snapshot.mortarHud && (
+        <MortarSightOverlay mortar={snapshot.mortarHud} pdaOpen={snapshot.isPdaOpen} />
       )}
 
       {/* Subtle Center Hitmarker Ticks (Crosshair Hit Confirmation; Host-controllable in Battle) */}

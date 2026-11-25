@@ -8,10 +8,171 @@ import {
   IBodycamAudioSource,
 } from './IBodycamAudioSource';
 import { BodycamMeleeAttackType, BodycamSurfaceMaterial } from './types';
+import { isHeadshotSfxEnabled } from '../data/audioSettings';
 
 export const SPEED_OF_SOUND_MPS = 343;
 export const OPEN_WORLD_SHARP_GUNSHOT_RANGE_M = 300;
 export const OPEN_WORLD_MAX_GUNSHOT_RANGE_M = 650;
+export const FIRE_SUPPORT_MAX_VOICES = 12;
+export const FIRE_SUPPORT_CULL_RADIUS_M = 350;
+
+export type FireSupportVoicePriority = 0 | 1 | 2;
+
+export interface FireSupportVoiceEntry {
+  id: number;
+  priority: FireSupportVoicePriority;
+  startedAtSec: number;
+  expiresAtSec: number;
+  stop: () => void;
+}
+
+/**
+ * 12-Voice Priority-Stealing Audio Pool for Conquest Fire Support (Mortars & Staged Bombers):
+ *  - P0 (Protected): Inbound Bomber Doppler flyby & active Player Mortar firing/sight/bore-drop cues.
+ *  - P1: Mortar detonation shockwaves & incoming whistles within 60m.
+ *  - P2: Distant whistles (> 60m) and distant AI mortar firing thumps (evicted oldest-first).
+ */
+export class FireSupportVoicePool {
+  private readonly maxVoices: number;
+  private readonly cullRadiusM: number;
+  private voices: FireSupportVoiceEntry[] = [];
+  private nextId = 1;
+  private evictedCount = 0;
+  private rejectedCount = 0;
+
+  constructor(maxVoices = FIRE_SUPPORT_MAX_VOICES, cullRadiusM = FIRE_SUPPORT_CULL_RADIUS_M) {
+    this.maxVoices = maxVoices;
+    this.cullRadiusM = cullRadiusM;
+  }
+
+  public prune(nowSec: number): void {
+    if (this.voices.length === 0) return;
+    let write = 0;
+    for (let i = 0; i < this.voices.length; i++) {
+      const v = this.voices[i];
+      if (v.expiresAtSec > nowSec) {
+        this.voices[write++] = v;
+      }
+    }
+    this.voices.length = write;
+  }
+
+  public acquire(
+    priority: FireSupportVoicePriority,
+    distanceM: number,
+    nowSec: number,
+    durationSec: number,
+    stop: () => void,
+  ): number | null {
+    if (distanceM > this.cullRadiusM) {
+      this.rejectedCount++;
+      return null;
+    }
+    this.prune(nowSec);
+
+    if (this.voices.length >= this.maxVoices) {
+      // Steal lowest-priority (highest numeric value), oldest voice first; never evict P0 for P1/P2
+      let victimIdx = -1;
+      let victimPriority = -1;
+      let victimStartedAt = Infinity;
+
+      for (let i = 0; i < this.voices.length; i++) {
+        const v = this.voices[i];
+        // P0 is strictly protected against P1/P2 stealing
+        if (v.priority === 0 && priority > 0) continue;
+        // Lower-priority callers cannot steal higher-priority active voices
+        if (v.priority < priority) continue;
+        if (
+          v.priority > victimPriority ||
+          (v.priority === victimPriority && v.startedAtSec < victimStartedAt)
+        ) {
+          victimPriority = v.priority;
+          victimStartedAt = v.startedAtSec;
+          victimIdx = i;
+        }
+      }
+
+      if (victimIdx < 0) {
+        this.rejectedCount++;
+        return null;
+      }
+
+      const victim = this.voices[victimIdx];
+      this.voices.splice(victimIdx, 1);
+      this.evictedCount++;
+      try {
+        victim.stop();
+      } catch {
+        // Ignore already-stopped node errors
+      }
+    }
+
+    const id = this.nextId++;
+    this.voices.push({
+      id,
+      priority,
+      startedAtSec: nowSec,
+      expiresAtSec: nowSec + Math.max(0.05, durationSec),
+      stop,
+    });
+    return id;
+  }
+
+  public release(id: number): void {
+    const idx = this.voices.findIndex((v) => v.id === id);
+    if (idx >= 0) {
+      this.voices.splice(idx, 1);
+    }
+  }
+
+  public getActiveCount(nowSec?: number): number {
+    if (nowSec !== undefined) this.prune(nowSec);
+    return this.voices.length;
+  }
+
+  public getStats(nowSec?: number): {
+    active: number;
+    maxVoices: number;
+    cullRadiusM: number;
+    evictedCount: number;
+    rejectedCount: number;
+    p0Active: number;
+    p1Active: number;
+    p2Active: number;
+  } {
+    if (nowSec !== undefined) this.prune(nowSec);
+    let p0Active = 0;
+    let p1Active = 0;
+    let p2Active = 0;
+    for (let i = 0; i < this.voices.length; i++) {
+      const p = this.voices[i].priority;
+      if (p === 0) p0Active++;
+      else if (p === 1) p1Active++;
+      else p2Active++;
+    }
+    return {
+      active: this.voices.length,
+      maxVoices: this.maxVoices,
+      cullRadiusM: this.cullRadiusM,
+      evictedCount: this.evictedCount,
+      rejectedCount: this.rejectedCount,
+      p0Active,
+      p1Active,
+      p2Active,
+    };
+  }
+
+  public clear(): void {
+    for (let i = 0; i < this.voices.length; i++) {
+      try {
+        this.voices[i].stop();
+      } catch {
+        // already stopped
+      }
+    }
+    this.voices.length = 0;
+  }
+}
 
 export interface BallisticFlybyClassification {
   isSupersonic: boolean;
@@ -234,6 +395,10 @@ export class BodycamAudio implements IBodycamAudioSource {
   private activeZombieSteps = 0;
   private activeFlybyVoices = 0;
   private activeDistantGunshots = 0;
+  private readonly fireSupportPool = new FireSupportVoicePool(
+    FIRE_SUPPORT_MAX_VOICES,
+    FIRE_SUPPORT_CULL_RADIUS_M,
+  );
 
   public ensureInitialized(): void {
     if (this.initialized) {
@@ -3569,7 +3734,577 @@ export class BodycamAudio implements IBodycamAudioSource {
     };
   }
 
+  /**
+   * Opt-in realistic Headshot Indicator SFX: quick fleshy impact thud + wet blood splat,
+   * mixed 10% quieter (0.9x) than standard impact cues. Disabled by default for full immersion.
+   */
+  public playHeadshotIndicator(force = false): void {
+    if (!force && !isHeadshotSfxEnabled()) return;
+    this.ensureInitialized();
+    if (!this.ctx || !this.dryBus || !this.noiseBuffer) return;
+    const ctx = this.ctx;
+    const t = ctx.currentTime;
+    const level = 0.9; // 10% quieter mix for non-intrusive realism
+
+    // 1. Quick low-passed fleshy skull/tissue thud (155Hz -> 48Hz over 55ms)
+    const thudOsc = ctx.createOscillator();
+    thudOsc.type = 'triangle';
+    thudOsc.frequency.setValueAtTime(158, t);
+    thudOsc.frequency.exponentialRampToValueAtTime(48, t + 0.055);
+
+    const thudLp = ctx.createBiquadFilter();
+    thudLp.type = 'lowpass';
+    thudLp.frequency.setValueAtTime(420, t);
+
+    const thudGain = ctx.createGain();
+    thudGain.gain.setValueAtTime(0.001, t);
+    thudGain.gain.linearRampToValueAtTime(0.32 * level, t + 0.005);
+    thudGain.gain.exponentialRampToValueAtTime(0.001, t + 0.068);
+
+    thudOsc.connect(thudLp);
+    thudLp.connect(thudGain);
+    thudGain.connect(this.dryBus);
+    thudOsc.start(t);
+    thudOsc.stop(t + 0.075);
+
+    // 2. Wet blood splat / tissue burst (dual resonant bandpass noise bursts)
+    const splatA = ctx.createBufferSource();
+    splatA.buffer = this.noiseBuffer;
+    const bpA = ctx.createBiquadFilter();
+    bpA.type = 'bandpass';
+    bpA.frequency.setValueAtTime(1180, t + 0.006);
+    bpA.frequency.exponentialRampToValueAtTime(520, t + 0.088);
+    bpA.Q.value = 2.6;
+    const gA = ctx.createGain();
+    gA.gain.setValueAtTime(0.001, t + 0.006);
+    gA.gain.linearRampToValueAtTime(0.24 * level, t + 0.015);
+    gA.gain.exponentialRampToValueAtTime(0.001, t + 0.095);
+    splatA.connect(bpA);
+    bpA.connect(gA);
+    gA.connect(this.dryBus);
+    splatA.start(t + 0.006, Math.random() * 0.7, 0.105);
+
+    const splatB = ctx.createBufferSource();
+    splatB.buffer = this.noiseBuffer;
+    const bpB = ctx.createBiquadFilter();
+    bpB.type = 'bandpass';
+    bpB.frequency.setValueAtTime(2550, t + 0.018);
+    bpB.frequency.exponentialRampToValueAtTime(1240, t + 0.085);
+    bpB.Q.value = 3.2;
+    const gB = ctx.createGain();
+    gB.gain.setValueAtTime(0.001, t + 0.018);
+    gB.gain.linearRampToValueAtTime(0.14 * level, t + 0.026);
+    gB.gain.exponentialRampToValueAtTime(0.001, t + 0.092);
+    splatB.connect(bpB);
+    bpB.connect(gB);
+    gB.connect(this.dryBus);
+    splatB.start(t + 0.018, Math.random() * 0.7, 0.095);
+  }
+
+  public getFireSupportActiveVoiceCount(): number {
+    return this.fireSupportPool.getActiveCount(this.ctx?.currentTime);
+  }
+
+  public getFireSupportVoicePoolStats() {
+    return this.fireSupportPool.getStats(this.ctx?.currentTime);
+  }
+
+  /** P0: Tactile mechanical detent click when turning mortar traversing/elevating handwheels */
+  public playMortarHandwheelClick(fine = false): void {
+    this.ensureInitialized();
+    if (!this.ctx || !this.dryBus) return;
+    const ctx = this.ctx;
+    const t = ctx.currentTime;
+    const osc = ctx.createOscillator();
+    osc.type = 'triangle';
+    const f0 = fine ? 1720 : 1280;
+    osc.frequency.setValueAtTime(f0, t);
+    osc.frequency.exponentialRampToValueAtTime(340, t + 0.018);
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.001, t);
+    g.gain.linearRampToValueAtTime(fine ? 0.065 : 0.095, t + 0.003);
+    g.gain.exponentialRampToValueAtTime(0.001, t + 0.024);
+    osc.connect(g);
+    g.connect(this.dryBus);
+    osc.start(t);
+    osc.stop(t + 0.028);
+  }
+
+  /** P0: Propellant augmenting ring strap/clip click when switching Charges 1-4 */
+  public playMortarChargeClick(chargeLevel: number): void {
+    this.ensureInitialized();
+    if (!this.ctx || !this.dryBus) return;
+    const ctx = this.ctx;
+    const t = ctx.currentTime;
+    const pitch = 780 + Math.max(1, Math.min(4, chargeLevel)) * 135;
+    const osc = ctx.createOscillator();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(pitch, t);
+    osc.frequency.exponentialRampToValueAtTime(pitch * 0.45, t + 0.032);
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.001, t);
+    g.gain.linearRampToValueAtTime(0.11, t + 0.004);
+    g.gain.exponentialRampToValueAtTime(0.001, t + 0.038);
+    osc.connect(g);
+    g.connect(this.dryBus);
+    osc.start(t);
+    osc.stop(t + 0.045);
+  }
+
+  /** P0: Metallic finned shell sliding down the 81mm bore tube and striking the fixed firing pin */
+  public playMortarShellDrop(position: Readonly<THREE.Vector3>): void {
+    this.ensureInitialized();
+    if (!this.ctx || !this.dryBus || !this.noiseBuffer) return;
+    const ctx = this.ctx;
+    const t = ctx.currentTime;
+    const dist = this.listenerPos.distanceTo(position);
+    const nodes: AudioScheduledSourceNode[] = [];
+    const panner = this.createHRTFPanner(position, 3.0, 65);
+    const voiceId = this.fireSupportPool.acquire(0, dist, t, 0.36, () => {
+      nodes.forEach((n) => {
+        try {
+          n.stop();
+        } catch {
+          // stopped
+        }
+      });
+      try {
+        panner?.disconnect();
+      } catch {
+        // disconnected
+      }
+    });
+    if (voiceId === null) {
+      try {
+        panner?.disconnect();
+      } catch {
+        // unused
+      }
+      return;
+    }
+
+    const dest: AudioNode = panner ?? this.dryBus;
+    if (panner) this.connectToOutputBuses(panner, false);
+
+    // Metallic bore slide scrape
+    const scrape = ctx.createBufferSource();
+    scrape.buffer = this.noiseBuffer;
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.setValueAtTime(1650, t);
+    bp.frequency.exponentialRampToValueAtTime(840, t + 0.22);
+    bp.Q.value = 4.5;
+    const sg = ctx.createGain();
+    sg.gain.setValueAtTime(0.001, t);
+    sg.gain.linearRampToValueAtTime(0.16, t + 0.03);
+    sg.gain.exponentialRampToValueAtTime(0.001, t + 0.24);
+    scrape.connect(bp);
+    bp.connect(sg);
+    sg.connect(dest);
+    scrape.start(t, Math.random() * 0.5, 0.26);
+    nodes.push(scrape);
+
+    // Firing pin clink at bottom of tube
+    const ping = ctx.createOscillator();
+    ping.type = 'triangle';
+    ping.frequency.setValueAtTime(2150, t + 0.23);
+    ping.frequency.exponentialRampToValueAtTime(920, t + 0.28);
+    const pg = ctx.createGain();
+    pg.gain.setValueAtTime(0.001, t + 0.23);
+    pg.gain.linearRampToValueAtTime(0.22, t + 0.235);
+    pg.gain.exponentialRampToValueAtTime(0.001, t + 0.31);
+    ping.connect(pg);
+    pg.connect(dest);
+    ping.start(t + 0.23);
+    ping.stop(t + 0.32);
+    nodes.push(ping);
+
+    ping.onended = () => {
+      this.fireSupportPool.release(voiceId);
+      try {
+        panner?.disconnect();
+      } catch {
+        // disconnected
+      }
+    };
+  }
+
+  /**
+   * 81mm Mortar tube launch: iconic hollow metallic "THOOMP" resonance + propellant gas blast.
+   * Priority: P0 when player-manned (protected), P2 when distant AI firing.
+   */
+  public playMortarLaunch(position: Readonly<THREE.Vector3>, isPlayerManned: boolean): void {
+    this.ensureInitialized();
+    if (!this.ctx || !this.dryBus || !this.noiseBuffer) return;
+    const ctx = this.ctx;
+    const dist = this.listenerPos.distanceTo(position);
+    const delaySec = isPlayerManned ? 0 : Math.min(1.05, Math.max(0, (dist - 18) / SPEED_OF_SOUND_MPS));
+    const t = ctx.currentTime + delaySec;
+    const priority: FireSupportVoicePriority = isPlayerManned ? 0 : dist <= 60 ? 1 : 2;
+    const nodes: AudioScheduledSourceNode[] = [];
+    const panner = this.createHRTFPanner(position, 9.0, FIRE_SUPPORT_CULL_RADIUS_M);
+
+    const voiceId = this.fireSupportPool.acquire(priority, dist, ctx.currentTime, delaySec + 0.85, () => {
+      nodes.forEach((n) => {
+        try {
+          n.stop();
+        } catch {
+          // stopped
+        }
+      });
+      try {
+        panner?.disconnect();
+      } catch {
+        // disconnected
+      }
+    });
+    if (voiceId === null) {
+      try {
+        panner?.disconnect();
+      } catch {
+        // unused
+      }
+      return;
+    }
+
+    const dest: AudioNode = panner ?? this.dryBus;
+    if (panner) this.connectToOutputBuses(panner, true);
+
+    const distScale = THREE.MathUtils.clamp(1 - dist / FIRE_SUPPORT_CULL_RADIUS_M, 0.14, 1.0);
+    if (dist < 45) this.duckAmbientWind(0.65, 0.008);
+
+    // 1. Hollow steel mortar tube resonance ("THOOMP" 215Hz -> 76Hz)
+    const tube = ctx.createOscillator();
+    tube.type = 'sine';
+    tube.frequency.setValueAtTime(225, t);
+    tube.frequency.exponentialRampToValueAtTime(74, t + 0.19);
+    const tubeGain = ctx.createGain();
+    tubeGain.gain.setValueAtTime(0.001, t);
+    tubeGain.gain.linearRampToValueAtTime(0.88 * distScale, t + 0.008);
+    tubeGain.gain.exponentialRampToValueAtTime(0.001, t + 0.38);
+    tube.connect(tubeGain);
+    tubeGain.connect(dest);
+    tube.start(t);
+    tube.stop(t + 0.42);
+    nodes.push(tube);
+
+    // 2. Metallic tube ring harmonic
+    const ring = ctx.createOscillator();
+    ring.type = 'triangle';
+    ring.frequency.setValueAtTime(490, t);
+    ring.frequency.exponentialRampToValueAtTime(260, t + 0.16);
+    const ringGain = ctx.createGain();
+    ringGain.gain.setValueAtTime(0.24 * distScale, t);
+    ringGain.gain.exponentialRampToValueAtTime(0.001, t + 0.22);
+    ring.connect(ringGain);
+    ringGain.connect(dest);
+    ring.start(t);
+    ring.stop(t + 0.24);
+    nodes.push(ring);
+
+    // 3. Muzzle propellant burst (air-absorbed by distance)
+    const burst = ctx.createBufferSource();
+    burst.buffer = this.noiseBuffer;
+    const lp = ctx.createBiquadFilter();
+    lp.type = 'lowpass';
+    lp.frequency.setValueAtTime(THREE.MathUtils.lerp(750, 3200, distScale), t);
+    lp.frequency.exponentialRampToValueAtTime(220, t + 0.48);
+    const bg = ctx.createGain();
+    bg.gain.setValueAtTime(0.001, t);
+    bg.gain.linearRampToValueAtTime(0.68 * distScale, t + 0.01);
+    bg.gain.exponentialRampToValueAtTime(0.001, t + 0.62);
+    burst.connect(lp);
+    lp.connect(bg);
+    bg.connect(dest);
+    burst.start(t, Math.random() * 0.4, 0.68);
+    nodes.push(burst);
+
+    burst.onended = () => {
+      this.fireSupportPool.release(voiceId);
+      try {
+        panner?.disconnect();
+      } catch {
+        // disconnected
+      }
+    };
+  }
+
+  /**
+   * Incoming 81mm mortar whistle descending toward impact point.
+   * Priority: P1 within 60m, P2 beyond 60m (culled > 350m).
+   */
+  public playMortarWhistle(impactPos: Readonly<THREE.Vector3>, durationSec = 1.45): void {
+    this.ensureInitialized();
+    if (!this.ctx || !this.dryBus || !this.noiseBuffer) return;
+    const ctx = this.ctx;
+    const t = ctx.currentTime;
+    const dist = this.listenerPos.distanceTo(impactPos);
+    const dur = THREE.MathUtils.clamp(durationSec, 0.45, 2.2);
+    const priority: FireSupportVoicePriority = dist <= 60 ? 1 : 2;
+    const nodes: AudioScheduledSourceNode[] = [];
+    const panner = this.createHRTFPanner(impactPos, 8.0, FIRE_SUPPORT_CULL_RADIUS_M);
+
+    const voiceId = this.fireSupportPool.acquire(priority, dist, t, dur + 0.1, () => {
+      nodes.forEach((n) => {
+        try {
+          n.stop();
+        } catch {
+          // stopped
+        }
+      });
+      try {
+        panner?.disconnect();
+      } catch {
+        // disconnected
+      }
+    });
+    if (voiceId === null) {
+      try {
+        panner?.disconnect();
+      } catch {
+        // unused
+      }
+      return;
+    }
+
+    const dest: AudioNode = panner ?? this.dryBus;
+    if (panner) this.connectToOutputBuses(panner, true);
+
+    const prox = THREE.MathUtils.clamp(1 - dist / FIRE_SUPPORT_CULL_RADIUS_M, 0.12, 1.0);
+
+    // Fin-stabilized aerodynamic scream (high-Q filtered air + descending Doppler whistle)
+    const air = ctx.createBufferSource();
+    air.buffer = this.noiseBuffer;
+    air.loop = true;
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.setValueAtTime(1680, t);
+    bp.frequency.exponentialRampToValueAtTime(540, t + dur);
+    bp.Q.value = 6.5;
+
+    const ag = ctx.createGain();
+    ag.gain.setValueAtTime(0.001, t);
+    ag.gain.exponentialRampToValueAtTime(0.42 * prox, t + dur * 0.88);
+    ag.gain.linearRampToValueAtTime(0.001, t + dur);
+
+    air.connect(bp);
+    bp.connect(ag);
+    ag.connect(dest);
+    air.start(t);
+    air.stop(t + dur + 0.02);
+    nodes.push(air);
+
+    const whistle = ctx.createOscillator();
+    whistle.type = 'sine';
+    whistle.frequency.setValueAtTime(1280, t);
+    whistle.frequency.exponentialRampToValueAtTime(420, t + dur);
+    const wg = ctx.createGain();
+    wg.gain.setValueAtTime(0.001, t);
+    wg.gain.exponentialRampToValueAtTime(0.11 * prox, t + dur * 0.85);
+    wg.gain.linearRampToValueAtTime(0.001, t + dur);
+    whistle.connect(wg);
+    wg.connect(dest);
+    whistle.start(t);
+    whistle.stop(t + dur + 0.02);
+    nodes.push(whistle);
+
+    whistle.onended = () => {
+      this.fireSupportPool.release(voiceId);
+      try {
+        panner?.disconnect();
+      } catch {
+        // disconnected
+      }
+    };
+  }
+
+  /**
+   * Heavy 81mm HE Mortar detonation shockwave, supersonic crack, and rolling dirt/shrapnel tail.
+   * Priority: P1 within 60m, P2 beyond 60m (culled > 350m).
+   */
+  public playMortarExplosion(position: Readonly<THREE.Vector3>): void {
+    this.ensureInitialized();
+    if (!this.ctx || !this.dryBus || !this.noiseBuffer) return;
+    const ctx = this.ctx;
+    const dist = this.listenerPos.distanceTo(position);
+    const delaySec = Math.min(1.0, Math.max(0, (dist - 16) / SPEED_OF_SOUND_MPS));
+    const t = ctx.currentTime + delaySec;
+    const priority: FireSupportVoicePriority = dist <= 60 ? 1 : 2;
+    const nodes: AudioScheduledSourceNode[] = [];
+    const panner = this.createHRTFPanner(position, 14.0, FIRE_SUPPORT_CULL_RADIUS_M);
+
+    const voiceId = this.fireSupportPool.acquire(priority, dist, ctx.currentTime, delaySec + 1.85, () => {
+      nodes.forEach((n) => {
+        try {
+          n.stop();
+        } catch {
+          // stopped
+        }
+      });
+      try {
+        panner?.disconnect();
+      } catch {
+        // disconnected
+      }
+    });
+    if (voiceId === null) {
+      try {
+        panner?.disconnect();
+      } catch {
+        // unused
+      }
+      return;
+    }
+
+    const dest: AudioNode = panner ?? this.dryBus;
+    if (panner) this.connectToOutputBuses(panner, true);
+
+    const prox = THREE.MathUtils.clamp(1 - dist / FIRE_SUPPORT_CULL_RADIUS_M, 0.15, 1.0);
+    if (dist < 80) this.duckAmbientWind(1.6, 0.005);
+
+    // 1. Deep 81mm overpressure chest-punch sub-bass
+    const sub = ctx.createOscillator();
+    sub.type = 'sine';
+    sub.frequency.setValueAtTime(104, t);
+    sub.frequency.exponentialRampToValueAtTime(22, t + 0.72);
+    const subGain = ctx.createGain();
+    subGain.gain.setValueAtTime(0.001, t);
+    subGain.gain.linearRampToValueAtTime(1.0 * prox, t + 0.008);
+    subGain.gain.exponentialRampToValueAtTime(0.001, t + 0.92);
+    sub.connect(subGain);
+    subGain.connect(dest);
+    sub.start(t);
+    sub.stop(t + 0.96);
+    nodes.push(sub);
+
+    // 2. Concussive HE detonation + rolling earth/valley tail
+    const blast = ctx.createBufferSource();
+    blast.buffer = this.noiseBuffer;
+    const lp = ctx.createBiquadFilter();
+    lp.type = 'lowpass';
+    lp.frequency.setValueAtTime(THREE.MathUtils.lerp(950, 5200, prox), t);
+    lp.frequency.exponentialRampToValueAtTime(160, t + 1.45);
+    const bg = ctx.createGain();
+    bg.gain.setValueAtTime(0.001, t);
+    bg.gain.linearRampToValueAtTime(0.96 * prox, t + 0.012);
+    bg.gain.exponentialRampToValueAtTime(0.001, t + 1.65);
+    blast.connect(lp);
+    lp.connect(bg);
+    bg.connect(dest);
+    blast.start(t, 0, 1.72);
+    nodes.push(blast);
+
+    // 3. Sharp shrapnel snap for close impacts (< 90m)
+    if (dist < 90) {
+      const snap = ctx.createBufferSource();
+      snap.buffer = this.noiseBuffer;
+      const bp = ctx.createBiquadFilter();
+      bp.type = 'bandpass';
+      bp.frequency.value = 2850;
+      bp.Q.value = 0.95;
+      const sg = ctx.createGain();
+      sg.gain.setValueAtTime(0.62 * prox, t);
+      sg.gain.exponentialRampToValueAtTime(0.001, t + 0.22);
+      snap.connect(bp);
+      bp.connect(sg);
+      sg.connect(dest);
+      snap.start(t, Math.random() * 0.6, 0.25);
+      nodes.push(snap);
+    }
+
+    blast.onended = () => {
+      this.fireSupportPool.release(voiceId);
+      try {
+        panner?.disconnect();
+      } catch {
+        // disconnected
+      }
+    };
+  }
+
+  /**
+   * P0 (Protected): Staged Bomber Doppler flyby cue (ready for Phase 4 air-strike integration).
+   */
+  public playBomberDopplerFlyby(position: Readonly<THREE.Vector3>, durationSec = 5.5): void {
+    this.ensureInitialized();
+    if (!this.ctx || !this.dryBus || !this.noiseBuffer) return;
+    const ctx = this.ctx;
+    const t = ctx.currentTime;
+    const dur = THREE.MathUtils.clamp(durationSec, 2.0, 10.0);
+    const dist = this.listenerPos.distanceTo(position);
+    const nodes: AudioScheduledSourceNode[] = [];
+    const panner = this.createHRTFPanner(position, 24.0, FIRE_SUPPORT_CULL_RADIUS_M);
+
+    const voiceId = this.fireSupportPool.acquire(0, Math.min(dist, FIRE_SUPPORT_CULL_RADIUS_M), t, dur + 0.2, () => {
+      nodes.forEach((n) => {
+        try {
+          n.stop();
+        } catch {
+          // stopped
+        }
+      });
+      try {
+        panner?.disconnect();
+      } catch {
+        // disconnected
+      }
+    });
+    if (voiceId === null) {
+      try {
+        panner?.disconnect();
+      } catch {
+        // unused
+      }
+      return;
+    }
+
+    const dest: AudioNode = panner ?? this.dryBus;
+    if (panner) this.connectToOutputBuses(panner, true);
+
+    const jet = ctx.createBufferSource();
+    jet.buffer = this.noiseBuffer;
+    jet.loop = true;
+    const lp = ctx.createBiquadFilter();
+    lp.type = 'lowpass';
+    lp.frequency.setValueAtTime(1450, t);
+    lp.frequency.exponentialRampToValueAtTime(320, t + dur);
+    const jg = ctx.createGain();
+    jg.gain.setValueAtTime(0.001, t);
+    jg.gain.linearRampToValueAtTime(0.55, t + dur * 0.45);
+    jg.gain.exponentialRampToValueAtTime(0.001, t + dur);
+    jet.connect(lp);
+    lp.connect(jg);
+    jg.connect(dest);
+    jet.start(t);
+    jet.stop(t + dur + 0.05);
+    nodes.push(jet);
+
+    const turbine = ctx.createOscillator();
+    turbine.type = 'sawtooth';
+    turbine.frequency.setValueAtTime(195, t);
+    turbine.frequency.exponentialRampToValueAtTime(98, t + dur);
+    const tg = ctx.createGain();
+    tg.gain.setValueAtTime(0.001, t);
+    tg.gain.linearRampToValueAtTime(0.14, t + dur * 0.45);
+    tg.gain.exponentialRampToValueAtTime(0.001, t + dur);
+    turbine.connect(tg);
+    tg.connect(dest);
+    turbine.start(t);
+    turbine.stop(t + dur + 0.05);
+    nodes.push(turbine);
+
+    turbine.onended = () => {
+      this.fireSupportPool.release(voiceId);
+      try {
+        panner?.disconnect();
+      } catch {
+        // disconnected
+      }
+    };
+  }
+
   public dispose(): void {
+    this.fireSupportPool.clear();
     try {
       this.windSource?.stop();
     } catch {

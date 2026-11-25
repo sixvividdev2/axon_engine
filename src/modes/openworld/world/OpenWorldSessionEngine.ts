@@ -2130,6 +2130,9 @@ export class OpenWorldSessionEngine {
 
     if (res.hit) {
       this.audio.playImpact(ev.point, hitZone === 'head' ? 'metal' : 'wood');
+      if (hitZone === 'head') {
+        this.audio.playHeadshotIndicator();
+      }
       if (res.friendlyFire && char && res.standingPenalty > 0) {
         characterRoster.adjustCash(char.slotId, -res.standingPenalty * 25);
       }

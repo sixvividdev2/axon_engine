@@ -1194,6 +1194,122 @@ export interface GameFlagEventPacket {
   ts: number;
 }
 
+/** Runtime feature kill-switch for Conquest Fire Support & Mortar Emplacements */
+export const ENABLE_CONQUEST_FIRE_SUPPORT = true;
+
+export type MortarPitStatus =
+  | 'INACTIVE'
+  | 'ACTIVE_AI'
+  | 'FIRE_MISSION'
+  | 'PLAYER_MANNED'
+  | 'KIA_REINFORCING';
+
+export interface MortarPitState {
+  pitId: string;
+  ownerTeam: 'A' | 'B';
+  sourceType: 'HQ' | 'FOB';
+  sourceId: string;
+  position: [number, number, number];
+  zeroBearingRad: number;
+  status: MortarPitStatus;
+  seatedPlayerId: string | null;
+  seatedPlayerName: string | null;
+  seatedPlayerTeam: 'A' | 'B' | null;
+  gunnerAiHp: number;
+  loaderAiHp: number;
+  respawnTimerSec: number;
+  reloadProgress01: number;
+  currentAzimuthRad: number;
+  currentElevationRad: number;
+  currentChargeLevel: 1 | 2 | 3 | 4;
+  activeMissionId: string | null;
+}
+
+export interface TeamFireSupportState {
+  team: 'A' | 'B';
+  airStrikeCooldownSec: number;
+  airStrikeMaxCooldownSec: number;
+  mortarStrikeCooldownSec: number;
+  mortarStrikeMaxCooldownSec: number;
+  activeBomberId: string | null;
+  activeMortarMissionId: string | null;
+}
+
+export interface GameMortarSeatRequestPacket {
+  type: 'game:mortar_seat_request';
+  senderUserId?: string;
+  senderUsername?: string;
+  senderTeam?: LobbyTeamId;
+  pitId: string;
+  action: 'mount' | 'exit';
+  ts: number;
+}
+
+export interface GameMortarFireRequestPacket {
+  type: 'game:mortar_fire_request';
+  senderUserId?: string;
+  senderUsername?: string;
+  senderTeam?: LobbyTeamId;
+  pitId: string;
+  azimuthRad: number;
+  elevationRad: number;
+  chargeLevel: 1 | 2 | 3 | 4;
+  ts: number;
+}
+
+export interface GameMortarCrewDamagePacket {
+  type: 'game:mortar_crew_damage';
+  senderUserId?: string;
+  senderTeam?: LobbyTeamId;
+  pitId: string;
+  role: 'gunner' | 'loader';
+  damage: number;
+  headshot?: boolean;
+  ts: number;
+}
+
+export interface GameFireSupportSyncPacket {
+  type: 'game:fire_support_sync';
+  senderUserId?: string;
+  senderIsHost?: boolean;
+  enabled: boolean;
+  pits: MortarPitState[];
+  teams?: [TeamFireSupportState, TeamFireSupportState];
+  ts: number;
+}
+
+export interface GameMortarLaunchPacket {
+  type: 'game:mortar_launch';
+  senderUserId?: string;
+  senderIsHost?: boolean;
+  shellId: string;
+  pitId: string;
+  callerId: string;
+  callerTeam: 'A' | 'B';
+  isPlayerManned: boolean;
+  ox: number;
+  oy: number;
+  oz: number;
+  azimuthRad: number;
+  elevationRad: number;
+  chargeLevel: 1 | 2 | 3 | 4;
+  ix: number;
+  iy: number;
+  iz: number;
+  flightTimeSec: number;
+  ts: number;
+}
+
+export interface GameMortarSeatRejectedPacket {
+  type: 'game:mortar_seat_rejected';
+  senderUserId?: string;
+  senderIsHost?: boolean;
+  targetUserId: string;
+  pitId: string;
+  reason: string;
+  ts: number;
+}
+
 export type GameSyncPacket =
   | GamePlayerStatePacket
   | GamePlayerFirePacket
@@ -1224,4 +1340,10 @@ export type GameSyncPacket =
   | GameDoorActionPacket
   | GameModeStatePacket
   | GameDogtagEventPacket
-  | GameFlagEventPacket;
+  | GameFlagEventPacket
+  | GameMortarSeatRequestPacket
+  | GameMortarFireRequestPacket
+  | GameMortarCrewDamagePacket
+  | GameFireSupportSyncPacket
+  | GameMortarLaunchPacket
+  | GameMortarSeatRejectedPacket;

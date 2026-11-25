@@ -255,6 +255,10 @@ export class BodycamController {
   private holdBreathHeldSec = 0;
   private holdBreathCooldownSec = 0;
   private holdBreathReboundSec = 0;
+  /** Latches true when breath reserve depletes to 0%; clears ONLY once lung reserve reaches 100%. */
+  private holdBreathDepletedLock = false;
+  /** Prevents rapid tap-spamming of inhale/exhale SFX on early release. */
+  private holdBreathReleaseDebounceSec = 0;
   private lowBreathPulseTimer = 0;
   private exhaustedBreathTimer = 0;
   private heartRateBpm = 74;
@@ -520,6 +524,14 @@ export class BodycamController {
     return this.holdBreathActive;
   }
 
+  public isHoldBreathDepletedLocked(): boolean {
+    return this.holdBreathDepletedLock;
+  }
+
+  public getHoldBreathRemainingFraction(): number {
+    return THREE.MathUtils.clamp(this.holdBreathRemainingSec / 7.0, 0, 1);
+  }
+
   public getHoldBreathVignette(): number {
     return this.breathVignette;
   }
@@ -540,6 +552,8 @@ export class BodycamController {
     this.holdBreathHeldSec = 0;
     this.holdBreathCooldownSec = 0;
     this.holdBreathReboundSec = 0;
+    this.holdBreathDepletedLock = false;
+    this.holdBreathReleaseDebounceSec = 0;
     this.lowBreathPulseTimer = 0;
     this.breathVignette = 0;
     this.holdBreathBlend = 0;
@@ -1896,6 +1910,9 @@ export class BodycamController {
     if (this.holdBreathCooldownSec > 0) {
       this.holdBreathCooldownSec = Math.max(0, this.holdBreathCooldownSec - dt);
     }
+    if (this.holdBreathReleaseDebounceSec > 0) {
+      this.holdBreathReleaseDebounceSec = Math.max(0, this.holdBreathReleaseDebounceSec - dt);
+    }
     if (this.holdBreathReboundSec > 0) {
       this.holdBreathReboundSec = Math.max(0, this.holdBreathReboundSec - dt);
     }
@@ -1947,12 +1964,14 @@ export class BodycamController {
     const hasBreathReserve = this.holdBreathActive
       ? this.holdBreathRemainingSec > 0.001
       : this.holdBreathRemainingSec > 0.15;
-    // Hold Breath requires at least 20% regular stamina
+    // Hold Breath requires at least 20% regular stamina, no depletion recovery lock, and no release spam debounce
     const canHoldBreath =
       health > 0 &&
       inAimStance &&
       input.holdBreath &&
       !wantsSprint &&
+      !this.holdBreathDepletedLock &&
+      (this.holdBreathActive || this.holdBreathReleaseDebounceSec <= 0) &&
       this.holdBreathCooldownSec <= 0 &&
       hasBreathReserve &&
       stamina >= HOLD_BREATH_MIN_STAMINA;
@@ -1977,7 +1996,9 @@ export class BodycamController {
       }
 
       if (this.holdBreathRemainingSec <= 0.001) {
+        // Depleted lung reserve -> lock hold-breath until full 100% catch-up recovery
         this.holdBreathActive = false;
+        this.holdBreathDepletedLock = true;
         this.holdBreathCooldownSec = HOLD_BREATH_COOLDOWN_SEC;
         this.holdBreathReboundSec = HOLD_BREATH_REBOUND_SEC;
         this.holdBreathHeldSec = 0;
@@ -1987,6 +2008,8 @@ export class BodycamController {
     } else {
       if (this.holdBreathActive) {
         this.holdBreathActive = false;
+        // Anti-spam debounce prevents rapid inhale/exhale audio spam on repeated taps
+        this.holdBreathReleaseDebounceSec = 0.65;
         if (this.holdBreathHeldSec >= 0.35) {
           const frac = THREE.MathUtils.clamp(this.holdBreathHeldSec / HOLD_BREATH_MAX_SEC, 0.15, 1.0);
           this.holdBreathReboundSec = HOLD_BREATH_REBOUND_SEC * (0.35 + 0.65 * frac);
@@ -1996,11 +2019,15 @@ export class BodycamController {
         this.holdBreathHeldSec = 0;
       }
 
-      const recoveryRate = (this.holdBreathCooldownSec > 0 ? 0.52 : 0.92) + 0.38 * stamina;
+      const recoveryRate = (this.holdBreathDepletedLock || this.holdBreathCooldownSec > 0 ? 0.52 : 0.92) + 0.38 * stamina;
       this.holdBreathRemainingSec = Math.min(
         HOLD_BREATH_MAX_SEC,
         this.holdBreathRemainingSec + recoveryRate * dt,
       );
+      if (this.holdBreathDepletedLock && this.holdBreathRemainingSec >= HOLD_BREATH_MAX_SEC - 0.001) {
+        this.holdBreathRemainingSec = HOLD_BREATH_MAX_SEC;
+        this.holdBreathDepletedLock = false;
+      }
     }
 
     this.holdBreathBlend = THREE.MathUtils.damp(
@@ -2017,8 +2044,10 @@ export class BodycamController {
       const lowUrgency = reserveFrac < 0.35 ? THREE.MathUtils.clamp((0.35 - reserveFrac) / 0.35, 0, 1) : 0;
       const lowPulse = lowUrgency * (0.28 + 0.24 * (0.5 + 0.5 * Math.sin(elapsed * 7.2)));
       targetBreathVignette = THREE.MathUtils.clamp(0.38 * this.holdBreathBlend + lowPulse, 0, 0.92);
-    } else if (this.holdBreathCooldownSec > 0) {
-      const cdFrac = this.holdBreathCooldownSec / HOLD_BREATH_COOLDOWN_SEC;
+    } else if (this.holdBreathCooldownSec > 0 || this.holdBreathDepletedLock) {
+      const cdFrac = this.holdBreathCooldownSec > 0
+        ? this.holdBreathCooldownSec / HOLD_BREATH_COOLDOWN_SEC
+        : Math.max(0, 1 - this.holdBreathRemainingSec / HOLD_BREATH_MAX_SEC) * 0.45;
       targetBreathVignette = cdFrac * (0.22 + 0.16 * (0.5 + 0.5 * Math.sin(elapsed * 5.6)));
     }
     this.breathVignette = THREE.MathUtils.damp(this.breathVignette, targetBreathVignette, 7.0, dt);

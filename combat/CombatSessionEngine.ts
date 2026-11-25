@@ -103,6 +103,7 @@ import {
 } from '../doors/DestructibleDoorSystem';
 import { PlayerInteractAnimator } from '../doors/PlayerInteractAnimator';
 import {
+  ENABLE_CONQUEST_FIRE_SUPPORT,
   GameBarrierRepairRequestPacket,
   GameBarrierUpdatePacket,
   GameBotCommsPacket,
@@ -113,6 +114,7 @@ import {
   GameDogtagEventPacket,
   GameDoorActionPacket,
   GameEnvSyncPacket,
+  GameFireSupportSyncPacket,
   GameFlagEventPacket,
   GameGlassShatterPacket,
   GameGrenadeEventKind,
@@ -122,6 +124,11 @@ import {
   GameMapInteractRequestPacket,
   GameMatchSyncPacket,
   GameModeStatePacket,
+  GameMortarCrewDamagePacket,
+  GameMortarFireRequestPacket,
+  GameMortarLaunchPacket,
+  GameMortarSeatRejectedPacket,
+  GameMortarSeatRequestPacket,
   GamePlayerFirePacket,
   GamePlayerHitPacket,
   GamePlayerKillPacket,
@@ -144,7 +151,9 @@ import {
   SyncedHandlingAction,
   TacticalPingKind,
   TacticalPingTargetType,
+  TeamFireSupportState,
 } from '../data/multiplayer';
+import type { PdaMortarFiringTableTelemetry } from '../bodycam-sdk/TacticalPdaDevice';
 import {
   BattleBotAI,
   BattleHumanTarget,
@@ -162,6 +171,21 @@ import {
   BattleModeHudSnapshot,
   ModeActorSample,
 } from './BattleModeController';
+import {
+  computeBearingRad,
+  solveMortarFiringTable,
+} from './MortarBallistics';
+import {
+  MORTAR_FRIENDLY_FLAG_MIN_DIST_M,
+  MORTAR_HQ_EXCLUSION_RADIUS_M,
+  MortarEmplacementSystem,
+  MortarExclusionZone,
+  MortarImpactEvent,
+  MortarPlayerHudTelemetry,
+  MortarSiteConfig,
+  MortarTargetCandidate,
+  computeMortarBlastDamageForActor,
+} from './MortarEmplacementSystem';
 
 export type CombatSessionMode = 'battle' | 'infection';
 
@@ -194,7 +218,7 @@ export interface SquadCommsMessage {
 
 export interface NearbyInteractPrompt {
   id: string;
-  kind: MapInteractable['kind'] | 'electronic_repair' | 'door_repair';
+  kind: MapInteractable['kind'] | 'electronic_repair' | 'door_repair' | 'mortar_emplacement';
   label: string;
   actionText: string;
   cost: number;
@@ -373,6 +397,9 @@ export interface CombatSessionSnapshot {
   // Unified [F] + Mouse Scroll Physical Door Interaction Prompt
   doorInteractReticle: 'hidden' | 'near' | 'ready';
   doorPrompt: CombatDoorPromptState | null;
+
+  // Conquest 81mm Mortar Manual Laying HUD Telemetry (non-null while seated)
+  mortarHud: MortarPlayerHudTelemetry | null;
 }
 
 type SnapshotListener = (snap: CombatSessionSnapshot) => void;
@@ -447,6 +474,25 @@ export class CombatSessionEngine {
   private modeController: BattleModeController | null = null;
   private readonly modeSceneGroup = new THREE.Group();
   private modeSyncAccum = 0;
+  private mortarSystem: MortarEmplacementSystem | null = null;
+  private seatedMortarPitId: string | null = null;
+  private mortarOpticalSight = false;
+  private mortarLevelHeld = false;
+  private mortarSyncAccum = 0;
+  private mortarHandwheelAudioAccum = 0;
+  private nearbyMortarPrompt: {
+    pitId: string;
+    promptText: string;
+    canMount: boolean;
+    blockedReason?: string;
+  } | null = null;
+  private readonly _mortarCamPos = new THREE.Vector3();
+  private readonly _mortarCamLook = new THREE.Vector3();
+  private readonly _mortarTargetsBuf: MortarTargetCandidate[] = [];
+  private readonly _mortarExclusionsBuf: MortarExclusionZone[] = [];
+  private readonly _mortarFobOwnerMap = new Map<string, 'A' | 'B' | null>();
+  private readonly _mortarOriginScratch = new THREE.Vector3();
+  private readonly _mortarTargetScratch = new THREE.Vector3();
   private spectateOverview = false;
   private readonly _modeActorsBuf: ModeActorSample[] = [];
   private readonly _spawnLosOrigin = new THREE.Vector3();
@@ -804,6 +850,9 @@ export class CombatSessionEngine {
     if (params.mode === 'battle') {
       this.scene.add(this.modeSceneGroup);
       this.modeController = this.createBattleModeController(params.battleConfig, isClientReplica);
+      if (params.battleConfig.rule === 'conquest') {
+        this.initConquestMortarSystem(isClientReplica);
+      }
       this.botAI = new BattleBotAI(
         this.scene,
         this.map,
@@ -1234,6 +1283,10 @@ export class CombatSessionEngine {
         const rm = this.remotePlayers.getHitMeshes();
         for (let i = 0; i < rm.length; i++) this.combinedHitMeshes.push(rm[i]);
       }
+      if (this.mortarSystem) {
+        const mm = this.mortarSystem.getAliveCrewHitMeshes();
+        for (let i = 0; i < mm.length; i++) this.combinedHitMeshes.push(mm[i]);
+      }
       return this.combinedHitMeshes;
     };
 
@@ -1620,6 +1673,512 @@ export class CombatSessionEngine {
         },
       },
     });
+  }
+
+  private initConquestMortarSystem(isClientReplica: boolean): void {
+    this.mortarSystem?.dispose();
+    this.mortarSystem = null;
+    this.seatedMortarPitId = null;
+    this.mortarOpticalSight = false;
+    this.mortarLevelHeld = false;
+    this.nearbyMortarPrompt = null;
+
+    if (!ENABLE_CONQUEST_FIRE_SUPPORT) return;
+
+    const objectives = this.map.battleObjectives;
+    const hqAPos =
+      objectives?.hqA?.position ??
+      this.map.spawnPoints.teamA[0]?.position ??
+      this.map.spawnPoints.playerStart.position;
+    const hqBPos =
+      objectives?.hqB?.position ??
+      this.map.spawnPoints.teamB[0]?.position ??
+      ([-hqAPos[0], hqAPos[1], -hqAPos[2]] as [number, number, number]);
+
+    const groundAt = (x: number, z: number, fallbackY: number): number =>
+      this.map.terrainHeightAt ? this.map.terrainHeightAt(x, z) : fallbackY;
+
+    const bearingAtoB = computeBearingRad(hqAPos[0], hqAPos[2], hqBPos[0], hqBPos[2]);
+    const bearingBtoA = computeBearingRad(hqBPos[0], hqBPos[2], hqAPos[0], hqAPos[2]);
+
+    const sites: MortarSiteConfig[] = [];
+    // Team A HQ 81mm Mortar Pit (offset 9m forward-flank from HQ spawn so operators don't clip on spawn)
+    const pitAX = hqAPos[0] + Math.sin(bearingAtoB) * 7.5 - Math.cos(bearingAtoB) * 5.5;
+    const pitAZ = hqAPos[2] - Math.cos(bearingAtoB) * 7.5 - Math.sin(bearingAtoB) * 5.5;
+    sites.push({
+      pitId: 'mortar_hq_a',
+      ownerTeam: 'A',
+      sourceType: 'HQ',
+      sourceId: 'hq_a',
+      position: [pitAX, groundAt(pitAX, pitAZ, hqAPos[1]), pitAZ],
+      zeroBearingRad: bearingAtoB,
+      active: true,
+    });
+
+    // Team B HQ 81mm Mortar Pit
+    const pitBX = hqBPos[0] + Math.sin(bearingBtoA) * 7.5 - Math.cos(bearingBtoA) * 5.5;
+    const pitBZ = hqBPos[2] - Math.cos(bearingBtoA) * 7.5 - Math.sin(bearingBtoA) * 5.5;
+    sites.push({
+      pitId: 'mortar_hq_b',
+      ownerTeam: 'B',
+      sourceType: 'HQ',
+      sourceId: 'hq_b',
+      position: [pitBX, groundAt(pitBX, pitBZ, hqBPos[1]), pitBZ],
+      zeroBearingRad: bearingBtoA,
+      active: true,
+    });
+
+    // Up to 4 Forward FOB Mortar Pits (max 6 total pits; capped to 2 active forward FOB pits per team)
+    const pois = objectives?.conquestPois ?? [];
+    for (let i = 0; i < Math.min(4, pois.length); i++) {
+      const poi = pois[i];
+      const flankAngle = bearingAtoB + (i % 2 === 0 ? Math.PI * 0.5 : -Math.PI * 0.5);
+      const fx = poi.position[0] + Math.sin(flankAngle) * 7.0;
+      const fz = poi.position[2] - Math.cos(flankAngle) * 7.0;
+      const defaultOwner: 'A' | 'B' = i < 2 ? 'A' : 'B';
+      sites.push({
+        pitId: `mortar_fob_${poi.id}`,
+        ownerTeam: defaultOwner,
+        sourceType: 'FOB',
+        sourceId: poi.id,
+        position: [fx, groundAt(fx, fz, poi.position[1]), fz],
+        zeroBearingRad: defaultOwner === 'A' ? bearingAtoB : bearingBtoA,
+        active: false,
+      });
+    }
+
+    this.mortarSystem = new MortarEmplacementSystem({
+      scene: this.scene,
+      isHost: !isClientReplica,
+      audio: this.audio,
+      getGroundHeight: (x, z) => (this.map.terrainHeightAt ? this.map.terrainHeightAt(x, z) : 0),
+      onImpact: (ev) => this.handleMortarImpact(ev),
+      onLaunchBroadcast: (pkt) => {
+        if (this.mp && this.isMpHost) {
+          this.mp.sendMessage(pkt as unknown as Record<string, unknown>);
+        }
+      },
+      enabled: ENABLE_CONQUEST_FIRE_SUPPORT,
+    });
+    this.mortarSystem.configureSites(sites);
+    installHorizonFogOnSubtree(this.mortarSystem.root, this.horizonFogUniforms);
+    this.syncMortarFobOwnershipFromMode();
+  }
+
+  private syncMortarFobOwnershipFromMode(): void {
+    if (!this.mortarSystem || !this.modeController) return;
+    const hud = this.modeController.getHudSnapshot();
+    this._mortarFobOwnerMap.clear();
+    for (let i = 0; i < hud.conquestPois.length; i++) {
+      const poi = hud.conquestPois[i];
+      this._mortarFobOwnerMap.set(poi.id, poi.owner);
+    }
+    this.mortarSystem.syncFobOwnership(this._mortarFobOwnerMap);
+  }
+
+  private broadcastFireSupportSync(): void {
+    if (!this.mp || !this.isMpHost || !this.mortarSystem) return;
+    const emptyTeamState = (team: 'A' | 'B'): TeamFireSupportState => ({
+      team,
+      airStrikeCooldownSec: 0,
+      airStrikeMaxCooldownSec: 120,
+      mortarStrikeCooldownSec: 0,
+      mortarStrikeMaxCooldownSec: 60,
+      activeBomberId: null,
+      activeMortarMissionId: null,
+    });
+    const pkt: GameFireSupportSyncPacket = {
+      type: 'game:fire_support_sync',
+      enabled: this.mortarSystem.isEnabled(),
+      pits: this.mortarSystem.getPitStates(),
+      teams: [emptyTeamState('A'), emptyTeamState('B')],
+      ts: Date.now(),
+    };
+    this.mp.sendMessage(pkt as unknown as Record<string, unknown>);
+  }
+
+  private tryMountNearbyMortar(): boolean {
+    if (!this.mortarSystem || !this.nearbyMortarPrompt || this.seatedMortarPitId) return false;
+    const prompt = this.nearbyMortarPrompt;
+    const localId = this.getLocalModeActorId();
+    const localName = this.mp?.localUsername ?? 'YOU';
+    const localTeam: 'A' | 'B' = this.localBattleTeam === 'B' ? 'B' : 'A';
+
+    if (!prompt.canMount) {
+      if (prompt.blockedReason) this.showToast(prompt.blockedReason, 2.2);
+      return true;
+    }
+
+    if (this.mp && !this.isMpHost) {
+      const req: GameMortarSeatRequestPacket = {
+        type: 'game:mortar_seat_request',
+        pitId: prompt.pitId,
+        action: 'mount',
+        ts: Date.now(),
+      };
+      this.mp.sendMessage(req as unknown as Record<string, unknown>);
+      this.showToast('Mounting 81mm Mortar...', 1.4);
+      return true;
+    }
+
+    const res = this.mortarSystem.requestSeat(prompt.pitId, localId, localName, localTeam);
+    if (!res.ok) {
+      this.showToast(res.reason ?? 'Cannot man mortar', 2.2);
+      return true;
+    }
+
+    this.seatedMortarPitId = prompt.pitId;
+    this.mortarOpticalSight = false;
+    this.mortarLevelHeld = false;
+    this.isFiring = false;
+    this.input.ads = false;
+    this.grenadeSystem.cancelCook();
+    this.audio.playGearRattle('weapon_swap', 0.55);
+    this.showToast('Manned 81mm Mortar · [M] Firing Table · [RMB] Sight · [F] Exit', 3.4);
+    this.broadcastFireSupportSync();
+    this.emitSnapshot();
+    return true;
+  }
+
+  private exitLocalMortarSeat(): void {
+    if (!this.seatedMortarPitId || !this.mortarSystem) return;
+    const pitId = this.seatedMortarPitId;
+    const localId = this.getLocalModeActorId();
+    this.seatedMortarPitId = null;
+    this.mortarOpticalSight = false;
+    this.mortarLevelHeld = false;
+
+    if (this.mp && !this.isMpHost) {
+      const req: GameMortarSeatRequestPacket = {
+        type: 'game:mortar_seat_request',
+        pitId,
+        action: 'exit',
+        ts: Date.now(),
+      };
+      this.mp.sendMessage(req as unknown as Record<string, unknown>);
+    } else {
+      this.mortarSystem.releaseSeat(pitId, localId);
+      this.broadcastFireSupportSync();
+    }
+    this.audio.playGearRattle('weapon_swap', 0.45);
+    this.emitSnapshot();
+  }
+
+  private triggerLocalMortarFire(): void {
+    if (!this.seatedMortarPitId || !this.mortarSystem) return;
+    const pitId = this.seatedMortarPitId;
+    const st = this.mortarSystem.getPitState(pitId);
+    if (!st) return;
+
+    const localId = this.getLocalModeActorId();
+    const localTeam: 'A' | 'B' = this.localBattleTeam === 'B' ? 'B' : 'A';
+    if (this.mp && !this.isMpHost) {
+      const req: GameMortarFireRequestPacket = {
+        type: 'game:mortar_fire_request',
+        pitId,
+        azimuthRad: st.currentAzimuthRad,
+        elevationRad: st.currentElevationRad,
+        chargeLevel: st.currentChargeLevel,
+        ts: Date.now(),
+      };
+      this.mp.sendMessage(req as unknown as Record<string, unknown>);
+      return;
+    }
+
+    const pkt = this.mortarSystem.tryPlayerFire(pitId, localId, localTeam);
+    if (pkt) {
+      this.modeController?.cancelSpawnProtection(localId);
+      this.broadcastFireSupportSync();
+      this.emitSnapshot();
+    }
+  }
+
+  private handleMortarImpact(ev: MortarImpactEvent): void {
+    const canApplyAuthorityDamage = this.isMpHost || !this.mp;
+    const localActorId = this.getLocalModeActorId();
+    const isLocalCaller = ev.callerId === localActorId;
+
+    // 0. Shatter nearby glass & damage breakable electronics inside blast envelope
+    if (this.map.shatterBreakable) {
+      const glassR = Math.max(ev.blastRadiusM * 0.9, 10.0);
+      const meshesCopy = this.map.raycastMeshes.slice();
+      for (let i = 0; i < meshesCopy.length; i++) {
+        const m = meshesCopy[i];
+        if (!m.userData?.breakableGlass || m.userData.shattered) continue;
+        m.getWorldPosition(this._tmpImpactPoint);
+        if (this._tmpImpactPoint.distanceTo(ev.position) <= glassR) {
+          this.handleWorldGlassShatter(m, this._tmpImpactPoint, undefined, !canApplyAuthorityDamage);
+        }
+      }
+    }
+    if (this.map.electronicsSystem) {
+      this.map.electronicsSystem.handleExplosion(
+        ev.position,
+        ev.blastRadiusM * 0.9,
+        this.camera.position,
+      );
+    }
+
+    // 1. Report Conquest fire heat
+    if (this.modeController) {
+      this.modeController.reportConquestAttack(ev.position.x, ev.position.z, ev.callerTeam);
+    }
+
+    // 2. Local player blast damage (100% enemy, 100% self-damage, 25% teammate splash + suppression)
+    if (this.playerAlive && !this.gameOver && this.matchOutcome === 'active') {
+      const playerChest = this._mortarOriginScratch.set(
+        this.controller.position.x,
+        this.controller.position.y + 1.1,
+        this.controller.position.z,
+      );
+      const dist = playerChest.distanceTo(ev.position);
+      if (dist <= ev.blastRadiusM * 1.45) {
+        const res = computeMortarBlastDamageForActor({
+          distanceM: dist,
+          blastRadiusM: ev.blastRadiusM,
+          maxDamage: ev.maxDamage,
+          actorId: localActorId,
+          actorTeam: this.localBattleTeam,
+          callerId: ev.callerId,
+          callerTeam: ev.callerTeam,
+        });
+        const shockProx = Math.max(0.15, 1 - dist / (ev.blastRadiusM * 1.45));
+        this.controller.applyRecoil(
+          0.048 * shockProx,
+          (Math.random() - 0.5) * 0.068 * shockProx,
+          0.022 * shockProx,
+          0.7,
+          { stanceCoupled: false },
+        );
+        this.adrenalineStress = Math.min(1, this.adrenalineStress + 0.55 * shockProx);
+        if (res.damage > 0) {
+          this.applyPlayerDamage(
+            res.damage,
+            '81mm MORTAR',
+            ev.callerTeam,
+            ev.callerId,
+          );
+        }
+      }
+    }
+
+    if (!canApplyAuthorityDamage) return;
+
+    // 3. Battle AI Bots AoE blast
+    if (this.botAI) {
+      const attackerName = isLocalCaller ? (this.mp?.localUsername ?? 'YOU') : '81mm MORTAR';
+      const botRes = this.botAI.applyAreaBlast(
+        ev.position,
+        ev.blastRadiusM,
+        ev.maxDamage,
+        'frag',
+        attackerName,
+        ev.callerTeam,
+        '81mm MORTAR',
+        undefined,
+        isLocalCaller && this.mp ? `human:${this.mp.localUserId}` : ev.callerId,
+      );
+      if (botRes.hits > 0 && isLocalCaller) {
+        this.playerDamageDealt += botRes.totalDamage;
+        this.hitmarkerTimer = botRes.kills > 0 ? 0.34 : 0.22;
+        this.hitmarkerHeadshot = false;
+        this.hitmarkerKill = botRes.kills > 0;
+        if (botRes.kills > 0) {
+          this.playerKills += botRes.kills;
+          this.playerGrenadeKills += botRes.kills;
+          if (this.mp) {
+            for (const botId of botRes.killedBotIds) {
+              const info = this.botAI.getBotInfo(botId);
+              if (!info) continue;
+              const killPkt: GamePlayerKillPacket = {
+                type: 'game:kill',
+                killerUserId: this.mp.localUserId,
+                killerName: this.mp.localUsername,
+                killerTeam: this.localBattleTeam,
+                victimUserId: info.id,
+                victimName: info.name,
+                victimTeam: info.team,
+                weaponId: 'mortar_81mm',
+                weaponName: '81mm MORTAR',
+                headshot: false,
+                killMethod: 'grenade',
+                ts: Date.now(),
+              };
+              this.mp.sendMessage(killPkt as unknown as Record<string, unknown>);
+            }
+          }
+          this.checkBattleVictory();
+        }
+        this.emitSnapshot();
+      } else if (botRes.kills > 0) {
+        this.checkBattleVictory();
+        this.emitSnapshot();
+      }
+    }
+
+    // 4. Multiplayer Remote Human Players blast (host-authoritative)
+    if (this.mp && this.remotePlayers) {
+      const humans = this.remotePlayers.getAliveHumanTargets();
+      for (let i = 0; i < humans.length; i++) {
+        const h = humans[i];
+        const dist = Math.hypot(
+          h.pos.x - ev.position.x,
+          h.pos.y + 1.0 - ev.position.y,
+          h.pos.z - ev.position.z,
+        );
+        if (dist >= ev.blastRadiusM) continue;
+        const dmgRes = computeMortarBlastDamageForActor({
+          distanceM: dist,
+          blastRadiusM: ev.blastRadiusM,
+          maxDamage: ev.maxDamage,
+          actorId: h.id,
+          actorTeam: h.team,
+          callerId: ev.callerId,
+          callerTeam: ev.callerTeam,
+        });
+        if (dmgRes.damage <= 0) continue;
+        const hitPkt: GameBotHitPlayerPacket = {
+          type: 'game:bot_hit_player',
+          targetUserId: h.id,
+          damage: dmgRes.damage,
+          botId: ev.pitId,
+          botName: '81mm MORTAR',
+          botTeam: ev.callerTeam,
+          ts: Date.now(),
+        };
+        this.mp.sendMessage(hitPkt as unknown as Record<string, unknown>);
+      }
+    }
+  }
+
+  private updateMortarSystem(dt: number): void {
+    if (!this.mortarSystem) return;
+
+    // Keep atmospheric wind synced with dynamic WeatherTimeSystem
+    if (this.weatherTime) {
+      this.mortarSystem.setWind(
+        this.weatherTime.getWindSpeedMps(),
+        this.weatherTime.getWindAngleRad(),
+      );
+    }
+
+    // Keep FOB mortar pit ownership synced with Conquest sector control
+    this.syncMortarFobOwnershipFromMode();
+
+    // Populate AI targeting & exclusion buffers (zero per-frame array allocations)
+    const targets = this._mortarTargetsBuf;
+    targets.length = 0;
+    targets.push({
+      id: this.getLocalModeActorId(),
+      team: this.localBattleTeam,
+      x: this.controller.position.x,
+      y: this.controller.position.y,
+      z: this.controller.position.z,
+      alive: this.playerAlive,
+    });
+    if (this.remotePlayers) {
+      const humans = this.remotePlayers.getAliveHumanTargets();
+      for (let i = 0; i < humans.length; i++) {
+        const h = humans[i];
+        targets.push({
+          id: h.id,
+          team: h.team,
+          x: h.pos.x,
+          y: h.pos.y,
+          z: h.pos.z,
+          alive: h.alive,
+        });
+      }
+    }
+    if (this.botAI) {
+      const botSnaps = this.botAI.exportSyncSnapshot().bots;
+      for (let i = 0; i < botSnaps.length; i++) {
+        const b = botSnaps[i];
+        if (!b.alive) continue;
+        targets.push({
+          id: b.id,
+          team: b.team,
+          x: b.x,
+          y: b.y,
+          z: b.z,
+          alive: true,
+        });
+      }
+    }
+
+    const exclusions = this._mortarExclusionsBuf;
+    exclusions.length = 0;
+    const obj = this.map.battleObjectives;
+    if (obj?.hqA) {
+      exclusions.push({
+        x: obj.hqA.position[0],
+        z: obj.hqA.position[2],
+        radiusM: MORTAR_HQ_EXCLUSION_RADIUS_M,
+        team: 'A',
+        kind: 'hq',
+      });
+    }
+    if (obj?.hqB) {
+      exclusions.push({
+        x: obj.hqB.position[0],
+        z: obj.hqB.position[2],
+        radiusM: MORTAR_HQ_EXCLUSION_RADIUS_M,
+        team: 'B',
+        kind: 'hq',
+      });
+    }
+    if (this.modeController) {
+      const pois = this.modeController.getHudSnapshot().conquestPois;
+      for (let i = 0; i < pois.length; i++) {
+        const p = pois[i];
+        exclusions.push({
+          x: p.position[0],
+          z: p.position[2],
+          radiusM: MORTAR_FRIENDLY_FLAG_MIN_DIST_M,
+          team: p.owner,
+          kind: 'flag',
+        });
+      }
+    }
+
+    this.mortarSystem.update(dt, {
+      localPlayerPos: this.controller.position,
+      targets,
+      exclusionZones: exclusions,
+    });
+
+    // Scan nearby interactable mortar pit when unseated
+    const prevPromptId = this.nearbyMortarPrompt?.pitId ?? null;
+    const prevPromptBlocked = this.nearbyMortarPrompt?.blockedReason ?? null;
+    if (!this.seatedMortarPitId && this.playerAlive) {
+      const localTeam: 'A' | 'B' = this.localBattleTeam === 'B' ? 'B' : 'A';
+      const found = this.mortarSystem.findNearestInteractablePit(this.controller.position, localTeam);
+      this.nearbyMortarPrompt = found
+        ? {
+            pitId: found.pitId,
+            promptText: found.promptText,
+            canMount: found.canMount,
+            blockedReason: found.blockedReason,
+          }
+        : null;
+    } else {
+      this.nearbyMortarPrompt = null;
+    }
+    if (
+      (this.nearbyMortarPrompt?.pitId ?? null) !== prevPromptId ||
+      (this.nearbyMortarPrompt?.blockedReason ?? null) !== prevPromptBlocked
+    ) {
+      this.emitSnapshot();
+    }
+
+    // Host 1 Hz fire-support state sync
+    if (this.mp && this.isMpHost) {
+      this.mortarSyncAccum += dt;
+      if (this.mortarSyncAccum >= 1.0) {
+        this.mortarSyncAccum = 0;
+        this.broadcastFireSupportSync();
+      }
+    }
   }
 
   private collectModeActors(): readonly ModeActorSample[] {
@@ -2705,6 +3264,105 @@ export class CombatSessionEngine {
       return;
     }
 
+    // === Conquest 81mm Mortar Emplacement Host/Client Sync Packets ===
+    if (type === 'game:mortar_seat_request' && this.mortarSystem && this.isMpHost) {
+      const pkt = raw as unknown as GameMortarSeatRequestPacket;
+      const reqId = pkt.senderUserId ?? '';
+      const reqName = pkt.senderUsername ?? 'OPERATOR';
+      if (!reqId) return;
+      const member = this.mp.members.find((m) => m.userId === reqId);
+      const reqTeam: 'A' | 'B' = member?.team === 'B' ? 'B' : 'A';
+      if (pkt.action === 'exit') {
+        this.mortarSystem.releaseSeat(pkt.pitId, reqId);
+        this.broadcastFireSupportSync();
+      } else {
+        const res = this.mortarSystem.requestSeat(pkt.pitId, reqId, reqName, reqTeam);
+        if (!res.ok) {
+          const rej: GameMortarSeatRejectedPacket = {
+            type: 'game:mortar_seat_rejected',
+            targetUserId: reqId,
+            pitId: pkt.pitId,
+            reason: res.reason ?? 'Mortar station unavailable',
+            ts: Date.now(),
+          };
+          this.mp.sendMessage(rej as unknown as Record<string, unknown>);
+        } else {
+          this.broadcastFireSupportSync();
+        }
+      }
+      return;
+    }
+
+    if (type === 'game:mortar_fire_request' && this.mortarSystem && this.isMpHost) {
+      const pkt = raw as unknown as GameMortarFireRequestPacket;
+      const reqId = pkt.senderUserId ?? '';
+      if (!reqId) return;
+      const pit = this.mortarSystem.getPitState(pkt.pitId);
+      if (!pit || pit.seatedPlayerId !== reqId) return;
+      const member = this.mp.members.find((m) => m.userId === reqId);
+      const reqTeam: 'A' | 'B' = member?.team === 'B' ? 'B' : 'A';
+      this.mortarSystem.setChargeLevel(pkt.pitId, pkt.chargeLevel);
+      this.mortarSystem.adjustHandwheels(
+        pkt.pitId,
+        pkt.azimuthRad - pit.currentAzimuthRad,
+        pkt.elevationRad - pit.currentElevationRad,
+      );
+      if (this.mortarSystem.tryPlayerFire(pkt.pitId, reqId, reqTeam)) {
+        this.broadcastFireSupportSync();
+      }
+      return;
+    }
+
+    if (type === 'game:mortar_crew_damage' && this.mortarSystem && this.isMpHost) {
+      const pkt = raw as unknown as GameMortarCrewDamagePacket;
+      const hitRes = this.mortarSystem.damageCrewMember(
+        pkt.pitId,
+        pkt.role,
+        pkt.damage,
+        Boolean(pkt.headshot),
+      );
+      if (hitRes) {
+        this.broadcastFireSupportSync();
+      }
+      return;
+    }
+
+    if (type === 'game:fire_support_sync' && this.mortarSystem && !this.isMpHost) {
+      const pkt = raw as unknown as GameFireSupportSyncPacket;
+      if (!pkt.senderIsHost) return;
+      this.mortarSystem.applyRemoteSyncPacket(pkt);
+      const localSeated = this.mortarSystem.getPitMannedBy(this.getLocalModeActorId());
+      if (localSeated !== this.seatedMortarPitId) {
+        this.seatedMortarPitId = localSeated;
+        if (!localSeated) {
+          this.mortarOpticalSight = false;
+          this.mortarLevelHeld = false;
+        }
+        this.emitSnapshot();
+      }
+      return;
+    }
+
+    if (type === 'game:mortar_launch' && this.mortarSystem && !this.isMpHost) {
+      const pkt = raw as unknown as GameMortarLaunchPacket;
+      if (!pkt.senderIsHost) return;
+      this.mortarSystem.applyRemoteLaunchPacket(pkt);
+      return;
+    }
+
+    if (type === 'game:mortar_seat_rejected' && this.mortarSystem && !this.isMpHost) {
+      const pkt = raw as unknown as GameMortarSeatRejectedPacket;
+      if (!pkt.senderIsHost || pkt.targetUserId !== this.mp.localUserId) return;
+      if (this.seatedMortarPitId === pkt.pitId) {
+        this.seatedMortarPitId = null;
+        this.mortarOpticalSight = false;
+        this.mortarLevelHeld = false;
+      }
+      this.showToast(pkt.reason, 2.4);
+      this.emitSnapshot();
+      return;
+    }
+
     if (type === 'game:map_interact_rejected' && this.params.mode === 'infection') {
       const pkt = raw as unknown as GameMapInteractRejectedPacket;
       if (!pkt.senderIsHost) return;
@@ -3052,6 +3710,9 @@ export class CombatSessionEngine {
         Boolean(this.mp && !this.isMpHost),
       );
       this.botAI.setModeController(this.modeController);
+      if (this.params.battleConfig.rule === 'conquest') {
+        this.initConquestMortarSystem(Boolean(this.mp && !this.isMpHost));
+      }
     }
     this.spawnPlayerAtStart();
     this.botAI.resetMatch(this.controller.position);
@@ -3714,6 +4375,7 @@ export class CombatSessionEngine {
       this.playerDamageDealt += damage;
       this.recordRemoteDamageAttribution(targetUserId, this.mp.localUserId);
       this.audio.playImpact(ev.point, headshot ? 'steel_plate' : 'wood');
+      if (headshot) this.audio.playHeadshotIndicator();
       this.remotePlayers.triggerHitFlinch(targetUserId);
 
       const hitPkt: GamePlayerHitPacket = {
@@ -3727,6 +4389,54 @@ export class CombatSessionEngine {
         ts: Date.now(),
       };
       this.mp.sendMessage(hitPkt as unknown as Record<string, unknown>);
+      this.emitSnapshot();
+      return;
+    }
+
+    // Killable 2-Man AI Mortar Crew (Gunner / Loader) in Conquest
+    if (ud?.mortarCrewPitId && this.mortarSystem) {
+      const pitId = String(ud.mortarCrewPitId);
+      const role: 'gunner' | 'loader' = ud.mortarCrewRole === 'loader' ? 'loader' : 'gunner';
+      const pitState = this.mortarSystem.getPitState(pitId);
+      if (!pitState || pitState.ownerTeam === this.localBattleTeam) return;
+
+      const headshot = ud.mortarHitZone === 'head';
+      const mult = headshot ? 2.2 : 1.0;
+      const dmg = Math.max(10, Math.min(350, Math.round(this.computeWeaponBaseDamage(ev) * mult)));
+
+      this.hitmarkerTimer = headshot ? 0.26 : 0.18;
+      this.hitmarkerHeadshot = headshot;
+      this.hitmarkerKill = false;
+      this.playerDamageDealt += dmg;
+      this.audio.playImpact(ev.point, headshot ? 'steel_plate' : 'wood');
+      if (headshot) this.audio.playHeadshotIndicator();
+
+      if (this.mp && !this.isMpHost) {
+        const crewPkt: GameMortarCrewDamagePacket = {
+          type: 'game:mortar_crew_damage',
+          pitId,
+          role,
+          damage: dmg,
+          headshot,
+          ts: Date.now(),
+        };
+        this.mp.sendMessage(crewPkt as unknown as Record<string, unknown>);
+      } else {
+        const hitRes = this.mortarSystem.damageCrewMember(pitId, role, dmg, headshot);
+        if (hitRes?.killed) {
+          this.hitmarkerKill = true;
+          this.playerKills += 1;
+          if (headshot) this.playerHeadshots += 1;
+          this.recordWeaponKill(this._runtimeProfile.id);
+          this.showToast(
+            hitRes.bothCrewDead
+              ? 'Enemy Mortar Crew Eliminated · Emplacement Capturable [F]'
+              : `Enemy Mortar ${role === 'loader' ? 'Loader' : 'Gunner'} Eliminated`,
+            2.6,
+          );
+          this.broadcastFireSupportSync();
+        }
+      }
       this.emitSnapshot();
       return;
     }
@@ -3813,6 +4523,7 @@ export class CombatSessionEngine {
         this.playerDamageDealt += Math.round(Math.max(8, baseDmg * mult));
         this.recordRemoteDamageAttribution(botId, this.mp.localUserId);
         this.audio.playImpact(ev.point, headshot ? 'steel_plate' : 'wood');
+        if (headshot) this.audio.playHeadshotIndicator();
         this.botAI.triggerVisualFlinch(botId);
 
         const dmgPkt: GameBotDamagePacket = {
@@ -3846,6 +4557,7 @@ export class CombatSessionEngine {
         this.hitmarkerHeadshot = res.headshot;
         this.hitmarkerKill = res.killed;
         this.audio.playImpact(ev.point, res.headshot ? 'steel_plate' : 'wood');
+        if (res.headshot) this.audio.playHeadshotIndicator();
 
         if (res.killed) {
           this.playerKills += 1;
@@ -3886,6 +4598,7 @@ export class CombatSessionEngine {
         this.hitmarkerHeadshot = headshot;
         this.hitmarkerKill = false;
         this.audio.playImpact(ev.point, headshot ? 'steel_plate' : 'wood');
+        if (headshot) this.audio.playHeadshotIndicator();
         this.zombieAI.playVisualHitFeedback(zombieId, ev.point, headshot);
         this.addPoints(10, 'HIT');
 
@@ -3925,6 +4638,7 @@ export class CombatSessionEngine {
         this.hitmarkerHeadshot = res.headshot;
         this.hitmarkerKill = res.killed;
         this.audio.playImpact(ev.point, res.headshot ? 'steel_plate' : 'wood');
+        if (res.headshot) this.audio.playHeadshotIndicator();
 
         if (res.pointsAwarded > 0) {
           this.addPoints(
@@ -4115,6 +4829,46 @@ export class CombatSessionEngine {
       if (pen.pierced) {
         this.audio.playImpact(ev.point, 'wood');
       }
+      return;
+    }
+
+    if (ud?.mortarCrewPitId && this.mortarSystem) {
+      const pitId = String(ud.mortarCrewPitId);
+      const role: 'gunner' | 'loader' = ud.mortarCrewRole === 'loader' ? 'loader' : 'gunner';
+      const pitState = this.mortarSystem.getPitState(pitId);
+      if (!pitState || pitState.ownerTeam === this.localBattleTeam) return;
+      const headshot = ud.mortarHitZone === 'head';
+      const dmg = Math.round(meleeDmg * (headshot ? 1.5 : 1.0));
+      this.hitmarkerTimer = 0.24;
+      this.hitmarkerHeadshot = headshot;
+      this.audio.playImpact(ev.point, 'wood');
+      if (headshot) this.audio.playHeadshotIndicator();
+      if (this.mp && !this.isMpHost) {
+        const crewPkt: GameMortarCrewDamagePacket = {
+          type: 'game:mortar_crew_damage',
+          pitId,
+          role,
+          damage: dmg,
+          headshot,
+          ts: Date.now(),
+        };
+        this.mp.sendMessage(crewPkt as unknown as Record<string, unknown>);
+      } else {
+        const hitRes = this.mortarSystem.damageCrewMember(pitId, role, dmg, headshot);
+        if (hitRes?.killed) {
+          this.hitmarkerKill = true;
+          this.playerKills += 1;
+          this.playerMeleeKills += 1;
+          this.showToast(
+            hitRes.bothCrewDead
+              ? 'Enemy Mortar Crew Eliminated · Emplacement Capturable [F]'
+              : `Enemy Mortar ${role === 'loader' ? 'Loader' : 'Gunner'} Eliminated`,
+            2.6,
+          );
+          this.broadcastFireSupportSync();
+        }
+      }
+      this.emitSnapshot();
       return;
     }
 
@@ -4436,6 +5190,9 @@ export class CombatSessionEngine {
 
       this.isFiring = false;
       this.input.ads = false;
+      if (this.seatedMortarPitId) {
+        this.exitLocalMortarSeat();
+      }
       if (this.grenadeSystem.isLeverReleased()) {
         this.handleGrenadeHolsterOrToss('death');
       } else {
@@ -4724,6 +5481,19 @@ export class CombatSessionEngine {
         blockedReason: null,
         isHoldAction: true,
         holdProgress: 0,
+      };
+    }
+
+    // 2b. Nearby Conquest 81mm Mortar Emplacement [F] prompt
+    if (this.nearbyMortarPrompt && !this.seatedMortarPitId) {
+      return {
+        id: this.nearbyMortarPrompt.pitId,
+        kind: 'mortar_emplacement',
+        label: '81mm Mortar',
+        actionText: this.nearbyMortarPrompt.promptText.replace(/^\[F\]\s*/i, ''),
+        cost: 0,
+        canAfford: this.nearbyMortarPrompt.canMount,
+        blockedReason: this.nearbyMortarPrompt.blockedReason ?? null,
       };
     }
 
@@ -5473,6 +6243,20 @@ export class CombatSessionEngine {
       this.pdaDevice.applyDragDelta(dx, dy);
       return;
     }
+    if (this.seatedMortarPitId && this.mortarSystem && !this.pdaDevice.isOpen()) {
+      const fineScale = this.mortarOpticalSight ? 0.55 : 1.0;
+      const dAz = dx * 0.00085 * fineScale;
+      const dEl = -dy * 0.00055 * fineScale;
+      if (Math.abs(dAz) > 1e-5 || Math.abs(dEl) > 1e-5) {
+        this.mortarSystem.adjustHandwheels(this.seatedMortarPitId, dAz, dEl);
+        this.mortarHandwheelAudioAccum += Math.abs(dAz) + Math.abs(dEl);
+        if (this.mortarHandwheelAudioAccum >= 0.035) {
+          this.mortarHandwheelAudioAccum = 0;
+          this.audio.playMortarHandwheelClick(this.mortarOpticalSight);
+        }
+      }
+      return;
+    }
     this.controller.handleMouseMove(dx, dy, this.config);
   };
 
@@ -5494,6 +6278,18 @@ export class CombatSessionEngine {
         this.pdaDevice.setDragging(true);
       } else if (e.button === 2 && this.pdaDevice.isOpen()) {
         this.pdaDevice.recenterOnPlayer();
+      }
+      return;
+    }
+
+    // Seated 81mm Mortar manual firing [LMB] and elbow collimator optical sight [RMB]
+    if (this.seatedMortarPitId && this.mortarSystem) {
+      if (e.button === 0) {
+        this.triggerLocalMortarFire();
+      } else if (e.button === 2) {
+        this.mortarOpticalSight = true;
+        this.audio.playTacticalSwitchClick(true);
+        this.emitSnapshot();
       }
       return;
     }
@@ -5574,6 +6370,10 @@ export class CombatSessionEngine {
         return;
       }
     } else if (e.button === 2) {
+      if (this.mortarOpticalSight) {
+        this.mortarOpticalSight = false;
+        this.emitSnapshot();
+      }
       this.input.ads = false;
     }
   };
@@ -5586,6 +6386,13 @@ export class CombatSessionEngine {
     if (this.pointerLocked && this.pdaDevice.isOpen()) {
       e.preventDefault();
       this.pdaDevice.applyWheel(e.deltaY);
+      return;
+    }
+    if (this.pointerLocked && this.seatedMortarPitId && this.mortarSystem) {
+      e.preventDefault();
+      const dEl = -Math.sign(e.deltaY) * 0.0045;
+      this.mortarSystem.adjustHandwheels(this.seatedMortarPitId, 0, dEl);
+      this.audio.playMortarHandwheelClick(true);
       return;
     }
     if (this.pointerLocked && this.activeDoorPrompt && this.activeDoorPrompt.options.length > 1) {
@@ -5637,25 +6444,46 @@ export class CombatSessionEngine {
 
     switch (e.code) {
       case 'Digit1':
-        this.equipSlot(0);
+        if (this.seatedMortarPitId && this.mortarSystem) {
+          this.mortarSystem.setChargeLevel(this.seatedMortarPitId, 1);
+          this.emitSnapshot();
+        } else {
+          this.equipSlot(0);
+        }
         break;
       case 'Digit2':
-        this.equipSlot(1);
+        if (this.seatedMortarPitId && this.mortarSystem) {
+          this.mortarSystem.setChargeLevel(this.seatedMortarPitId, 2);
+          this.emitSnapshot();
+        } else {
+          this.equipSlot(1);
+        }
         break;
       case 'Digit3':
-        this.equipSlot(-2);
+        if (this.seatedMortarPitId && this.mortarSystem) {
+          this.mortarSystem.setChargeLevel(this.seatedMortarPitId, 3);
+          this.emitSnapshot();
+        } else {
+          this.equipSlot(-2);
+        }
         break;
       case 'Digit4':
+        if (this.seatedMortarPitId && this.mortarSystem) {
+          this.mortarSystem.setChargeLevel(this.seatedMortarPitId, 4);
+          this.emitSnapshot();
+          break;
+        }
       case 'Digit5':
       case 'KeyH':
-        if (!e.repeat) this.drawOrHolsterGrenade();
+        if (!e.repeat && !this.seatedMortarPitId) this.drawOrHolsterGrenade();
         break;
       case 'Digit0':
-        this.equipSlot(-1);
+        if (!this.seatedMortarPitId) this.equipSlot(-1);
         break;
       case 'KeyI':
         if (
           !e.repeat &&
+          !this.seatedMortarPitId &&
           !this.pdaDevice.isBlockingWeaponActions() &&
           !this.controller.isSprinting &&
           !this.controller.isVaulting()
@@ -5684,19 +6512,37 @@ export class CombatSessionEngine {
         this.altHeld = true;
         break;
       case 'KeyC':
-        if (!e.repeat) this.controller.toggleCrouch();
+        if (!e.repeat && !this.seatedMortarPitId) this.controller.toggleCrouch();
         break;
       case 'KeyQ':
-        this.input.leanLeft = true;
+        if (this.seatedMortarPitId && this.mortarSystem) {
+          if (!e.repeat) {
+            this.mortarSystem.cycleChargeLevel(this.seatedMortarPitId, -1);
+            this.emitSnapshot();
+          }
+        } else {
+          this.input.leanLeft = true;
+        }
         break;
       case 'KeyE':
-        this.input.leanRight = true;
+        if (this.seatedMortarPitId && this.mortarSystem) {
+          if (!e.repeat) {
+            this.mortarSystem.cycleChargeLevel(this.seatedMortarPitId, 1);
+            this.emitSnapshot();
+          }
+        } else {
+          this.input.leanRight = true;
+        }
         break;
       case 'KeyF':
         this.interactKeyHeld = true;
         if (!e.repeat) {
-          if (this.tryStartHoldRepair()) {
+          if (this.seatedMortarPitId) {
+            this.exitLocalMortarSeat();
+          } else if (this.tryStartHoldRepair()) {
             // Started realistic two-handed Hold [F] electronics or door repair
+          } else if (this.nearbyMortarPrompt) {
+            this.tryMountNearbyMortar();
           } else if (this.activeDoorId && this.activeDoorPrompt) {
             this.executeSelectedDoorOption();
           } else if (this.params.mode === 'infection' && this.nearbyInteractable) {
@@ -5716,7 +6562,9 @@ export class CombatSessionEngine {
         if (!e.repeat) this.toggleLaser();
         break;
       case 'KeyR':
-        if (!e.repeat) {
+        if (this.seatedMortarPitId && !this.pdaDevice.isOpen()) {
+          this.mortarLevelHeld = true;
+        } else if (!e.repeat) {
           if (this.pdaDevice.isOpen()) {
             this.pdaDevice.recenterOnPlayer();
           } else {
@@ -6255,6 +7103,9 @@ export class CombatSessionEngine {
           this.emitSnapshot();
         }
         break;
+      case 'KeyR':
+        this.mortarLevelHeld = false;
+        break;
       case 'Space':
         this.input.vault = false;
         break;
@@ -6522,7 +7373,7 @@ export class CombatSessionEngine {
 
     // Step player controller, 3D PDA telemetry + choreography, & IK animator
     if (this.playerAlive) {
-      if (this.holdRepair.isActive()) {
+      if (this.holdRepair.isActive() || this.seatedMortarPitId) {
         this.input.ads = false;
         this.input.sprint = false;
       }
@@ -6532,47 +7383,91 @@ export class CombatSessionEngine {
         this.grenadeSystem.isLeverReleased(),
         this.grenadeSystem.getThrowStyle(),
       );
-      this.controller.update(
-        dt,
-        this.elapsedSec,
-        this.input,
-        this.adapter,
-        prof,
-        this._runtimeConfig,
-        this.stamina,
-        this.hp,
-        (drain) => {
-          this.stamina = Math.max(0, this.stamina - drain);
-        },
-      );
-
-      this.updatePdaTelemetry(dt);
-      if (this.lastKickHandlingTimer > 0) {
-        this.lastKickHandlingTimer = Math.max(0, this.lastKickHandlingTimer - dt);
-      }
-      // Step active Hold [F] electronics or door two-handed repair
-      if (this.holdRepair.isActive()) {
-        const completed = this.holdRepair.step(
-          dt,
-          this.interactKeyHeld && this.pointerLocked,
-          this.camera.position,
-          this.camera,
-          this.interactAnimator,
-        );
-        this.animator.setExternalHandOverride(
-          this.interactAnimator.isActive() ? this.interactAnimator.ikOverride : null,
-        );
-        if (completed) {
-          this.emitSnapshot();
+      if (this.seatedMortarPitId && this.mortarSystem) {
+        // Seated 81mm Mortar manual laying: WASD cranks deflection/elevation handwheels, Hold [R] levels bubble & stakes
+        if (!this.pdaDevice.isOpen()) {
+          const azDir = (this.input.right ? 1 : 0) - (this.input.left ? 1 : 0);
+          // W lowers tube toward 45 deg (longer range), S raises tube toward 80 deg (shorter range)
+          const elDir = (this.input.backward ? 1 : 0) - (this.input.forward ? 1 : 0);
+          const fine = this.mortarOpticalSight ? 0.45 : 1.0;
+          if (azDir !== 0 || elDir !== 0) {
+            const dAz = azDir * 0.48 * fine * dt;
+            const dEl = elDir * 0.30 * fine * dt;
+            this.mortarSystem.adjustHandwheels(this.seatedMortarPitId, dAz, dEl);
+            this.mortarHandwheelAudioAccum += Math.abs(dAz) + Math.abs(dEl);
+            if (this.mortarHandwheelAudioAccum >= 0.04) {
+              this.mortarHandwheelAudioAccum = 0;
+              this.audio.playMortarHandwheelClick(this.mortarOpticalSight);
+            }
+          }
+          if (this.mortarLevelHeld) {
+            this.mortarSystem.relevelBubbleAndStakes(this.seatedMortarPitId, dt);
+          }
         }
-      } else if (this.interactAnimator.isActive()) {
-        const active = this.interactAnimator.update(dt, this.camera);
-        this.animator.setExternalHandOverride(active ? this.interactAnimator.ikOverride : null);
+        const pitState = this.mortarSystem.getPitState(this.seatedMortarPitId);
+        if (pitState) {
+          this.controller.position.set(
+            pitState.position[0] - Math.sin(pitState.currentAzimuthRad) * 0.85,
+            pitState.position[1],
+            pitState.position[2] + Math.cos(pitState.currentAzimuthRad) * 0.85,
+          );
+        }
+        this.updatePdaTelemetry(dt);
+        if (
+          this.mortarSystem.getPlayerCameraPose(
+            this.seatedMortarPitId,
+            this.mortarOpticalSight && !this.pdaDevice.isOpen(),
+            this._mortarCamPos,
+            this._mortarCamLook,
+          )
+        ) {
+          this.camera.position.copy(this._mortarCamPos);
+          this.camera.lookAt(this._mortarCamLook);
+          this.camera.updateMatrixWorld();
+        }
       } else {
-        this.animator.setExternalHandOverride(null);
+        this.controller.update(
+          dt,
+          this.elapsedSec,
+          this.input,
+          this.adapter,
+          prof,
+          this._runtimeConfig,
+          this.stamina,
+          this.hp,
+          (drain) => {
+            this.stamina = Math.max(0, this.stamina - drain);
+          },
+        );
+
+        this.updatePdaTelemetry(dt);
+        if (this.lastKickHandlingTimer > 0) {
+          this.lastKickHandlingTimer = Math.max(0, this.lastKickHandlingTimer - dt);
+        }
+        // Step active Hold [F] electronics or door two-handed repair
+        if (this.holdRepair.isActive()) {
+          const completed = this.holdRepair.step(
+            dt,
+            this.interactKeyHeld && this.pointerLocked,
+            this.camera.position,
+            this.camera,
+            this.interactAnimator,
+          );
+          this.animator.setExternalHandOverride(
+            this.interactAnimator.isActive() ? this.interactAnimator.ikOverride : null,
+          );
+          if (completed) {
+            this.emitSnapshot();
+          }
+        } else if (this.interactAnimator.isActive()) {
+          const active = this.interactAnimator.update(dt, this.camera);
+          this.animator.setExternalHandOverride(active ? this.interactAnimator.ikOverride : null);
+        } else {
+          this.animator.setExternalHandOverride(null);
+        }
+        this.animator.update(dt, this.elapsedSec, this.controller, this.adapter, prof, this.input.ads);
+        this.animator.applyCameraAdditiveOverlay(this.camera);
       }
-      this.animator.update(dt, this.elapsedSec, this.controller, this.adapter, prof, this.input.ads);
-      this.animator.applyCameraAdditiveOverlay(this.camera);
     } else {
       if (this.pdaDevice.isOpen()) {
         this.pdaDevice.setOpen(false);
@@ -6642,9 +7537,11 @@ export class CombatSessionEngine {
 
     this.weaponRig.root.visible =
       this.playerAlive &&
+      !this.seatedMortarPitId &&
       !this.grenadeSystem.isWeaponHidden() &&
       !this.pdaDevice.isWeaponHidden();
-    this.skeleton.root.visible = this.playerAlive || this.playerRagdoll.isActive();
+    this.skeleton.root.visible =
+      (this.playerAlive && !this.seatedMortarPitId) || this.playerRagdoll.isActive();
 
     // Step drift-free 20 Hz multiplayer broadcast (+ immediate flush on stance/fire/reload/grenade transitions)
     if (this.mp && this.remotePlayers) {
@@ -6902,6 +7799,9 @@ export class CombatSessionEngine {
         );
         if (this.modeController) {
           this.modeController.update(dt, this.collectModeActors());
+        }
+        if (this.mortarSystem) {
+          this.updateMortarSystem(dt);
         }
         this.checkBattleVictory();
       } else if (this.params.mode === 'infection' && this.zombieAI) {
@@ -7482,6 +8382,13 @@ export class CombatSessionEngine {
             options: this.activeDoorPrompt.options.map((o) => ({ ...o })),
           }
         : null,
+      mortarHud:
+        this.seatedMortarPitId && this.mortarSystem
+          ? this.mortarSystem.getPlayerMortarHudTelemetry(
+              this.seatedMortarPitId,
+              this.mortarOpticalSight && !this.pdaDevice.isOpen(),
+            )
+          : null,
     };
   }
 
@@ -7851,6 +8758,48 @@ export class CombatSessionEngine {
       });
     }
 
+    let mortarTable: PdaMortarFiringTableTelemetry | null = null;
+    if (this.seatedMortarPitId && this.mortarSystem) {
+      const pit = this.mortarSystem.getPitState(this.seatedMortarPitId);
+      const hud = this.mortarSystem.getPlayerMortarHudTelemetry(this.seatedMortarPitId, false);
+      if (pit && hud) {
+        const ret = this.pdaDevice.getReticleWorldCoords();
+        const wind = this.mortarSystem.getWindVector();
+        const pitOrigin = this._mortarOriginScratch.set(
+          pit.position[0],
+          pit.position[1] + 1.15,
+          pit.position[2],
+        );
+        const targetGroundY = this.map.terrainHeightAt
+          ? this.map.terrainHeightAt(ret.x, ret.z)
+          : pit.position[1];
+        const targetPos = this._mortarTargetScratch.set(ret.x, targetGroundY, ret.z);
+        const sol = solveMortarFiringTable(pitOrigin, targetPos, wind.windX, wind.windZ);
+        const rec = sol.recommended;
+        mortarTable = {
+          pitId: pit.pitId,
+          pitX: pit.position[0],
+          pitZ: pit.position[2],
+          currentDeflectionMils: hud.deflectionMils,
+          currentElevationMils: hud.elevationMils,
+          currentElevationDeg: hud.elevationDeg,
+          currentChargeLevel: pit.currentChargeLevel,
+          targetX: ret.x,
+          targetZ: ret.z,
+          targetRangeM: sol.horizontalRangeM,
+          recommendedCharge: rec ? rec.charge : null,
+          solutionDeflectionMils: rec ? rec.deflectionMils : sol.rawBearingMils,
+          solutionElevationMils: rec ? rec.elevationMils : 0,
+          solutionElevationDeg: rec ? rec.elevationDeg : 0,
+          solutionFlightTimeSec: rec ? rec.flightTimeSec : 0,
+          windLeadMils: rec ? rec.windLeadMils : 0,
+          inRange: Boolean(rec?.inRange),
+          foAddDropM: hud.foAddDropM,
+          foLeftRightM: hud.foLeftRightM,
+        };
+      }
+    }
+
     this.controller.writePdaMotionState(this._pdaMotionScratch);
     this.pdaDevice.setTelemetry({
       playerX: this.controller.position.x,
@@ -7863,6 +8812,7 @@ export class CombatSessionEngine {
       zoneLabel: this.map.name.toUpperCase(),
       allies: this._pdaAllyBuf,
       pings: this._pdaPingBuf,
+      mortarTable,
     });
     this.pdaDevice.update(
       dt,
@@ -7900,6 +8850,8 @@ export class CombatSessionEngine {
       document.exitPointerLock();
     }
     this.remotePlayers?.dispose();
+    this.mortarSystem?.dispose();
+    this.mortarSystem = null;
     this.modeController?.dispose();
     this.modeController = null;
     this.scene.remove(this.modeSceneGroup);

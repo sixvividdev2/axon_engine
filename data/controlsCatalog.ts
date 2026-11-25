@@ -69,7 +69,7 @@ export const CONTROL_BINDING_GROUPS: readonly ControlBindingGroup[] = [
     title: 'Interactions, PDA & Interface',
     description: 'World interactions, squad communications, tactical map, and menus.',
     bindings: [
-      { id: 'interact', keys: ['F'], action: 'Interact (Doors, Armory, Repairs, Loot)' },
+      { id: 'interact', keys: ['F'], action: 'Interact (Doors, Armory, Repairs, Mortars, Loot)' },
       { id: 'interact_scroll', keys: ['Scroll'], action: 'Cycle Contextual Action Prompt' },
       {
         id: 'pda',
