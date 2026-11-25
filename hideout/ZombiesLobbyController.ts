@@ -34,9 +34,10 @@ import {
 } from '../data/attachments';
 import { getDefaultAmmoVariant, resolveBaseCaliberId } from '../data/calibers';
 import {
-  getEffectiveFireMode,
-  SelectableFireMode,
-  toggleWeaponFireMode,
+  fireModeStore,
+  getEffectiveFireRpm,
+  isSingleShotFireMode,
+  shouldCyclePumpOnShot,
 } from '../data/fireModeControl';
 import { AdaptivePerformanceController, graphicsQualityStore } from '../data/graphicsQuality';
 import { keybindStore } from '../data/keybindStore';
@@ -140,7 +141,6 @@ export class ZombiesLobbyController {
 
   private shiftHeld = false;
   private holdBreathHeld = false;
-  private fireModeOverrideByWeapon: Record<string, SelectableFireMode> = {};
   private keyFHeld = false;
   private stamina = 1.0;
   private heartRateBpm = 72;
@@ -644,8 +644,8 @@ export class ZombiesLobbyController {
     ) {
       return;
     }
-    const effectiveMode = getEffectiveFireMode(prof, this.fireModeOverrideByWeapon);
-    const isSingle = effectiveMode === 'semi' || effectiveMode === 'bolt' || effectiveMode === 'pump';
+    const effectiveMode = fireModeStore.getEffectiveMode(prof);
+    const isSingle = isSingleShotFireMode(effectiveMode);
     if (isSingle && this.semiTriggerConsumed) return;
 
     if (currentAmmo <= 0) {
@@ -659,7 +659,8 @@ export class ZombiesLobbyController {
 
     const remaining = currentAmmo - 1;
     this.magAmmoByWeapon[prof.id] = remaining;
-    this.fireCooldown = 60 / Math.max(25, prof.rpm);
+    const effectiveRpm = getEffectiveFireRpm(prof, effectiveMode);
+    this.fireCooldown = 60 / Math.max(25, effectiveRpm);
     if (isSingle) this.semiTriggerConsumed = true;
 
     const derived = this.weaponRig.getDerivedStats();
@@ -679,7 +680,11 @@ export class ZombiesLobbyController {
     const muzzleVel = ammo.baseVelocityMs * (prof.barrelVelocityMult ?? 1.0) * derived.velocityMult;
     const shotImpulse = THREE.MathUtils.clamp((ammo.bulletMassGrams * muzzleVel) / 4500, 0.75, 1.65);
     this.physicsProps.handleBulletRay(this._muzzlePos, this._muzzleDir, 85, shotImpulse);
-    this.weaponRig.triggerFire(derived.isSuppressed, remaining);
+    this.weaponRig.triggerFire(
+      derived.isSuppressed,
+      remaining,
+      shouldCyclePumpOnShot(prof, effectiveMode),
+    );
     this.weaponRig.setAmmoState(remaining, true);
     this.controller.applyRecoil(
       prof.recoilPitchRad,
@@ -1241,8 +1246,9 @@ export class ZombiesLobbyController {
       case 'KeyK':
         if (!e.repeat && this.equippedWeaponId !== 'unarmed' && !this.swapChoreography.isActive()) {
           const prof = resolveWeaponProfile(this.equippedWeaponId);
-          const res = toggleWeaponFireMode(prof, this.fireModeOverrideByWeapon);
+          const res = fireModeStore.toggle(prof);
           if (res.toggled) {
+            this.weaponRig.emitModeToggleCue();
             this.audio.playWeaponCue('mode_toggle', { intensity: 0.55 });
             this.showToast(`Fire Mode: ${res.label}`);
             this.emitSnapshot(true);

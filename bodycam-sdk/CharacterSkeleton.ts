@@ -2459,69 +2459,71 @@ export class CharacterSkeleton {
       const wrapScale = supportWrapTight * scale;
 
       if (style === 'vertical_grip') {
-        setFinger(hand.index, 72 * wrapScale, 86 * wrapScale, 52 * wrapScale);
-        setFinger(hand.middle, 78 * wrapScale, 92 * wrapScale, 56 * wrapScale);
-        setFinger(hand.ring, 82 * wrapScale, 96 * wrapScale, 60 * wrapScale);
-        setFinger(hand.pinky, 86 * wrapScale, 100 * wrapScale, 64 * wrapScale);
+        // Locked horizontal fist wrap around vertical foregrip cylinder (thumb high on grip collar)
+        setFinger(hand.index, 62 * wrapScale, 60 * wrapScale, 34 * wrapScale);
+        setFinger(hand.middle, 64 * wrapScale, 62 * wrapScale, 35 * wrapScale);
+        setFinger(hand.ring, 66 * wrapScale, 64 * wrapScale, 36 * wrapScale);
+        setFinger(hand.pinky, 68 * wrapScale, 64 * wrapScale, 36 * wrapScale);
         hand.thumbProx.rotation.set(
-          THREE.MathUtils.lerp(-0.34, 0.04, padTap01),
-          s * THREE.MathUtils.lerp(0.44, 0.24, padTap01),
-          THREE.MathUtils.lerp(-s * 0.16, s * 0.14, padTap01),
+          THREE.MathUtils.lerp(-0.30, -0.06, padTap01),
+          s * THREE.MathUtils.lerp(0.58, 0.36, padTap01),
+          s * THREE.MathUtils.lerp(-0.18, 0.10, padTap01),
         );
-        hand.thumbDist.rotation.set(THREE.MathUtils.lerp(-0.52, -0.18, padTap01), 0, 0);
+        hand.thumbDist.rotation.set(THREE.MathUtils.lerp(-0.46, -0.22, padTap01), 0, 0);
         return;
       }
       if (style === 'angled_grip') {
-        setFinger(hand.index, 15 * wrapScale, 24 * wrapScale, 13 * wrapScale);
-        setFinger(hand.middle, 28 * wrapScale, 42 * wrapScale, 26 * wrapScale);
-        setFinger(hand.ring, 33 * wrapScale, 47 * wrapScale, 29 * wrapScale);
-        setFinger(hand.pinky, 38 * wrapScale, 52 * wrapScale, 32 * wrapScale);
+        // Tight angled wrap hugging AFG wedge & handstop with thumb indexed forward along left side rail
+        setFinger(hand.index, 50 * wrapScale, 50 * wrapScale, 35 * wrapScale);
+        setFinger(hand.middle, 50 * wrapScale, 52 * wrapScale, 40 * wrapScale);
+        setFinger(hand.ring, 52 * wrapScale, 52 * wrapScale, 40 * wrapScale);
+        setFinger(hand.pinky, 48 * wrapScale, 46 * wrapScale, 33 * wrapScale);
         hand.thumbProx.rotation.set(
-          THREE.MathUtils.lerp(0.08, 0.18, padTap01),
-          s * THREE.MathUtils.lerp(0.12, 0.26, padTap01),
-          s * THREE.MathUtils.lerp(0.28, 0.12, padTap01),
+          THREE.MathUtils.lerp(-0.52, -0.38, padTap01),
+          s * THREE.MathUtils.lerp(1.35, 1.22, padTap01),
+          s * THREE.MathUtils.lerp(0.14, 0.04, padTap01),
         );
-        hand.thumbDist.rotation.set(THREE.MathUtils.lerp(-0.14, -0.30, padTap01), 0, 0);
+        hand.thumbDist.rotation.set(THREE.MathUtils.lerp(-0.14, -0.28, padTap01), 0, 0);
         return;
       }
       if (style === 'pump_forend') {
-        // Firm cradled cup around ribbed shotgun pump forend
-        setFinger(hand.index, 30 * wrapScale, 44 * wrapScale, 28 * wrapScale);
-        setFinger(hand.middle, 34 * wrapScale, 48 * wrapScale, 31 * wrapScale);
-        setFinger(hand.ring, 38 * wrapScale, 52 * wrapScale, 34 * wrapScale);
-        setFinger(hand.pinky, 42 * wrapScale, 56 * wrapScale, 36 * wrapScale);
+        // Deep under-forend cradle wrap hugging ribbed pump shotgun slide
+        setFinger(hand.index, 61 * wrapScale, 58 * wrapScale, 47 * wrapScale);
+        setFinger(hand.middle, 58 * wrapScale, 61 * wrapScale, 52 * wrapScale);
+        setFinger(hand.ring, 61 * wrapScale, 61 * wrapScale, 52 * wrapScale);
+        setFinger(hand.pinky, 58 * wrapScale, 54 * wrapScale, 40 * wrapScale);
         hand.thumbProx.rotation.set(
-          THREE.MathUtils.lerp(-0.10, 0.08, padTap01),
-          s * THREE.MathUtils.lerp(0.24, 0.30, padTap01),
-          s * 0.16,
+          THREE.MathUtils.lerp(-0.54, -0.38, padTap01),
+          s * THREE.MathUtils.lerp(1.30, 1.18, padTap01),
+          s * THREE.MathUtils.lerp(0.16, 0.06, padTap01),
         );
-        hand.thumbDist.rotation.set(THREE.MathUtils.lerp(-0.28, -0.36, padTap01), 0, 0);
+        hand.thumbDist.rotation.set(THREE.MathUtils.lerp(-0.20, -0.34, padTap01), 0, 0);
         return;
       }
       if (style === 'handguard_cradle') {
-        // Modern high-thumb C-clamp over slim free-float MLOK handguard
-        setFinger(hand.index, 24 * wrapScale, 36 * wrapScale, 22 * wrapScale);
-        setFinger(hand.middle, 29 * wrapScale, 42 * wrapScale, 26 * wrapScale);
-        setFinger(hand.ring, 33 * wrapScale, 46 * wrapScale, 29 * wrapScale);
-        setFinger(hand.pinky, 37 * wrapScale, 50 * wrapScale, 32 * wrapScale);
+        // Anatomical C-clamp: fingers curl snugly up & inward around right/top-right rail, thumb rides top-left
+        setFinger(hand.index, 62 * wrapScale, 60 * wrapScale, 53 * wrapScale);
+        setFinger(hand.middle, 60 * wrapScale, 62 * wrapScale, 55 * wrapScale);
+        setFinger(hand.ring, 62 * wrapScale, 62 * wrapScale, 55 * wrapScale);
+        setFinger(hand.pinky, 57 * wrapScale, 50 * wrapScale, 39 * wrapScale);
         hand.thumbProx.rotation.set(
-          THREE.MathUtils.lerp(0.04, 0.16, padTap01),
-          s * THREE.MathUtils.lerp(0.32, 0.38, padTap01),
-          s * THREE.MathUtils.lerp(0.26, 0.14, padTap01),
+          THREE.MathUtils.lerp(-0.92, -0.78, padTap01),
+          s * THREE.MathUtils.lerp(1.22, 1.08, padTap01),
+          s * THREE.MathUtils.lerp(-0.18, -0.04, padTap01),
         );
-        hand.thumbDist.rotation.set(THREE.MathUtils.lerp(-0.16, -0.34, padTap01), 0, 0);
+        hand.thumbDist.rotation.set(THREE.MathUtils.lerp(-0.34, -0.48, padTap01), 0, 0);
         return;
       }
-      setFinger(hand.index, 22 * wrapScale, 32 * wrapScale, 20 * wrapScale);
-      setFinger(hand.middle, 26 * wrapScale, 37 * wrapScale, 24 * wrapScale);
-      setFinger(hand.ring, 29 * wrapScale, 40 * wrapScale, 26 * wrapScale);
-      setFinger(hand.pinky, 33 * wrapScale, 44 * wrapScale, 28 * wrapScale);
+      setFinger(hand.index, 60 * wrapScale, 58 * wrapScale, 48 * wrapScale);
+      setFinger(hand.middle, 58 * wrapScale, 60 * wrapScale, 50 * wrapScale);
+      setFinger(hand.ring, 60 * wrapScale, 60 * wrapScale, 50 * wrapScale);
+      setFinger(hand.pinky, 56 * wrapScale, 50 * wrapScale, 38 * wrapScale);
       hand.thumbProx.rotation.set(
-        THREE.MathUtils.lerp(-0.06, 0.12, padTap01),
-        s * THREE.MathUtils.lerp(0.20, 0.30, padTap01),
-        s * THREE.MathUtils.lerp(0.14, 0.08, padTap01),
+        THREE.MathUtils.lerp(-0.78, -0.62, padTap01),
+        s * THREE.MathUtils.lerp(1.20, 1.08, padTap01),
+        s * THREE.MathUtils.lerp(-0.10, 0.02, padTap01),
       );
-      hand.thumbDist.rotation.set(THREE.MathUtils.lerp(-0.22, -0.34, padTap01), 0, 0);
+      hand.thumbDist.rotation.set(THREE.MathUtils.lerp(-0.30, -0.42, padTap01), 0, 0);
       return;
     }
 

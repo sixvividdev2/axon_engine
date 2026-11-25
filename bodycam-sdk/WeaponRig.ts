@@ -1140,8 +1140,15 @@ export class WeaponRig {
   private syncSocketsFromAssembly(asm: WeaponModelAssembly): void {
     this.rightHandSocketAnchor.position.copy(asm.rightHandSocket.position);
     this.rightHandSocketAnchor.rotation.copy(asm.rightHandSocket.rotation);
-    this.leftHandSocketAnchor.position.copy(asm.leftHandSocket.position);
-    this.leftHandSocketAnchor.rotation.copy(asm.leftHandSocket.rotation);
+    if (asm.leftHandSocket.parent && asm.leftHandSocket.parent !== asm.group) {
+      asm.group.updateMatrixWorld(true);
+      asm.leftHandSocket.getWorldPosition(this.leftHandSocketAnchor.position);
+      asm.group.worldToLocal(this.leftHandSocketAnchor.position);
+      this.leftHandSocketAnchor.rotation.copy(asm.leftHandSocket.rotation);
+    } else {
+      this.leftHandSocketAnchor.position.copy(asm.leftHandSocket.position);
+      this.leftHandSocketAnchor.rotation.copy(asm.leftHandSocket.rotation);
+    }
     this.hasLeftHandSocket = asm.hasLeftHandSocket;
 
     this.syncMuzzleFromAssembly();

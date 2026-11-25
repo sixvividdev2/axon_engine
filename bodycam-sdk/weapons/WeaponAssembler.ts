@@ -2147,19 +2147,37 @@ export class WeaponAssembler {
         assembly.handPoseProfile.supportRadiusM = 0.019;
       }
       if (assembly.hasLeftHandSocket) {
-        const off = gripDef.leftHandSocketOffset ?? [0, 0, 0];
-        const rOff = gripDef.leftHandRotOffset ?? [0, 0, 0];
-        assembly.leftHandSocket.position.set(
-          assembly.baseLeftHandPos.x + off[0],
-          assembly.baseLeftHandPos.y + off[1],
-          assembly.baseLeftHandPos.z + off[2],
-        );
-        assembly.leftHandSocket.rotation.set(
-          assembly.baseLeftHandRot.x + rOff[0],
-          assembly.baseLeftHandRot.y + rOff[1],
-          assembly.baseLeftHandRot.z + rOff[2],
-        );
-        assembly.leftGripCurl = gripDef.leftGripCurl ?? assembly.baseLeftGripCurl;
+        const socketParent = assembly.leftHandSocket.parent ?? assembly.group;
+        assembly.group.updateMatrixWorld(true);
+        const fgPos = new THREE.Vector3();
+        assembly.foregripMountSocket.getWorldPosition(fgPos);
+        socketParent.worldToLocal(fgPos);
+
+        if (gripDef.id === 'grip_vertical_rk') {
+          // Align palm flush to rear-left of vertical shaft (center at fgPos + [0, -0.054, 0], R=0.0155)
+          assembly.leftHandSocket.position.set(fgPos.x - 0.032, fgPos.y - 0.0485, fgPos.z + 0.045);
+          assembly.leftHandSocket.rotation.set(-0.042, -0.284, 1.579);
+          assembly.leftGripCurl = gripDef.leftGripCurl ?? 1.0;
+        } else if (gripDef.id === 'grip_angled_afg') {
+          // Align palm to sloped AFG wedge with tight angled wrap & thumb along left side rail
+          assembly.leftHandSocket.position.set(fgPos.x - 0.042, fgPos.y - 0.0205, fgPos.z + 0.023);
+          assembly.leftHandSocket.rotation.set(-0.157, -1.175, 2.866);
+          assembly.leftGripCurl = gripDef.leftGripCurl ?? 0.92;
+        } else {
+          const off = gripDef.leftHandSocketOffset ?? [0, 0, 0];
+          const rOff = gripDef.leftHandRotOffset ?? [0, 0, 0];
+          assembly.leftHandSocket.position.set(
+            assembly.baseLeftHandPos.x + off[0],
+            assembly.baseLeftHandPos.y + off[1],
+            assembly.baseLeftHandPos.z + off[2],
+          );
+          assembly.leftHandSocket.rotation.set(
+            assembly.baseLeftHandRot.x + rOff[0],
+            assembly.baseLeftHandRot.y + rOff[1],
+            assembly.baseLeftHandRot.z + rOff[2],
+          );
+          assembly.leftGripCurl = gripDef.leftGripCurl ?? assembly.baseLeftGripCurl;
+        }
       }
     }
 

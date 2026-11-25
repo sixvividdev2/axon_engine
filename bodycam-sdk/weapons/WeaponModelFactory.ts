@@ -2761,6 +2761,34 @@ export class WeaponModelFactory {
       }
     });
 
+    // Calibrate leftHandSocket directly against each long gun's physical handguard/pump forend geometry
+    // so fingers wrap snugly around the outer surface with zero clipping on every weapon in the arsenal.
+    if (hasLeftHandSocket && (spec.holdClass === 'rifle' || spec.holdClass === 'shotgun')) {
+      if (style === 'P90Bullpup') {
+        leftHandSocket.position.set(-0.028, -0.038, -0.106);
+        leftHandSocket.rotation.set(-0.042, -0.284, 1.579);
+        handPoseProfile.supportStyle = 'vertical_grip';
+        handPoseProfile.baseSupportStyle = 'vertical_grip';
+        handPoseProfile.supportRadiusM = 0.0175;
+        handPoseProfile.baseSupportRadiusM = 0.0175;
+      } else if (pumpForend && handPoseProfile.supportStyle === 'pump_forend') {
+        // Parent leftHandSocket directly to pumpForend so support hand tracks 1:1 during pump cycles
+        pumpForend.add(leftHandSocket);
+        const fgLocal = foregripMountSocket.position;
+        leftHandSocket.position.set(fgLocal.x - 0.047, fgLocal.y + 0.006, fgLocal.z + 0.017);
+        leftHandSocket.rotation.set(-0.464, -1.253, 2.576);
+      } else if (foregripMountSocket.position.lengthSq() > 1e-6) {
+        group.updateMatrixWorld(true);
+        const fgInGroup = new THREE.Vector3();
+        foregripMountSocket.getWorldPosition(fgInGroup);
+        group.worldToLocal(fgInGroup);
+        leftHandSocket.position.set(fgInGroup.x - 0.048, fgInGroup.y + 0.0045, fgInGroup.z + 0.019);
+        leftHandSocket.rotation.set(-0.464, -1.253, 2.576);
+      }
+      baseLeftHandPos.copy(leftHandSocket.position);
+      baseLeftHandRot.copy(leftHandSocket.rotation);
+    }
+
     const baseAdsEyeReliefM = adsEyeReliefM;
     const baseMagazine = magazine;
 

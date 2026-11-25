@@ -56,10 +56,11 @@ import {
   resolveBaseCaliberId,
 } from '../data/calibers';
 import {
+  fireModeStore,
   formatFireModeLabel,
-  getEffectiveFireMode as resolveEffectiveFireMode,
-  SelectableFireMode,
-  toggleWeaponFireMode,
+  getEffectiveFireRpm,
+  isSingleShotFireMode,
+  shouldCyclePumpOnShot,
 } from '../data/fireModeControl';
 import { keybindStore } from '../data/keybindStore';
 import { AdaptivePerformanceController, graphicsQualityStore } from '../data/graphicsQuality';
@@ -241,7 +242,6 @@ export class HideoutSessionController {
   private localGear: OperatorGearConfig;
   private equippedWeaponId = 'm4a1';
   private magAmmoByWeapon: Record<string, number> = {};
-  private fireModeOverrideByWeapon: Record<string, SelectableFireMode> = {};
   private adsModeByWeapon: Record<string, AdsMode> = {};
   private tacticalEquipmentId: TacticalEquipmentId = DEFAULT_TACTICAL_EQUIPMENT_ID;
   private grenadeCount = 2;
@@ -1320,7 +1320,7 @@ export class HideoutSessionController {
   }
 
   private getEffectiveFireMode(prof: BodycamWeaponProfile): BodycamWeaponProfile['fireMode'] {
-    return resolveEffectiveFireMode(prof, this.fireModeOverrideByWeapon);
+    return fireModeStore.getEffectiveMode(prof);
   }
 
   private getFireModeLabel(prof: BodycamWeaponProfile): string {
@@ -1382,7 +1382,7 @@ export class HideoutSessionController {
     if (this.weaponRig.getReadOnlyRigState().pullbackRatio > 0.72) return;
 
     const effMode = this.getEffectiveFireMode(prof);
-    const isSingleShot = effMode === 'semi' || effMode === 'bolt' || effMode === 'pump';
+    const isSingleShot = isSingleShotFireMode(effMode);
     if (isSingleShot && this.semiTriggerConsumed) return;
 
     if (currentAmmo <= 0) {
@@ -1396,7 +1396,8 @@ export class HideoutSessionController {
 
     const remainingAmmo = currentAmmo - 1;
     this.magAmmoByWeapon[prof.id] = remainingAmmo;
-    this.fireCooldown = 60 / Math.max(25, prof.rpm);
+    const effectiveRpm = getEffectiveFireRpm(prof, effMode);
+    this.fireCooldown = 60 / Math.max(25, effectiveRpm);
     if (isSingleShot) {
       this.semiTriggerConsumed = true;
     }
@@ -1446,7 +1447,7 @@ export class HideoutSessionController {
       });
     }
 
-    this.weaponRig.triggerFire(suppressed, remainingAmmo);
+    this.weaponRig.triggerFire(suppressed, remainingAmmo, shouldCyclePumpOnShot(prof, effMode));
     this.weaponRig.setAmmoState(remainingAmmo, true);
     if (!suppressed) {
       this.postProcess.triggerNvgFlashSpike(0.5);
@@ -2718,8 +2719,9 @@ export class HideoutSessionController {
           !this.pdaDevice.isBlockingWeaponActions()
         ) {
           const prof = resolveWeaponProfile(this.equippedWeaponId);
-          const res = toggleWeaponFireMode(prof, this.fireModeOverrideByWeapon);
+          const res = fireModeStore.toggle(prof);
           if (res.toggled) {
+            this.weaponRig.emitModeToggleCue();
             this.audio.playWeaponCue('mode_toggle', { intensity: 0.55 });
             this.showToast(`Fire Mode: ${res.label}`);
             this.emitSnapshot(true);

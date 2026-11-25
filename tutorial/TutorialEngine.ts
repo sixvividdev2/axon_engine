@@ -6,6 +6,7 @@ import {
   BodycamInputState,
   BodycamMeleeHitEvent,
   BodycamPostProcess,
+  BodycamRaycastResult,
   BodycamSDKConfig,
   BodycamWeaponProfile,
   CharacterAnimator,
@@ -13,6 +14,7 @@ import {
   computeTargetHingeAngularImpulse,
   createBodycamPhysicsPropAdapter,
   createPdaMotionState,
+  createRaycastResult,
   DEFAULT_BODYCAM_SDK_CONFIG,
   DEFAULT_TRAUMA_MODIFIERS,
   DynamicPhysicsPropSystem,
@@ -44,14 +46,21 @@ import {
   resolveBaseCaliberId,
 } from '../data/calibers';
 import {
+  fireModeStore,
   formatFireModeLabel,
-  getEffectiveFireMode,
-  SelectableFireMode,
-  toggleWeaponFireMode,
+  getEffectiveFireRpm,
+  isSingleShotFireMode,
+  shouldCyclePumpOnShot,
 } from '../data/fireModeControl';
 import { graphicsQualityStore } from '../data/graphicsQuality';
 import { keybindStore } from '../data/keybindStore';
 import { getTacticalEquipmentDef, TacticalEquipmentId } from '../data/tacticalEquipment';
+import {
+  DoorInteractOption,
+  DoorInteractOptionId,
+} from '../doors/DestructibleDoorSystem';
+import { HoldRepairController } from '../doors/HoldRepairController';
+import { PlayerInteractAnimator } from '../doors/PlayerInteractAnimator';
 import { GymBallistics } from '../gym/GymBallistics';
 import {
   TUTORIAL_STEPS,
@@ -59,6 +68,17 @@ import {
   TutorialCourseStateMachine,
 } from './TutorialCourseLogic';
 import { buildTutorialWorld, TutorialWorldHandle } from './TutorialWorld';
+
+export interface TutorialDoorPromptState {
+  title: string;
+  options: Array<{ id: string; label: string; hint?: string }>;
+  selectedIndex: number;
+}
+
+export interface TutorialRepairState {
+  label: string;
+  progress01: number;
+}
 
 export interface TutorialSnapshot {
   course: TutorialCourseSnapshot;
@@ -79,6 +99,8 @@ export interface TutorialSnapshot {
   grenadeStage: GrenadeHoldStage;
   isPdaOpen: boolean;
   doorPrompt: string | null;
+  doorPromptState: TutorialDoorPromptState | null;
+  repairState: TutorialRepairState | null;
   toastMessage: string | null;
   masterVolume: number;
 }
@@ -150,6 +172,8 @@ export class TutorialEngine {
   private readonly grenadeSystem: TacticalGrenadeSystem;
   private readonly physicsProps: DynamicPhysicsPropSystem;
   private readonly course: TutorialCourseStateMachine;
+  private readonly interactAnimator = new PlayerInteractAnimator();
+  private readonly holdRepair = new HoldRepairController();
 
   private readonly config: BodycamSDKConfig = { ...DEFAULT_BODYCAM_SDK_CONFIG };
   private readonly _pdaMotionScratch = createPdaMotionState();
@@ -162,6 +186,11 @@ export class TutorialEngine {
   private readonly _playerVelScratch = new THREE.Vector3();
   private readonly _whipVel = new THREE.Vector2();
   private readonly _doorCenter = new THREE.Vector3();
+  private readonly _ikTargetPos = new THREE.Vector3();
+  private readonly _repairAnchorScratch = new THREE.Vector3();
+  private readonly _blastDirScratch = new THREE.Vector3();
+  private readonly _doorRaycaster = new THREE.Raycaster();
+  private readonly _doorOcclHit: BodycamRaycastResult = createRaycastResult();
   private readonly irIlluminatorLight: THREE.SpotLight;
   private readonly irIlluminatorTarget = new THREE.Object3D();
 
@@ -184,7 +213,6 @@ export class TutorialEngine {
   private readonly attachmentsByWeapon: Record<string, WeaponAttachments> = {};
   private readonly magAmmoByWeapon: Record<string, number> = {};
   private readonly adsModeByWeapon: Record<string, AdsMode> = {};
-  private readonly fireModeOverrideByWeapon: Record<string, SelectableFireMode> = {};
   private equippedWeaponId = 'm4_556';
   private readonly tacticalEquipmentId: TacticalEquipmentId = 'm67_frag';
 
@@ -195,6 +223,7 @@ export class TutorialEngine {
   private semiTriggerConsumed = false;
   private sprintHeld = false;
   private holdBreathHeld = false;
+  private keyFHeld = false;
   private flashlightOn = false;
   private nvgFlipped = false;
   private grenadeCount = 6;
@@ -210,6 +239,10 @@ export class TutorialEngine {
   private prevPosZ = 22;
   private wasVaulting = false;
   private doorPrompt: string | null = null;
+  private activeDoorId: string | null = null;
+  private activeDoorTitle = '';
+  private activeDoorOptions: DoorInteractOption[] = [];
+  private selectedDoorOptionIndex = 0;
   private toastMessage: string | null = null;
   private toastTimer = 0;
   private contextLost = false;
@@ -258,6 +291,7 @@ export class TutorialEngine {
       this.config.masterVolume,
       this.config.gearRattleGain,
     );
+    this.world.doorSystem.setAudioVolume(this.config.masterVolume);
 
     this.weaponRig = new WeaponRig(this.scene, this.isSoftwareGl, this.audio);
     this.weaponRig.flashlight.intensity = 0;
@@ -369,9 +403,31 @@ export class TutorialEngine {
       },
       audio: this.audio,
       onDetonate: (ev) => {
-        // Blast shatters bottles and sends cans, boxes & papers flying in Bay 07 pit!
+        // Blast shatters bottles, sends cans/boxes/papers flying, and can blast-breach Bay 05 door!
         if (ev.kind !== 'smoke') {
           this.physicsProps.handleBlast(ev.position, 8.5, 18.0);
+          if (this.world.doorSystem.getDoorCenterWorldPos(this.world.doorId, this._doorCenter)) {
+            if (ev.position.distanceTo(this._doorCenter) < 4.8) {
+              this._blastDirScratch.subVectors(this._doorCenter, ev.position);
+              this._blastDirScratch.y = 0;
+              if (this._blastDirScratch.lengthSq() < 1e-4) {
+                this._blastDirScratch.set(0, 0, -1);
+              } else {
+                this._blastDirScratch.normalize();
+              }
+              this.world.doorSystem.executeKick(
+                this.world.doorId,
+                this._blastDirScratch,
+                6.2,
+                true,
+                undefined,
+                false,
+                undefined,
+                ev.position,
+              );
+              this.course.recordEvent('door_interact');
+            }
+          }
         }
         // Safe training detonation — no self-damage, restock if empty
         if (this.grenadeCount <= 1) this.grenadeCount = 6;
@@ -491,15 +547,18 @@ export class TutorialEngine {
       this.config.masterVolume,
       this.config.gearRattleGain,
     );
+    this.world.doorSystem.setAudioVolume(this.config.masterVolume);
     this.emitSnapshot();
   }
 
   public skipCurrentStep(): void {
+    this.holdRepair.cancel(this.interactAnimator);
+    this.interactAnimator.cancel();
     const next = this.course.skipStep();
     if (!this.course.isCourseComplete()) {
       this.teleportTo(next.spawnPos[0], next.spawnPos[1], next.spawnPos[2], next.spawnYaw);
-      if (next.index > 4 && !this.world.door.isOpen) {
-        this.world.toggleDoor(true);
+      if (next.index > 4) {
+        this.world.openDoorForSkip();
       }
     }
     this.syncWaypoint();
@@ -508,11 +567,13 @@ export class TutorialEngine {
   }
 
   public jumpToStep(index: number): void {
+    this.holdRepair.cancel(this.interactAnimator);
+    this.interactAnimator.cancel();
     const step = this.course.jumpToStep(index);
     this.teleportTo(step.spawnPos[0], step.spawnPos[1], step.spawnPos[2], step.spawnYaw);
-    if (step.index > 4 && !this.world.door.isOpen) {
-      this.world.toggleDoor(true);
-    } else if (step.index <= 4) {
+    if (step.index > 4) {
+      this.world.openDoorForSkip();
+    } else {
       this.world.resetDoor();
     }
     this.syncWaypoint();
@@ -521,6 +582,8 @@ export class TutorialEngine {
   }
 
   public restartCourse(): void {
+    this.holdRepair.cancel(this.interactAnimator);
+    this.interactAnimator.cancel();
     const first = this.course.restart();
     this.world.resetDoor();
     this.grenadeCount = 6;
@@ -536,6 +599,8 @@ export class TutorialEngine {
   public dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    this.holdRepair.cancel(this.interactAnimator);
+    this.interactAnimator.cancel();
     cancelAnimationFrame(this.frameId);
     window.clearTimeout(this.frameId);
     this.unbindEvents();
@@ -593,12 +658,14 @@ export class TutorialEngine {
   }
 
   private switchWeapon(weaponId: string, silent = false): void {
+    this.holdRepair.cancel(this.interactAnimator);
     const prof = resolveWeaponProfile(weaponId);
     const changed = weaponId !== this.equippedWeaponId;
     this.equippedWeaponId = prof.id;
     this.reloadTimer = 0;
     this.fireCooldown = 0.14;
     this.isFiring = false;
+    this.semiTriggerConsumed = false;
     const att = this.attachmentsByWeapon[prof.id] ?? createBareAttachments();
     this.weaponRig.setWeaponProfile(prof, att);
     const armed = this.adsModeByWeapon[prof.id] ?? 'PRIMARY';
@@ -694,16 +761,34 @@ export class TutorialEngine {
 
   private handleMeleeHit(ev: BodycamMeleeHitEvent): void {
     this.course.recordEvent('melee');
-    // Check if near Bay 05 training door — breach it open on kick/bash!
-    const distToDoor = Math.hypot(
-      this.controller.position.x - 0,
-      this.controller.position.z - this.world.door.hingeZ,
-    );
-    if (distToDoor < 2.6 && !this.world.door.isOpen) {
-      this.world.toggleDoor(true);
-      this.audio.playImpact(ev.point, 'wood');
+    const doorId = ev.object?.userData?.destructibleDoorId as string | undefined;
+    if (doorId) {
+      if (ev.attackType === 'kick') {
+        this.controller.getVelocity(this._playerVelScratch);
+        const horizSpeed = Math.hypot(this._playerVelScratch.x, this._playerVelScratch.z);
+        this.world.doorSystem.executeKick(
+          doorId,
+          ev.direction,
+          horizSpeed,
+          this.controller.isSprinting,
+          undefined,
+          false,
+          undefined,
+          ev.point,
+          ev.object,
+        );
+      } else {
+        this.world.doorSystem.applyMeleeBash(
+          doorId,
+          ev.point,
+          ev.direction,
+          undefined,
+          false,
+          ev.object,
+          ev.attackType,
+        );
+      }
       this.course.recordEvent('door_interact');
-      this.showToast('Door Breached!');
       this.emitSnapshot();
       return;
     }
@@ -731,7 +816,13 @@ export class TutorialEngine {
   }
 
   private attemptFire(): void {
-    if (this.pdaDevice.isBlockingWeaponActions() || this.grenadeSystem.isDrawn()) return;
+    if (
+      this.pdaDevice.isBlockingWeaponActions() ||
+      this.grenadeSystem.isDrawn() ||
+      this.holdRepair.isActive()
+    ) {
+      return;
+    }
     const prof = this.getWeaponProfile();
     if (prof.holdClass === 'melee_1h') {
       if (!this.semiTriggerConsumed) {
@@ -750,6 +841,11 @@ export class TutorialEngine {
       return;
     }
     if (prof.magCapacity <= 0) return;
+
+    const effectiveFireMode = fireModeStore.getEffectiveMode(prof);
+    const isSingleShot = isSingleShotFireMode(effectiveFireMode);
+    if (isSingleShot && this.semiTriggerConsumed) return;
+
     if (
       this.reloadTimer > 0 ||
       this.fireCooldown > 0 ||
@@ -768,14 +864,9 @@ export class TutorialEngine {
       return;
     }
 
-    const effectiveFireMode = getEffectiveFireMode(prof, this.fireModeOverrideByWeapon);
     this.magAmmoByWeapon[prof.id] = current - 1;
-    this.fireCooldown = 60 / Math.max(40, prof.rpm);
-    if (
-      effectiveFireMode === 'semi' ||
-      effectiveFireMode === 'bolt' ||
-      effectiveFireMode === 'pump'
-    ) {
+    this.fireCooldown = 60 / Math.max(40, getEffectiveFireRpm(prof, effectiveFireMode));
+    if (isSingleShot) {
       this.semiTriggerConsumed = true;
     }
 
@@ -788,7 +879,11 @@ export class TutorialEngine {
     const muzzleVel = ammo.baseVelocityMs * (prof.barrelVelocityMult ?? 1.0) * derived.velocityMult;
     const shotImpulse = THREE.MathUtils.clamp((ammo.bulletMassGrams * muzzleVel) / 4500, 0.75, 1.65);
     this.physicsProps.handleBulletRay(this._muzzlePos, this._muzzleDir, 70, shotImpulse);
-    this.weaponRig.triggerFire(suppressed, current - 1);
+    this.weaponRig.triggerFire(
+      suppressed,
+      current - 1,
+      shouldCyclePumpOnShot(prof, effectiveFireMode),
+    );
     if (!suppressed) this.postProcess.triggerNvgFlashSpike(0.45);
 
     this.controller.applyRecoil(
@@ -818,14 +913,206 @@ export class TutorialEngine {
 
   private toggleFireMode(): void {
     const prof = this.getWeaponProfile();
-    const res = toggleWeaponFireMode(prof, this.fireModeOverrideByWeapon);
+    const res = fireModeStore.toggle(prof);
     if (!res.toggled) {
       this.showToast(`${prof.name}: ${res.label} only`);
       this.emitSnapshot();
       return;
     }
-    this.audio.playTacticalSwitchClick(res.nextMode === 'auto' || res.nextMode === 'semi');
+    this.weaponRig.emitModeToggleCue();
+    this.audio.playWeaponCue('mode_toggle', { intensity: 0.55 });
     this.showToast(`Fire Mode: ${res.label}`);
+    this.emitSnapshot();
+  }
+
+  private updateDoorScan(): void {
+    if (this.pauseOpen || this.pdaDevice.isOpen() || this.holdRepair.isActive()) {
+      if (!this.holdRepair.isActive()) {
+        this.activeDoorId = null;
+        this.activeDoorOptions = [];
+        this.doorPrompt = null;
+      }
+      return;
+    }
+
+    const DOOR_INTERACT_MAX_M = 2.65;
+    this.camera.getWorldPosition(this._camPos);
+    this.camera.getWorldDirection(this._camForward).normalize();
+    this._doorRaycaster.set(this._camPos, this._camForward);
+    this._doorRaycaster.near = 0.08;
+    this._doorRaycaster.far = DOOR_INTERACT_MAX_M + 0.25;
+
+    const proxies = this.world.doorSystem.getInteractableMeshes();
+    const hits = this._doorRaycaster.intersectObjects(proxies, false);
+
+    let matchedId: string | null = null;
+    let matchedOptions: DoorInteractOption[] = [];
+
+    for (let i = 0; i < hits.length; i++) {
+      const h = hits[i];
+      if (!h.object.visible || h.distance > DOOR_INTERACT_MAX_M) continue;
+      const doorId = h.object.userData.destructibleDoorId as string | undefined;
+      if (!doorId) continue;
+
+      this.controller.getVelocity(this._playerVelScratch);
+      const horizSpeed = Math.hypot(this._playerVelScratch.x, this._playerVelScratch.z);
+      const opts = this.world.doorSystem.getInteractOptions(
+        doorId,
+        this.controller.isSprinting,
+        horizSpeed,
+        this._camPos,
+      );
+      if (opts.length === 0) continue;
+
+      if (h.distance > 0.5) {
+        const blocked = this.adapter.raycast(
+          this._camPos,
+          this._camForward,
+          0.08,
+          h.distance - 0.35,
+          this._doorOcclHit,
+        );
+        if (blocked && this._doorOcclHit.object?.userData?.destructibleDoorId !== doorId) {
+          continue;
+        }
+      }
+
+      matchedId = doorId;
+      matchedOptions = opts;
+      break;
+    }
+
+    if (!matchedId) {
+      this.activeDoorId = null;
+      this.activeDoorTitle = '';
+      this.activeDoorOptions = [];
+      this.selectedDoorOptionIndex = 0;
+      this.doorPrompt = null;
+      return;
+    }
+
+    const prevSelectedId = this.activeDoorOptions[this.selectedDoorOptionIndex]?.id;
+    const sameDoor = this.activeDoorId === matchedId;
+    this.activeDoorId = matchedId;
+    this.activeDoorTitle = this.world.doorSystem.getDoor(matchedId)?.label ?? 'Door';
+    this.activeDoorOptions = matchedOptions;
+
+    if (sameDoor && prevSelectedId) {
+      const keptIdx = matchedOptions.findIndex((o) => o.id === prevSelectedId);
+      this.selectedDoorOptionIndex =
+        keptIdx >= 0 ? keptIdx : Math.min(this.selectedDoorOptionIndex, matchedOptions.length - 1);
+    } else {
+      this.selectedDoorOptionIndex = 0;
+    }
+
+    const chosen = matchedOptions[this.selectedDoorOptionIndex] ?? matchedOptions[0];
+    const interactLbl = keybindStore.getLabel('interact');
+    this.doorPrompt = chosen ? `[${interactLbl}] ${chosen.label}` : null;
+  }
+
+  private executeActiveDoorOption(): void {
+    if (!this.activeDoorId || this.activeDoorOptions.length === 0) return;
+    const safeIdx = THREE.MathUtils.clamp(
+      this.selectedDoorOptionIndex,
+      0,
+      this.activeDoorOptions.length - 1,
+    );
+    const chosen = this.activeDoorOptions[safeIdx];
+    if (!chosen) return;
+
+    const doorId = this.activeDoorId;
+    const optId = chosen.id as DoorInteractOptionId;
+    this.camera.getWorldPosition(this._camPos);
+    this.camera.getWorldDirection(this._camForward).normalize();
+    this.controller.getVelocity(this._playerVelScratch);
+    const horizSpeed = Math.hypot(this._playerVelScratch.x, this._playerVelScratch.z);
+
+    if (optId === 'kick') {
+      this.animator.interruptInspect();
+      this.input.ads = false;
+      this.animator.triggerPushKick(this.controller, DEFAULT_TRAUMA_MODIFIERS);
+      this.world.doorSystem.executeKick(
+        doorId,
+        this._camForward,
+        horizSpeed,
+        this.controller.isSprinting,
+      );
+      this.course.recordEvent('door_interact');
+      this.course.recordEvent('melee');
+      this.emitSnapshot();
+      return;
+    }
+
+    if (optId === 'repair') {
+      if (!this.world.doorSystem.getRepairAnchorWorldPos(doorId, this._repairAnchorScratch)) {
+        this.world.doorSystem.getDoorCenterWorldPos(doorId, this._repairAnchorScratch);
+      }
+      const doorLabel = this.world.doorSystem.getDoor(doorId)?.label ?? 'Door';
+      this.isFiring = false;
+      this.input.ads = false;
+      this.holdRepair.start(
+        {
+          kind: 'DOOR_REPAIR',
+          targetId: doorId,
+          label: `Repairing ${doorLabel}`,
+          durationSec: 2.3,
+          anchorPos: this._repairAnchorScratch,
+          dynamicAnchorProvider: (out) =>
+            this.world.doorSystem.getRepairAnchorWorldPos(doorId, out),
+          onWorkTick: () => {
+            this.world.doorSystem.playRepairWorkTick(doorId);
+          },
+          onComplete: () => {
+            this.camera.getWorldPosition(this._camPos);
+            this.camera.getWorldDirection(this._camForward).normalize();
+            const repaired = this.world.doorSystem.executeOption(doorId, 'repair', {
+              actorPos: this._camPos,
+              actorForward: this._camForward,
+              horizontalSpeedMps: 0,
+              isSprinting: false,
+            });
+            if (repaired) {
+              this.course.recordEvent('door_interact');
+              this.showToast(`${doorLabel} Repaired`);
+              this.emitSnapshot();
+            }
+          },
+        },
+        this.interactAnimator,
+      );
+      this.emitSnapshot();
+      return;
+    }
+
+    const ok = this.world.doorSystem.executeOption(doorId, optId, {
+      actorPos: this._camPos,
+      actorForward: this._camForward,
+      horizontalSpeedMps: horizSpeed,
+      isSprinting: this.controller.isSprinting,
+    });
+    if (!ok) return;
+
+    this.course.recordEvent('door_interact');
+
+    if (optId === 'open' || optId === 'peek' || optId === 'close_soft') {
+      if (this.world.doorSystem.getDoorknobWorldPos(doorId, this._camPos, this._ikTargetPos)) {
+        const animKind =
+          optId === 'open'
+            ? 'DOOR_OPEN'
+            : optId === 'peek'
+              ? 'DOOR_PEEK'
+              : 'DOOR_CLOSE_SOFT';
+        this.interactAnimator.trigger(animKind, this._ikTargetPos, (out) =>
+          this.world.doorSystem.getDoorknobWorldPos(doorId, this._camPos, out),
+        );
+      }
+    } else if (optId === 'close') {
+      if (this.world.doorSystem.getPushFaceWorldPos(doorId, this._camPos, this._ikTargetPos)) {
+        this.interactAnimator.trigger('DOOR_CLOSE_PUSH', this._ikTargetPos, (out) =>
+          this.world.doorSystem.getPushFaceWorldPos(doorId, this._camPos, out),
+        );
+      }
+    }
     this.emitSnapshot();
   }
 
@@ -1018,6 +1305,14 @@ export class TutorialEngine {
     if (!this.pointerLocked) return;
     if (this.pdaDevice.isOpen()) {
       this.pdaDevice.applyWheel(e.deltaY);
+      return;
+    }
+    if (this.activeDoorOptions.length > 1 && !this.holdRepair.isActive()) {
+      const step = e.deltaY > 0 ? 1 : -1;
+      const len = this.activeDoorOptions.length;
+      this.selectedDoorOptionIndex = (this.selectedDoorOptionIndex + step + len) % len;
+      this.audio.playTacticalSwitchClick(true);
+      this.emitSnapshot();
     }
   };
 
@@ -1143,17 +1438,10 @@ export class TutorialEngine {
       this.course.recordEvent('accessory');
       this.showToast('Inspecting Firearm');
     }
-    if (keybindStore.matchesKeyCode(code, 'interact') && !repeat) {
-      const distToDoor = Math.hypot(
-        this.controller.position.x - 0,
-        this.controller.position.z - this.world.door.hingeZ,
-      );
-      if (distToDoor < 2.8) {
-        const opened = this.world.toggleDoor(false);
-        this.audio.playImpact(this._doorCenter.set(0, 1.1, this.world.door.hingeZ), 'wood');
-        this.course.recordEvent('door_interact');
-        this.showToast(opened ? 'Door Opened' : 'Door Closed');
-        this.emitSnapshot();
+    if (keybindStore.matchesKeyCode(code, 'interact')) {
+      this.keyFHeld = true;
+      if (!repeat && !this.pdaDevice.isOpen()) {
+        this.executeActiveDoorOption();
       }
     }
     if (
@@ -1274,6 +1562,13 @@ export class TutorialEngine {
     if (keybindStore.matchesKeyCode(code, 'hold_breath')) this.holdBreathHeld = false;
     if (keybindStore.matchesKeyCode(code, 'lean_left')) this.input.leanLeft = false;
     if (keybindStore.matchesKeyCode(code, 'lean_right')) this.input.leanRight = false;
+    if (keybindStore.matchesKeyCode(code, 'interact')) {
+      this.keyFHeld = false;
+      if (this.holdRepair.isActive()) {
+        this.holdRepair.cancel(this.interactAnimator);
+        this.emitSnapshot();
+      }
+    }
   }
 
   private readonly onKeyDown = (e: KeyboardEvent): void => {
@@ -1328,6 +1623,8 @@ export class TutorialEngine {
     this.semiTriggerConsumed = false;
     this.sprintHeld = false;
     this.holdBreathHeld = false;
+    this.keyFHeld = false;
+    this.holdRepair.cancel(this.interactAnimator);
     this.input.forward = false;
     this.input.backward = false;
     this.input.left = false;
@@ -1459,16 +1756,29 @@ export class TutorialEngine {
       }
     }
 
-    // Proximity prompt for Bay 05 wooden training door
-    const distToDoor = Math.hypot(pos.x, pos.z - this.world.door.hingeZ);
-    const interactLbl = keybindStore.getLabel('interact');
-    const kickLbl = keybindStore.getLabel('push_kick');
-    this.doorPrompt =
-      distToDoor < 2.6
-        ? this.world.door.isOpen
-          ? `[${interactLbl}] Close Training Door`
-          : `[${interactLbl}] Open Door · [${kickLbl}] Push-Kick Breach`
-        : null;
+    // Raycast scan for Bay 05 Destructible Door & step Hold-to-Repair / 1P interact IK
+    this.updateDoorScan();
+
+    if (this.holdRepair.isActive()) {
+      this.holdRepair.step(
+        dt,
+        this.keyFHeld,
+        this.controller.position,
+        this.camera,
+        this.interactAnimator,
+        3.45,
+      );
+      this.animator.setExternalHandOverride(
+        this.interactAnimator.isActive() ? this.interactAnimator.ikOverride : null,
+      );
+    } else if (this.interactAnimator.isActive()) {
+      const stillActive = this.interactAnimator.update(dt, this.camera);
+      this.animator.setExternalHandOverride(
+        stillActive ? this.interactAnimator.ikOverride : null,
+      );
+    } else {
+      this.animator.setExternalHandOverride(null);
+    }
 
     // Update 3D TAC-PDA
     const activeStep = this.course.getActiveStep();
@@ -1500,7 +1810,7 @@ export class TutorialEngine {
       !this.grenadeSystem.isWeaponHidden() && !this.pdaDevice.isWeaponHidden();
     this.skeleton.root.visible = true;
 
-    // Step Ballistics & detect Bay 03 Steel Target hits
+    // Step Ballistics & detect Bay 03 Steel Target hits + Bay 05 Door bullet chipping/penetration
     this.camera.getWorldPosition(this._camPos);
     this._camRight.set(1, 0, 0).applyQuaternion(this.camera.quaternion);
     this.ballistics.update(
@@ -1517,6 +1827,18 @@ export class TutorialEngine {
         listenerRightDir: this._camRight,
         audio: this.audio,
       },
+      (ev) => {
+        const doorId = ev.object?.userData?.destructibleDoorId as string | undefined;
+        if (doorId) {
+          this.world.doorSystem.applyBulletImpact(
+            doorId,
+            ev.point,
+            ev.incomingDir,
+            Math.max(16, ev.impactEnergyJ * 0.02),
+          );
+          this.course.recordEvent('door_interact');
+        }
+      },
     );
 
     // Step Grenade System
@@ -1529,7 +1851,7 @@ export class TutorialEngine {
     }
 
     // Step Tutorial World, Dynamic Physics Props & Course Auto-Advance
-    this.world.update(dt, this.elapsedSec);
+    this.world.update(dt, this.elapsedSec, this._camPos);
     const tutWindStrength = 0.65 + 0.32 * Math.sin(this.elapsedSec * 0.38);
     this.physicsProps.setWind(0.7, 0.7, tutWindStrength);
     this.controller.getVelocity(this._playerVelScratch);
@@ -1578,7 +1900,8 @@ export class TutorialEngine {
   private buildSnapshot(): TutorialSnapshot {
     const prof = this.getWeaponProfile();
     const derived = this.weaponRig.getDerivedStats();
-    const effectiveMode = getEffectiveFireMode(prof, this.fireModeOverrideByWeapon);
+    const effectiveMode = fireModeStore.getEffectiveMode(prof);
+    const activeRepair = this.holdRepair.getState();
     return {
       course: this.course.getSnapshot(),
       pointerLocked: this.pointerLocked,
@@ -1598,6 +1921,28 @@ export class TutorialEngine {
       grenadeStage: this.grenadeSystem.getHoldStage(),
       isPdaOpen: this.pdaDevice.isOpen(),
       doorPrompt: this.doorPrompt,
+      doorPromptState:
+        this.activeDoorId && this.activeDoorOptions.length > 0 && !activeRepair
+          ? {
+              title: this.activeDoorTitle,
+              options: this.activeDoorOptions.map((o) => ({
+                id: o.id,
+                label: o.label,
+                hint: o.hint,
+              })),
+              selectedIndex: THREE.MathUtils.clamp(
+                this.selectedDoorOptionIndex,
+                0,
+                Math.max(0, this.activeDoorOptions.length - 1),
+              ),
+            }
+          : null,
+      repairState: activeRepair
+        ? {
+            label: activeRepair.label,
+            progress01: activeRepair.progress01,
+          }
+        : null,
       toastMessage: this.toastMessage,
       masterVolume: this.config.masterVolume,
     };

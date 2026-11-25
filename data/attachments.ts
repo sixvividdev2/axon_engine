@@ -796,9 +796,9 @@ export const ATTACHMENTS: Record<string, AttachmentDef> = {
     recoilYawMult: 0.78,
     sightMisalignMult: 0.80,
     foregripPose: 'vertical',
-    leftHandSocketOffset: [0.004, -0.052, 0.008],
-    leftHandRotOffset: [-0.08, 0.18, -0.62],
-    leftGripCurl: 1.02,
+    leftHandSocketOffset: [0.018, -0.053, 0.032],
+    leftHandRotOffset: [0.422, 0.969, -0.997],
+    leftGripCurl: 1.0,
   },
   grip_angled_afg: {
     id: 'grip_angled_afg',
@@ -816,9 +816,9 @@ export const ATTACHMENTS: Record<string, AttachmentDef> = {
     recoilYawMult: 0.88,
     sightMisalignMult: 0.88,
     foregripPose: 'angled',
-    leftHandSocketOffset: [0.0, -0.018, -0.006],
-    leftHandRotOffset: [0.04, 0.08, -0.18],
-    leftGripCurl: 0.86,
+    leftHandSocketOffset: [0.006, -0.025, 0.004],
+    leftHandRotOffset: [0.307, 0.078, 0.290],
+    leftGripCurl: 0.92,
   },
 
   // === MAGAZINES & CALIBER CONVERSIONS ===

@@ -208,10 +208,67 @@ export const TutorialHud: React.FC<TutorialHudProps> = ({
         </div>
       )}
 
-      {/* Contextual Door Interact Prompt */}
-      {snapshot.pointerLocked && snapshot.doorPrompt && (
-        <div className="fixed bottom-24 left-1/2 -translate-x-1/2 border border-amber-500/45 bg-[#0d1014]/92 px-4 py-1.5 font-mono-tabular text-xs text-amber-200">
-          {snapshot.doorPrompt}
+      {/* Hold-to-Repair Progress Bar */}
+      {snapshot.pointerLocked && snapshot.repairState && (
+        <div className="fixed bottom-24 left-1/2 -translate-x-1/2 w-[260px] border border-amber-500/45 bg-[#0d1014]/94 px-4 py-2.5 shadow-xl">
+          <div className="flex items-center justify-between text-xs font-mono-tabular">
+            <span className="font-medium text-amber-200">{snapshot.repairState.label}</span>
+            <span className="text-amber-400">
+              {Math.round(snapshot.repairState.progress01 * 100)}%
+            </span>
+          </div>
+          <div className="mt-2 h-1.5 w-full bg-neutral-800">
+            <div
+              className="h-full bg-amber-400 origin-left"
+              style={{
+                transform: `scaleX(${Math.max(0.02, Math.min(1, snapshot.repairState.progress01))})`,
+              }}
+            />
+          </div>
+          <div className="mt-1.5 text-[10px] font-mono-tabular text-neutral-400">
+            Hold [{k('interact')}] to complete repair
+          </div>
+        </div>
+      )}
+
+      {/* Contextual Multi-Option Door Interact Card */}
+      {snapshot.pointerLocked && !snapshot.repairState && snapshot.doorPromptState && (
+        <div className="fixed bottom-24 left-1/2 -translate-x-1/2 min-w-[230px] border border-white/14 bg-[#0d1014]/94 px-3.5 py-2.5 shadow-xl">
+          <div className="flex items-center justify-between gap-3 border-b border-white/10 pb-1.5 text-[11px] font-mono-tabular text-neutral-400">
+            <span className="font-medium text-neutral-200">{snapshot.doorPromptState.title}</span>
+            {snapshot.doorPromptState.options.length > 1 && (
+              <span className="text-[10px] text-neutral-500">Scroll</span>
+            )}
+          </div>
+          <ul className="mt-1.5 space-y-1">
+            {snapshot.doorPromptState.options.map((opt, idx) => {
+              const selected = idx === snapshot.doorPromptState!.selectedIndex;
+              return (
+                <li
+                  key={opt.id}
+                  className={`flex items-center justify-between gap-3 px-2 py-1 font-mono-tabular text-xs ${
+                    selected
+                      ? 'border-l-2 border-amber-400 bg-amber-500/14 text-amber-100'
+                      : 'border-l-2 border-transparent text-neutral-400'
+                  }`}
+                >
+                  <span className="flex items-center gap-2">
+                    <span
+                      className={`inline-block min-w-[22px] text-center text-[11px] font-semibold ${
+                        selected ? 'text-amber-300' : 'text-neutral-600'
+                      }`}
+                    >
+                      {selected ? `[${k('interact')}]` : '·'}
+                    </span>
+                    <span>{opt.label}</span>
+                  </span>
+                  {opt.hint && (
+                    <span className="text-[10px] text-neutral-400">{opt.hint}</span>
+                  )}
+                </li>
+              );
+            })}
+          </ul>
         </div>
       )}
 

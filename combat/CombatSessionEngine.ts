@@ -63,9 +63,9 @@ import {
   resolveBaseCaliberId,
 } from '../data/calibers';
 import {
-  getEffectiveFireMode,
-  SelectableFireMode,
-  toggleWeaponFireMode,
+  fireModeStore,
+  getEffectiveFireRpm,
+  isSingleShotFireMode,
 } from '../data/fireModeControl';
 import { keybindStore } from '../data/keybindStore';
 import {
@@ -667,7 +667,6 @@ export class CombatSessionEngine {
   private shiftHeld = false;
   private holdBreathHeld = false;
   private altHeld = false;
-  private fireModeOverrideByWeapon: Record<string, SelectableFireMode> = {};
   private fireCooldown = 0;
   private semiTriggerConsumed = false;
   private reloadTimer = 0;
@@ -6297,8 +6296,8 @@ export class CombatSessionEngine {
     }
     if (this.weaponRig.getReadOnlyRigState().pullbackRatio > 0.72) return;
 
-    const effMode = getEffectiveFireMode(prof, this.fireModeOverrideByWeapon);
-    const isSingle = effMode === 'semi' || effMode === 'bolt' || effMode === 'pump';
+    const effMode = fireModeStore.getEffectiveMode(prof);
+    const isSingle = isSingleShotFireMode(effMode);
     if (isSingle && this.semiTriggerConsumed) return;
 
     if (curAmmo <= 0) {
@@ -6311,7 +6310,7 @@ export class CombatSessionEngine {
 
     const remaining = curAmmo - 1;
     this.magAmmoByWeapon[prof.id] = remaining;
-    const effectiveRpm = prof.toggleablePumpSemi ? (effMode === 'semi' ? 240 : 85) : prof.rpm;
+    const effectiveRpm = getEffectiveFireRpm(prof, effMode);
     this.fireCooldown = 60 / Math.max(25, effectiveRpm);
     if (isSingle) this.semiTriggerConsumed = true;
 
@@ -7001,9 +7000,10 @@ export class CombatSessionEngine {
       case 'KeyK':
         if (!e.repeat && !this.pdaDevice.isBlockingWeaponActions() && !this.grenadeSystem.isDrawn()) {
           const prof = this._runtimeProfile;
-          const res = toggleWeaponFireMode(prof, this.fireModeOverrideByWeapon);
+          const res = fireModeStore.toggle(prof);
           if (res.toggled) {
             this.weaponRig.emitModeToggleCue();
+            this.audio.playWeaponCue('mode_toggle', { intensity: 0.55 });
             this.showToast(`Fire Mode: ${res.label}`);
             this.emitSnapshot();
           }

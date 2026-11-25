@@ -46,9 +46,8 @@ import {
   WeaponRig,
 } from '../bodycam-sdk';
 import {
-  getEffectiveFireMode,
-  SelectableFireMode,
-  toggleWeaponFireMode,
+  fireModeStore,
+  getEffectiveFireRpm,
 } from '../data/fireModeControl';
 import { keybindStore } from '../data/keybindStore';
 import {
@@ -239,10 +238,8 @@ export class GymEngine {
   private attachmentsByWeapon: Record<string, WeaponAttachments> = {};
   private selectedAmmoVariantByWeapon: Record<string, AmmoVariantId> = {};
   private adsModeByWeapon: Record<string, AdsMode> = {};
-  private spas12Mode: 'semi' | 'pump' = 'semi';
-  private fireModeOverrideByWeapon: Record<string, SelectableFireMode> = {
-    spas12: 'semi',
-  };
+  private spas12Mode: 'semi' | 'pump' =
+    fireModeStore.getEffectiveMode(SDK_WEAPON_PROFILES.spas12) === 'pump' ? 'pump' : 'semi';
   private flashlightOn = false;
   private simulatedArmTrauma = false;
   private lookingAtBench = false;
@@ -760,7 +757,7 @@ export class GymEngine {
   public toggleFireMode(): void {
     const prof = SDK_WEAPON_PROFILES[this.equippedWeaponId];
     if (!prof) return;
-    const res = toggleWeaponFireMode(prof, this.fireModeOverrideByWeapon);
+    const res = fireModeStore.toggle(prof);
     if (!res.toggled) return;
     if (prof.toggleablePumpSemi) {
       this.spas12Mode = res.nextMode === 'pump' ? 'pump' : 'semi';
@@ -787,10 +784,12 @@ export class GymEngine {
     this._runtimeProfile.recoilPitchRad = base.recoilPitchRad * derived.recoilPitchMult;
     this._runtimeProfile.recoilYawRad = base.recoilYawRad * derived.recoilYawMult;
 
-    this._runtimeProfile.fireMode = getEffectiveFireMode(base, this.fireModeOverrideByWeapon);
+    const effMode = fireModeStore.getEffectiveMode(base);
+    this._runtimeProfile.fireMode = effMode;
     if (base.toggleablePumpSemi) {
+      this.spas12Mode = effMode === 'pump' ? 'pump' : 'semi';
       this._runtimeProfile.fireMode = this.spas12Mode;
-      this._runtimeProfile.rpm = this.spas12Mode === 'semi' ? 240 : 85;
+      this._runtimeProfile.rpm = getEffectiveFireRpm(base, this.spas12Mode);
     }
 
     if (base.holdClass !== 'unarmed') {

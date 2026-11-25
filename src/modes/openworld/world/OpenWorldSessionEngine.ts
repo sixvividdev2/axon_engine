@@ -56,10 +56,11 @@ import {
   type GraphicsQualityProfile,
 } from '../../../../data/graphicsQuality';
 import {
+  fireModeStore,
   formatFireModeLabel,
-  getEffectiveFireMode,
-  SelectableFireMode,
-  toggleWeaponFireMode,
+  getEffectiveFireRpm,
+  isSingleShotFireMode,
+  shouldCyclePumpOnShot,
 } from '../../../../data/fireModeControl';
 import { keybindStore } from '../../../../data/keybindStore';
 import {
@@ -742,7 +743,6 @@ export class OpenWorldSessionEngine {
   private grenadeCount = 2;
   private shiftHeld = false;
   private holdBreathHeld = false;
-  private fireModeOverrideByWeapon: Record<string, SelectableFireMode> = {};
   private killsThisSortie = 0;
   private damageFlashAlpha = 0;
   private hitMarkerAlpha = 0;
@@ -1551,8 +1551,9 @@ export class OpenWorldSessionEngine {
       case 'KeyK':
         if (!e.repeat && !this.isNonFirearmEquipped() && !this.pdaDevice.isBlockingWeaponActions() && !this.grenadeSystem.isDrawn()) {
           const prof = resolveWeaponProfile(this.equippedWeaponId);
-          const res = toggleWeaponFireMode(prof, this.fireModeOverrideByWeapon);
+          const res = fireModeStore.toggle(prof);
           if (res.toggled) {
+            this.weaponRig.emitModeToggleCue();
             this.audio.playWeaponCue('mode_toggle', { intensity: 0.55 });
             this.showToast(`Fire Mode: ${res.label}`, 1.8);
             this.emitSnapshot();
@@ -1950,8 +1951,8 @@ export class OpenWorldSessionEngine {
     }
 
     const prof = resolveWeaponProfile(this.equippedWeaponId);
-    const effMode = getEffectiveFireMode(prof, this.fireModeOverrideByWeapon);
-    const isSingle = effMode === 'semi' || effMode === 'bolt' || effMode === 'pump';
+    const effMode = fireModeStore.getEffectiveMode(prof);
+    const isSingle = isSingleShotFireMode(effMode);
     if (isSingle && this.semiTriggerConsumed) return;
 
     const char = this.getActiveCharacter();
@@ -2003,7 +2004,8 @@ export class OpenWorldSessionEngine {
       this.magAmmoByWeapon[prof.id] = nextAmmo;
     }
 
-    this.fireCooldown = 60 / Math.max(30, prof.rpm);
+    const effectiveRpm = getEffectiveFireRpm(prof, effMode);
+    this.fireCooldown = 60 / Math.max(30, effectiveRpm);
     if (isSingle) this.semiTriggerConsumed = true;
 
     const derived = this.weaponRig.getDerivedStats();
@@ -2022,7 +2024,7 @@ export class OpenWorldSessionEngine {
     });
     this.physicsProps.handleBulletRay(_muzzlePos, _muzzleDir, 75, 1.15);
 
-    this.weaponRig.triggerFire(suppressed, nextAmmo);
+    this.weaponRig.triggerFire(suppressed, nextAmmo, shouldCyclePumpOnShot(prof, effMode));
     this.weaponRig.setAmmoState(nextAmmo, true);
     this.heartRateBpm = Math.min(168, this.heartRateBpm + 1.8);
     this.controller.applyRecoil(
@@ -4134,7 +4136,7 @@ export class OpenWorldSessionEngine {
         hasChestRig: Boolean(character?.tacticalInventory?.chestRig),
         fireModeLabel: nonFirearm
           ? ''
-          : formatFireModeLabel(getEffectiveFireMode(prof, this.fireModeOverrideByWeapon)),
+          : formatFireModeLabel(fireModeStore.getEffectiveMode(prof)),
         reloading: this.reloadTimer > 0,
         isAds: this.input.ads,
         armedAdsMode: this.armedAdsMode,

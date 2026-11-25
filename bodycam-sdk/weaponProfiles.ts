@@ -106,8 +106,12 @@ function makeLongGun(o: RifleBlueprintOpts): BodycamWeaponProfile {
     lowReadyRotation: heavy ? [-0.42, 0.52, 0.16] : [-0.44, 0.54, 0.17],
     rightHandSocket: { ...DEFAULT_RIFLE_RIGHT },
     leftHandSocket: {
-      position: [o.id === 'fn_p90' ? -0.022 : -0.036, o.id === 'fn_p90' ? -0.042 : -0.030, leftZ],
-      rotation: [0.06, -0.42, 2.22],
+      position: [
+        o.id === 'fn_p90' ? -0.028 : -0.048,
+        o.id === 'fn_p90' ? -0.038 : -0.002,
+        o.id === 'fn_p90' ? -0.106 : leftZ + 0.018,
+      ],
+      rotation: o.id === 'fn_p90' ? [-0.042, -0.284, 1.579] : [-0.464, -1.253, 2.576],
       gripCurl: 0.90,
     },
     muzzleOffset: [0, 0.024, muzzleZ],

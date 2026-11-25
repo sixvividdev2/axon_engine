@@ -5,43 +5,33 @@ import {
   BodycamPhysicsWorld,
   BodycamSurfaceMaterial,
   IR_LAYER,
-  PhysicsDynamicSlab,
 } from '../bodycam-sdk';
+import { DestructibleDoorSystem } from '../doors/DestructibleDoorSystem';
 import { createGymTextures, createStencilSignTexture } from '../gym/GymTextures';
 import { PaperShootingTarget, ReactiveSteelTarget } from '../gym/GymWorld';
 
-export interface TutorialDoorState {
-  id: string;
-  pivot: THREE.Group;
-  hitMesh: THREE.Mesh;
-  hingeX: number;
-  hingeZ: number;
-  width: number;
-  height: number;
-  openAngleRad: number;
-  targetAngleRad: number;
-  isOpen: boolean;
-  isBreached: boolean;
-  slab: PhysicsDynamicSlab;
-}
+export const TUTORIAL_BREACH_DOOR_ID = 'tutorial_breach_door';
 
 export interface TutorialWorldHandle {
   physics: BodycamPhysicsWorld;
   raycastMeshes: THREE.Object3D[];
   steelTargets: ReactiveSteelTarget[];
   paperTargets: PaperShootingTarget[];
-  door: TutorialDoorState;
+  doorSystem: DestructibleDoorSystem;
+  doorId: string;
   grenadePitCenter: THREE.Vector3;
   fireSupportPitCenter: THREE.Vector3;
   setWaypointPosition: (x: number, y: number, z: number, visible: boolean) => void;
-  toggleDoor: (breachForce?: boolean) => boolean;
+  openDoorForSkip: () => void;
   resetDoor: () => void;
   triggerTrainingStrikeBlast: (x: number, z: number) => void;
-  update: (dt: number, elapsedSec: number) => void;
+  update: (dt: number, elapsedSec: number, listenerPos?: Readonly<THREE.Vector3>) => void;
   dispose: () => void;
 }
 
 const _wpPos = new THREE.Vector3();
+const _skipActorPos = new THREE.Vector3(0, 1.5, -15.5);
+const _skipActorDir = new THREE.Vector3(0, 0, -1);
 
 /**
  * Builds a lightweight, architectural 8-Bay Tactical Killhouse Training Course (~13m x 74m).
@@ -453,60 +443,22 @@ export function buildTutorialWorld(
   addBox(-0.62, 1.15, -16.8, 0.08, 2.3, 0.42, steelFrameMat, 'metal', false, false);
   addBox(0.62, 1.15, -16.8, 0.08, 2.3, 0.42, steelFrameMat, 'metal', false, false);
 
-  // Physical hinged wooden breach door (hinge on west jamb x = -0.57, z = -16.8)
-  const doorWidth = 1.14;
-  const doorHeight = 2.24;
-  const doorPivot = new THREE.Group();
-  doorPivot.position.set(-0.57, 0, -16.8);
-  root.add(doorPivot);
-
-  const doorLeaf = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(doorWidth, doorHeight, 0.08)), woodMat);
-  doorLeaf.position.set(doorWidth * 0.5, doorHeight * 0.5, 0);
-  doorLeaf.castShadow = !isSoftwareGl;
-  doorLeaf.receiveShadow = true;
-  doorLeaf.userData.surface = 'wood';
-  doorLeaf.userData.tutorialDoor = true;
-  doorPivot.add(doorLeaf);
-
-  // Door kick-plate & brass handle accent
-  const kickPlate = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(doorWidth - 0.14, 0.34, 0.092)), hazardMat);
-  kickPlate.position.set(doorWidth * 0.5, 0.26, 0);
-  doorPivot.add(kickPlate);
-  const handle = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(0.14, 0.035, 0.14)), brassMat);
-  handle.position.set(doorWidth - 0.14, 1.04, 0);
-  doorPivot.add(handle);
-
-  raycastMeshes.push(doorLeaf);
-
-  const doorSlab: PhysicsDynamicSlab = {
-    id: 'tutorial_breach_door',
-    originX: -0.57,
-    originZ: -16.8,
-    minY: 0,
-    maxY: doorHeight,
-    dirX: 1,
-    dirZ: 0,
-    length: doorWidth,
-    halfThickness: 0.06,
-    active: true,
-    rigidBlocked: true,
-  };
-  physics.addDynamicSlab(doorSlab);
-
-  const door: TutorialDoorState = {
-    id: 'tutorial_breach_door',
-    pivot: doorPivot,
-    hitMesh: doorLeaf,
-    hingeX: -0.57,
-    hingeZ: -16.8,
-    width: doorWidth,
-    height: doorHeight,
-    openAngleRad: 0,
-    targetAngleRad: 0,
-    isOpen: false,
-    isBreached: false,
-    slab: doorSlab,
-  };
+  // Full interactive & destructible Bay 05 Breach Door (identical system to Hideout & Combat)
+  const doorSystem = new DestructibleDoorSystem(root, physics, isSoftwareGl);
+  doorSystem.addDoor({
+    id: TUTORIAL_BREACH_DOOR_ID,
+    label: 'Bay 05 Breach Door',
+    hingePos: [-0.57, 0, -16.8],
+    closedYawRad: 0,
+    swingSign: 1,
+    width: 1.14,
+    height: 2.24,
+    thickness: 0.075,
+    repairable: true,
+    style: 'bunker_wood',
+    addFrameJamb: false,
+  });
+  raycastMeshes.push(...doorSystem.getRaycastMeshes());
 
   // =========================================================================
   // BAY 06 (z = -19.2 .. -27.5): Darkened NVG & IR Stencil Alcove
@@ -745,34 +697,32 @@ export function buildTutorialWorld(
   root.add(waypointGroup);
   _wpPos.set(0, 0, 14.2);
 
-  const syncDoorSlab = (): void => {
-    door.pivot.rotation.y = door.openAngleRad;
-    // Rotate door direction vector by -openAngleRad around Y (right-handed XZ)
-    const c = Math.cos(-door.openAngleRad);
-    const s = Math.sin(-door.openAngleRad);
-    door.slab.dirX = c;
-    door.slab.dirZ = s;
-    door.slab.active = Math.abs(door.openAngleRad) < 1.25;
-  };
-
-  const toggleDoor = (breachForce = false): boolean => {
-    if (breachForce) {
-      door.isOpen = true;
-      door.isBreached = true;
-      door.targetAngleRad = -Math.PI * 0.58;
-      return true;
+  const openDoorForSkip = (): void => {
+    const d = doorSystem.getDoor(TUTORIAL_BREACH_DOOR_ID);
+    if (!d) return;
+    if (d.hingeMode === 'attached' && Math.abs(d.angleRad) < 0.75) {
+      doorSystem.executeOption(TUTORIAL_BREACH_DOOR_ID, 'open', {
+        actorPos: _skipActorPos,
+        actorForward: _skipActorDir,
+        horizontalSpeedMps: 0,
+        isSprinting: false,
+      });
     }
-    door.isOpen = !door.isOpen;
-    door.targetAngleRad = door.isOpen ? -Math.PI * 0.52 : 0;
-    return door.isOpen;
   };
 
   const resetDoor = (): void => {
-    door.isOpen = false;
-    door.isBreached = false;
-    door.openAngleRad = 0;
-    door.targetAngleRad = 0;
-    syncDoorSlab();
+    doorSystem.applyRemoteAction({
+      doorId: TUTORIAL_BREACH_DOOR_ID,
+      action: 'repair',
+      angleRad: 0,
+      angularVel: 0,
+      latched: true,
+      damageState: 0,
+      chipDamage: 0,
+      hingeMode: 'attached',
+      destructionOutcome: 'none',
+      seed: 1,
+    });
   };
 
   const triggerTrainingStrikeBlast = (x: number, z: number): void => {
@@ -786,20 +736,15 @@ export function buildTutorialWorld(
     blastLight.intensity = 22;
   };
 
-  const update = (dt: number, elapsedSec: number): void => {
+  const update = (dt: number, elapsedSec: number, listenerPos?: Readonly<THREE.Vector3>): void => {
     // 1. Smoothly damp 3D waypoint ring & bobbing diamond
     waypointGroup.position.x = THREE.MathUtils.damp(waypointGroup.position.x, _wpPos.x, 9, dt);
     waypointGroup.position.z = THREE.MathUtils.damp(waypointGroup.position.z, _wpPos.z, 9, dt);
     wpDiamond.position.y = 1.62 + Math.sin(elapsedSec * 3.2) * 0.14;
     wpDiamond.rotation.y = elapsedSec * 1.6;
 
-    // 2. Smooth physical hinge spring for Bay 05 wooden breach door
-    const doorLambda = door.isBreached ? 16 : 9;
-    const prevAngle = door.openAngleRad;
-    door.openAngleRad = THREE.MathUtils.damp(door.openAngleRad, door.targetAngleRad, doorLambda, dt);
-    if (Math.abs(door.openAngleRad - prevAngle) > 1e-4) {
-      syncDoorSlab();
-    }
+    // 2. Step full DestructibleDoorSystem (hinges, splinters, debris, penetrable holes)
+    doorSystem.update(dt, listenerPos);
 
     // 3. Reactive AR500 steel target spring return & impact flash
     for (let i = 0; i < steelTargets.length; i++) {
@@ -845,18 +790,20 @@ export function buildTutorialWorld(
     raycastMeshes,
     steelTargets,
     paperTargets,
-    door,
+    doorSystem,
+    doorId: TUTORIAL_BREACH_DOOR_ID,
     grenadePitCenter,
     fireSupportPitCenter,
     setWaypointPosition: (x, y, z, visible) => {
       _wpPos.set(x, y, z);
       waypointGroup.visible = visible;
     },
-    toggleDoor,
+    openDoorForSkip,
     resetDoor,
     triggerTrainingStrikeBlast,
     update,
     dispose: () => {
+      doorSystem.dispose();
       for (const g of ownedGeos) g.dispose();
       for (const m of ownedMats) m.dispose();
       for (const t of ownedTex) t.dispose();
