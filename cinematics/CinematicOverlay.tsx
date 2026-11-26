@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Pause, Play, Crosshair, Radio } from 'lucide-react';
+import { Pause, Play, Crosshair, Radio, Volume2 } from 'lucide-react';
 import {
   CinematicDirector,
   CinematicSnapshot,
@@ -13,13 +13,11 @@ export interface CinematicOverlayProps {
 }
 
 /**
- * Minimal, zero-clutter AAA Cinematic Viewport & Diegetic Telemetry Overlay.
- * Strictly zero backdrop-filter over WebGL, zero static pill badges, zero pulsing dots.
- *
- * Controls:
- * - [Space] toggles Pause / Play (freezes 3D scene & Web Audio cleanly)
- * - Hold [Enter] (1.2s progress bar) skips smoothly
- * - Move mouse during FP Helicopter / APC passenger cabin beats for live constrained mouse look
+ * Minimal, zero-clutter AAA Cinematic Viewport Overlay.
+ * - Clean cinema view on aerial sweeps: zero center reticles, zero red dots, zero corner telemetry.
+ * - Strictly zero backdrop-filter over WebGL, zero static pill badges, zero pulsing dots.
+ * - [Space] toggles Pause / Play; Hold [Enter] (1.2s) skips smoothly.
+ * - Shows a discreet non-blocking audio unlock button only if the browser blocked autoplay.
  */
 export const CinematicOverlay: React.FC<CinematicOverlayProps> = ({
   sequence,
@@ -59,23 +57,26 @@ export const CinematicOverlay: React.FC<CinematicOverlayProps> = ({
 
   const showLetterbox = snapshot ? !snapshot.mouseLookActive : true;
   const isGunCam = snapshot?.cameraMode === 'gun_cam';
-  const isDroneCam = snapshot?.cameraMode === 'drone_aerial';
+  const isCleanCinema = snapshot?.cameraMode === 'drone_aerial';
 
   return (
-    <div className="fixed inset-0 z-50 select-none overflow-hidden bg-black">
+    <div
+      className="fixed inset-0 z-50 select-none overflow-hidden bg-black"
+      onPointerDown={() => directorRef.current?.unlockAudio()}
+    >
       {/* Live 3D Cinematic Canvas */}
       <div ref={containerRef} className="fixed inset-0 h-full w-full" />
 
-      {/* Subtle Tactical Vignette & Camera Frame (no blur) */}
+      {/* Subtle Cinematic Vignette (no blur) */}
       <div
         className="pointer-events-none fixed inset-0"
         style={{
           background:
-            'radial-gradient(circle at 50% 50%, rgba(0,0,0,0) 54%, rgba(0,0,0,0.58) 100%)',
+            'radial-gradient(circle at 50% 50%, rgba(0,0,0,0) 56%, rgba(0,0,0,0.52) 100%)',
         }}
       />
 
-      {/* Cinematic Letterbox Bars (auto-retracted during live FP Mouse-Look) */}
+      {/* Widescreen Letterbox Bars (auto-retracted during live FP Mouse-Look) */}
       <div
         className="pointer-events-none fixed inset-x-0 top-0 bg-black transition-[height] duration-300"
         style={{ height: showLetterbox ? '52px' : '0px' }}
@@ -85,41 +86,27 @@ export const CinematicOverlay: React.FC<CinematicOverlayProps> = ({
         style={{ height: showLetterbox ? '52px' : '0px' }}
       />
 
-      {/* Subtle Gun-Cam / Drone Reticle Corner Marks */}
-      {(isGunCam || isDroneCam) && (
-        <div className="pointer-events-none fixed inset-0 flex items-center justify-center">
-          <div className="relative h-24 w-36 border border-white/15">
-            <div className="absolute left-1/2 top-1/2 h-1.5 w-1.5 -translate-x-1/2 -translate-y-1/2 bg-red-500/80" />
-          </div>
-        </div>
-      )}
-
-      {/* Top-Left Camera Feed Telemetry */}
-      {snapshot && (
+      {/* Minimal Top-Left Feed Label (hidden completely during clean aerial cinema sweeps) */}
+      {snapshot && !isCleanCinema && snapshot.feedLabel && (
         <div className="pointer-events-none fixed left-6 top-16 flex flex-col gap-0.5 font-mono-tabular">
           <div className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.16em] text-amber-300">
             {isGunCam ? (
-              <Crosshair className="h-3.5 w-3.5 text-red-400" />
+              <Crosshair className="h-3.5 w-3.5 text-amber-400" />
             ) : (
               <Radio className="h-3.5 w-3.5 text-amber-400" />
             )}
             <span>{snapshot.feedLabel}</span>
           </div>
-          <div className="text-xs font-medium tracking-wider text-neutral-300">
-            {snapshot.locationLabel}
-          </div>
-          {snapshot.killConfirmedFlash && (
-            <div className="mt-1 text-xs font-bold uppercase tracking-[0.2em] text-red-400">
-              HOSTILE NEUTRALIZED
+          {snapshot.locationLabel && (
+            <div className="text-xs font-medium tracking-wider text-neutral-300">
+              {snapshot.locationLabel}
             </div>
           )}
-        </div>
-      )}
-
-      {/* Top-Right Timecode */}
-      {snapshot && (
-        <div className="pointer-events-none fixed right-6 top-16 font-mono-tabular text-xs tracking-wider text-neutral-400">
-          {snapshot.elapsedSec.toFixed(1)}s / {snapshot.durationSec.toFixed(1)}s
+          {snapshot.killConfirmedFlash && (
+            <div className="mt-1 text-xs font-bold uppercase tracking-[0.2em] text-amber-300">
+              HOSTILE NEUTRALIZED ({snapshot.killCount})
+            </div>
+          )}
         </div>
       )}
 
@@ -160,9 +147,20 @@ export const CinematicOverlay: React.FC<CinematicOverlayProps> = ({
         </div>
       )}
 
-      {/* Bottom-Right Minimal Controls: [Space] Pause/Play + Hold [Enter] Skip Bar */}
+      {/* Bottom-Right Minimal Controls: Optional Audio Unlock + [Space] Pause/Play + Hold [Enter] Skip */}
       {snapshot && (
-        <div className="pointer-events-auto fixed bottom-3.5 right-6 flex items-center gap-4 font-mono-tabular text-[11px] text-neutral-300">
+        <div className="pointer-events-auto fixed bottom-3.5 right-6 flex items-center gap-3 font-mono-tabular text-[11px] text-neutral-300">
+          {snapshot.audioBlocked && !snapshot.paused && (
+            <button
+              type="button"
+              onClick={() => directorRef.current?.unlockAudio()}
+              className="flex cursor-pointer items-center gap-1.5 border border-amber-400/50 bg-[#0d1015]/92 px-2.5 py-1 text-amber-300 transition-colors hover:border-amber-300 hover:text-white"
+            >
+              <Volume2 className="h-3.5 w-3.5" />
+              <span>Click to Enable Audio</span>
+            </button>
+          )}
+
           <button
             type="button"
             onClick={() => directorRef.current?.togglePause()}

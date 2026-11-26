@@ -5,6 +5,7 @@ import {
   OperatorGearConfig,
   OperatorId,
   OperatorUniformId,
+  poseStandingNpcGesture,
   resolveWeaponProfile,
   WeaponAssembler,
   WeaponModelAssembly,
@@ -114,9 +115,9 @@ interface ActiveNpcInstance {
   def: BunkerNpcDefinition;
   group: THREE.Group;
   skeleton: CharacterSkeleton;
+  weaponMount: THREE.Group | null;
   weaponAssembly: WeaponModelAssembly | null;
   proxyMesh: THREE.Mesh;
-  basePelvisY: number;
   curHeadYaw: number;
   curHeadPitch: number;
   curTorsoYaw: number;
@@ -194,7 +195,8 @@ export class BunkerNpcSystem {
       }
     });
 
-    // Optional held weapon mounted to right hand socket
+    // Optional held weapon mounted on chest low-ready pivot (hands solved onto grip/handguard via 2-bone IK)
+    let weaponMount: THREE.Group | null = null;
     let weaponAssembly: WeaponModelAssembly | null = null;
     if (def.heldWeaponId && def.heldWeaponId !== 'unarmed') {
       const prof = resolveWeaponProfile(def.heldWeaponId);
@@ -223,9 +225,10 @@ export class BunkerNpcSystem {
         build.attachments,
         { thirdPersonMode: true },
       );
-      asm.group.position.set(0.02, -0.02, -0.14);
-      asm.group.rotation.set(0.12, 0.35, -0.08);
-      skel.sockets.socket_weapon_r.add(asm.group);
+      weaponMount = new THREE.Group();
+      weaponMount.name = `NpcWeaponMount_${def.id}`;
+      weaponMount.add(asm.group);
+      skel.chest.add(weaponMount);
       weaponAssembly = asm;
     }
 
@@ -245,17 +248,23 @@ export class BunkerNpcSystem {
     this.interactableMeshes.push(proxyMesh);
     this.group.add(npcGroup);
 
+    const phaseOffset = (this.npcs.size + 1) * 1.37;
+    // Immediately apply anatomical initial pose so frame 0 never shows bind pose or inverted arms
+    poseStandingNpcGesture(skel, def.gesture, phaseOffset, {
+      weaponMount,
+    });
+
     this.npcs.set(def.id, {
       def,
       group: npcGroup,
       skeleton: skel,
+      weaponMount,
       weaponAssembly,
       proxyMesh,
-      basePelvisY: skel.pelvis.position.y,
       curHeadYaw: 0,
       curHeadPitch: 0,
       curTorsoYaw: 0,
-      phaseOffset: (this.npcs.size + 1) * 1.37,
+      phaseOffset,
       lastCaptionAtSec: -999,
       nextLineIndex: 0,
       visible: true,
@@ -267,8 +276,10 @@ export class BunkerNpcSystem {
     if (!inst) return;
     const idx = this.interactableMeshes.indexOf(inst.proxyMesh);
     if (idx >= 0) this.interactableMeshes.splice(idx, 1);
+    if (inst.weaponMount) {
+      inst.skeleton.chest.remove(inst.weaponMount);
+    }
     if (inst.weaponAssembly) {
-      inst.skeleton.sockets.socket_weapon_r.remove(inst.weaponAssembly.group);
       inst.weaponAssembly.dispose();
     }
     inst.skeleton.dispose();
@@ -609,26 +620,22 @@ export class BunkerNpcSystem {
         : { inRange: false, targetYawRad: 0, targetPitchRad: 0, distM: 999 };
       const goalYaw = gaze.inRange ? gaze.targetYawRad : Math.sin(t * 0.45) * 0.08;
       const goalPitch = gaze.inRange ? gaze.targetPitchRad : Math.sin(t * 0.32) * 0.025;
-      const goalTorso = gaze.inRange ? gaze.targetYawRad * 0.28 : 0;
+      const goalTorso = gaze.inRange ? gaze.targetYawRad * 0.25 : 0;
 
       inst.curHeadYaw = THREE.MathUtils.damp(inst.curHeadYaw, goalYaw, 6.5, clampedDt);
       inst.curHeadPitch = THREE.MathUtils.damp(inst.curHeadPitch, goalPitch, 6.5, clampedDt);
       inst.curTorsoYaw = THREE.MathUtils.damp(inst.curTorsoYaw, goalTorso, 4.2, clampedDt);
 
-      skel.neck.rotation.y = inst.curHeadYaw * 0.45;
-      skel.headGroup.rotation.y = inst.curHeadYaw * 0.55;
-      skel.headGroup.rotation.x = inst.curHeadPitch;
-      skel.spineUpper.rotation.y = inst.curTorsoYaw;
+      // 2. Anatomically Grounded Two-Bone IK Pose & Role-Specific Idle Gesture
+      poseStandingNpcGesture(skel, inst.def.gesture, t, {
+        headYawRad: inst.curHeadYaw,
+        headPitchRad: inst.curHeadPitch,
+        torsoYawRad: inst.curTorsoYaw,
+        playerNear: gaze.inRange,
+        weaponMount: inst.weaponMount,
+      });
 
-      // 2. Subtle organic breathing & weight shift
-      const breath = Math.sin(t * 1.85);
-      skel.chest.rotation.x = breath * 0.022;
-      skel.pelvis.position.y = inst.basePelvisY + Math.sin(t * 0.9) * 0.004;
-
-      // 3. Procedural Role-Specific Idle Arm Gestures
-      this.applyIdleGesture(inst, t, gaze.inRange);
-
-      // 4. Proximity Radio / Voice Caption Trigger (with anti-spam cooldown)
+      // 3. Proximity Radio / Voice Caption Trigger (with anti-spam cooldown)
       if (
         !this.activeCaption &&
         gaze.inRange &&
@@ -637,68 +644,6 @@ export class BunkerNpcSystem {
         inst.def.approachLines.length > 0
       ) {
         this.triggerNpcLine(inst.def.id);
-      }
-    }
-  }
-
-  private applyIdleGesture(inst: ActiveNpcInstance, t: number, playerNear: boolean): void {
-    const skel = inst.skeleton;
-    const rArm = skel.rightArm;
-    const lArm = skel.leftArm;
-
-    switch (inst.def.gesture) {
-      case 'tinker': {
-        // Bent forearms tinkering over Gunsmith workbench
-        rArm.upperArm.rotation.set(-0.58 + Math.sin(t * 2.6) * 0.06, 0.12, -0.14);
-        rArm.forearm.rotation.set(-0.78 + Math.cos(t * 3.1) * 0.08, 0, 0);
-        lArm.upperArm.rotation.set(-0.52 + Math.cos(t * 1.9) * 0.04, -0.14, 0.14);
-        lArm.forearm.rotation.set(-0.72, 0, 0);
-        break;
-      }
-      case 'briefing': {
-        // Ops Commander leaning slightly with one hand gesturing toward war table when player nears
-        const wave = playerNear ? Math.sin(t * 2.2) * 0.14 : Math.sin(t * 0.8) * 0.04;
-        rArm.upperArm.rotation.set(-0.46 + wave, 0.08, -0.18);
-        rArm.forearm.rotation.set(-0.68 - wave * 0.4, 0, 0);
-        lArm.upperArm.rotation.set(-0.28, -0.1, 0.12);
-        lArm.forearm.rotation.set(-0.54, 0, 0);
-        break;
-      }
-      case 'clipboard': {
-        // Quartermaster holding logistics manifest tablet with left arm, tapping with right
-        lArm.upperArm.rotation.set(-0.62, -0.22, 0.16);
-        lArm.forearm.rotation.set(-0.92, 0.15, 0);
-        rArm.upperArm.rotation.set(-0.48 + Math.sin(t * 2.1) * 0.05, 0.26, -0.14);
-        rArm.forearm.rotation.set(-0.88 + Math.sin(t * 2.8) * 0.07, 0, 0);
-        break;
-      }
-      case 'radio_check': {
-        // Occasional left hand raised toward shoulder comms PTT mic
-        const pttCycle = Math.max(0, Math.sin(t * 0.65 - 0.5));
-        lArm.upperArm.rotation.set(-0.22 - pttCycle * 0.85, -0.12, 0.14);
-        lArm.forearm.rotation.set(-0.32 - pttCycle * 0.95, 0, 0);
-        rArm.upperArm.rotation.set(-0.18, 0.06, -0.12);
-        rArm.forearm.rotation.set(-0.34, 0, 0);
-        break;
-      }
-      case 'rifle_ready': {
-        // Low-ready tactical rifle carry across chest with gentle breathing sway
-        const sway = Math.sin(t * 1.4) * 0.03;
-        rArm.upperArm.rotation.set(-0.56 + sway, 0.24, -0.18);
-        rArm.forearm.rotation.set(-0.88, -0.12, 0);
-        lArm.upperArm.rotation.set(-0.68 - sway, -0.34, 0.22);
-        lArm.forearm.rotation.set(-0.96, 0.18, 0);
-        break;
-      }
-      case 'at_ease':
-      default: {
-        // Relaxed parade/standby posture with slight weapon cradle
-        const sway = Math.sin(t * 1.1) * 0.025;
-        rArm.upperArm.rotation.set(-0.32 + sway, 0.16, -0.12);
-        rArm.forearm.rotation.set(-0.58, 0, 0);
-        lArm.upperArm.rotation.set(-0.24 - sway, -0.14, 0.12);
-        lArm.forearm.rotation.set(-0.42, 0, 0);
-        break;
       }
     }
   }

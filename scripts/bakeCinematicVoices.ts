@@ -4,18 +4,29 @@ import { GoogleGenAI } from '@google/genai';
 import { CINEMATIC_VOICE_MANIFEST, CinematicVoiceCue } from '../cinematics/cinematicVoiceManifest';
 
 const OUTPUT_DIR = path.resolve(process.cwd(), 'public', 'audio', 'cinematics');
-const TTS_MODEL = process.env.GEMINI_TTS_MODEL || 'gemini-3.8-flash-tts';
+const TTS_MODEL = process.env.GEMINI_TTS_MODEL || 'gemini-3.8-flash-lite-tts';
 
 /**
- * Generates a single 24kHz mono 16-bit WAV file via Gemini 3.8 TTS and saves it to disk.
- * Gemini 3.8 TTS unary generateContent returns a complete WAV file (with 44-byte RIFF header)
- * in `inlineData.data` — write the decoded buffer directly without adding a second header.
+ * Generates a single 24kHz mono 16-bit WAV file via Gemini 3.8 TTS (`gemini-3.8-flash-lite-tts`)
+ * using structured `speechMetadata.style` direction so style instructions are never spoken aloud.
+ * Unary `generateContent` returns a complete WAV file (with 44-byte RIFF header) in `inlineData.data`.
  */
 async function bakeCueWithGemini(ai: GoogleGenAI, cue: CinematicVoiceCue): Promise<Buffer> {
-  const prompt = `[Direction: ${cue.stylePrompt}]\n${cue.text}`;
   const response = await ai.models.generateContent({
     model: TTS_MODEL,
-    contents: prompt,
+    contents: [
+      {
+        role: 'user',
+        parts: [
+          {
+            text: cue.text,
+            speechMetadata: {
+              style: cue.stylePrompt,
+            },
+          } as { text: string; speechMetadata?: { style: string } },
+        ],
+      },
+    ],
     config: {
       responseModalities: ['AUDIO'],
       speechConfig: {

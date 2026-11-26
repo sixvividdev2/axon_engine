@@ -1,12 +1,16 @@
 import * as THREE from 'three';
 import {
   operatorAssetLoader,
+  poseSeatedOperator,
   resolveWeaponProfile,
   WeaponAssembler,
   WeaponModelAssembly,
   WeaponModelFactory,
 } from '../bodycam-sdk';
-import type { CharacterSkeleton } from '../bodycam-sdk';
+import type { CharacterSkeleton, OperatorId, OperatorUniformId } from '../bodycam-sdk';
+
+/** Natural forward-left 3/4 gaze inside the helicopter troop bay framing squadmate, door gunner & cockpit pilot. */
+export const HELI_DEFAULT_CABIN_YAW_RAD = THREE.MathUtils.degToRad(30);
 
 export interface CinematicHelicopterRig {
   root: THREE.Group;
@@ -16,7 +20,20 @@ export interface CinematicHelicopterRig {
   pilotSeatAnchor: THREE.Object3D;
   navStrobeMat: THREE.MeshStandardMaterial;
   pilotSkeleton: CharacterSkeleton;
+  doorGunnerSkeleton: CharacterSkeleton;
   crewSkeleton: CharacterSkeleton;
+  crewWeaponMount: THREE.Group;
+  doorGunPivot: THREE.Group;
+  updateCrew: (timeSec: number, gunnerFiring?: boolean) => void;
+  dispose: () => void;
+}
+
+export interface CinematicEscortGunshipRig {
+  root: THREE.Group;
+  mainRotorPivot: THREE.Group;
+  tailRotorPivot: THREE.Group;
+  navStrobeMat: THREE.MeshStandardMaterial;
+  updateCombat: (timeSec: number, dt: number, firing: boolean) => void;
   dispose: () => void;
 }
 
@@ -44,10 +61,109 @@ export interface GunCamRig {
   dispose: () => void;
 }
 
+export interface ArmedCinematicOperator {
+  skeleton: CharacterSkeleton;
+  weaponMount: THREE.Group;
+  weaponAssembly: WeaponModelAssembly;
+  muzzleFlashMesh: THREE.Mesh;
+  dispose: () => void;
+}
+
+function buildCompactRifleAssembly(weaponId: string): WeaponModelAssembly {
+  const prof = resolveWeaponProfile(weaponId);
+  const asm = WeaponModelFactory.build({
+    id: prof.id,
+    holdClass: prof.holdClass,
+    barrelLengthM: prof.barrelLengthM,
+    visualStyle: prof.visualStyle,
+    finish: prof.finish,
+    railType: prof.railType,
+    isRevolver: prof.isRevolver,
+    boreAxisHeightM: prof.boreAxisHeightM,
+    rightHandSocket: prof.rightHandSocket,
+    leftHandSocket: prof.leftHandSocket,
+    muzzleOffset: prof.muzzleOffset,
+    laserOffset: prof.laserOffset,
+    supportsSuppressor: prof.supportsSuppressor,
+    renderLayer: 0,
+  });
+  WeaponAssembler.applyAttachments(
+    asm,
+    prof.massKg,
+    prof.barrelLengthM,
+    prof.magCapacity,
+    {
+      optic: 'holo_eotech',
+      muzzle: 'comp_tactical',
+      foregrip: 'grip_angled',
+      tactical: 'peq15',
+    },
+    { thirdPersonMode: true },
+  );
+  return asm;
+}
+
+/**
+ * Builds an armed cinematic operator (allied breach squadmate or corridor hostile) with
+ * rifle mounted cleanly on `skeleton.chest` + muzzle flash mesh for animated gunfights.
+ */
+export function buildArmedCinematicOperator(opts: {
+  operatorId: OperatorId;
+  uniformId: OperatorUniformId;
+  helmetType: 'none' | 'mich' | 'mil_tec';
+  helmetColor: 'black' | 'olive_drab' | 'desert_tan' | 'ranger_green' | 'coyote_brown' | 'uniform';
+  faceGear: 'open_face' | 'neck_gaiter' | 'balaclava';
+  weaponId: string;
+}): ArmedCinematicOperator {
+  const loaded = operatorAssetLoader.loadProceduralOperator(opts.operatorId, {
+    previewMode: true,
+    uniformId: opts.uniformId,
+    gear: {
+      uniformId: opts.uniformId,
+      helmetType: opts.helmetType,
+      helmetColor: opts.helmetColor,
+      faceGear: opts.faceGear,
+      eyewear: 'clear_glasses',
+    },
+  });
+  const skeleton = loaded.skeleton;
+  skeleton.setFirstPersonHeadShadowOnly(false);
+
+  const weaponAssembly = buildCompactRifleAssembly(opts.weaponId);
+  const weaponMount = new THREE.Group();
+  weaponMount.add(weaponAssembly.group);
+  skeleton.chest.add(weaponMount);
+
+  const flashGeo = new THREE.OctahedronGeometry(0.11, 0);
+  const flashMat = new THREE.MeshBasicMaterial({
+    color: 0xffd166,
+    transparent: true,
+    opacity: 0.92,
+  });
+  const muzzleFlashMesh = new THREE.Mesh(flashGeo, flashMat);
+  muzzleFlashMesh.position.set(0, 0.055, -0.66);
+  muzzleFlashMesh.visible = false;
+  weaponMount.add(muzzleFlashMesh);
+
+  return {
+    skeleton,
+    weaponMount,
+    weaponAssembly,
+    muzzleFlashMesh,
+    dispose: () => {
+      skeleton.chest.remove(weaponMount);
+      weaponAssembly.dispose();
+      flashGeo.dispose();
+      flashMat.dispose();
+      skeleton.dispose();
+    },
+  };
+}
+
 /**
  * Multi-part 3D Tactical Transport Helicopter ("VALKYRIE 2-1") with open troop bay,
- * cockpit canopy, seated pilot + crew chief, landing skids, navigation strobes,
- * and spinning main & tail rotors.
+ * cockpit seats, cyclic/collective controls, interior cabin dome glow, landing skids,
+ * spinning rotors, and properly two-bone-IK seated Pilot & Troop-Bay Crew Chief.
  */
 export function buildCinematicHelicopter(isSoftwareGl: boolean): CinematicHelicopterRig {
   const root = new THREE.Group();
@@ -79,14 +195,15 @@ export function buildCinematicHelicopter(isSoftwareGl: boolean): CinematicHelico
       roughness: 0.14,
       metalness: 0.25,
       transparent: true,
-      opacity: 0.45,
+      opacity: 0.36,
+      depthWrite: false,
     }),
   );
   const navStrobeMat = trackMat(
     new THREE.MeshStandardMaterial({
-      color: 0xffc8c8,
-      emissive: 0xef4444,
-      emissiveIntensity: 3.0,
+      color: 0xfde68a,
+      emissive: 0xf59e0b,
+      emissiveIntensity: 2.2,
       roughness: 0.2,
     }),
   );
@@ -94,7 +211,7 @@ export function buildCinematicHelicopter(isSoftwareGl: boolean): CinematicHelico
     new THREE.MeshStandardMaterial({
       color: 0xbbf7d0,
       emissive: 0x10b981,
-      emissiveIntensity: 2.4,
+      emissiveIntensity: 2.2,
       roughness: 0.2,
     }),
   );
@@ -107,67 +224,90 @@ export function buildCinematicHelicopter(isSoftwareGl: boolean): CinematicHelico
     }),
   );
 
-  // Fuselage floor & roof framing the open troop bay (Z = -1.6 .. +1.6)
-  const floorDeck = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(2.35, 0.22, 4.8)), hullMat);
-  floorDeck.position.set(0, 0.82, 0.1);
+  // Fuselage floor (top surface Y = 0.93m) & roof (bottom surface Y = 2.40m -> 1.47m headroom)
+  const floorDeck = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(2.42, 0.22, 4.9)), hullMat);
+  floorDeck.position.set(0, 0.82, 0.05);
   floorDeck.receiveShadow = true;
   floorDeck.castShadow = !isSoftwareGl;
   root.add(floorDeck);
 
-  const roofDeck = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(2.28, 0.36, 4.5)), hullMat);
-  roofDeck.position.set(0, 2.54, 0.25);
+  const roofDeck = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(2.36, 0.34, 4.6)), hullMat);
+  roofDeck.position.set(0, 2.57, 0.2);
   roofDeck.castShadow = !isSoftwareGl;
   root.add(roofDeck);
 
+  // Strong warm-amber interior cabin dome light + forward cockpit avionics fill so
+  // the seated squadmate, active port door gunner, and cockpit pilot read crisply in flight
+  const cabinLight = new THREE.PointLight(0xffdbb5, 9.2, 7.8, 1.35);
+  cabinLight.position.set(0.15, 2.24, -0.1);
+  root.add(cabinLight);
+
+  const cockpitFillLight = new THREE.PointLight(0x7dd3fc, 3.8, 4.8, 1.5);
+  cockpitFillLight.position.set(0.25, 1.98, -1.78);
+  root.add(cockpitFillLight);
+
   // Forward cockpit nose & instrument console (facing -Z)
-  const nose = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(2.12, 0.92, 1.85)), hullMat);
+  const nose = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(2.16, 0.92, 1.85)), hullMat);
   nose.position.set(0, 1.24, -2.95);
   nose.rotation.x = 0.16;
   root.add(nose);
 
   const cockpitGlass = new THREE.Mesh(
-    trackGeo(new THREE.BoxGeometry(2.04, 0.86, 1.42)),
+    trackGeo(new THREE.BoxGeometry(2.08, 0.9, 1.42)),
     canopyGlassMat,
   );
-  cockpitGlass.position.set(0, 1.98, -2.55);
+  cockpitGlass.position.set(0, 2.0, -2.55);
   cockpitGlass.rotation.x = 0.28;
   root.add(cockpitGlass);
 
-  const dash = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(1.78, 0.34, 0.42)), darkMetalMat);
+  const dash = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(1.82, 0.34, 0.42)), darkMetalMat);
   dash.position.set(0, 1.44, -2.25);
   root.add(dash);
 
-  const dashScreen = new THREE.Mesh(trackGeo(new THREE.PlaneGeometry(1.3, 0.16)), dashGlowMat);
+  const dashScreen = new THREE.Mesh(trackGeo(new THREE.PlaneGeometry(1.32, 0.16)), dashGlowMat);
   dashScreen.position.set(0, 1.5, -2.03);
   root.add(dashScreen);
 
+  // Pilot armored bucket seat + cyclic stick + collective lever
+  const pilotSeatBase = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(0.48, 0.38, 0.46)), interiorMat);
+  pilotSeatBase.position.set(0.48, 1.12, -1.58);
+  const pilotSeatBack = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(0.46, 0.64, 0.1)), interiorMat);
+  pilotSeatBack.position.set(0.48, 1.62, -1.38);
+  const cyclicStick = new THREE.Mesh(trackGeo(new THREE.CylinderGeometry(0.018, 0.022, 0.56, 8)), darkMetalMat);
+  cyclicStick.position.set(0.52, 1.26, -1.92);
+  cyclicStick.rotation.x = 0.14;
+  root.add(pilotSeatBase, pilotSeatBack, cyclicStick);
+
   // Rear bulkhead wall separating troop bay from turbine bay
-  const rearWall = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(2.26, 1.52, 0.28)), interiorMat);
-  rearWall.position.set(0, 1.66, 2.15);
+  const rearWall = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(2.32, 1.54, 0.28)), interiorMat);
+  rearWall.position.set(0, 1.68, 2.15);
   root.add(rearWall);
 
-  // Structural corner pillars around the open troop doors (so FP mouse-look sees authentic framing!)
-  for (const sx of [-1.06, 1.06]) {
-    for (const sz of [-1.35, 1.55]) {
-      const pillar = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(0.14, 1.54, 0.18)), darkMetalMat);
-      pillar.position.set(sx, 1.66, sz);
+  // Structural corner pillars & overhead grab rails around open troop doors
+  for (const sx of [-1.08, 1.08]) {
+    for (const sz of [-1.32, 1.58]) {
+      const pillar = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(0.14, 1.56, 0.18)), darkMetalMat);
+      pillar.position.set(sx, 1.68, sz);
       root.add(pillar);
     }
-    // Overhead grab rail along cabin ceiling
     const rail = new THREE.Mesh(
       trackGeo(new THREE.CylinderGeometry(0.018, 0.018, 2.75, 8)),
       darkMetalMat,
     );
     rail.rotation.x = Math.PI * 0.5;
-    rail.position.set(sx * 0.72, 2.26, 0.15);
+    rail.position.set(sx * 0.72, 2.3, 0.15);
     root.add(rail);
   }
 
-  // Troop benches along left & right walls
-  for (const sx of [-0.72, 0.72]) {
-    const bench = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(0.42, 0.08, 2.25)), interiorMat);
-    bench.position.set(sx, 1.24, 0.25);
-    root.add(bench);
+  // Troop benches along port (-X) and starboard (+X) walls (top surface Y = 1.32m -> 0.39m above floor)
+  for (const sx of [-0.76, 0.76]) {
+    const bench = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(0.44, 0.08, 2.25)), interiorMat);
+    bench.position.set(sx, 1.28, 0.25);
+    const benchLegF = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(0.06, 0.34, 0.06)), darkMetalMat);
+    benchLegF.position.set(sx, 1.1, -0.75);
+    const benchLegR = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(0.06, 0.34, 0.06)), darkMetalMat);
+    benchLegR.position.set(sx, 1.1, 1.25);
+    root.add(bench, benchLegF, benchLegR);
   }
 
   // Twin turbine pods on roof
@@ -177,7 +317,7 @@ export function buildCinematicHelicopter(isSoftwareGl: boolean): CinematicHelico
       darkMetalMat,
     );
     turbine.rotation.x = Math.PI * 0.5;
-    turbine.position.set(sx, 2.86, 0.65);
+    turbine.position.set(sx, 2.9, 0.65);
     root.add(turbine);
   }
 
@@ -187,20 +327,20 @@ export function buildCinematicHelicopter(isSoftwareGl: boolean): CinematicHelico
     hullMat,
   );
   tailBoom.rotation.x = Math.PI * 0.5;
-  tailBoom.position.set(0, 2.02, 5.05);
+  tailBoom.position.set(0, 2.04, 5.05);
   root.add(tailBoom);
 
   const tailFin = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(0.16, 1.68, 0.92)), hullMat);
-  tailFin.position.set(0, 2.68, 7.65);
+  tailFin.position.set(0, 2.7, 7.65);
   tailFin.rotation.x = -0.25;
   root.add(tailFin);
 
   const horizStab = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(2.35, 0.1, 0.52)), hullMat);
-  horizStab.position.set(0, 2.05, 6.8);
+  horizStab.position.set(0, 2.07, 6.8);
   root.add(horizStab);
 
   // Heavy twin landing skids & cross-struts
-  for (const sx of [-1.22, 1.22]) {
+  for (const sx of [-1.24, 1.24]) {
     const skid = new THREE.Mesh(
       trackGeo(new THREE.CylinderGeometry(0.065, 0.065, 5.2, 10)),
       darkMetalMat,
@@ -222,20 +362,20 @@ export function buildCinematicHelicopter(isSoftwareGl: boolean): CinematicHelico
 
   // Navigation strobes
   const tailStrobe = new THREE.Mesh(trackGeo(new THREE.SphereGeometry(0.08, 8, 6)), navStrobeMat);
-  tailStrobe.position.set(0, 3.54, 7.82);
+  tailStrobe.position.set(0, 3.56, 7.82);
   root.add(tailStrobe);
 
   const stbdLight = new THREE.Mesh(trackGeo(new THREE.SphereGeometry(0.065, 8, 6)), greenNavMat);
-  stbdLight.position.set(1.22, 2.48, -1.35);
+  stbdLight.position.set(1.24, 2.5, -1.35);
   root.add(stbdLight);
 
   const portLight = new THREE.Mesh(trackGeo(new THREE.SphereGeometry(0.065, 8, 6)), navStrobeMat);
-  portLight.position.set(-1.22, 2.48, -1.35);
+  portLight.position.set(-1.24, 2.5, -1.35);
   root.add(portLight);
 
   // Main 4-blade rotor assembly
   const mainRotorPivot = new THREE.Group();
-  mainRotorPivot.position.set(0, 3.22, 0.05);
+  mainRotorPivot.position.set(0, 3.24, 0.05);
   root.add(mainRotorPivot);
 
   const mast = new THREE.Mesh(
@@ -257,7 +397,7 @@ export function buildCinematicHelicopter(isSoftwareGl: boolean): CinematicHelico
 
   // Tail rotor assembly
   const tailRotorPivot = new THREE.Group();
-  tailRotorPivot.position.set(0.24, 3.12, 7.72);
+  tailRotorPivot.position.set(0.24, 3.14, 7.72);
   root.add(tailRotorPivot);
   const tailBladeGeo = trackGeo(new THREE.BoxGeometry(0.03, 1.38, 0.14));
   const tb1 = new THREE.Mesh(tailBladeGeo, darkMetalMat);
@@ -265,7 +405,76 @@ export function buildCinematicHelicopter(isSoftwareGl: boolean): CinematicHelico
   tb2.rotation.x = Math.PI * 0.5;
   tailRotorPivot.add(tb1, tb2);
 
-  // Seated Pilot + Seated Crew Chief inside helicopter using real anatomical CharacterSkeletons
+  // Port-side pintle-mounted 7.62mm Heavy Machine Gun rig inside open port doorway (-X)
+  const doorGunPivot = new THREE.Group();
+  doorGunPivot.position.set(-1.14, 1.58, -0.78);
+  root.add(doorGunPivot);
+
+  const pintlePost = new THREE.Mesh(
+    trackGeo(new THREE.CylinderGeometry(0.028, 0.036, 0.64, 8)),
+    darkMetalMat,
+  );
+  pintlePost.position.set(0.02, -0.32, 0);
+  doorGunPivot.add(pintlePost);
+
+  const gunAssemblyPivot = new THREE.Group();
+  // YXZ order: pitch down (-15 deg on X) then yaw outward port (+90 deg on Y) into the warzone valley
+  gunAssemblyPivot.rotation.order = 'YXZ';
+  gunAssemblyPivot.rotation.set(-0.26, Math.PI * 0.5, 0);
+  doorGunPivot.add(gunAssemblyPivot);
+
+  const gunReceiver = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(0.14, 0.16, 0.56)), darkMetalMat);
+  gunReceiver.position.set(0, 0.04, -0.05);
+  const gunBarrel = new THREE.Mesh(
+    trackGeo(new THREE.CylinderGeometry(0.024, 0.028, 0.72, 8)),
+    darkMetalMat,
+  );
+  gunBarrel.rotation.x = Math.PI * 0.5;
+  gunBarrel.position.set(0, 0.055, -0.66);
+  const gunShroud = new THREE.Mesh(
+    trackGeo(new THREE.CylinderGeometry(0.042, 0.044, 0.36, 8)),
+    hullMat,
+  );
+  gunShroud.rotation.x = Math.PI * 0.5;
+  gunShroud.position.set(0, 0.055, -0.48);
+  const ammoBox = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(0.16, 0.2, 0.24)), hullMat);
+  ammoBox.position.set(-0.14, -0.02, -0.08);
+  const spadeGripL = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(0.03, 0.14, 0.03)), darkMetalMat);
+  spadeGripL.position.set(-0.08, 0.04, 0.26);
+  const spadeGripR = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(0.03, 0.14, 0.03)), darkMetalMat);
+  spadeGripR.position.set(0.08, 0.04, 0.26);
+  gunAssemblyPivot.add(gunReceiver, gunBarrel, gunShroud, ammoBox, spadeGripL, spadeGripR);
+
+  const doorGunFlashMat = trackMat(
+    new THREE.MeshBasicMaterial({ color: 0xffd166, transparent: true, opacity: 0.94 }),
+  );
+  const doorGunFlash = new THREE.Mesh(trackGeo(new THREE.OctahedronGeometry(0.16, 0)), doorGunFlashMat);
+  doorGunFlash.position.set(0, 0.055, -1.08);
+  doorGunFlash.visible = false;
+  gunAssemblyPivot.add(doorGunFlash);
+
+  const doorGunLight = new THREE.PointLight(0xffb74d, 0, 12, 1.4);
+  doorGunLight.position.set(0, 0.08, -1.25);
+  gunAssemblyPivot.add(doorGunLight);
+
+  // Pooled glowing downward tracer bolts streaming out of the port door gun when firing
+  const gunnerTracerGeo = trackGeo(new THREE.CylinderGeometry(0.016, 0.016, 2.4, 5));
+  gunnerTracerGeo.rotateX(Math.PI * 0.5);
+  const gunnerTracerMat = trackMat(
+    new THREE.MeshBasicMaterial({ color: 0xfef08a, transparent: true, opacity: 0.92 }),
+  );
+  const gunnerTracers: THREE.Mesh[] = [];
+  for (let i = 0; i < 4; i++) {
+    const tr = new THREE.Mesh(gunnerTracerGeo, gunnerTracerMat);
+    tr.visible = false;
+    gunAssemblyPivot.add(tr);
+    gunnerTracers.push(tr);
+  }
+
+  // Three fully visible IK-posed operators seated cleanly on cabin floor deck (Y = 0.93m):
+  // 1. Cockpit Pilot forward-right (+0.44, 0.93, -1.52) visible down center aisle
+  // 2. Active Port Door Gunner forward-left (-0.76, 0.93, -0.68) firing pintle LMG out open port door
+  // 3. Seated Squadmate across-left (-0.70, 0.93, +0.08) facing directly toward player cradling rifle
   const pilotOp = operatorAssetLoader.loadProceduralOperator('MALE', {
     previewMode: true,
     uniformId: 'ffa',
@@ -279,45 +488,102 @@ export function buildCinematicHelicopter(isSoftwareGl: boolean): CinematicHelico
   });
   const pilotSkeleton = pilotOp.skeleton;
   pilotSkeleton.setFirstPersonHeadShadowOnly(false);
-  pilotSkeleton.root.position.set(0.46, 0.52, -1.68);
-  pilotSkeleton.root.rotation.y = 0; // facing -Z cockpit glass
-  pilotSkeleton.leftLeg.thigh.rotation.x = -1.35;
-  pilotSkeleton.rightLeg.thigh.rotation.x = -1.35;
-  pilotSkeleton.leftLeg.shin.rotation.x = 1.25;
-  pilotSkeleton.rightLeg.shin.rotation.x = 1.25;
-  pilotSkeleton.rightArm.upperArm.rotation.set(-0.62, 0.12, -0.1);
-  pilotSkeleton.leftArm.upperArm.rotation.set(-0.55, -0.1, 0.1);
+  pilotSkeleton.root.position.set(0.44, 0.93, -1.52);
+  pilotSkeleton.root.rotation.y = 0; // faces -Z through cockpit glass
   root.add(pilotSkeleton.root);
+
+  const doorGunnerOp = operatorAssetLoader.loadProceduralOperator('MALE', {
+    previewMode: true,
+    uniformId: 'team_a',
+    gear: {
+      uniformId: 'team_a',
+      helmetType: 'mil_tec',
+      helmetColor: 'coyote_brown',
+      eyewear: 'tinted_visor',
+      faceGear: 'neck_gaiter',
+    },
+  });
+  const doorGunnerSkeleton = doorGunnerOp.skeleton;
+  doorGunnerSkeleton.setFirstPersonHeadShadowOnly(false);
+  doorGunnerSkeleton.root.position.set(-0.76, 0.93, -0.78);
+  doorGunnerSkeleton.root.rotation.y = Math.PI * 0.5; // faces -X straight out open port door onto pintle gun
+  root.add(doorGunnerSkeleton.root);
 
   const crewOp = operatorAssetLoader.loadProceduralOperator('FEMALE', {
     previewMode: true,
-    uniformId: 'infection',
+    uniformId: 'team_a',
     gear: {
-      uniformId: 'infection',
+      uniformId: 'team_a',
       helmetType: 'mil_tec',
-      helmetColor: 'olive_drab',
+      helmetColor: 'desert_tan',
       eyewear: 'clear_glasses',
+      faceGear: 'neck_gaiter',
     },
   });
   const crewSkeleton = crewOp.skeleton;
   crewSkeleton.setFirstPersonHeadShadowOnly(false);
-  crewSkeleton.root.position.set(-0.72, 0.48, 0.18);
-  crewSkeleton.root.rotation.y = -Math.PI * 0.5; // seated on port bench facing player across cabin
-  crewSkeleton.leftLeg.thigh.rotation.x = -1.35;
-  crewSkeleton.rightLeg.thigh.rotation.x = -1.35;
-  crewSkeleton.leftLeg.shin.rotation.x = 1.25;
-  crewSkeleton.rightLeg.shin.rotation.x = 1.25;
-  crewSkeleton.rightArm.upperArm.rotation.set(-0.45, 0.15, -0.12);
-  crewSkeleton.leftArm.upperArm.rotation.set(-0.45, -0.15, 0.12);
+  crewSkeleton.root.position.set(-0.70, 0.93, -0.02);
+  crewSkeleton.root.rotation.y = -Math.PI * 0.42; // angled directly across-forward toward player camera
   root.add(crewSkeleton.root);
 
-  // Camera seat anchor on starboard troop bench (looking out & across cabin with live mouse look)
+  const crewRifle = buildCompactRifleAssembly('m4a1');
+  const crewWeaponMount = new THREE.Group();
+  crewWeaponMount.add(crewRifle.group);
+  crewSkeleton.chest.add(crewWeaponMount);
+
+  const updateCrew = (timeSec: number, gunnerFiring = false): void => {
+    const gunSweep = Math.sin(timeSec * 0.95) * 0.16;
+    const firePulse = gunnerFiring ? (Math.sin(timeSec * 58.0) > 0.05 ? 1 : 0) : 0;
+    gunAssemblyPivot.rotation.set(
+      -0.26 + Math.sin(timeSec * 1.3) * 0.05 + firePulse * 0.03,
+      Math.PI * 0.5 + gunSweep,
+      0,
+    );
+    gunAssemblyPivot.position.set(firePulse * 0.028, 0, 0);
+
+    doorGunFlash.visible = firePulse > 0;
+    doorGunFlash.rotation.z = timeSec * 52;
+    doorGunLight.intensity = firePulse > 0 ? 16 : 0;
+
+    for (let i = 0; i < gunnerTracers.length; i++) {
+      const tr = gunnerTracers[i];
+      if (!gunnerFiring) {
+        tr.visible = false;
+        continue;
+      }
+      const phase = ((timeSec * 4.2 + i * 0.25) % 1);
+      tr.visible = phase < 0.85;
+      tr.position.set(0, 0.055, -2.2 - phase * 34.0);
+    }
+
+    poseSeatedOperator(pilotSkeleton, 'heli_pilot', timeSec, {
+      seatHeightAboveFloor: 0.44,
+      headYawRad: Math.sin(timeSec * 0.45) * 0.14,
+      headPitchRad: -0.05,
+    });
+    poseSeatedOperator(doorGunnerSkeleton, 'heli_door_gunner', timeSec, {
+      seatHeightAboveFloor: 0.44,
+      headYawRad: gunSweep * 0.65,
+      headPitchRad: -0.16,
+      recoilKick01: firePulse,
+    });
+    poseSeatedOperator(crewSkeleton, 'heli_crew', timeSec, {
+      seatHeightAboveFloor: 0.44,
+      headYawRad: 0.18 + Math.sin(timeSec * 0.68) * 0.22,
+      headPitchRad: -0.02,
+      weaponMount: crewWeaponMount,
+    });
+  };
+  updateCrew(0, false);
+
+  // Starboard passenger camera anchor placed toward rear bench (z = +0.96) so neutral +36deg forward-left
+  // view simultaneously frames seated squadmate, active port door gunner, and cockpit pilot inside +/-32deg!
   const passengerSeatAnchor = new THREE.Object3D();
-  passengerSeatAnchor.position.set(0.66, 1.94, 0.22);
+  passengerSeatAnchor.position.set(0.74, 2.0, 0.96);
   root.add(passengerSeatAnchor);
 
   const pilotSeatAnchor = new THREE.Object3D();
-  pilotSeatAnchor.position.set(0.46, 1.85, -1.68);
+  pilotSeatAnchor.position.set(0.44, 1.98, -1.52);
   root.add(pilotSeatAnchor);
 
   return {
@@ -328,9 +594,16 @@ export function buildCinematicHelicopter(isSoftwareGl: boolean): CinematicHelico
     pilotSeatAnchor,
     navStrobeMat,
     pilotSkeleton,
+    doorGunnerSkeleton,
     crewSkeleton,
+    crewWeaponMount,
+    doorGunPivot,
+    updateCrew,
     dispose: () => {
+      crewSkeleton.chest.remove(crewWeaponMount);
+      crewRifle.dispose();
       pilotSkeleton.dispose();
+      doorGunnerSkeleton.dispose();
       crewSkeleton.dispose();
       for (const g of geos) g.dispose();
       for (const m of mats) m.dispose();
@@ -339,8 +612,165 @@ export function buildCinematicHelicopter(isSoftwareGl: boolean): CinematicHelico
 }
 
 /**
+ * Lightweight wingman Escort Gunship ("VALKYRIE 2-2") with stub weapon pylons, rocket pods,
+ * spinning rotors, navigation strobes, and pooled chin-turret tracer streams firing down into the warzone.
+ */
+export function buildEscortGunship(isSoftwareGl: boolean): CinematicEscortGunshipRig {
+  const root = new THREE.Group();
+  root.name = 'CinematicEscortGunship';
+  const geos: THREE.BufferGeometry[] = [];
+  const mats: THREE.Material[] = [];
+
+  const trackGeo = <T extends THREE.BufferGeometry>(g: T): T => {
+    geos.push(g);
+    return g;
+  };
+  const trackMat = <T extends THREE.Material>(m: T): T => {
+    mats.push(m);
+    return m;
+  };
+
+  const hullMat = trackMat(
+    new THREE.MeshStandardMaterial({ color: 0x262d28, roughness: 0.62, metalness: 0.4 }),
+  );
+  const darkMetalMat = trackMat(
+    new THREE.MeshStandardMaterial({ color: 0x15181c, roughness: 0.45, metalness: 0.7 }),
+  );
+  const navStrobeMat = trackMat(
+    new THREE.MeshStandardMaterial({
+      color: 0xfde68a,
+      emissive: 0xf59e0b,
+      emissiveIntensity: 2.6,
+    }),
+  );
+  const flashMat = trackMat(
+    new THREE.MeshBasicMaterial({ color: 0xffd166, transparent: true, opacity: 0.94 }),
+  );
+  const tracerMat = trackMat(
+    new THREE.MeshBasicMaterial({ color: 0xfde047, transparent: true, opacity: 0.92 }),
+  );
+
+  // Sleek armored gunship fuselage, stub weapon wings, twin rocket pods, tail boom & skids
+  const fuselage = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(1.72, 1.38, 4.6)), hullMat);
+  fuselage.position.set(0, 1.55, 0);
+  fuselage.castShadow = !isSoftwareGl;
+  root.add(fuselage);
+
+  const nose = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(1.42, 0.92, 1.8)), hullMat);
+  nose.position.set(0, 1.38, -2.9);
+  nose.rotation.x = 0.22;
+  root.add(nose);
+
+  const stubWings = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(4.6, 0.16, 0.92)), darkMetalMat);
+  stubWings.position.set(0, 1.52, -0.35);
+  root.add(stubWings);
+
+  for (const sx of [-2.05, 2.05]) {
+    const pod = new THREE.Mesh(trackGeo(new THREE.CylinderGeometry(0.24, 0.24, 1.45, 10)), darkMetalMat);
+    pod.rotation.x = Math.PI * 0.5;
+    pod.position.set(sx, 1.24, -0.4);
+    root.add(pod);
+  }
+
+  const tailBoom = new THREE.Mesh(
+    trackGeo(new THREE.CylinderGeometry(0.2, 0.4, 5.2, 10)),
+    hullMat,
+  );
+  tailBoom.rotation.x = Math.PI * 0.5;
+  tailBoom.position.set(0, 1.88, 4.75);
+  root.add(tailBoom);
+
+  const tailFin = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(0.14, 1.55, 0.85)), hullMat);
+  tailFin.position.set(0, 2.48, 7.2);
+  tailFin.rotation.x = -0.24;
+  root.add(tailFin);
+
+  const strobe = new THREE.Mesh(trackGeo(new THREE.SphereGeometry(0.09, 8, 6)), navStrobeMat);
+  strobe.position.set(0, 3.28, 7.36);
+  root.add(strobe);
+
+  // Main & tail rotors
+  const mainRotorPivot = new THREE.Group();
+  mainRotorPivot.position.set(0, 2.52, -0.05);
+  root.add(mainRotorPivot);
+  const bladeGeo = trackGeo(new THREE.BoxGeometry(5.2, 0.035, 0.3));
+  for (let b = 0; b < 4; b++) {
+    const bp = new THREE.Group();
+    bp.rotation.y = (b * Math.PI) / 2;
+    const bl = new THREE.Mesh(bladeGeo, darkMetalMat);
+    bl.position.set(2.65, 0.04, 0);
+    bp.add(bl);
+    mainRotorPivot.add(bp);
+  }
+
+  const tailRotorPivot = new THREE.Group();
+  tailRotorPivot.position.set(0.2, 2.86, 7.25);
+  root.add(tailRotorPivot);
+  const tailBladeGeo = trackGeo(new THREE.BoxGeometry(0.03, 1.25, 0.13));
+  const tb1 = new THREE.Mesh(tailBladeGeo, darkMetalMat);
+  const tb2 = new THREE.Mesh(tailBladeGeo, darkMetalMat);
+  tb2.rotation.x = Math.PI * 0.5;
+  tailRotorPivot.add(tb1, tb2);
+
+  // Chin cannon turret + downward tracer stream pool
+  const turretPivot = new THREE.Group();
+  turretPivot.position.set(0, 0.82, -3.55);
+  turretPivot.rotation.x = -0.38; // firing downward into combat valley
+  root.add(turretPivot);
+
+  const chinFlash = new THREE.Mesh(trackGeo(new THREE.OctahedronGeometry(0.24, 0)), flashMat);
+  chinFlash.position.set(0, 0, -0.4);
+  chinFlash.visible = false;
+  turretPivot.add(chinFlash);
+
+  const tracerGeo = trackGeo(new THREE.CylinderGeometry(0.03, 0.03, 3.4, 5));
+  tracerGeo.rotateX(Math.PI * 0.5);
+  const tracers: THREE.Mesh[] = [];
+  for (let i = 0; i < 4; i++) {
+    const tMesh = new THREE.Mesh(tracerGeo, tracerMat);
+    tMesh.visible = false;
+    turretPivot.add(tMesh);
+    tracers.push(tMesh);
+  }
+
+  const updateCombat = (timeSec: number, dt: number, firing: boolean): void => {
+    mainRotorPivot.rotation.y += dt * 28.0;
+    tailRotorPivot.rotation.x += dt * 44.0;
+    navStrobeMat.emissiveIntensity = Math.sin(timeSec * 8.2) > 0.6 ? 3.5 : 0.4;
+
+    const pulse = firing && Math.sin(timeSec * 46.0) > -0.1;
+    chinFlash.visible = pulse;
+    chinFlash.rotation.z = timeSec * 40;
+    turretPivot.rotation.y = Math.sin(timeSec * 1.1) * 0.24;
+
+    for (let i = 0; i < tracers.length; i++) {
+      const tr = tracers[i];
+      if (!firing) {
+        tr.visible = false;
+        continue;
+      }
+      const p = (timeSec * 3.2 + i * 0.25) % 1;
+      tr.visible = p < 0.88;
+      tr.position.set(0, 0, -2.5 - p * 42.0);
+    }
+  };
+
+  return {
+    root,
+    mainRotorPivot,
+    tailRotorPivot,
+    navStrobeMat,
+    updateCombat,
+    dispose: () => {
+      for (const g of geos) g.dispose();
+      for (const m of mats) m.dispose();
+    },
+  };
+}
+
+/**
  * Multi-part 3D Armored Tactical APC with articulated driver & passenger doors,
- * rotating heavy off-road wheels, interior dash, halogen headlights, and roof amber strobe.
+ * steering wheel column, rotating heavy off-road wheels, halogen headlights, and roof strobe.
  */
 export function buildCinematicApc(isSoftwareGl: boolean): CinematicApcRig {
   const root = new THREE.Group();
@@ -372,14 +802,15 @@ export function buildCinematicApc(isSoftwareGl: boolean): CinematicApcRig {
       roughness: 0.16,
       metalness: 0.2,
       transparent: true,
-      opacity: 0.42,
+      opacity: 0.38,
+      depthWrite: false,
     }),
   );
   const beaconMat = trackMat(
     new THREE.MeshStandardMaterial({
       color: 0xfef08a,
       emissive: 0xf59e0b,
-      emissiveIntensity: 2.8,
+      emissiveIntensity: 2.6,
       roughness: 0.2,
     }),
   );
@@ -400,31 +831,35 @@ export function buildCinematicApc(isSoftwareGl: boolean): CinematicApcRig {
     }),
   );
 
-  // Forward faces -Z
-  // Lower armored chassis + engine hood + rear troop compartment (leaving front cab sides open for articulated doors)
+  // Lower armored chassis + hood + rear troop compartment
   const lowerHull = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(2.52, 0.72, 6.2)), armorMat);
-  lowerHull.position.set(0, 0.92, 0);
+  lowerHull.position.set(0, 0.86, 0);
   lowerHull.castShadow = !isSoftwareGl;
   lowerHull.receiveShadow = true;
   root.add(lowerHull);
 
   const hood = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(2.38, 0.68, 1.95)), armorMat);
-  hood.position.set(0, 1.56, -2.05);
+  hood.position.set(0, 1.54, -2.05);
   hood.rotation.x = 0.08;
   root.add(hood);
 
-  const rearBody = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(2.5, 1.32, 3.0)), armorMat);
+  const rearBody = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(2.5, 1.38, 3.0)), armorMat);
   rearBody.position.set(0, 1.92, 1.55);
   rearBody.castShadow = !isSoftwareGl;
   root.add(rearBody);
 
   const cabRoof = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(2.44, 0.18, 1.65)), armorMat);
-  cabRoof.position.set(0, 2.48, -0.58);
+  cabRoof.position.set(0, 2.54, -0.58);
   root.add(cabRoof);
 
-  // Armored windshield + interior dashboard
-  const windshield = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(2.16, 0.72, 0.08)), glassMat);
-  windshield.position.set(0, 2.02, -1.32);
+  // Subtle green dashboard ambient light inside cab
+  const cabLight = new THREE.PointLight(0x86efac, 2.4, 4.2, 1.6);
+  cabLight.position.set(0, 2.15, -0.72);
+  root.add(cabLight);
+
+  // Armored windshield + interior dashboard + driver steering wheel
+  const windshield = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(2.16, 0.76, 0.08)), glassMat);
+  windshield.position.set(0, 2.06, -1.32);
   windshield.rotation.x = -0.22;
   root.add(windshield);
 
@@ -432,39 +867,44 @@ export function buildCinematicApc(isSoftwareGl: boolean): CinematicApcRig {
   dashboard.position.set(0, 1.52, -1.12);
   root.add(dashboard);
 
+  const wheelRim = new THREE.Mesh(trackGeo(new THREE.TorusGeometry(0.18, 0.022, 8, 16)), darkMetalMat);
+  wheelRim.position.set(-0.62, 1.72, -0.92);
+  wheelRim.rotation.x = 0.48;
+  root.add(wheelRim);
+
   // Front A-pillars
   for (const sx of [-1.14, 1.14]) {
-    const pillar = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(0.14, 1.24, 0.16)), darkMetalMat);
-    pillar.position.set(sx, 1.88, -1.24);
+    const pillar = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(0.14, 1.28, 0.16)), darkMetalMat);
+    pillar.position.set(sx, 1.9, -1.24);
     root.add(pillar);
   }
 
-  // Articulated Driver Door (Left / -X side, hinged at front edge Z = -1.24)
+  // Articulated Driver Door (-X)
   const driverDoorPivot = new THREE.Group();
-  driverDoorPivot.position.set(-1.24, 1.52, -1.22);
+  driverDoorPivot.position.set(-1.24, 1.54, -1.22);
   root.add(driverDoorPivot);
   const dDoorLower = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(0.12, 0.78, 1.24)), armorMat);
   dDoorLower.position.set(0, -0.05, 0.62);
-  const dDoorFrame = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(0.1, 0.54, 1.2)), glassMat);
+  const dDoorFrame = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(0.1, 0.56, 1.2)), glassMat);
   dDoorFrame.position.set(0, 0.56, 0.62);
   driverDoorPivot.add(dDoorLower, dDoorFrame);
 
-  // Articulated Passenger Door (Right / +X side, hinged at front edge Z = -1.24)
+  // Articulated Passenger Door (+X)
   const passengerDoorPivot = new THREE.Group();
-  passengerDoorPivot.position.set(1.24, 1.52, -1.22);
+  passengerDoorPivot.position.set(1.24, 1.54, -1.22);
   root.add(passengerDoorPivot);
   const pDoorLower = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(0.12, 0.78, 1.24)), armorMat);
   pDoorLower.position.set(0, -0.05, 0.62);
-  const pDoorFrame = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(0.1, 0.54, 1.2)), glassMat);
+  const pDoorFrame = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(0.1, 0.56, 1.2)), glassMat);
   pDoorFrame.position.set(0, 0.56, 0.62);
   passengerDoorPivot.add(pDoorLower, pDoorFrame);
 
-  // Roof amber rotating beacon + front halogen headlights + single downward spot beam
+  // Roof amber strobe + halogen headlights + forward beam
   const roofBeacon = new THREE.Mesh(
     trackGeo(new THREE.CylinderGeometry(0.12, 0.14, 0.22, 10)),
     beaconMat,
   );
-  roofBeacon.position.set(0, 2.68, -0.45);
+  roofBeacon.position.set(0, 2.74, -0.45);
   root.add(roofBeacon);
 
   for (const hx of [-0.88, 0.88]) {
@@ -473,9 +913,9 @@ export function buildCinematicApc(isSoftwareGl: boolean): CinematicApcRig {
     root.add(hl);
   }
 
-  const headlightBeam = new THREE.SpotLight(0xfff1d0, 24, 34, Math.PI * 0.34, 0.55, 1.3);
+  const headlightBeam = new THREE.SpotLight(0xfff1d0, 24, 38, Math.PI * 0.34, 0.55, 1.3);
   headlightBeam.position.set(0, 1.4, -3.15);
-  headlightBeam.target.position.set(0, 0.2, -16);
+  headlightBeam.target.position.set(0, 0.2, -18);
   root.add(headlightBeam, headlightBeam.target);
 
   // 6 Heavy Armored Tires
@@ -494,13 +934,13 @@ export function buildCinematicApc(isSoftwareGl: boolean): CinematicApcRig {
     }
   }
 
-  // Interior driver & passenger anchors
+  // Driver floor deck anchor (Y = 0.98m -> seated driver head sits at Y ≈ 2.22m, well below 2.45m roof!)
   const driverSeatAnchor = new THREE.Object3D();
-  driverSeatAnchor.position.set(-0.62, 0.58, -0.52);
+  driverSeatAnchor.position.set(-0.62, 0.98, -0.52);
   root.add(driverSeatAnchor);
 
   const passengerSeatAnchor = new THREE.Object3D();
-  passengerSeatAnchor.position.set(0.62, 1.96, -0.52);
+  passengerSeatAnchor.position.set(0.62, 2.04, -0.52);
   root.add(passengerSeatAnchor);
 
   return {
@@ -523,8 +963,7 @@ export function buildCinematicApc(isSoftwareGl: boolean): CinematicApcRig {
 /**
  * Rail / Gun-Mounted Tactical Camera Rig for cinematic room-clearing & firefight kill shots.
  * Mounts an authentic M4A1 carbine (`WeaponModelFactory`) with top rail + PEQ laser + muzzle flash
- * so the camera sits offset beside the upper handguard rail looking tightly past the receiver/barrel
- * downrange at the target!
+ * so the camera looks tightly past the upper receiver/handguard downrange at targets.
  */
 export function buildGunCamRig(): GunCamRig {
   const root = new THREE.Group();
@@ -533,68 +972,40 @@ export function buildGunCamRig(): GunCamRig {
   const weaponPivot = new THREE.Group();
   root.add(weaponPivot);
 
-  const prof = resolveWeaponProfile('m4a1');
-  const assembly = WeaponModelFactory.build({
-    id: prof.id,
-    holdClass: prof.holdClass,
-    barrelLengthM: prof.barrelLengthM,
-    visualStyle: prof.visualStyle,
-    finish: prof.finish,
-    railType: prof.railType,
-    isRevolver: prof.isRevolver,
-    boreAxisHeightM: prof.boreAxisHeightM,
-    rightHandSocket: prof.rightHandSocket,
-    leftHandSocket: prof.leftHandSocket,
-    muzzleOffset: prof.muzzleOffset,
-    laserOffset: prof.laserOffset,
-    supportsSuppressor: prof.supportsSuppressor,
-    renderLayer: 0,
-  });
-  WeaponAssembler.applyAttachments(
-    assembly,
-    prof.massKg,
-    prof.barrelLengthM,
-    prof.magCapacity,
-    {
-      optic: 'holo_eotech',
-      muzzle: 'comp_tactical',
-      foregrip: 'grip_angled',
-      tactical: 'peq15',
-    },
-    { thirdPersonMode: false },
-  );
+  const assembly = buildCompactRifleAssembly('m4a1');
   weaponPivot.add(assembly.group);
 
-  // Camera mounted to right upper Picatinny rail slightly behind muzzle looking downrange (-Z)
+  // Camera mounted clear on the upper-right Picatinny rail past the optic housing so the
+  // receiver/handguard anchor the lower-left corner while >80% of the viewport stays wide open downrange!
   const cameraAnchor = new THREE.Object3D();
-  cameraAnchor.position.set(0.088, 0.082, -0.04);
-  cameraAnchor.rotation.set(-0.015, 0.045, 0.06); // crisp canted gun-cam look!
+  cameraAnchor.position.set(0.125, 0.104, -0.095);
+  cameraAnchor.rotation.set(-0.008, 0.0, 0.024);
   weaponPivot.add(cameraAnchor);
 
-  const flashGeo = new THREE.OctahedronGeometry(0.13, 0);
+  const flashGeo = new THREE.OctahedronGeometry(0.15, 0);
   const flashMat = new THREE.MeshBasicMaterial({
     color: 0xffd166,
     transparent: true,
-    opacity: 0.92,
+    opacity: 0.94,
   });
   const muzzleFlashMesh = new THREE.Mesh(flashGeo, flashMat);
   muzzleFlashMesh.position.set(0, 0.055, -0.68);
   muzzleFlashMesh.visible = false;
   weaponPivot.add(muzzleFlashMesh);
 
-  const muzzleLight = new THREE.PointLight(0xffb74d, 0, 12, 1.5);
-  muzzleLight.position.set(0, 0.08, -0.74);
+  const muzzleLight = new THREE.PointLight(0xffb74d, 0, 16, 1.35);
+  muzzleLight.position.set(0, 0.06, -0.78);
   weaponPivot.add(muzzleLight);
 
-  const laserGeo = new THREE.CylinderGeometry(0.0022, 0.0022, 18, 6);
+  const laserGeo = new THREE.CylinderGeometry(0.0018, 0.0018, 18, 6);
   laserGeo.rotateX(Math.PI * 0.5);
   const laserMat = new THREE.MeshBasicMaterial({
-    color: 0xef4444,
+    color: 0x34d399,
     transparent: true,
-    opacity: 0.45,
+    opacity: 0.22,
   });
   const laserBeam = new THREE.Mesh(laserGeo, laserMat);
-  laserBeam.position.set(-0.03, 0.06, -9.2);
+  laserBeam.position.set(0.032, 0.072, -9.35);
   weaponPivot.add(laserBeam);
 
   return {
