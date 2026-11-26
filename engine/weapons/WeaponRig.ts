@@ -30,6 +30,7 @@ export interface ReadOnlyWeaponRigState {
   isSprinting: boolean;
   isMoving: boolean;
   strideProgress: number;
+  bobPhase: number;
   pullbackRatio: number;
   recoilX: number;
   recoilZ: number;
@@ -136,6 +137,7 @@ export class WeaponRig {
   private lastIsSprinting = false;
   private lastIsMoving = false;
   private lastStrideProgress = 0;
+  private lastBobPhase = 0;
 
   private scene: THREE.Scene;
   private raycaster = new THREE.Raycaster();
@@ -163,6 +165,7 @@ export class WeaponRig {
     isSprinting: false,
     isMoving: false,
     strideProgress: 0,
+    bobPhase: 0,
     pullbackRatio: 0,
     recoilX: 0,
     recoilZ: 0,
@@ -892,6 +895,7 @@ export class WeaponRig {
     s.isSprinting = this.lastIsSprinting;
     s.isMoving = this.lastIsMoving;
     s.strideProgress = this.lastStrideProgress;
+    s.bobPhase = this.lastBobPhase;
     s.pullbackRatio = this.pullbackRatio;
     s.recoilX = 0;
     s.recoilZ = this.recoilZ;
@@ -965,6 +969,7 @@ export class WeaponRig {
     this.lastIsSprinting = isSprinting;
     this.lastIsMoving = isMoving;
     this.lastStrideProgress = strideProgress;
+    this.lastBobPhase = bobPhase !== undefined ? bobPhase : strideProgress * Math.PI;
     this.lastHoldBreathBlend = THREE.MathUtils.damp(
       this.lastHoldBreathBlend,
       THREE.MathUtils.clamp(holdBreathBlend, 0, 1),

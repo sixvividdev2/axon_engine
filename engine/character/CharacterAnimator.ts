@@ -139,9 +139,10 @@ export class CharacterAnimator {
   private hasPrevPos = false;
   private smoothedLocalVelX = 0;
   private smoothedLocalVelZ = 0;
-  private prevStridePhase = 0;
-  private stepSign = 1;
+  private lastMoveDirX = 0;
+  private lastMoveDirZ = -1;
   private moveWeight = 0;
+  private sprintBlend = 0;
   private crouchBlend = 0;
 
   // Per-foot smoothed world elevation & slope pitch for smooth stairs/curbs/ramps
@@ -842,12 +843,13 @@ export class CharacterAnimator {
     const wantsUnarmedSprint =
       spec.holdClass === 'unarmed' &&
       state.sprint &&
+      state.isMoving &&
       !wantsUnarmedGuard &&
       !state.vaultState.active;
     this.unarmedSprintBlend = THREE.MathUtils.damp(
       this.unarmedSprintBlend,
       wantsUnarmedSprint ? 1 : 0,
-      11,
+      wantsUnarmedSprint ? 10 : 6.5,
       dt,
     );
 
@@ -949,16 +951,28 @@ export class CharacterAnimator {
     this.smoothedLocalVelX = THREE.MathUtils.damp(this.smoothedLocalVelX, rawLocalVx, 14, dt);
     this.smoothedLocalVelZ = THREE.MathUtils.damp(this.smoothedLocalVelZ, rawLocalVz, 14, dt);
 
-    if (state.isMoving && state.stridePhase < this.prevStridePhase - 0.5) {
-      this.stepSign *= -1;
-    }
-    this.prevStridePhase = state.stridePhase;
-
-    this.moveWeight = THREE.MathUtils.damp(this.moveWeight, state.isMoving ? 1 : 0, 11, dt);
+    const horizSpeed = Math.hypot(this.smoothedLocalVelX, this.smoothedLocalVelZ);
+    const targetMoveWeight = THREE.MathUtils.clamp(horizSpeed / 1.6, 0, 1);
+    this.moveWeight = THREE.MathUtils.damp(
+      this.moveWeight,
+      targetMoveWeight,
+      targetMoveWeight > this.moveWeight ? 11 : 9,
+      dt,
+    );
+    this.sprintBlend = THREE.MathUtils.damp(
+      this.sprintBlend,
+      state.sprint && state.isMoving ? 1 : 0,
+      9.5,
+      dt,
+    );
     this.crouchBlend = THREE.MathUtils.damp(this.crouchBlend, state.crouch ? 1 : 0, 11, dt);
 
-    const cyclePhase = (this.stepSign > 0 ? state.stridePhase : state.stridePhase + 1.0) * Math.PI;
-    const pelvisBob = this.moveWeight * (Math.abs(Math.sin(cyclePhase)) * (state.sprint ? 0.038 : 0.018));
+    const cyclePhase =
+      typeof state.bobPhase === 'number' && Number.isFinite(state.bobPhase)
+        ? state.bobPhase
+        : state.stridePhase * Math.PI;
+    const pelvisBobAmp = THREE.MathUtils.lerp(0.018, 0.038, this.sprintBlend);
+    const pelvisBob = this.moveWeight * (Math.abs(Math.sin(cyclePhase)) * pelvisBobAmp);
     const pelvisSwayX = this.moveWeight * Math.cos(cyclePhase) * 0.016;
 
     const kickP =
@@ -989,7 +1003,7 @@ export class CharacterAnimator {
       -this.crouchBlend * 0.20 -
       landingBend * 0.28 -
       headDuck * 0.44 -
-      (state.sprint ? 0.07 : 0) +
+      this.sprintBlend * 0.07 +
       kickShiftWeight * 0.16;
     const leanAngle = -leanSign * 1.22 + kickShiftWeight * 0.10;
 
@@ -1584,11 +1598,17 @@ export class CharacterAnimator {
     this.skeleton.root.worldToLocal(this._hipR);
 
     const speed = Math.hypot(this.smoothedLocalVelX, this.smoothedLocalVelZ);
-    const moveDirX = speed > 0.12 ? this.smoothedLocalVelX / speed : 0;
-    const moveDirZ = speed > 0.12 ? this.smoothedLocalVelZ / speed : -1;
+    if (speed > 0.12) {
+      this.lastMoveDirX = this.smoothedLocalVelX / speed;
+      this.lastMoveDirZ = this.smoothedLocalVelZ / speed;
+    }
+    const moveDirX = this.lastMoveDirX;
+    const moveDirZ = this.lastMoveDirZ;
 
-    const strideLen = state.sprint ? 0.42 : state.crouch ? 0.22 : 0.28;
-    const stepLiftH = state.sprint ? 0.15 : state.crouch ? 0.08 : 0.10;
+    const baseStrideLen = THREE.MathUtils.lerp(0.28, 0.22, this.crouchBlend);
+    const baseStepLift = THREE.MathUtils.lerp(0.10, 0.08, this.crouchBlend);
+    const strideLen = THREE.MathUtils.lerp(baseStrideLen, 0.42, this.sprintBlend);
+    const stepLiftH = THREE.MathUtils.lerp(baseStepLift, 0.15, this.sprintBlend);
     const landingBend = state.landingKneeBend;
     const stanceSpreadX = 0.115 + this.crouchBlend * 0.032 + landingBend * 0.042;
     const smoothRootY = this.skeleton.root.position.y;
@@ -2052,7 +2072,9 @@ export class CharacterAnimator {
     const eyeH = state.chestHeight;
     const breathBob = Math.sin(elapsed * 2.2) * 0.0045;
     const guardStrideBob =
-      this.moveWeight * Math.sin(state.stridePhase * Math.PI * 2) * (state.sprint ? 0.014 : 0.007);
+      this.moveWeight *
+      Math.sin(cyclePhase * 2) *
+      THREE.MathUtils.lerp(0.007, 0.014, this.sprintBlend);
     const kickBrace =
       this.combatMove === 'PUSH_KICK'
         ? smoothstep(0.0, 0.16, this.combatTime / Math.max(0.01, this.combatDuration)) *
@@ -2064,7 +2086,7 @@ export class CharacterAnimator {
 
     if (isUnarmed) {
       const g = this.unarmedGuardBlend;
-      const sprintBlend = this.unarmedSprintBlend * this.moveWeight * (1 - g);
+      const sprintBlend = this.unarmedSprintBlend * (1 - g);
       const aimPitchOff = state.aimPitch * 0.18;
       const aimYawOff = state.aimYaw * 0.16;
 
@@ -2356,7 +2378,7 @@ export class CharacterAnimator {
     this._aimPoleEuler.set(state.aimPitch * 0.55, state.aimYaw * 0.70, -state.lean * 0.85, 'YXZ');
     if (isUnarmed) {
       const poleGuardW = Math.max(this.unarmedGuardBlend, activePunchPoleWeight);
-      const sprintPoleW = this.unarmedSprintBlend * this.moveWeight * (1 - poleGuardW);
+      const sprintPoleW = this.unarmedSprintBlend * (1 - poleGuardW);
 
       this._readyPoleR.set(this._shoulderR.x + 0.14, this._shoulderR.y - 0.30, this._shoulderR.z + 0.28);
       this._readyPoleL.set(this._shoulderL.x - 0.14, this._shoulderL.y - 0.30, this._shoulderL.z + 0.28);

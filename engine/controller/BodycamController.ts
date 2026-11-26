@@ -449,6 +449,8 @@ export class BodycamController {
     this.landingRollVel = 0;
     this.takeoffHeave = 0;
     this.takeoffHeaveVel = 0;
+    this.bobPhase = 0;
+    this.strideProgress = 0;
     this.bobWeight = 0;
     this.sprintBobBlend = 0;
     this.crouchBobBlend = 0;
@@ -1605,9 +1607,10 @@ export class BodycamController {
             : 'footstep_walk';
         this.acoustic.emitNoise(this.position, acousticRadius, acousticKind);
       }
-    } else if (this.grounded) {
-      this.strideProgress = 0.72;
     }
+    // Keep bobPhase & strideProgress strictly continuous on stop so legs, pelvis,
+    // arms, and weapon settle smoothly into idle without a single-frame phase snap.
+    this.strideProgress = (this.bobPhase % Math.PI) / Math.PI;
 
     // Continuous exaggerated smooth walk/run headbob (sprint intensity dialed back ~10%)
     const aimBobAtten = this.isAds ? 0.32 : this.isCanted ? 0.38 : this.isPointAim ? 0.55 : 1.0;

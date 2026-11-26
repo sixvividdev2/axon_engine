@@ -23,6 +23,7 @@ export interface CharacterDriverState {
   landingKneeBend: number;
   landingCompression: number;
   stridePhase: number;
+  bobPhase?: number;
   wallPullback: number;
   recoilSpring: {
     z: number;
@@ -60,6 +61,7 @@ export class ControllerStateReader {
     landingKneeBend: 0,
     landingCompression: 0,
     stridePhase: 0,
+    bobPhase: 0,
     wallPullback: 0,
     recoilSpring: { z: 0, pitch: 0, roll: 0 },
     chestHeight: 1.42,
@@ -117,6 +119,7 @@ export class ControllerStateReader {
     s.aimPitch = rigState.aimPitch;
     s.isMoving = rigState.isMoving;
     s.stridePhase = rigState.strideProgress;
+    s.bobPhase = rigState.bobPhase;
     s.wallPullback = rigState.pullbackRatio;
     s.recoilSpring.z = rigState.recoilZ;
     s.recoilSpring.pitch = rigState.recoilPitch;

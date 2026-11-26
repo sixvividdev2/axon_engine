@@ -132,9 +132,8 @@ export class CharacterAnimator {
   private wasPdaActive = false;
   private wasGrenadeActive = false;
 
-  private prevStridePhase = 0;
-  private stepSign = 1;
   private moveWeight = 0;
+  private sprintBlend = 0;
   private crouchBlend = 0;
 
   // Per-foot smoothed world ground elevation & slope pitch for stairs/curbs/ramps
@@ -717,12 +716,13 @@ export class CharacterAnimator {
     const wantsUnarmedSprint =
       spec.holdClass === 'unarmed' &&
       controller.isSprinting &&
+      rigState.isMoving &&
       !wantsUnarmedGuard &&
       !controller.isVaulting();
     this.unarmedSprintBlend = THREE.MathUtils.damp(
       this.unarmedSprintBlend,
       wantsUnarmedSprint ? 1 : 0,
-      11,
+      wantsUnarmedSprint ? 10 : 6.5,
       clampedDt,
     );
 
@@ -760,16 +760,26 @@ export class CharacterAnimator {
     this.skeleton.root.position.set(controller.position.x, smoothRootY, controller.position.z);
     this.skeleton.root.rotation.set(0, controller.torsoYaw + vaultStateTop.spinYawOffset, 0);
 
-    if (rigState.isMoving && rigState.strideProgress < this.prevStridePhase - 0.5) {
-      this.stepSign *= -1;
-    }
-    this.prevStridePhase = rigState.strideProgress;
-
-    this.moveWeight = THREE.MathUtils.damp(this.moveWeight, rigState.isMoving ? 1 : 0, 11, clampedDt);
+    const ctrlVel = controller.getVelocity(this._tmpWorldA);
+    const horizSpeed = Math.hypot(ctrlVel.x, ctrlVel.z);
+    const targetMoveWeight = THREE.MathUtils.clamp(horizSpeed / 1.6, 0, 1);
+    this.moveWeight = THREE.MathUtils.damp(
+      this.moveWeight,
+      targetMoveWeight,
+      targetMoveWeight > this.moveWeight ? 11 : 9,
+      clampedDt,
+    );
+    this.sprintBlend = THREE.MathUtils.damp(
+      this.sprintBlend,
+      controller.isSprinting && rigState.isMoving ? 1 : 0,
+      9.5,
+      clampedDt,
+    );
     this.crouchBlend = THREE.MathUtils.damp(this.crouchBlend, controller.crouched ? 1 : 0, 11, clampedDt);
 
-    const cyclePhase = (this.stepSign > 0 ? rigState.strideProgress : rigState.strideProgress + 1.0) * Math.PI;
-    const pelvisBob = this.moveWeight * (Math.abs(Math.sin(cyclePhase)) * (controller.isSprinting ? 0.038 : 0.018));
+    const cyclePhase = rigState.bobPhase;
+    const pelvisBobAmp = THREE.MathUtils.lerp(0.018, 0.038, this.sprintBlend);
+    const pelvisBob = this.moveWeight * (Math.abs(Math.sin(cyclePhase)) * pelvisBobAmp);
     const pelvisSwayX = this.moveWeight * Math.cos(cyclePhase) * 0.016;
 
     // Kick weight shift onto left planting leg + chest lean-back
@@ -802,7 +812,7 @@ export class CharacterAnimator {
       -this.crouchBlend * 0.20 -
       landingBend * 0.28 -
       headDuck * 0.44 -
-      (controller.isSprinting ? 0.07 : 0) +
+      this.sprintBlend * 0.07 +
       kickShiftWeight * 0.16;
     const leanAngle = -leanSign * 1.22 + kickShiftWeight * 0.10;
 
@@ -1572,7 +1582,7 @@ export class CharacterAnimator {
   private updateLowerBodyIK(
     dt: number,
     controller: BodycamController,
-    isSprinting: boolean,
+    _isSprinting: boolean,
     cyclePhase: number,
     adapter: IBodycamWorldAdapter,
     trauma?: Readonly<BodycamTraumaModifiers>,
@@ -1582,8 +1592,10 @@ export class CharacterAnimator {
     this.skeleton.root.worldToLocal(this._hipL);
     this.skeleton.root.worldToLocal(this._hipR);
 
-    const strideLen = (isSprinting ? 0.42 : controller.crouched ? 0.22 : 0.30) * this.moveWeight;
-    const stepLift = (isSprinting ? 0.14 : controller.crouched ? 0.065 : 0.095) * this.moveWeight;
+    const baseStrideLen = THREE.MathUtils.lerp(0.30, 0.22, this.crouchBlend);
+    const baseStepLift = THREE.MathUtils.lerp(0.095, 0.065, this.crouchBlend);
+    const strideLen = THREE.MathUtils.lerp(baseStrideLen, 0.42, this.sprintBlend) * this.moveWeight;
+    const stepLift = THREE.MathUtils.lerp(baseStepLift, 0.14, this.sprintBlend) * this.moveWeight;
 
     const smoothRootY = this.skeleton.root.position.y;
     const groundRefY = Math.max(controller.position.y, smoothRootY);
@@ -2327,7 +2339,9 @@ export class CharacterAnimator {
     const eyeH = controller.getEyeHeight();
     const breathBob = Math.sin(elapsed * 2.2) * 0.0045;
     const guardStrideBob =
-      this.moveWeight * Math.sin(rigState.strideProgress * Math.PI * 2) * (controller.isSprinting ? 0.014 : 0.007);
+      this.moveWeight *
+      Math.sin(cyclePhase * 2) *
+      THREE.MathUtils.lerp(0.007, 0.014, this.sprintBlend);
     const kickBrace =
       this.combatMove === 'PUSH_KICK'
         ? smoothstep(0.0, 0.16, this.combatTime / Math.max(0.01, this.combatDuration)) *
@@ -2342,7 +2356,7 @@ export class CharacterAnimator {
 
     if (isUnarmed) {
       const g = this.unarmedGuardBlend;
-      const sprintBlend = this.unarmedSprintBlend * this.moveWeight * (1 - g);
+      const sprintBlend = this.unarmedSprintBlend * (1 - g);
       const aimPitchOff = rigState.aimPitch * 0.18;
       const aimYawOff = rigState.aimYaw * 0.16;
 
@@ -2775,7 +2789,7 @@ export class CharacterAnimator {
     );
     if (isUnarmed) {
       const poleGuardW = Math.max(this.unarmedGuardBlend, activePunchPoleWeight);
-      const sprintPoleW = this.unarmedSprintBlend * this.moveWeight * (1 - poleGuardW);
+      const sprintPoleW = this.unarmedSprintBlend * (1 - poleGuardW);
 
       this._readyPoleR.set(this._shoulderR.x + 0.14, this._shoulderR.y - 0.30, this._shoulderR.z + 0.28);
       this._readyPoleL.set(this._shoulderL.x - 0.14, this._shoulderL.y - 0.30, this._shoulderL.z + 0.28);

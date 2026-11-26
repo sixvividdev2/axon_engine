@@ -378,6 +378,12 @@ export class WeaponAnimator {
   public pointAimBlend = 0;
   public sprintBlend = 0;
   public inspectBlend = 0;
+  private moveBobBlend = 0;
+  private dampedWalkSwingX = 0;
+  private dampedWalkSwingY = 0;
+  private dampedStrideYaw = 0;
+  private dampedStridePitch = 0;
+  private dampedStrideRoll = 0;
   private reloadSpeedMult = 1.0;
   private equipTimer = 0;
   private equipDuration = 0.24;
@@ -2447,10 +2453,17 @@ export class WeaponAnimator {
       massRate * 1.15 * speedScale,
       dt,
     );
+    const wantsSprintPose = input.isSprinting && this.action !== 'RELOAD';
     this.sprintBlend = THREE.MathUtils.damp(
       this.sprintBlend,
-      input.isSprinting && this.action !== 'RELOAD' ? 1 : 0,
-      11.5,
+      wantsSprintPose ? 1 : 0,
+      wantsSprintPose ? 11.5 : 8.5,
+      dt,
+    );
+    this.moveBobBlend = THREE.MathUtils.damp(
+      this.moveBobBlend,
+      input.isMoving ? 1 : 0,
+      input.isMoving ? 12.0 : 9.0,
       dt,
     );
     this.inspectBlend = THREE.MathUtils.damp(
@@ -2947,12 +2960,16 @@ export class WeaponAnimator {
       0.12,
       1 - this.adsBlend * 0.80 - this.cantBlend * 0.78 - this.pointAimBlend * 0.45,
     );
-    const walkSwingX = input.isMoving
-      ? Math.sin(input.bobPhase) * (input.isSprinting ? 0.030 : 0.012) * sightBobScale
-      : 0;
-    const walkSwingY = input.isMoving
-      ? (-Math.cos(input.bobPhase * 2) * 0.5 - 0.5) * (input.isSprinting ? 0.025 : 0.011) * sightBobScale
-      : 0;
+    const walkSwingAmpX = THREE.MathUtils.lerp(0.012, 0.030, this.sprintBlend);
+    const walkSwingAmpY = THREE.MathUtils.lerp(0.011, 0.025, this.sprintBlend);
+    const targetWalkSwingX =
+      Math.sin(input.bobPhase) * walkSwingAmpX * sightBobScale * this.moveBobBlend;
+    const targetWalkSwingY =
+      (-Math.cos(input.bobPhase * 2) * 0.5 - 0.5) * walkSwingAmpY * sightBobScale * this.moveBobBlend;
+    this.dampedWalkSwingX = THREE.MathUtils.damp(this.dampedWalkSwingX, targetWalkSwingX, 16, dt);
+    this.dampedWalkSwingY = THREE.MathUtils.damp(this.dampedWalkSwingY, targetWalkSwingY, 16, dt);
+    const walkSwingX = this.dampedWalkSwingX;
+    const walkSwingY = this.dampedWalkSwingY;
     const settleY = THREE.MathUtils.clamp(input.verticalMotionOffset * 0.22, -0.05, 0.032) * sightBobScale;
 
     const breathScale = Math.max(
@@ -3089,12 +3106,22 @@ export class WeaponAnimator {
       aimBlend *
       opticRotScale;
 
-    const strideRotAmp = (input.isMoving ? 1 : 0) * aimBlend * (input.isSprinting ? 1.35 : 1.0) * opticRotScale;
-    const adsStrideYaw = Math.sin(input.bobPhase) * 0.0068 * strideRotAmp;
+    const strideRotAmp =
+      this.moveBobBlend *
+      aimBlend *
+      THREE.MathUtils.lerp(1.0, 1.35, this.sprintBlend) *
+      opticRotScale;
+    const targetStrideYaw = Math.sin(input.bobPhase) * 0.0068 * strideRotAmp;
+    const targetStridePitch = Math.cos(input.bobPhase * 2) * 0.0032 * strideRotAmp;
+    const targetStrideRoll = Math.sin(input.bobPhase) * 0.014 * strideRotAmp;
+    this.dampedStrideYaw = THREE.MathUtils.damp(this.dampedStrideYaw, targetStrideYaw, 16, dt);
+    this.dampedStridePitch = THREE.MathUtils.damp(this.dampedStridePitch, targetStridePitch, 16, dt);
+    this.dampedStrideRoll = THREE.MathUtils.damp(this.dampedStrideRoll, targetStrideRoll, 16, dt);
+    const adsStrideYaw = this.dampedStrideYaw;
     const adsStridePitch =
-      Math.cos(input.bobPhase * 2) * 0.0032 * strideRotAmp +
+      this.dampedStridePitch +
       THREE.MathUtils.clamp(input.verticalMotionOffset * 0.26, -0.014, 0.014) * aimBlend * opticRotScale;
-    const adsStrideRoll = Math.sin(input.bobPhase) * 0.014 * strideRotAmp;
+    const adsStrideRoll = this.dampedStrideRoll;
 
     const idleMicroPitch = Math.sin(input.elapsed * 1.4) * 0.0025 * (1 - aimStab * 0.55);
 
