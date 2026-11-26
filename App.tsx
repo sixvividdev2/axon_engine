@@ -28,23 +28,29 @@ import { AccountSettingsModal } from './ui/AccountSettingsModal';
 import { AuthModal } from './ui/AuthModal';
 import { CombatHud, MultiplayerHudControls } from './ui/CombatHud';
 import { GameSettingsModal } from './ui/GameSettingsModal';
-import { HubTabId, MainMenuHub } from './ui/MainMenuHub';
 import { RankUpCinematic } from './ui/RankUpCinematic';
 import { SocialHubDrawer } from './ui/SocialHubDrawer';
 import { SocialInviteToast } from './ui/SocialInviteToast';
 import { BackpackUnlockToast } from './ui/BackpackUnlockToast';
 import { UnifiedLoadoutWorkbench } from './ui/UnifiedLoadoutWorkbench';
 import { HideoutView } from './hideout/HideoutView';
+import type { OpsLaptopTabId } from './hideout/HideoutOpsLaptopModal';
+import { CinematicOverlay } from './cinematics/CinematicOverlay';
+import { cinematicPrefsStore } from './cinematics/cinematicPrefsStore';
+import type { CinematicSequenceId } from './cinematics/cinematicVoiceManifest';
 import { CharacterSlotId, OpenWorldView } from './src/modes/openworld';
 import { TutorialView } from './tutorial/TutorialView';
 
-type ActiveView =
-  | { kind: 'hideout' }
+type ActiveNonCinematicView =
+  | { kind: 'hideout'; initialOpsLaptopTab?: OpsLaptopTabId | null }
   | { kind: 'openworld'; slotId: CharacterSlotId | null }
-  | { kind: 'menu'; tab: HubTabId }
   | { kind: 'playground' }
   | { kind: 'tutorial'; returnTo: 'hideout' | 'playground' | 'openworld'; openWorldSlotId?: CharacterSlotId | null }
   | { kind: 'combat'; params: CombatSessionParams; sessionKey: number; isMultiplayer: boolean };
+
+type ActiveView =
+  | ActiveNonCinematicView
+  | { kind: 'cinematic'; sequence: CinematicSequenceId; nextView: ActiveNonCinematicView };
 
 const DEFAULT_BATTLE_CONFIG: BattleMatchConfig = {
   mapId: 'pripyat_block',
@@ -446,8 +452,22 @@ function AppShell() {
   const [battleConfig, setBattleConfig] = useState<BattleMatchConfig>(DEFAULT_BATTLE_CONFIG);
   const [infectionConfig, setInfectionConfig] =
     useState<InfectionMatchConfig>(DEFAULT_INFECTION_CONFIG);
-  const [view, setView] = useState<ActiveView>({ kind: 'hideout' });
+  const [view, setView] = useState<ActiveView>(() =>
+    cinematicPrefsStore.shouldPlayPrologueOnLaunch()
+      ? { kind: 'cinematic', sequence: 'prologue', nextView: { kind: 'hideout' } }
+      : { kind: 'hideout' },
+  );
   const lastHandledSignalSeqRef = useRef<number>(0);
+
+  // Listen for "Replay Prologue Cinematic" triggers from Game Settings
+  useEffect(() => {
+    return cinematicPrefsStore.subscribeReplay(() => {
+      if (document.pointerLockElement) {
+        document.exitPointerLock();
+      }
+      setView({ kind: 'cinematic', sequence: 'prologue', nextView: { kind: 'hideout' } });
+    });
+  }, []);
 
   // React to authoritative multiplayer lobby match start / restart / return-all-to-lobby signals
   useEffect(() => {
@@ -458,7 +478,7 @@ function AppShell() {
       if (document.pointerLockElement) {
         document.exitPointerLock();
       }
-      setView({ kind: 'menu', tab: 'multiplayer' });
+      setView({ kind: 'hideout', initialOpsLaptopTab: 'multiplayer' });
       return;
     }
 
@@ -520,11 +540,22 @@ function AppShell() {
             multiplayer: mpBridge,
           };
 
+    const transitSeq: CinematicSequenceId =
+      st.mode === 'infection'
+        ? 'infection_breach'
+        : st.battleRule === 'conquest'
+          ? 'heli_to_conquest'
+          : 'heli_to_battle';
+
     setView({
-      kind: 'combat',
-      params,
-      sessionKey: Date.now() + matchSignal.seq,
-      isMultiplayer: true,
+      kind: 'cinematic',
+      sequence: transitSeq,
+      nextView: {
+        kind: 'combat',
+        params,
+        sessionKey: Date.now() + matchSignal.seq,
+        isMultiplayer: true,
+      },
     });
   }, [
     matchSignal,
@@ -562,39 +593,67 @@ function AppShell() {
               document.exitPointerLock();
             }
             leaveLobby();
-            setView({ kind: 'menu', tab: 'multiplayer' });
+            setView({ kind: 'hideout', initialOpsLaptopTab: 'multiplayer' });
           },
         }
       : null;
 
   return (
     <>
+      {view.kind === 'cinematic' && (
+        <CinematicOverlay
+          sequence={view.sequence}
+          onComplete={() => {
+            if (view.sequence === 'prologue') {
+              cinematicPrefsStore.markPrologueSeen();
+            }
+            setView(view.nextView);
+          }}
+        />
+      )}
+
       {view.kind === 'hideout' && (
         <HideoutView
           battleConfig={battleConfig}
           infectionConfig={infectionConfig}
+          initialOpsLaptopTab={view.initialOpsLaptopTab ?? null}
           onChangeBattleConfig={setBattleConfig}
           onChangeInfectionConfig={setInfectionConfig}
           onLaunchBattle={(cfg) => {
             setBattleConfig(cfg);
+            const seq: CinematicSequenceId =
+              cfg.rule === 'conquest' ? 'heli_to_conquest' : 'heli_to_battle';
             setView({
-              kind: 'combat',
-              params: { mode: 'battle', battleConfig: cfg },
-              sessionKey: Date.now(),
-              isMultiplayer: false,
+              kind: 'cinematic',
+              sequence: seq,
+              nextView: {
+                kind: 'combat',
+                params: { mode: 'battle', battleConfig: cfg },
+                sessionKey: Date.now(),
+                isMultiplayer: false,
+              },
             });
           }}
           onLaunchInfection={(cfg) => {
             setInfectionConfig(cfg);
             setView({
-              kind: 'combat',
-              params: { mode: 'infection', infectionConfig: cfg },
-              sessionKey: Date.now(),
-              isMultiplayer: false,
+              kind: 'cinematic',
+              sequence: 'infection_breach',
+              nextView: {
+                kind: 'combat',
+                params: { mode: 'infection', infectionConfig: cfg },
+                sessionKey: Date.now(),
+                isMultiplayer: false,
+              },
             });
           }}
-          onLaunchOpenWorld={(slotId) => setView({ kind: 'openworld', slotId })}
-          onOpenClassicHub={(tab) => setView({ kind: 'menu', tab })}
+          onLaunchOpenWorld={(slotId) =>
+            setView({
+              kind: 'cinematic',
+              sequence: 'heli_to_perimeter',
+              nextView: { kind: 'openworld', slotId },
+            })
+          }
           onLaunchPlayground={() => setView({ kind: 'playground' })}
           onLaunchTutorial={() => setView({ kind: 'tutorial', returnTo: 'hideout' })}
         />
@@ -612,42 +671,6 @@ function AppShell() {
             })
           }
         />
-      )}
-
-      {view.kind === 'menu' && (
-        <div className="relative h-screen w-screen overflow-hidden">
-          <button
-            type="button"
-            onClick={() => setView({ kind: 'hideout' })}
-            className="fixed bottom-4 left-4 z-50 border border-amber-500/50 bg-[#101216]/95 px-4 py-2 text-xs font-semibold text-amber-200 transition-colors hover:border-amber-400 hover:bg-[#191d24] whitespace-nowrap"
-          >
-            Return to 3D Hideout
-          </button>
-          <MainMenuHub
-            initialTab={view.tab}
-            initialBattleConfig={battleConfig}
-            initialInfectionConfig={infectionConfig}
-            onLaunchPlayground={() => setView({ kind: 'playground' })}
-            onLaunchBattle={(cfg) => {
-              setBattleConfig(cfg);
-              setView({
-                kind: 'combat',
-                params: { mode: 'battle', battleConfig: cfg },
-                sessionKey: Date.now(),
-                isMultiplayer: false,
-              });
-            }}
-            onLaunchInfection={(cfg) => {
-              setInfectionConfig(cfg);
-              setView({
-                kind: 'combat',
-                params: { mode: 'infection', infectionConfig: cfg },
-                sessionKey: Date.now(),
-                isMultiplayer: false,
-              });
-            }}
-          />
-        </div>
       )}
 
       {view.kind === 'playground' && (
@@ -699,13 +722,11 @@ function AppShell() {
               ? () => setView({ kind: 'tutorial', returnTo: 'hideout' })
               : undefined
           }
-          onReturnToMenu={(tab) =>
+          onReturnToMenu={() =>
             setView(
               view.isMultiplayer
-                ? { kind: 'menu', tab: 'multiplayer' }
-                : tab
-                  ? { kind: 'hideout' }
-                  : { kind: 'hideout' },
+                ? { kind: 'hideout', initialOpsLaptopTab: 'multiplayer' }
+                : { kind: 'hideout' },
             )
           }
         />

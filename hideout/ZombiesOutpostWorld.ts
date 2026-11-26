@@ -11,6 +11,7 @@ import {
 import { loadoutStore } from '../data/loadoutStore';
 import { createHideoutMaterials, HideoutMaterialLibrary } from './HideoutMaterials';
 import { HideoutElectronicsSystem } from './HideoutElectronicsSystem';
+import { BunkerNpcSystem } from './BunkerNpcSystem';
 import type { GunWallSlotAnchor } from './HideoutBunkerWorld';
 
 export type ZombiesOutpostInteractKind =
@@ -61,6 +62,7 @@ export interface ZombiesOutpostWorldHandle {
   triggerReturnSeal: () => void;
   setBriefingState: (state: ZombiesOutpostBriefingState) => void;
   electronics: HideoutElectronicsSystem;
+  npcSystem: BunkerNpcSystem;
   update: (dt: number, listenerPos?: THREE.Vector3) => void;
   dispose: () => void;
 }
@@ -146,7 +148,7 @@ function drawOpsMapCanvas(
   ctx.fillStyle = '#f8fafc';
   ctx.font = '700 28px "Oswald", sans-serif';
   ctx.textAlign = 'left';
-  ctx.fillText('QUARANTINE OPERATIONS · SECTOR BRIEFING', 24, 37);
+  ctx.fillText('INFECTION OPERATIONS · SECTOR BRIEFING', 24, 37);
 
   // Tactical zone map diagram on left half
   ctx.strokeStyle = 'rgba(239, 68, 68, 0.55)';
@@ -211,7 +213,7 @@ function drawOpsMapCanvas(
   ctx.fillRect(0, h - 46, w, 46);
   ctx.fillStyle = '#f59e0b';
   ctx.font = '600 16px "IBM Plex Mono", monospace';
-  ctx.fillText('[E / F] OPEN ZOMBIES OPERATIONS BRIEFING & DEPLOY', 24, h - 17);
+  ctx.fillText('[F] INFECTION BRIEFING · SCROLL TO CONFIGURE & DEPLOY', 24, h - 17);
 }
 
 /**
@@ -1223,6 +1225,13 @@ export function buildZombiesOutpostWorld(
 
   physics.setRaycastMeshes(raycastMeshes);
 
+  // Interactive 3D Outpost Commander + 0..3 Dynamic Allied AI Squadmates
+  const npcSystem = new BunkerNpcSystem(root, interactableMeshes, {
+    isSoftwareGl,
+    maxAnisotropy: maxAniso,
+  });
+  npcSystem.populateOutpostCommander();
+
   // Animation state
   let elapsedSec = 0;
   let cratePopTimer = 0;
@@ -1232,6 +1241,7 @@ export function buildZombiesOutpostWorld(
 
   const setBriefingState = (state: ZombiesOutpostBriefingState): void => {
     lastBriefingState = state;
+    npcSystem.syncOutpostSquadmates(state.botCount);
     if (!electronics.isInteractiveLinkBroken('outpost_ops_board')) {
       drawOpsMapCanvas(opsCtx, state);
       opsTex.needsUpdate = true;
@@ -1278,7 +1288,9 @@ export function buildZombiesOutpostWorld(
   const update = (dt: number, listenerPos?: THREE.Vector3): void => {
     const clampedDt = Math.min(dt, 0.05);
     elapsedSec += clampedDt;
-    electronics.update(clampedDt, listenerPos ?? fallbackListenerPos);
+    const listener = listenerPos ?? fallbackListenerPos;
+    electronics.update(clampedDt, listener);
+    npcSystem.update(clampedDt, listener);
 
     // Flickering crimson road flares
     const flicker =
@@ -1336,8 +1348,10 @@ export function buildZombiesOutpostWorld(
     triggerReturnSeal,
     setBriefingState,
     electronics,
+    npcSystem,
     update,
     dispose: () => {
+      npcSystem.dispose();
       electronics.dispose();
       for (const slot of gunWallSlots) {
         if (slot.assembly) {

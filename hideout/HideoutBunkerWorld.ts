@@ -21,9 +21,16 @@ import {
 } from './HideoutLongRangeGallery';
 import { HideoutAirlockBay } from './HideoutAirlockBay';
 import { HideoutReadyRoom } from './HideoutReadyRoom';
+import { HideoutPerimeterWing } from './HideoutPerimeterWing';
+import { BunkerNpcSystem } from './BunkerNpcSystem';
 import { hideoutStateStore } from './HideoutStateStore';
 
-export type HideoutRoomId = 'arsenal' | 'gun_range' | 'ready_room' | 'zombies_portal';
+export type HideoutRoomId =
+  | 'arsenal'
+  | 'gun_range'
+  | 'ready_room'
+  | 'perimeter_wing'
+  | 'zombies_portal';
 
 export type HideoutInteractableKind =
   | 'gun_wall_slot'
@@ -33,8 +40,13 @@ export type HideoutInteractableKind =
   | 'range_console'
   | 'range_ammo_box'
   | 'ballistics_console'
+  | 'calibration_gym_door'
   | 'ops_laptop'
+  | 'perimeter_laptop'
   | 'ops_briefing_board'
+  | 'perimeter_roster_alcove'
+  | 'perimeter_quartermaster'
+  | 'perimeter_heli_hatch'
   | 'airlock_override';
 
 export interface HideoutInteractableMeta {
@@ -67,7 +79,8 @@ export const HIDEOUT_ROOMS: readonly HideoutRoomBounds[] = [
   { id: 'arsenal', label: 'Arsenal Room', minX: -5.5, maxX: 5.5, minZ: -4.5, maxZ: 4.5 },
   { id: 'gun_range', label: 'Gun Range', minX: 5.5, maxX: 34.0, minZ: -12.0, maxZ: 112.0 },
   { id: 'ready_room', label: 'Ready Room', minX: -16.5, maxX: -5.5, minZ: -5.0, maxZ: 5.0 },
-  { id: 'zombies_portal', label: 'Sector 4 · Bio-Containment Airlock', minX: -4.5, maxX: 4.5, minZ: 4.5, maxZ: 13.5 },
+  { id: 'perimeter_wing', label: 'Perimeter Ops Wing', minX: -16.5, maxX: -6.5, minZ: -14.8, maxZ: -5.0 },
+  { id: 'zombies_portal', label: 'Sector 4 · Infection Airlock', minX: -4.5, maxX: 4.5, minZ: 4.5, maxZ: 13.5 },
 ];
 
 export function resolveHideoutRoom(x: number, z: number): HideoutRoomBounds {
@@ -88,6 +101,8 @@ export interface HideoutBunkerWorldHandle {
   gunRange: HideoutGunRange;
   longRangeGallery: HideoutLongRangeGallery;
   readyRoom: HideoutReadyRoom;
+  perimeterWing: HideoutPerimeterWing;
+  npcSystem: BunkerNpcSystem;
   airlockBay: HideoutAirlockBay;
   root: THREE.Group;
   raycastMeshes: THREE.Object3D[];
@@ -132,7 +147,7 @@ export function buildHideoutBunkerWorld(
   physics.baseFloorY = 0;
   physics.boundsMinX = -16.2;
   physics.boundsMaxX = 33.3;
-  physics.boundsMinZ = -11.6;
+  physics.boundsMinZ = -15.0;
   physics.boundsMaxZ = 107.6;
 
   const maxAniso = Math.min(8, renderer.capabilities.getMaxAnisotropy());
@@ -308,8 +323,8 @@ export function buildHideoutBunkerWorld(
   const DOOR_W = 2.8;
   const DOOR_H = 2.75;
 
-  // Interior acoustic reverb zones across the bunker (including Bay 3 100m Gallery)
-  physics.addInteriorZone({ minX: -16.5, maxX: 34.0, minY: 0, maxY: H_RANGE, minZ: -12.0, maxZ: 112.0, material: 'concrete' });
+  // Interior acoustic reverb zones across the bunker (including Perimeter Ops Wing & Bay 3 100m Gallery)
+  physics.addInteriorZone({ minX: -16.5, maxX: 34.0, minY: 0, maxY: H_RANGE, minZ: -15.0, maxZ: 112.0, material: 'concrete' });
 
   // --- ROOM 1: ARSENAL ROOM (X ∈ [-5.5, 5.5], Z ∈ [-4.5, 4.5]) ---
   addBoxStructure(0, -0.1, 0, 12.2, 0.2, 10.2, materials.concreteFloor, 'concrete', false);
@@ -370,14 +385,19 @@ export function buildHideoutBunkerWorld(
     root.add(mesh);
   };
   makePlaque(5.46, 3.16, 0, -Math.PI * 0.5, 'GUN RANGE', 'BAYS 1–3 · BALLISTICS', '#d97706');
-  makePlaque(-5.46, 3.16, 0, Math.PI * 0.5, 'READY ROOM', 'OPS COMMAND · DEPLOY', '#60a5fa');
-  makePlaque(0, 3.16, 4.46, Math.PI, 'SECTOR 4 · AIRLOCK', 'QUARANTINE TRANSPORT BAY', '#d97706');
+  makePlaque(-5.46, 3.16, 0, Math.PI * 0.5, 'READY ROOM', 'OPS COMMAND · PERIMETER', '#60a5fa');
+  makePlaque(0, 3.16, 4.46, Math.PI, 'SECTOR 4 · AIRLOCK', 'INFECTION TRANSPORT BAY', '#d97706');
 
   // --- ROOM 2: READY ROOM SHELL (X ∈ [-16.5, -6.5], Z ∈ [-5.0, 5.0]) ---
   addBoxStructure(-11.5, -0.1, 0, 10.6, 0.2, 10.6, materials.concreteFloor, 'concrete', false);
   addBoxStructure(-11.5, H_HUB + 0.1, 0, 10.6, 0.2, 10.6, materials.concreteCeiling, 'concrete', true, false).userData.isRoof = true;
   addBoxStructure(-16.75, H_HUB * 0.5, 0, 0.5, H_HUB, 10.6, materials.concreteWall, 'concrete');
-  addBoxStructure(-11.5, H_HUB * 0.5, -5.25, 10.6, H_HUB, 0.5, materials.concreteWall, 'concrete');
+  // North Bulkhead split at X ∈ [-12.9, -10.1] for open doorway into Perimeter Ops Wing
+  addBoxStructure(-14.7, H_HUB * 0.5, -5.25, 3.6, H_HUB, 0.5, materials.concreteWall, 'concrete');
+  addBoxStructure(-8.3, H_HUB * 0.5, -5.25, 3.6, H_HUB, 0.5, materials.concreteWall, 'concrete');
+  addBoxStructure(-11.5, DOOR_H + (H_HUB - DOOR_H) * 0.5, -5.25, DOOR_W, H_HUB - DOOR_H, 0.5, materials.concreteWall, 'concrete');
+  addDoorwayFrame(-11.5, -5.25, DOOR_W, DOOR_H, 0.58, false);
+  makePlaque(-11.5, 3.16, -4.96, 0, 'PERIMETER OPS WING', 'ROSTER · QUARTERMASTER · HELIPAD', '#10b981');
   addBoxStructure(-11.5, H_HUB * 0.5, 5.25, 10.6, H_HUB, 0.5, materials.concreteWall, 'concrete');
   addOverheadLamp(-11.5, H_HUB - 0.12, -1.8, materials.warmLampEmissive, [
     { light: readyRoomLight, dropFraction: 0.5 },
@@ -397,6 +417,38 @@ export function buildHideoutBunkerWorld(
   makePlaque(24.46, 3.72, -1.6, -Math.PI * 0.5, 'BAY 3 · 100M GALLERY', 'LONG-RANGE & BALLISTICS BENCH', '#38bdf8');
   addBoxStructure(15.5, H_RANGE * 0.5, -10.25, 18.6, H_RANGE, 0.5, materials.concreteWall, 'concrete');
   addBoxStructure(15.5, H_RANGE * 0.5, 36.25, 18.6, H_RANGE, 0.5, materials.concreteWall, 'concrete');
+
+  // Physical Calibration Gym & Playground Transit Door on Gun Range North foyer wall (X = 11.2, Z = -9.96)
+  const gymDoorX = 11.2;
+  const gymDoorZ = -9.96;
+  const gymDoorLeaf = new THREE.Mesh(
+    trackGeo(new THREE.BoxGeometry(1.42, 2.42, 0.12)),
+    materials.darkSteel,
+  );
+  gymDoorLeaf.position.set(gymDoorX, 1.21, gymDoorZ);
+  root.add(gymDoorLeaf);
+  raycastMeshes.push(gymDoorLeaf);
+  const gymDoorHandle = new THREE.Mesh(
+    trackGeo(new THREE.BoxGeometry(0.28, 0.05, 0.09)),
+    materials.brushedSteel,
+  );
+  gymDoorHandle.position.set(gymDoorX + 0.44, 1.12, gymDoorZ + 0.08);
+  root.add(gymDoorHandle);
+  addDoorwayFrame(gymDoorX, gymDoorZ + 0.02, 1.66, 2.54, 0.22, false);
+  makePlaque(gymDoorX, 2.86, gymDoorZ + 0.08, 0, 'CALIBRATION GYM', 'OPTICS · BALLISTICS · PLAYGROUND', '#f59e0b');
+  const gymDoorProxyMat = new THREE.MeshBasicMaterial({ visible: false });
+  ownedMats.push(gymDoorProxyMat);
+  const gymDoorProxy = new THREE.Mesh(
+    trackGeo(new THREE.BoxGeometry(1.72, 2.5, 0.55)),
+    gymDoorProxyMat,
+  );
+  gymDoorProxy.position.set(gymDoorX, 1.25, gymDoorZ + 0.16);
+  gymDoorProxy.userData.hideoutInteractable = {
+    kind: 'calibration_gym_door',
+    maxDistanceM: 3.1,
+  } satisfies HideoutInteractableMeta;
+  root.add(gymDoorProxy);
+  interactableMeshes.push(gymDoorProxy);
   // West side wall segments of Gun Range flanking the Arsenal bulkhead
   addBoxStructure(6.25, H_RANGE * 0.5, -7.5, 0.5, H_RANGE, 5.4, materials.concreteWall, 'concrete');
   addBoxStructure(6.25, H_RANGE * 0.5, 20.5, 0.5, H_RANGE, 31.8, materials.concreteWall, 'concrete');
@@ -961,7 +1013,7 @@ export function buildHideoutBunkerWorld(
   );
 
   // ============================================================================
-  // 5D. PHASE 4 READY ROOM — OPS COMMAND LAPTOP & TACTICAL BRIEFING WALL
+  // 5D. PHASE 4 READY ROOM — OPS COMMAND LAPTOP, PERIMETER LAPTOP & BRIEFING WALL
   // ============================================================================
   const readyRoom = new HideoutReadyRoom(
     root,
@@ -973,6 +1025,25 @@ export function buildHideoutBunkerWorld(
     isSoftwareGl,
     maxAniso,
   );
+
+  // ============================================================================
+  // 5D2. DEDICATED PERIMETER OPS WING (NORTH OF READY ROOM) & BUNKER NPCs
+  // ============================================================================
+  const perimeterWing = new HideoutPerimeterWing(
+    root,
+    physics,
+    materials,
+    raycastMeshes,
+    interactableMeshes,
+    isSoftwareGl,
+    maxAniso,
+  );
+
+  const npcSystem = new BunkerNpcSystem(root, interactableMeshes, {
+    isSoftwareGl,
+    maxAnisotropy: maxAniso,
+  });
+  npcSystem.populateHideoutCoreNpcs();
 
   // ============================================================================
   // 5E. MERGED COLD-WAR BUNKER ARCHITECTURAL DRESSING
@@ -1194,7 +1265,7 @@ export function buildHideoutBunkerWorld(
   });
   doorSystem.addDoor({
     id: 'hideout_sector4_door',
-    label: 'Sector 4 Containment Door',
+    label: 'Sector 4 Infection Door',
     hingePos: [-TACTICAL_DOOR_W * 0.5, 0, 5.18],
     closedYawRad: 0,
     swingSign: -1,
@@ -1236,10 +1307,12 @@ export function buildHideoutBunkerWorld(
       crateLidPivot.rotation.x = 0;
     }
 
-    // Step Gun Range reactive targets, 30s CQB course, 100m Gallery, Ready Room displays, Airlock Bay, debris & sparks
+    // Step Gun Range reactive targets, 30s CQB course, 100m Gallery, Ready Room, Perimeter Wing, NPCs, Airlock Bay
     gunRange.update(clampedDt);
     longRangeGallery.update(clampedDt);
     readyRoom.update(clampedDt);
+    perimeterWing.update(clampedDt);
+    npcSystem.update(clampedDt, listenerPos);
     airlockBay.update(clampedDt);
     electronics.update(clampedDt, listenerPos);
     penetrableSystem.update(clampedDt, listenerPos);
@@ -1281,11 +1354,27 @@ export function buildHideoutBunkerWorld(
     if (kind === 'ballistics_console') {
       return longRangeGallery.getConsoleWorldPos(outPos);
     }
+    if (kind === 'calibration_gym_door') {
+      outPos.set(gymDoorX, 1.15, gymDoorZ + 0.12);
+      return true;
+    }
     if (kind === 'ops_laptop') {
       return readyRoom.getLaptopWorldPos(outPos);
     }
+    if (kind === 'perimeter_laptop') {
+      return readyRoom.getPerimeterLaptopWorldPos(outPos);
+    }
     if (kind === 'ops_briefing_board') {
       return readyRoom.getBoardWorldPos(outPos);
+    }
+    if (kind === 'perimeter_quartermaster') {
+      return perimeterWing.getPropPos('perimeter_quartermaster', outPos);
+    }
+    if (kind === 'perimeter_heli_hatch') {
+      return perimeterWing.getPropPos('perimeter_heli_hatch', outPos);
+    }
+    if (kind === 'perimeter_roster_alcove') {
+      return perimeterWing.getPropPos('perimeter_roster_alcove', outPos);
     }
     if (kind === 'airlock_override') {
       return airlockBay.getOverrideSwitchWorldPos(outPos);
@@ -1302,6 +1391,8 @@ export function buildHideoutBunkerWorld(
     gunRange,
     longRangeGallery,
     readyRoom,
+    perimeterWing,
+    npcSystem,
     airlockBay,
     root,
     raycastMeshes,
@@ -1318,6 +1409,8 @@ export function buildHideoutBunkerWorld(
     getSlotTransform,
     updateProps,
     dispose: () => {
+      npcSystem.dispose();
+      perimeterWing.dispose();
       airlockBay.dispose();
       readyRoom.dispose();
       longRangeGallery.dispose();

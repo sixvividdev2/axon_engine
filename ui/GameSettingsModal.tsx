@@ -1,5 +1,6 @@
 import React, { useEffect } from 'react';
-import { Keyboard, Sliders, User, X } from 'lucide-react';
+import { Film, Keyboard, Sliders, User, X } from 'lucide-react';
+import { cinematicPrefsStore } from '../cinematics/cinematicPrefsStore';
 import { useAuth } from '../context/AuthContext';
 import {
   closeGameSettings,
@@ -346,6 +347,31 @@ export const GameSettingsModal: React.FC = () => {
                     {headshotSfx ? 'ON' : 'OFF'}
                   </button>
                 </div>
+              </section>
+
+              {/* Cinematics */}
+              <section className="flex flex-wrap items-center justify-between gap-3 border border-neutral-800 bg-neutral-900/40 p-4">
+                <div className="flex items-center gap-2.5">
+                  <Film className="h-4 w-4 text-amber-400" />
+                  <div>
+                    <div className="text-xs font-semibold text-neutral-100">
+                      Prologue &amp; Insertion Cinematics
+                    </div>
+                    <div className="text-[11px] text-neutral-400">
+                      Replay the opening aerial sweep, gun-cam breach, and helicopter arrival into the bunker. Space pauses · Hold Enter skips.
+                    </div>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    closeGameSettings();
+                    cinematicPrefsStore.requestReplayPrologue();
+                  }}
+                  className="cursor-pointer whitespace-nowrap shrink-0 border border-amber-500/50 bg-amber-950/35 px-3.5 py-1.5 font-mono-tabular text-xs font-semibold uppercase tracking-wider text-amber-200 transition-colors hover:border-amber-400 hover:bg-amber-900/45"
+                >
+                  Replay Prologue Cinematic
+                </button>
               </section>
 
               {/* Career Profile */}

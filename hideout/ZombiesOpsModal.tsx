@@ -42,7 +42,7 @@ export const ZOMBIE_DIFFICULTY_PRESETS: ReadonlyArray<{
   {
     id: 'standard',
     label: 'Standard',
-    desc: 'Baseline quarantine containment curve (1.0x HP, 1.0x speed, 7s intermission).',
+    desc: 'Baseline infection survival curve (1.0x HP, 1.0x speed, 7s intermission).',
     zombieHealthMult: 1.0,
     zombieMoveSpeedMult: 1.0,
     zombieAttackSpeedMult: 1.0,
@@ -144,10 +144,10 @@ export const ZombiesOpsModal: React.FC<ZombiesOpsModalProps> = ({
             <Skull className="h-5 w-5 text-red-500" />
             <div className="flex flex-col">
               <span className="font-display text-lg font-bold tracking-wider text-neutral-50">
-                Zombies Operations Briefing
+                Infection Operations Briefing
               </span>
               <span className="font-mono-tabular text-xs text-neutral-400">
-                Fortified Quarantine Outpost · Dispatch Terminal
+                Fortified Infection Outpost · Dispatch Terminal
               </span>
             </div>
           </div>
@@ -220,7 +220,7 @@ export const ZombiesOpsModal: React.FC<ZombiesOpsModalProps> = ({
             <section className="flex flex-col gap-3">
               <div className="flex items-baseline justify-between">
                 <h2 className="font-display text-sm font-semibold uppercase tracking-wider text-neutral-200">
-                  Quarantine Sector Selection
+                  Infection Sector Selection
                 </h2>
                 <span className="font-mono-tabular text-xs text-neutral-500">
                   {ZOMBIE_MAPS.filter((m) => m.status === 'playable').length} Active ·{' '}
@@ -488,7 +488,7 @@ export const ZombiesOpsModal: React.FC<ZombiesOpsModalProps> = ({
             className="flex cursor-pointer items-center gap-2 border border-red-500 bg-red-600 px-6 py-2.5 font-display text-sm font-bold uppercase tracking-wider text-white transition-colors hover:bg-red-500 disabled:cursor-not-allowed disabled:opacity-45"
           >
             <Skull className="h-4 w-4" />
-            <span>Deploy to Quarantine Zone</span>
+            <span>Deploy to Infection Zone</span>
           </button>
         </footer>
       </div>

@@ -1,11 +1,10 @@
 import React, { useMemo, useState } from 'react';
 import {
-  Compass,
   Crosshair,
   Lock,
   Radio,
   Shield,
-  Skull,
+  Target,
   User,
   Users,
   Wrench,
@@ -20,35 +19,26 @@ import { useLobby } from '../context/LobbyContext';
 import { useLoadoutStore } from '../data/loadoutStore';
 import { formatRankLabel, getWeaponUnlockRank } from '../data/progression';
 import { TACTICAL_EQUIPMENT_LIST, TacticalEquipmentId } from '../data/tacticalEquipment';
-import { InfectionMapRecord, SaveManager } from '../engine/persistence/SaveManager';
-import { BATTLE_MAPS, ZOMBIE_MAPS } from '../maps/MapRegistry';
+import { BATTLE_MAPS } from '../maps/MapRegistry';
 import {
   BattleMatchConfig,
   BattleRuleId,
   BotDifficultyId,
   getDefaultScoreLimitForRule,
-  InfectionMatchConfig,
 } from '../maps/types';
 import { MapSelector } from '../ui/MapSelector';
 import { MultiplayerHubPanel } from '../ui/MultiplayerHubPanel';
 import { WeatherTimeControls } from '../ui/WeatherTimeControls';
-import {
-  CharacterSlotId,
-  PerimeterOpsTerminalPanel,
-  useHideoutShardAdapter,
-} from '../src/modes/openworld';
 
-export type OpsLaptopTabId = 'perimeter' | 'battle' | 'multiplayer' | 'infection';
+export type OpsLaptopTabId = 'battle' | 'multiplayer' | 'gym';
+
+export const OPS_LAPTOP_TABS: readonly OpsLaptopTabId[] = ['battle', 'multiplayer', 'gym'] as const;
 
 interface HideoutOpsLaptopModalProps {
   initialTab: OpsLaptopTabId;
   battleConfig: BattleMatchConfig;
-  infectionConfig: InfectionMatchConfig;
   onChangeBattleConfig: (next: BattleMatchConfig) => void;
-  onChangeInfectionConfig: (next: InfectionMatchConfig) => void;
   onDeployBattle: (config: BattleMatchConfig) => void;
-  onDeployInfection: (config: InfectionMatchConfig) => void;
-  onDeployOpenWorld?: (slotId: CharacterSlotId) => void;
   onLaunchPlayground: () => void;
   onOpenGunsmith: () => void;
   onOpenOperatorGear: () => void;
@@ -56,7 +46,6 @@ interface HideoutOpsLaptopModalProps {
 }
 
 const BOT_COUNTS = [4, 6, 8, 10] as const;
-const INFECTION_BOT_COUNTS = [0, 1, 2, 3] as const;
 const BATTLE_MODE_OPTIONS: ReadonlyArray<{ id: BattleRuleId; short: string; name: string }> = [
   { id: 'tdm', short: 'TDM', name: 'Team Deathmatch' },
   { id: 'ffa', short: 'FFA', name: 'Free-For-All' },
@@ -91,7 +80,7 @@ function getScoreLimitPresets(rule: BattleRuleId): { label: string; values: read
 function getBattleRuleSummary(rule: BattleRuleId): string {
   switch (rule) {
     case 'conquest':
-      return 'Conquest · Most Territory Controlled Wins · Protected HQs · 1 Life per Loadout · Uncontested FOB Spawns';
+      return 'Conquest · Most Territory Controlled Wins · Protected HQs · Helicopter Insertion';
     case 'ctf':
       return 'Capture the Flag · Home Flag Required to Score · Carrier Drop & Teammate Return';
     case 'koth':
@@ -104,24 +93,21 @@ function getBattleRuleSummary(rule: BattleRuleId): string {
       return 'Free-For-All · Every Operator Hostile · Spawn Protection Active';
     case 'tdm':
     default:
-      return 'Team A vs Team B · Friendly Fire Off · Spawn Protection Active';
+      return 'Team A vs Team B · Friendly Fire Off · Helicopter Insertion';
   }
 }
 
 /**
  * Diegetic Ready Room Ops Command Laptop Terminal.
- * Uses solid matte surfaces (zero backdrop-filter over WebGL), zero static pill badges,
- * zero pulsing dots, and tabular numerals. Fully wired to Battle, Infection, and Multiplayer.
+ * Dedicated to Combat Ops, Squads & Multiplayer Lobbies, and the standalone Calibration Gym / Playground.
+ * Perimeter Operations has its own dedicated Ready Room laptop and North Wing;
+ * Infection is staged physically via the Sector 4 Infection Airlock and 3D Infection Outpost.
  */
 export const HideoutOpsLaptopModal: React.FC<HideoutOpsLaptopModalProps> = ({
   initialTab,
   battleConfig,
-  infectionConfig,
   onChangeBattleConfig,
-  onChangeInfectionConfig,
   onDeployBattle,
-  onDeployInfection,
-  onDeployOpenWorld,
   onLaunchPlayground,
   onOpenGunsmith,
   onOpenOperatorGear,
@@ -134,16 +120,10 @@ export const HideoutOpsLaptopModal: React.FC<HideoutOpsLaptopModalProps> = ({
     useTacticalEquipmentSelection();
   const loadoutState = useLoadoutStore();
   const activeLoadout = loadoutState.slots[loadoutState.activeIndex] ?? loadoutState.slots[0];
-  const { activeCharacter, bankruptcy } = useHideoutShardAdapter();
 
   const [activeTab, setActiveTab] = useState<OpsLaptopTabId>(
-    initialTab === 'perimeter' ? 'perimeter' : lobby ? 'multiplayer' : initialTab,
+    initialTab === 'gym' ? 'gym' : lobby ? 'multiplayer' : initialTab,
   );
-
-  const infectionRecords: Record<string, InfectionMapRecord> = useMemo(() => {
-    const sm = new SaveManager();
-    return sm.loadInfectionRecords();
-  }, []);
 
   const primaryWeapons = useMemo(
     () => [
@@ -168,8 +148,6 @@ export const HideoutOpsLaptopModal: React.FC<HideoutOpsLaptopModalProps> = ({
   const operatorProfile = OPERATOR_PROFILES[selectedOperatorId];
   const updateBattle = (patch: Partial<BattleMatchConfig>) =>
     onChangeBattleConfig({ ...battleConfig, ...patch });
-  const updateInfection = (patch: Partial<InfectionMatchConfig>) =>
-    onChangeInfectionConfig({ ...infectionConfig, ...patch });
 
   return (
     <div className="fixed inset-0 z-30 flex items-center justify-center bg-[#06080b]/88 p-4 sm:p-6">
@@ -181,18 +159,6 @@ export const HideoutOpsLaptopModal: React.FC<HideoutOpsLaptopModalProps> = ({
           </span>
 
           <nav className="flex items-center gap-1.5" aria-label="Operations Mode">
-            <button
-              type="button"
-              onClick={() => setActiveTab('perimeter')}
-              className={`flex cursor-pointer items-center gap-2 border px-3.5 py-2 text-xs font-semibold transition-colors whitespace-nowrap shrink-0 ${
-                activeTab === 'perimeter'
-                  ? 'border-emerald-400 bg-emerald-500/18 text-emerald-100'
-                  : 'border-white/10 bg-[#151a22] text-neutral-400 hover:border-white/25 hover:text-neutral-100'
-              }`}
-            >
-              <Compass className="h-3.5 w-3.5" />
-              <span>Perimeter Ops</span>
-            </button>
             <button
               type="button"
               onClick={() => setActiveTab('battle')}
@@ -220,15 +186,15 @@ export const HideoutOpsLaptopModal: React.FC<HideoutOpsLaptopModalProps> = ({
             </button>
             <button
               type="button"
-              onClick={() => setActiveTab('infection')}
+              onClick={() => setActiveTab('gym')}
               className={`flex cursor-pointer items-center gap-2 border px-3.5 py-2 text-xs font-semibold transition-colors whitespace-nowrap shrink-0 ${
-                activeTab === 'infection'
-                  ? 'border-red-500 bg-red-600/20 text-red-100'
+                activeTab === 'gym'
+                  ? 'border-amber-400 bg-amber-500/18 text-amber-100'
                   : 'border-white/10 bg-[#151a22] text-neutral-400 hover:border-white/25 hover:text-neutral-100'
               }`}
             >
-              <Skull className="h-3.5 w-3.5" />
-              <span>Containment &amp; Gym</span>
+              <Target className="h-3.5 w-3.5" />
+              <span>Calibration Gym &amp; Playground</span>
             </button>
           </nav>
 
@@ -255,27 +221,6 @@ export const HideoutOpsLaptopModal: React.FC<HideoutOpsLaptopModalProps> = ({
               ·
             </span>
             <span className="text-neutral-400">Loadout {activeLoadout.name}</span>
-            {activeCharacter && (
-              <>
-                <span className="text-neutral-600" aria-hidden="true">
-                  ·
-                </span>
-                <span className="font-semibold text-emerald-300">
-                  {activeCharacter.callsign} ({activeCharacter.shardMode}) · $
-                  {activeCharacter.cash.toLocaleString()}
-                </span>
-                {bankruptcy?.isBankruptcyRisk && (
-                  <>
-                    <span className="text-neutral-600" aria-hidden="true">
-                      ·
-                    </span>
-                    <span className="font-semibold text-red-400">
-                      BANKRUPTCY RISK (MEDEVAC ${bankruptcy.nextRespawnFee.toLocaleString()})
-                    </span>
-                  </>
-                )}
-              </>
-            )}
             {lobby && (
               <>
                 <span className="text-neutral-600" aria-hidden="true">
@@ -310,13 +255,9 @@ export const HideoutOpsLaptopModal: React.FC<HideoutOpsLaptopModalProps> = ({
 
         {/* Terminal Body */}
         <div className="flex-1 overflow-y-auto px-6 py-5">
-          {activeTab === 'perimeter' && (
-            <PerimeterOpsTerminalPanel onDeployOpenWorld={onDeployOpenWorld} />
-          )}
-
           {activeTab === 'battle' && (
             <div className="flex flex-col gap-5">
-              {/* Top Row: Heading + TDM/FFA Selector */}
+              {/* Top Row: Heading + Rule Selector */}
               <div className="flex flex-wrap items-end justify-between gap-4">
                 <div>
                   <h2 className="font-display text-2xl font-bold tracking-wide text-neutral-50">
@@ -632,8 +573,8 @@ export const HideoutOpsLaptopModal: React.FC<HideoutOpsLaptopModalProps> = ({
                   </h3>
                   <p className="mt-2 text-xs leading-relaxed text-neutral-400">
                     Host private or public lobbies, join friends by room code, and run custom
-                    Special Events directly from your Ready Room laptop. Solo Combat Ops and
-                    Containment remain playable offline.
+                    Special Events directly from your Ready Room laptop. Solo Combat Ops,
+                    Perimeter Ops, and Infection remain playable offline.
                   </p>
                   <button
                     type="button"
@@ -652,118 +593,80 @@ export const HideoutOpsLaptopModal: React.FC<HideoutOpsLaptopModalProps> = ({
             </div>
           )}
 
-          {activeTab === 'infection' && (
-            <div className="flex flex-col gap-5">
-              <div className="flex flex-wrap items-end justify-between gap-4">
+          {activeTab === 'gym' && (
+            <div className="flex flex-col gap-6">
+              <div className="flex flex-wrap items-end justify-between gap-4 border-b border-white/10 pb-4">
                 <div>
-                  <h2 className="font-display text-2xl font-bold tracking-wide text-red-50">
-                    Containment Ops &amp; Calibration Facility
+                  <h2 className="font-display text-2xl font-bold tracking-wide text-amber-50">
+                    Calibration Gym &amp; Playground
                   </h2>
-                  <p className="mt-0.5 text-xs text-neutral-400">
-                    Deploy straight into round-based Infection survival or open the standalone
-                    Calibration Playground.
+                  <p className="mt-1 max-w-2xl text-xs leading-relaxed text-neutral-400">
+                    Standalone live-fire testing range for weapon ballistics, PiP optics tuning,
+                    bodycam camera kinematics, tactical grenades, destructible barriers, and
+                    third-person rig calibration. Also accessible on foot through the transit door
+                    in the Gun Range foyer.
                   </p>
                 </div>
                 <button
                   type="button"
                   onClick={onLaunchPlayground}
-                  className="cursor-pointer border border-white/14 bg-[#151a22] px-4 py-2 text-xs font-semibold text-neutral-200 transition-colors hover:border-amber-400/60 hover:text-amber-200 whitespace-nowrap shrink-0"
+                  className="cursor-pointer bg-amber-500 px-8 py-3 font-display text-sm font-bold uppercase tracking-wider text-neutral-950 transition-colors hover:bg-amber-400 whitespace-nowrap shrink-0"
                 >
-                  Open Calibration Playground
+                  Launch Calibration Gym
                 </button>
               </div>
 
-              <div>
-                <div className="mb-2 text-xs font-medium text-red-300/85">Containment Site</div>
-                <MapSelector
-                  maps={ZOMBIE_MAPS}
-                  selectedMapId={infectionConfig.mapId}
-                  onSelectMap={(mapId) => updateInfection({ mapId })}
-                  theme="infection"
-                  infectionRecords={infectionRecords}
-                />
-              </div>
+              <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
+                <div className="border border-white/10 bg-[#11151b] p-5">
+                  <div className="font-mono-tabular text-[11px] font-semibold uppercase tracking-wider text-amber-300">
+                    Station 01 · Ballistics &amp; Optics
+                  </div>
+                  <div className="mt-2 font-display text-lg font-bold text-neutral-50">
+                    Full Armory &amp; Live PiP Scopes
+                  </div>
+                  <p className="mt-1.5 text-xs leading-relaxed text-neutral-400">
+                    Swap across all unlocked and experimental firearms, test recoil impulse, zero
+                    long-range optics, and inspect ballistic penetration on steel, timber, and
+                    concrete lanes.
+                  </p>
+                </div>
 
-              <div className="grid grid-cols-1 gap-3 border border-red-950/70 bg-[#120e10] p-4 md:grid-cols-12">
-                <div className="md:col-span-5">
-                  <div className="text-xs font-semibold text-sky-300">
-                    Friendly AI Squadmates (0–3)
+                <div className="border border-white/10 bg-[#11151b] p-5">
+                  <div className="font-mono-tabular text-[11px] font-semibold uppercase tracking-wider text-sky-300">
+                    Station 02 · Bodycam &amp; Rig Tuner
                   </div>
-                  <div className="mt-0.5 font-mono-tabular text-[11px] text-neutral-400">
-                    Allied operators filling your 4-man containment squad
+                  <div className="mt-2 font-display text-lg font-bold text-neutral-50">
+                    Real-Time Kinematics Sandbox
                   </div>
+                  <p className="mt-1.5 text-xs leading-relaxed text-neutral-400">
+                    Tune headbob damping, chest-cam FOV, vault clearances, secondary gear physics,
+                    and live lens distortion with instant visual feedback.
+                  </p>
                 </div>
-                <div className="flex items-center gap-1.5 md:col-span-4">
-                  {INFECTION_BOT_COUNTS.map((cnt) => {
-                    const active = (infectionConfig.botCount ?? 0) === cnt;
-                    return (
-                      <button
-                        key={cnt}
-                        type="button"
-                        onClick={() => updateInfection({ botCount: cnt })}
-                        className={`flex-1 cursor-pointer border py-2 font-mono-tabular text-xs font-semibold transition-colors ${
-                          active
-                            ? 'border-sky-400 bg-sky-500/20 text-sky-200'
-                            : 'border-white/10 bg-[#171316] text-neutral-400 hover:text-neutral-200'
-                        }`}
-                      >
-                        {cnt === 0 ? 'Solo' : `${cnt} Bot${cnt > 1 ? 's' : ''}`}
-                      </button>
-                    );
-                  })}
-                </div>
-                <div className="flex items-center gap-1 md:col-span-3">
-                  {DIFFICULTIES.map((d) => {
-                    const active = (infectionConfig.botDifficulty ?? 'tactical') === d.id;
-                    const disabled = (infectionConfig.botCount ?? 0) === 0;
-                    return (
-                      <button
-                        key={d.id}
-                        type="button"
-                        disabled={disabled}
-                        onClick={() => updateInfection({ botDifficulty: d.id })}
-                        className={`flex-1 border py-2 font-mono-tabular text-[11px] font-semibold transition-colors ${
-                          disabled
-                            ? 'cursor-not-allowed border-white/5 bg-[#121012] text-neutral-600'
-                            : active
-                              ? 'cursor-pointer border-sky-400 bg-sky-500/20 text-sky-200'
-                              : 'cursor-pointer border-white/10 bg-[#171316] text-neutral-400 hover:text-neutral-200'
-                        }`}
-                      >
-                        {d.label}
-                      </button>
-                    );
-                  })}
+
+                <div className="border border-white/10 bg-[#11151b] p-5">
+                  <div className="font-mono-tabular text-[11px] font-semibold uppercase tracking-wider text-emerald-300">
+                    Station 03 · Ordnance &amp; Movement
+                  </div>
+                  <div className="mt-2 font-display text-lg font-bold text-neutral-50">
+                    Grenade Pit &amp; Parkour Course
+                  </div>
+                  <p className="mt-1.5 text-xs leading-relaxed text-neutral-400">
+                    Practice grenade cooking, smoke screening, flashbang breaches, backpack drops,
+                    and timed obstacle climbs with unlimited resupply.
+                  </p>
                 </div>
               </div>
 
-              <WeatherTimeControls
-                mapId={infectionConfig.mapId}
-                weatherPreset={infectionConfig.weatherPreset ?? 'auto'}
-                timeOfDayStart={infectionConfig.timeOfDayStart ?? 'auto'}
-                accent="red"
-                onChangeWeather={(weatherPreset) => updateInfection({ weatherPreset })}
-                onChangeTimeOfDay={(timeOfDayStart) => updateInfection({ timeOfDayStart })}
-              />
-
-              <div className="flex flex-wrap items-center justify-between gap-4 border-t border-white/10 pt-4">
-                <span className="font-mono-tabular text-xs text-neutral-400">
-                  Start Pistol · Wall-Buys · Mystery Crate · Power &amp; Perks
-                </span>
-                <button
-                  type="button"
-                  onClick={() =>
-                    onDeployInfection({
-                      ...infectionConfig,
-                      tacticalEquipmentId: tacticalSelection.equipmentId,
-                      weatherPreset: infectionConfig.weatherPreset ?? 'auto',
-                      timeOfDayStart: infectionConfig.timeOfDayStart ?? 'auto',
-                    })
-                  }
-                  className="cursor-pointer bg-red-600 px-8 py-2.5 font-display text-sm font-bold uppercase tracking-wider text-white transition-colors hover:bg-red-500 whitespace-nowrap shrink-0"
-                >
-                  Deploy Containment
-                </button>
+              <div className="flex flex-wrap items-center justify-between gap-4 border border-amber-500/25 bg-[#12100c] px-5 py-4">
+                <div className="text-xs text-neutral-300">
+                  Looking for <span className="font-semibold text-red-300">Infection</span>? Walk
+                  South through the <span className="font-semibold text-neutral-100">Sector 4 Infection Airlock</span>{' '}
+                  to board the APC escort to the 3D Infection Outpost.
+                </div>
+                <div className="font-mono-tabular text-[11px] text-neutral-500">
+                  Direct Access: Gun Range North Foyer Transit Door
+                </div>
               </div>
             </div>
           )}

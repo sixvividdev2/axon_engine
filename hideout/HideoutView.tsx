@@ -12,20 +12,17 @@ import { getTacticalEquipmentDef } from '../data/tacticalEquipment';
 import { SaveManager } from '../engine/persistence/SaveManager';
 import { BATTLE_MAPS, ZOMBIE_MAPS } from '../maps/MapRegistry';
 import { BattleMatchConfig, formatBattleRuleName, InfectionMatchConfig } from '../maps/types';
-import { HubTabId } from '../ui/MainMenuHub';
 import { OperatorSelectPanel } from '../ui/OperatorSelectPanel';
 import { UnifiedLoadoutWorkbench } from '../ui/UnifiedLoadoutWorkbench';
 import { formatTimeOfDayLabel, formatWeatherPresetLabel } from '../ui/WeatherTimeControls';
-import {
-  AirlockTransitionDirection,
-  AirlockTransitionOverlay,
-} from './AirlockTransitionOverlay';
+import { CinematicOverlay } from '../cinematics/CinematicOverlay';
 import { HideoutHud } from './HideoutHud';
 import { HideoutOpsLaptopModal, OpsLaptopTabId } from './HideoutOpsLaptopModal';
+import { HideoutPerimeterLaptopModal } from './HideoutPerimeterLaptopModal';
 import { ReadyRoomBriefingState } from './HideoutReadyRoom';
 import { HideoutSessionController, HideoutSnapshot } from './HideoutSessionController';
 import { ZombiesLobbyController, ZombiesLobbySnapshot } from './ZombiesLobbyController';
-import { ZombiesOpsModal } from './ZombiesOpsModal';
+import { ZOMBIE_DIFFICULTY_PRESETS, ZombiesOpsModal } from './ZombiesOpsModal';
 import { ZombiesOutpostHud } from './ZombiesOutpostHud';
 import type { ZombiesOutpostBriefingState } from './ZombiesOutpostWorld';
 import {
@@ -37,33 +34,41 @@ import {
 interface HideoutViewProps {
   battleConfig: BattleMatchConfig;
   infectionConfig: InfectionMatchConfig;
+  initialOpsLaptopTab?: OpsLaptopTabId | null;
   onChangeBattleConfig: (next: BattleMatchConfig) => void;
   onChangeInfectionConfig: (next: InfectionMatchConfig) => void;
   onLaunchBattle: (config: BattleMatchConfig) => void;
   onLaunchInfection: (config: InfectionMatchConfig) => void;
   onLaunchOpenWorld?: (slotId: CharacterSlotId) => void;
-  onOpenClassicHub: (tab: HubTabId) => void;
   onLaunchPlayground: () => void;
   onLaunchTutorial: () => void;
 }
 
 type ActiveHubScene = 'hideout' | 'zombies_outpost';
-type HideoutModalKind = 'none' | 'gunsmith' | 'operator' | 'ops_laptop' | 'zombies_ops';
+type HideoutModalKind =
+  | 'none'
+  | 'gunsmith'
+  | 'operator'
+  | 'ops_laptop'
+  | 'perimeter_laptop'
+  | 'zombies_ops';
+type ApcTransitKind = 'apc_to_outpost' | 'apc_to_hideout';
 
 /**
- * Top-level React host for the 3D Tactical Hideout AND standalone 3D Zombies Quarantine Outpost Lobby.
- * Strictly renders ONLY ONE 3D WebGL scene/controller at a time inside the isolated canvas ref,
- * swapping cleanly at peak decontamination mist occlusion during the ~1.8s Airlock Transition.
+ * Top-level React host for the 3D Tactical Hideout AND standalone 3D Infection Outpost Lobby.
+ * Strictly renders ONLY ONE 3D WebGL scene at a time:
+ * - Unmounts the outgoing 3D controller while the APC Escort transit cinematic plays
+ * - Mounts the destination 3D scene cleanly on completion (zero overlapping WebGL contexts)
  */
 export const HideoutView: React.FC<HideoutViewProps> = ({
   battleConfig,
   infectionConfig,
+  initialOpsLaptopTab = null,
   onChangeBattleConfig,
   onChangeInfectionConfig,
   onLaunchBattle,
   onLaunchInfection,
   onLaunchOpenWorld,
-  onOpenClassicHub,
   onLaunchPlayground,
   onLaunchTutorial,
 }) => {
@@ -91,31 +96,51 @@ export const HideoutView: React.FC<HideoutViewProps> = ({
 
   const battleConfigRef = useRef(battleConfig);
   battleConfigRef.current = battleConfig;
+  const infectionConfigRef = useRef(infectionConfig);
+  infectionConfigRef.current = infectionConfig;
   const tacticalIdRef = useRef(tacticalSelection.equipmentId);
   tacticalIdRef.current = tacticalSelection.equipmentId;
   const onLaunchBattleRef = useRef(onLaunchBattle);
   onLaunchBattleRef.current = onLaunchBattle;
+  const onLaunchInfectionRef = useRef(onLaunchInfection);
+  onLaunchInfectionRef.current = onLaunchInfection;
+  const onLaunchOpenWorldRef = useRef(onLaunchOpenWorld);
+  onLaunchOpenWorldRef.current = onLaunchOpenWorld;
+  const onLaunchPlaygroundRef = useRef(onLaunchPlayground);
+  onLaunchPlaygroundRef.current = onLaunchPlayground;
   const onChangeBattleConfigRef = useRef(onChangeBattleConfig);
   onChangeBattleConfigRef.current = onChangeBattleConfig;
+  const onChangeInfectionConfigRef = useRef(onChangeInfectionConfig);
+  onChangeInfectionConfigRef.current = onChangeInfectionConfig;
 
   const [activeScene, setActiveScene] = useState<ActiveHubScene>('hideout');
-  const [transition, setTransition] = useState<{
-    active: boolean;
-    direction: AirlockTransitionDirection;
-  }>({ active: false, direction: 'to_outpost' });
+  const [apcTransit, setApcTransit] = useState<ApcTransitKind | null>(null);
 
   const [hideoutSnapshot, setHideoutSnapshot] = useState<HideoutSnapshot | null>(null);
   const [zombiesSnapshot, setZombiesSnapshot] = useState<ZombiesLobbySnapshot | null>(null);
-  const [activeModal, setActiveModal] = useState<HideoutModalKind>('none');
-  const [opsLaptopTab, setOpsLaptopTab] = useState<OpsLaptopTabId>('battle');
+  const [activeModal, setActiveModal] = useState<HideoutModalKind>(
+    initialOpsLaptopTab ? 'ops_laptop' : 'none',
+  );
+  const [opsLaptopTab, setOpsLaptopTab] = useState<OpsLaptopTabId>(
+    initialOpsLaptopTab ?? 'battle',
+  );
 
-  const beginAirlockTransition = useCallback((direction: AirlockTransitionDirection) => {
+  // If App routes back to Hideout with a specific Ops Laptop tab (e.g., multiplayer lobby return), open it cleanly
+  useEffect(() => {
+    if (initialOpsLaptopTab) {
+      setOpsLaptopTab(initialOpsLaptopTab);
+      setActiveModal('ops_laptop');
+      hideoutControllerRef.current?.setModalActive(true);
+    }
+  }, [initialOpsLaptopTab]);
+
+  const beginApcTransit = useCallback((kind: ApcTransitKind) => {
     setActiveModal('none');
-    setTransition((prev) => (prev.active ? prev : { active: true, direction }));
+    setApcTransit((prev) => prev ?? kind);
   }, []);
 
-  const beginAirlockTransitionRef = useRef(beginAirlockTransition);
-  beginAirlockTransitionRef.current = beginAirlockTransition;
+  const beginApcTransitRef = useRef(beginApcTransit);
+  beginApcTransitRef.current = beginApcTransit;
 
   // Keep staged Battle primary/secondary synced when player swaps active Loadout in Gunsmith
   useEffect(() => {
@@ -220,10 +245,10 @@ export const HideoutView: React.FC<HideoutViewProps> = ({
   const zombiesBriefingRef = useRef(zombiesBriefing);
   zombiesBriefingRef.current = zombiesBriefing;
 
-  // Mount EXCLUSIVELY the active 3D scene controller (Hideout OR Zombies Outpost)
+  // Mount EXCLUSIVELY one 3D scene controller (and unmount both while APC transit cinematic plays)
   useEffect(() => {
     const el = containerRef.current;
-    if (!el) return;
+    if (!el || apcTransit !== null) return;
 
     if (activeScene === 'hideout') {
       const controller = new HideoutSessionController(el, {
@@ -234,6 +259,15 @@ export const HideoutView: React.FC<HideoutViewProps> = ({
         onOpenOpsLaptop: (initialTab = 'battle') => {
           setOpsLaptopTab(initialTab);
           setActiveModal('ops_laptop');
+        },
+        onOpenPerimeterLaptop: () => setActiveModal('perimeter_laptop'),
+        onLaunchPlayground: () => {
+          setActiveModal('none');
+          onLaunchPlaygroundRef.current();
+        },
+        onDeployPerimeterSlot: (slotId) => {
+          setActiveModal('none');
+          onLaunchOpenWorldRef.current?.(slotId);
         },
         onQuickDeployBattle: () => {
           const cfg = battleConfigRef.current;
@@ -254,11 +288,14 @@ export const HideoutView: React.FC<HideoutViewProps> = ({
           return nextMap.name;
         },
         onEnterZombiesOutpost: () => {
-          beginAirlockTransitionRef.current('to_outpost');
+          beginApcTransitRef.current('apc_to_outpost');
         },
       });
       hideoutControllerRef.current = controller;
       controller.syncOpsBriefing(briefingRef.current);
+      if (initialOpsLaptopTab) {
+        controller.setModalActive(true);
+      }
       const unsub = controller.subscribe((next) => setHideoutSnapshot(next));
 
       return () => {
@@ -273,10 +310,53 @@ export const HideoutView: React.FC<HideoutViewProps> = ({
     const zController = new ZombiesLobbyController(el, {
       isWeaponUnlocked: (weaponId) => isWeaponUnlockedRef.current(weaponId),
       onOpenZombiesOps: () => setActiveModal('zombies_ops'),
+      onQuickDeployInfection: () => {
+        const cfg = infectionConfigRef.current;
+        const chosenMap = ZOMBIE_MAPS.find((m) => m.id === cfg.mapId) ?? ZOMBIE_MAPS[0];
+        onLaunchInfectionRef.current({
+          ...cfg,
+          mapId: chosenMap.status === 'playable' ? chosenMap.id : ZOMBIE_MAPS[0].id,
+          tacticalEquipmentId: tacticalIdRef.current,
+          weatherPreset: cfg.weatherPreset ?? 'auto',
+          timeOfDayStart: cfg.timeOfDayStart ?? 'auto',
+        });
+      },
+      onCycleInfectionMap: () => {
+        const cfg = infectionConfigRef.current;
+        const playable = ZOMBIE_MAPS.filter((m) => m.status === 'playable');
+        const list = playable.length > 0 ? playable : ZOMBIE_MAPS;
+        const idx = list.findIndex((m) => m.id === cfg.mapId);
+        const nextMap = list[(idx + 1) % list.length];
+        onChangeInfectionConfigRef.current({ ...cfg, mapId: nextMap.id });
+        return nextMap.name;
+      },
+      onCycleInfectionDifficulty: () => {
+        const cfg = infectionConfigRef.current;
+        const idx = ZOMBIE_DIFFICULTY_PRESETS.findIndex(
+          (p) => p.id === (cfg.difficultyPreset ?? 'standard'),
+        );
+        const nextPreset = ZOMBIE_DIFFICULTY_PRESETS[(idx + 1) % ZOMBIE_DIFFICULTY_PRESETS.length];
+        onChangeInfectionConfigRef.current({
+          ...cfg,
+          difficultyPreset: nextPreset.id,
+          zombieHealthMult: nextPreset.zombieHealthMult,
+          zombieMoveSpeedMult: nextPreset.zombieMoveSpeedMult,
+          zombieAttackSpeedMult: nextPreset.zombieAttackSpeedMult,
+          zombieSpawnAmountMult: nextPreset.zombieSpawnAmountMult,
+          waveBreakIntervalSec: nextPreset.waveBreakIntervalSec,
+        });
+        return nextPreset.label;
+      },
+      onCycleInfectionBots: () => {
+        const cfg = infectionConfigRef.current;
+        const nextBots = ((cfg.botCount ?? 0) + 1) % 4;
+        onChangeInfectionConfigRef.current({ ...cfg, botCount: nextBots });
+        return nextBots;
+      },
       onOpenGunsmith: () => setActiveModal('gunsmith'),
       onOpenOperatorGear: () => setActiveModal('operator'),
       onReturnToHideout: () => {
-        beginAirlockTransitionRef.current('to_hideout');
+        beginApcTransitRef.current('apc_to_hideout');
       },
     });
     zombiesControllerRef.current = zController;
@@ -289,7 +369,7 @@ export const HideoutView: React.FC<HideoutViewProps> = ({
       zombiesControllerRef.current = null;
       setZombiesSnapshot(null);
     };
-  }, [activeScene]);
+  }, [activeScene, apcTransit, initialOpsLaptopTab]);
 
   // Re-sync owned weapons on rank / unlock updates
   useEffect(() => {
@@ -347,20 +427,15 @@ export const HideoutView: React.FC<HideoutViewProps> = ({
     setActiveModal(kind);
   };
 
-  // Peak decontamination mist occlusion: dispose outgoing 3D scene and mount destination 3D scene
-  const handleMidpointSwap = useCallback(() => {
-    if (transition.direction === 'to_outpost') {
+  const handleApcTransitComplete = useCallback(() => {
+    if (apcTransit === 'apc_to_outpost') {
       setActiveScene('zombies_outpost');
-    } else {
+    } else if (apcTransit === 'apc_to_hideout') {
       hideoutSpawnZoneRef.current = 'airlock_return';
       setActiveScene('hideout');
     }
-  }, [transition.direction]);
-
-  const handleTransitionComplete = useCallback(() => {
-    setTransition((prev) => ({ ...prev, active: false }));
-    requestActivePointerLock();
-  }, [requestActivePointerLock]);
+    setApcTransit(null);
+  }, [apcTransit]);
 
   const returnLabel = activeScene === 'zombies_outpost' ? 'Return to Outpost' : 'Return to Hideout';
 
@@ -370,17 +445,17 @@ export const HideoutView: React.FC<HideoutViewProps> = ({
       <div ref={containerRef} className="fixed inset-0 h-full w-full" />
 
       {/* Main Hideout HUD */}
-      {activeScene === 'hideout' && hideoutSnapshot && (
+      {apcTransit === null && activeScene === 'hideout' && hideoutSnapshot && (
         <HideoutHud
           snapshot={hideoutSnapshot}
-          modalOpen={activeModal !== 'none' || transition.active}
+          modalOpen={activeModal !== 'none'}
           onRequestLock={() => hideoutControllerRef.current?.requestPointerLock()}
           onOpenGunsmith={() => openModal('gunsmith')}
           onOpenOperatorGear={() => openModal('operator')}
           onOpenOpsLaptop={(tab = 'battle') => openModal('ops_laptop', tab)}
+          onOpenPerimeterLaptop={() => openModal('perimeter_laptop')}
           onVolumeChange={(v) => hideoutControllerRef.current?.setMasterVolume(v)}
           onGraphicsChange={() => hideoutControllerRef.current?.applyGraphicsQuality()}
-          onOpenClassicHub={onOpenClassicHub}
           onLaunchPlayground={onLaunchPlayground}
           onLaunchTutorial={onLaunchTutorial}
           onCloseInventory={() => hideoutControllerRef.current?.closeInventory(true)}
@@ -407,11 +482,11 @@ export const HideoutView: React.FC<HideoutViewProps> = ({
         />
       )}
 
-      {/* Standalone 3D Zombies Outpost Lobby HUD */}
-      {activeScene === 'zombies_outpost' && zombiesSnapshot && (
+      {/* Standalone 3D Infection Outpost Lobby HUD */}
+      {apcTransit === null && activeScene === 'zombies_outpost' && zombiesSnapshot && (
         <ZombiesOutpostHud
           snapshot={zombiesSnapshot}
-          modalOpen={activeModal !== 'none' || transition.active}
+          modalOpen={activeModal !== 'none'}
           onRequestLock={() => zombiesControllerRef.current?.requestPointerLock()}
           onOpenZombiesOps={() => openModal('zombies_ops')}
           onOpenGunsmith={() => openModal('gunsmith')}
@@ -447,15 +522,15 @@ export const HideoutView: React.FC<HideoutViewProps> = ({
         />
       )}
 
-      {/* Animated Bio-Containment Airlock & Transport Transition Overlay */}
-      <AirlockTransitionOverlay
-        active={transition.active}
-        direction={transition.direction}
-        onMidpointSwap={handleMidpointSwap}
-        onComplete={handleTransitionComplete}
-      />
+      {/* Always-Play 3D Armored APC Escort Transit Cinematic (Hideout ↔ Infection Outpost) */}
+      {apcTransit !== null && (
+        <CinematicOverlay
+          sequence={apcTransit}
+          onComplete={handleApcTransitComplete}
+        />
+      )}
 
-      {/* Zombies Outpost Operations Map Board / Field Radio Modal */}
+      {/* Infection Outpost Operations Map Board / Field Radio Modal */}
       {activeModal === 'zombies_ops' && (
         <ZombiesOpsModal
           infectionConfig={infectionConfig}
@@ -470,22 +545,9 @@ export const HideoutView: React.FC<HideoutViewProps> = ({
         />
       )}
 
-      {/* Ready Room Ops Command Laptop Terminal Overlay */}
-      {activeModal === 'ops_laptop' && (
-        <HideoutOpsLaptopModal
-          initialTab={opsLaptopTab}
-          battleConfig={battleConfig}
-          infectionConfig={infectionConfig}
-          onChangeBattleConfig={onChangeBattleConfig}
-          onChangeInfectionConfig={onChangeInfectionConfig}
-          onDeployBattle={(cfg) => {
-            setActiveModal('none');
-            onLaunchBattle(cfg);
-          }}
-          onDeployInfection={(cfg) => {
-            setActiveModal('none');
-            onLaunchInfection(cfg);
-          }}
+      {/* Dedicated Ready Room Perimeter Operations Laptop Terminal Overlay */}
+      {activeModal === 'perimeter_laptop' && (
+        <HideoutPerimeterLaptopModal
           onDeployOpenWorld={
             onLaunchOpenWorld
               ? (slotId) => {
@@ -494,6 +556,22 @@ export const HideoutView: React.FC<HideoutViewProps> = ({
                 }
               : undefined
           }
+          onOpenGunsmith={() => openModal('gunsmith')}
+          onOpenOperatorGear={() => openModal('operator')}
+          onClose={closeModalAndResume}
+        />
+      )}
+
+      {/* Ready Room Ops Command Laptop Terminal Overlay (Combat · Squads · Calibration Gym) */}
+      {activeModal === 'ops_laptop' && (
+        <HideoutOpsLaptopModal
+          initialTab={opsLaptopTab}
+          battleConfig={battleConfig}
+          onChangeBattleConfig={onChangeBattleConfig}
+          onDeployBattle={(cfg) => {
+            setActiveModal('none');
+            onLaunchBattle(cfg);
+          }}
           onLaunchPlayground={() => {
             setActiveModal('none');
             onLaunchPlayground();

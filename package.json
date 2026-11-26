@@ -9,9 +9,11 @@
     "lint": "tsc --noEmit",
     "start": "NODE_ENV=production tsx server.ts",
     "preview": "vite preview",
+    "bake:cinematics": "tsx scripts/bakeCinematicVoices.ts",
     "cf:deploy": "vite build && wrangler deploy"
   },
   "dependencies": {
+    "@google/genai": "^3.6.1",
     "@tailwindcss/vite": "^4.3.5",
     "@types/express": "^5.0.6",
     "@types/react": "^19.3.0",

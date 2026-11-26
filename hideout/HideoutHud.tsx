@@ -19,7 +19,6 @@ import {
   useAdaptiveScaling,
   useGraphicsQuality,
 } from '../data/graphicsQuality';
-import { HubTabId } from '../ui/MainMenuHub';
 import { OpsLaptopTabId } from './HideoutOpsLaptopModal';
 import { HideoutSnapshot } from './HideoutSessionController';
 import { PMC_FACTIONS, useHideoutShardAdapter } from '../src/modes/openworld';
@@ -39,9 +38,9 @@ interface HideoutHudProps {
   onOpenGunsmith: () => void;
   onOpenOperatorGear: () => void;
   onOpenOpsLaptop: (tab?: OpsLaptopTabId) => void;
+  onOpenPerimeterLaptop: () => void;
   onVolumeChange: (volume: number) => void;
   onGraphicsChange: (quality: GraphicsQualityId) => void;
-  onOpenClassicHub: (tab: HubTabId) => void;
   onLaunchPlayground: () => void;
   onLaunchTutorial: () => void;
   onCloseInventory?: () => void;
@@ -75,9 +74,9 @@ export const HideoutHud: React.FC<HideoutHudProps> = ({
   onOpenGunsmith,
   onOpenOperatorGear,
   onOpenOpsLaptop,
+  onOpenPerimeterLaptop,
   onVolumeChange,
   onGraphicsChange,
-  onOpenClassicHub,
   onLaunchPlayground,
   onLaunchTutorial,
   onCloseInventory,
@@ -496,6 +495,18 @@ export const HideoutHud: React.FC<HideoutHudProps> = ({
         </div>
       )}
 
+      {/* Quiet NPC radio / voice caption strip */}
+      {showLiveHud && snapshot.npcCaption && !snapshot.toastMessage && (
+        <div className="fixed bottom-12 left-1/2 -translate-x-1/2 max-w-xl px-4 py-1.5 text-center">
+          <div className="font-mono-tabular text-[10px] font-semibold uppercase tracking-[0.16em] text-amber-400">
+            {snapshot.npcCaption.speaker}
+          </div>
+          <div className="mt-0.5 text-xs font-medium text-neutral-100 drop-shadow-[0_1px_2px_rgba(0,0,0,0.95)]">
+            {snapshot.npcCaption.text}
+          </div>
+        </div>
+      )}
+
       {/* Compact status toast (Personal Stash, Resupply, Weapon Swap, Repair) */}
       {snapshot.toastMessage && !showPauseMenu && !modalOpen && (
         <div className="fixed bottom-14 left-1/2 -translate-x-1/2 border border-amber-500/35 bg-[#0e1013]/92 px-4 py-2 text-xs font-medium text-amber-100">
@@ -545,11 +556,11 @@ export const HideoutHud: React.FC<HideoutHudProps> = ({
               <div className="grid grid-cols-2 gap-2">
                 <button
                   type="button"
-                  onClick={() => onOpenOpsLaptop('perimeter')}
+                  onClick={onOpenPerimeterLaptop}
                   className="flex items-center justify-center gap-1.5 border border-emerald-500/40 bg-[#121e1b] px-2.5 py-2.5 text-xs font-medium text-emerald-100 transition-colors hover:border-emerald-400 hover:bg-[#172824] whitespace-nowrap"
                 >
                   <User className="h-3.5 w-3.5 text-emerald-400" />
-                  <span>Perimeter Roster</span>
+                  <span>Perimeter Terminal</span>
                 </button>
                 <button
                   type="button"
@@ -582,13 +593,9 @@ export const HideoutHud: React.FC<HideoutHudProps> = ({
             <div className="mt-5 space-y-2">
               <div className="flex items-center justify-between">
                 <span className="text-xs font-medium text-neutral-400">Deploy &amp; Training</span>
-                <button
-                  type="button"
-                  onClick={() => onOpenClassicHub('battle')}
-                  className="text-[11px] text-neutral-500 underline-offset-2 transition-colors hover:text-neutral-300 hover:underline whitespace-nowrap"
-                >
-                  Classic Menu Hub
-                </button>
+                <span className="font-mono-tabular text-[10px] text-neutral-500">
+                  Infection via Sector 4 Airlock
+                </span>
               </div>
               <div className="grid grid-cols-2 gap-2">
                 <button
@@ -600,13 +607,6 @@ export const HideoutHud: React.FC<HideoutHudProps> = ({
                 </button>
                 <button
                   type="button"
-                  onClick={() => onOpenOpsLaptop('infection')}
-                  className="border border-white/10 bg-[#171a20] px-3 py-2 text-xs font-medium text-neutral-200 transition-colors hover:border-red-500/45 hover:bg-[#1d2128] whitespace-nowrap"
-                >
-                  Containment Ops
-                </button>
-                <button
-                  type="button"
                   onClick={() => onOpenOpsLaptop('multiplayer')}
                   className="border border-white/10 bg-[#171a20] px-3 py-2 text-xs font-medium text-neutral-200 transition-colors hover:border-sky-400/50 hover:bg-[#1d2128] whitespace-nowrap"
                 >
@@ -614,8 +614,15 @@ export const HideoutHud: React.FC<HideoutHudProps> = ({
                 </button>
                 <button
                   type="button"
+                  onClick={onOpenPerimeterLaptop}
+                  className="border border-emerald-500/35 bg-[#121e1b] px-3 py-2 text-xs font-medium text-emerald-200 transition-colors hover:border-emerald-400 hover:bg-[#172824] whitespace-nowrap"
+                >
+                  Perimeter Ops
+                </button>
+                <button
+                  type="button"
                   onClick={onLaunchPlayground}
-                  className="border border-white/10 bg-[#171a20] px-3 py-2 text-xs font-medium text-neutral-200 transition-colors hover:border-white/25 hover:bg-[#1d2128] whitespace-nowrap"
+                  className="border border-white/10 bg-[#171a20] px-3 py-2 text-xs font-medium text-neutral-200 transition-colors hover:border-amber-400/60 hover:bg-[#1d2128] whitespace-nowrap"
                 >
                   Calibration Gym
                 </button>

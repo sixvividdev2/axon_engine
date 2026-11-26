@@ -79,7 +79,7 @@ function makeBiohazardPanelTexture(): THREE.CanvasTexture {
   ctx.fillStyle = '#f3f4f6';
   ctx.font = '700 32px "Oswald", sans-serif';
   ctx.textAlign = 'left';
-  ctx.fillText('QUARANTINE AIRLOCK 04', 140, 108);
+  ctx.fillText('INFECTION AIRLOCK 04', 140, 108);
 
   ctx.fillStyle = '#f59e0b';
   ctx.font = '600 18px "IBM Plex Mono", monospace';
@@ -88,7 +88,7 @@ function makeBiohazardPanelTexture(): THREE.CanvasTexture {
   ctx.fillStyle = '#9ca3af';
   ctx.font = '500 15px "IBM Plex Mono", monospace';
   ctx.fillText('OVERRIDE [E / F] OR STEP INTO CHAMBER', 140, 184);
-  ctx.fillText('DEST: FORTIFIED QUARANTINE OUTPOST', 140, 212);
+  ctx.fillText('DEST: FORTIFIED INFECTION OUTPOST', 140, 212);
 
   const tex = new THREE.CanvasTexture(c);
   tex.colorSpace = THREE.SRGBColorSpace;
@@ -142,10 +142,10 @@ function makeBlastDoorTexture(): THREE.CanvasTexture {
   ctx.fillStyle = '#d1d5db';
   ctx.font = '700 36px "Oswald", sans-serif';
   ctx.textAlign = 'center';
-  ctx.fillText('BIO-CONTAINMENT', 256, 112);
+  ctx.fillText('INFECTION SECTOR 4', 256, 112);
   ctx.fillStyle = '#f59e0b';
   ctx.font = '600 22px "IBM Plex Mono", monospace';
-  ctx.fillText('DECON AIRLOCK · SEALED BAY', 256, 148);
+  ctx.fillText('DECON AIRLOCK · APC TRANSPORT BAY', 256, 148);
 
   const tex = new THREE.CanvasTexture(c);
   tex.colorSpace = THREE.SRGBColorSpace;

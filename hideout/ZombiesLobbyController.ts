@@ -77,6 +77,7 @@ import { PlayerInteractAnimator } from '../doors/PlayerInteractAnimator';
 import type { BrokenElectronicRepairTarget } from './HideoutElectronicsSystem';
 import { GunWallSwapChoreography } from './GunWallSwapChoreography';
 import type { HideoutPromptOption, HideoutPromptState, InteractReticleState } from './HideoutSessionController';
+import type { BunkerNpcInteractMeta } from './BunkerNpcSystem';
 import {
   buildZombiesOutpostWorld,
   ZombiesOutpostBriefingState,
@@ -98,6 +99,7 @@ export interface ZombiesLobbySnapshot {
   isSwappingRack: boolean;
   interactReticleState: InteractReticleState;
   prompt: HideoutPromptState | null;
+  npcCaption: { speaker: string; text: string } | null;
   toastMessage: string | null;
   fps: number;
   masterVolume: number;
@@ -110,6 +112,10 @@ export interface ZombiesLobbySnapshot {
 export interface ZombiesLobbyControllerCallbacks {
   isWeaponUnlocked: (weaponId: string) => boolean;
   onOpenZombiesOps: () => void;
+  onQuickDeployInfection?: () => void;
+  onCycleInfectionMap?: () => string;
+  onCycleInfectionDifficulty?: () => string;
+  onCycleInfectionBots?: () => number;
   onOpenGunsmith: () => void;
   onOpenOperatorGear: () => void;
   onReturnToHideout: () => void;
@@ -202,6 +208,8 @@ export class ZombiesLobbyController {
   private readonly magAmmoByWeapon: Record<string, number> = {};
 
   private activeMeta: ZombiesOutpostInteractMeta | null = null;
+  private activeNpcMeta: BunkerNpcInteractMeta | null = null;
+  private lastNpcCaptionKey = '';
   private activeElectronicRepair: BrokenElectronicRepairTarget | null = null;
   private activeLiveRound: { id: number; caliberId: string; caliberLabel: string; weaponId: string } | null = null;
   private activeGroundBackpack: { id: string; label: string; itemCount: number } | null = null;
@@ -1155,18 +1163,51 @@ export class ZombiesLobbyController {
       }
       return;
     }
-    if (this.activeElectronicRepair && !this.activeMeta) {
+    if (this.activeElectronicRepair && !this.activeMeta && !this.activeNpcMeta) {
       this.startElectronicHoldRepair(this.activeElectronicRepair);
       return;
     }
 
-    const meta = this.activeMeta;
     const prompt = this.activePrompt;
-    if (!meta || !prompt || prompt.options.length === 0) return;
+    if (!prompt || prompt.options.length === 0) return;
 
     const safeIdx = THREE.MathUtils.clamp(this.selectedOptionIndex, 0, prompt.options.length - 1);
     const chosen = prompt.options[safeIdx];
     if (!chosen) return;
+
+    if (this.activeNpcMeta) {
+      const npc = this.activeNpcMeta;
+      this.audio.playWeaponCue('mode_toggle', { intensity: 0.45 });
+      if (chosen.id === 'npc_talk') {
+        this.world.npcSystem.triggerNpcLine(npc.npcId);
+        this.emitSnapshot(true);
+        return;
+      }
+      if (npc.role === 'outpost_commander') {
+        if (chosen.id === 'quick_deploy_infection' && this.callbacks.onQuickDeployInfection) {
+          this.setModalActive(true);
+          this.callbacks.onQuickDeployInfection();
+        } else if (chosen.id === 'cycle_inf_map' && this.callbacks.onCycleInfectionMap) {
+          const nextMap = this.callbacks.onCycleInfectionMap();
+          this.showToast(`Infection Sector: ${nextMap}`);
+        } else {
+          this.setModalActive(true);
+          this.callbacks.onOpenZombiesOps();
+        }
+        return;
+      }
+      if (npc.role === 'outpost_squadmate') {
+        if (chosen.id === 'cycle_inf_bots' && this.callbacks.onCycleInfectionBots) {
+          const nextBots = this.callbacks.onCycleInfectionBots();
+          this.showToast(nextBots === 0 ? 'Allied AI Fireteam: Solo' : `Allied AI Squadmates: +${nextBots}`);
+        }
+        return;
+      }
+      return;
+    }
+
+    const meta = this.activeMeta;
+    if (!meta) return;
 
     switch (meta.kind) {
       case 'gun_wall_slot': {
@@ -1195,8 +1236,22 @@ export class ZombiesLobbyController {
           this.interactAnimator.trigger('PROP_INTERACT', this._ikTargetPos);
         }
         this.audio.playWeaponCue('mode_toggle', { intensity: 0.5 });
-        this.setModalActive(true);
-        this.callbacks.onOpenZombiesOps();
+        if (chosen.id === 'quick_deploy_infection' && this.callbacks.onQuickDeployInfection) {
+          this.setModalActive(true);
+          this.callbacks.onQuickDeployInfection();
+        } else if (chosen.id === 'cycle_inf_map' && this.callbacks.onCycleInfectionMap) {
+          const nextMap = this.callbacks.onCycleInfectionMap();
+          this.showToast(`Infection Sector: ${nextMap}`);
+        } else if (chosen.id === 'cycle_inf_diff' && this.callbacks.onCycleInfectionDifficulty) {
+          const nextDiff = this.callbacks.onCycleInfectionDifficulty();
+          this.showToast(`Threat Difficulty: ${nextDiff}`);
+        } else if (chosen.id === 'cycle_inf_bots' && this.callbacks.onCycleInfectionBots) {
+          const nextBots = this.callbacks.onCycleInfectionBots();
+          this.showToast(nextBots === 0 ? 'Allied AI: Solo' : `Allied AI Squadmates: +${nextBots}`);
+        } else {
+          this.setModalActive(true);
+          this.callbacks.onOpenZombiesOps();
+        }
         break;
       }
       case 'outpost_ammo_crate': {
@@ -1239,6 +1294,7 @@ export class ZombiesLobbyController {
       this.returnTransitionActive
     ) {
       this.activeMeta = null;
+      this.activeNpcMeta = null;
       this.activeGroundBackpack = null;
       this.activePrompt = null;
       this.interactReticleState = 'hidden';
@@ -1254,11 +1310,32 @@ export class ZombiesLobbyController {
 
     const hits = this._raycaster.intersectObjects(this.world.interactableMeshes, false);
     let matched: ZombiesOutpostInteractMeta | null = null;
+    let matchedNpc: BunkerNpcInteractMeta | null = null;
     let nearDetected = false;
 
     for (let i = 0; i < hits.length; i++) {
       const h = hits[i];
       if (!h.object.visible) continue;
+      const npcMeta = h.object.userData.bunkerNpc as BunkerNpcInteractMeta | undefined;
+      if (npcMeta) {
+        if (h.distance > npcMeta.maxDistanceM + NEAR_EXTRA) continue;
+        if (h.distance > 0.55) {
+          const blocked = this.adapter.raycast(
+            this._camPos,
+            this._lookDir,
+            0.08,
+            h.distance - 0.35,
+            this._occlRayHit,
+          );
+          if (blocked) continue;
+        }
+        if (h.distance <= npcMeta.maxDistanceM) {
+          matchedNpc = npcMeta;
+        } else {
+          nearDetected = true;
+        }
+        break;
+      }
       const meta = h.object.userData.outpostInteractable as ZombiesOutpostInteractMeta | undefined;
       if (!meta) continue;
       if (meta.kind === 'gun_wall_slot' && typeof meta.slotIndex === 'number') {
@@ -1287,6 +1364,7 @@ export class ZombiesLobbyController {
     const activeRep = this.holdRepair.getState();
     if (activeRep) {
       this.activeMeta = null;
+      this.activeNpcMeta = null;
       this.activeElectronicRepair = null;
       this.interactReticleState = 'ready';
       this.activePrompt = {
@@ -1307,9 +1385,40 @@ export class ZombiesLobbyController {
     }
 
     this.activeMeta = matched;
+    this.activeNpcMeta = matchedNpc;
     this.activeElectronicRepair = null;
     this.activeLiveRound = null;
     this.activeGroundBackpack = null;
+
+    if (matchedNpc) {
+      const keyId = `npc:${matchedNpc.npcId}`;
+      if (keyId !== this.lastTargetKeyId) {
+        this.lastTargetKeyId = keyId;
+        this.selectedOptionIndex = 0;
+      }
+      this.interactReticleState = 'ready';
+      const opts: HideoutPromptOption[] =
+        matchedNpc.role === 'outpost_commander'
+          ? [
+              { id: 'quick_deploy_infection', label: 'Deploy to Infection Zone' },
+              { id: 'open_ops', label: 'Open Infection Briefing Board' },
+              { id: 'cycle_inf_map', label: 'Cycle Infection Sector' },
+              { id: 'npc_talk', label: 'Talk to Outpost Commander' },
+            ]
+          : [
+              { id: 'cycle_inf_bots', label: 'Cycle Allied AI Squad Count' },
+              { id: 'npc_talk', label: 'Check In with Squadmate' },
+            ];
+      this.selectedOptionIndex = THREE.MathUtils.clamp(this.selectedOptionIndex, 0, opts.length - 1);
+      this.activePrompt = {
+        key: 'F',
+        targetLabel: matchedNpc.callsign,
+        options: opts,
+        selectedIndex: this.selectedOptionIndex,
+      };
+      return;
+    }
+
     if (!matched) {
       const brokenElec = this.world.electronics.findBrokenRepairTarget(
         this._camPos,
@@ -1420,18 +1529,26 @@ export class ZombiesLobbyController {
       if (this.world.electronics.isInteractiveLinkBroken('outpost_ops_board')) {
         this.activePrompt = {
           key: 'F',
-          targetLabel: 'Zombies Operations Map Board',
+          targetLabel: 'Infection Operations Map Board',
           options: [{ id: 'repair_ops_board', label: 'Repair Operations Map Board', hint: 'Hold [F]' }],
           selectedIndex: 0,
           holdProgress: 0,
         };
         return;
       }
+      const opts: HideoutPromptOption[] = [
+        { id: 'quick_deploy_infection', label: 'Deploy to Infection Zone', hint: 'Breach' },
+        { id: 'open_ops', label: 'Open Full Infection Briefing' },
+        { id: 'cycle_inf_map', label: 'Cycle Infection Sector' },
+        { id: 'cycle_inf_diff', label: 'Cycle Threat Difficulty' },
+        { id: 'cycle_inf_bots', label: 'Cycle Allied AI Squadmates (0–3)' },
+      ];
+      this.selectedOptionIndex = THREE.MathUtils.clamp(this.selectedOptionIndex, 0, opts.length - 1);
       this.activePrompt = {
         key: 'F',
-        targetLabel: 'Zombies Operations Map Board',
-        options: [{ id: 'open_ops', label: 'Select Map, Difficulty & Deploy' }],
-        selectedIndex: 0,
+        targetLabel: 'Infection Operations Map Board',
+        options: opts,
+        selectedIndex: this.selectedOptionIndex,
       };
       return;
     }
@@ -1447,11 +1564,17 @@ export class ZombiesLobbyController {
         };
         return;
       }
+      const opts: HideoutPromptOption[] = [
+        { id: 'open_ops', label: 'Infection Briefing & Squad Dispatch' },
+        { id: 'cycle_inf_bots', label: 'Cycle Allied AI Squadmates (0–3)' },
+        { id: 'quick_deploy_infection', label: 'Deploy to Infection Zone' },
+      ];
+      this.selectedOptionIndex = THREE.MathUtils.clamp(this.selectedOptionIndex, 0, opts.length - 1);
       this.activePrompt = {
         key: 'F',
         targetLabel: 'Tactical Field Radio',
-        options: [{ id: 'open_ops', label: 'Quarantine Briefing & Squad Dispatch' }],
-        selectedIndex: 0,
+        options: opts,
+        selectedIndex: this.selectedOptionIndex,
       };
       return;
     }
@@ -1484,8 +1607,8 @@ export class ZombiesLobbyController {
     if (matched.kind === 'outpost_return_airlock') {
       this.activePrompt = {
         key: 'F',
-        targetLabel: 'Armored Transport · Return Airlock',
-        options: [{ id: 'return_hideout', label: 'Board Transport → Return to Hideout' }],
+        targetLabel: 'Armored APC · Return Transport',
+        options: [{ id: 'return_hideout', label: 'Board APC Escort → Return to Hideout' }],
         selectedIndex: 0,
       };
     }
@@ -1747,6 +1870,7 @@ export class ZombiesLobbyController {
           !e.repeat &&
           !this.holdRepair.isActive() &&
           (this.activeMeta ||
+            this.activeNpcMeta ||
             this.activeElectronicRepair ||
             this.activeLiveRound ||
             this.activeGroundBackpack)
@@ -2151,7 +2275,12 @@ export class ZombiesLobbyController {
       );
       this.postProcess.render();
 
-      if (nextSig !== prevSig || this.interactReticleState !== prevReticle || now - this.lastEmitMs >= 180) {
+      const liveCap = this.world.npcSystem.getActiveCaption();
+      const capKey = liveCap ? `${liveCap.npcId}:${liveCap.text}` : '';
+      const capChanged = capKey !== this.lastNpcCaptionKey;
+      this.lastNpcCaptionKey = capKey;
+
+      if (nextSig !== prevSig || this.interactReticleState !== prevReticle || capChanged || now - this.lastEmitMs >= 180) {
         this.lastEmitMs = now;
         this.emitSnapshot(false);
       }
@@ -2169,7 +2298,7 @@ export class ZombiesLobbyController {
     return {
       pointerLocked: this.pointerLocked,
       pauseOpen: this.pauseOpen,
-      locationLabel: 'Fortified Quarantine Outpost · Zombies Lobby',
+      locationLabel: 'Fortified Infection Outpost',
       equippedWeaponId: this.equippedWeaponId,
       equippedWeaponName: this.equippedWeaponId === 'unarmed' ? 'Unarmed' : prof.name,
       equippedCaliber: this.equippedWeaponId === 'unarmed' ? '' : prof.caliberLabel,
@@ -2190,6 +2319,10 @@ export class ZombiesLobbyController {
             options: this.activePrompt.options.map((o) => ({ ...o })),
           }
         : null,
+      npcCaption: (() => {
+        const cap = this.world.npcSystem.getActiveCaption();
+        return cap ? { speaker: cap.speaker, text: cap.text } : null;
+      })(),
       toastMessage: this.toastMessage,
       fps: this.currentFps,
       masterVolume: this.config.masterVolume,

@@ -165,6 +165,18 @@ export const ZombiesOutpostHud: React.FC<ZombiesOutpostHudProps> = ({
         </div>
       )}
 
+      {/* Quiet NPC radio / voice caption strip */}
+      {showLiveHud && snapshot.npcCaption && !snapshot.toastMessage && (
+        <div className="fixed bottom-12 left-1/2 -translate-x-1/2 max-w-xl px-4 py-1.5 text-center">
+          <div className="font-mono-tabular text-[10px] font-semibold uppercase tracking-[0.16em] text-amber-400">
+            {snapshot.npcCaption.speaker}
+          </div>
+          <div className="mt-0.5 text-xs font-medium text-neutral-100 drop-shadow-[0_1px_2px_rgba(0,0,0,0.95)]">
+            {snapshot.npcCaption.text}
+          </div>
+        </div>
+      )}
+
       {/* Quiet bottom toast */}
       {showLiveHud && snapshot.toastMessage && (
         <div className="fixed bottom-6 left-1/2 -translate-x-1/2 border border-white/14 bg-[#0d1014]/92 px-4 py-1.5 text-xs font-medium text-neutral-200">
@@ -180,7 +192,7 @@ export const ZombiesOutpostHud: React.FC<ZombiesOutpostHudProps> = ({
             onClick={onRequestLock}
             className="cursor-pointer border border-amber-400/60 bg-[#0d1014]/94 px-6 py-3 font-display text-sm font-semibold uppercase tracking-wider text-neutral-100 transition-colors hover:border-amber-300 hover:bg-[#151a20]"
           >
-            Click to Engage Quarantine Outpost
+            Click to Engage Infection Outpost
           </button>
         </div>
       )}
@@ -191,10 +203,10 @@ export const ZombiesOutpostHud: React.FC<ZombiesOutpostHudProps> = ({
           <div className="flex w-full max-w-md flex-col gap-4 border border-white/14 bg-[#0d1015] p-6 text-neutral-100">
             <div className="flex flex-col gap-0.5 border-b border-white/10 pb-3">
               <h2 className="font-display text-xl font-bold tracking-wider text-white">
-                Quarantine Outpost
+                Infection Outpost
               </h2>
               <p className="text-xs text-neutral-400">
-                Inspect field rack weapons, plan Zombies ops, or return to the main Hideout.
+                Inspect field rack weapons, configure Infection ops, or take the APC escort back to the Hideout.
               </p>
             </div>
 
@@ -212,7 +224,7 @@ export const ZombiesOutpostHud: React.FC<ZombiesOutpostHudProps> = ({
                 className="flex cursor-pointer items-center gap-2.5 border border-red-500/55 bg-red-600/18 px-4 py-2 text-left text-xs font-semibold text-red-100 transition-colors hover:bg-red-600/28"
               >
                 <Radio className="h-4 w-4 text-red-400" />
-                <span>Zombies Operations Briefing</span>
+                <span>Infection Operations Briefing</span>
               </button>
               <div className="grid grid-cols-2 gap-2">
                 <button
@@ -248,7 +260,7 @@ export const ZombiesOutpostHud: React.FC<ZombiesOutpostHudProps> = ({
                 className="flex cursor-pointer items-center gap-2.5 border border-white/14 bg-[#141820] px-4 py-2 text-left text-xs font-medium text-neutral-200 transition-colors hover:border-amber-500/60 hover:text-white"
               >
                 <ArrowLeft className="h-4 w-4 text-amber-400" />
-                <span>Return to Hideout (Airlock Transport)</span>
+                <span>Return to Hideout (APC Escort)</span>
               </button>
             </div>
 
@@ -337,7 +349,7 @@ export const ZombiesOutpostHud: React.FC<ZombiesOutpostHudProps> = ({
           maxHp={100}
           bleeding={false}
           sprintSlow={!snapshot.encumbrance.canSprint}
-          modeLabel="Quarantine Outpost"
+          modeLabel="Infection Outpost"
           showSecureContainer={false}
           allowInstantMagPack={true}
           onMutateInventory={(nextInv, nextExternal, statusNote) =>

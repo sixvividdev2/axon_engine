@@ -118,7 +118,15 @@ import { LongRangeSnapshot } from './HideoutLongRangeGallery';
 import { OpsLaptopTabId } from './HideoutOpsLaptopModal';
 import { ReadyRoomBriefingState } from './HideoutReadyRoom';
 import { hideoutStateStore } from './HideoutStateStore';
+import type { BunkerNpcInteractMeta } from './BunkerNpcSystem';
 import { hideoutShardAdapter } from '../src/modes/openworld/HideoutShardAdapter';
+import {
+  CHARACTER_SLOT_IDS,
+  CharacterSlotId,
+  PMC_FACTIONS,
+} from '../src/modes/openworld/types';
+import type { GridContainer } from '../src/modes/openworld/inventory/TetrisInventoryTypes';
+import { createMedicalItem } from '../src/modes/openworld/inventory/TetrisInventoryCore';
 
 export type InteractReticleState = 'hidden' | 'near' | 'ready';
 
@@ -139,6 +147,7 @@ export interface HideoutPromptState {
 
 type ActiveInteractTarget =
   | { source: 'prop'; meta: HideoutInteractableMeta; keyId: string }
+  | { source: 'npc'; meta: BunkerNpcInteractMeta; keyId: string }
   | { source: 'door'; doorId: string; keyId: string }
   | { source: 'electronic'; target: BrokenElectronicRepairTarget; keyId: string }
   | {
@@ -185,6 +194,7 @@ export interface HideoutSnapshot {
   isSwappingGunWall: boolean;
   interactReticleState: InteractReticleState;
   prompt: HideoutPromptState | null;
+  npcCaption: { speaker: string; text: string } | null;
   toastMessage: string | null;
   fps: number;
   masterVolume: number;
@@ -196,10 +206,14 @@ export interface HideoutSnapshot {
   encumbrance: OperatorEncumbranceState;
 }
 
+const LOCKER_STASH_STORAGE_KEY = 'axon_hideout_locker_stash_v1';
+
 const HIDEOUT_PDA_MARKERS: readonly PdaPingMarker[] = [
   { x: 0, z: 0, label: 'ARSENAL', kind: 'poi' },
   { x: -11.5, z: 0, label: 'READY ROOM', kind: 'poi' },
-  { x: 0, z: 9.5, label: 'SECTOR 4', kind: 'danger' },
+  { x: -11.5, z: -10.5, label: 'PERIMETER WING', kind: 'poi' },
+  { x: 0, z: 9.5, label: 'SECTOR 4 · INFECTION', kind: 'danger' },
+  { x: 11.2, z: -9.5, label: 'CALIBRATION GYM', kind: 'poi' },
   { x: 10.7, z: 14, label: 'BAY 1 · BALLISTICS', kind: 'poi' },
   { x: 19.2, z: 16, label: 'BAY 2 · CQB', kind: 'poi' },
   { x: 29.0, z: 28.2, label: '25M', kind: 'order' },
@@ -213,6 +227,9 @@ export interface HideoutControllerCallbacks {
   onOpenGunsmith: () => void;
   onOpenOperatorGear: () => void;
   onOpenOpsLaptop: (initialTab?: OpsLaptopTabId) => void;
+  onOpenPerimeterLaptop: () => void;
+  onLaunchPlayground: () => void;
+  onDeployPerimeterSlot?: (slotId: CharacterSlotId) => void;
   onQuickDeployBattle: () => void;
   onCycleStagedMap: () => string;
   onEnterZombiesOutpost?: () => void;
@@ -248,6 +265,8 @@ export class HideoutSessionController {
   private readonly postProcess: BodycamPostProcess;
   private readonly scopeRenderer: ScopeRenderer;
   private readonly swapChoreography: GunWallSwapChoreography;
+  private personalLockerStashGrid: GridContainer;
+  private lastNpcCaptionKey = '';
   private readonly grenadeSystem: TacticalGrenadeSystem;
   private readonly physicsProps: DynamicPhysicsPropSystem;
   private readonly pdaDevice: TacticalPdaDevice;
@@ -673,6 +692,7 @@ export class HideoutSessionController {
 
     this.worldBackpacks = new WorldBackpackSystem(this.scene);
     this.seedHideoutPracticeBackpacks();
+    this.personalLockerStashGrid = this.loadOrSeedPersonalLockerStash();
 
     // Spawn player either in Arsenal Room facing Gun Wall (-Z) or returning from Bio-Containment Airlock
     if (callbacks.initialSpawnZone === 'airlock_return') {
@@ -683,7 +703,7 @@ export class HideoutSessionController {
       this.controller.aimPitch = 0;
       this.airlockReturnCooldownSec = 2.6;
       this.currentRoomId = 'zombies_portal';
-      this.currentRoomLabel = 'Sector 4 · Bio-Containment Airlock';
+      this.currentRoomLabel = 'Sector 4 · Infection Airlock';
     } else {
       this.controller.position.set(0, 0, 1.95);
       this.controller.torsoYaw = 0;
@@ -763,6 +783,7 @@ export class HideoutSessionController {
     // Sync Gun Wall strictly with active character (or classic career) owned weapons
     this.syncOwnedWeapons();
     this.refreshPdaOpenWorldOverlay();
+    this.syncPerimeterWingVisuals();
 
     // Live M/F skeleton hot-swap when operator body type changes (e.g., switching roster slots)
     this.unsubOperatorId = operatorSelectionStore.subscribe((nextOpId) => {
@@ -812,6 +833,7 @@ export class HideoutSessionController {
     this.unsubOpenWorld = hideoutShardAdapter.subscribe(() => {
       if (this.disposed) return;
       this.refreshPdaOpenWorldOverlay();
+      this.syncPerimeterWingVisuals();
       if (!this.swapChoreography.isActive()) {
         this.syncOwnedWeapons();
       }
@@ -993,6 +1015,82 @@ export class HideoutSessionController {
     }
   }
 
+  private loadOrSeedPersonalLockerStash(): GridContainer {
+    try {
+      const raw = typeof window !== 'undefined' ? window.localStorage.getItem(LOCKER_STASH_STORAGE_KEY) : null;
+      if (raw) {
+        const parsed = JSON.parse(raw) as GridContainer;
+        if (parsed && typeof parsed.width === 'number' && typeof parsed.height === 'number' && Array.isArray(parsed.items)) {
+          return parsed;
+        }
+      }
+    } catch {
+      // ignore corrupted locker stash storage
+    }
+    const grid: GridContainer = {
+      id: 'hideout_locker_stash_grid',
+      label: 'Arsenal Tactical Locker',
+      width: 8,
+      height: 6,
+      items: [],
+    };
+    const starterItems = [
+      createLoadedMagazineForWeapon('m4a1'),
+      createLoadedMagazineForWeapon('m4a1'),
+      createLoadedMagazineForWeapon('makarov_pm'),
+      createAmmoStackItem(getDefaultAmmoVariant('556x45').id, 60),
+      createAmmoStackItem(getDefaultAmmoVariant('9x19').id, 50),
+      createMedicalItem('ifak'),
+      createMedicalItem('bandage'),
+    ];
+    for (const item of starterItems) {
+      autoPlaceItemInGrid(grid, item);
+    }
+    return grid;
+  }
+
+  private persistPersonalLockerStash(): void {
+    try {
+      if (typeof window !== 'undefined') {
+        window.localStorage.setItem(
+          LOCKER_STASH_STORAGE_KEY,
+          JSON.stringify(this.personalLockerStashGrid),
+        );
+      }
+    } catch {
+      // ignore quota/private mode errors
+    }
+  }
+
+  public openPersonalLockerStash(): void {
+    const ctx: ExternalLootContext = {
+      kind: 'event_crate',
+      id: 'hideout_personal_locker_stash',
+      title: 'Arsenal Tactical Locker',
+      subtitle: 'Personal Stash Grid (8x6) · Persistent Bunker Storage',
+      lootKit: {
+        primaryWeaponId: null,
+        secondaryWeaponId: null,
+        armorPlateId: null,
+        armorName: null,
+        chestRig: null,
+        backpack: null,
+        beltSlots: [null, null, null, null],
+        looseGrid: {
+          ...this.personalLockerStashGrid,
+          items: this.personalLockerStashGrid.items.map((it) => ({ ...it })),
+        },
+      },
+    };
+    this.openInventory(ctx);
+  }
+
+  private syncPerimeterWingVisuals(): void {
+    const snap = hideoutShardAdapter.getSnapshot();
+    this.world.perimeterWing.syncRosterPlaques(snap.roster);
+    this.world.npcSystem.syncPerimeterRosterAlcoves(snap.roster);
+  }
+
   public applyInventoryMutation(
     nextInv: OperatorTacticalInventory,
     nextExternal?: CorpseTacticalLootSnapshot | null,
@@ -1001,12 +1099,18 @@ export class HideoutSessionController {
     this.tacticalInventory = cloneTacticalInventory(nextInv);
     this.refreshEncumbranceAndBackpackVisual();
     this.syncMagAmmoFromInventory();
-    if (
-      nextExternal !== undefined &&
-      this.activeExternalLoot &&
-      this.activeExternalLoot.kind === 'ground_backpack'
-    ) {
-      if (nextExternal && nextExternal.backpack) {
+    if (nextExternal !== undefined && this.activeExternalLoot) {
+      if (this.activeExternalLoot.id === 'hideout_personal_locker_stash' && nextExternal) {
+        this.personalLockerStashGrid = {
+          ...nextExternal.looseGrid,
+          items: nextExternal.looseGrid.items.map((it) => ({ ...it })),
+        };
+        this.persistPersonalLockerStash();
+        this.activeExternalLoot = {
+          ...this.activeExternalLoot,
+          lootKit: nextExternal,
+        };
+      } else if (this.activeExternalLoot.kind === 'ground_backpack' && nextExternal && nextExternal.backpack) {
         this.worldBackpacks.updateContainerContents(
           this.activeExternalLoot.id,
           nextExternal.backpack,
@@ -2089,6 +2193,62 @@ export class HideoutSessionController {
       return;
     }
 
+    if (target.source === 'npc') {
+      const npc = target.meta;
+      this.audio.playWeaponCue('mode_toggle', { intensity: 0.4 });
+      if (chosen.id === 'npc_talk') {
+        this.world.npcSystem.triggerNpcLine(npc.npcId);
+        this.emitSnapshot(true);
+        return;
+      }
+      if (npc.role === 'armorer') {
+        this.setModalActive(true);
+        this.callbacks.onOpenGunsmith();
+        return;
+      }
+      if (npc.role === 'ops_commander') {
+        if (chosen.id === 'npc_quick_deploy') {
+          this.setModalActive(true);
+          this.callbacks.onQuickDeployBattle();
+        } else {
+          this.setModalActive(true);
+          this.callbacks.onOpenOpsLaptop('battle');
+        }
+        return;
+      }
+      if (npc.role === 'quartermaster') {
+        if (chosen.id === 'npc_perimeter_terminal') {
+          this.setModalActive(true);
+          this.callbacks.onOpenPerimeterLaptop();
+        } else {
+          this.openPersonalLockerStash();
+        }
+        return;
+      }
+      if (npc.role === 'contract_officer') {
+        this.setModalActive(true);
+        this.callbacks.onOpenPerimeterLaptop();
+        return;
+      }
+      if (npc.role === 'roster_operator' && npc.rosterSlotId) {
+        const slotId = npc.rosterSlotId;
+        if (chosen.id === 'alcove_set_active') {
+          hideoutShardAdapter.getRoster().setActiveSlot(slotId);
+          this.world.npcSystem.triggerNpcLine(npc.npcId, 'Point assigned. Standing by for helipad insertion.');
+          this.showToast(`Active Operator: ${npc.displayName}`);
+        } else if (chosen.id === 'alcove_deploy') {
+          hideoutShardAdapter.getRoster().setActiveSlot(slotId);
+          this.setModalActive(true);
+          this.callbacks.onDeployPerimeterSlot?.(slotId);
+        } else {
+          this.setModalActive(true);
+          this.callbacks.onOpenPerimeterLaptop();
+        }
+        return;
+      }
+      return;
+    }
+
     const meta = target.meta;
     switch (meta.kind) {
       case 'gun_wall_slot': {
@@ -2107,14 +2267,16 @@ export class HideoutSessionController {
         break;
       }
       case 'locker_door': {
-        if (chosen.id === 'operator_gear') {
+        if (chosen.id === 'open_personal_stash') {
+          this.audio.playGearRattle('weapon_swap', 0.42);
+          if (!this.world.lockerOpen) {
+            this.world.toggleLockerDoor();
+          }
+          this.openPersonalLockerStash();
+        } else if (chosen.id === 'operator_gear') {
           this.audio.playGearRattle('weapon_swap', 0.45);
           this.setModalActive(true);
           this.callbacks.onOpenOperatorGear();
-        } else if (chosen.id === 'open_stash_roster') {
-          this.audio.playGearRattle('weapon_swap', 0.45);
-          this.setModalActive(true);
-          this.callbacks.onOpenOpsLaptop('perimeter');
         } else {
           if (this.world.getPropInteractPos('locker_door', this._ikTargetPos)) {
             this.interactAnimator.trigger('PROP_INTERACT', this._ikTargetPos, (out) =>
@@ -2234,18 +2396,107 @@ export class HideoutSessionController {
           this.interactAnimator.trigger('PROP_INTERACT', this._ikTargetPos);
         }
         this.audio.playWeaponCue('mode_toggle', { intensity: 0.5 });
-        if (chosen.id === 'open_perimeter') {
-          this.setModalActive(true);
-          this.callbacks.onOpenOpsLaptop('perimeter');
-        } else if (chosen.id === 'quick_deploy') {
+        if (chosen.id === 'quick_deploy') {
           this.setModalActive(true);
           this.callbacks.onQuickDeployBattle();
         } else if (chosen.id === 'open_squads') {
           this.setModalActive(true);
           this.callbacks.onOpenOpsLaptop('multiplayer');
+        } else if (chosen.id === 'open_gym') {
+          this.setModalActive(true);
+          this.callbacks.onOpenOpsLaptop('gym');
         } else {
           this.setModalActive(true);
           this.callbacks.onOpenOpsLaptop('battle');
+        }
+        break;
+      }
+      case 'perimeter_laptop': {
+        if (this.world.readyRoom.isPerimeterLaptopBroken()) {
+          const linked = this.world.electronics.getNodeByLinkId('perimeter_laptop');
+          if (linked && linked.broken) {
+            this.startElectronicHoldRepair({
+              id: linked.id,
+              label: linked.label,
+              anchorPos: linked.anchorPos,
+              durationSec: linked.durationSec,
+              distanceM: 1.4,
+              interactiveLinkId: 'perimeter_laptop',
+            });
+          }
+          break;
+        }
+        if (this.world.getPropInteractPos('perimeter_laptop', this._ikTargetPos)) {
+          this.interactAnimator.trigger('PROP_INTERACT', this._ikTargetPos);
+        }
+        this.audio.playWeaponCue('mode_toggle', { intensity: 0.5 });
+        if (chosen.id === 'deploy_perimeter_active') {
+          const active = hideoutShardAdapter.getActiveCharacter();
+          if (active && this.callbacks.onDeployPerimeterSlot) {
+            this.setModalActive(true);
+            this.callbacks.onDeployPerimeterSlot(active.slotId);
+          } else {
+            this.setModalActive(true);
+            this.callbacks.onOpenPerimeterLaptop();
+          }
+        } else {
+          this.setModalActive(true);
+          this.callbacks.onOpenPerimeterLaptop();
+        }
+        break;
+      }
+      case 'calibration_gym_door': {
+        if (this.world.getPropInteractPos('calibration_gym_door', this._ikTargetPos)) {
+          this.interactAnimator.trigger('PROP_INTERACT', this._ikTargetPos);
+        }
+        this.audio.playWeaponCue('bolt_pull', { intensity: 0.65 });
+        this.setModalActive(true);
+        this.callbacks.onLaunchPlayground();
+        break;
+      }
+      case 'perimeter_roster_alcove': {
+        const slotId = CHARACTER_SLOT_IDS[meta.slotIndex ?? 0] ?? 'slot_0';
+        const rosterSnap = hideoutShardAdapter.getSnapshot().roster;
+        const ch = rosterSnap.slots[slotId];
+        this.audio.playWeaponCue('mode_toggle', { intensity: 0.45 });
+        if (ch && chosen.id === 'alcove_set_active') {
+          hideoutShardAdapter.getRoster().setActiveSlot(slotId);
+          this.showToast(`Active Perimeter Operator: ${ch.callsign}`);
+        } else if (ch && chosen.id === 'alcove_deploy' && this.callbacks.onDeployPerimeterSlot) {
+          hideoutShardAdapter.getRoster().setActiveSlot(slotId);
+          this.setModalActive(true);
+          this.callbacks.onDeployPerimeterSlot(slotId);
+        } else {
+          this.setModalActive(true);
+          this.callbacks.onOpenPerimeterLaptop();
+        }
+        break;
+      }
+      case 'perimeter_quartermaster': {
+        if (this.world.getPropInteractPos('perimeter_quartermaster', this._ikTargetPos)) {
+          this.interactAnimator.trigger('PROP_INTERACT', this._ikTargetPos);
+        }
+        this.audio.playGearRattle('weapon_swap', 0.45);
+        if (chosen.id === 'qm_perimeter_terminal') {
+          this.setModalActive(true);
+          this.callbacks.onOpenPerimeterLaptop();
+        } else {
+          this.openPersonalLockerStash();
+        }
+        break;
+      }
+      case 'perimeter_heli_hatch': {
+        if (this.world.getPropInteractPos('perimeter_heli_hatch', this._ikTargetPos)) {
+          this.interactAnimator.trigger('PROP_INTERACT', this._ikTargetPos);
+        }
+        this.audio.playWeaponCue('bolt_pull', { intensity: 0.7 });
+        const active = hideoutShardAdapter.getActiveCharacter();
+        if (chosen.id === 'heli_deploy' && active && this.callbacks.onDeployPerimeterSlot) {
+          this.setModalActive(true);
+          this.callbacks.onDeployPerimeterSlot(active.slotId);
+        } else {
+          this.setModalActive(true);
+          this.callbacks.onOpenPerimeterLaptop();
         }
         break;
       }
@@ -2409,6 +2660,32 @@ export class HideoutSessionController {
 
         if (h.distance <= DOOR_INTERACT_MAX_M) {
           matched = { source: 'door', doorId, keyId: `door:${doorId}` };
+        } else {
+          nearDetected = true;
+        }
+        break;
+      }
+
+      const npcMeta = h.object.userData.bunkerNpc as BunkerNpcInteractMeta | undefined;
+      if (npcMeta) {
+        const maxNearNpc = npcMeta.maxDistanceM + NEAR_AWARENESS_EXTRA_M;
+        if (h.distance > maxNearNpc) continue;
+        if (h.distance > 0.5) {
+          const blocked = this.adapter.raycast(
+            this._camPos,
+            this._lookDir,
+            0.08,
+            h.distance - 0.35,
+            this._occlRayHit,
+          );
+          if (blocked) continue;
+        }
+        if (h.distance <= npcMeta.maxDistanceM) {
+          matched = {
+            source: 'npc',
+            meta: npcMeta,
+            keyId: `npc:${npcMeta.npcId}`,
+          };
         } else {
           nearDetected = true;
         }
@@ -2600,6 +2877,51 @@ export class HideoutSessionController {
       return;
     }
 
+    if (matched.source === 'npc') {
+      const npc = matched.meta;
+      let opts: HideoutPromptOption[] = [];
+      if (npc.role === 'armorer') {
+        opts = [
+          { id: 'npc_gunsmith', label: 'Open Gunsmith Workbench' },
+          { id: 'npc_talk', label: 'Talk to Armorer' },
+        ];
+      } else if (npc.role === 'ops_commander') {
+        opts = [
+          { id: 'npc_ops_terminal', label: 'Open Ops Command Terminal', hint: 'Combat · Squads · Gym' },
+          { id: 'npc_quick_deploy', label: 'Quick Deploy Staged Match' },
+          { id: 'npc_talk', label: 'Request Situation Briefing' },
+        ];
+      } else if (npc.role === 'quartermaster') {
+        opts = [
+          { id: 'npc_stash', label: 'Open Personal Stash Grid' },
+          { id: 'npc_perimeter_terminal', label: 'Open Perimeter Operations Terminal' },
+          { id: 'npc_talk', label: 'Talk to Quartermaster' },
+        ];
+      } else if (npc.role === 'contract_officer') {
+        opts = [
+          { id: 'npc_perimeter_terminal', label: 'Open Perimeter Operations Terminal', hint: 'Roster · Shards' },
+          { id: 'npc_talk', label: 'Check Sector Contracts' },
+        ];
+      } else if (npc.role === 'roster_operator' && npc.rosterSlotId) {
+        const rosterSnap = hideoutShardAdapter.getSnapshot().roster;
+        const isActive = rosterSnap.activeSlotId === npc.rosterSlotId;
+        opts = [
+          ...(isActive ? [] : [{ id: 'alcove_set_active', label: 'Set as Active Operator' }]),
+          { id: 'alcove_deploy', label: 'Deploy Helicopter Insertion', hint: 'Perimeter Ops' },
+          { id: 'alcove_manage', label: 'Open Perimeter Operations Terminal' },
+          { id: 'npc_talk', label: 'Check In with Operator' },
+        ];
+      }
+      this.selectedOptionIndex = THREE.MathUtils.clamp(this.selectedOptionIndex, 0, Math.max(0, opts.length - 1));
+      this.activePrompt = {
+        key: 'F',
+        targetLabel: npc.callsign,
+        options: opts,
+        selectedIndex: this.selectedOptionIndex,
+      };
+      return;
+    }
+
     const meta = matched.meta;
     if (meta.kind === 'gun_wall_slot' && typeof meta.slotIndex === 'number') {
       const slot = this.world.gunWallSlots[meta.slotIndex];
@@ -2641,14 +2963,14 @@ export class HideoutSessionController {
 
     if (meta.kind === 'locker_door') {
       const opts: HideoutPromptOption[] = [
-        { id: 'open_stash_roster', label: 'Personal Stash & Roster', hint: 'Perimeter Ops' },
-        { id: 'operator_gear', label: 'Operator Gear' },
-        { id: 'toggle_locker', label: this.world.lockerOpen ? 'Close Locker' : 'Open Locker' },
+        { id: 'open_personal_stash', label: 'Personal Stash Grid', hint: '8x6 Locker' },
+        { id: 'operator_gear', label: 'Operator Gear & Rig' },
+        { id: 'toggle_locker', label: this.world.lockerOpen ? 'Close Locker Door' : 'Open Locker Door' },
       ];
       this.selectedOptionIndex = THREE.MathUtils.clamp(this.selectedOptionIndex, 0, opts.length - 1);
       this.activePrompt = {
         key: 'F',
-        targetLabel: 'Tactical Locker',
+        targetLabel: 'Arsenal Tactical Locker',
         options: opts,
         selectedIndex: this.selectedOptionIndex,
       };
@@ -2755,15 +3077,130 @@ export class HideoutSessionController {
         return;
       }
       const opts: HideoutPromptOption[] = [
-        { id: 'open_perimeter', label: 'Perimeter Ops Roster & Shards', hint: '3 Slots · Stash' },
-        { id: 'open_ops', label: 'Open Ops Command Terminal', hint: 'Battle · Squads · Ops' },
+        { id: 'open_ops', label: 'Open Ops Command Terminal', hint: 'Combat · Squads · Gym' },
         { id: 'quick_deploy', label: 'Quick Deploy Staged Match' },
         { id: 'open_squads', label: 'Squads & Multiplayer Lobbies' },
+        { id: 'open_gym', label: 'Calibration Gym & Playground' },
       ];
       this.selectedOptionIndex = THREE.MathUtils.clamp(this.selectedOptionIndex, 0, opts.length - 1);
       this.activePrompt = {
         key: 'F',
         targetLabel: 'Ops Command Laptop',
+        options: opts,
+        selectedIndex: this.selectedOptionIndex,
+      };
+      return;
+    }
+
+    if (meta.kind === 'perimeter_laptop') {
+      if (this.world.readyRoom.isPerimeterLaptopBroken()) {
+        this.selectedOptionIndex = 0;
+        this.activePrompt = {
+          key: 'F',
+          targetLabel: 'Perimeter Operations Laptop',
+          options: [{ id: 'repair_perimeter_laptop', label: 'Repair Perimeter Laptop', hint: 'Hold [F]' }],
+          selectedIndex: 0,
+          holdProgress: 0,
+        };
+        return;
+      }
+      const activeChar = hideoutShardAdapter.getActiveCharacter();
+      const opts: HideoutPromptOption[] = [
+        { id: 'open_perimeter_laptop', label: 'Open Perimeter Operations Terminal', hint: '3 Slots · Shards' },
+        ...(activeChar
+          ? [
+              {
+                id: 'deploy_perimeter_active',
+                label: `Deploy ${activeChar.callsign} (Helicopter Lift)`,
+                hint: activeChar.shardMode,
+              },
+            ]
+          : []),
+      ];
+      this.selectedOptionIndex = THREE.MathUtils.clamp(this.selectedOptionIndex, 0, opts.length - 1);
+      this.activePrompt = {
+        key: 'F',
+        targetLabel: 'Perimeter Operations Laptop',
+        options: opts,
+        selectedIndex: this.selectedOptionIndex,
+      };
+      return;
+    }
+
+    if (meta.kind === 'calibration_gym_door') {
+      this.selectedOptionIndex = 0;
+      this.activePrompt = {
+        key: 'F',
+        targetLabel: 'Calibration Gym & Playground Transit',
+        options: [{ id: 'enter_gym', label: 'Enter Calibration Gym & Playground' }],
+        selectedIndex: 0,
+      };
+      return;
+    }
+
+    if (meta.kind === 'perimeter_roster_alcove') {
+      const slotIdx = meta.slotIndex ?? 0;
+      const slotId = CHARACTER_SLOT_IDS[slotIdx] ?? 'slot_0';
+      const rosterSnap = hideoutShardAdapter.getSnapshot().roster;
+      const ch = rosterSnap.slots[slotId];
+      const isActive = rosterSnap.activeSlotId === slotId;
+      if (ch) {
+        const faction = PMC_FACTIONS[ch.pmcFaction];
+        const opts: HideoutPromptOption[] = [
+          ...(isActive ? [] : [{ id: 'alcove_set_active', label: `Set ${ch.callsign} Active` }]),
+          { id: 'alcove_deploy', label: 'Deploy Helicopter Insertion', hint: ch.shardMode },
+          { id: 'alcove_manage', label: 'Manage in Perimeter Terminal' },
+        ];
+        this.selectedOptionIndex = THREE.MathUtils.clamp(this.selectedOptionIndex, 0, opts.length - 1);
+        this.activePrompt = {
+          key: 'F',
+          targetLabel: `Slot ${slotIdx + 1} · ${ch.callsign} (${faction.shortName})`,
+          options: opts,
+          selectedIndex: this.selectedOptionIndex,
+        };
+      } else {
+        this.selectedOptionIndex = 0;
+        this.activePrompt = {
+          key: 'F',
+          targetLabel: `Roster Alcove ${slotIdx + 1} · Vacant`,
+          options: [{ id: 'alcove_recruit', label: 'Recruit Perimeter Operator', hint: 'Open Terminal' }],
+          selectedIndex: 0,
+        };
+      }
+      return;
+    }
+
+    if (meta.kind === 'perimeter_quartermaster') {
+      const opts: HideoutPromptOption[] = [
+        { id: 'qm_stash', label: 'Open Personal Stash Grid', hint: '8x6 Locker' },
+        { id: 'qm_perimeter_terminal', label: 'Open Perimeter Operations Terminal' },
+      ];
+      this.selectedOptionIndex = THREE.MathUtils.clamp(this.selectedOptionIndex, 0, opts.length - 1);
+      this.activePrompt = {
+        key: 'F',
+        targetLabel: 'Quartermaster Logistics Counter',
+        options: opts,
+        selectedIndex: this.selectedOptionIndex,
+      };
+      return;
+    }
+
+    if (meta.kind === 'perimeter_heli_hatch') {
+      const activeChar = hideoutShardAdapter.getActiveCharacter();
+      const opts: HideoutPromptOption[] = activeChar
+        ? [
+            {
+              id: 'heli_deploy',
+              label: `Board Valkyrie 2-1 → Deploy ${activeChar.callsign}`,
+              hint: activeChar.shardMode,
+            },
+            { id: 'heli_terminal', label: 'Open Perimeter Operations Terminal' },
+          ]
+        : [{ id: 'heli_terminal', label: 'Assign Operator in Perimeter Terminal' }];
+      this.selectedOptionIndex = THREE.MathUtils.clamp(this.selectedOptionIndex, 0, opts.length - 1);
+      this.activePrompt = {
+        key: 'F',
+        targetLabel: 'Helipad Pad 01 · Valkyrie 2-1 Hatch',
         options: opts,
         selectedIndex: this.selectedOptionIndex,
       };
@@ -2789,11 +3226,11 @@ export class HideoutSessionController {
       this.selectedOptionIndex = 0;
       this.activePrompt = {
         key: 'F',
-        targetLabel: 'Bio-Containment Airlock Override',
+        targetLabel: 'Sector 4 · Infection Airlock Override',
         options: [
           {
             id: 'enter_zombies_outpost',
-            label: 'Cycle Airlock → Quarantine Outpost',
+            label: 'Board APC Escort → Infection Outpost',
           },
         ],
         selectedIndex: 0,
@@ -3838,8 +4275,13 @@ export class HideoutSessionController {
       );
       this.postProcess.render();
 
+      const liveCaption = this.world.npcSystem.getActiveCaption();
+      const captionKey = liveCaption ? `${liveCaption.npcId}:${liveCaption.text}` : '';
+      const captionChanged = captionKey !== this.lastNpcCaptionKey;
+      this.lastNpcCaptionKey = captionKey;
+
       const emitIntervalMs = this.world.gunRange.isCourseRunning() ? 90 : 160;
-      if (roomChanged || promptChanged || now - this.lastEmitMs >= emitIntervalMs) {
+      if (roomChanged || promptChanged || captionChanged || now - this.lastEmitMs >= emitIntervalMs) {
         this.lastEmitMs = now;
         this.emitSnapshot(false);
       }
@@ -3895,6 +4337,10 @@ export class HideoutSessionController {
             options: this.activePrompt.options.map((o) => ({ ...o })),
           }
         : null,
+      npcCaption: (() => {
+        const cap = this.world.npcSystem.getActiveCaption();
+        return cap ? { speaker: cap.speaker, text: cap.text } : null;
+      })(),
       toastMessage: this.toastMessage,
       fps: this.currentFps,
       masterVolume: this.config.masterVolume,
