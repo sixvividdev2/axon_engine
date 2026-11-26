@@ -20,6 +20,7 @@ import {
   DEFAULT_BODYCAM_SDK_CONFIG,
   DEFAULT_TRAUMA_MODIFIERS,
   DynamicPhysicsPropSystem,
+  EjectedLiveRoundPool,
   GrenadeDetonationEvent,
   GrenadeHoldStage,
   IBodycamWorldAdapter,
@@ -40,7 +41,36 @@ import {
   type PdaTabMode,
   VIEWMODEL_LAYER,
   WeaponRig,
+  WorldBackpackSystem,
 } from '../bodycam-sdk';
+import {
+  addLooseRoundToInventory,
+  autoPlaceItemInGrid,
+  buildModeLoadoutTacticalInventory,
+  cloneTacticalInventory,
+  computeOperatorEncumbrance,
+  countCompatibleReserveRounds,
+  createAmmoStackItem,
+  createLoadedMagazineForWeapon,
+  createPopulatedWorldBackpack,
+  cycleChamberInWeaponSlot,
+  extractItemByLocator,
+  findBestReloadMagazine,
+  fireRoundFromWeaponSlot,
+  getLoadedAmmoCount,
+  getWeaponSlotByWeaponId,
+  isBackpackTemplateId,
+  peekItemByLocator,
+  swapMagazineIntoWeapon,
+} from '../src/modes/openworld/inventory/TetrisInventoryCore';
+import type {
+  CorpseTacticalLootSnapshot,
+  ItemSourceLocator,
+  MedicalItem,
+  OperatorEncumbranceState,
+  OperatorTacticalInventory,
+} from '../src/modes/openworld/inventory/TetrisInventoryTypes';
+import type { ExternalLootContext } from '../src/modes/openworld/ui/TacticalInventoryModal';
 import {
   computeDerivedWeaponStats,
   getDefaultZeroDistanceM,
@@ -51,6 +81,7 @@ import {
   AMMO_VARIANTS,
   AmmoVariantDef,
   AmmoVariantId,
+  BASE_CALIBERS,
   getAmmoVariantsForCaliber,
   getDefaultAmmoVariant,
   resolveBaseCaliberId,
@@ -109,7 +140,23 @@ export interface HideoutPromptState {
 type ActiveInteractTarget =
   | { source: 'prop'; meta: HideoutInteractableMeta; keyId: string }
   | { source: 'door'; doorId: string; keyId: string }
-  | { source: 'electronic'; target: BrokenElectronicRepairTarget; keyId: string };
+  | { source: 'electronic'; target: BrokenElectronicRepairTarget; keyId: string }
+  | {
+      source: 'live_round';
+      roundId: number;
+      caliberId: string;
+      caliberLabel: string;
+      weaponId: string;
+      keyId: string;
+    }
+  | {
+      source: 'ground_backpack';
+      containerId: string;
+      label: string;
+      itemCount: number;
+      isPracticeGear: boolean;
+      keyId: string;
+    };
 
 export interface HideoutSnapshot {
   pointerLocked: boolean;
@@ -143,6 +190,10 @@ export interface HideoutSnapshot {
   masterVolume: number;
   gunRange: GunRangeSnapshot;
   longRange: LongRangeSnapshot;
+  inventoryOpen: boolean;
+  tacticalInventory: OperatorTacticalInventory;
+  externalLoot: ExternalLootContext | null;
+  encumbrance: OperatorEncumbranceState;
 }
 
 const HIDEOUT_PDA_MARKERS: readonly PdaPingMarker[] = [
@@ -186,6 +237,7 @@ export class HideoutSessionController {
   private readonly world: HideoutBunkerWorldHandle;
   private readonly adapter: IBodycamWorldAdapter;
   private readonly ballistics: BallisticsSolver;
+  private readonly ejectedLiveRounds: EjectedLiveRoundPool;
   private readonly audio: BodycamAudio;
   private readonly weaponRig: WeaponRig;
   private skeleton: CharacterSkeleton;
@@ -236,6 +288,7 @@ export class HideoutSessionController {
     cant: false,
     adsMode: 'PRIMARY',
     holdBreath: false,
+    freeZoom: false,
     vault: false,
   };
 
@@ -252,6 +305,12 @@ export class HideoutSessionController {
   private fireCooldown = 0;
   private reloadTimer = 0;
   private pendingReloadWeaponId: string | null = null;
+  private pendingReloadMagLocator: ItemSourceLocator | null = null;
+  private tacticalInventory: OperatorTacticalInventory;
+  private encumbrance: OperatorEncumbranceState;
+  private inventoryOpen = false;
+  private activeExternalLoot: ExternalLootContext | null = null;
+  private readonly worldBackpacks: WorldBackpackSystem;
   private pointerLocked = false;
   private pauseOpen = false;
   private modalActive = false;
@@ -260,6 +319,7 @@ export class HideoutSessionController {
 
   private shiftHeld = false;
   private holdBreathHeld = false;
+  private freeZoomHeld = false;
   private keyFHeld = false;
   private stamina = 1.0;
   private heartRateBpm = 72;
@@ -386,6 +446,7 @@ export class HideoutSessionController {
     this.world.longRangeGallery.setAudioVolume(this.config.masterVolume);
     this.world.electronics.setAudioVolume(this.config.masterVolume);
     this.ballistics = new BallisticsSolver(this.scene);
+    this.ejectedLiveRounds = new EjectedLiveRoundPool(this.scene);
 
     this.adapter = this.world.physics.createAdapter({
       onMeleeHit: (ev) => {
@@ -599,6 +660,20 @@ export class HideoutSessionController {
     this.animator.setGrenadeSystem(this.grenadeSystem);
     this.syncBeltEquipmentMesh();
 
+    // Unified spatial Tetris Tactical Inventory + 3D worn backpack + Arsenal Practice Rack packs
+    this.tacticalInventory = buildModeLoadoutTacticalInventory({
+      primaryWeaponId: activeLoadout.primaryWeaponId,
+      secondaryWeaponId: activeLoadout.secondaryWeaponId,
+      backpackId: activeLoadout.backpackId ?? undefined,
+      mode: 'hideout',
+    });
+    this.encumbrance = computeOperatorEncumbrance(this.tacticalInventory);
+    const bootBpId = this.tacticalInventory.backpack?.templateId ?? null;
+    this.skeleton.setBackpack(bootBpId && isBackpackTemplateId(bootBpId) ? bootBpId : null);
+
+    this.worldBackpacks = new WorldBackpackSystem(this.scene);
+    this.seedHideoutPracticeBackpacks();
+
     // Spawn player either in Arsenal Room facing Gun Wall (-Z) or returning from Bio-Containment Airlock
     if (callbacks.initialSpawnZone === 'airlock_return') {
       this.controller.position.set(0, 0, 7.25);
@@ -716,6 +791,15 @@ export class HideoutSessionController {
         this.grenadeCount = getTacticalEquipmentDef(this.tacticalEquipmentId).maxCarry;
         this.syncBeltEquipmentMesh();
       }
+      // Sync selected backpack tier if changed at Loadout Workbench
+      const desiredBp = slot.backpackId ?? null;
+      const curBp = this.tacticalInventory.backpack?.templateId ?? null;
+      if (desiredBp !== curBp) {
+        this.tacticalInventory.backpack = desiredBp
+          ? createPopulatedWorldBackpack(desiredBp, slot.primaryWeaponId)
+          : null;
+        this.refreshEncumbranceAndBackpackVisual();
+      }
       // Refresh currently held weapon attachments & Gun Wall mounted builds live
       if (!this.swapChoreography.isActive()) {
         this.applyEquippedWeaponRig(this.equippedWeaponId, false);
@@ -784,8 +868,247 @@ export class HideoutSessionController {
     this.skeleton.enableArmViewmodelLayer();
     this.scene.add(this.skeleton.root);
     this.animator.setSkeleton(this.skeleton);
+    const bpId = this.tacticalInventory.backpack?.templateId ?? null;
+    this.skeleton.setBackpack(bpId && isBackpackTemplateId(bpId) ? bpId : null);
     this.syncBeltEquipmentMesh();
     this.syncNvgRuntime();
+  }
+
+  private seedHideoutPracticeBackpacks(): void {
+    const spots: Array<{
+      id: string;
+      templateId: 'pack_assault_20l' | 'pack_rucksack_35l' | 'pack_logistics_55l';
+      x: number;
+      z: number;
+      yaw: number;
+      label: string;
+    }> = [
+      {
+        id: 'hideout-rack-20l',
+        templateId: 'pack_assault_20l',
+        x: -2.95,
+        z: -1.15,
+        yaw: 0.45,
+        label: '20L Assault Pack (Rack)',
+      },
+      {
+        id: 'hideout-rack-35l',
+        templateId: 'pack_rucksack_35l',
+        x: -2.95,
+        z: -0.25,
+        yaw: 0.3,
+        label: '35L Field Rucksack (Rack)',
+      },
+      {
+        id: 'hideout-rack-55l',
+        templateId: 'pack_logistics_55l',
+        x: -2.95,
+        z: 0.65,
+        yaw: 0.18,
+        label: '55L Logistics Frame (Rack)',
+      },
+    ];
+    for (const s of spots) {
+      const pack = createPopulatedWorldBackpack(
+        s.templateId,
+        this.equippedWeaponId !== 'unarmed' ? this.equippedWeaponId : 'm4a1',
+      );
+      this.worldBackpacks.spawnBackpack({
+        id: s.id,
+        backpack: pack,
+        position: new THREE.Vector3(s.x, 0, s.z),
+        yaw: s.yaw,
+        ownerLabel: s.label,
+        isPracticeGear: true,
+      });
+    }
+  }
+
+  private refreshEncumbranceAndBackpackVisual(): void {
+    this.encumbrance = computeOperatorEncumbrance(this.tacticalInventory);
+    const bpId = this.tacticalInventory.backpack?.templateId ?? null;
+    this.skeleton.setBackpack(bpId && isBackpackTemplateId(bpId) ? bpId : null);
+  }
+
+  private ensureWeaponInTacticalInventory(weaponId: string): 'primary' | 'secondary' | null {
+    if (weaponId === 'unarmed') return null;
+    const existing = getWeaponSlotByWeaponId(this.tacticalInventory, weaponId);
+    if (existing) return existing;
+    const prof = resolveWeaponProfile(weaponId);
+    const targetSlot: 'primary' | 'secondary' =
+      prof.holdClass === 'pistol' ? 'secondary' : 'primary';
+    const mag = createLoadedMagazineForWeapon(prof.id);
+    this.tacticalInventory[targetSlot] = {
+      weaponId: prof.id,
+      chamberedRound: null,
+      loadedMag: mag,
+    };
+    for (let i = 0; i < 2; i++) {
+      const spare = createLoadedMagazineForWeapon(prof.id);
+      const placedRig = this.tacticalInventory.chestRig
+        ? autoPlaceItemInGrid(this.tacticalInventory.chestRig.generalGrid, spare)
+        : false;
+      if (!placedRig && this.tacticalInventory.backpack) {
+        autoPlaceItemInGrid(this.tacticalInventory.backpack.grid, spare);
+      }
+    }
+    this.refreshEncumbranceAndBackpackVisual();
+    return targetSlot;
+  }
+
+  private syncMagAmmoFromInventory(): void {
+    const primary = this.tacticalInventory.primary;
+    if (primary.weaponId) {
+      this.magAmmoByWeapon[primary.weaponId] = getLoadedAmmoCount(primary);
+    }
+    const secondary = this.tacticalInventory.secondary;
+    if (secondary.weaponId) {
+      this.magAmmoByWeapon[secondary.weaponId] = getLoadedAmmoCount(secondary);
+    }
+    if (this.equippedWeaponId !== 'unarmed') {
+      const prof = resolveWeaponProfile(this.equippedWeaponId);
+      const curMag = this.magAmmoByWeapon[prof.id] ?? 0;
+      this.weaponRig.setAmmoState(curMag, true);
+    }
+  }
+
+  public openInventory(externalLoot: ExternalLootContext | null = null): void {
+    if (this.modalActive || this.pauseOpen || this.disposed) return;
+    this.inventoryOpen = true;
+    this.activeExternalLoot = externalLoot;
+    this.clearMovementInputs();
+    if (document.pointerLockElement === this.renderer.domElement) {
+      document.exitPointerLock();
+    }
+    this.emitSnapshot(true);
+  }
+
+  public closeInventory(reacquireLock = true): void {
+    if (!this.inventoryOpen) return;
+    this.inventoryOpen = false;
+    this.activeExternalLoot = null;
+    this.emitSnapshot(true);
+    if (reacquireLock && !this.modalActive && !this.pauseOpen && !this.disposed) {
+      this.requestPointerLock();
+    }
+  }
+
+  public applyInventoryMutation(
+    nextInv: OperatorTacticalInventory,
+    nextExternal?: CorpseTacticalLootSnapshot | null,
+    statusNote?: string,
+  ): void {
+    this.tacticalInventory = cloneTacticalInventory(nextInv);
+    this.refreshEncumbranceAndBackpackVisual();
+    this.syncMagAmmoFromInventory();
+    if (
+      nextExternal !== undefined &&
+      this.activeExternalLoot &&
+      this.activeExternalLoot.kind === 'ground_backpack'
+    ) {
+      if (nextExternal && nextExternal.backpack) {
+        this.worldBackpacks.updateContainerContents(
+          this.activeExternalLoot.id,
+          nextExternal.backpack,
+        );
+        this.activeExternalLoot = {
+          ...this.activeExternalLoot,
+          lootKit: nextExternal,
+        };
+      }
+    }
+    if (statusNote) {
+      this.showToast(statusNote);
+    }
+    this.emitSnapshot(true);
+  }
+
+  public triggerInventoryDragReload(
+    weaponSlotKey: 'primary' | 'secondary',
+    sourceLocator: ItemSourceLocator,
+  ): void {
+    const slot = this.tacticalInventory[weaponSlotKey];
+    if (!slot.weaponId) return;
+    const prof = resolveWeaponProfile(slot.weaponId);
+    const swap = swapMagazineIntoWeapon(this.tacticalInventory, weaponSlotKey, sourceLocator);
+    if (!swap.ok) {
+      this.showToast('Incompatible or inaccessible magazine');
+      return;
+    }
+    this.refreshEncumbranceAndBackpackVisual();
+    this.syncMagAmmoFromInventory();
+    this.audio.playWeaponCue('mag_in', { intensity: 0.78 });
+    this.showToast(`Loaded ${prof.name} Magazine`);
+    this.emitSnapshot(true);
+  }
+
+  public useMedicalItemFromInventory(locator: ItemSourceLocator, med: MedicalItem): void {
+    const extracted = extractItemByLocator(this.tacticalInventory, locator);
+    if (!extracted) return;
+    this.refreshEncumbranceAndBackpackVisual();
+    this.audio.playGearRattle('crouch', 0.45);
+    this.showToast(`Applied ${med.name}`);
+    this.emitSnapshot(true);
+  }
+
+  public dropEquippedBackpack(): boolean {
+    if (!this.tacticalInventory.backpack) {
+      this.showToast('No backpack equipped');
+      return false;
+    }
+    const dropped = this.tacticalInventory.backpack;
+    this.tacticalInventory.backpack = null;
+    this.refreshEncumbranceAndBackpackVisual();
+
+    const forward = new THREE.Vector3(
+      -Math.sin(this.controller.aimYaw),
+      0,
+      -Math.cos(this.controller.aimYaw),
+    ).normalize();
+    const dropPos = this.controller.position.clone().addScaledVector(forward, 1.1);
+    const container = this.worldBackpacks.spawnBackpack({
+      backpack: dropped,
+      position: dropPos,
+      yaw: this.controller.aimYaw + Math.PI,
+      isPracticeGear: true,
+    });
+    this.audio.playGearRattle('weapon_swap', 0.72);
+    this.showToast(`Dropped ${dropped.name} (${dropped.grid.items.length} items)`);
+    if (this.inventoryOpen && !this.activeExternalLoot) {
+      this.activeExternalLoot = this.worldBackpacks.buildExternalLootContext(container.id);
+    }
+    this.emitSnapshot(true);
+    return true;
+  }
+
+  public equipGroundBackpack(
+    containerId: string,
+  ): { ok: boolean; error?: string; requiresUnequipFirst?: boolean } {
+    const res = this.worldBackpacks.equipFromWorld(containerId, this.tacticalInventory);
+    if (!res.ok) {
+      if (res.error) this.showToast(res.error);
+      return res;
+    }
+    this.refreshEncumbranceAndBackpackVisual();
+    if (this.activeExternalLoot && this.activeExternalLoot.id === containerId) {
+      this.activeExternalLoot = null;
+    }
+    this.audio.playGearRattle('weapon_swap', 0.78);
+    if (res.equippedPack) {
+      this.showToast(
+        `Equipped ${res.equippedPack.name} (${res.equippedPack.grid.items.length} items inside)`,
+      );
+    }
+    this.emitSnapshot(true);
+    return res;
+  }
+
+  public restockBenchAmmo(): void {
+    this.resupplyAllWeapons(false);
+  }
+
+  public playMagPackTickAudio(): void {
+    this.audio.playWeaponCue('mode_toggle', { intensity: 0.32 });
   }
 
   private refreshPdaOpenWorldOverlay(): void {
@@ -938,8 +1261,13 @@ export class HideoutSessionController {
       this.input.adsMode = this.getArmedAdsMode(profile.id);
     }
 
-    if (weaponId !== 'unarmed' && this.magAmmoByWeapon[profile.id] === undefined) {
-      this.magAmmoByWeapon[profile.id] = profile.magCapacity;
+    if (weaponId !== 'unarmed') {
+      const slotKey = this.ensureWeaponInTacticalInventory(profile.id);
+      if (slotKey) {
+        this.magAmmoByWeapon[profile.id] = getLoadedAmmoCount(this.tacticalInventory[slotKey]);
+      } else if (this.magAmmoByWeapon[profile.id] === undefined) {
+        this.magAmmoByWeapon[profile.id] = profile.magCapacity;
+      }
     }
     const curMag = weaponId === 'unarmed' ? 0 : (this.magAmmoByWeapon[profile.id] ?? profile.magCapacity);
     this.weaponRig.setAmmoState(curMag, weaponId !== 'unarmed');
@@ -1335,11 +1663,37 @@ export class HideoutSessionController {
     hideoutShardAdapter.resupplyAllAmmo();
     this.reloadTimer = 0;
     this.pendingReloadWeaponId = null;
+    this.pendingReloadMagLocator = null;
     if (this.weaponRig.isTubularReloading()) {
       this.weaponRig.interruptTubularReload();
     }
     if (this.equippedWeaponId !== 'unarmed') {
       const prof = resolveWeaponProfile(this.equippedWeaponId);
+      const slotKey = this.ensureWeaponInTacticalInventory(prof.id);
+      if (slotKey) {
+        this.tacticalInventory[slotKey] = {
+          weaponId: prof.id,
+          chamberedRound: null,
+          loadedMag: createLoadedMagazineForWeapon(prof.id),
+        };
+        const baseCal = resolveBaseCaliberId(prof.caliberLabel);
+        const defVar = getDefaultAmmoVariant(baseCal);
+        const loose = createAmmoStackItem(defVar.id, 60);
+        const placedLoose = this.tacticalInventory.chestRig
+          ? autoPlaceItemInGrid(this.tacticalInventory.chestRig.generalGrid, loose)
+          : false;
+        if (!placedLoose && this.tacticalInventory.backpack) {
+          autoPlaceItemInGrid(this.tacticalInventory.backpack.grid, loose);
+        }
+        const spareMag = createLoadedMagazineForWeapon(prof.id);
+        const placedSpare = this.tacticalInventory.chestRig
+          ? autoPlaceItemInGrid(this.tacticalInventory.chestRig.generalGrid, spareMag)
+          : false;
+        if (!placedSpare && this.tacticalInventory.backpack) {
+          autoPlaceItemInGrid(this.tacticalInventory.backpack.grid, spareMag);
+        }
+        this.refreshEncumbranceAndBackpackVisual();
+      }
       this.magAmmoByWeapon[prof.id] = prof.magCapacity;
       this.weaponRig.setAmmoState(prof.magCapacity, true);
     }
@@ -1394,7 +1748,14 @@ export class HideoutSessionController {
       return;
     }
 
-    const remainingAmmo = currentAmmo - 1;
+    const slotKey = this.ensureWeaponInTacticalInventory(prof.id);
+    if (slotKey) {
+      fireRoundFromWeaponSlot(this.tacticalInventory[slotKey]);
+      this.encumbrance = computeOperatorEncumbrance(this.tacticalInventory);
+    }
+    const remainingAmmo = slotKey
+      ? getLoadedAmmoCount(this.tacticalInventory[slotKey])
+      : currentAmmo - 1;
     this.magAmmoByWeapon[prof.id] = remainingAmmo;
     const effectiveRpm = getEffectiveFireRpm(prof, effMode);
     this.fireCooldown = 60 / Math.max(25, effectiveRpm);
@@ -1607,6 +1968,29 @@ export class HideoutSessionController {
 
     this.camera.getWorldPosition(this._camPos);
     this.camera.getWorldDirection(this._lookDir).normalize();
+
+    if (target.source === 'ground_backpack') {
+      const ctx = this.worldBackpacks.buildExternalLootContext(target.containerId);
+      if (ctx) {
+        this.audio.playGearRattle('weapon_swap', 0.45);
+        this.openInventory(ctx);
+      }
+      return;
+    }
+
+    if (target.source === 'live_round') {
+      const collected = this.ejectedLiveRounds.collectRound(target.roundId);
+      if (collected) {
+        hideoutShardAdapter.addReserve(collected.weaponId, 1);
+        const baseCal = resolveBaseCaliberId(collected.caliberId);
+        addLooseRoundToInventory(this.tacticalInventory, getDefaultAmmoVariant(baseCal).id);
+        this.encumbrance = computeOperatorEncumbrance(this.tacticalInventory);
+        this.audio.playGearRattle('crouch', 0.42);
+        this.showToast(`+1 ${collected.caliberLabel} Round Recovered`);
+        this.emitSnapshot(true);
+      }
+      return;
+    }
 
     if (target.source === 'door') {
       const optId = chosen.id as DoorInteractOptionId;
@@ -1962,7 +2346,7 @@ export class HideoutSessionController {
   }
 
   private updateInteractableScan(): void {
-    if (this.swapChoreography.isActive() || this.pauseOpen || this.modalActive) {
+    if (this.swapChoreography.isActive() || this.pauseOpen || this.modalActive || this.inventoryOpen) {
       this.activeTarget = null;
       this.activePrompt = null;
       this.interactReticleState = 'hidden';
@@ -2095,6 +2479,34 @@ export class HideoutSessionController {
       }
     }
 
+    if (!matched) {
+      const bpCand = this.worldBackpacks.findInteractable(this._camPos, this._lookDir, 3.05);
+      if (bpCand) {
+        matched = {
+          source: 'ground_backpack',
+          containerId: bpCand.id,
+          label: bpCand.name,
+          itemCount: bpCand.itemCount,
+          isPracticeGear: bpCand.isPracticeGear,
+          keyId: `ground_backpack:${bpCand.id}`,
+        };
+      }
+    }
+
+    if (!matched) {
+      const liveCand = this.ejectedLiveRounds.findLookedAtPickup(this._camPos, this._lookDir, 2.65);
+      if (liveCand) {
+        matched = {
+          source: 'live_round',
+          roundId: liveCand.id,
+          caliberId: liveCand.caliberId,
+          caliberLabel: liveCand.caliberLabel,
+          weaponId: liveCand.weaponId,
+          keyId: `live_round:${liveCand.id}`,
+        };
+      }
+    }
+
     this.activeTarget = matched;
     if (!matched) {
       this.activePrompt = null;
@@ -2110,6 +2522,39 @@ export class HideoutSessionController {
     }
 
     this.interactReticleState = 'ready';
+
+    if (matched.source === 'ground_backpack') {
+      this.selectedOptionIndex = 0;
+      this.activePrompt = {
+        key: 'F',
+        targetLabel: matched.label,
+        options: [
+          {
+            id: 'open_ground_backpack',
+            label: `Open Backpack (${matched.itemCount} items)`,
+            hint: this.tacticalInventory.backpack ? 'Transfer / Swap' : 'Loot / Equip',
+          },
+        ],
+        selectedIndex: 0,
+      };
+      return;
+    }
+
+    if (matched.source === 'live_round') {
+      this.selectedOptionIndex = 0;
+      this.activePrompt = {
+        key: 'F',
+        targetLabel: `${matched.caliberLabel} Live Round`,
+        options: [
+          {
+            id: 'pickup_live_round',
+            label: `Pick up 1x ${matched.caliberLabel} Round`,
+          },
+        ],
+        selectedIndex: 0,
+      };
+      return;
+    }
 
     if (matched.source === 'electronic') {
       this.selectedOptionIndex = 0;
@@ -2381,6 +2826,66 @@ export class HideoutSessionController {
     this.emitSnapshot(true);
   }
 
+  private triggerChamberCycle(): void {
+    if (
+      this.equippedWeaponId === 'unarmed' ||
+      this.swapChoreography.isActive() ||
+      this.pdaDevice.isBlockingWeaponActions() ||
+      this.grenadeSystem.isDrawn() ||
+      this.weaponRig.isSuppressorActionActive() ||
+      this.weaponRig.isChamberCycling() ||
+      this.reloadTimer > 0 ||
+      this.weaponRig.isTubularReloading() ||
+      this.controller.isVaulting()
+    ) {
+      return;
+    }
+    const prof = this.getWeaponProfile(this.equippedWeaponId);
+    if (prof.holdClass === 'unarmed' || prof.holdClass === 'melee_1h' || prof.magCapacity <= 0) {
+      return;
+    }
+    const weaponId = prof.id;
+    const curMag = this.magAmmoByWeapon[weaponId] ?? prof.magCapacity;
+    const hasLiveRound = curMag > 0;
+    const baseCal = resolveBaseCaliberId(prof.caliberLabel);
+    const caliberLabel = BASE_CALIBERS[baseCal]?.shortLabel ?? baseCal;
+
+    const started = this.animator.triggerChamberCycle({
+      hasLiveRound,
+      onExtractApex: (pos, quat) => {
+        if (this.equippedWeaponId !== weaponId) return;
+        const magNow = this.magAmmoByWeapon[weaponId] ?? 0;
+        if (magNow <= 0) return;
+        const slotKey = getWeaponSlotByWeaponId(this.tacticalInventory, weaponId);
+        if (slotKey) {
+          cycleChamberInWeaponSlot(this.tacticalInventory[slotKey]);
+          this.encumbrance = computeOperatorEncumbrance(this.tacticalInventory);
+        }
+        const nextMag = slotKey ? getLoadedAmmoCount(this.tacticalInventory[slotKey]) : magNow - 1;
+        this.magAmmoByWeapon[weaponId] = nextMag;
+        this.weaponRig.setAmmoState(nextMag, true);
+        this.controller.getVelocity(this._velScratch);
+        this.ejectedLiveRounds.spawnRound({
+          position: pos,
+          quaternion: quat,
+          caliberId: baseCal,
+          caliberLabel,
+          weaponId,
+          holdClass: prof.holdClass,
+          carrierVelocity: this._velScratch,
+        });
+        this.emitSnapshot(true);
+      },
+      onComplete: () => {
+        this.emitSnapshot(true);
+      },
+    });
+    if (started) {
+      this.isFiring = false;
+      this.emitSnapshot(true);
+    }
+  }
+
   private clearMovementInputs(): void {
     this.input.forward = false;
     this.input.backward = false;
@@ -2390,9 +2895,11 @@ export class HideoutSessionController {
     this.input.leanLeft = false;
     this.input.leanRight = false;
     this.input.ads = false;
+    this.input.freeZoom = false;
     this.input.vault = false;
     this.shiftHeld = false;
     this.holdBreathHeld = false;
+    this.freeZoomHeld = false;
     this.keyFHeld = false;
     this.isFiring = false;
     this.semiTriggerConsumed = false;
@@ -2405,11 +2912,13 @@ export class HideoutSessionController {
     this.pointerLocked = locked;
     if (!locked) {
       this.clearMovementInputs();
-      if (!this.modalActive && !this.disposed) {
+      if (!this.modalActive && !this.inventoryOpen && !this.disposed) {
         this.pauseOpen = true;
       }
     } else {
       this.pauseOpen = false;
+      this.inventoryOpen = false;
+      this.activeExternalLoot = null;
     }
     this.emitSnapshot(true);
   };
@@ -2442,6 +2951,13 @@ export class HideoutSessionController {
     const isFireBtn = keybindStore.matchesMouseButton(e.button, 'fire');
     const isAdsBtn = keybindStore.matchesMouseButton(e.button, 'ads');
     const isPointAimBtn = keybindStore.matchesMouseButton(e.button, 'point_aim');
+    const isFreeZoomBtn = keybindStore.matchesMouseButton(e.button, 'free_zoom');
+    const isCycleChamberBtn = keybindStore.matchesMouseButton(e.button, 'cycle_chamber');
+
+    if (isFreeZoomBtn) {
+      this.freeZoomHeld = true;
+      return;
+    }
 
     if (this.pdaDevice.isBlockingWeaponActions()) {
       if (isFireBtn && this.pdaDevice.isOpen()) {
@@ -2478,6 +2994,11 @@ export class HideoutSessionController {
       return;
     }
 
+    if (isCycleChamberBtn) {
+      this.triggerChamberCycle();
+      return;
+    }
+
     if (isAdsBtn && !this.swapChoreography.isActive()) {
       this.animator.interruptInspect();
       this.input.ads = true;
@@ -2508,6 +3029,9 @@ export class HideoutSessionController {
   };
 
   private readonly onMouseUp = (e: MouseEvent): void => {
+    if (keybindStore.matchesMouseButton(e.button, 'free_zoom')) {
+      this.freeZoomHeld = false;
+    }
     if (keybindStore.matchesMouseButton(e.button, 'fire')) {
       if (this.pdaDevice.isDragging()) {
         this.pdaDevice.setDragging(false);
@@ -2557,7 +3081,21 @@ export class HideoutSessionController {
   private readonly onKeyDown = (e: KeyboardEvent): void => {
     if (this.modalActive || keybindStore.isCapturing()) return;
 
+    if (e.code === 'Tab' && !e.repeat && !this.pauseOpen) {
+      e.preventDefault();
+      if (this.inventoryOpen) {
+        this.closeInventory(true);
+      } else if (this.pointerLocked) {
+        this.openInventory(null);
+      }
+      return;
+    }
+
     if (e.code === 'Escape' && !e.repeat) {
+      if (this.inventoryOpen) {
+        this.closeInventory(true);
+        return;
+      }
       if (this.pauseOpen) {
         this.requestPointerLock();
       } else if (!this.pointerLocked) {
@@ -2567,11 +3105,21 @@ export class HideoutSessionController {
       return;
     }
 
-    if (!this.pointerLocked || this.pauseOpen) return;
+    if (!this.pointerLocked || this.pauseOpen || this.inventoryOpen) return;
     this.audio.ensureInitialized();
 
     if (keybindStore.matchesKeyCode(e.code, 'hold_breath')) {
       this.holdBreathHeld = true;
+    }
+    if (keybindStore.matchesKeyCode(e.code, 'free_zoom')) {
+      this.freeZoomHeld = true;
+    }
+    if (keybindStore.matchesKeyCode(e.code, 'point_aim')) {
+      e.preventDefault();
+      if (!e.repeat && !this.pdaDevice.isBlockingWeaponActions() && !this.grenadeSystem.isDrawn()) {
+        this.cycleAimMode();
+      }
+      return;
     }
 
     const code = keybindStore.resolveManagedInputCode(e.code);
@@ -2649,6 +3197,11 @@ export class HideoutSessionController {
           this.weaponRig.weaponAnimator.triggerInspect();
         }
         break;
+      case 'KeyY':
+        if (!e.repeat) {
+          this.triggerChamberCycle();
+        }
+        break;
       case 'KeyR':
         if (this.pdaDevice.isOpen()) {
           if (!e.repeat) this.pdaDevice.recenterOnPlayer();
@@ -2659,15 +3212,20 @@ export class HideoutSessionController {
           this.equippedWeaponId !== 'unarmed' &&
           !this.swapChoreography.isActive() &&
           !this.pdaDevice.isBlockingWeaponActions() &&
+          !this.weaponRig.isChamberCycling() &&
           this.reloadTimer <= 0 &&
           !this.weaponRig.isTubularReloading()
         ) {
           const prof = resolveWeaponProfile(this.equippedWeaponId);
           const curMag = this.magAmmoByWeapon[prof.id] ?? prof.magCapacity;
+          const slotKey = this.ensureWeaponInTacticalInventory(prof.id);
+          const bestMag = slotKey
+            ? findBestReloadMagazine(this.tacticalInventory, prof.id)
+            : null;
           const reserve = hideoutShardAdapter.getReserveForWeapon(prof.id);
-          if (curMag < prof.magCapacity && reserve > 0) {
-            const needed = Math.min(prof.magCapacity - curMag, reserve);
-            if (prof.holdClass === 'shotgun' && prof.fireMode === 'pump') {
+          if (prof.holdClass === 'shotgun' && prof.fireMode === 'pump') {
+            if (curMag < prof.magCapacity && reserve > 0) {
+              const needed = Math.min(prof.magCapacity - curMag, reserve);
               const started = this.weaponRig.triggerTubularReload(
                 needed,
                 curMag === 0,
@@ -2689,14 +3247,21 @@ export class HideoutSessionController {
                 },
               );
               if (started) this.emitSnapshot(true);
-            } else {
-              this.reloadTimer = prof.reloadDurationSec;
-              this.pendingReloadWeaponId = prof.id;
-              this.animator.triggerReload(prof.reloadDurationSec);
-              this.emitSnapshot(true);
+            } else if (reserve <= 0 && curMag < prof.magCapacity) {
+              this.showToast('No Reserve Shells — Resupply at Ammo Box');
             }
-          } else if (reserve <= 0 && curMag < prof.magCapacity) {
-            this.showToast('No Reserve Ammo — Resupply at Ammo Box');
+          } else if (bestMag && curMag < prof.magCapacity) {
+            const dur = prof.reloadDurationSec * (bestMag.reloadTimeMult ?? 1);
+            this.reloadTimer = dur;
+            this.pendingReloadWeaponId = prof.id;
+            this.pendingReloadMagLocator = bestMag.locator;
+            this.animator.triggerReload(dur);
+            if (bestMag.fromBackpack) {
+              this.showToast('Drawing spare magazine from Backpack (slower)...');
+            }
+            this.emitSnapshot(true);
+          } else if (curMag < prof.magCapacity) {
+            this.showToast('No Loaded Magazine — Press [TAB] to Pack Mags or Resupply');
           }
         }
         break;
@@ -2812,6 +3377,9 @@ export class HideoutSessionController {
   private readonly onKeyUp = (e: KeyboardEvent): void => {
     if (keybindStore.matchesKeyCode(e.code, 'hold_breath')) {
       this.holdBreathHeld = false;
+    }
+    if (keybindStore.matchesKeyCode(e.code, 'free_zoom')) {
+      this.freeZoomHeld = false;
     }
     const code = keybindStore.resolveManagedInputCode(e.code);
     if (!code) return;
@@ -2977,7 +3545,13 @@ export class HideoutSessionController {
       const firearmAdsBlocking =
         this.input.ads && this.equippedWeaponId !== 'unarmed' && !grenadeDrawn;
       this.input.sprint =
-        !suppBusy && !pdaBusy && this.shiftHeld && this.input.forward && !firearmAdsBlocking && !swapping;
+        !suppBusy &&
+        !pdaBusy &&
+        this.encumbrance.canSprint &&
+        this.shiftHeld &&
+        this.input.forward &&
+        !firearmAdsBlocking &&
+        !swapping;
       this.input.holdBreath =
         !suppBusy &&
         !pdaBusy &&
@@ -2985,8 +3559,15 @@ export class HideoutSessionController {
         this.input.ads &&
         this.equippedWeaponId !== 'unarmed' &&
         !swapping;
+      this.input.freeZoom =
+        this.freeZoomHeld &&
+        this.pointerLocked &&
+        !this.pauseOpen &&
+        !this.modalActive &&
+        !this.inventoryOpen &&
+        !pdaBusy;
 
-      // Step fire cooldown & box-magazine reload timer
+      // Step fire cooldown & physical box-magazine reload timer
       if (this.fireCooldown > 0) {
         this.fireCooldown = Math.max(0, this.fireCooldown - dt);
       }
@@ -2994,17 +3575,29 @@ export class HideoutSessionController {
         this.reloadTimer = Math.max(0, this.reloadTimer - dt);
         if (this.reloadTimer <= 0 && this.pendingReloadWeaponId) {
           const reloadId = this.pendingReloadWeaponId;
+          const magLoc = this.pendingReloadMagLocator;
           this.pendingReloadWeaponId = null;
+          this.pendingReloadMagLocator = null;
           if (reloadId === this.equippedWeaponId) {
-            const rProf = resolveWeaponProfile(reloadId);
-            const curMag = this.magAmmoByWeapon[rProf.id] ?? 0;
-            const needed = Math.max(0, rProf.magCapacity - curMag);
-            const taken = hideoutShardAdapter.consumeReserve(rProf.id, needed);
-            if (taken > 0) {
-              const nextAmmo = curMag + taken;
-              this.magAmmoByWeapon[rProf.id] = nextAmmo;
-              this.weaponRig.setAmmoState(nextAmmo, true);
-              this.emitSnapshot(true);
+            const slotKey = getWeaponSlotByWeaponId(this.tacticalInventory, reloadId);
+            if (slotKey && magLoc && peekItemByLocator(this.tacticalInventory, magLoc)) {
+              const swap = swapMagazineIntoWeapon(this.tacticalInventory, slotKey, magLoc);
+              if (swap.ok) {
+                this.refreshEncumbranceAndBackpackVisual();
+                this.syncMagAmmoFromInventory();
+                this.emitSnapshot(true);
+              }
+            } else {
+              const rProf = resolveWeaponProfile(reloadId);
+              const curMag = this.magAmmoByWeapon[rProf.id] ?? 0;
+              const needed = Math.max(0, rProf.magCapacity - curMag);
+              const taken = hideoutShardAdapter.consumeReserve(rProf.id, needed);
+              if (taken > 0) {
+                const nextAmmo = curMag + taken;
+                this.magAmmoByWeapon[rProf.id] = nextAmmo;
+                this.weaponRig.setAmmoState(nextAmmo, true);
+                this.emitSnapshot(true);
+              }
             }
           }
         }
@@ -3017,11 +3610,11 @@ export class HideoutSessionController {
         this.isFiring = false;
       }
 
-      // Stamina & resting/exertion heart-rate biomechanics coupled to weapon stability
+      // Stamina & resting/exertion heart-rate biomechanics coupled to weapon stability & encumbrance
       const isMoving =
         this.input.forward || this.input.backward || this.input.left || this.input.right;
       if (this.controller.isSprinting && isMoving) {
-        this.stamina = Math.max(0, this.stamina - dt * 0.145);
+        this.stamina = Math.max(0, this.stamina - dt * 0.145 * this.encumbrance.staminaDrainMult);
       } else if (this.controller.isHoldBreathActive()) {
         this.stamina = Math.max(0, this.stamina - dt * 0.14);
       } else {
@@ -3037,7 +3630,7 @@ export class HideoutSessionController {
       this.heartRateBpm += (targetHr - this.heartRateBpm) * Math.min(1, hrLerp);
       this.controller.setHeartRateBpm(this.heartRateBpm);
 
-      // Update player first-person movement, breathing sway & weapon rig
+      // Update player first-person movement, breathing sway & weapon rig (with live encumbrance)
       this.controller.update(
         dt,
         this.elapsedSec,
@@ -3048,7 +3641,15 @@ export class HideoutSessionController {
         this.stamina,
         100,
         (drainAmt) => {
-          this.stamina = Math.max(0, this.stamina - drainAmt);
+          this.stamina = Math.max(0, this.stamina - drainAmt * this.encumbrance.staminaDrainMult);
+        },
+        {
+          encumbranceRatio: this.encumbrance.ratio01,
+          swayAmpMult: 1 + this.encumbrance.ratio01 * 0.25,
+          moveSpeedMult: this.encumbrance.moveSpeedMult,
+          staminaDrainMult: this.encumbrance.staminaDrainMult,
+          exertionRateMult: this.encumbrance.exertionRateMult,
+          canSprint: this.encumbrance.canSprint,
         },
       );
 
@@ -3196,6 +3797,7 @@ export class HideoutSessionController {
           },
         },
       );
+      this.ejectedLiveRounds.update(dt, this.adapter, undefined, this.audio);
 
       const wasLiveGrenade = this.grenadeSystem.isLeverReleased();
       this.grenadeSystem.update(dt, this._camPos);
@@ -3271,7 +3873,13 @@ export class HideoutSessionController {
       fireModeLabel: this.getFireModeLabel(prof),
       ammoInMag,
       magCapacity: this.equippedWeaponId === 'unarmed' ? 0 : prof.magCapacity,
-      ammoReserve: hideoutShardAdapter.getReserveForWeapon(this.equippedWeaponId),
+      ammoReserve:
+        this.equippedWeaponId === 'unarmed'
+          ? 0
+          : (() => {
+              const res = countCompatibleReserveRounds(this.tacticalInventory, prof.id);
+              return res.rigAndBeltRounds + res.backpackRounds;
+            })(),
       grenadeDrawn: this.grenadeSystem.isDrawn(),
       grenadeHoldStage: this.grenadeSystem.getHoldStage(),
       grenadeName: grenadeDef.shortName,
@@ -3295,6 +3903,10 @@ export class HideoutSessionController {
         this.controller.position.x,
         this.controller.position.z,
       ),
+      inventoryOpen: this.inventoryOpen,
+      tacticalInventory: this.tacticalInventory,
+      externalLoot: this.activeExternalLoot,
+      encumbrance: this.encumbrance,
     };
   }
 
@@ -3337,6 +3949,8 @@ export class HideoutSessionController {
     this.physicsProps.dispose();
     this.grenadeSystem.dispose();
     this.ballistics.dispose();
+    this.ejectedLiveRounds.dispose();
+    this.worldBackpacks.dispose();
     this.scene.remove(this.ballistics.group);
     this.swapChoreography.dispose();
     this.scopeRenderer.dispose();

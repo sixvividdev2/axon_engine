@@ -28,11 +28,17 @@ describe('Keybind Store & Per-User Persistence', () => {
     keybindStore.resetAllDefaults();
   });
 
-  it('defaults Switch Fire Mode to KeyK without colliding with Canted Optic (B) or Ping (Z)', () => {
+  it('defaults Switch Fire Mode to KeyK, Cycle Chamber to KeyY, Free Zoom to Mouse1, and Point Aim to AltLeft', () => {
     expect(DEFAULT_KEYBINDS.switch_fire_mode).toBe('KeyK');
     expect(DEFAULT_KEYBINDS.canted_optic).toBe('KeyB');
     expect(DEFAULT_KEYBINDS.ping).toBe('KeyZ');
+    expect(DEFAULT_KEYBINDS.cycle_chamber).toBe('KeyY');
+    expect(DEFAULT_KEYBINDS.free_zoom).toBe('Mouse1');
+    expect(DEFAULT_KEYBINDS.point_aim).toBe('AltLeft');
     expect(keybindStore.getLabel('switch_fire_mode')).toBe('K');
+    expect(keybindStore.getLabel('cycle_chamber')).toBe('Y');
+    expect(keybindStore.getLabel('free_zoom')).toBe('MMB');
+    expect(keybindStore.getLabel('point_aim')).toBe('Alt');
   });
 
   it('auto-clears conflicting actions in the same conflict group and reports cleared action IDs', () => {
@@ -96,12 +102,12 @@ describe('Keybind Store & Per-User Persistence', () => {
       expect(keybindStore.getCode('crouch')).toBe('KeyC'); // User A's default, not guest's ControlLeft
 
       // User A rebinds reload -> triggers debounced account persistence
-      keybindStore.rebindAction('reload', 'KeyY');
+      keybindStore.rebindAction('reload', 'KeyO');
       await vi.advanceTimersByTimeAsync(250);
       expect(persistMock).toHaveBeenCalledTimes(1);
       expect(savedPayloads[0]).toEqual({
         switch_fire_mode: 'KeyU',
-        reload: 'KeyY',
+        reload: 'KeyO',
       });
 
       // Sign out -> User A bindings do not leak into guest profile

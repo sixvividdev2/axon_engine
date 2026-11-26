@@ -12,10 +12,12 @@ import type { PmcFactionId, SecureContainerTier } from '../types';
 import {
   AmmoStackItem,
   BackpackItem,
+  BackpackTemplateId,
   BatteryItem,
   BeltAllowedKind,
   ChestRigItem,
   CorpseTacticalLootSnapshot,
+  EncumbranceTier,
   EquippedWeaponSlotState,
   GenericLootItem,
   GrenadeItem,
@@ -24,6 +26,7 @@ import {
   MagazineClass,
   MagazineItem,
   MedicalItem,
+  OperatorEncumbranceState,
   OperatorTacticalInventory,
   PlacedGridItem,
   QuickReloadCandidate,
@@ -101,7 +104,7 @@ export const CHEST_RIG_TEMPLATES: readonly ChestRigTemplate[] = [
 ] as const;
 
 export interface BackpackTemplate {
-  readonly templateId: string;
+  readonly templateId: BackpackTemplateId;
   readonly name: string;
   readonly shortLabel: string;
   readonly gridWidth: number;
@@ -111,7 +114,19 @@ export interface BackpackTemplate {
   readonly valueUsd: number;
   readonly weightKg: number;
   readonly requiredFobTier: 1 | 2 | 3;
+  readonly unlockRank: 10 | 20 | 30;
+  readonly comfortableWeightKg: number;
+  readonly heavyWeightKg: number;
+  readonly maxWeightKg: number;
+  readonly skinLabel: string;
+  readonly accentHex: string;
 }
+
+export const BASE_ENCUMBRANCE_LIMITS = {
+  comfortableWeightKg: 12.0,
+  heavyWeightKg: 18.0,
+  maxWeightKg: 24.0,
+} as const;
 
 export const BACKPACK_TEMPLATES: readonly BackpackTemplate[] = [
   {
@@ -125,6 +140,12 @@ export const BACKPACK_TEMPLATES: readonly BackpackTemplate[] = [
     valueUsd: 850,
     weightKg: 1.2,
     requiredFobTier: 1,
+    unlockRank: 10,
+    comfortableWeightKg: 15.0,
+    heavyWeightKg: 23.0,
+    maxWeightKg: 30.0,
+    skinLabel: 'Ranger OD Cordura',
+    accentHex: '#6b8e57',
   },
   {
     templateId: 'pack_rucksack_35l',
@@ -137,6 +158,12 @@ export const BACKPACK_TEMPLATES: readonly BackpackTemplate[] = [
     valueUsd: 1950,
     weightKg: 1.9,
     requiredFobTier: 2,
+    unlockRank: 20,
+    comfortableWeightKg: 20.0,
+    heavyWeightKg: 31.0,
+    maxWeightKg: 40.0,
+    skinLabel: 'Coyote Earth Field',
+    accentHex: '#c29b61',
   },
   {
     templateId: 'pack_logistics_55l',
@@ -149,8 +176,27 @@ export const BACKPACK_TEMPLATES: readonly BackpackTemplate[] = [
     valueUsd: 3600,
     weightKg: 2.6,
     requiredFobTier: 3,
+    unlockRank: 30,
+    comfortableWeightKg: 26.0,
+    heavyWeightKg: 40.0,
+    maxWeightKg: 52.0,
+    skinLabel: 'Alpine Slate Frame',
+    accentHex: '#64748b',
   },
 ] as const;
+
+export function isBackpackTemplateId(val: unknown): val is BackpackTemplateId {
+  return (
+    val === 'pack_assault_20l' ||
+    val === 'pack_rucksack_35l' ||
+    val === 'pack_logistics_55l'
+  );
+}
+
+export function getBackpackTemplate(templateId: string | null | undefined): BackpackTemplate | null {
+  if (!templateId) return null;
+  return BACKPACK_TEMPLATES.find((b) => b.templateId === templateId) ?? null;
+}
 
 export interface MagazineTemplate {
   readonly templateId: string;
@@ -1443,4 +1489,390 @@ export function resizeSecureContainer(
  */
 export function getVariantsForBaseCaliber(baseCaliber: BaseCaliberId): AmmoVariantDef[] {
   return Object.values(AMMO_VARIANTS).filter((v) => v.caliberId === baseCaliber);
+}
+
+// ============================================================================
+// WEIGHT & ENCUMBRANCE SOLVER (BACKPACK-SCALED CAPACITY CURVE)
+// ============================================================================
+
+export function getSingleCartridgeWeightKg(variantId: AmmoVariantId): number {
+  const def = AMMO_VARIANTS[variantId];
+  if (!def) return 0.012;
+  // Bullet mass + brass/steel casing + propellant (~1.9x bullet mass)
+  return Math.max(0.004, (def.bulletMassGrams * 1.9) / 1000);
+}
+
+export function computeTacticalItemWeightKg(item: TacticalItem): number {
+  if (item.kind === 'magazine') {
+    let total = item.weightKg;
+    for (let i = 0; i < item.rounds.length; i++) {
+      total += getSingleCartridgeWeightKg(item.rounds[i]);
+    }
+    return Number(total.toFixed(3));
+  }
+  if (item.kind === 'ammo_stack') {
+    return Number((getSingleCartridgeWeightKg(item.variantId) * Math.max(0, item.count)).toFixed(3));
+  }
+  if (item.kind === 'grenade') {
+    return Number((item.weightKg * Math.max(1, item.count)).toFixed(3));
+  }
+  if (item.kind === 'chest_rig') {
+    let total = item.weightKg;
+    for (const m of item.rifleMagSlots) {
+      if (m) total += computeTacticalItemWeightKg(m);
+    }
+    for (const m of item.pistolMagSlots) {
+      if (m) total += computeTacticalItemWeightKg(m);
+    }
+    total += computeGridWeightKg(item.generalGrid);
+    return Number(total.toFixed(3));
+  }
+  if (item.kind === 'backpack') {
+    return Number((item.weightKg + computeGridWeightKg(item.grid)).toFixed(3));
+  }
+  return Number(Math.max(0, item.weightKg).toFixed(3));
+}
+
+export function computeGridWeightKg(grid: GridContainer): number {
+  let total = 0;
+  for (let i = 0; i < grid.items.length; i++) {
+    total += computeTacticalItemWeightKg(grid.items[i].item);
+  }
+  return Number(total.toFixed(3));
+}
+
+function estimateEquippedWeaponWeightKg(weaponId: string | null): number {
+  if (!weaponId || weaponId === 'unarmed') return 0;
+  const prof = resolveWeaponProfile(weaponId);
+  if (typeof prof.massKg === 'number' && prof.massKg > 0) {
+    return prof.massKg;
+  }
+  switch (prof.category) {
+    case 'pistols':
+    case 'revolvers':
+      return 0.85;
+    case 'shotguns':
+      return 3.45;
+    case 'dmrs':
+      return 4.35;
+    default:
+      return 3.1;
+  }
+}
+
+function computeWeaponSlotWeightKg(slot: EquippedWeaponSlotState): number {
+  if (!slot.weaponId || slot.weaponId === 'unarmed') return 0;
+  let total = estimateEquippedWeaponWeightKg(slot.weaponId);
+  if (slot.loadedMag) total += computeTacticalItemWeightKg(slot.loadedMag);
+  if (slot.chamberedRound) total += getSingleCartridgeWeightKg(slot.chamberedRound);
+  return total;
+}
+
+/**
+ * Computes real-time carried weight & gradual encumbrance modifiers.
+ * Higher-tier worn backpacks raise comfortable, heavy, and overload weight thresholds
+ * while still contributing their own empty pack weight.
+ */
+export function computeOperatorEncumbrance(
+  inv: OperatorTacticalInventory,
+): OperatorEncumbranceState {
+  let rawKg = 0;
+  rawKg += computeWeaponSlotWeightKg(inv.primary);
+  rawKg += computeWeaponSlotWeightKg(inv.secondary);
+  if (inv.armorPlateId) {
+    rawKg += 3.2;
+  }
+  for (const b of inv.beltSlots) {
+    if (b) rawKg += computeTacticalItemWeightKg(b);
+  }
+  if (inv.chestRig) {
+    rawKg += computeTacticalItemWeightKg(inv.chestRig);
+  }
+  if (inv.backpack) {
+    rawKg += computeTacticalItemWeightKg(inv.backpack);
+  }
+  // Secure container items carry negligible harness weight except actual ammo/meds
+  rawKg += computeGridWeightKg(inv.secureContainer) * 0.35;
+
+  const packTpl = inv.backpack ? getBackpackTemplate(inv.backpack.templateId) : null;
+  const comfortableKg = packTpl
+    ? packTpl.comfortableWeightKg
+    : BASE_ENCUMBRANCE_LIMITS.comfortableWeightKg;
+  const heavyKg = packTpl ? packTpl.heavyWeightKg : BASE_ENCUMBRANCE_LIMITS.heavyWeightKg;
+  const maxKg = packTpl ? packTpl.maxWeightKg : BASE_ENCUMBRANCE_LIMITS.maxWeightKg;
+
+  const totalWeightKg = Number(Math.max(0, rawKg).toFixed(2));
+  const span = Math.max(1, maxKg - comfortableKg);
+  const ratio01 = Math.max(0, (totalWeightKg - comfortableKg) / span);
+
+  let tier: EncumbranceTier = 'light';
+  if (totalWeightKg > maxKg) tier = 'overloaded';
+  else if (totalWeightKg >= heavyKg) tier = 'heavy';
+  else if (totalWeightKg > comfortableKg) tier = 'moderate';
+
+  let moveSpeedMult = 1.0;
+  let staminaDrainMult = 1.0;
+  let exertionRateMult = 1.0;
+  let canSprint = true;
+
+  if (tier === 'moderate') {
+    const t = Math.min(1, (totalWeightKg - comfortableKg) / Math.max(0.5, heavyKg - comfortableKg));
+    moveSpeedMult = 1.0 - t * 0.11; // 1.00 -> 0.89
+    staminaDrainMult = 1.0 + t * 0.45; // 1.00 -> 1.45
+    exertionRateMult = 1.0 + t * 0.35; // 1.00 -> 1.35
+  } else if (tier === 'heavy') {
+    const t = Math.min(1, (totalWeightKg - heavyKg) / Math.max(0.5, maxKg - heavyKg));
+    moveSpeedMult = 0.89 - t * 0.11; // 0.89 -> 0.78
+    staminaDrainMult = 1.45 + t * 0.6; // 1.45 -> 2.05
+    exertionRateMult = 1.35 + t * 0.45; // 1.35 -> 1.80
+  } else if (tier === 'overloaded') {
+    const overKg = totalWeightKg - maxKg;
+    const overT = Math.min(1, overKg / 14.0);
+    moveSpeedMult = Math.max(0.56, 0.76 - overT * 0.2); // 0.76 -> 0.56
+    staminaDrainMult = 2.15 + overT * 0.85;
+    exertionRateMult = 1.9 + overT * 0.7;
+    canSprint = false;
+  }
+
+  return {
+    totalWeightKg,
+    comfortableKg,
+    heavyKg,
+    maxKg,
+    ratio01: Number(Math.min(1.5, ratio01).toFixed(3)),
+    tier,
+    moveSpeedMult: Number(moveSpeedMult.toFixed(3)),
+    staminaDrainMult: Number(staminaDrainMult.toFixed(3)),
+    exertionRateMult: Number(exertionRateMult.toFixed(3)),
+    canSprint,
+  };
+}
+
+/**
+ * Finds the best loaded compatible magazine for `[R]` reload.
+ * Prioritizes Chest Rig & Belt (`reloadTimeMult = 1.0`), optionally falling back
+ * to Backpack (`reloadTimeMult = 1.45`) when `allowBackpackFallback` is enabled.
+ */
+export function findBestReloadMagazine(
+  inv: OperatorTacticalInventory,
+  weaponId: string,
+  allowBackpackFallback = true,
+): QuickReloadCandidate | null {
+  const fast = findQuickReloadMagazine(inv, weaponId);
+  if (fast) {
+    return { ...fast, fromBackpack: false, reloadTimeMult: 1.0 };
+  }
+  if (!allowBackpackFallback || !inv.backpack || !weaponId || weaponId === 'unarmed') {
+    return null;
+  }
+  let bestPack: QuickReloadCandidate | null = null;
+  for (const p of inv.backpack.grid.items) {
+    if (p.item.kind !== 'magazine') continue;
+    if (p.item.rounds.length <= 0) continue;
+    if (!isMagazineCompatibleWithWeapon(p.item, weaponId)) continue;
+    if (!bestPack || p.item.rounds.length > bestPack.magazine.rounds.length) {
+      bestPack = {
+        locator: { zone: 'backpack_grid', instanceId: p.item.instanceId },
+        magazine: p.item,
+        fromBackpack: true,
+        reloadTimeMult: 1.45,
+      };
+    }
+  }
+  return bestPack;
+}
+
+/**
+ * Manually cycles the chamber of an equipped firearm:
+ * ejects the currently chambered live round (if any) and strips the next top round
+ * from the seated magazine into the chamber.
+ */
+export function cycleChamberInWeaponSlot(
+  slot: EquippedWeaponSlotState,
+): { ejectedRound: AmmoVariantId | null; newChamberedRound: AmmoVariantId | null } {
+  const ejectedRound = slot.chamberedRound;
+  const nextRound =
+    slot.loadedMag && slot.loadedMag.rounds.length > 0
+      ? (slot.loadedMag.rounds.pop() ?? null)
+      : null;
+  slot.chamberedRound = nextRound;
+  return { ejectedRound, newChamberedRound: nextRound };
+}
+
+/**
+ * Adds a picked-up loose round (e.g. an ejected live cartridge) into an existing compatible
+ * ammo stack or creates a new 1-round stack in Chest Rig or Backpack.
+ */
+export function addLooseRoundToInventory(
+  inv: OperatorTacticalInventory,
+  variantId: AmmoVariantId,
+  count = 1,
+): boolean {
+  const stack = createAmmoStackItem(variantId, Math.max(1, Math.floor(count)));
+  if (inv.chestRig && autoPlaceItemInGrid(inv.chestRig.generalGrid, stack, true)) {
+    return true;
+  }
+  if (inv.backpack && autoPlaceItemInGrid(inv.backpack.grid, stack, true)) {
+    return true;
+  }
+  return autoPlaceItemInGrid(inv.secureContainer, stack, true);
+}
+
+/**
+ * Builds a complete, combat-ready OperatorTacticalInventory for Battle, Infection,
+ * Hideout, Playground, or Tutorial modes from the player's equipped loadout.
+ */
+export function buildModeLoadoutTacticalInventory(options: {
+  primaryWeaponId: string;
+  secondaryWeaponId: string;
+  primaryAmmoVariantId?: AmmoVariantId;
+  secondaryAmmoVariantId?: AmmoVariantId;
+  tacticalEquipmentId?: string;
+  backpackId?: BackpackTemplateId | null;
+  mode: 'battle' | 'infection' | 'hideout' | 'playground' | 'tutorial';
+}): OperatorTacticalInventory {
+  const primaryWep = options.primaryWeaponId || 'm4a1';
+  const secondaryWep = options.secondaryWeaponId || 'makarov_pm';
+  const primaryCal = getWeaponBaseCaliber(primaryWep);
+  const secondaryCal = getWeaponBaseCaliber(secondaryWep);
+
+  const resolveVariant = (cal: BaseCaliberId, requested?: AmmoVariantId): AmmoVariantId => {
+    if (requested && AMMO_VARIANTS[requested]?.caliberId === cal) return requested;
+    return getDefaultAmmoVariant(cal).id;
+  };
+
+  const pVar = resolveVariant(primaryCal, options.primaryAmmoVariantId);
+  const sVar = resolveVariant(secondaryCal, options.secondaryAmmoVariantId);
+
+  const primaryTpl = resolveMagazineTemplateForWeapon(primaryWep);
+  const secondaryTpl = resolveMagazineTemplateForWeapon(secondaryWep);
+
+  const makeFilledMag = (wep: string, variantId: AmmoVariantId, count?: number): MagazineItem => {
+    const tpl = resolveMagazineTemplateForWeapon(wep);
+    const n = Math.min(tpl.capacity, count ?? tpl.capacity);
+    return createLoadedMagazineForWeapon(wep, [{ variantId, count: n }]);
+  };
+
+  const chestRig = createChestRigItem(
+    options.mode === 'playground' || options.mode === 'hideout'
+      ? 'rig_smersh_assault'
+      : 'rig_mk4_micro',
+  );
+  const backpack =
+    options.backpackId && isBackpackTemplateId(options.backpackId)
+      ? createBackpackItem(options.backpackId)
+      : null;
+
+  const primaryLoadedMag = makeFilledMag(primaryWep, pVar);
+  const primaryChamber = primaryLoadedMag.rounds.pop() ?? null;
+
+  const secLoadedMag = makeFilledMag(secondaryWep, sVar);
+  const secChamber = secLoadedMag.rounds.pop() ?? null;
+
+  // Seat 2 spare primary mags + leave 1 open rig pouch for tactical mag retention
+  const sparePrimaryMags = options.mode === 'infection' ? 2 : 2;
+  for (let i = 0; i < Math.min(sparePrimaryMags, chestRig.rifleMagSlots.length); i++) {
+    chestRig.rifleMagSlots[i] = makeFilledMag(primaryWep, pVar);
+  }
+  // Seat 1-2 spare sidearm mags
+  if (chestRig.pistolMagSlots.length > 0) {
+    chestRig.pistolMagSlots[0] = makeFilledMag(secondaryWep, sVar);
+  }
+  if (chestRig.pistolMagSlots.length > 1 && options.mode !== 'infection') {
+    chestRig.pistolMagSlots[1] = makeFilledMag(secondaryWep, sVar);
+  }
+
+  // Loose reserve ammo stacks in Chest Rig so players can manually pack magazines in every mode
+  const loosePrimaryCount =
+    options.mode === 'playground' || options.mode === 'hideout'
+      ? Math.min(60, primaryTpl.capacity * 2)
+      : Math.min(60, primaryTpl.capacity);
+  autoPlaceItemInGrid(chestRig.generalGrid, createAmmoStackItem(pVar, loosePrimaryCount));
+  autoPlaceItemInGrid(
+    chestRig.generalGrid,
+    createAmmoStackItem(sVar, Math.min(45, secondaryTpl.capacity * 2)),
+  );
+  autoPlaceItemInGrid(chestRig.generalGrid, createMedicalItem('bandage'));
+
+  // Tactical Belt: 2 grenades (from loadout) + 1 IFAK/Bandage + 1 empty spare quick-slot
+  const eqId = options.tacticalEquipmentId || 'm67_frag';
+  const beltSlots: Array<TacticalItem | null> = [
+    createGrenadeItem(eqId),
+    createGrenadeItem(eqId),
+    createMedicalItem('ifak'),
+    null,
+  ];
+
+  // If the operator deployed with a backpack, populate extra loose ammo & an empty spare mag ready to pack
+  if (backpack) {
+    autoPlaceItemInGrid(
+      backpack.grid,
+      createAmmoStackItem(pVar, Math.min(60, primaryTpl.capacity * 2)),
+    );
+    autoPlaceItemInGrid(backpack.grid, createMagazineItem(primaryTpl.templateId, []));
+    autoPlaceItemInGrid(backpack.grid, createMedicalItem('splint_stim'));
+  }
+
+  const secureContainer = createGridContainer('secure_container', 'Secure Container', 2, 2);
+
+  return {
+    primary: {
+      weaponId: primaryWep,
+      chamberedRound: primaryChamber,
+      loadedMag: primaryLoadedMag,
+    },
+    secondary: {
+      weaponId: secondaryWep,
+      chamberedRound: secChamber,
+      loadedMag: secLoadedMag,
+    },
+    armorPlateId: options.mode === 'battle' ? 'plate_nij3a' : null,
+    beltSlots,
+    chestRig,
+    backpack,
+    secureContainer,
+  };
+}
+
+/**
+ * Generates a lootable world backpack with mode-appropriate tactical supplies inside
+ * (magazines, loose ammo, medical kits) for Battle, Infection, Open World, and Practice racks.
+ */
+export function createPopulatedWorldBackpack(
+  templateId: BackpackTemplateId,
+  primaryWeaponId = 'm4a1',
+  primaryVariantId?: AmmoVariantId,
+): BackpackItem {
+  const pack = createBackpackItem(templateId);
+  const cal = getWeaponBaseCaliber(primaryWeaponId);
+  const defVar =
+    primaryVariantId && AMMO_VARIANTS[primaryVariantId]?.caliberId === cal
+      ? primaryVariantId
+      : getDefaultAmmoVariant(cal).id;
+  const allCalVars = getVariantsForBaseCaliber(cal);
+  const apVar =
+    allCalVars.find(
+      (v) =>
+        v.coreType === 'tungsten_ap' ||
+        v.coreType === 'steel_core_ap' ||
+        v.penetrationRating >= 35,
+    )?.id ?? defVar;
+
+  autoPlaceItemInGrid(pack.grid, createAmmoStackItem(defVar, 45));
+  autoPlaceItemInGrid(pack.grid, createLoadedMagazineForWeapon(primaryWeaponId));
+  autoPlaceItemInGrid(pack.grid, createMedicalItem('ifak'));
+
+  if (templateId === 'pack_rucksack_35l' || templateId === 'pack_logistics_55l') {
+    autoPlaceItemInGrid(pack.grid, createAmmoStackItem(apVar, 30));
+    autoPlaceItemInGrid(pack.grid, createGrenadeItem('m67_frag'));
+    autoPlaceItemInGrid(pack.grid, createMedicalItem('bandage'));
+  }
+  if (templateId === 'pack_logistics_55l') {
+    autoPlaceItemInGrid(pack.grid, createLoadedMagazineForWeapon(primaryWeaponId));
+    autoPlaceItemInGrid(pack.grid, createAmmoStackItem(defVar, 60));
+    autoPlaceItemInGrid(pack.grid, createMedicalItem('splint_stim'));
+    autoPlaceItemInGrid(pack.grid, createGrenadeItem('m84_flash'));
+  }
+
+  return pack;
 }

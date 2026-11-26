@@ -253,6 +253,8 @@ export interface BodycamInputState {
   /** Legacy field retained for compatibility; ignored when adsMode is set */
   cant: boolean;
   holdBreath: boolean;
+  /** Hold to engage subtle tactical Free Zoom (Focus) FOV narrowing anytime, stacking onto ADS and sprint */
+  freeZoom?: boolean;
   /** Press/hold Space while moving forward toward a ledge to vault or mantle */
   vault?: boolean;
   /** Optional explicit spin-vault trigger (otherwise double-tap Space triggers/upgrades to SPIN_VAULT) */
@@ -657,6 +659,7 @@ export interface BodycamTelemetry {
   isAds: boolean;
   isCanted: boolean;
   isPointAim: boolean;
+  focusBlend: number;
   aimStance: AimStance;
   armedAdsMode: AdsMode;
   laserOn: boolean;
@@ -702,6 +705,7 @@ export function createBodycamTelemetry(): BodycamTelemetry {
     isAds: false,
     isCanted: false,
     isPointAim: false,
+    focusBlend: 0,
     aimStance: 'HIP',
     armedAdsMode: 'PRIMARY',
     laserOn: false,

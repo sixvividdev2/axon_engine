@@ -24,6 +24,8 @@ export interface FacialExpressionInput {
   injury01: number;
   /** 0..1 sharp flinch impulse (damage hit / near detonation) */
   flinchImpulse01: number;
+  /** 0..1 tactical Free Zoom / focus squint intensity */
+  focus01?: number;
   /** World-space point eyes should track (converted into head local space, -Z forward) */
   gazeTargetWorld?: Readonly<THREE.Vector3> | null;
   /** Optional explicit local gaze yaw override (radians) when gazeTargetWorld is omitted */
@@ -108,6 +110,7 @@ export class FacialExpressionController {
     const stress = THREE.MathUtils.clamp(input.stress01, 0, 1);
     const injury = THREE.MathUtils.clamp(input.injury01, 0, 1);
     const flinch = THREE.MathUtils.clamp(input.flinchImpulse01, 0, 1);
+    const focus = THREE.MathUtils.clamp(input.focus01 ?? 0, 0, 1);
 
     // 1. Solve smooth gaze yaw/pitch (character faces local -Z)
     let targetYaw = input.localGazeYaw ?? 0;
@@ -129,13 +132,18 @@ export class FacialExpressionController {
       }
     }
 
-    // Subtle biological micro-saccades (minimized while aiming or dead)
+    // Subtle biological micro-saccades (minimized while aiming, focusing, or dead)
     this.saccadeTimerSec -= evalDt;
     if (this.saccadeTimerSec <= 0) {
       this.saccadeTimerSec =
-        input.intent === 'aiming' ? 2.4 : input.mode === 'zombie' ? 0.35 + Math.random() * 0.7 : 0.9 + Math.random() * 1.8;
-      const ampYaw = input.intent === 'aiming' || input.intent === 'dead' ? 0.008 : 0.052;
-      const ampPitch = input.intent === 'aiming' || input.intent === 'dead' ? 0.005 : 0.026;
+        input.intent === 'aiming' || focus > 0.35
+          ? 2.4
+          : input.mode === 'zombie'
+            ? 0.35 + Math.random() * 0.7
+            : 0.9 + Math.random() * 1.8;
+      const focusDamp = 1 - focus * 0.65;
+      const ampYaw = (input.intent === 'aiming' || input.intent === 'dead' ? 0.008 : 0.052) * focusDamp;
+      const ampPitch = (input.intent === 'aiming' || input.intent === 'dead' ? 0.005 : 0.026) * focusDamp;
       this.saccadeYawOffset = (Math.random() - 0.5) * 2 * ampYaw;
       this.saccadePitchOffset = (Math.random() - 0.5) * 2 * ampPitch;
     }
@@ -174,13 +182,15 @@ export class FacialExpressionController {
               ? 4.6 + Math.random() * 5.2
               : input.intent === 'suppressed'
                 ? 2.1 + Math.random() * 2.0
-                : 3.1 + Math.random() * 2.6;
+                : focus > 0.25
+                  ? 4.2 + Math.random() * 2.8
+                  : 3.1 + Math.random() * 2.6;
           this.blinkTimerSec = baseCadence;
         } else {
           blinkWeight = Math.sin(t * Math.PI);
         }
       } else {
-        this.blinkTimerSec -= evalDt;
+        this.blinkTimerSec -= evalDt * (focus > 0.25 ? 0.72 : 1.0);
         if (this.blinkTimerSec <= 0) {
           this.blinkElapsedSec = 0;
         }
@@ -248,8 +258,14 @@ export class FacialExpressionController {
           break;
       }
 
-      // Continuous injury & flinch overlays (clamped for realistic human subtlety except flinch/blink)
+      // Continuous focus squint, injury & flinch overlays (clamped for realistic human subtlety except flinch/blink)
       if (input.intent !== 'dead') {
+        if (focus > 0.001) {
+          tgt[FACIAL_MORPH_INDEX.eye_squint_l] = Math.min(0.72, tgt[FACIAL_MORPH_INDEX.eye_squint_l] + focus * 0.34);
+          tgt[FACIAL_MORPH_INDEX.eye_squint_r] = Math.min(0.72, tgt[FACIAL_MORPH_INDEX.eye_squint_r] + focus * 0.34);
+          tgt[FACIAL_MORPH_INDEX.brow_furrow_down] = Math.min(0.58, tgt[FACIAL_MORPH_INDEX.brow_furrow_down] + focus * 0.18);
+          tgt[FACIAL_MORPH_INDEX.cheek_raise] = Math.min(0.45, tgt[FACIAL_MORPH_INDEX.cheek_raise] + focus * 0.12);
+        }
         tgt[FACIAL_MORPH_INDEX.brow_inner_up] = Math.min(0.45, tgt[FACIAL_MORPH_INDEX.brow_inner_up] + injury * 0.18);
         tgt[FACIAL_MORPH_INDEX.mouth_tense_grimace] = Math.min(0.45, tgt[FACIAL_MORPH_INDEX.mouth_tense_grimace] + injury * 0.14 + stress * 0.10);
         tgt[FACIAL_MORPH_INDEX.jaw_open] = Math.min(0.42, tgt[FACIAL_MORPH_INDEX.jaw_open] + flinch * 0.22);

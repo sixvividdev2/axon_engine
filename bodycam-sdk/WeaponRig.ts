@@ -19,6 +19,7 @@ import {
 import { SDK_WEAPON_PROFILES } from './weaponProfiles';
 import {
   WeaponAnimator,
+  WeaponChamberCycleOptions,
   WeaponPoseUpdateInput,
   WeaponSyncedHandlingSnapshot,
 } from './weapons/WeaponAnimator';
@@ -401,6 +402,22 @@ export class WeaponRig {
     return this.weaponAnimator.triggerInspect();
   }
 
+  public triggerChamberCycle(opts: WeaponChamberCycleOptions): boolean {
+    if (
+      this.currentProfile.holdClass !== 'pistol' &&
+      this.currentProfile.holdClass !== 'rifle' &&
+      this.currentProfile.holdClass !== 'shotgun'
+    ) {
+      return false;
+    }
+    this.cancelZoomTwist();
+    return this.weaponAnimator.triggerChamberCycle(opts);
+  }
+
+  public isChamberCycling(): boolean {
+    return this.weaponAnimator.isChamberCycling();
+  }
+
   public interruptInspect(): void {
     this.weaponAnimator.interruptInspect();
   }
@@ -591,6 +608,17 @@ export class WeaponRig {
     if (!this.assembly) return false;
     this.root.updateMatrixWorld(true);
     this.assembly.ejectionPortSocket.getWorldPosition(outPos);
+    return true;
+  }
+
+  public getEjectionPortWorldTransform(
+    outPos: THREE.Vector3,
+    outQuat: THREE.Quaternion,
+  ): boolean {
+    if (!this.assembly) return false;
+    this.root.updateMatrixWorld(true);
+    this.assembly.ejectionPortSocket.getWorldPosition(outPos);
+    this.assembly.ejectionPortSocket.getWorldQuaternion(outQuat);
     return true;
   }
 

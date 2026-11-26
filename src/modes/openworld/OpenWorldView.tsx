@@ -72,6 +72,14 @@ export const OpenWorldView: React.FC<OpenWorldViewProps> = ({
             engineRef.current?.useMedicalItemFromInventory(loc, med)
           }
           onUsePdaBattery={(loc) => engineRef.current?.usePdaBatteryFromInventory(loc)}
+          onDropEquippedBackpack={() => engineRef.current?.dropEquippedBackpack()}
+          onEquipGroundBackpack={(id) =>
+            engineRef.current?.equipGroundBackpack(id) ?? {
+              ok: false,
+              error: 'Session unavailable.',
+            }
+          }
+          onMagPackTickAudio={() => engineRef.current?.playMagPackTickAudio()}
           onFastTravelToSector={(secId) => engineRef.current?.fastTravelToSector(secId)}
           onFundFobUpgrade={() => engineRef.current?.fundFobUpgrade()}
           onBuyFobOffer={(offerId) => engineRef.current?.buyFobTraderOffer(offerId)}

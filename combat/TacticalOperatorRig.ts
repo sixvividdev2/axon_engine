@@ -44,6 +44,11 @@ import {
   BuiltTacticalEquipmentMesh,
   getBeltSlotTransforms,
 } from '../bodycam-sdk/equipment/TacticalEquipmentMesh';
+import {
+  buildTacticalBackpackMesh,
+  BuiltTacticalBackpackMesh,
+} from '../bodycam-sdk/equipment/TacticalBackpackMesh';
+import type { BackpackTemplateId } from '../src/modes/openworld/inventory/TetrisInventoryTypes';
 import { resolveWeaponProfile } from '../bodycam-sdk/weaponProfiles';
 import {
   evalRatchetedSuppressorTwist,
@@ -73,6 +78,8 @@ export interface TacticalCombatPose {
   pointAimBlend: number;
   /** 0..1 40-degree Canted ADS blend */
   cantBlend: number;
+  /** 0..1 tactical Free Zoom / focus blend (neck/head forward crane + eye squint) */
+  focusBlend?: number;
   /** 0..1 tactical reload posture blend */
   reloadBlend: number;
   /** Horizontal travel speed (m/s) for walk/sprint stride */
@@ -160,6 +167,7 @@ export interface BuiltTacticalOperatorRig {
     count?: number,
     visible?: boolean,
   ) => void;
+  setBackpack: (templateId: BackpackTemplateId | null) => void;
   setWeaponClass: (weaponClass: 'pistol' | 'smg' | 'shotgun' | 'rifle') => void;
   setWeaponLoadout: (weaponId: string, attachments?: WeaponAttachments | null) => void;
   setSuppressedVisual: (suppressed: boolean) => void;
@@ -860,6 +868,43 @@ export class TacticalOperatorRigFactory {
 
     upperBody.add(abdomen, chest, frontPlate, backPlate, cummerbund);
 
+    // 3D Worn Backpack Mount behind rear ballistic plate
+    const backpackMount = new THREE.Group();
+    backpackMount.name = 'gear_backpack_mount';
+    backpackMount.position.set(0, 0.315, 0.122 * chestD);
+    upperBody.add(backpackMount);
+    let activeBackpackMesh: BuiltTacticalBackpackMesh | null = null;
+    let activeBackpackId: BackpackTemplateId | null = null;
+
+    const setBackpack = (templateId: BackpackTemplateId | null): void => {
+      if (activeBackpackId === templateId) return;
+      if (activeBackpackMesh) {
+        backpackMount.remove(activeBackpackMesh.root);
+        activeBackpackMesh.dispose();
+        activeBackpackMesh = null;
+      }
+      activeBackpackId = templateId;
+      if (!templateId) return;
+      const built = buildTacticalBackpackMesh(templateId, {
+        mode: 'worn',
+        isFemale,
+        castShadow: true,
+        receiveShadow: true,
+      });
+      backpackMount.add(built.root);
+      activeBackpackMesh = built;
+    };
+
+    this.disposables.push({
+      dispose: () => {
+        if (activeBackpackMesh) {
+          backpackMount.remove(activeBackpackMesh.root);
+          activeBackpackMesh.dispose();
+          activeBackpackMesh = null;
+        }
+      },
+    });
+
     // Subtle contoured chest silhouette for FEMALE operator under/integrated with carrier
     if (isFemale) {
       for (const side of [-1, 1]) {
@@ -962,6 +1007,7 @@ export class TacticalOperatorRigFactory {
       stress01: 0.1,
       injury01: 0,
       flinchImpulse01: 0,
+      focus01: 0,
       gazeTargetWorld: null,
       distanceToCameraM: 8,
       isVisible: true,
@@ -1647,15 +1693,23 @@ export class TacticalOperatorRigFactory {
         -lean * 0.24 * (1 - vaultW) + vaultRoll + strideTorsoRoll,
       );
 
-      // 3. Head aim pitch/yaw/roll tracking + idle scanning + cheek-weld roll
+      // 3. Head aim pitch/yaw/roll tracking + Free-Zoom forward neck crane + idle scanning + cheek-weld roll
+      const focus = THREE.MathUtils.clamp(pose.focusBlend ?? 0, 0, 1) * (1 - vaultW * 0.75);
       const cheekWeldRoll = (ads - pointAim * 0.35) * 0.11 * (1 - vaultW) * (isGrenadeAct ? 0 : 1);
       const headYaw = THREE.MathUtils.clamp(pose.headYaw ?? 0, -0.78, 0.78) * (1 - vaultW * 0.8);
       const headPitchExtra = THREE.MathUtils.clamp(pose.headPitchOffset ?? 0, -0.35, 0.35);
       const headRollExtra = THREE.MathUtils.clamp(pose.headRollOffset ?? 0, -0.25, 0.25);
+      // Shift head forward ~2.9cm from the neck along local -Z with a subtle attentive forward chin tilt;
+      // counter-anchor collar & angle neck forward so the neck stays seamlessly seated into the vest collar.
+      headGroup.position.set(0, 0.555 - focus * 0.004, -0.029 * focus);
+      neckSkin.position.set(0, 0.022, 0.004 + focus * 0.011);
+      neckSkin.rotation.set(-focus * 0.22, 0, 0);
+      neck.position.set(0, 0.02, 0.005 + focus * 0.016);
+      neck.rotation.set(-focus * 0.14, 0, 0);
       headGroup.rotation.order = 'YXZ';
       headGroup.rotation.set(
         THREE.MathUtils.clamp(
-          pitch * 0.76 * (1 - vaultW * 0.6) - vaultW * vaultPeak * 0.18 + headPitchExtra,
+          pitch * 0.76 * (1 - vaultW * 0.6) - vaultW * vaultPeak * 0.18 - focus * 0.045 + headPitchExtra,
           -0.68,
           0.62,
         ),
@@ -1678,6 +1732,7 @@ export class TacticalOperatorRigFactory {
       facialInputScratch.stress01 = pose.stress01 ?? (ads * 0.45 + recoil * 0.4);
       facialInputScratch.injury01 = pose.injury01 ?? 0;
       facialInputScratch.flinchImpulse01 = pose.flinchImpulse01 ?? Math.min(1, Math.abs(pose.flinchPitch) * 2.5);
+      facialInputScratch.focus01 = focus;
       facialInputScratch.gazeTargetWorld = pose.gazeTargetWorld ?? null;
       facialInputScratch.distanceToCameraM = pose.distanceToCameraM ?? 8;
       facialInputScratch.isVisible = pose.isVisible ?? root.visible;
@@ -1723,8 +1778,12 @@ export class TacticalOperatorRigFactory {
       const inspectEnv = isInspectAct
         ? smoothstep3P(0.0, 0.18, hProg) * (1 - smoothstep3P(0.82, 1.0, hProg))
         : 0;
+      const isChamberCycleAct = hAct === 'CHAMBER_CYCLE';
+      const chamberCycleEnv = isChamberCycleAct
+        ? smoothstep3P(0.0, 0.16, hProg) * (1 - smoothstep3P(0.82, 1.0, hProg))
+        : 0;
 
-      // Reload / Suppressor / Inspect posture dip
+      // Reload / Suppressor / Inspect / Chamber-Cycle posture dip
       const effReload = hAct === 'RELOAD' ? Math.max(reload, smoothstep3P(0.0, 0.12, hProg) * (1 - smoothstep3P(0.88, 1.0, hProg))) : reload;
       wx = THREE.MathUtils.lerp(wx, 0.085 * torsoW, effReload);
       wy = THREE.MathUtils.lerp(wy, 0.275, effReload);
@@ -1740,6 +1799,11 @@ export class TacticalOperatorRigFactory {
         wx = THREE.MathUtils.lerp(wx, 0.07 * torsoW, inspectEnv);
         wy = THREE.MathUtils.lerp(wy, 0.36, inspectEnv);
         wepYaw = THREE.MathUtils.lerp(wepYaw, 0.42, inspectEnv);
+      } else if (chamberCycleEnv > 0.005) {
+        wx = THREE.MathUtils.lerp(wx, 0.082 * torsoW, chamberCycleEnv);
+        wy = THREE.MathUtils.lerp(wy, 0.345, chamberCycleEnv);
+        wz = THREE.MathUtils.lerp(wz, -0.155, chamberCycleEnv);
+        wepYaw = THREE.MathUtils.lerp(wepYaw, 0.34, chamberCycleEnv);
       }
 
       // Vault/climb retention tuck (keeps rifle controlled at right ribcage while left hand braces ledge)
@@ -1762,8 +1826,8 @@ export class TacticalOperatorRigFactory {
       const recoilZKick = recoil * 0.045 + Math.abs(pose.firingVibration) * 0.35;
       const recoilPitchKick = recoil * 0.095 + pose.firingVibration;
       const cantRollRad = effPointAim * 0.61 + effCant * 0.70;
-      const reloadPitchOffset = -effReload * 0.38 - suppEnv * 0.22;
-      const reloadRollOffset = effReload * 0.38 + suppEnv * 0.30 + inspectEnv * 0.55;
+      const reloadPitchOffset = -effReload * 0.38 - suppEnv * 0.22 - chamberCycleEnv * 0.14;
+      const reloadRollOffset = effReload * 0.38 + suppEnv * 0.30 + inspectEnv * 0.55 + chamberCycleEnv * 0.44;
       const vaultWepPitch = -vaultW * 0.48;
       const vaultWepRoll = -vaultW * 0.28;
       const wallPitchOffset = wallObs * 0.86;
@@ -1784,6 +1848,12 @@ export class TacticalOperatorRigFactory {
 
       // Animate 3P weapon sub-parts (pump forend, magazine drop, bolt handle, suppressor twist)
       let pumpTravelZ = 0;
+      const chamberRackTravel =
+        isChamberCycleAct && hProg > 0.20 && hProg < 0.78
+          ? hProg < 0.52
+            ? smoothstep3P(0.20, 0.52, hProg)
+            : 1 - smoothstep3P(0.56, 0.78, hProg)
+          : 0;
       if (weaponAsm) {
         if (weaponAsm.pumpForend) {
           if (hAct === 'PUMP') {
@@ -1791,6 +1861,8 @@ export class TacticalOperatorRigFactory {
               hProg < 0.45
                 ? smoothstep3P(0.0, 0.45, hProg) * 0.085
                 : (1 - smoothstep3P(0.45, 1.0, hProg)) * 0.085;
+          } else if (isChamberCycleAct) {
+            pumpTravelZ = chamberRackTravel * 0.085;
           }
           weaponAsm.pumpForend.position.z = basePumpZ + pumpTravelZ;
         }
@@ -1810,9 +1882,11 @@ export class TacticalOperatorRigFactory {
           const boltBack =
             hAct === 'BOLT'
               ? Math.sin(smoothstep3P(0.18, 0.82, hProg) * Math.PI) * 0.065
-              : hAct === 'RELOAD' && hProg > 0.70 && hProg < 0.88
-                ? Math.sin(smoothstep3P(0.70, 0.88, hProg) * Math.PI) * 0.055
-                : recoil * 0.032;
+              : isChamberCycleAct
+                ? chamberRackTravel * 0.064
+                : hAct === 'RELOAD' && hProg > 0.70 && hProg < 0.88
+                  ? Math.sin(smoothstep3P(0.70, 0.88, hProg) * Math.PI) * 0.055
+                  : recoil * 0.032;
           weaponAsm.slideOrBolt.position.z = baseBoltZ + boltBack;
         }
         if (weaponAsm.suppressor) {
@@ -2053,6 +2127,21 @@ export class TacticalOperatorRigFactory {
             _sockTmp.z += bPull;
             _handAuxR.copy(_sockTmp).applyQuaternion(weaponSocket.quaternion).add(weaponSocket.position);
             _gripR.lerp(_handAuxR, bEnv);
+          } else if (hAct === 'CHAMBER_CYCLE') {
+            const cEnv = smoothstep3P(0.0, 0.20, hProg) * (1 - smoothstep3P(0.80, 1.0, hProg));
+            const isBoltAction = Boolean(weaponAsm?.boltHandlePivot);
+            const isPumpAction = Boolean(weaponAsm?.pumpForend);
+            if (isBoltAction) {
+              _sockTmp.copy(boltHandleLocal);
+              _sockTmp.z += chamberRackTravel * 0.068;
+              _handAuxR.copy(_sockTmp).applyQuaternion(weaponSocket.quaternion).add(weaponSocket.position);
+              _gripR.lerp(_handAuxR, cEnv);
+            } else if (!isPumpAction) {
+              _sockTmp.copy(boltRackLocal);
+              _sockTmp.z += chamberRackTravel * 0.062;
+              _handAuxL.copy(_sockTmp).applyQuaternion(weaponSocket.quaternion).add(weaponSocket.position);
+              _gripL.lerp(_handAuxL, cEnv);
+            }
           } else if (
             hAct === 'ZOOM_TWIST' ||
             hAct === 'TURRET' ||
@@ -2142,7 +2231,12 @@ export class TacticalOperatorRigFactory {
       pelvisGroup.rotation.set(0, 0, 0);
       upperBody.position.set(0, 0.035, 0);
       upperBody.rotation.set(0, 0, 0);
+      headGroup.position.set(0, 0.555, 0);
       headGroup.rotation.set(0, 0, 0);
+      neckSkin.position.set(0, 0.022, 0.004);
+      neckSkin.rotation.set(0, 0, 0);
+      neck.position.set(0, 0.02, 0.005);
+      neck.rotation.set(0, 0, 0);
 
       leftLegParts.hipPivot.rotation.set(0, 0, 0);
       leftLegParts.kneePivot.rotation.set(0, 0, 0);
@@ -2203,6 +2297,7 @@ export class TacticalOperatorRigFactory {
       applyCombatPose,
       resetRagdollPose,
       setBeltEquipment,
+      setBackpack,
       setWeaponClass,
       setWeaponLoadout,
       setSuppressedVisual,

@@ -22,6 +22,7 @@ import {
   DEFAULT_BODYCAM_SDK_CONFIG,
   DEFAULT_TRAUMA_MODIFIERS,
   DynamicPhysicsPropSystem,
+  EjectedLiveRoundPool,
   GrenadeDetonationEvent,
   GrenadeHoldStage,
   GrenadeThrowStyle,
@@ -44,7 +45,37 @@ import {
   type PdaTabMode,
   VIEWMODEL_LAYER,
   WeaponRig,
+  WorldBackpackSystem,
 } from '../bodycam-sdk';
+import { loadoutStore } from '../data/loadoutStore';
+import {
+  addLooseRoundToInventory,
+  autoPlaceItemInGrid,
+  buildModeLoadoutTacticalInventory,
+  cloneTacticalInventory,
+  computeOperatorEncumbrance,
+  countCompatibleReserveRounds,
+  createAmmoStackItem,
+  createLoadedMagazineForWeapon,
+  createPopulatedWorldBackpack,
+  cycleChamberInWeaponSlot,
+  extractItemByLocator,
+  findBestReloadMagazine,
+  fireRoundFromWeaponSlot,
+  getLoadedAmmoCount,
+  getWeaponSlotByWeaponId,
+  isBackpackTemplateId,
+  peekItemByLocator,
+  swapMagazineIntoWeapon,
+} from '../src/modes/openworld/inventory/TetrisInventoryCore';
+import type {
+  CorpseTacticalLootSnapshot,
+  ItemSourceLocator,
+  MedicalItem,
+  OperatorEncumbranceState,
+  OperatorTacticalInventory,
+} from '../src/modes/openworld/inventory/TetrisInventoryTypes';
+import type { ExternalLootContext } from '../src/modes/openworld/ui/TacticalInventoryModal';
 import {
   fireModeStore,
   getEffectiveFireRpm,
@@ -75,6 +106,7 @@ import {
   AMMO_VARIANTS,
   AmmoVariantDef,
   AmmoVariantId,
+  BASE_CALIBERS,
   BaseCaliberId,
   getDefaultAmmoVariant,
   resolveBaseCaliberId,
@@ -156,6 +188,11 @@ export interface GymSnapshot {
   irIlluminatorOn: boolean;
   repairPromptLabel: string | null;
   repairProgress: number;
+  ammoReserve: number;
+  inventoryOpen: boolean;
+  tacticalInventory: OperatorTacticalInventory;
+  externalLoot: ExternalLootContext | null;
+  encumbrance: OperatorEncumbranceState;
 }
 
 type Listener = (snap: GymSnapshot) => void;
@@ -189,6 +226,7 @@ export class GymEngine {
   private readonly postProcess: BodycamPostProcess;
   private readonly scopeRenderer: ScopeRenderer;
   private readonly ballistics: GymBallistics;
+  private readonly ejectedLiveRounds: EjectedLiveRoundPool;
   private readonly grenadeSystem: TacticalGrenadeSystem;
   private readonly physicsProps: DynamicPhysicsPropSystem;
   private readonly pdaDevice: TacticalPdaDevice;
@@ -228,6 +266,7 @@ export class GymEngine {
     cant: false,
     adsMode: 'PRIMARY',
     holdBreath: false,
+    freeZoom: false,
     vault: false,
   };
 
@@ -256,10 +295,28 @@ export class GymEngine {
   private isFiring = false;
   private shiftHeld = false;
   private holdBreathHeld = false;
+  private freeZoomHeld = false;
   private altHeld = false;
+  private nearbyLiveRound: {
+    id: number;
+    caliberId: string;
+    caliberLabel: string;
+    weaponId: string;
+  } | null = null;
+  private nearbyGroundBackpack: {
+    id: string;
+    label: string;
+    itemCount: number;
+  } | null = null;
   private fireCooldown = 0;
   private semiTriggerConsumed = false;
   private reloadTimer = 0;
+  private pendingReloadMagLocator: ItemSourceLocator | null = null;
+  private tacticalInventory: OperatorTacticalInventory;
+  private encumbrance: OperatorEncumbranceState;
+  private inventoryOpen = false;
+  private activeExternalLoot: ExternalLootContext | null = null;
+  private readonly worldBackpacks: WorldBackpackSystem;
   private stamina = 1.0;
   private heartRateBpm = 84;
   private heartStress = 0;
@@ -491,6 +548,7 @@ export class GymEngine {
       this.world.steelTargets,
       this.world.paperTargets,
     );
+    this.ejectedLiveRounds = new EjectedLiveRoundPool(this.scene);
 
     this.grenadeSystem = new TacticalGrenadeSystem({
       scene: this.scene,
@@ -581,6 +639,21 @@ export class GymEngine {
       const derived = computeDerivedWeaponStats(w.massKg, w.barrelLengthM, w.magCapacity, att);
       this.magAmmoByWeapon[w.id] = derived.magCapacity;
     }
+
+    // Initialize unified spatial Tetris Tactical Inventory + 3D worn backpack + practice pack rack
+    const activeSlot = loadoutStore.getActiveSlot();
+    this.tacticalInventory = buildModeLoadoutTacticalInventory({
+      primaryWeaponId: 'm4_556',
+      secondaryWeaponId: 'pm_9x19',
+      backpackId: activeSlot.backpackId ?? 'pack_assault_20l',
+      mode: 'playground',
+    });
+    this.encumbrance = computeOperatorEncumbrance(this.tacticalInventory);
+    const bootBpId = this.tacticalInventory.backpack?.templateId ?? null;
+    this.skeleton.setBackpack(bootBpId && isBackpackTemplateId(bootBpId) ? bootBpId : null);
+
+    this.worldBackpacks = new WorldBackpackSystem(this.scene);
+    this.seedGymPracticeBackpacks();
 
     // Spawn at central courtyard with bare M4A1 (iron sights only until Gunsmith mounted)
     this.switchWeapon('m4_556', true);
@@ -1405,6 +1478,12 @@ export class GymEngine {
       this.weaponRig.flashlight.visible = false;
       this.weaponRig.flashlight.intensity = 0;
     }
+    if (prof.holdClass !== 'unarmed') {
+      const slotKey = this.ensureWeaponInTacticalInventory(prof.id);
+      if (slotKey) {
+        this.magAmmoByWeapon[prof.id] = getLoadedAmmoCount(this.tacticalInventory[slotKey]);
+      }
+    }
     this.weaponRig.setAmmoState(this.magAmmoByWeapon[prof.id] ?? 0);
     if (!silent) {
       this.audio.playGearRattle('weapon_swap', 0.9);
@@ -1415,6 +1494,270 @@ export class GymEngine {
       );
       this.emitSnapshot();
     }
+  }
+
+  private seedGymPracticeBackpacks(): void {
+    const spots: Array<{
+      id: string;
+      templateId: 'pack_assault_20l' | 'pack_rucksack_35l' | 'pack_logistics_55l';
+      x: number;
+      z: number;
+      yaw: number;
+      label: string;
+    }> = [
+      {
+        id: 'gym-rack-20l',
+        templateId: 'pack_assault_20l',
+        x: -2.4,
+        z: -2.5,
+        yaw: 0.2,
+        label: '20L Assault Pack (Range Rack)',
+      },
+      {
+        id: 'gym-rack-35l',
+        templateId: 'pack_rucksack_35l',
+        x: -1.4,
+        z: -2.5,
+        yaw: 0.05,
+        label: '35L Field Rucksack (Range Rack)',
+      },
+      {
+        id: 'gym-rack-55l',
+        templateId: 'pack_logistics_55l',
+        x: -0.4,
+        z: -2.5,
+        yaw: -0.1,
+        label: '55L Logistics Frame (Range Rack)',
+      },
+    ];
+    for (const s of spots) {
+      const pack = createPopulatedWorldBackpack(s.templateId, 'm4_556');
+      const y = this.adapter.getGroundHeight(s.x, s.z, 1.0);
+      this.worldBackpacks.spawnBackpack({
+        id: s.id,
+        backpack: pack,
+        position: new THREE.Vector3(s.x, y, s.z),
+        yaw: s.yaw,
+        ownerLabel: s.label,
+        isPracticeGear: true,
+      });
+    }
+  }
+
+  private refreshEncumbranceAndBackpackVisual(): void {
+    this.encumbrance = computeOperatorEncumbrance(this.tacticalInventory);
+    const bpId = this.tacticalInventory.backpack?.templateId ?? null;
+    this.skeleton.setBackpack(bpId && isBackpackTemplateId(bpId) ? bpId : null);
+  }
+
+  private ensureWeaponInTacticalInventory(weaponId: string): 'primary' | 'secondary' | null {
+    if (weaponId === 'unarmed') return null;
+    const existing = getWeaponSlotByWeaponId(this.tacticalInventory, weaponId);
+    if (existing) return existing;
+    const prof = resolveWeaponProfile(weaponId);
+    const targetSlot: 'primary' | 'secondary' =
+      prof.holdClass === 'pistol' ? 'secondary' : 'primary';
+    this.tacticalInventory[targetSlot] = {
+      weaponId: prof.id,
+      chamberedRound: null,
+      loadedMag: createLoadedMagazineForWeapon(prof.id),
+    };
+    for (let i = 0; i < 2; i++) {
+      const spare = createLoadedMagazineForWeapon(prof.id);
+      const placedRig = this.tacticalInventory.chestRig
+        ? autoPlaceItemInGrid(this.tacticalInventory.chestRig.generalGrid, spare)
+        : false;
+      if (!placedRig && this.tacticalInventory.backpack) {
+        autoPlaceItemInGrid(this.tacticalInventory.backpack.grid, spare);
+      }
+    }
+    this.refreshEncumbranceAndBackpackVisual();
+    return targetSlot;
+  }
+
+  private syncMagAmmoFromInventory(): void {
+    const primary = this.tacticalInventory.primary;
+    if (primary.weaponId) {
+      this.magAmmoByWeapon[primary.weaponId] = getLoadedAmmoCount(primary);
+    }
+    const secondary = this.tacticalInventory.secondary;
+    if (secondary.weaponId) {
+      this.magAmmoByWeapon[secondary.weaponId] = getLoadedAmmoCount(secondary);
+    }
+    const curProf = this.getWeaponProfile();
+    if (curProf.holdClass !== 'unarmed') {
+      this.weaponRig.setAmmoState(this.magAmmoByWeapon[curProf.id] ?? 0);
+    }
+  }
+
+  public openInventory(externalLoot: ExternalLootContext | null = null): void {
+    if (this.tunerOpen || this.world.gunsmithBench.isOpen() || this.disposed) return;
+    this.inventoryOpen = true;
+    this.activeExternalLoot = externalLoot;
+    this.clearHeldControlInputs();
+    if (document.pointerLockElement === this.renderer.domElement) {
+      document.exitPointerLock();
+    }
+    this.emitSnapshot();
+  }
+
+  public closeInventory(reacquireLock = true): void {
+    if (!this.inventoryOpen) return;
+    this.inventoryOpen = false;
+    this.activeExternalLoot = null;
+    this.emitSnapshot();
+    if (reacquireLock && !this.tunerOpen && !this.world.gunsmithBench.isOpen() && !this.disposed) {
+      this.requestLock();
+    }
+  }
+
+  public applyInventoryMutation(
+    nextInv: OperatorTacticalInventory,
+    nextExternal?: CorpseTacticalLootSnapshot | null,
+    statusNote?: string,
+  ): void {
+    this.tacticalInventory = cloneTacticalInventory(nextInv);
+    this.refreshEncumbranceAndBackpackVisual();
+    this.syncMagAmmoFromInventory();
+    if (
+      nextExternal !== undefined &&
+      this.activeExternalLoot &&
+      this.activeExternalLoot.kind === 'ground_backpack' &&
+      nextExternal &&
+      nextExternal.backpack
+    ) {
+      this.worldBackpacks.updateContainerContents(
+        this.activeExternalLoot.id,
+        nextExternal.backpack,
+      );
+      this.activeExternalLoot = {
+        ...this.activeExternalLoot,
+        lootKit: nextExternal,
+      };
+    }
+    if (statusNote) this.showToast(statusNote);
+    this.emitSnapshot();
+  }
+
+  public triggerInventoryDragReload(
+    weaponSlotKey: 'primary' | 'secondary',
+    sourceLocator: ItemSourceLocator,
+  ): void {
+    const slot = this.tacticalInventory[weaponSlotKey];
+    if (!slot.weaponId) return;
+    const swap = swapMagazineIntoWeapon(this.tacticalInventory, weaponSlotKey, sourceLocator);
+    if (!swap.ok) {
+      this.showToast('Incompatible or inaccessible magazine');
+      return;
+    }
+    this.refreshEncumbranceAndBackpackVisual();
+    this.syncMagAmmoFromInventory();
+    this.audio.playWeaponCue('mag_in', { intensity: 0.78 });
+    this.emitSnapshot();
+  }
+
+  public useMedicalItemFromInventory(locator: ItemSourceLocator, med: MedicalItem): void {
+    const extracted = extractItemByLocator(this.tacticalInventory, locator);
+    if (!extracted) return;
+    if (this.simulatedArmTrauma) {
+      this.simulatedArmTrauma = false;
+    }
+    this.refreshEncumbranceAndBackpackVisual();
+    this.audio.playGearRattle('crouch', 0.45);
+    this.showToast(`Applied ${med.name}`);
+    this.emitSnapshot();
+  }
+
+  public dropEquippedBackpack(): boolean {
+    if (!this.tacticalInventory.backpack) {
+      this.showToast('No backpack equipped');
+      return false;
+    }
+    const dropped = this.tacticalInventory.backpack;
+    this.tacticalInventory.backpack = null;
+    this.refreshEncumbranceAndBackpackVisual();
+
+    const forward = new THREE.Vector3(
+      -Math.sin(this.controller.aimYaw),
+      0,
+      -Math.cos(this.controller.aimYaw),
+    ).normalize();
+    const dropPos = this.controller.position.clone().addScaledVector(forward, 1.15);
+    dropPos.y = this.adapter.getGroundHeight(dropPos.x, dropPos.z, this.controller.position.y + 0.5);
+    const container = this.worldBackpacks.spawnBackpack({
+      backpack: dropped,
+      position: dropPos,
+      yaw: this.controller.aimYaw + Math.PI,
+      isPracticeGear: true,
+    });
+    this.audio.playGearRattle('weapon_swap', 0.72);
+    this.showToast(`Dropped ${dropped.name} (${dropped.grid.items.length} items)`);
+    if (this.inventoryOpen && !this.activeExternalLoot) {
+      this.activeExternalLoot = this.worldBackpacks.buildExternalLootContext(container.id);
+    }
+    this.emitSnapshot();
+    return true;
+  }
+
+  public equipGroundBackpack(
+    containerId: string,
+  ): { ok: boolean; error?: string; requiresUnequipFirst?: boolean } {
+    const res = this.worldBackpacks.equipFromWorld(containerId, this.tacticalInventory);
+    if (!res.ok) {
+      if (res.error) this.showToast(res.error);
+      return res;
+    }
+    this.refreshEncumbranceAndBackpackVisual();
+    if (this.activeExternalLoot && this.activeExternalLoot.id === containerId) {
+      this.activeExternalLoot = null;
+    }
+    this.audio.playGearRattle('weapon_swap', 0.78);
+    if (res.equippedPack) {
+      this.showToast(
+        `Equipped ${res.equippedPack.name} (${res.equippedPack.grid.items.length} items inside)`,
+      );
+    }
+    this.emitSnapshot();
+    return res;
+  }
+
+  public restockBenchAmmo(): void {
+    const prof = this.getWeaponProfile();
+    if (prof.holdClass !== 'unarmed') {
+      const slotKey = this.ensureWeaponInTacticalInventory(prof.id);
+      if (slotKey) {
+        this.tacticalInventory[slotKey] = {
+          weaponId: prof.id,
+          chamberedRound: null,
+          loadedMag: createLoadedMagazineForWeapon(prof.id),
+        };
+        const baseCal = this.getActiveBaseCaliberId(prof.id);
+        const loose = createAmmoStackItem(getDefaultAmmoVariant(baseCal).id, 60);
+        const placedLoose = this.tacticalInventory.chestRig
+          ? autoPlaceItemInGrid(this.tacticalInventory.chestRig.generalGrid, loose)
+          : false;
+        if (!placedLoose && this.tacticalInventory.backpack) {
+          autoPlaceItemInGrid(this.tacticalInventory.backpack.grid, loose);
+        }
+        const spare = createLoadedMagazineForWeapon(prof.id);
+        const placedSpare = this.tacticalInventory.chestRig
+          ? autoPlaceItemInGrid(this.tacticalInventory.chestRig.generalGrid, spare)
+          : false;
+        if (!placedSpare && this.tacticalInventory.backpack) {
+          autoPlaceItemInGrid(this.tacticalInventory.backpack.grid, spare);
+        }
+        this.refreshEncumbranceAndBackpackVisual();
+      }
+      this.magAmmoByWeapon[prof.id] = prof.magCapacity;
+      this.weaponRig.setAmmoState(prof.magCapacity);
+    }
+    this.audio.playWeaponCue('mag_in', { intensity: 0.85 });
+    this.showToast('Range Bench Ammo & Magazines Restocked');
+    this.emitSnapshot();
+  }
+
+  public playMagPackTickAudio(): void {
+    this.audio.playWeaponCue('mode_toggle', { intensity: 0.32 });
   }
 
   private showToast(msg: string, durationSec = 2.2): void {
@@ -1499,6 +1842,7 @@ export class GymEngine {
       prof.magCapacity <= 0 ||
       this.reloadTimer > 0 ||
       this.weaponRig.isTubularReloading() ||
+      this.weaponRig.isChamberCycling() ||
       this.controller.isVaulting() ||
       this.pdaDevice.isBlockingWeaponActions() ||
       this.weaponRig.isSuppressorActionActive()
@@ -1537,9 +1881,22 @@ export class GymEngine {
       }
       return;
     }
-    this.reloadTimer = prof.reloadDurationSec;
-    this.animator.triggerReload(prof.reloadDurationSec);
-    this.showToast(`Reloading ${prof.name}...`);
+    const slotKey = this.ensureWeaponInTacticalInventory(prof.id);
+    const bestMag = slotKey ? findBestReloadMagazine(this.tacticalInventory, prof.id) : null;
+    if (!bestMag) {
+      this.showToast('No Loaded Magazine — Press [TAB] to Pack Mags or Restock');
+      this.emitSnapshot();
+      return;
+    }
+    const dur = prof.reloadDurationSec * (bestMag.reloadTimeMult ?? 1);
+    this.reloadTimer = dur;
+    this.pendingReloadMagLocator = bestMag.locator;
+    this.animator.triggerReload(dur);
+    this.showToast(
+      bestMag.fromBackpack
+        ? `Drawing ${prof.name} mag from Backpack (slower)...`
+        : `Reloading ${prof.name}...`,
+    );
     this.emitSnapshot();
   }
 
@@ -1585,6 +1942,105 @@ export class GymEngine {
       this.showToast(`Inspecting ${prof.name} · ZERO ${zeroDist}m${mradTag}`);
       this.emitSnapshot();
     }
+  }
+
+  private togglePointAimMode(): void {
+    const prof = this.getWeaponProfile();
+    if (prof.holdClass === 'unarmed') return;
+    const cur = this.getArmedAdsMode(prof.id);
+    const next: AdsMode = cur === 'POINT_AIM' ? 'PRIMARY' : 'POINT_AIM';
+    this.setArmedAdsMode(prof.id, next);
+    this.audio.playGearRattle('weapon_swap', 0.45);
+    this.showToast(
+      next === 'POINT_AIM'
+        ? `Point Aim Mode: ARMED (${keybindStore.getLabel('ads')})`
+        : `Primary Optic ADS (${keybindStore.getLabel('ads')})`,
+    );
+    this.emitSnapshot();
+  }
+
+  private triggerChamberCycle(): void {
+    const prof = this.getWeaponProfile();
+    if (
+      prof.holdClass === 'unarmed' ||
+      prof.holdClass === 'melee_1h' ||
+      prof.magCapacity <= 0 ||
+      this.reloadTimer > 0 ||
+      this.weaponRig.isTubularReloading() ||
+      this.weaponRig.isChamberCycling() ||
+      this.controller.isVaulting() ||
+      this.pdaDevice.isBlockingWeaponActions() ||
+      this.grenadeSystem.isDrawn() ||
+      this.weaponRig.isSuppressorActionActive() ||
+      this.animator.isCombatBusy()
+    ) {
+      return;
+    }
+
+    const weaponId = prof.id;
+    const curAmmo = this.magAmmoByWeapon[weaponId] ?? 0;
+    const hasLiveRound = curAmmo > 0;
+    const calId = this.getActiveBaseCaliberId(weaponId);
+    const calDef = BASE_CALIBERS[calId];
+    const caliberLabel = calDef?.shortLabel ?? prof.caliberLabel;
+
+    this.isFiring = false;
+    this.animator.interruptInspect();
+    this.weaponRig.cancelZoomTwist();
+
+    const started = this.animator.triggerChamberCycle({
+      hasLiveRound,
+      onExtractApex: (portPos, portQuat) => {
+        if (this.equippedWeaponId !== weaponId) return;
+        const liveNow = this.magAmmoByWeapon[weaponId] ?? 0;
+        if (liveNow <= 0) return;
+        const slotKey = getWeaponSlotByWeaponId(this.tacticalInventory, weaponId);
+        if (slotKey) {
+          cycleChamberInWeaponSlot(this.tacticalInventory[slotKey]);
+          this.encumbrance = computeOperatorEncumbrance(this.tacticalInventory);
+        }
+        const nextAmmo = slotKey ? getLoadedAmmoCount(this.tacticalInventory[slotKey]) : liveNow - 1;
+        this.magAmmoByWeapon[weaponId] = nextAmmo;
+        this.weaponRig.setAmmoState(nextAmmo);
+        this.controller.getVelocity(this._playerVelScratch);
+        this.ejectedLiveRounds.spawnRound({
+          position: portPos,
+          quaternion: portQuat,
+          caliberId: calId,
+          caliberLabel,
+          weaponId,
+          holdClass: prof.holdClass,
+          carrierVelocity: this._playerVelScratch,
+        });
+        this.emitSnapshot();
+      },
+      onComplete: () => {
+        this.emitSnapshot();
+      },
+    });
+
+    if (started) {
+      this.showToast(
+        hasLiveRound
+          ? `Cycling Chamber — Ejecting Live ${caliberLabel}`
+          : `Racking ${prof.name} (Chamber Empty)`,
+      );
+      this.emitSnapshot();
+    }
+  }
+
+  private tryPickupNearbyLiveRound(): boolean {
+    if (!this.nearbyLiveRound) return false;
+    const collected = this.ejectedLiveRounds.collectRound(this.nearbyLiveRound.id);
+    this.nearbyLiveRound = null;
+    if (!collected) return false;
+    const baseCal = resolveBaseCaliberId(collected.caliberId);
+    addLooseRoundToInventory(this.tacticalInventory, getDefaultAmmoVariant(baseCal).id);
+    this.encumbrance = computeOperatorEncumbrance(this.tacticalInventory);
+    this.audio.playGearRattle('crouch', 0.45);
+    this.showToast(`+1 ${collected.caliberLabel} Round Recovered`);
+    this.emitSnapshot();
+    return true;
   }
 
   private triggerQuickBash(): void {
@@ -1732,7 +2188,14 @@ export class GymEngine {
       return;
     }
 
-    const remainingAmmo = currentAmmo - 1;
+    const slotKey = this.ensureWeaponInTacticalInventory(prof.id);
+    if (slotKey) {
+      fireRoundFromWeaponSlot(this.tacticalInventory[slotKey]);
+      this.encumbrance = computeOperatorEncumbrance(this.tacticalInventory);
+    }
+    const remainingAmmo = slotKey
+      ? getLoadedAmmoCount(this.tacticalInventory[slotKey])
+      : currentAmmo - 1;
     this.magAmmoByWeapon[prof.id] = remainingAmmo;
     this.fireCooldown = 60 / Math.max(25, prof.rpm);
     if (isSingleShotMode) {
@@ -1810,8 +2273,10 @@ export class GymEngine {
     this.semiTriggerConsumed = false;
     this.shiftHeld = false;
     this.holdBreathHeld = false;
+    this.freeZoomHeld = false;
     this.altHeld = false;
     this.input.ads = false;
+    this.input.freeZoom = false;
     this.input.forward = false;
     this.input.backward = false;
     this.input.left = false;
@@ -1836,6 +2301,9 @@ export class GymEngine {
     this.pointerLocked = document.pointerLockElement === this.renderer.domElement;
     if (!this.pointerLocked) {
       this.clearHeldControlInputs();
+    } else {
+      this.inventoryOpen = false;
+      this.activeExternalLoot = null;
     }
     this.emitSnapshot();
   };
@@ -1928,6 +2396,13 @@ export class GymEngine {
     const isFireBtn = keybindStore.matchesMouseButton(e.button, 'fire');
     const isAdsBtn = keybindStore.matchesMouseButton(e.button, 'ads');
     const isPointAimBtn = keybindStore.matchesMouseButton(e.button, 'point_aim');
+    const isFreeZoomBtn = keybindStore.matchesMouseButton(e.button, 'free_zoom');
+    const isCycleChamberBtn = keybindStore.matchesMouseButton(e.button, 'cycle_chamber');
+
+    if (isFreeZoomBtn) {
+      this.freeZoomHeld = true;
+      return;
+    }
 
     if (this.pdaDevice.isBlockingWeaponActions()) {
       if (isFireBtn && this.pdaDevice.isOpen()) {
@@ -1966,19 +2441,9 @@ export class GymEngine {
       this.animator.interruptInspect();
       this.input.ads = true;
     } else if (isPointAimBtn) {
-      // Toggles Point Aim mode for ADS on every firearm (never initiates ADS on its own)
-      const prof = this.getWeaponProfile();
-      if (prof.holdClass === 'unarmed') return;
-      const cur = this.getArmedAdsMode(prof.id);
-      const next: AdsMode = cur === 'POINT_AIM' ? 'PRIMARY' : 'POINT_AIM';
-      this.setArmedAdsMode(prof.id, next);
-      this.audio.playGearRattle('weapon_swap', 0.45);
-      this.showToast(
-        next === 'POINT_AIM'
-          ? `Point Aim Mode: ARMED (${keybindStore.getLabel('ads')})`
-          : `Primary Optic ADS (${keybindStore.getLabel('ads')})`,
-      );
-      this.emitSnapshot();
+      this.togglePointAimMode();
+    } else if (isCycleChamberBtn) {
+      this.triggerChamberCycle();
     }
   };
 
@@ -1989,6 +2454,9 @@ export class GymEngine {
   };
 
   private readonly onMouseUp = (e: MouseEvent): void => {
+    if (keybindStore.matchesMouseButton(e.button, 'free_zoom')) {
+      this.freeZoomHeld = false;
+    }
     if (keybindStore.matchesMouseButton(e.button, 'fire')) {
       if (this.pdaDevice.isDragging()) {
         this.pdaDevice.setDragging(false);
@@ -2040,14 +2508,48 @@ export class GymEngine {
       return;
     }
 
+    if (e.code === 'Tab' && !e.repeat && !this.tunerOpen) {
+      e.preventDefault();
+      if (this.inventoryOpen) {
+        this.closeInventory(true);
+      } else if (this.pointerLocked) {
+        this.openInventory(null);
+      }
+      return;
+    }
+
+    if (e.code === 'Escape' && !e.repeat && this.inventoryOpen) {
+      e.preventDefault();
+      this.closeInventory(true);
+      return;
+    }
+
     if (keybindStore.matchesKeyCode(e.code, 'tuner')) {
       e.preventDefault();
       this.toggleTuner();
       return;
     }
 
-    if (!this.pointerLocked) return;
+    if (!this.pointerLocked || this.inventoryOpen) return;
     this.audio.ensureInitialized();
+
+    if (keybindStore.matchesKeyCode(e.code, 'free_zoom')) {
+      this.freeZoomHeld = true;
+      return;
+    }
+    if (keybindStore.matchesKeyCode(e.code, 'point_aim')) {
+      e.preventDefault();
+      if (!e.repeat && !this.pdaDevice.isBlockingWeaponActions() && !this.grenadeSystem.isDrawn()) {
+        this.togglePointAimMode();
+      }
+      return;
+    }
+    if (keybindStore.matchesKeyCode(e.code, 'cycle_chamber')) {
+      if (!e.repeat && !this.pdaDevice.isBlockingWeaponActions()) {
+        this.triggerChamberCycle();
+      }
+      return;
+    }
 
     if (keybindStore.matchesKeyCode(e.code, 'hold_breath')) {
       this.holdBreathHeld = true;
@@ -2119,6 +2621,14 @@ export class GymEngine {
               this.interactAnimator,
             );
             this.emitSnapshot();
+          } else if (this.nearbyGroundBackpack) {
+            const ctx = this.worldBackpacks.buildExternalLootContext(this.nearbyGroundBackpack.id);
+            if (ctx) {
+              this.audio.playGearRattle('weapon_swap', 0.45);
+              this.openInventory(ctx);
+            }
+          } else if (this.tryPickupNearbyLiveRound()) {
+            // Live round recovered from ground
           } else {
             this.toggleFlashlight();
           }
@@ -2236,6 +2746,9 @@ export class GymEngine {
   };
 
   private readonly onKeyUp = (e: KeyboardEvent): void => {
+    if (keybindStore.matchesKeyCode(e.code, 'free_zoom')) {
+      this.freeZoomHeld = false;
+    }
     if (keybindStore.matchesKeyCode(e.code, 'hold_breath')) {
       this.holdBreathHeld = false;
     }
@@ -2389,9 +2902,22 @@ export class GymEngine {
       this.reloadTimer -= dt * Math.max(0.5, traumaMult);
       if (this.reloadTimer <= 0) {
         this.reloadTimer = 0;
-        this.magAmmoByWeapon[prof.id] = prof.magCapacity;
-        this.weaponRig.setAmmoState(prof.magCapacity);
-        this.showToast(`Reloaded: ${prof.magCapacity}/${prof.magCapacity}`);
+        const magLoc = this.pendingReloadMagLocator;
+        this.pendingReloadMagLocator = null;
+        const slotKey = getWeaponSlotByWeaponId(this.tacticalInventory, prof.id);
+        if (slotKey && magLoc && peekItemByLocator(this.tacticalInventory, magLoc)) {
+          const swap = swapMagazineIntoWeapon(this.tacticalInventory, slotKey, magLoc);
+          if (swap.ok) {
+            this.refreshEncumbranceAndBackpackVisual();
+            this.syncMagAmmoFromInventory();
+            const loaded = this.magAmmoByWeapon[prof.id] ?? 0;
+            this.showToast(`Reloaded: ${loaded}/${prof.magCapacity}`);
+          }
+        } else {
+          this.magAmmoByWeapon[prof.id] = prof.magCapacity;
+          this.weaponRig.setAmmoState(prof.magCapacity);
+          this.showToast(`Reloaded: ${prof.magCapacity}/${prof.magCapacity}`);
+        }
       }
     }
 
@@ -2425,13 +2951,20 @@ export class GymEngine {
     const firearmAdsBlocking =
       this.input.ads && prof.holdClass !== 'unarmed' && !grenadeDrawn;
     // Shift sprints freely with fists guard up or grenade held; aiming a firearm engages Hold Breath instead
-    this.input.sprint = !suppBusy && !pdaBusy && this.shiftHeld && !firearmAdsBlocking;
+    this.input.sprint =
+      !suppBusy &&
+      !pdaBusy &&
+      this.encumbrance.canSprint &&
+      this.shiftHeld &&
+      !firearmAdsBlocking;
     this.input.holdBreath =
       !suppBusy &&
       !pdaBusy &&
       this.input.ads &&
       prof.holdClass !== 'unarmed' &&
       (this.holdBreathHeld || this.altHeld);
+    this.input.freeZoom =
+      this.freeZoomHeld && this.pointerLocked && !benchBusy && !pdaBusy && !this.inventoryOpen;
 
     let isVaultingNow = false;
     if (!benchBusy) {
@@ -2452,7 +2985,15 @@ export class GymEngine {
         this.stamina,
         100,
         (drain) => {
-          this.stamina = Math.max(0, this.stamina - drain);
+          this.stamina = Math.max(0, this.stamina - drain * this.encumbrance.staminaDrainMult);
+        },
+        {
+          encumbranceRatio: this.encumbrance.ratio01,
+          swayAmpMult: 1 + this.encumbrance.ratio01 * 0.25,
+          moveSpeedMult: this.encumbrance.moveSpeedMult,
+          staminaDrainMult: this.encumbrance.staminaDrainMult,
+          exertionRateMult: this.encumbrance.exertionRateMult,
+          canSprint: this.encumbrance.canSprint,
         },
       );
 
@@ -2528,11 +3069,29 @@ export class GymEngine {
           !this.lookingAtBench && !this.holdRepair.isActive()
             ? this.world.electronics.findBrokenRepairTarget(this.camera.position, this._lookDir, 3.0)
             : null;
+        this.nearbyGroundBackpack =
+          !this.lookingAtBench && !this.nearbyBrokenElectronic && !this.holdRepair.isActive()
+            ? (() => {
+                const cand = this.worldBackpacks.findInteractable(this.camera.position, this._lookDir, 3.05);
+                return cand ? { id: cand.id, label: cand.name, itemCount: cand.itemCount } : null;
+              })()
+            : null;
+        this.nearbyLiveRound =
+          !this.lookingAtBench &&
+          !this.nearbyBrokenElectronic &&
+          !this.nearbyGroundBackpack &&
+          !this.holdRepair.isActive()
+            ? this.ejectedLiveRounds.findLookedAtPickup(this.camera.position, this._lookDir)
+            : null;
       } else {
         this.lookingAtBench = false;
         this.nearbyBrokenElectronic = null;
+        this.nearbyGroundBackpack = null;
+        this.nearbyLiveRound = null;
       }
     } else {
+      this.nearbyGroundBackpack = null;
+      this.nearbyLiveRound = null;
       this.controller.setGrenadeTension(0, false, 'underhand');
       if (this.pdaDevice.isOpen()) {
         this.pdaDevice.setOpen(false);
@@ -2584,6 +3143,7 @@ export class GymEngine {
         );
       },
     );
+    this.ejectedLiveRounds.update(dt, this.adapter, undefined, this.audio);
     const wasLiveBefore = this.grenadeSystem.isLeverReleased();
     this.grenadeSystem.update(dt, this.camera.position);
     const launched = this.grenadeSystem.consumeLastLaunchedThrow();
@@ -2788,11 +3348,28 @@ export class GymEngine {
         const repairState = this.holdRepair.getState();
         if (repairState) return `Repairing ${repairState.label}`;
         if (this.nearbyBrokenElectronic) {
-          return `Hold [F] Repair ${this.nearbyBrokenElectronic.label}`;
+          return `Hold [${keybindStore.getLabel('interact')}] Repair ${this.nearbyBrokenElectronic.label}`;
+        }
+        if (this.nearbyGroundBackpack) {
+          return `[${keybindStore.getLabel('interact')}] Open ${this.nearbyGroundBackpack.label} (${this.nearbyGroundBackpack.itemCount} items)`;
+        }
+        if (this.nearbyLiveRound) {
+          return `[${keybindStore.getLabel('interact')}] Pick up 1x ${this.nearbyLiveRound.caliberLabel} Round`;
         }
         return null;
       })(),
       repairProgress: this.holdRepair.getState()?.progress01 ?? 0,
+      ammoReserve:
+        prof.holdClass === 'unarmed'
+          ? 0
+          : (() => {
+              const res = countCompatibleReserveRounds(this.tacticalInventory, prof.id);
+              return res.rigAndBeltRounds + res.backpackRounds;
+            })(),
+      inventoryOpen: this.inventoryOpen,
+      tacticalInventory: this.tacticalInventory,
+      externalLoot: this.activeExternalLoot,
+      encumbrance: this.encumbrance,
     };
   }
 
@@ -2819,6 +3396,8 @@ export class GymEngine {
     this.pdaDevice.dispose();
     this.physicsProps.dispose();
     this.grenadeSystem.dispose();
+    this.ejectedLiveRounds.dispose();
+    this.worldBackpacks.dispose();
     this.ballistics.dispose();
     this.scopeRenderer.dispose();
     this.weaponRig.dispose();

@@ -10,6 +10,7 @@ import {
   VALID_SYNCED_HANDLING_ACTIONS,
 } from '../data/multiplayer';
 import { isTacticalEquipmentId } from '../data/tacticalEquipment';
+import { isBackpackTemplateId } from '../src/modes/openworld/inventory/TetrisInventoryCore';
 
 export interface CachedMatchState {
   powerOn: boolean;
@@ -77,6 +78,9 @@ const ALLOWED_GAME_TYPES = new Set<string>([
   'game:mortar_fire_request',
   'game:mortar_crew_damage',
   'game:fire_support_request',
+  'game:backpack_drop',
+  'game:backpack_sync',
+  'game:backpack_pickup',
 ]);
 
 const VALID_DOOR_ACTIONS = new Set<string>([
@@ -266,6 +270,7 @@ export function validateAndSanitizeGameMessage(
     safePayload.pointAimBlend = Number(
       clampFinite(parsed.pointAimBlend, 0, 1, safePayload.isPointAim ? 1 : 0).toFixed(3),
     );
+    safePayload.focus = Number(clampFinite(parsed.focus, 0, 1, 0).toFixed(3));
     safePayload.isFiring = Boolean(parsed.isFiring);
     safePayload.isReloading = Boolean(parsed.isReloading);
     safePayload.fireSeq = Math.floor(clampFinite(parsed.fireSeq, 0, 1_000_000, 0));
@@ -312,6 +317,13 @@ export function validateAndSanitizeGameMessage(
       parsed.eyewear === 'tinted_visor'
     ) {
       safePayload.eyewear = parsed.eyewear;
+    }
+    if (parsed.bp === null) {
+      safePayload.bp = null;
+    } else if (isBackpackTemplateId(parsed.bp)) {
+      safePayload.bp = parsed.bp;
+    } else {
+      delete safePayload.bp;
     }
     safePayload.lean = Number(clampFinite(parsed.lean, -1, 1, 0).toFixed(2));
     safePayload.weaponId = String(parsed.weaponId ?? 'm4a1').slice(0, 40);
@@ -1122,6 +1134,47 @@ export function validateAndSanitizeGameMessage(
     safePayload.seed = Math.floor(clampFinite(parsed.seed, 0, 2_147_483_647, 1));
     safePayload.totalDurationSec = Number(clampFinite(parsed.totalDurationSec, 2, 30, 8.5).toFixed(3));
     safePayload.dangerClose = Boolean(parsed.dangerClose);
+  } else if (type === 'game:backpack_drop') {
+    const containerId = String(parsed.containerId ?? '').trim().slice(0, 64);
+    const bp = parsed.backpack as Record<string, unknown> | null | undefined;
+    if (
+      !containerId ||
+      !bp ||
+      typeof bp !== 'object' ||
+      bp.kind !== 'backpack' ||
+      !isBackpackTemplateId(bp.templateId) ||
+      !isFiniteCoord(parsed.x) ||
+      !isFiniteCoord(parsed.y) ||
+      !isFiniteCoord(parsed.z)
+    ) {
+      return null;
+    }
+    safePayload.containerId = containerId;
+    safePayload.x = Number(parsed.x.toFixed(3));
+    safePayload.y = Number(parsed.y.toFixed(3));
+    safePayload.z = Number(parsed.z.toFixed(3));
+    safePayload.yaw = Number(clampFinite(parsed.yaw, -100, 100, 0).toFixed(4));
+    safePayload.ownerLabel =
+      typeof parsed.ownerLabel === 'string' ? parsed.ownerLabel.slice(0, 40) : null;
+    safePayload.backpack = bp;
+  } else if (type === 'game:backpack_sync') {
+    const containerId = String(parsed.containerId ?? '').trim().slice(0, 64);
+    const bp = parsed.backpack as Record<string, unknown> | null | undefined;
+    if (
+      !containerId ||
+      !bp ||
+      typeof bp !== 'object' ||
+      bp.kind !== 'backpack' ||
+      !isBackpackTemplateId(bp.templateId)
+    ) {
+      return null;
+    }
+    safePayload.containerId = containerId;
+    safePayload.backpack = bp;
+  } else if (type === 'game:backpack_pickup') {
+    const containerId = String(parsed.containerId ?? '').trim().slice(0, 64);
+    if (!containerId) return null;
+    safePayload.containerId = containerId;
   }
 
   return {

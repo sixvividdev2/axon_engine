@@ -361,6 +361,22 @@ class HideoutStateStore {
     return taken;
   }
 
+  public addReserve(weaponId: string, rounds: number): number {
+    if (weaponId === 'unarmed' || rounds <= 0) return 0;
+    const prof = resolveWeaponProfile(weaponId);
+    const calId = resolveBaseCaliberId(prof.defaultCaliberId);
+    const avail = this.state.ammoReserve[calId] ?? getDefaultReserveForCaliber(calId);
+    this.state = {
+      ...this.state,
+      ammoReserve: {
+        ...this.state.ammoReserve,
+        [calId]: avail + rounds,
+      },
+    };
+    this.saveAndEmit();
+    return rounds;
+  }
+
   public resupplyAllAmmo(): void {
     const nextReserve: Record<string, number> = { ...DEFAULT_RESERVE_BY_CALIBER };
     for (const calId of Object.keys(this.state.ammoReserve)) {

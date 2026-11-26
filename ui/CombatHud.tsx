@@ -36,6 +36,17 @@ import { ControlsSettingsTab } from './ControlsSettingsTab';
 import { HeartRateIndicator } from './HeartRateIndicator';
 import { KillfeedOverlay } from './KillfeedOverlay';
 import { MortarSightOverlay } from './MortarSightOverlay';
+import {
+  InventoryScoreboardData,
+  InventoryScoreboardRow,
+  TacticalInventoryModal,
+} from '../src/modes/openworld/ui/TacticalInventoryModal';
+import type {
+  CorpseTacticalLootSnapshot,
+  ItemSourceLocator,
+  MedicalItem,
+  OperatorTacticalInventory,
+} from '../src/modes/openworld/inventory/TetrisInventoryTypes';
 
 const HUD_SLIDE_TRANSITION = { duration: 0.26, ease: [0.22, 1, 0.36, 1] as const };
 const MODAL_TRANSITION = { duration: 0.22, ease: [0.22, 1, 0.36, 1] as const };
@@ -77,6 +88,22 @@ interface CombatHudProps {
   onConfirmConquestRedeploy?: () => void;
   onCycleSpectateTarget?: (dir: 1 | -1) => void;
   onToggleSpectateOverview?: () => void;
+  onCloseInventory?: () => void;
+  onMutateInventory?: (
+    nextInv: OperatorTacticalInventory,
+    nextExternal?: CorpseTacticalLootSnapshot | null,
+    statusNote?: string,
+  ) => void;
+  onTriggerDragReload?: (
+    weaponSlotKey: 'primary' | 'secondary',
+    sourceLocator: ItemSourceLocator,
+  ) => void;
+  onUseMedicalItem?: (locator: ItemSourceLocator, med: MedicalItem) => void;
+  onDropEquippedBackpack?: () => void;
+  onEquipGroundBackpack?: (
+    containerId: string,
+  ) => { ok: boolean; error?: string; requiresUnequipFirst?: boolean };
+  onMagPackTickAudio?: () => void;
   onRematch: () => void;
   onLaunchTutorial?: () => void;
   onReturnToMenu: (tab?: 'battle' | 'infection') => void;
@@ -117,6 +144,13 @@ export const CombatHud: React.FC<CombatHudProps> = ({
   onConfirmConquestRedeploy,
   onCycleSpectateTarget,
   onToggleSpectateOverview,
+  onCloseInventory,
+  onMutateInventory,
+  onTriggerDragReload,
+  onUseMedicalItem,
+  onDropEquippedBackpack,
+  onEquipGroundBackpack,
+  onMagPackTickAudio,
   onRematch,
   onLaunchTutorial,
   onReturnToMenu,
@@ -164,10 +198,85 @@ export const CombatHud: React.FC<CombatHudProps> = ({
   const paused =
     !snapshot.pointerLocked &&
     !snapshot.tunerOpen &&
+    !snapshot.inventoryOpen &&
     !snapshot.gameOver &&
     !conquestRedeployOpen &&
     !conquestSpectatingActive &&
     snapshot.matchOutcome === 'active';
+
+  const inventoryScoreboard: InventoryScoreboardData = isBattle
+    ? {
+        mode: 'battle',
+        title: formatBattleRuleName(snapshot.battleRule),
+        mapName: snapshot.mapName,
+        targetLabel: `Target ${modeHud?.scoreLimit ?? snapshot.killLimit}`,
+        scoreColumnLabel: isKillConfirmedRule(snapshot.battleRule)
+          ? 'Enemy / Friendly Tags'
+          : snapshot.battleRule === 'conquest'
+            ? 'Captures'
+            : snapshot.battleRule === 'ctf'
+              ? 'Caps / Rets'
+              : snapshot.battleRule === 'koth'
+                ? 'Hill Time'
+                : 'Score',
+        battleRule: snapshot.battleRule,
+        rows: snapshot.scoreboard.map(
+          (row): InventoryScoreboardRow => ({
+            id: row.id,
+            name: row.name,
+            team: row.team,
+            kills: row.kills,
+            deaths: row.deaths,
+            isPlayer: row.isPlayer,
+            enemyDogtags: row.enemyDogtags,
+            friendlyDogtags: row.friendlyDogtags,
+            poiCaptures: row.poiCaptures,
+            territoryPoints: row.territoryPoints,
+            flagCaptures: row.flagCaptures,
+            flagReturns: row.flagReturns,
+            hillControlSec: row.hillControlSec,
+            conquestEliminated: row.conquestEliminated,
+            conquestLivesRemaining: row.conquestLivesRemaining,
+          }),
+        ),
+      }
+    : {
+        mode: 'infection',
+        title: 'Infection Survival',
+        mapName: snapshot.mapName,
+        targetLabel: `Round ${snapshot.roundState.round}`,
+        scoreColumnLabel: 'Points',
+        round: snapshot.roundState.round,
+        rows: [
+          {
+            id: 'local-player',
+            name: multiplayerSession?.localPlayerName ?? 'YOU',
+            team: 'SQUAD',
+            kills: snapshot.playerKills,
+            deaths: snapshot.playerDeaths,
+            points: snapshot.points,
+            isPlayer: true,
+          },
+          ...snapshot.infectionSquadBots.map(
+            (bot): InventoryScoreboardRow => ({
+              id: bot.id,
+              name: bot.name,
+              team: 'SQUAD',
+              kills: bot.kills,
+              deaths: 0,
+              points: bot.kills * 100,
+              isPlayer: false,
+            }),
+          ),
+        ],
+      };
+
+  const encumbrance = snapshot.encumbrance;
+  const showEncumbranceBadge =
+    showMatchHud &&
+    snapshot.playerAlive &&
+    !snapshot.inventoryOpen &&
+    (encumbrance.tier === 'heavy' || encumbrance.tier === 'overloaded');
 
   return (
     <MotionConfig reducedMotion="user">
@@ -2271,6 +2380,52 @@ export const CombatHud: React.FC<CombatHudProps> = ({
           </motion.div>
         )}
       </AnimatePresence>
+
+      {/* === LIVE ENCUMBRANCE WARNING BADGE === */}
+      {showEncumbranceBadge && (
+        <div
+          className={`fixed bottom-24 left-5 z-20 flex items-center gap-2 border px-2.5 py-1 font-mono-tabular text-[10px] font-semibold uppercase tracking-wider ${
+            encumbrance.tier === 'overloaded'
+              ? 'border-red-500/80 bg-red-950/90 text-red-200'
+              : 'border-amber-500/70 bg-amber-950/88 text-amber-200'
+          }`}
+        >
+          <span>
+            {encumbrance.totalWeightKg.toFixed(1)}/{encumbrance.maxKg.toFixed(0)} KG
+          </span>
+          <span className="opacity-60">·</span>
+          <span>{encumbrance.tier === 'overloaded' ? 'OVERLOADED · NO SPRINT' : 'HEAVY LOAD'}</span>
+        </div>
+      )}
+
+      {/* === UNIFIED TACTICAL INVENTORY & MATCH SCOREBOARD MODAL (TAB) === */}
+      {snapshot.inventoryOpen &&
+        snapshot.matchOutcome === 'active' &&
+        !snapshot.gameOver && (
+          <TacticalInventoryModal
+            inventory={snapshot.tacticalInventory}
+            externalLoot={snapshot.externalLoot}
+            playerHp={snapshot.hp}
+            maxHp={snapshot.maxHp}
+            bleeding={false}
+            sprintSlow={!snapshot.encumbrance.canSprint}
+            modeLabel={isBattle ? 'Battle' : 'Infection'}
+            showSecureContainer={false}
+            scoreboard={inventoryScoreboard}
+            initialTab={snapshot.inventoryInitialTab}
+            onMutateInventory={(nextInv, nextExternal, statusNote) =>
+              onMutateInventory?.(nextInv, nextExternal, statusNote)
+            }
+            onTriggerDragReload={(slotKey, locator) =>
+              onTriggerDragReload?.(slotKey, locator)
+            }
+            onUseMedicalItem={(locator, med) => onUseMedicalItem?.(locator, med)}
+            onDropEquippedBackpack={onDropEquippedBackpack}
+            onEquipGroundBackpack={onEquipGroundBackpack}
+            onMagPackTickAudio={onMagPackTickAudio}
+            onClose={() => onCloseInventory?.()}
+          />
+        )}
     </div>
     </MotionConfig>
   );

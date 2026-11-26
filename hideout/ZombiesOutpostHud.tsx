@@ -8,6 +8,13 @@ import {
 } from '../data/graphicsQuality';
 import type { ZombiesLobbySnapshot } from './ZombiesLobbyController';
 import { openGameSettings } from '../data/gameSettingsStore';
+import { TacticalInventoryModal } from '../src/modes/openworld/ui/TacticalInventoryModal';
+import type {
+  CorpseTacticalLootSnapshot,
+  ItemSourceLocator,
+  MedicalItem,
+  OperatorTacticalInventory,
+} from '../src/modes/openworld/inventory/TetrisInventoryTypes';
 
 interface ZombiesOutpostHudProps {
   snapshot: ZombiesLobbySnapshot;
@@ -20,6 +27,23 @@ interface ZombiesOutpostHudProps {
   onLaunchTutorial?: () => void;
   onVolumeChange: (volume: number) => void;
   onGraphicsChange: (quality: GraphicsQualityId) => void;
+  onCloseInventory?: () => void;
+  onMutateInventory?: (
+    nextInv: OperatorTacticalInventory,
+    nextExternal?: CorpseTacticalLootSnapshot | null,
+    statusNote?: string,
+  ) => void;
+  onTriggerDragReload?: (
+    weaponSlotKey: 'primary' | 'secondary',
+    sourceLocator: ItemSourceLocator,
+  ) => void;
+  onUseMedicalItem?: (locator: ItemSourceLocator, med: MedicalItem) => void;
+  onDropEquippedBackpack?: () => void;
+  onEquipGroundBackpack?: (
+    containerId: string,
+  ) => { ok: boolean; error?: string; requiresUnequipFirst?: boolean };
+  onRestockBenchAmmo?: () => void;
+  onMagPackTickAudio?: () => void;
 }
 
 /**
@@ -37,11 +61,24 @@ export const ZombiesOutpostHud: React.FC<ZombiesOutpostHudProps> = ({
   onLaunchTutorial,
   onVolumeChange,
   onGraphicsChange,
+  onCloseInventory,
+  onMutateInventory,
+  onTriggerDragReload,
+  onUseMedicalItem,
+  onDropEquippedBackpack,
+  onEquipGroundBackpack,
+  onRestockBenchAmmo,
+  onMagPackTickAudio,
 }) => {
   const [graphicsQuality, setGraphicsQuality] = useGraphicsQuality();
-  const showLiveHud = snapshot.pointerLocked && !snapshot.pauseOpen && !modalOpen;
-  const showEntryPrompt = !snapshot.pointerLocked && !snapshot.pauseOpen && !modalOpen;
-  const showPauseMenu = snapshot.pauseOpen && !modalOpen;
+  const showLiveHud =
+    snapshot.pointerLocked && !snapshot.pauseOpen && !modalOpen && !snapshot.inventoryOpen;
+  const showEntryPrompt =
+    !snapshot.pointerLocked && !snapshot.pauseOpen && !modalOpen && !snapshot.inventoryOpen;
+  const showPauseMenu = snapshot.pauseOpen && !modalOpen && !snapshot.inventoryOpen;
+  const encumbrance = snapshot.encumbrance;
+  const showEncumbranceBadge =
+    showLiveHud && (encumbrance.tier === 'heavy' || encumbrance.tier === 'overloaded');
 
   return (
     <div className="pointer-events-none fixed inset-0 z-10 select-none">
@@ -274,6 +311,46 @@ export const ZombiesOutpostHud: React.FC<ZombiesOutpostHudProps> = ({
             </div>
           </div>
         </div>
+      )}
+
+      {showEncumbranceBadge && (
+        <div
+          className={`fixed bottom-20 left-6 z-20 flex items-center gap-2 border px-2.5 py-1 font-mono-tabular text-[10px] font-semibold uppercase tracking-wider ${
+            encumbrance.tier === 'overloaded'
+              ? 'border-red-500/80 bg-red-950/90 text-red-200'
+              : 'border-amber-500/70 bg-amber-950/88 text-amber-200'
+          }`}
+        >
+          <span>
+            {encumbrance.totalWeightKg.toFixed(1)}/{encumbrance.maxKg.toFixed(0)} KG
+          </span>
+          <span className="opacity-60">·</span>
+          <span>{encumbrance.tier === 'overloaded' ? 'OVERLOADED · NO SPRINT' : 'HEAVY LOAD'}</span>
+        </div>
+      )}
+
+      {snapshot.inventoryOpen && !modalOpen && (
+        <TacticalInventoryModal
+          inventory={snapshot.tacticalInventory}
+          externalLoot={snapshot.externalLoot}
+          playerHp={100}
+          maxHp={100}
+          bleeding={false}
+          sprintSlow={!snapshot.encumbrance.canSprint}
+          modeLabel="Quarantine Outpost"
+          showSecureContainer={false}
+          allowInstantMagPack={true}
+          onMutateInventory={(nextInv, nextExternal, statusNote) =>
+            onMutateInventory?.(nextInv, nextExternal, statusNote)
+          }
+          onTriggerDragReload={(slotKey, locator) => onTriggerDragReload?.(slotKey, locator)}
+          onUseMedicalItem={(locator, med) => onUseMedicalItem?.(locator, med)}
+          onDropEquippedBackpack={onDropEquippedBackpack}
+          onEquipGroundBackpack={onEquipGroundBackpack}
+          onRestockBenchAmmo={onRestockBenchAmmo}
+          onMagPackTickAudio={onMagPackTickAudio}
+          onClose={() => onCloseInventory?.()}
+        />
       )}
     </div>
   );

@@ -27,6 +27,7 @@ import {
   IBodycamWorldAdapter,
 } from './types';
 import { WeaponRig } from './WeaponRig';
+import { WeaponChamberCycleOptions } from './weapons/WeaponAnimator';
 
 export type BodycamCombatMove =
   | 'NONE'
@@ -451,6 +452,15 @@ export class CharacterAnimator {
     return this.weaponRig.triggerInspect();
   }
 
+  public triggerChamberCycle(opts: WeaponChamberCycleOptions): boolean {
+    if (this.combatMove !== 'NONE') return false;
+    return this.weaponRig.triggerChamberCycle(opts);
+  }
+
+  public isChamberCycling(): boolean {
+    return this.weaponRig.isChamberCycling();
+  }
+
   public interruptInspect(): void {
     this.weaponRig.interruptInspect();
   }
@@ -663,6 +673,10 @@ export class CharacterAnimator {
       return ph !== 'OPEN_BREECH' && ph !== 'CLOSE_BREECH';
     }
     const act = anim.getActiveAction();
+    if (act === 'CHAMBER_CYCLE' && isFirearm) {
+      const style = anim.getChamberCycleStyle();
+      return style !== 'pump_shotgun' && style !== 'bolt_action';
+    }
     return (
       isFirearm &&
       (act === 'RELOAD' ||
@@ -913,6 +927,13 @@ export class CharacterAnimator {
       protract + rightClavProtract + leanFollowR + rigState.aimYaw * 0.20 * clavAimWeight,
       clavElevPitch * 0.12 * clavAimWeight,
     );
+
+    // 1P Neck & Head Free-Zoom forward shift parity (matches 3P operator forward crane & shadow silhouette)
+    const focus1P = THREE.MathUtils.clamp(controller.focusBlend, 0, 1);
+    this.skeleton.neck.position.set(0, 0.13 - focus1P * 0.003, 0.015 - focus1P * 0.010);
+    this.skeleton.neck.rotation.set(-focus1P * 0.22, 0, 0);
+    this.skeleton.headGroup.position.set(0, 0.09 - focus1P * 0.004, -focus1P * 0.018);
+    this.skeleton.headGroup.rotation.set(focus1P * 0.16, 0, 0);
 
     this.skeleton.root.updateMatrixWorld(true);
     this._rootWorldQuatInv.copy(this.skeleton.root.quaternion).invert();
@@ -3183,6 +3204,44 @@ export class CharacterAnimator {
         const fromPt = arSlap ? this._magWellRoot : this._boltRackRoot;
         this._lDesiredRoot.copy(fromPt).lerp(this._tmpWorldB, t);
         leftGripCurl = THREE.MathUtils.lerp(0.85, spec.leftHandSocket?.gripCurl ?? 0.85, t);
+      }
+    } else if (weaponAction === 'CHAMBER_CYCLE' && isFirearm) {
+      // Manual Chamber Cycling (`Y`) Left-Hand IK:
+      //  - pump_shotgun: left hand remains welded 1:1 to moving pumpForend (no override needed)
+      //  - bolt_action: right hand tracks boltHandleSocket via boltHandW while left hand supports forend
+      //  - pistol_slide / ar_charging_handle / ak_side_bolt / mp5_cocking_tube / revolver_cylinder:
+      //    left hand reaches physical slide/charging handle, pinches & pulls rearward with live travel, then returns cleanly.
+      const style = anim.getChamberCycleStyle();
+      if (style !== 'pump_shotgun' && style !== 'bolt_action') {
+        leftOverridden = true;
+        const p = anim.getActionProgress();
+        this.weaponRig.boltRackAnchor.getWorldPosition(this._boltRackRoot);
+        this.skeleton.root.worldToLocal(this._boltRackRoot);
+
+        const travelZ = anim.getManualBoltPull01() * (weaponAsm?.slideTravelZ ?? 0.062);
+        this.weaponRig.weaponPivot.getWorldQuaternion(this._inspectWeaponQuat);
+        this._inspectSlideWorld
+          .set(0, style === 'pistol_slide' ? 0.008 : 0, travelZ)
+          .applyQuaternion(this._inspectWeaponQuat);
+        this._inspectSlideWorld.applyQuaternion(this._rootWorldQuatInv);
+        this._tmpWorldB.copy(this._boltRackRoot).add(this._inspectSlideWorld);
+
+        if (p < 0.22) {
+          const reachT = smoothstep(0.0, 0.22, p);
+          this._lDesiredRoot.lerp(this._tmpWorldB, reachT);
+          leftGripCurl = THREE.MathUtils.lerp(spec.leftHandSocket?.gripCurl ?? 0.85, 0.72, reachT);
+          leftPinchPose01 = reachT * 0.65;
+        } else if (p < 0.76) {
+          this._lDesiredRoot.copy(this._tmpWorldB);
+          const gripW = p < 0.60 ? 1.0 : 1 - smoothstep(0.60, 0.74, p);
+          leftGripCurl = THREE.MathUtils.lerp(0.62, 0.90, gripW);
+          leftPinchPose01 = style === 'ar_charging_handle' || style === 'pistol_slide' ? 0.85 * gripW : 0.45 * gripW;
+        } else {
+          const retT = smoothstep(0.76, 1.0, p);
+          this._tmpWorldA.copy(this._lDesiredRoot);
+          this._lDesiredRoot.copy(this._boltRackRoot).lerp(this._tmpWorldA, retT);
+          leftGripCurl = THREE.MathUtils.lerp(0.68, spec.leftHandSocket?.gripCurl ?? 0.85, retT);
+        }
       }
     } else if (anim.isTubularReloading() && isFirearm) {
       // Shell-by-shell tubular shotgun reload IK:

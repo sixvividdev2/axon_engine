@@ -10,6 +10,13 @@ import {
 } from 'lucide-react';
 import { openGameSettings } from '../data/gameSettingsStore';
 import { formatInputCodeLabel, KeybindActionId, useKeybinds } from '../data/keybindStore';
+import { TacticalInventoryModal } from '../src/modes/openworld/ui/TacticalInventoryModal';
+import type {
+  CorpseTacticalLootSnapshot,
+  ItemSourceLocator,
+  MedicalItem,
+  OperatorTacticalInventory,
+} from '../src/modes/openworld/inventory/TetrisInventoryTypes';
 import { TUTORIAL_STEPS, TutorialStepId } from './TutorialCourseLogic';
 import type { TutorialSnapshot } from './TutorialEngine';
 
@@ -22,6 +29,23 @@ interface TutorialHudProps {
   onRestart: () => void;
   onVolumeChange: (vol: number) => void;
   onExit: () => void;
+  onCloseInventory?: () => void;
+  onMutateInventory?: (
+    nextInv: OperatorTacticalInventory,
+    nextExternal?: CorpseTacticalLootSnapshot | null,
+    statusNote?: string,
+  ) => void;
+  onTriggerDragReload?: (
+    weaponSlotKey: 'primary' | 'secondary',
+    sourceLocator: ItemSourceLocator,
+  ) => void;
+  onUseMedicalItem?: (locator: ItemSourceLocator, med: MedicalItem) => void;
+  onDropEquippedBackpack?: () => void;
+  onEquipGroundBackpack?: (
+    containerId: string,
+  ) => { ok: boolean; error?: string; requiresUnequipFirst?: boolean };
+  onRestockBenchAmmo?: () => void;
+  onMagPackTickAudio?: () => void;
 }
 
 function formatTimer(sec: number): string {
@@ -40,6 +64,14 @@ export const TutorialHud: React.FC<TutorialHudProps> = ({
   onRestart,
   onVolumeChange,
   onExit,
+  onCloseInventory,
+  onMutateInventory,
+  onTriggerDragReload,
+  onUseMedicalItem,
+  onDropEquippedBackpack,
+  onEquipGroundBackpack,
+  onRestockBenchAmmo,
+  onMagPackTickAudio,
 }) => {
   const keybinds = useKeybinds();
   const k = (action: KeybindActionId) => formatInputCodeLabel(keybinds.bindings[action]);
@@ -116,10 +148,19 @@ export const TutorialHud: React.FC<TutorialHudProps> = ({
     }
   };
 
-  const { course } = snapshot;
+  const { course, encumbrance } = snapshot;
   const { activeStep } = course;
-  const showStartGate = !snapshot.pointerLocked && !snapshot.pauseOpen && !course.courseComplete;
-  const showPause = snapshot.pauseOpen && !course.courseComplete;
+  const showStartGate =
+    !snapshot.pointerLocked &&
+    !snapshot.pauseOpen &&
+    !snapshot.inventoryOpen &&
+    !course.courseComplete;
+  const showPause = snapshot.pauseOpen && !snapshot.inventoryOpen && !course.courseComplete;
+  const showEncumbranceBadge =
+    snapshot.pointerLocked &&
+    !snapshot.inventoryOpen &&
+    !course.courseComplete &&
+    (encumbrance.tier === 'heavy' || encumbrance.tier === 'overloaded');
 
   return (
     <div className="pointer-events-none fixed inset-0 z-20 select-none text-neutral-100">
@@ -197,13 +238,17 @@ export const TutorialHud: React.FC<TutorialHudProps> = ({
           <div className="font-semibold text-neutral-50">{snapshot.equippedWeaponName}</div>
           <div className="mt-0.5 text-[11px] text-neutral-400">
             {snapshot.magCapacity > 0
-              ? `${snapshot.ammoInMag} / ${snapshot.magCapacity} · ${snapshot.fireModeLabel}`
+              ? `${snapshot.ammoInMag} / ${snapshot.magCapacity} (+${snapshot.ammoReserve}) · ${snapshot.fireModeLabel}`
               : 'Melee'}
             {' · '}
             Grenades {snapshot.grenadeCount}
             {snapshot.nvgActive ? ' · NVG ON' : ''}
             {snapshot.flashlightOn ? ' · Light' : ''}
             {snapshot.laserOn ? ' · Laser' : ''}
+          </div>
+          <div className="mt-0.5 text-[10px] text-neutral-500">
+            [{k('scoreboard_inventory')}] Tactical Gear · {encumbrance.totalWeightKg.toFixed(1)}/
+            {encumbrance.maxKg.toFixed(0)} KG
           </div>
         </div>
       )}
@@ -271,6 +316,16 @@ export const TutorialHud: React.FC<TutorialHudProps> = ({
           </ul>
         </div>
       )}
+
+      {/* Simple World Interact Prompt (Ground Backpacks & Recovered Live Rounds) */}
+      {snapshot.pointerLocked &&
+        !snapshot.repairState &&
+        !snapshot.doorPromptState &&
+        snapshot.doorPrompt && (
+          <div className="fixed bottom-24 left-1/2 -translate-x-1/2 border border-amber-400/45 bg-[#0d1014]/94 px-4 py-1.5 font-mono-tabular text-xs font-medium text-amber-100 shadow-xl">
+            {snapshot.doorPrompt}
+          </div>
+        )}
 
       {/* Action Feedback Toast */}
       {snapshot.toastMessage && snapshot.pointerLocked && (
@@ -493,6 +548,45 @@ export const TutorialHud: React.FC<TutorialHudProps> = ({
             </div>
           </div>
         </div>
+      )}
+      {showEncumbranceBadge && (
+        <div
+          className={`fixed bottom-14 left-4 z-20 flex items-center gap-2 border px-2.5 py-1 font-mono-tabular text-[10px] font-semibold uppercase tracking-wider ${
+            encumbrance.tier === 'overloaded'
+              ? 'border-red-500/80 bg-red-950/90 text-red-200'
+              : 'border-amber-500/70 bg-amber-950/88 text-amber-200'
+          }`}
+        >
+          <span>
+            {encumbrance.totalWeightKg.toFixed(1)}/{encumbrance.maxKg.toFixed(0)} KG
+          </span>
+          <span className="opacity-60">·</span>
+          <span>{encumbrance.tier === 'overloaded' ? 'OVERLOADED · NO SPRINT' : 'HEAVY LOAD'}</span>
+        </div>
+      )}
+
+      {snapshot.inventoryOpen && !course.courseComplete && (
+        <TacticalInventoryModal
+          inventory={snapshot.tacticalInventory}
+          externalLoot={snapshot.externalLoot}
+          playerHp={100}
+          maxHp={100}
+          bleeding={false}
+          sprintSlow={!encumbrance.canSprint}
+          modeLabel="Field Training"
+          showSecureContainer={false}
+          allowInstantMagPack={true}
+          onMutateInventory={(nextInv, nextExternal, statusNote) =>
+            onMutateInventory?.(nextInv, nextExternal, statusNote)
+          }
+          onTriggerDragReload={(slotKey, locator) => onTriggerDragReload?.(slotKey, locator)}
+          onUseMedicalItem={(locator, med) => onUseMedicalItem?.(locator, med)}
+          onDropEquippedBackpack={onDropEquippedBackpack}
+          onEquipGroundBackpack={onEquipGroundBackpack}
+          onRestockBenchAmmo={onRestockBenchAmmo}
+          onMagPackTickAudio={onMagPackTickAudio}
+          onClose={() => onCloseInventory?.()}
+        />
       )}
     </div>
   );

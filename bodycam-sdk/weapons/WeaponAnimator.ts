@@ -26,6 +26,7 @@ export type WeaponPoseStateId =
   | 'Reload'
   | 'MagCheck'
   | 'Inspect'
+  | 'ChamberCycle'
   | 'SuppressorToggle';
 
 export type WeaponMechanicalAction =
@@ -33,6 +34,7 @@ export type WeaponMechanicalAction =
   | 'RELOAD'
   | 'MAG_CHECK'
   | 'INSPECT'
+  | 'CHAMBER_CYCLE'
   | 'SUPPRESSOR_ATTACH'
   | 'SUPPRESSOR_DETACH';
 
@@ -76,7 +78,28 @@ export type WeaponSyncedHandlingAction =
   | 'SELECTOR'
   | 'LIGHT_PAD'
   | 'MAG_CHECK'
-  | 'INSPECT';
+  | 'INSPECT'
+  | 'CHAMBER_CYCLE';
+
+export type ChamberCyclePlatformStyle =
+  | 'pistol_slide'
+  | 'ar_charging_handle'
+  | 'ak_side_bolt'
+  | 'mp5_cocking_tube'
+  | 'pump_shotgun'
+  | 'bolt_action'
+  | 'revolver_cylinder';
+
+export interface WeaponChamberCycleOptions {
+  /** True when a live round is chambered and should extract at the apex of the stroke */
+  hasLiveRound: boolean;
+  /** Fired once at the physical extraction apex with live world transform of the ejection port */
+  onExtractApex?: (ejectionPos: THREE.Vector3, ejectionQuat: THREE.Quaternion) => void;
+  /** Optional callback fired when the chamber cycle returns to battery */
+  onComplete?: () => void;
+  /** Optional explicit duration override in seconds */
+  durationSec?: number;
+}
 
 export type TubularReloadPhase =
   | 'NONE'
@@ -497,6 +520,21 @@ export class WeaponAnimator {
   private readonly _tmpEuler = new THREE.Euler(0, 0, 0, 'YXZ');
   private readonly _cueOpts: BodycamWeaponCueOptions = {};
 
+  // Manual Chamber Cycling (`Y`) state
+  private chamberCycleStyle: ChamberCyclePlatformStyle = 'ar_charging_handle';
+  private chamberCycleHasLiveRound = false;
+  private chamberCycleOpenCueFired = false;
+  private chamberCycleExtractFired = false;
+  private chamberCycleCloseCueFired = false;
+  private chamberCyclePump01 = 0;
+  private chamberCycleBoltRotZ = 0;
+  private chamberCycleOnExtractApex:
+    | ((ejectionPos: THREE.Vector3, ejectionQuat: THREE.Quaternion) => void)
+    | null = null;
+  private chamberCycleOnComplete: (() => void) | null = null;
+  private readonly _chamberEjectPos = new THREE.Vector3();
+  private readonly _chamberEjectQuat = new THREE.Quaternion();
+
   constructor(scene: THREE.Scene, audio?: IBodycamAudioSource) {
     this.scene = scene;
     this.audio = audio;
@@ -656,7 +694,27 @@ export class WeaponAnimator {
     return this.boltCycleTimer >= 0;
   }
 
+  public isChamberCycling(): boolean {
+    return this.action === 'CHAMBER_CYCLE';
+  }
+
+  public getChamberCycleStyle(): ChamberCyclePlatformStyle {
+    return this.chamberCycleStyle;
+  }
+
+  public getChamberCycleProgress(): number {
+    return this.action === 'CHAMBER_CYCLE' ? this.getActionProgress() : 0;
+  }
+
+  public getManualBoltPull01(): number {
+    return this.manualBoltPull01;
+  }
+
   public getBoltRightHandBlend(): number {
+    if (this.action === 'CHAMBER_CYCLE' && this.chamberCycleStyle === 'bolt_action') {
+      const p = this.getActionProgress();
+      return smoothstep(0.08, 0.22, p) * (1 - smoothstep(0.80, 0.94, p));
+    }
     return this.boltRightHandBlend;
   }
 
@@ -837,6 +895,7 @@ export class WeaponAnimator {
   public isBlockingFiringAction(): boolean {
     return (
       this.action === 'RELOAD' ||
+      this.action === 'CHAMBER_CYCLE' ||
       this.action === 'SUPPRESSOR_ATTACH' ||
       this.action === 'SUPPRESSOR_DETACH' ||
       this.boltCycleTimer >= 0 ||
@@ -883,6 +942,11 @@ export class WeaponAnimator {
     if (this.pumpCycleTimer >= 0) {
       snap.action = 'PUMP';
       snap.progress = this.getPumpCycleProgress();
+      return snap;
+    }
+    if (this.action === 'CHAMBER_CYCLE') {
+      snap.action = 'CHAMBER_CYCLE';
+      snap.progress = this.getActionProgress();
       return snap;
     }
     if (this.action === 'MAG_CHECK') {
@@ -1221,6 +1285,88 @@ export class WeaponAnimator {
     return true;
   }
 
+  private resolveChamberCycleStyle(): ChamberCyclePlatformStyle {
+    const asm = this.assembly;
+    if (!asm) return 'ar_charging_handle';
+    if (asm.cylinderPivot) return 'revolver_cylinder';
+    if (asm.boltHandlePivot) return 'bolt_action';
+    if (asm.pumpForend) return 'pump_shotgun';
+    const vs = asm.visualStyle ?? '';
+    if (vs === 'MP5RollerSMG') return 'mp5_cocking_tube';
+    if (
+      vs === 'carbine_ak' ||
+      vs === 'rifle_ak' ||
+      vs === 'AKStamped' ||
+      vs === 'SovietDMR'
+    ) {
+      return 'ak_side_bolt';
+    }
+    if (this.weightClass === 'pistol' || asm.holdClass === 'pistol') {
+      return 'pistol_slide';
+    }
+    return 'ar_charging_handle';
+  }
+
+  /**
+   * Triggers a detailed, platform-authentic manual chamber cycle (`Y` key):
+   * tilts the firearm cleanly toward the chest-cam, racks the slide/charging handle/bolt/pump
+   * to full rearward travel, fires `onExtractApex` at extraction peak, and snaps smoothly back to battery.
+   */
+  public triggerChamberCycle(opts: WeaponChamberCycleOptions): boolean {
+    if (
+      !this.assembly ||
+      this.assembly.holdClass === 'unarmed' ||
+      this.assembly.holdClass === 'melee_1h' ||
+      this.assembly.holdClass === 'melee_2h' ||
+      this.assembly.holdClass === 'throwable'
+    ) {
+      return false;
+    }
+    if (
+      this.action === 'RELOAD' ||
+      this.action === 'MAG_CHECK' ||
+      this.action === 'CHAMBER_CYCLE' ||
+      this.isSuppressorActionActive() ||
+      this.tubularPhase !== 'NONE' ||
+      this.boltCycleTimer >= 0 ||
+      this.pumpCycleTimer >= 0
+    ) {
+      return false;
+    }
+    this.cancelMicroAction();
+    if (this.action === 'INSPECT') {
+      this.interruptInspect();
+    }
+
+    const style = this.resolveChamberCycleStyle();
+    this.chamberCycleStyle = style;
+    this.chamberCycleHasLiveRound = opts.hasLiveRound;
+    this.chamberCycleOpenCueFired = false;
+    this.chamberCycleExtractFired = false;
+    this.chamberCycleCloseCueFired = false;
+    this.chamberCyclePump01 = 0;
+    this.chamberCycleBoltRotZ = 0;
+    this.chamberCycleOnExtractApex = opts.onExtractApex ?? null;
+    this.chamberCycleOnComplete = opts.onComplete ?? null;
+
+    const defaultDur =
+      style === 'bolt_action'
+        ? 0.96
+        : style === 'pistol_slide'
+          ? 0.78
+          : style === 'pump_shotgun'
+            ? 0.76
+            : style === 'revolver_cylinder'
+              ? 0.88
+              : 0.86;
+
+    this.action = 'CHAMBER_CYCLE';
+    this.actionTime = 0;
+    this.actionDuration = Math.max(0.55, opts.durationSec ?? defaultDur);
+    this.emitCue('ads_rustle', 0.68);
+    return true;
+  }
+
   /** Instant combat interrupt (~0.12s crisp damped blend back to combat readiness) */
   public interruptInspect(): void {
     if (this.action === 'INSPECT' || this.action === 'MAG_CHECK') {
@@ -1250,6 +1396,10 @@ export class WeaponAnimator {
     this._suppTwistSample.wristRollRad = 0;
     this._suppTwistSample.gripRelease01 = 0;
     this._suppTwistSample.weaponCounterRollRad = 0;
+    this.chamberCycleOnExtractApex = null;
+    this.chamberCycleOnComplete = null;
+    this.chamberCyclePump01 = 0;
+    this.chamberCycleBoltRotZ = 0;
     this.action = 'NONE';
     this.actionTime = 0;
     this.manualBoltPull01 = 0;
@@ -1459,6 +1609,8 @@ export class WeaponAnimator {
     this.manualBoltPull01 = 0;
     this.magCheckPullM = 0;
     this.inspectLeftHandSlideZ = 0;
+    this.chamberCyclePump01 = 0;
+    this.chamberCycleBoltRotZ = 0;
 
     // 1. Advance active weapon action (RELOAD / MAG_CHECK / INSPECT) + synced audio beats
     if (this.action !== 'NONE') {
@@ -1586,6 +1738,129 @@ export class WeaponAnimator {
           this.inspectLeftHandSlideZ = 0;
           this.action = 'NONE';
           this.actionTime = 0;
+        }
+      } else if (this.action === 'CHAMBER_CYCLE') {
+        // Detailed 4-beat manual chamber cycle choreography:
+        //  0.00 -> 0.22: Present ejection port & action cleanly toward chest-cam
+        //  0.22 -> 0.54: Firm rearward draw to mechanical stop (with brief chamber-check dwell)
+        //  ~0.50: Extraction apex -> eject intact live round (if chambered) + mechanical recoil jolt
+        //  0.54 -> 0.78: Crisp spring-driven return to battery + bolt lock-up impulse
+        //  0.78 -> 1.00: Smooth recovery to ready posture
+        const style = this.chamberCycleStyle;
+
+        if (style === 'bolt_action') {
+          if (p < 0.24) {
+            this.chamberCycleBoltRotZ = -smoothstep(0.10, 0.24, p) * 1.05;
+            if (!this.chamberCycleOpenCueFired && p >= 0.14) {
+              this.chamberCycleOpenCueFired = true;
+              this.emitCue('bolt_open', 0.95);
+              this.pushMechanicalImpulse(0.014, 0.016, 0.012, 0.04, -0.04, 0.08);
+            }
+          } else if (p < 0.54) {
+            this.chamberCycleBoltRotZ = -1.05;
+            this.manualBoltPull01 = Math.pow(smoothstep(0.24, 0.50, p), 0.88);
+            if (!this.chamberCycleExtractFired && p >= 0.47) {
+              this.chamberCycleExtractFired = true;
+              this.emitCue('bolt_pull', 0.96);
+              this.pushMechanicalImpulse(0.018, 0.012, 0.055, 0.06, 0.04, 0.07);
+              if (this.chamberCycleHasLiveRound && this.assembly) {
+                this.assembly.group.updateMatrixWorld(true);
+                this.assembly.ejectionPortSocket.getWorldPosition(this._chamberEjectPos);
+                this.assembly.ejectionPortSocket.getWorldQuaternion(this._chamberEjectQuat);
+                this.chamberCycleOnExtractApex?.(this._chamberEjectPos, this._chamberEjectQuat);
+              }
+            }
+          } else if (p < 0.76) {
+            this.chamberCycleBoltRotZ = -1.05;
+            this.manualBoltPull01 = 1 - smoothstep(0.54, 0.74, p);
+            this.isBoltLockedOpen = false;
+            if (!this.chamberCycleCloseCueFired && p >= 0.58) {
+              this.chamberCycleCloseCueFired = true;
+              this.emitCue('bolt_push', 0.92);
+            }
+          } else {
+            this.chamberCycleBoltRotZ = (1 - smoothstep(0.76, 0.88, p)) * -1.05;
+            if (p >= 0.82 && p - (dt / Math.max(0.1, this.actionDuration)) < 0.82) {
+              this.emitCue('bolt_lock', 0.98);
+              this.pushMechanicalImpulse(-0.012, -0.018, -0.042, -0.06, 0.03, -0.07);
+            }
+          }
+        } else if (style === 'revolver_cylinder') {
+          if (!this.chamberCycleOpenCueFired && p >= 0.22) {
+            this.chamberCycleOpenCueFired = true;
+            this.emitCue('bolt_open', 0.85);
+            const chambers = Math.max(1, this.assembly?.revolverChambers ?? 6);
+            this.cylinderTargetAngle += (Math.PI * 2) / chambers;
+            this.pushMechanicalImpulse(0.010, 0.014, 0.015, 0.05, 0.03, 0.09);
+          }
+          if (!this.chamberCycleExtractFired && p >= 0.50) {
+            this.chamberCycleExtractFired = true;
+            if (this.chamberCycleHasLiveRound && this.assembly) {
+              this.assembly.group.updateMatrixWorld(true);
+              this.assembly.ejectionPortSocket.getWorldPosition(this._chamberEjectPos);
+              this.assembly.ejectionPortSocket.getWorldQuaternion(this._chamberEjectQuat);
+              this.chamberCycleOnExtractApex?.(this._chamberEjectPos, this._chamberEjectQuat);
+            }
+          }
+          if (!this.chamberCycleCloseCueFired && p >= 0.74) {
+            this.chamberCycleCloseCueFired = true;
+            this.isBoltLockedOpen = false;
+            this.emitCue('bolt_lock', 0.92);
+            this.pushMechanicalImpulse(-0.008, -0.014, -0.025, -0.05, -0.03, -0.06);
+          }
+        } else {
+          // Slide / AR Charging Handle / AK Side-Bolt / MP5 Cocking Tube / Pump Forend
+          let travel = 0;
+          if (p >= 0.20 && p < 0.50) {
+            travel = Math.pow(smoothstep(0.20, 0.48, p), 0.85);
+          } else if (p >= 0.50 && p < 0.58) {
+            // Brief tactile dwell at full rear lock so operator visually confirms chamber extraction
+            travel = 1.0;
+          } else if (p >= 0.58 && p < 0.76) {
+            this.isBoltLockedOpen = false;
+            travel = 1 - Math.pow(smoothstep(0.58, 0.76, p), 1.35);
+          }
+
+          if (style === 'pump_shotgun') {
+            this.chamberCyclePump01 = travel;
+            this.manualBoltPull01 = travel * 0.92;
+          } else {
+            this.manualBoltPull01 = travel;
+          }
+
+          if (!this.chamberCycleOpenCueFired && p >= 0.24) {
+            this.chamberCycleOpenCueFired = true;
+            this.emitCue('rack', style === 'pistol_slide' ? 0.88 : 0.98);
+            this.pushMechanicalImpulse(0, -0.012, 0.048, 0.06, 0.04, 0.08);
+          }
+          if (!this.chamberCycleExtractFired && p >= 0.49) {
+            this.chamberCycleExtractFired = true;
+            this.pushMechanicalImpulse(0.015, 0.010, 0.032, 0.05, 0.03, 0.06);
+            if (this.chamberCycleHasLiveRound && this.assembly) {
+              this.assembly.group.updateMatrixWorld(true);
+              this.assembly.ejectionPortSocket.getWorldPosition(this._chamberEjectPos);
+              this.assembly.ejectionPortSocket.getWorldQuaternion(this._chamberEjectQuat);
+              this.chamberCycleOnExtractApex?.(this._chamberEjectPos, this._chamberEjectQuat);
+            }
+          }
+          if (!this.chamberCycleCloseCueFired && p >= 0.70) {
+            this.chamberCycleCloseCueFired = true;
+            this.isBoltLockedOpen = false;
+            this.emitCue('bolt_lock', style === 'pistol_slide' ? 0.92 : 1.04);
+            this.pushMechanicalImpulse(-0.012, -0.022, -0.052, -0.08, -0.03, -0.09);
+          }
+        }
+
+        if (p >= 1.0) {
+          const cb = this.chamberCycleOnComplete;
+          this.chamberCycleOnExtractApex = null;
+          this.chamberCycleOnComplete = null;
+          this.chamberCyclePump01 = 0;
+          this.chamberCycleBoltRotZ = 0;
+          this.isBoltLockedOpen = false;
+          this.action = 'NONE';
+          this.actionTime = 0;
+          cb?.();
         }
       } else if (this.action === 'SUPPRESSOR_DETACH' || this.action === 'SUPPRESSOR_ATTACH') {
         const isAttach = this.action === 'SUPPRESSOR_ATTACH';
@@ -1981,28 +2256,35 @@ export class WeaponAnimator {
 
     const asm = this.assembly;
     if (asm) {
-      this.boltCycleOffsetZ = boltCycle01 * asm.slideTravelZ;
-      const finalBolt01 = Math.max(blowback01, locked01, this.manualBoltPull01, pump01 * 0.95, boltCycle01);
+      this.boltCycleOffsetZ = Math.max(boltCycle01, this.action === 'CHAMBER_CYCLE' ? this.manualBoltPull01 : 0) * asm.slideTravelZ;
+      const effectivePump01 = Math.max(pump01, this.chamberCyclePump01);
+      const finalBolt01 = Math.max(blowback01, locked01, this.manualBoltPull01, effectivePump01 * 0.95, boltCycle01);
       if (asm.slideOrBolt) {
         asm.slideOrBolt.position.z = asm.slideBaseZ + finalBolt01 * asm.slideTravelZ;
       }
       if (asm.chargingHandle) {
         // Non-reciprocating charging handles (AR-15 / AR-10 / HK416 / MCX) stay locked forward
-        // during blowback and bolt lockback, pulling rearward only on manual reload rack.
+        // during blowback and bolt lockback, pulling rearward only on manual reload/chamber rack.
         asm.chargingHandle.position.z =
           asm.chargingHandleBaseZ + this.manualBoltPull01 * asm.slideTravelZ;
       }
       if (asm.boltHandlePivot) {
-        asm.boltHandlePivot.rotation.z = boltHandleRotZ;
+        asm.boltHandlePivot.rotation.z =
+          this.action === 'CHAMBER_CYCLE' ? this.chamberCycleBoltRotZ : boltHandleRotZ;
       }
       if (asm.barrelBreakGroup) {
-        // Top-break revolver hinge (Webley Mk VI): tilts barrel, rib, sights & cylinder downward as one unit during RELOAD
+        // Top-break revolver hinge (Webley Mk VI): tilts barrel, rib, sights & cylinder downward as one unit during RELOAD or CHAMBER_CYCLE
         let break01 = 0;
         if (this.action === 'RELOAD') {
           const p = this.getActionProgress();
           const openEnv = smoothstep(0.10, 0.24, p);
           const closeEnv = 1 - smoothstep(0.68, 0.82, p);
           break01 = openEnv * closeEnv;
+        } else if (this.action === 'CHAMBER_CYCLE' && this.chamberCycleStyle === 'revolver_cylinder') {
+          const p = this.getActionProgress();
+          const openEnv = smoothstep(0.18, 0.36, p);
+          const closeEnv = 1 - smoothstep(0.64, 0.80, p);
+          break01 = openEnv * closeEnv * 0.72;
         }
         asm.barrelBreakGroup.rotation.x = -break01 * 0.82;
       }
@@ -2010,7 +2292,7 @@ export class WeaponAnimator {
         asm.cylinderPivot.rotation.z = this.cylinderAngle;
       }
       if (asm.pumpForend) {
-        asm.pumpForend.position.z = asm.pumpBaseZ + pump01 * 0.082;
+        asm.pumpForend.position.z = asm.pumpBaseZ + effectivePump01 * 0.082;
       }
       if (asm.selectorLever) {
         asm.selectorLever.rotation.x = this.selectorAngleCurrent;
@@ -2111,6 +2393,7 @@ export class WeaponAnimator {
       this.action === 'RELOAD' ||
       this.action === 'MAG_CHECK' ||
       this.action === 'INSPECT' ||
+      this.action === 'CHAMBER_CYCLE' ||
       this.action === 'SUPPRESSOR_ATTACH' ||
       this.action === 'SUPPRESSOR_DETACH' ||
       this.tubularPhase !== 'NONE' ||
@@ -2472,6 +2755,52 @@ export class WeaponAnimator {
         this._targetPos.lerp(this._tmpVecA, raiseEnv);
         this._targetQuat.slerp(this._actionQuat, raiseEnv);
       }
+    } else if (this.action === 'CHAMBER_CYCLE' && input.isFirearm) {
+      // Detailed Chest-Cam Manual Chamber Cycling Presentation:
+      // Frames the ejection port, bolt/slide/charging handle, and extracting live cartridge crisply in view.
+      const p = this.getActionProgress();
+      const style = this.chamberCycleStyle;
+      const env = smoothstep(0.0, 0.20, p) * (1 - smoothstep(0.80, 1.0, p));
+      const rackAccent = smoothstep(0.22, 0.48, p) * (1 - smoothstep(0.58, 0.78, p));
+
+      const rollDeg =
+        style === 'pistol_slide'
+          ? 34
+          : style === 'ak_side_bolt'
+            ? 38
+            : style === 'mp5_cocking_tube'
+              ? 24
+              : style === 'bolt_action'
+                ? 18
+                : style === 'pump_shotgun'
+                  ? 26
+                  : style === 'revolver_cylinder'
+                    ? 40
+                    : 32;
+      const yawDeg =
+        style === 'pistol_slide'
+          ? 24
+          : style === 'bolt_action'
+            ? 14
+            : style === 'pump_shotgun'
+              ? 18
+              : 28;
+      const pitchDeg = style === 'pistol_slide' ? 14 : style === 'bolt_action' ? 8 : 11;
+
+      this._actionPos.set(
+        this._hipPos.x - (style === 'pistol_slide' ? 0.042 : 0.056) * env,
+        this._hipPos.y + (style === 'pistol_slide' ? 0.036 : 0.024) * env + rackAccent * 0.010,
+        this._hipPos.z + (style === 'pistol_slide' ? 0.038 : 0.052) * env + rackAccent * 0.014,
+      );
+      this._tmpEuler.set(
+        THREE.MathUtils.degToRad(pitchDeg) * env - rackAccent * 0.045,
+        THREE.MathUtils.degToRad(yawDeg) * env + rackAccent * 0.06,
+        THREE.MathUtils.degToRad(rollDeg) * env + rackAccent * 0.08,
+        'YXZ',
+      );
+      this._actionQuat.copy(this._hipQuat).multiply(this._addQuat.setFromEuler(this._tmpEuler));
+      this._targetPos.lerp(this._actionPos, env);
+      this._targetQuat.slerp(this._actionQuat, env);
     } else if (this.tubularPhase !== 'NONE' && input.isFirearm) {
       // Shell-by-shell tubular shotgun reload cant (38°-42° inboard so underside loading port faces left hand cleanly)
       let env = 1;
@@ -2570,6 +2899,9 @@ export class WeaponAnimator {
     } else if (this.action === 'INSPECT') {
       this.activePoseState = 'Inspect';
       poseLambda = 9.5;
+    } else if (this.action === 'CHAMBER_CYCLE') {
+      this.activePoseState = 'ChamberCycle';
+      poseLambda = 13.5;
     } else if (this.equipTimer > 0.01) {
       this.activePoseState = 'Equip';
       poseLambda = 15;

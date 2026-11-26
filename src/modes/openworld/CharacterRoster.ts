@@ -1329,6 +1329,22 @@ export class CharacterRoster {
     return taken;
   }
 
+  public addArsenalReserve(
+    slotId: CharacterSlotId,
+    weaponId: string,
+    rounds: number,
+  ): number {
+    const c = this.state.slots[slotId];
+    if (!c || weaponId === 'unarmed' || rounds <= 0) return 0;
+    const prof = resolveWeaponProfile(weaponId);
+    const calId = resolveBaseCaliberId(prof.defaultCaliberId);
+    const avail = c.arsenal.ammoReserve[calId] ?? getDefaultReserveForCaliber(calId);
+    this.mutateCharacter(slotId, (ch) => {
+      ch.arsenal.ammoReserve[calId] = avail + rounds;
+    });
+    return rounds;
+  }
+
   public resupplyArsenalAmmo(slotId: CharacterSlotId): void {
     this.mutateCharacter(slotId, (c) => {
       const next: Record<string, number> = { ...DEFAULT_AMMO_RESERVE };

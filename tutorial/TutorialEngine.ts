@@ -18,6 +18,7 @@ import {
   DEFAULT_BODYCAM_SDK_CONFIG,
   DEFAULT_TRAUMA_MODIFIERS,
   DynamicPhysicsPropSystem,
+  EjectedLiveRoundPool,
   GrenadeHoldStage,
   IBodycamWorldAdapter,
   IR_LAYER,
@@ -31,6 +32,7 @@ import {
   type PdaTabMode,
   VIEWMODEL_LAYER,
   WeaponRig,
+  WorldBackpackSystem,
 } from '../bodycam-sdk';
 import {
   computeDerivedWeaponStats,
@@ -42,6 +44,8 @@ import {
 import {
   AMMO_VARIANTS,
   AmmoVariantDef,
+  BASE_CALIBERS,
+  BaseCaliberId,
   getDefaultAmmoVariant,
   resolveBaseCaliberId,
 } from '../data/calibers';
@@ -54,6 +58,7 @@ import {
 } from '../data/fireModeControl';
 import { graphicsQualityStore } from '../data/graphicsQuality';
 import { keybindStore } from '../data/keybindStore';
+import { loadoutStore } from '../data/loadoutStore';
 import { getTacticalEquipmentDef, TacticalEquipmentId } from '../data/tacticalEquipment';
 import {
   DoorInteractOption,
@@ -62,6 +67,33 @@ import {
 import { HoldRepairController } from '../doors/HoldRepairController';
 import { PlayerInteractAnimator } from '../doors/PlayerInteractAnimator';
 import { GymBallistics } from '../gym/GymBallistics';
+import {
+  addLooseRoundToInventory,
+  autoPlaceItemInGrid,
+  buildModeLoadoutTacticalInventory,
+  cloneTacticalInventory,
+  computeOperatorEncumbrance,
+  countCompatibleReserveRounds,
+  createAmmoStackItem,
+  createLoadedMagazineForWeapon,
+  createPopulatedWorldBackpack,
+  cycleChamberInWeaponSlot,
+  extractItemByLocator,
+  findBestReloadMagazine,
+  fireRoundFromWeaponSlot,
+  getLoadedAmmoCount,
+  getWeaponSlotByWeaponId,
+  isBackpackTemplateId,
+  swapMagazineIntoWeapon,
+} from '../src/modes/openworld/inventory/TetrisInventoryCore';
+import type {
+  CorpseTacticalLootSnapshot,
+  ItemSourceLocator,
+  MedicalItem,
+  OperatorEncumbranceState,
+  OperatorTacticalInventory,
+} from '../src/modes/openworld/inventory/TetrisInventoryTypes';
+import type { ExternalLootContext } from '../src/modes/openworld/ui/TacticalInventoryModal';
 import {
   TUTORIAL_STEPS,
   TutorialCourseSnapshot,
@@ -89,6 +121,7 @@ export interface TutorialSnapshot {
   fireModeLabel: string;
   ammoInMag: number;
   magCapacity: number;
+  ammoReserve: number;
   isReloading: boolean;
   armedAdsMode: AdsMode;
   laserOn: boolean;
@@ -98,6 +131,10 @@ export interface TutorialSnapshot {
   grenadeCount: number;
   grenadeStage: GrenadeHoldStage;
   isPdaOpen: boolean;
+  inventoryOpen: boolean;
+  tacticalInventory: OperatorTacticalInventory;
+  externalLoot: ExternalLootContext | null;
+  encumbrance: OperatorEncumbranceState;
   doorPrompt: string | null;
   doorPromptState: TutorialDoorPromptState | null;
   repairState: TutorialRepairState | null;
@@ -169,8 +206,10 @@ export class TutorialEngine {
   private readonly postProcess: BodycamPostProcess;
   private readonly scopeRenderer: ScopeRenderer;
   private readonly ballistics: GymBallistics;
+  private readonly ejectedLiveRounds: EjectedLiveRoundPool;
   private readonly grenadeSystem: TacticalGrenadeSystem;
   private readonly physicsProps: DynamicPhysicsPropSystem;
+  private readonly worldBackpacks: WorldBackpackSystem;
   private readonly course: TutorialCourseStateMachine;
   private readonly interactAnimator = new PlayerInteractAnimator();
   private readonly holdRepair = new HoldRepairController();
@@ -207,6 +246,7 @@ export class TutorialEngine {
     cant: false,
     adsMode: 'PRIMARY',
     holdBreath: false,
+    freeZoom: false,
     vault: false,
   };
 
@@ -215,6 +255,12 @@ export class TutorialEngine {
   private readonly adsModeByWeapon: Record<string, AdsMode> = {};
   private equippedWeaponId = 'm4_556';
   private readonly tacticalEquipmentId: TacticalEquipmentId = 'm67_frag';
+  private tacticalInventory!: OperatorTacticalInventory;
+  private encumbrance!: OperatorEncumbranceState;
+  private inventoryOpen = false;
+  private activeExternalLoot: ExternalLootContext | null = null;
+  private pendingReloadMagLocator: ItemSourceLocator | null = null;
+  private nearbyGroundBackpack: { id: string; name: string; itemCount: number } | null = null;
 
   private pointerLocked = false;
   private pauseOpen = false;
@@ -223,7 +269,14 @@ export class TutorialEngine {
   private semiTriggerConsumed = false;
   private sprintHeld = false;
   private holdBreathHeld = false;
+  private freeZoomHeld = false;
   private keyFHeld = false;
+  private nearbyLiveRound: {
+    id: number;
+    caliberId: string;
+    caliberLabel: string;
+    weaponId: string;
+  } | null = null;
   private flashlightOn = false;
   private nvgFlipped = false;
   private grenadeCount = 6;
@@ -390,6 +443,7 @@ export class TutorialEngine {
       this.world.steelTargets,
       this.world.paperTargets,
     );
+    this.ejectedLiveRounds = new EjectedLiveRoundPool(this.scene);
 
     this.grenadeSystem = new TacticalGrenadeSystem({
       scene: this.scene,
@@ -448,6 +502,9 @@ export class TutorialEngine {
     });
     this.seedTutorialDynamicProps();
 
+    this.worldBackpacks = new WorldBackpackSystem(this.scene);
+    this.seedTutorialWorldBackpacks();
+
     this.course = new TutorialCourseStateMachine({
       onTaskComplete: (label) => {
         this.audio.playTacticalSwitchClick(true);
@@ -475,6 +532,10 @@ export class TutorialEngine {
       const derived = computeDerivedWeaponStats(prof.massKg, prof.barrelLengthM, prof.magCapacity, att);
       this.magAmmoByWeapon[id] = derived.magCapacity;
     }
+
+    this.tacticalInventory = this.buildTutorialInventory();
+    this.refreshEncumbranceAndBackpackVisual();
+    this.syncMagAmmoFromInventory();
 
     this.switchWeapon('m4_556', true);
     this.weaponRig.laserOn = false;
@@ -584,8 +645,19 @@ export class TutorialEngine {
   public restartCourse(): void {
     this.holdRepair.cancel(this.interactAnimator);
     this.interactAnimator.cancel();
+    this.inventoryOpen = false;
+    this.activeExternalLoot = null;
+    this.pendingReloadMagLocator = null;
     const first = this.course.restart();
     this.world.resetDoor();
+    this.ejectedLiveRounds.clear();
+    this.nearbyLiveRound = null;
+    this.nearbyGroundBackpack = null;
+    this.worldBackpacks.clear();
+    this.seedTutorialWorldBackpacks();
+    this.tacticalInventory = this.buildTutorialInventory();
+    this.refreshEncumbranceAndBackpackVisual();
+    this.syncMagAmmoFromInventory();
     this.grenadeCount = 6;
     if (this.nvgFlipped) this.toggleNvg(false);
     if (this.pdaDevice.isOpen()) this.pdaDevice.setOpen(false);
@@ -594,6 +666,180 @@ export class TutorialEngine {
     this.syncWaypoint();
     this.showToast('Field Training Restarted');
     this.emitSnapshot();
+  }
+
+  public openInventory(externalLoot: ExternalLootContext | null = null): void {
+    if (this.pauseOpen || this.course.isCourseComplete() || this.disposed) return;
+    if (this.pdaDevice.isOpen()) {
+      this.pdaDevice.setOpen(false);
+    }
+    this.inventoryOpen = true;
+    this.activeExternalLoot = externalLoot;
+    this.clearHeldInputs();
+    if (document.pointerLockElement === this.renderer.domElement) {
+      document.exitPointerLock();
+    }
+    this.emitSnapshot();
+  }
+
+  public closeInventory(reacquireLock = true): void {
+    if (!this.inventoryOpen) return;
+    this.inventoryOpen = false;
+    this.activeExternalLoot = null;
+    this.emitSnapshot();
+    if (reacquireLock && !this.pauseOpen && !this.course.isCourseComplete() && !this.disposed) {
+      this.requestLock();
+    }
+  }
+
+  public applyInventoryMutation(
+    nextInv: OperatorTacticalInventory,
+    nextExternal?: CorpseTacticalLootSnapshot | null,
+    statusNote?: string,
+  ): void {
+    this.tacticalInventory = cloneTacticalInventory(nextInv);
+    this.refreshEncumbranceAndBackpackVisual();
+    this.syncMagAmmoFromInventory();
+    if (
+      nextExternal !== undefined &&
+      this.activeExternalLoot &&
+      this.activeExternalLoot.kind === 'ground_backpack' &&
+      nextExternal &&
+      nextExternal.backpack
+    ) {
+      this.worldBackpacks.updateContainerContents(
+        this.activeExternalLoot.id,
+        nextExternal.backpack,
+      );
+      this.activeExternalLoot = {
+        ...this.activeExternalLoot,
+        lootKit: nextExternal,
+      };
+    }
+    if (statusNote) this.showToast(statusNote);
+    this.emitSnapshot();
+  }
+
+  public triggerInventoryDragReload(
+    weaponSlotKey: 'primary' | 'secondary',
+    sourceLocator: ItemSourceLocator,
+  ): void {
+    const slot = this.tacticalInventory[weaponSlotKey];
+    if (!slot) return;
+    const swap = swapMagazineIntoWeapon(this.tacticalInventory, weaponSlotKey, sourceLocator);
+    if (!swap.ok) {
+      this.showToast('Incompatible or inaccessible magazine');
+      return;
+    }
+    this.refreshEncumbranceAndBackpackVisual();
+    this.syncMagAmmoFromInventory();
+    this.audio.playWeaponCue('mag_in', { intensity: 0.78 });
+    this.course.recordEvent('reload');
+    this.emitSnapshot();
+  }
+
+  public useMedicalItemFromInventory(locator: ItemSourceLocator, med: MedicalItem): void {
+    const extracted = extractItemByLocator(this.tacticalInventory, locator);
+    if (!extracted) return;
+    this.refreshEncumbranceAndBackpackVisual();
+    this.audio.playGearRattle('crouch', 0.45);
+    this.showToast(`Applied ${med.name}`);
+    this.emitSnapshot();
+  }
+
+  public dropEquippedBackpack(): boolean {
+    if (!this.tacticalInventory.backpack) {
+      this.showToast('No backpack equipped');
+      return false;
+    }
+    const dropped = this.tacticalInventory.backpack;
+    this.tacticalInventory.backpack = null;
+    this.refreshEncumbranceAndBackpackVisual();
+
+    const forward = new THREE.Vector3(
+      -Math.sin(this.controller.aimYaw),
+      0,
+      -Math.cos(this.controller.aimYaw),
+    ).normalize();
+    const dropPos = this.controller.position.clone().addScaledVector(forward, 1.15);
+    dropPos.y = this.adapter.getGroundHeight(dropPos.x, dropPos.z, this.controller.position.y);
+    const container = this.worldBackpacks.spawnBackpack({
+      backpack: dropped,
+      position: dropPos,
+      yaw: this.controller.aimYaw + Math.PI,
+      isPracticeGear: true,
+    });
+    this.audio.playGearRattle('weapon_swap', 0.72);
+    this.showToast(`Dropped ${dropped.name} (${dropped.grid.items.length} items)`);
+    if (this.inventoryOpen && !this.activeExternalLoot) {
+      this.activeExternalLoot = this.worldBackpacks.buildExternalLootContext(container.id);
+    }
+    this.emitSnapshot();
+    return true;
+  }
+
+  public equipGroundBackpack(
+    containerId: string,
+  ): { ok: boolean; error?: string; requiresUnequipFirst?: boolean } {
+    const res = this.worldBackpacks.equipFromWorld(containerId, this.tacticalInventory);
+    if (!res.ok) {
+      if (res.error) this.showToast(res.error);
+      return res;
+    }
+    this.refreshEncumbranceAndBackpackVisual();
+    if (this.activeExternalLoot && this.activeExternalLoot.id === containerId) {
+      this.activeExternalLoot = null;
+    }
+    this.audio.playGearRattle('weapon_swap', 0.78);
+    if (res.equippedPack) {
+      this.showToast(
+        `Equipped ${res.equippedPack.name} (${res.equippedPack.grid.items.length} items inside)`,
+      );
+    }
+    this.emitSnapshot();
+    return res;
+  }
+
+  public restockBenchAmmo(): void {
+    const prof = this.getWeaponProfile();
+    const slotKey = getWeaponSlotByWeaponId(this.tacticalInventory, prof.id);
+    if (prof.magCapacity > 0 && slotKey) {
+      const freshMag = createLoadedMagazineForWeapon(prof.id);
+      const chambered = freshMag.rounds.pop() ?? null;
+      this.tacticalInventory[slotKey] = {
+        weaponId: prof.id,
+        chamberedRound: chambered,
+        loadedMag: freshMag,
+      };
+      const baseCal = resolveBaseCaliberId(prof.caliberLabel);
+      const loose = createAmmoStackItem(getDefaultAmmoVariant(baseCal).id, 60);
+      if (
+        !this.tacticalInventory.chestRig ||
+        !autoPlaceItemInGrid(this.tacticalInventory.chestRig.generalGrid, loose, true)
+      ) {
+        if (this.tacticalInventory.backpack) {
+          autoPlaceItemInGrid(this.tacticalInventory.backpack.grid, loose, true);
+        }
+      }
+      const spare = createLoadedMagazineForWeapon(prof.id);
+      if (
+        !this.tacticalInventory.chestRig ||
+        !autoPlaceItemInGrid(this.tacticalInventory.chestRig.generalGrid, spare)
+      ) {
+        if (this.tacticalInventory.backpack) {
+          autoPlaceItemInGrid(this.tacticalInventory.backpack.grid, spare);
+        }
+      }
+      this.refreshEncumbranceAndBackpackVisual();
+      this.syncMagAmmoFromInventory();
+    }
+    this.audio.playWeaponCue('mag_in', { intensity: 0.85 });
+    this.showToast('Training Rack Ammo & Magazines Restocked');
+    this.emitSnapshot();
+  }
+
+  public playMagPackTickAudio(): void {
+    this.audio.playTacticalSwitchClick(true);
   }
 
   public dispose(): void {
@@ -607,6 +853,8 @@ export class TutorialEngine {
     if (document.pointerLockElement === this.renderer.domElement) {
       document.exitPointerLock();
     }
+    this.worldBackpacks.dispose();
+    this.ejectedLiveRounds.dispose();
     this.ballistics.dispose();
     this.physicsProps.dispose();
     this.grenadeSystem.dispose();
@@ -627,6 +875,60 @@ export class TutorialEngine {
   // ---------------------------------------------------------------------------
   // Private helpers
   // ---------------------------------------------------------------------------
+
+  private buildTutorialInventory(): OperatorTacticalInventory {
+    const activeSlot = loadoutStore.getActiveSlot();
+    return buildModeLoadoutTacticalInventory({
+      primaryWeaponId: 'm4_556',
+      secondaryWeaponId: 'pm_9x19',
+      backpackId: activeSlot.backpackId ?? null,
+      mode: 'tutorial',
+    });
+  }
+
+  private seedTutorialWorldBackpacks(): void {
+    const spawns: Array<{
+      tier: 'pack_assault_20l' | 'pack_rucksack_35l' | 'pack_logistics_55l';
+      x: number;
+      z: number;
+      yaw: number;
+    }> = [
+      { tier: 'pack_assault_20l', x: -3.2, z: 22.3, yaw: 0.35 },
+      { tier: 'pack_rucksack_35l', x: -2.2, z: 22.3, yaw: 0.15 },
+      { tier: 'pack_logistics_55l', x: -1.1, z: 22.3, yaw: -0.25 },
+    ];
+    for (const s of spawns) {
+      const y = this.adapter.getGroundHeight(s.x, s.z, 1.0);
+      const pack = createPopulatedWorldBackpack(s.tier, 'm4_556');
+      this.worldBackpacks.spawnBackpack({
+        backpack: pack,
+        position: new THREE.Vector3(s.x, y, s.z),
+        yaw: s.yaw,
+        isPracticeGear: true,
+      });
+    }
+  }
+
+  private refreshEncumbranceAndBackpackVisual(): void {
+    this.encumbrance = computeOperatorEncumbrance(this.tacticalInventory);
+    const bpId = this.tacticalInventory.backpack?.templateId ?? null;
+    this.skeleton.setBackpack(isBackpackTemplateId(bpId) ? bpId : null);
+  }
+
+  private syncMagAmmoFromInventory(): void {
+    const primary = this.tacticalInventory.primary;
+    if (primary) {
+      this.magAmmoByWeapon[primary.weaponId] = getLoadedAmmoCount(primary);
+    }
+    const secondary = this.tacticalInventory.secondary;
+    if (secondary) {
+      this.magAmmoByWeapon[secondary.weaponId] = getLoadedAmmoCount(secondary);
+    }
+    const curProf = this.getWeaponProfile();
+    if (curProf.magCapacity > 0) {
+      this.weaponRig.setAmmoState(this.magAmmoByWeapon[curProf.id] ?? 0);
+    }
+  }
 
   private getWeaponProfile(): BodycamWeaponProfile {
     return resolveWeaponProfile(this.equippedWeaponId);
@@ -748,15 +1050,119 @@ export class TutorialEngine {
 
   private startReload(): void {
     const prof = this.getWeaponProfile();
-    if (prof.magCapacity <= 0 || this.reloadTimer > 0) return;
+    if (prof.magCapacity <= 0 || this.reloadTimer > 0 || this.weaponRig.isChamberCycling()) return;
+    const best = findBestReloadMagazine(this.tacticalInventory, prof.id);
+    if (!best) {
+      this.showToast(
+        `No Loaded Mags — Press [${keybindStore.getLabel('scoreboard_inventory')}] to Pack or Restock`,
+      );
+      this.emitSnapshot();
+      return;
+    }
     // Allow tactical reload even on full mag during Bay 04 so the player never gets stuck!
-    const reloadSec = Math.max(0.8, (prof.reloadDurationSec ?? 1.8) * 0.85);
+    this.pendingReloadMagLocator = best.locator;
+    const reloadSec = Math.max(
+      0.8,
+      (prof.reloadDurationSec ?? 1.8) * 0.85 * best.reloadTimeMult,
+    );
     this.weaponRig.triggerReload(reloadSec);
     this.animator.triggerReload(reloadSec);
     this.reloadTimer = reloadSec;
     this.course.recordEvent('reload');
-    this.showToast('Reloading...');
+    this.showToast(best.fromBackpack ? 'Reloading from Backpack...' : 'Reloading...');
     this.emitSnapshot();
+  }
+
+  private triggerChamberCycle(): void {
+    const prof = this.getWeaponProfile();
+    if (
+      prof.holdClass === 'unarmed' ||
+      prof.holdClass === 'melee_1h' ||
+      prof.magCapacity <= 0 ||
+      this.reloadTimer > 0 ||
+      this.weaponRig.isChamberCycling() ||
+      this.controller.isVaulting() ||
+      this.pdaDevice.isBlockingWeaponActions() ||
+      this.grenadeSystem.isDrawn() ||
+      this.holdRepair.isActive() ||
+      this.weaponRig.isSuppressorActionActive() ||
+      this.animator.isCombatBusy()
+    ) {
+      return;
+    }
+
+    const weaponId = prof.id;
+    const curAmmo = this.magAmmoByWeapon[weaponId] ?? 0;
+    const hasLiveRound = curAmmo > 0;
+    const calId = resolveBaseCaliberId(prof.caliberLabel);
+    const calDef = BASE_CALIBERS[calId];
+    const caliberLabel = calDef?.shortLabel ?? prof.caliberLabel;
+
+    this.isFiring = false;
+    this.animator.interruptInspect();
+
+    const started = this.animator.triggerChamberCycle({
+      hasLiveRound,
+      onExtractApex: (portPos, portQuat) => {
+        if (this.equippedWeaponId !== weaponId) return;
+        const slotKey = getWeaponSlotByWeaponId(this.tacticalInventory, weaponId);
+        let ejected = false;
+        let nextAmmo = this.magAmmoByWeapon[weaponId] ?? 0;
+        if (slotKey) {
+          const slot = this.tacticalInventory[slotKey];
+          const cycled = cycleChamberInWeaponSlot(slot);
+          if (cycled.ejectedRound) {
+            ejected = true;
+            nextAmmo = getLoadedAmmoCount(slot);
+            this.refreshEncumbranceAndBackpackVisual();
+          }
+        } else if (nextAmmo > 0) {
+          ejected = true;
+          nextAmmo = nextAmmo - 1;
+        }
+        if (!ejected) return;
+        this.magAmmoByWeapon[weaponId] = nextAmmo;
+        this.weaponRig.setAmmoState(nextAmmo);
+        this.controller.getVelocity(this._playerVelScratch);
+        this.ejectedLiveRounds.spawnRound({
+          position: portPos,
+          quaternion: portQuat,
+          caliberId: calId,
+          caliberLabel,
+          weaponId,
+          holdClass: prof.holdClass,
+          carrierVelocity: this._playerVelScratch,
+        });
+        this.emitSnapshot();
+      },
+      onComplete: () => {
+        this.emitSnapshot();
+      },
+    });
+
+    if (started) {
+      this.course.recordEvent('accessory');
+      this.showToast(
+        hasLiveRound
+          ? `Cycling Chamber — Ejecting Live ${caliberLabel}`
+          : `Racking ${prof.name} (Chamber Empty)`,
+      );
+      this.emitSnapshot();
+    }
+  }
+
+  private tryPickupNearbyLiveRound(): boolean {
+    if (!this.nearbyLiveRound) return false;
+    const collected = this.ejectedLiveRounds.collectRound(this.nearbyLiveRound.id);
+    this.nearbyLiveRound = null;
+    if (!collected) return false;
+    const variant = getDefaultAmmoVariant(collected.caliberId as BaseCaliberId);
+    addLooseRoundToInventory(this.tacticalInventory, variant.id);
+    this.refreshEncumbranceAndBackpackVisual();
+    this.audio.playGearRattle('crouch', 0.45);
+    this.showToast(`+1 ${collected.caliberLabel} Round Recovered`);
+    this.emitSnapshot();
+    return true;
   }
 
   private handleMeleeHit(ev: BodycamMeleeHitEvent): void {
@@ -864,14 +1270,25 @@ export class TutorialEngine {
       return;
     }
 
-    this.magAmmoByWeapon[prof.id] = current - 1;
+    const slotKey = getWeaponSlotByWeaponId(this.tacticalInventory, prof.id);
+    let ammo = this.getActiveAmmoVariant(prof.id);
+    let remainingAfterShot = current - 1;
+    if (slotKey) {
+      const slot = this.tacticalInventory[slotKey];
+      const firedVariant = fireRoundFromWeaponSlot(slot);
+      if (firedVariant) {
+        ammo = firedVariant;
+      }
+      remainingAfterShot = getLoadedAmmoCount(slot);
+      this.refreshEncumbranceAndBackpackVisual();
+    }
+    this.magAmmoByWeapon[prof.id] = remainingAfterShot;
     this.fireCooldown = 60 / Math.max(40, getEffectiveFireRpm(prof, effectiveFireMode));
     if (isSingleShot) {
       this.semiTriggerConsumed = true;
     }
 
     const derived = this.weaponRig.getDerivedStats();
-    const ammo = this.getActiveAmmoVariant(prof.id);
     const suppressed = derived.isSuppressed;
 
     this.weaponRig.getMuzzleWorldTransform(this._muzzlePos, this._muzzleDir, true);
@@ -926,7 +1343,14 @@ export class TutorialEngine {
   }
 
   private updateDoorScan(): void {
-    if (this.pauseOpen || this.pdaDevice.isOpen() || this.holdRepair.isActive()) {
+    if (
+      this.pauseOpen ||
+      this.inventoryOpen ||
+      this.pdaDevice.isOpen() ||
+      this.holdRepair.isActive()
+    ) {
+      this.nearbyLiveRound = null;
+      this.nearbyGroundBackpack = null;
       if (!this.holdRepair.isActive()) {
         this.activeDoorId = null;
         this.activeDoorOptions = [];
@@ -987,9 +1411,32 @@ export class TutorialEngine {
       this.activeDoorTitle = '';
       this.activeDoorOptions = [];
       this.selectedDoorOptionIndex = 0;
-      this.doorPrompt = null;
+      const interactLbl = keybindStore.getLabel('interact');
+      const groundPack = this.pointerLocked
+        ? this.worldBackpacks.findInteractable(this._camPos, this._camForward)
+        : null;
+      if (groundPack) {
+        this.nearbyGroundBackpack = {
+          id: groundPack.id,
+          name: groundPack.name,
+          itemCount: groundPack.itemCount,
+        };
+        this.nearbyLiveRound = null;
+        this.doorPrompt = `[${interactLbl}] Open ${groundPack.name} (${groundPack.itemCount} items)`;
+        return;
+      }
+      this.nearbyGroundBackpack = null;
+      const pickup = this.pointerLocked
+        ? this.ejectedLiveRounds.findLookedAtPickup(this._camPos, this._camForward)
+        : null;
+      this.nearbyLiveRound = pickup;
+      this.doorPrompt = pickup
+        ? `[${interactLbl}] Pick up 1x ${pickup.caliberLabel} Round`
+        : null;
       return;
     }
+    this.nearbyLiveRound = null;
+    this.nearbyGroundBackpack = null;
 
     const prevSelectedId = this.activeDoorOptions[this.selectedDoorOptionIndex]?.id;
     const sameDoor = this.activeDoorId === matchedId;
@@ -1200,9 +1647,11 @@ export class TutorialEngine {
     if (locked) {
       this.hasEnteredOnce = true;
       this.pauseOpen = false;
+      this.inventoryOpen = false;
+      this.activeExternalLoot = null;
     } else {
       this.clearHeldInputs();
-      if (this.hasEnteredOnce && !this.course.isCourseComplete()) {
+      if (this.hasEnteredOnce && !this.course.isCourseComplete() && !this.inventoryOpen) {
         this.pauseOpen = true;
       }
     }
@@ -1219,12 +1668,22 @@ export class TutorialEngine {
   };
 
   private readonly onMouseDown = (e: MouseEvent): void => {
+    if (e.button === 1) {
+      e.preventDefault();
+    }
     if (!this.pointerLocked) return;
     this.audio.ensureInitialized();
 
     const isFireBtn = keybindStore.matchesMouseButton(e.button, 'fire');
     const isAdsBtn = keybindStore.matchesMouseButton(e.button, 'ads');
     const isPointAimBtn = keybindStore.matchesMouseButton(e.button, 'point_aim');
+    const isFreeZoomBtn = keybindStore.matchesMouseButton(e.button, 'free_zoom');
+    const isCycleChamberBtn = keybindStore.matchesMouseButton(e.button, 'cycle_chamber');
+
+    if (isFreeZoomBtn) {
+      this.freeZoomHeld = true;
+      return;
+    }
 
     if (isFireBtn) {
       if (this.pdaDevice.isOpen()) {
@@ -1277,12 +1736,26 @@ export class TutorialEngine {
       return;
     }
 
+    if (isCycleChamberBtn) {
+      this.triggerChamberCycle();
+      return;
+    }
+
     // Support side mouse buttons rebound to gameplay actions
     const mouseCode = `Mouse${e.button}`;
     this.handleActionInputDown(mouseCode, false, e);
   };
 
+  private readonly onAuxClick = (e: MouseEvent): void => {
+    if (e.button === 1) {
+      e.preventDefault();
+    }
+  };
+
   private readonly onMouseUp = (e: MouseEvent): void => {
+    if (keybindStore.matchesMouseButton(e.button, 'free_zoom')) {
+      this.freeZoomHeld = false;
+    }
     if (keybindStore.matchesMouseButton(e.button, 'fire')) {
       if (this.pdaDevice.isDragging()) {
         this.pdaDevice.setDragging(false);
@@ -1383,8 +1856,21 @@ export class TutorialEngine {
         }
       }
     }
-    if (keybindStore.matchesKeyCode(code, 'point_aim') && !repeat) {
-      this.togglePointAim();
+    if (keybindStore.matchesKeyCode(code, 'free_zoom')) {
+      this.freeZoomHeld = true;
+    }
+    if (keybindStore.matchesKeyCode(code, 'point_aim')) {
+      e.preventDefault();
+      if (!repeat) {
+        this.togglePointAim();
+      }
+    }
+    if (
+      keybindStore.matchesKeyCode(code, 'cycle_chamber') &&
+      !repeat &&
+      !this.pdaDevice.isBlockingWeaponActions()
+    ) {
+      this.triggerChamberCycle();
     }
     if (
       keybindStore.matchesKeyCode(code, 'canted_optic') &&
@@ -1441,7 +1927,16 @@ export class TutorialEngine {
     if (keybindStore.matchesKeyCode(code, 'interact')) {
       this.keyFHeld = true;
       if (!repeat && !this.pdaDevice.isOpen()) {
-        this.executeActiveDoorOption();
+        if (this.activeDoorId && this.activeDoorOptions.length > 0) {
+          this.executeActiveDoorOption();
+        } else if (this.nearbyGroundBackpack) {
+          const ctx = this.worldBackpacks.buildExternalLootContext(this.nearbyGroundBackpack.id);
+          if (ctx) {
+            this.openInventory(ctx);
+          }
+        } else {
+          this.tryPickupNearbyLiveRound();
+        }
       }
     }
     if (
@@ -1535,17 +2030,21 @@ export class TutorialEngine {
     }
     if (keybindStore.matchesKeyCode(code, 'scoreboard_inventory')) {
       e.preventDefault();
-      if (!repeat && this.pdaDevice.isOpen()) {
-        const nextTab: PdaTabMode =
-          this.pdaDevice.getActiveTab() === 'fire_support' ? 'tac_map' : 'fire_support';
-        this.pdaDevice.setActiveTab(nextTab);
-        this.audio.playTacticalSwitchClick(true);
-        this.showToast(
-          nextTab === 'fire_support'
-            ? `PDA: Fire Support Tab — Press [${keybindStore.getLabel('vault')}] to Call Strike`
-            : 'PDA: Tactical Map Tab',
-        );
-        this.emitSnapshot();
+      if (!repeat) {
+        if (this.pdaDevice.isOpen()) {
+          const nextTab: PdaTabMode =
+            this.pdaDevice.getActiveTab() === 'fire_support' ? 'tac_map' : 'fire_support';
+          this.pdaDevice.setActiveTab(nextTab);
+          this.audio.playTacticalSwitchClick(true);
+          this.showToast(
+            nextTab === 'fire_support'
+              ? `PDA: Fire Support Tab — Press [${keybindStore.getLabel('vault')}] to Call Strike`
+              : 'PDA: Tactical Map Tab',
+          );
+          this.emitSnapshot();
+        } else {
+          this.openInventory(null);
+        }
       }
     }
     if (keybindStore.matchesKeyCode(code, 'ping') && !repeat) {
@@ -1560,6 +2059,7 @@ export class TutorialEngine {
     if (keybindStore.matchesKeyCode(code, 'move_right')) this.input.right = false;
     if (keybindStore.matchesKeyCode(code, 'sprint')) this.sprintHeld = false;
     if (keybindStore.matchesKeyCode(code, 'hold_breath')) this.holdBreathHeld = false;
+    if (keybindStore.matchesKeyCode(code, 'free_zoom')) this.freeZoomHeld = false;
     if (keybindStore.matchesKeyCode(code, 'lean_left')) this.input.leanLeft = false;
     if (keybindStore.matchesKeyCode(code, 'lean_right')) this.input.leanRight = false;
     if (keybindStore.matchesKeyCode(code, 'interact')) {
@@ -1572,7 +2072,17 @@ export class TutorialEngine {
   }
 
   private readonly onKeyDown = (e: KeyboardEvent): void => {
-    if (!this.pointerLocked || keybindStore.isCapturing()) return;
+    if (keybindStore.isCapturing()) return;
+    if (this.inventoryOpen) {
+      if (e.code === 'Escape' || keybindStore.matchesKeyCode(e.code, 'scoreboard_inventory')) {
+        e.preventDefault();
+        if (!e.repeat) {
+          this.closeInventory(true);
+        }
+      }
+      return;
+    }
+    if (!this.pointerLocked) return;
     this.audio.ensureInitialized();
     this.handleActionInputDown(e.code, e.repeat, e);
   };
@@ -1596,6 +2106,7 @@ export class TutorialEngine {
     window.addEventListener('mousemove', this.onMouseMove);
     window.addEventListener('mousedown', this.onMouseDown);
     window.addEventListener('mouseup', this.onMouseUp);
+    window.addEventListener('auxclick', this.onAuxClick);
     window.addEventListener('wheel', this.onWheel, { passive: true });
     this.renderer.domElement.addEventListener('contextmenu', this.onContextMenu);
     window.addEventListener('keydown', this.onKeyDown);
@@ -1610,6 +2121,7 @@ export class TutorialEngine {
     window.removeEventListener('mousemove', this.onMouseMove);
     window.removeEventListener('mousedown', this.onMouseDown);
     window.removeEventListener('mouseup', this.onMouseUp);
+    window.removeEventListener('auxclick', this.onAuxClick);
     window.removeEventListener('wheel', this.onWheel);
     this.renderer.domElement.removeEventListener('contextmenu', this.onContextMenu);
     window.removeEventListener('keydown', this.onKeyDown);
@@ -1623,6 +2135,7 @@ export class TutorialEngine {
     this.semiTriggerConsumed = false;
     this.sprintHeld = false;
     this.holdBreathHeld = false;
+    this.freeZoomHeld = false;
     this.keyFHeld = false;
     this.holdRepair.cancel(this.interactAnimator);
     this.input.forward = false;
@@ -1634,6 +2147,7 @@ export class TutorialEngine {
     this.input.leanRight = false;
     this.input.ads = false;
     this.input.holdBreath = false;
+    this.input.freeZoom = false;
     this.input.vault = false;
   }
 
@@ -1690,13 +2204,20 @@ export class TutorialEngine {
       !this.input.ads &&
       !this.controller.crouched &&
       !this.pdaDevice.isOpen() &&
-      !this.grenadeSystem.isDrawn();
+      !this.grenadeSystem.isDrawn() &&
+      this.encumbrance.canSprint;
 
     this.input.sprint = this.sprintHeld && canSprint && this.stamina > 0.08;
     this.input.holdBreath = this.holdBreathHeld && this.input.ads && !this.input.sprint;
+    this.input.freeZoom =
+      this.freeZoomHeld &&
+      this.pointerLocked &&
+      !this.pauseOpen &&
+      !this.inventoryOpen &&
+      !this.pdaDevice.isOpen();
 
     if (this.input.sprint) {
-      this.stamina = Math.max(0, this.stamina - 0.16 * dt);
+      this.stamina = Math.max(0, this.stamina - 0.16 * this.encumbrance.staminaDrainMult * dt);
     } else {
       this.stamina = Math.min(1, this.stamina + 0.28 * dt);
     }
@@ -1705,8 +2226,18 @@ export class TutorialEngine {
     if (this.reloadTimer > 0) {
       this.reloadTimer = Math.max(0, this.reloadTimer - dt);
       if (this.reloadTimer <= 0) {
-        const derived = this.weaponRig.getDerivedStats();
-        this.magAmmoByWeapon[prof.id] = derived.magCapacity;
+        const slotKey = getWeaponSlotByWeaponId(this.tacticalInventory, prof.id);
+        if (slotKey && this.pendingReloadMagLocator) {
+          swapMagazineIntoWeapon(this.tacticalInventory, slotKey, this.pendingReloadMagLocator);
+          this.pendingReloadMagLocator = null;
+          this.refreshEncumbranceAndBackpackVisual();
+          this.syncMagAmmoFromInventory();
+        } else {
+          this.pendingReloadMagLocator = null;
+          const derived = this.weaponRig.getDerivedStats();
+          this.magAmmoByWeapon[prof.id] = derived.magCapacity;
+          this.weaponRig.setAmmoState(derived.magCapacity);
+        }
         this.emitSnapshot();
       }
     }
@@ -1725,6 +2256,15 @@ export class TutorialEngine {
       this.config,
       this.stamina,
       100,
+      undefined,
+      {
+        encumbranceRatio: this.encumbrance.ratio01,
+        swayAmpMult: 1 + this.encumbrance.ratio01 * 0.25,
+        moveSpeedMult: this.encumbrance.moveSpeedMult,
+        staminaDrainMult: this.encumbrance.staminaDrainMult,
+        exertionRateMult: this.encumbrance.exertionRateMult,
+        canSprint: this.encumbrance.canSprint,
+      },
     );
     this.input.vault = false;
 
@@ -1840,6 +2380,7 @@ export class TutorialEngine {
         }
       },
     );
+    this.ejectedLiveRounds.update(dt, this.adapter, undefined, this.audio);
 
     // Step Grenade System
     this.grenadeSystem.update(dt, this.camera.position);
@@ -1902,6 +2443,11 @@ export class TutorialEngine {
     const derived = this.weaponRig.getDerivedStats();
     const effectiveMode = fireModeStore.getEffectiveMode(prof);
     const activeRepair = this.holdRepair.getState();
+    const reserveCounts =
+      prof.magCapacity > 0 ? countCompatibleReserveRounds(this.tacticalInventory, prof.id) : null;
+    const ammoReserve = reserveCounts
+      ? reserveCounts.rigAndBeltRounds + reserveCounts.backpackRounds
+      : 0;
     return {
       course: this.course.getSnapshot(),
       pointerLocked: this.pointerLocked,
@@ -1911,6 +2457,7 @@ export class TutorialEngine {
       fireModeLabel: formatFireModeLabel(effectiveMode),
       ammoInMag: this.magAmmoByWeapon[prof.id] ?? 0,
       magCapacity: derived.magCapacity,
+      ammoReserve,
       isReloading: this.reloadTimer > 0,
       armedAdsMode: this.adsModeByWeapon[prof.id] ?? 'PRIMARY',
       laserOn: this.weaponRig.laserOn && derived.hasLaser,
@@ -1920,6 +2467,10 @@ export class TutorialEngine {
       grenadeCount: this.grenadeCount,
       grenadeStage: this.grenadeSystem.getHoldStage(),
       isPdaOpen: this.pdaDevice.isOpen(),
+      inventoryOpen: this.inventoryOpen,
+      tacticalInventory: this.tacticalInventory,
+      externalLoot: this.activeExternalLoot,
+      encumbrance: this.encumbrance,
       doorPrompt: this.doorPrompt,
       doorPromptState:
         this.activeDoorId && this.activeDoorOptions.length > 0 && !activeRepair

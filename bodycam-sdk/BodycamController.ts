@@ -164,6 +164,9 @@ export class BodycamController {
   public isAds = false;
   public isCanted = false;
   public isPointAim = false;
+  /** Smooth 0..1 tactical Free Zoom (Focus) blend; works anytime (including sprint) and stacks onto ADS */
+  public focusBlend = 0;
+  public isFocusing = false;
   public aimStance: AimStance = 'HIP';
   public armedAdsMode: AdsMode = 'PRIMARY';
   public grounded = true;
@@ -450,6 +453,8 @@ export class BodycamController {
     this.wantCrouch = false;
     this.wasCrouched = false;
     this.isSprinting = false;
+    this.focusBlend = 0;
+    this.isFocusing = false;
     this.sprintExhausted = false;
     this.armStamina = 1.0;
     this.exhaustedBreathTimer = 0;
@@ -1051,6 +1056,13 @@ export class BodycamController {
     this.isAds = this.aimStance === 'ADS';
     this.isCanted = this.aimStance === 'CANTED_ADS';
     this.isPointAim = this.aimStance === 'POINT_AIM';
+
+    // Tactical Free Zoom (Focus): hold-to-focus anytime (including sprint) and stacks smoothly onto ADS
+    const wantsFocus = Boolean(input.freeZoom);
+    this.focusBlend = THREE.MathUtils.damp(this.focusBlend, wantsFocus ? 1 : 0, 11.5, dt);
+    if (this.focusBlend < 0.001) this.focusBlend = 0;
+    else if (this.focusBlend > 0.999) this.focusBlend = 1;
+    this.isFocusing = this.focusBlend > 0.08;
 
     // Preserve subtle glance freedom (±42° around vault heading) while climbing without full 180° torso twist
     if (vaulting) {
@@ -2207,10 +2219,12 @@ export class BodycamController {
       reboundMult *
       hrCalmOrStressMult *
       holdBreathFactor;
+    const focusSwayMult = THREE.MathUtils.lerp(1.0, 0.85, this.focusBlend);
     const camSwayScale =
       this.swayEnvelope *
       this.smoothedAmpMult *
       swayMult *
+      focusSwayMult *
       (this.isAds
         ? BREATH_SWAY_CONFIG.adsCamSwayScale
         : this.isCanted
@@ -2430,9 +2444,10 @@ export class BodycamController {
 
     // Wide Horizontal FOV -> dynamic Vertical FOV
     // Primary ADS: full adsHFovDeg; Canted Optic ADS: ~0.85x CQB focus; Point Aim: ~0.90x tactical focus
+    // Free Zoom (Focus) smoothly multiplies horizontal FOV by 0.87 (~13% reduction) across all stances, stacking onto ADS & sprint.
     const grenadeFovCompress =
       this.grenadeThrowStyle === 'overhand' ? this.grenadeCharge01 * 3.8 : 0;
-    const targetHFov = (this.isAds
+    const baseTargetHFov = (this.isAds
       ? config.adsHFovDeg
       : this.isCanted
         ? THREE.MathUtils.lerp(config.baseHFovDeg, config.adsHFovDeg, 0.72)
@@ -2441,6 +2456,8 @@ export class BodycamController {
           : wantsSprint
             ? config.sprintHFovDeg
             : config.baseHFovDeg) - grenadeFovCompress;
+    const focusFovMult = THREE.MathUtils.lerp(1.0, 0.87, this.focusBlend);
+    const targetHFov = baseTargetHFov * focusFovMult;
     const targetVFov = horizontalToVerticalFov(targetHFov, this.camera.aspect);
     if (Math.abs(this.camera.fov - targetVFov) > 0.05) {
       this.camera.fov = THREE.MathUtils.damp(this.camera.fov, targetVFov, 12, dt);
@@ -2592,6 +2609,7 @@ export class BodycamController {
     out.isAds = this.isAds;
     out.isCanted = this.isCanted;
     out.isPointAim = this.isPointAim;
+    out.focusBlend = this.focusBlend;
     out.aimStance = this.aimStance;
     out.armedAdsMode = this.armedAdsMode;
     out.laserOn = rig.laserOn;

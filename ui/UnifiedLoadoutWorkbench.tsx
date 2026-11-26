@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
+  Backpack,
   Check,
   Crosshair,
   Eye,
@@ -56,6 +57,15 @@ import {
   useGraphicsQuality,
 } from '../data/graphicsQuality';
 import { loadoutStore, useLoadoutStore } from '../data/loadoutStore';
+import {
+  backpackUnlockStore,
+  useBackpackUnlocks,
+} from '../data/backpackUnlocks';
+import {
+  BASE_ENCUMBRANCE_LIMITS,
+  getBackpackTemplate,
+} from '../src/modes/openworld/inventory/TetrisInventoryCore';
+import type { BackpackTemplateId } from '../src/modes/openworld/inventory/TetrisInventoryTypes';
 import {
   getAttachmentRequiredGunLevel,
   getWeaponUnlockRank,
@@ -1108,6 +1118,13 @@ export const UnifiedLoadoutWorkbench: React.FC<UnifiedLoadoutWorkbenchProps> = (
                 ))}
               </div>
             </div>
+
+            {/* Tactical Backpack Tier Selector (Rank 10 / 20 / 30 or World Pickup Unlocks) */}
+            <BackpackLoadoutSelector
+              activeIndex={loadoutState.activeIndex}
+              selectedBackpackId={activeSlot.backpackId}
+              careerRank={careerRank}
+            />
           </aside>
 
           {/* RIGHT SIDE RAIL: Weapon Attachments, Reticle Color & Live Telemetry */}
@@ -1539,6 +1556,122 @@ export const UnifiedLoadoutWorkbench: React.FC<UnifiedLoadoutWorkbenchProps> = (
           )}
         </div>
       )}
+    </div>
+  );
+};
+
+const BACKPACK_ORDER: BackpackTemplateId[] = [
+  'pack_assault_20l',
+  'pack_rucksack_35l',
+  'pack_logistics_55l',
+];
+
+const BackpackLoadoutSelector: React.FC<{
+  activeIndex: number;
+  selectedBackpackId: BackpackTemplateId | null;
+  careerRank: number;
+}> = ({ activeIndex, selectedBackpackId, careerRank }) => {
+  const { discoveredIds } = useBackpackUnlocks();
+  const activeTpl = selectedBackpackId ? getBackpackTemplate(selectedBackpackId) : null;
+  const maxCarryKg = activeTpl ? activeTpl.maxWeightKg : BASE_ENCUMBRANCE_LIMITS.maxWeightKg;
+
+  return (
+    <div className="space-y-1.5 border-t border-slate-800 pt-2">
+      <div className="flex items-center justify-between font-mono-tabular text-[10px] uppercase tracking-wider text-slate-400">
+        <span className="flex items-center gap-1">
+          <Backpack className="h-3 w-3 text-amber-400" />
+          <span>Tactical Backpack</span>
+        </span>
+        <span className="text-amber-300">Max {maxCarryKg} kg</span>
+      </div>
+
+      <div className="grid grid-cols-1 gap-1">
+        {/* Option 0: No Backpack */}
+        <button
+          type="button"
+          onClick={() => loadoutStore.setSlotBackpack(activeIndex, null)}
+          className={`flex cursor-pointer items-center justify-between border px-2 py-1.5 text-left font-mono-tabular transition-colors ${
+            selectedBackpackId === null
+              ? 'border-amber-400 bg-amber-500/15 text-amber-100'
+              : 'border-slate-800 bg-slate-950/75 text-slate-400 hover:border-slate-600 hover:text-slate-200'
+          }`}
+        >
+          <div>
+            <div className="text-[10px] font-semibold">No Backpack (Rig + Belt Only)</div>
+            <div className="text-[9px] text-slate-500">
+              0.0 kg tare · {BASE_ENCUMBRANCE_LIMITS.maxWeightKg} kg overload threshold
+            </div>
+          </div>
+          {selectedBackpackId === null && <Check className="h-3.5 w-3.5 text-amber-300" />}
+        </button>
+
+        {/* 3 Unlockable Backpack Tiers */}
+        {BACKPACK_ORDER.map((id) => {
+          const tpl = getBackpackTemplate(id);
+          if (!tpl) return null;
+          const unlocked = backpackUnlockStore.isUnlocked(id, careerRank);
+          const foundInWorld = discoveredIds.includes(id);
+          const selected = selectedBackpackId === id;
+
+          return (
+            <button
+              key={id}
+              type="button"
+              disabled={!unlocked}
+              onClick={() => unlocked && loadoutStore.setSlotBackpack(activeIndex, id)}
+              title={
+                unlocked
+                  ? `${tpl.name} · ${tpl.gridWidth}x${tpl.gridHeight} grid · ${tpl.maxWeightKg} kg max load`
+                  : `Unlock at Career Rank ${tpl.unlockRank} or find & equip one in-world`
+              }
+              className={`flex items-center justify-between border px-2 py-1.5 text-left font-mono-tabular transition-colors ${
+                !unlocked
+                  ? 'cursor-not-allowed border-slate-800/80 bg-slate-950/40 text-slate-600 opacity-75'
+                  : selected
+                    ? 'cursor-pointer border-amber-400 bg-amber-500/15 text-amber-100'
+                    : 'cursor-pointer border-slate-800 bg-slate-950/75 text-slate-300 hover:border-slate-600'
+              }`}
+            >
+              <div className="min-w-0 pr-2">
+                <div className="flex items-center gap-1.5">
+                  <span
+                    className="inline-block h-2 w-2 shrink-0 border border-white/25"
+                    style={{ backgroundColor: tpl.accentHex }}
+                  />
+                  <span className="truncate text-[10px] font-semibold">{tpl.name}</span>
+                </div>
+                <div className="mt-0.5 text-[9px] text-slate-400">
+                  {tpl.gridWidth}x{tpl.gridHeight} Grid · {tpl.weightKg.toFixed(1)} kg ·{' '}
+                  <span className="text-sky-300">{tpl.maxWeightKg} kg Max</span>
+                </div>
+                <div className="text-[8px] uppercase tracking-wider text-slate-500">
+                  {tpl.skinLabel}
+                </div>
+              </div>
+
+              <div className="shrink-0 text-right">
+                {!unlocked ? (
+                  <div className="flex flex-col items-end gap-0.5 text-[9px] text-amber-400/80">
+                    <span className="flex items-center gap-0.5 font-semibold">
+                      <Lock className="h-2.5 w-2.5" />
+                      RANK {tpl.unlockRank}
+                    </span>
+                    <span className="text-[8px] text-slate-500">OR FIND IN WORLD</span>
+                  </div>
+                ) : selected ? (
+                  <Check className="h-3.5 w-3.5 text-amber-300" />
+                ) : foundInWorld && careerRank < tpl.unlockRank ? (
+                  <span className="border border-emerald-500/40 bg-emerald-950/50 px-1 py-0.5 text-[8px] text-emerald-300">
+                    FOUND
+                  </span>
+                ) : (
+                  <span className="text-[9px] text-slate-500">UNLOCKED</span>
+                )}
+              </div>
+            </button>
+          );
+        })}
+      </div>
     </div>
   );
 };

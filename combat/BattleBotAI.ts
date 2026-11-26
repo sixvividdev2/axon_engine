@@ -20,6 +20,8 @@ import {
   normalizeOperatorId,
   OperatorId,
 } from '../bodycam-sdk/operator/OperatorTypes';
+import { isBackpackTemplateId } from '../src/modes/openworld/inventory/TetrisInventoryCore';
+import type { BackpackTemplateId } from '../src/modes/openworld/inventory/TetrisInventoryTypes';
 import { graphicsQualityStore } from '../data/graphicsQuality';
 import {
   BotDifficultyId,
@@ -204,6 +206,15 @@ export interface InfectionBotStatusSummary {
   points: number;
   weaponLabel: string;
   kills: number;
+}
+
+export interface BotBackpackDropEvent {
+  readonly botId: string;
+  readonly botName: string;
+  readonly backpackId: BackpackTemplateId;
+  readonly pos: THREE.Vector3;
+  readonly yaw: number;
+  readonly weaponId: string;
 }
 
 export interface BattleBotTuningOptions {
@@ -516,6 +527,7 @@ interface BotActor {
   netGrenadeEquipId: TacticalEquipmentId;
   netGrenadeCharge01: number;
   netGrenadeThrowStyle: 'overhand' | 'underhand';
+  backpackId: BackpackTemplateId | null;
 
   alive: boolean;
   hp: number;
@@ -683,6 +695,7 @@ export class BattleBotAI {
   private onBotCommsCb: ((ev: BotCommsEvent) => void) | null = null;
   private onBotGrenadeCb: ((ev: BotGrenadeEvent) => void) | null = null;
   private onAssistAwardedCb: ((assisterId: string) => void) | null = null;
+  private onBotBackpackDropCb: ((ev: BotBackpackDropEvent) => void) | null = null;
   private modeController: BattleModeController | null = null;
 
   public scoreA = 0;
@@ -853,9 +866,18 @@ export class BattleBotAI {
       const initAtt = buildBotAttachmentsForWeapon(initSpec.id, i, this.coopInfectionMode);
       const ownsSuppressor = Boolean(getOwnedSuppressorDef(initAtt));
       const suppressed = ownsSuppressor && !initAtt.suppressorStowed;
+      const initialBackpackId: BackpackTemplateId | null =
+        i % 5 === 0
+          ? 'pack_logistics_55l'
+          : i % 3 === 0
+            ? 'pack_rucksack_35l'
+            : i % 2 === 0
+              ? 'pack_assault_20l'
+              : null;
       rig.setWeaponClass(initSpec.visualClass);
       rig.setWeaponLoadout(initSpec.id, initAtt);
       rig.setSuppressedVisual(suppressed);
+      rig.setBackpack(initialBackpackId);
       this.group.add(rig.root);
 
       const initialPouch = this.buildBotGrenadePouch(i);
@@ -903,6 +925,7 @@ export class BattleBotAI {
         netGrenadeEquipId: initialPrimaryGrenade,
         netGrenadeCharge01: 0,
         netGrenadeThrowStyle: 'overhand',
+        backpackId: initialBackpackId,
         alive: true,
         hp: this.aiMaxHp,
         maxHp: this.aiMaxHp,
@@ -1392,6 +1415,10 @@ export class BattleBotAI {
     this.onAssistAwardedCb = listener;
   }
 
+  public setBackpackDropListener(listener: ((ev: BotBackpackDropEvent) => void) | null): void {
+    this.onBotBackpackDropCb = listener;
+  }
+
   public replenishBotGrenades(): void {
     for (let i = 0; i < this.bots.length; i++) {
       const b = this.bots[i];
@@ -1744,6 +1771,7 @@ export class BattleBotAI {
     bot.rig.setWeaponClass(bot.weaponClass);
     bot.rig.setWeaponLoadout(bot.weaponId, bot.attachments);
     bot.rig.setSuppressedVisual(bot.suppressed);
+    bot.rig.setBackpack(bot.backpackId);
     bot.root = rig.root;
     bot.bodyPivot = rig.bodyPivot;
     bot.leftLeg = rig.leftLeg;
@@ -1844,6 +1872,7 @@ export class BattleBotAI {
         gc: b.grenadeStage !== 'HOLSTERED' ? Number(b.grenadeCharge01.toFixed(3)) : undefined,
         gts: b.grenadeStage !== 'HOLSTERED' ? b.grenadeThrowStyle : undefined,
         sup: b.suppressed,
+        bp: b.backpackId,
         points: this.coopInfectionMode ? b.points : undefined,
         reloading: b.reloadTimer > 0,
         x: Number(b.pos.x.toFixed(3)),
@@ -1915,6 +1944,13 @@ export class BattleBotAI {
         bot.suppressed = sb.sup;
       }
       bot.rig.setWeaponLoadout(bot.weaponId, bot.attachments);
+      if (sb.bp !== undefined) {
+        const nextBp = isBackpackTemplateId(sb.bp) ? sb.bp : null;
+        if (bot.backpackId !== nextBp) {
+          bot.backpackId = nextBp;
+          bot.rig.setBackpack(nextBp);
+        }
+      }
       if (typeof sb.points === 'number') bot.points = sb.points;
       bot.netReloading = Boolean(sb.reloading);
       const nextHa: SyncedHandlingAction = sb.ha ?? (bot.netReloading ? 'RELOAD' : 'NONE');
@@ -2156,6 +2192,16 @@ export class BattleBotAI {
     victim.alive = false;
     victim.hp = 0;
     victim.deaths += 1;
+    if (victim.backpackId && !this.isClientReplica) {
+      this.onBotBackpackDropCb?.({
+        botId: victim.id,
+        botName: victim.name,
+        backpackId: victim.backpackId,
+        pos: victim.pos.clone(),
+        yaw: victim.yaw,
+        weaponId: victim.weaponId,
+      });
+    }
     victim.respawnTimer = 4.0;
     victim.deathTimer = 0;
     victim.muzzleFlash.visible = false;

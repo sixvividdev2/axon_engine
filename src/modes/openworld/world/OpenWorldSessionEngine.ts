@@ -18,6 +18,7 @@ import {
   DEFAULT_BODYCAM_SDK_CONFIG,
   DynamicPhysicsPropSystem,
   type DynamicPropSupportSample,
+  EjectedLiveRoundPool,
   GrenadeDetonationEvent,
   GrenadeHoldStage,
   LENS_PRESETS,
@@ -38,7 +39,9 @@ import {
   type PdaVehicleMarker,
   VIEWMODEL_LAYER,
   WeaponRig,
+  WorldBackpackSystem,
 } from '../../../../bodycam-sdk';
+import { backpackUnlockStore } from '../../../../data/backpackUnlocks';
 import {
   getDefaultZeroDistanceM,
   normalizeWeaponAttachments,
@@ -47,6 +50,7 @@ import {
   AMMO_VARIANTS,
   AmmoVariantDef,
   AmmoVariantId,
+  BASE_CALIBERS,
   getDefaultAmmoVariant,
   resolveBaseCaliberId,
 } from '../../../../data/calibers';
@@ -76,16 +80,20 @@ import {
 } from '../../../../hideout/HideoutElectronicsSystem';
 import { characterRoster } from '../CharacterRoster';
 import {
+  autoPlaceItemInGrid,
   cloneCorpseLootSnapshot,
   cloneTacticalInventory,
+  computeOperatorEncumbrance,
   consumeOneGrenadeFromInventory,
   countCompatibleReserveRounds,
   countGrenadesInInventory,
+  createAmmoStackItem,
   extractItemByLocator,
-  findQuickReloadMagazine,
+  findBestReloadMagazine,
   fireRoundFromWeaponSlot,
   getLoadedAmmoCount,
   getWeaponSlotByWeaponId,
+  isBackpackTemplateId,
   peekItemByLocator,
   peekNextRoundVariant,
   swapMagazineIntoWeapon,
@@ -647,6 +655,9 @@ export class OpenWorldSessionEngine {
   private readonly ambienceAudio: OpenWorldAmbienceAudio;
   private readonly wildlifeManager: WildlifeManager;
   private readonly ballistics: BallisticsSolver;
+  private readonly ejectedLiveRounds: EjectedLiveRoundPool;
+  private readonly _liveRoundVel = new THREE.Vector3();
+  private readonly _liveRoundTerrainSample = createTerrainSample();
   private readonly weaponRig: WeaponRig;
   private readonly skeleton: CharacterSkeleton;
   private readonly animator: CharacterAnimator;
@@ -672,6 +683,7 @@ export class OpenWorldSessionEngine {
     cant: false,
     adsMode: 'PRIMARY',
     holdBreath: false,
+    freeZoom: false,
     vault: false,
   };
   private readonly _pdaMotionScratch = createPdaMotionState();
@@ -701,6 +713,7 @@ export class OpenWorldSessionEngine {
   private readonly corpseMarkerGroup = new THREE.Group();
   private readonly corpseGeometries: THREE.BufferGeometry[] = [];
   private readonly corpseMaterials: THREE.Material[] = [];
+  private readonly worldBackpacks: WorldBackpackSystem;
 
   private readonly keysDown = new Set<string>();
   private readonly listeners = new Set<SnapshotListener>();
@@ -743,6 +756,7 @@ export class OpenWorldSessionEngine {
   private grenadeCount = 2;
   private shiftHeld = false;
   private holdBreathHeld = false;
+  private freeZoomHeld = false;
   private killsThisSortie = 0;
   private damageFlashAlpha = 0;
   private hitMarkerAlpha = 0;
@@ -1008,6 +1022,7 @@ export class OpenWorldSessionEngine {
     this.bodycamAdapter.onMeleeHit = (ev) => this.handleMeleeHit(ev);
 
     this.ballistics = new BallisticsSolver(this.scene);
+    this.ejectedLiveRounds = new EjectedLiveRoundPool(this.scene);
 
     this.weaponRig = new WeaponRig(this.scene, this.isSoftwareGl, this.audio);
     this.weaponRig.flashlight.intensity = 0;
@@ -1092,6 +1107,8 @@ export class OpenWorldSessionEngine {
     this.corpseMarkerGroup.name = 'openworld_shard_corpses';
     this.scene.add(this.corpseMarkerGroup);
 
+    this.worldBackpacks = new WorldBackpackSystem(this.scene);
+
     // Sync character armor plate, equipped weapon & initial FOB deployment
     this.syncCharacterLoadout(targetChar);
 
@@ -1105,6 +1122,34 @@ export class OpenWorldSessionEngine {
     }
 
     this.rebuildShardCorpseMarkers();
+    // Spawn 3 discoverable field supply backpacks near FOBs/outposts so players can loot & unlock tiers in-world
+    for (const lm of OPENWORLD_LANDMARKS) {
+      if (lm.id === 'landmark_fob_alpha') {
+        const px = lm.worldX + 9.5;
+        const pz = lm.worldZ + 6.0;
+        this.worldBackpacks.spawnLootBackpackPreset({
+          templateId: 'pack_assault_20l',
+          position: new THREE.Vector3(px, this.streamer.sampleGroundHeight(px, pz), pz),
+          ownerLabel: 'FOB Alpha Surplus Pack',
+        });
+      } else if (lm.id === 'landmark_fob_bravo') {
+        const px = lm.worldX - 8.5;
+        const pz = lm.worldZ + 7.5;
+        this.worldBackpacks.spawnLootBackpackPreset({
+          templateId: 'pack_rucksack_35l',
+          position: new THREE.Vector3(px, this.streamer.sampleGroundHeight(px, pz), pz),
+          ownerLabel: 'FOB Bravo Field Pack',
+        });
+      } else if (lm.id === 'landmark_radar_array' || lm.id === 'landmark_port_terminal') {
+        const px = lm.worldX + 12.0;
+        const pz = lm.worldZ - 9.0;
+        this.worldBackpacks.spawnLootBackpackPreset({
+          templateId: 'pack_logistics_55l',
+          position: new THREE.Vector3(px, this.streamer.sampleGroundHeight(px, pz), pz),
+          ownerLabel: 'Logistics Cache Pack',
+        });
+      }
+    }
     this.sectorManager.syncFromShard(initialShard, targetChar);
     this.applyRenderPipelineMode(this.renderPipeline);
 
@@ -1207,6 +1252,10 @@ export class OpenWorldSessionEngine {
 
     if (char?.tacticalInventory) {
       this.grenadeCount = countGrenadesInInventory(char.tacticalInventory);
+      const bpId = char.tacticalInventory.backpack?.templateId ?? null;
+      this.skeleton.setBackpack(isBackpackTemplateId(bpId) ? bpId : null);
+    } else {
+      this.skeleton.setBackpack(null);
     }
 
     const weaponId =
@@ -1331,9 +1380,11 @@ export class OpenWorldSessionEngine {
     this.input.leanLeft = false;
     this.input.leanRight = false;
     this.input.ads = false;
+    this.input.freeZoom = false;
     this.input.vault = false;
     this.shiftHeld = false;
     this.holdBreathHeld = false;
+    this.freeZoomHeld = false;
     this.isFiring = false;
     this.semiTriggerConsumed = false;
     this.pdaDevice.setDragging(false);
@@ -1396,6 +1447,22 @@ export class OpenWorldSessionEngine {
     if (keybindStore.matchesKeyCode(e.code, 'hold_breath')) {
       this.holdBreathHeld = true;
     }
+    if (keybindStore.matchesKeyCode(e.code, 'free_zoom')) {
+      this.freeZoomHeld = true;
+    }
+    if (keybindStore.matchesKeyCode(e.code, 'point_aim')) {
+      e.preventDefault();
+      if (
+        !e.repeat &&
+        this.activeModal === null &&
+        this.navMode === 'foot' &&
+        !this.pdaDevice.isBlockingWeaponActions() &&
+        !this.grenadeSystem.isDrawn()
+      ) {
+        this.cycleAimMode();
+      }
+      return;
+    }
 
     const code = keybindStore.resolveManagedInputCode(e.code);
     if (!code) return;
@@ -1423,6 +1490,10 @@ export class OpenWorldSessionEngine {
         if (this.navMode === 'foot' && !this.pdaDevice.isBlockingWeaponActions() && !this.grenadeSystem.isDrawn()) {
           this.weaponRig.triggerInspect();
         }
+        return;
+      }
+      if (code === 'KeyY') {
+        this.triggerChamberCycle();
         return;
       }
       if (code === 'KeyV') {
@@ -1567,6 +1638,9 @@ export class OpenWorldSessionEngine {
     if (keybindStore.matchesKeyCode(e.code, 'hold_breath')) {
       this.holdBreathHeld = false;
     }
+    if (keybindStore.matchesKeyCode(e.code, 'free_zoom')) {
+      this.freeZoomHeld = false;
+    }
     const code = keybindStore.resolveManagedInputCode(e.code);
     if (!code) return;
     this.keysDown.delete(code);
@@ -1644,6 +1718,13 @@ export class OpenWorldSessionEngine {
     const isFireBtn = keybindStore.matchesMouseButton(e.button, 'fire');
     const isAdsBtn = keybindStore.matchesMouseButton(e.button, 'ads');
     const isPointAimBtn = keybindStore.matchesMouseButton(e.button, 'point_aim');
+    const isFreeZoomBtn = keybindStore.matchesMouseButton(e.button, 'free_zoom');
+    const isCycleChamberBtn = keybindStore.matchesMouseButton(e.button, 'cycle_chamber');
+
+    if (isFreeZoomBtn) {
+      this.freeZoomHeld = true;
+      return;
+    }
 
     // Tactical PDA Grab-Sheet Drag / GPS Recenter
     if (this.pdaDevice.isBlockingWeaponActions()) {
@@ -1679,6 +1760,11 @@ export class OpenWorldSessionEngine {
       return;
     }
 
+    if (isCycleChamberBtn) {
+      this.triggerChamberCycle();
+      return;
+    }
+
     if (isAdsBtn) {
       if (this.equippedWeaponId === 'combat_knife') {
         this.animator.triggerKnifeStab(this.controller);
@@ -1700,6 +1786,9 @@ export class OpenWorldSessionEngine {
   };
 
   private readonly onMouseUp = (e: MouseEvent): void => {
+    if (keybindStore.matchesMouseButton(e.button, 'free_zoom')) {
+      this.freeZoomHeld = false;
+    }
     if (keybindStore.matchesMouseButton(e.button, 'fire')) {
       if (this.pdaDevice.isDragging()) {
         this.pdaDevice.setDragging(false);
@@ -1837,10 +1926,95 @@ export class OpenWorldSessionEngine {
     this.emitSnapshot();
   }
 
+  private triggerChamberCycle(): void {
+    if (
+      this.activeModal !== null ||
+      this.navMode !== 'foot' ||
+      this.isNonFirearmEquipped() ||
+      this.reloadTimer > 0 ||
+      this.grenadeSystem.isDrawn() ||
+      this.pdaDevice.isBlockingWeaponActions() ||
+      this.weaponRig.isSuppressorActionActive() ||
+      this.weaponRig.isChamberCycling() ||
+      this.controller.isVaulting()
+    ) {
+      return;
+    }
+    const prof = resolveWeaponProfile(this.equippedWeaponId);
+    if (prof.magCapacity <= 0) return;
+
+    const char = this.getActiveCharacter();
+    let curAmmo = this.magAmmoByWeapon[prof.id] ?? prof.magCapacity;
+    if (char?.tacticalInventory) {
+      const slotKey = getWeaponSlotByWeaponId(char.tacticalInventory, prof.id);
+      if (slotKey) {
+        curAmmo = getLoadedAmmoCount(char.tacticalInventory[slotKey]);
+      }
+    }
+    const hasLiveRound = curAmmo > 0;
+    const weaponId = prof.id;
+    const baseCal = resolveBaseCaliberId(prof.caliberLabel);
+    const defaultCaliberLabel = BASE_CALIBERS[baseCal]?.shortLabel ?? baseCal;
+
+    const started = this.animator.triggerChamberCycle({
+      hasLiveRound,
+      onExtractApex: (pos, quat) => {
+        if (this.equippedWeaponId !== weaponId) return;
+        const activeCharNow = this.getActiveCharacter();
+        let ejectedVariantId: string = baseCal;
+        let ejectedLabel = defaultCaliberLabel;
+        if (activeCharNow?.tacticalInventory) {
+          const slotKey = getWeaponSlotByWeaponId(activeCharNow.tacticalInventory, weaponId);
+          if (slotKey) {
+            const invClone = cloneTacticalInventory(activeCharNow.tacticalInventory);
+            const extractedVariant = fireRoundFromWeaponSlot(invClone[slotKey]);
+            if (!extractedVariant) return;
+            const nextAmmo = getLoadedAmmoCount(invClone[slotKey]);
+            this.magAmmoByWeapon[weaponId] = nextAmmo;
+            this.weaponRig.setAmmoState(nextAmmo, true);
+            characterRoster.updateTacticalInventory(activeCharNow.slotId, invClone);
+            ejectedVariantId = extractedVariant.id;
+            ejectedLabel = `${defaultCaliberLabel} ${extractedVariant.shortName}`;
+          } else {
+            const magNow = this.magAmmoByWeapon[weaponId] ?? 0;
+            if (magNow <= 0) return;
+            this.magAmmoByWeapon[weaponId] = magNow - 1;
+            this.weaponRig.setAmmoState(magNow - 1, true);
+          }
+        } else {
+          const magNow = this.magAmmoByWeapon[weaponId] ?? 0;
+          if (magNow <= 0) return;
+          this.magAmmoByWeapon[weaponId] = magNow - 1;
+          this.weaponRig.setAmmoState(magNow - 1, true);
+        }
+
+        this.controller.getVelocity(this._liveRoundVel);
+        this.ejectedLiveRounds.spawnRound({
+          position: pos,
+          quaternion: quat,
+          caliberId: ejectedVariantId,
+          caliberLabel: ejectedLabel,
+          weaponId,
+          holdClass: prof.holdClass,
+          carrierVelocity: this._liveRoundVel,
+        });
+        this.emitSnapshot();
+      },
+      onComplete: () => {
+        this.emitSnapshot();
+      },
+    });
+    if (started) {
+      this.isFiring = false;
+      this.emitSnapshot();
+    }
+  }
+
   private startReload(): void {
     if (
       this.isNonFirearmEquipped() ||
       this.reloadTimer > 0 ||
+      this.weaponRig.isChamberCycling() ||
       this.grenadeSystem.isDrawn() ||
       this.pdaDevice.isBlockingWeaponActions()
     ) {
@@ -1855,12 +2029,10 @@ export class OpenWorldSessionEngine {
     if (char?.tacticalInventory) {
       const slotKey = getWeaponSlotByWeaponId(char.tacticalInventory, prof.id);
       if (slotKey) {
-        const candidate = findQuickReloadMagazine(char.tacticalInventory, prof.id);
+        const candidate = findBestReloadMagazine(char.tacticalInventory, prof.id);
         if (!candidate) {
           this.showToast(
-            char.tacticalInventory.chestRig
-              ? 'No loaded mag in Chest Rig / Belt — press [Tab] to drag-reload from Backpack'
-              : 'No Chest Rig equipped — press [Tab] to drag-reload from Backpack',
+            'No loaded compatible magazine in Rig, Belt, or Backpack — press [Tab] to pack rounds',
             4.0,
           );
           this.emitSnapshot();
@@ -1868,7 +2040,7 @@ export class OpenWorldSessionEngine {
         }
         this.isFiring = false;
         this.input.ads = false;
-        this.reloadTimer = Math.max(1.1, prof.reloadDurationSec);
+        this.reloadTimer = Math.max(1.1, prof.reloadDurationSec) * candidate.reloadTimeMult;
         this.pendingReloadWeaponId = prof.id;
         this.pendingReloadSpec = {
           weaponId: prof.id,
@@ -1877,6 +2049,9 @@ export class OpenWorldSessionEngine {
         };
         this.weaponRig.triggerReload(this.reloadTimer);
         this.audio.playWeaponCue('mag_out', { intensity: 0.65 });
+        if (candidate.fromBackpack) {
+          this.showToast('Pulling spare magazine from Backpack (slower reload)', 2.4);
+        }
         this.emitSnapshot();
         return;
       }
@@ -2349,6 +2524,11 @@ export class OpenWorldSessionEngine {
     if (!char) return;
     characterRoster.updateTacticalInventory(char.slotId, nextInv);
     this.grenadeCount = countGrenadesInInventory(nextInv);
+    const bpId = nextInv.backpack?.templateId ?? null;
+    this.skeleton.setBackpack(isBackpackTemplateId(bpId) ? bpId : null);
+    if (isBackpackTemplateId(bpId)) {
+      backpackUnlockStore.unlockByWorldPickup(bpId, { isPracticeGear: false });
+    }
 
     if (!this.isNonFirearmEquipped()) {
       const prof = resolveWeaponProfile(this.equippedWeaponId);
@@ -2372,6 +2552,10 @@ export class OpenWorldSessionEngine {
           characterRoster.recordRotatingContractProgress(char.slotId, (rec) => rec.archetype === 'recon', 1);
           this.showToast('WORLD EVENT CRATE CLEARED: +$1,800 Salvage Completion Bonus', 4.8);
         }
+      } else if (this.activeExternalLoot.kind === 'ground_backpack' && nextExternal.backpack) {
+        this.worldBackpacks.updateContainerContents(this.activeExternalLoot.id, nextExternal.backpack);
+        const refreshed = this.worldBackpacks.buildExternalLootContext(this.activeExternalLoot.id);
+        this.activeExternalLoot = refreshed ?? null;
       }
     }
 
@@ -2379,6 +2563,70 @@ export class OpenWorldSessionEngine {
       this.showToast(statusNote, 3.0);
     }
     this.emitSnapshot();
+  }
+
+  public dropEquippedBackpack(): void {
+    const char = this.getActiveCharacter();
+    if (!char?.tacticalInventory?.backpack) return;
+    const invClone = cloneTacticalInventory(char.tacticalInventory);
+    const forward = new THREE.Vector3();
+    this.camera.getWorldDirection(forward);
+    forward.y = 0;
+    if (forward.lengthSq() < 1e-4) forward.set(0, 0, -1);
+    forward.normalize();
+
+    const dropped = this.worldBackpacks.dropFromInventory(
+      invClone,
+      this.controller.position,
+      forward,
+      (x, z) => this.streamer.sampleGroundHeight(x, z),
+      { ownerLabel: char.callsign },
+    );
+    if (!dropped) return;
+
+    characterRoster.updateTacticalInventory(char.slotId, invClone);
+    this.skeleton.setBackpack(null);
+    this.audio.playGearRattle('weapon_swap', 0.65);
+    if (!this.activeExternalLoot) {
+      this.activeExternalLoot = this.worldBackpacks.buildExternalLootContext(dropped.id);
+    }
+    this.showToast(
+      `Dropped ${dropped.backpack.shortLabel} (${dropped.backpack.grid.items.length} item(s)) on ground`,
+      3.0,
+    );
+    this.emitSnapshot();
+  }
+
+  public equipGroundBackpack(containerId: string): {
+    ok: boolean;
+    error?: string;
+    requiresUnequipFirst?: boolean;
+  } {
+    const char = this.getActiveCharacter();
+    if (!char?.tacticalInventory) {
+      return { ok: false, error: 'Inventory unavailable.' };
+    }
+    const invClone = cloneTacticalInventory(char.tacticalInventory);
+    const res = this.worldBackpacks.equipFromWorld(containerId, invClone);
+    if (!res.ok) return res;
+
+    characterRoster.updateTacticalInventory(char.slotId, invClone);
+    const bpId = invClone.backpack?.templateId ?? null;
+    this.skeleton.setBackpack(isBackpackTemplateId(bpId) ? bpId : null);
+    this.audio.playGearRattle('weapon_swap', 0.7);
+    if (this.activeExternalLoot?.id === containerId) {
+      this.activeExternalLoot = null;
+    }
+    this.showToast(
+      `Equipped ${invClone.backpack?.shortLabel ?? 'Backpack'} (${invClone.backpack?.grid.items.length ?? 0} item(s) intact)`,
+      3.4,
+    );
+    this.emitSnapshot();
+    return { ok: true };
+  }
+
+  public playMagPackTickAudio(): void {
+    this.audio.playTacticalSwitchClick(true);
   }
 
   public useMedicalItemFromInventory(locator: ItemSourceLocator, _med: MedicalItem): void {
@@ -2528,6 +2776,61 @@ export class OpenWorldSessionEngine {
     const char = this.getActiveCharacter();
     if (!inter) return;
 
+    if (inter.kind === 'live_round_pickup') {
+      const roundId = Number(inter.id);
+      const collected = this.ejectedLiveRounds.collectRound(roundId);
+      if (collected) {
+        let storedInInventory = false;
+        if (char?.tacticalInventory) {
+          const invClone = cloneTacticalInventory(char.tacticalInventory);
+          const resolvedVariant: AmmoVariantId =
+            collected.caliberId in AMMO_VARIANTS
+              ? (collected.caliberId as AmmoVariantId)
+              : getDefaultAmmoVariant(collected.caliberId).id;
+
+          // Try stacking onto an existing loose ammo box of the same variant first
+          const grids = [
+            ...(invClone.chestRig ? [invClone.chestRig.generalGrid] : []),
+            ...(invClone.backpack ? [invClone.backpack.grid] : []),
+            invClone.secureContainer,
+          ];
+          for (const grid of grids) {
+            const match = grid.items.find(
+              (entry) =>
+                entry.item.kind === 'ammo_stack' &&
+                entry.item.variantId === resolvedVariant &&
+                entry.item.count < entry.item.maxStack,
+            );
+            if (match && match.item.kind === 'ammo_stack') {
+              match.item.count += 1;
+              storedInInventory = true;
+              break;
+            }
+          }
+          if (!storedInInventory) {
+            const looseItem = createAmmoStackItem(resolvedVariant, 1);
+            for (const grid of grids) {
+              if (autoPlaceItemInGrid(grid, looseItem)) {
+                storedInInventory = true;
+                break;
+              }
+            }
+          }
+          if (storedInInventory) {
+            characterRoster.updateTacticalInventory(char.slotId, invClone);
+          }
+        }
+        if (!storedInInventory && this.activeSlotId) {
+          characterRoster.addArsenalReserve(this.activeSlotId, collected.weaponId, 1);
+        }
+        this.audio.playGearRattle('crouch', 0.42);
+        this.showToast(`+1 ${collected.caliberLabel} Round Recovered`, 2.0);
+        this.activeInteractable = null;
+        this.emitSnapshot();
+      }
+      return;
+    }
+
     if (inter.kind === 'wildlife_harvest') {
       const harvest = this.wildlifeManager.harvestCarcass(inter.id);
       if (harvest) {
@@ -2536,6 +2839,19 @@ export class OpenWorldSessionEngine {
         }
         this.showToast(harvest.summaryLabel, 4.5);
         this.activeInteractable = null;
+        this.emitSnapshot();
+      }
+      return;
+    }
+
+    if (inter.kind === 'ground_backpack') {
+      const ctx = this.worldBackpacks.buildExternalLootContext(inter.id);
+      if (ctx) {
+        this.activeModal = 'inventory';
+        this.activeExternalLoot = ctx;
+        this.clearInputs();
+        this.exitPointerLock();
+        this.audio.playGearRattle('weapon_swap', 0.55);
         this.emitSnapshot();
       }
       return;
@@ -3532,6 +3848,33 @@ export class OpenWorldSessionEngine {
         });
       }
 
+      if (this.navMode === 'foot') {
+        this.camera.getWorldPosition(_camPos);
+        this.camera.getWorldDirection(_forward).normalize();
+        const liveCand = this.ejectedLiveRounds.findLookedAtPickup(_camPos, _forward, 2.65);
+        if (liveCand) {
+          candidates.push({
+            kind: 'live_round_pickup',
+            id: String(liveCand.id),
+            label: `Pick up 1x ${liveCand.caliberLabel} Round`,
+            sublabel: 'Intact Live Cartridge',
+            distanceM: liveCand.distanceM,
+            canExecute: true,
+          });
+        }
+        const bpCand = this.worldBackpacks.findInteractable(_camPos, _forward, 3.0);
+        if (bpCand) {
+          candidates.push({
+            kind: 'ground_backpack',
+            id: bpCand.id,
+            label: `Inspect / Equip ${bpCand.name}`,
+            sublabel: `${bpCand.itemCount} item(s) inside · [F] Open Container`,
+            distanceM: bpCand.distanceM,
+            canExecute: true,
+          });
+        }
+      }
+
       candidates.sort((a, b) => a.distanceM - b.distanceM);
       this.activeInteractable = candidates[0] ?? null;
     } else {
@@ -3545,6 +3888,12 @@ export class OpenWorldSessionEngine {
       this.bodycamAdapter,
       (ev) => this.handleBallisticImpact(ev),
       flybyCtx,
+    );
+    this.ejectedLiveRounds.update(
+      dt,
+      this.bodycamAdapter,
+      (x, z) => sampleOpenWorldTerrain(x, z, this._liveRoundTerrainSample).height,
+      this.audio,
     );
     if (this.navMode === 'foot') {
       this.camera.getWorldPosition(_camPos);
@@ -3704,6 +4053,12 @@ export class OpenWorldSessionEngine {
       !this.input.ads;
     this.input.holdBreath =
       !pdaBusy && this.holdBreathHeld && this.input.ads && !this.isNonFirearmEquipped();
+    this.input.freeZoom =
+      this.freeZoomHeld &&
+      this.pointerLocked &&
+      this.activeModal === null &&
+      this.navMode === 'foot' &&
+      !pdaBusy;
 
     if (this.fireCooldown > 0) {
       this.fireCooldown = Math.max(0, this.fireCooldown - dt);
@@ -3780,6 +4135,9 @@ export class OpenWorldSessionEngine {
     this.heartRateBpm += (targetHr - this.heartRateBpm) * Math.min(1, hrLerp);
     this.controller.setHeartRateBpm(this.heartRateBpm);
 
+    const enc = activeChar?.tacticalInventory
+      ? computeOperatorEncumbrance(activeChar.tacticalInventory)
+      : null;
     this.controller.update(
       dt,
       this.elapsedSec,
@@ -3792,6 +4150,16 @@ export class OpenWorldSessionEngine {
       (drainAmt) => {
         this.stamina = Math.max(0, this.stamina - drainAmt);
       },
+      enc
+        ? {
+            encumbranceRatio: enc.ratio01,
+            swayAmpMult: 1 + enc.ratio01 * 0.25,
+            staminaDrainMult: enc.staminaDrainMult,
+            exertionRateMult: enc.exertionRateMult,
+            moveSpeedMult: enc.moveSpeedMult,
+            canSprint: enc.canSprint && this.sprintSlowRemainingSec <= 0,
+          }
+        : undefined,
     );
 
     // Step Hold [F] two-handed repair IK before full-body animator
@@ -4229,6 +4597,8 @@ export class OpenWorldSessionEngine {
     this.grenadeSystem.dispose();
     this.pdaDevice.dispose();
     this.ballistics.dispose();
+    this.ejectedLiveRounds.dispose();
+    this.worldBackpacks.dispose();
     this.weaponRig.dispose();
     this.skeleton.dispose();
     this.streamer.setPhysicsPropCallbacks(null);

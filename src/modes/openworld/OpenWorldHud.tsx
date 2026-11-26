@@ -72,6 +72,11 @@ interface OpenWorldHudProps {
   ) => void;
   onUseMedicalItem: (locator: ItemSourceLocator, med: MedicalItem) => void;
   onUsePdaBattery: (locator: ItemSourceLocator) => void;
+  onDropEquippedBackpack?: () => void;
+  onEquipGroundBackpack?: (
+    containerId: string,
+  ) => { ok: boolean; error?: string; requiresUnequipFirst?: boolean };
+  onMagPackTickAudio?: () => void;
   onFastTravelToSector: (sectorId: string) => void;
   onFundFobUpgrade: () => void;
   onBuyFobOffer: (offerId: string) => void;
@@ -159,6 +164,9 @@ export const OpenWorldHud: React.FC<OpenWorldHudProps> = ({
   onTriggerDragReload,
   onUseMedicalItem,
   onUsePdaBattery,
+  onDropEquippedBackpack,
+  onEquipGroundBackpack,
+  onMagPackTickAudio,
   onFastTravelToSector,
   onFundFobUpgrade,
   onBuyFobOffer,
@@ -848,10 +856,15 @@ export const OpenWorldHud: React.FC<OpenWorldHudProps> = ({
             bleeding={combat.bleedingRemainingSec > 0}
             sprintSlow={combat.sprintSlowRemainingSec > 0}
             pdaBatteryPct={combat.pdaBatteryPct}
+            modeLabel="Open World"
+            showSecureContainer={true}
             onMutateInventory={onMutateInventory}
             onTriggerDragReload={onTriggerDragReload}
             onUseMedicalItem={onUseMedicalItem}
             onUsePdaBattery={onUsePdaBattery}
+            onDropEquippedBackpack={onDropEquippedBackpack}
+            onEquipGroundBackpack={onEquipGroundBackpack}
+            onMagPackTickAudio={onMagPackTickAudio}
             onClose={onCloseModal}
           />
         )}

@@ -17,10 +17,12 @@ export type KeybindActionId =
   | 'fire'
   | 'ads'
   | 'hold_breath'
+  | 'free_zoom'
   | 'point_aim'
   | 'canted_optic'
   | 'switch_fire_mode'
   | 'reload'
+  | 'cycle_chamber'
   | 'suppressor'
   | 'inspect'
   | 'reticle_illum'
@@ -118,7 +120,15 @@ export const KEYBIND_ACTIONS: readonly KeybindActionDefinition[] = [
   { id: 'fire', group: 'weapons', label: 'Fire Weapon / Throw', defaultCode: 'Mouse0', conflictGroup: 'general' },
   { id: 'ads', group: 'weapons', label: 'Aim Down Sights (ADS)', defaultCode: 'Mouse2', conflictGroup: 'general' },
   { id: 'hold_breath', group: 'weapons', label: 'Hold Breath (While ADS)', defaultCode: 'ShiftLeft', conflictGroup: 'ads_modifier' },
-  { id: 'point_aim', group: 'weapons', label: 'Toggle Point Aim', defaultCode: 'Mouse1', conflictGroup: 'general' },
+  {
+    id: 'free_zoom',
+    group: 'weapons',
+    label: 'Free Zoom (Focus)',
+    description: 'Hold to narrow FOV slightly anytime; stacks onto ADS and works while sprinting.',
+    defaultCode: 'Mouse1',
+    conflictGroup: 'general',
+  },
+  { id: 'point_aim', group: 'weapons', label: 'Toggle Point Aim', defaultCode: 'AltLeft', conflictGroup: 'general' },
   { id: 'canted_optic', group: 'weapons', label: 'Toggle Canted Optic', defaultCode: 'KeyB', conflictGroup: 'general' },
   {
     id: 'switch_fire_mode',
@@ -129,6 +139,14 @@ export const KEYBIND_ACTIONS: readonly KeybindActionDefinition[] = [
     conflictGroup: 'general',
   },
   { id: 'reload', group: 'weapons', label: 'Reload Weapon', defaultCode: 'KeyR', conflictGroup: 'general' },
+  {
+    id: 'cycle_chamber',
+    group: 'weapons',
+    label: 'Cycle Chamber / Rack Action',
+    description: 'Manually racks the bolt, slide, or pump to cycle and eject a chambered live round onto the ground.',
+    defaultCode: 'KeyY',
+    conflictGroup: 'general',
+  },
   { id: 'suppressor', group: 'weapons', label: 'Attach / Remove Suppressor', defaultCode: 'KeyG', conflictGroup: 'general' },
   { id: 'inspect', group: 'weapons', label: 'Inspect Weapon', defaultCode: 'KeyI', conflictGroup: 'general' },
   { id: 'reticle_illum', group: 'weapons', label: 'Reticle Illumination', defaultCode: 'KeyN', conflictGroup: 'general' },

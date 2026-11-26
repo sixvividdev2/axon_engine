@@ -11,6 +11,7 @@ import {
 import { SecondaryPhysicsRigApplier } from '../bodycam-sdk/physics/SecondaryPhysicsRigApplier';
 import { OperatorUniformId } from '../bodycam-sdk/TacticalUniforms';
 import { tacticalEquipmentStore } from '../bodycam-sdk/equipment/TacticalEquipmentStore';
+import { loadoutStore } from '../data/loadoutStore';
 
 export type FacialPreviewIntent = 'calm' | 'alert' | 'suppressed';
 
@@ -80,6 +81,7 @@ export class OperatorPreviewStage {
   private readonly resizeObserver: ResizeObserver;
   private readonly stageDisposables: Array<{ dispose: () => void }> = [];
   private readonly unsubTacticalEquipment: () => void;
+  private readonly unsubLoadout: () => void;
 
   // Scratch vectors
   private readonly _lookTarget = new THREE.Vector3(0, TARGET_Y, 0);
@@ -143,6 +145,12 @@ export class OperatorPreviewStage {
     this.unsubTacticalEquipment = tacticalEquipmentStore.subscribe((sel) => {
       if (!this.disposed && this.skeleton) {
         this.skeleton.setBeltEquipment(sel.equipmentId, sel.beltSlot, 2, sel.mountOnBelt);
+      }
+    });
+    this.unsubLoadout = loadoutStore.subscribe(() => {
+      if (!this.disposed && this.skeleton) {
+        this.skeleton.setBackpack(loadoutStore.getActiveSlot().backpackId);
+        this.skeleton.setAllMeshesWorldLayer();
       }
     });
 
@@ -326,6 +334,7 @@ export class OperatorPreviewStage {
     const skel = loaded.skeleton;
     const sel = tacticalEquipmentStore.getSelection();
     skel.setBeltEquipment(sel.equipmentId, sel.beltSlot, 2, sel.mountOnBelt);
+    skel.setBackpack(loadoutStore.getActiveSlot().backpackId);
     skel.setNvgFlipped(this.currentNvgFlipped);
     skel.setFirstPersonHeadShadowOnly(false);
     skel.setAllMeshesWorldLayer();
@@ -594,6 +603,7 @@ export class OperatorPreviewStage {
     }
 
     this.unsubTacticalEquipment();
+    this.unsubLoadout();
     this.resizeObserver.disconnect();
     const dom = this.renderer.domElement;
     dom.removeEventListener('pointerdown', this.onPointerDown);

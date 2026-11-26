@@ -8,6 +8,8 @@ import {
   WeaponProgressRecord,
 } from '../data/progression';
 import { KeybindOverrides, keybindStore } from '../data/keybindStore';
+import { BACKPACK_UNLOCK_RANK, backpackUnlockStore } from '../data/backpackUnlocks';
+import type { BackpackTemplateId } from '../src/modes/openworld/inventory/TetrisInventoryTypes';
 import {
   AccountProfile,
   commitMatchProgression,
@@ -82,8 +84,10 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   useEffect(() => {
     if (user) {
       keybindStore.setActiveUser(user.id, user.keybinds ?? {}, persistAccountKeybinds);
+      backpackUnlockStore.setActiveUser(user.id);
     } else {
       keybindStore.setActiveUser(null, null, null);
+      backpackUnlockStore.setActiveUser(null);
     }
   }, [user?.id, persistAccountKeybinds]);
 
@@ -176,8 +180,18 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     async (input: MatchResultInput): Promise<MatchProgressionSummary | null> => {
       if (!user) return null;
       try {
+        const prevRank = user.rank ?? 1;
         const { user: updatedUser, summary } = await commitMatchProgression(input);
         setUser(updatedUser);
+        const nextRank = updatedUser.rank ?? prevRank;
+        if (nextRank > prevRank) {
+          (Object.keys(BACKPACK_UNLOCK_RANK) as BackpackTemplateId[]).forEach((packId) => {
+            const req = BACKPACK_UNLOCK_RANK[packId];
+            if (prevRank < req && nextRank >= req && !backpackUnlockStore.isDiscoveredInWorld(packId)) {
+              backpackUnlockStore.notifyRankUnlock(packId);
+            }
+          });
+        }
         return summary;
       } catch {
         return null;

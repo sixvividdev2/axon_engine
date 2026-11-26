@@ -32,6 +32,7 @@ import { HubTabId, MainMenuHub } from './ui/MainMenuHub';
 import { RankUpCinematic } from './ui/RankUpCinematic';
 import { SocialHubDrawer } from './ui/SocialHubDrawer';
 import { SocialInviteToast } from './ui/SocialInviteToast';
+import { BackpackUnlockToast } from './ui/BackpackUnlockToast';
 import { UnifiedLoadoutWorkbench } from './ui/UnifiedLoadoutWorkbench';
 import { HideoutView } from './hideout/HideoutView';
 import { CharacterSlotId, OpenWorldView } from './src/modes/openworld';
@@ -110,6 +111,25 @@ function PlaygroundView({
           onTeleportZone={(zone) => engine?.teleportToZone(zone)}
           onLaunchTutorial={onLaunchTutorial}
           onReturnToMenu={onReturnToMenu}
+          onCloseInventory={() => engine?.closeInventory(true)}
+          onMutateInventory={(nextInv, nextExternal, statusNote) =>
+            engine?.applyInventoryMutation(nextInv, nextExternal, statusNote)
+          }
+          onTriggerDragReload={(slotKey, locator) =>
+            engine?.triggerInventoryDragReload(slotKey, locator)
+          }
+          onUseMedicalItem={(locator, med) => engine?.useMedicalItemFromInventory(locator, med)}
+          onDropEquippedBackpack={() => {
+            engine?.dropEquippedBackpack();
+          }}
+          onEquipGroundBackpack={(containerId) =>
+            engine?.equipGroundBackpack(containerId) ?? {
+              ok: false,
+              error: 'Playground not ready.',
+            }
+          }
+          onRestockBenchAmmo={() => engine?.restockBenchAmmo()}
+          onMagPackTickAudio={() => engine?.playMagPackTickAudio()}
         />
       )}
 
@@ -360,6 +380,26 @@ function CombatSessionView({
           onConfirmConquestRedeploy={() => engine?.confirmConquestRedeploy()}
           onCycleSpectateTarget={(dir) => engine?.cycleSpectateTarget(dir)}
           onToggleSpectateOverview={() => engine?.toggleSpectateOverview()}
+          onCloseInventory={() => engine?.closeInventory(true)}
+          onMutateInventory={(nextInv, nextExternal, statusNote) =>
+            engine?.applyInventoryMutation(nextInv, nextExternal, statusNote)
+          }
+          onTriggerDragReload={(slotKey, locator) =>
+            engine?.triggerInventoryDragReload(slotKey, locator)
+          }
+          onUseMedicalItem={(locator, med) =>
+            engine?.useMedicalItemFromInventory(locator, med)
+          }
+          onDropEquippedBackpack={() => {
+            engine?.dropEquippedBackpack();
+          }}
+          onEquipGroundBackpack={(containerId) =>
+            engine?.equipGroundBackpack(containerId) ?? {
+              ok: false,
+              error: 'Session not ready.',
+            }
+          }
+          onMagPackTickAudio={() => engine?.playMagPackTickAudio()}
           onRematch={() => {
             committedMatchRef.current = false;
             setRankSummary(null);
@@ -676,6 +716,7 @@ function AppShell() {
       <GameSettingsModal />
       <SocialHubDrawer />
       <SocialInviteToast />
+      <BackpackUnlockToast />
     </>
   );
 }

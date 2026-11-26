@@ -114,14 +114,23 @@ export const ControlsSettingsTab: React.FC<ControlsSettingsTabProps> = ({ compac
       e.stopPropagation();
     };
 
+    const onAuxClick = (e: MouseEvent) => {
+      if (e.button === 1) {
+        e.preventDefault();
+        e.stopPropagation();
+      }
+    };
+
     window.addEventListener('keydown', onKeyDown, true);
     window.addEventListener('mousedown', onMouseDown, true);
     window.addEventListener('contextmenu', onContextMenu, true);
+    window.addEventListener('auxclick', onAuxClick, true);
     return () => {
       keybindStore.setCapturing(false);
       window.removeEventListener('keydown', onKeyDown, true);
       window.removeEventListener('mousedown', onMouseDown, true);
       window.removeEventListener('contextmenu', onContextMenu, true);
+      window.removeEventListener('auxclick', onAuxClick, true);
     };
   }, [capturingActionId]);
 

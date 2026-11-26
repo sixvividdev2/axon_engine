@@ -46,6 +46,11 @@ import {
   BuiltTacticalEquipmentMesh,
   getBeltSlotTransforms,
 } from './equipment/TacticalEquipmentMesh';
+import {
+  buildTacticalBackpackMesh,
+  BuiltTacticalBackpackMesh,
+} from './equipment/TacticalBackpackMesh';
+import type { BackpackTemplateId } from '../src/modes/openworld/inventory/TetrisInventoryTypes';
 import { tacticalEquipmentStore } from './equipment/TacticalEquipmentStore';
 import { WeaponHandPoseProfile } from './weapons/WeaponModelFactory';
 
@@ -189,6 +194,9 @@ export class CharacterSkeleton {
   public readonly leftChestBalanceAnchor = new THREE.Object3D();
 
   private beltEquipmentMeshes: BuiltTacticalEquipmentMesh[] = [];
+  public readonly backpackMount = new THREE.Group();
+  private equippedBackpackMesh: BuiltTacticalBackpackMesh | null = null;
+  private equippedBackpackId: BackpackTemplateId | null = null;
   private beltEquipmentState: {
     equipmentId: TacticalEquipmentId;
     beltSlot: TacticalBeltSlot;
@@ -708,6 +716,11 @@ export class CharacterSkeleton {
     cummerbund.scale.set(1.08, 1.0, 0.66);
     cummerbund.position.set(0, -0.095, 0.005);
     this.chest.add(upperTorso, trapSlope, frontPlate, backPlate, cummerbund);
+
+    // 3D Worn Backpack Mount (strictly parented to chest behind rear SAPI plate)
+    this.backpackMount.name = 'gear_backpack_mount';
+    this.backpackMount.position.set(0, -0.015, 0.116);
+    this.chest.add(this.backpackMount);
 
     // Secondary Chest Soft-Tissue Nodes (strictly child of spine_03, >= 20mm behind front SAPI plate interior)
     const sec_chest_l = new THREE.Group();
@@ -2862,7 +2875,42 @@ export class CharacterSkeleton {
     return true;
   }
 
+  public setBackpack(templateId: BackpackTemplateId | null): void {
+    if (this.equippedBackpackId === templateId) return;
+    if (this.equippedBackpackMesh) {
+      this.backpackMount.remove(this.equippedBackpackMesh.root);
+      this.equippedBackpackMesh.dispose();
+      this.equippedBackpackMesh = null;
+    }
+    this.equippedBackpackId = templateId;
+    if (!templateId) return;
+
+    const built = buildTacticalBackpackMesh(templateId, {
+      mode: 'worn',
+      isFemale: this.operatorId === 'FEMALE',
+      castShadow: true,
+      receiveShadow: true,
+    });
+    built.root.traverse((obj) => {
+      if ((obj as THREE.Mesh).isMesh) {
+        const m = obj as THREE.Mesh;
+        m.layers.set(this.beltUseWorldLayer ? 0 : VIEWMODEL_LAYER);
+      }
+    });
+    this.backpackMount.add(built.root);
+    this.equippedBackpackMesh = built;
+  }
+
+  public getBackpackId(): BackpackTemplateId | null {
+    return this.equippedBackpackId;
+  }
+
   public dispose(): void {
+    if (this.equippedBackpackMesh) {
+      this.backpackMount.remove(this.equippedBackpackMesh.root);
+      this.equippedBackpackMesh.dispose();
+      this.equippedBackpackMesh = null;
+    }
     for (let i = 0; i < this.beltEquipmentMeshes.length; i++) {
       const prev = this.beltEquipmentMeshes[i];
       this.beltEquipmentMount.remove(prev.group);

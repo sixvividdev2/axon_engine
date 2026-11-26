@@ -138,7 +138,9 @@ export interface OpenWorldInteractableContext {
     | 'wildlife_harvest'
     | 'convoy_hijack'
     | 'world_event_crate'
-    | 'electronic_repair';
+    | 'electronic_repair'
+    | 'live_round_pickup'
+    | 'ground_backpack';
   id: string;
   label: string;
   sublabel: string;

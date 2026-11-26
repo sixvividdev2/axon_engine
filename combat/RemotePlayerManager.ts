@@ -24,6 +24,7 @@ import {
   TacticalEquipmentId,
 } from '../data/tacticalEquipment';
 import { BattleScoreEntry, BattleTeamId } from './BattleBotAI';
+import { isBackpackTemplateId } from '../src/modes/openworld/inventory/TetrisInventoryCore';
 import { BattleRuleId, isFreeForAllBattleRule } from '../maps/types';
 import {
   BuiltTacticalOperatorRig,
@@ -76,6 +77,8 @@ interface RemoteOperator {
   targetPointAim: number;
   cantBlend: number;
   targetCant: number;
+  focusBlend: number;
+  targetFocus: number;
   reloadBlend: number;
   targetReload: number;
   adsMode: 'PRIMARY' | 'POINT_AIM' | 'CANTED';
@@ -160,6 +163,7 @@ export class RemotePlayerManager {
     adsBlend: 0,
     pointAimBlend: 0,
     cantBlend: 0,
+    focusBlend: 0,
     reloadBlend: 0,
     speedMps: 0,
     walkCycle: 0,
@@ -394,6 +398,8 @@ export class RemotePlayerManager {
       targetPointAim: 0,
       cantBlend: 0,
       targetCant: 0,
+      focusBlend: 0,
+      targetFocus: 0,
       reloadBlend: 0,
       targetReload: 0,
       adsMode: 'PRIMARY',
@@ -491,6 +497,10 @@ export class RemotePlayerManager {
           : 1
         : 0;
     op.targetCant = stance === 'CANTED_ADS' || Boolean(pkt.isCanted) ? 1 : 0;
+    op.targetFocus =
+      typeof pkt.focus === 'number' && Number.isFinite(pkt.focus)
+        ? THREE.MathUtils.clamp(pkt.focus, 0, 1)
+        : 0;
 
     op.isFiring = Boolean(pkt.isFiring);
     op.isReloading = Boolean(pkt.isReloading);
@@ -576,6 +586,7 @@ export class RemotePlayerManager {
       op.adsBlend = op.targetAds;
       op.pointAimBlend = op.targetPointAim;
       op.cantBlend = op.targetCant;
+      op.focusBlend = op.targetFocus;
       op.reloadBlend = op.targetReload;
       op.hasInitialState = true;
     }
@@ -606,6 +617,10 @@ export class RemotePlayerManager {
           facePreset: pkt.facePreset,
         });
       }
+    }
+
+    if (pkt.bp !== undefined) {
+      op.rig.setBackpack(isBackpackTemplateId(pkt.bp) ? pkt.bp : null);
     }
 
     op.rig.root.visible = op.alive;
@@ -700,6 +715,8 @@ export class RemotePlayerManager {
     op.isReloading = false;
     op.targetReload = 0;
     op.reloadBlend = 0;
+    op.targetFocus = 0;
+    op.focusBlend = 0;
     op.handlingAction = 'NONE';
     op.handlingProgress = 0;
     op.targetHandlingProgress = 0;
@@ -856,6 +873,7 @@ export class RemotePlayerManager {
       op.adsBlend += (op.targetAds - op.adsBlend) * poseAlpha;
       op.pointAimBlend += (op.targetPointAim - op.pointAimBlend) * poseAlpha;
       op.cantBlend += (op.targetCant - op.cantBlend) * poseAlpha;
+      op.focusBlend += (op.targetFocus - op.focusBlend) * poseAlpha;
       op.reloadBlend += (op.targetReload - op.reloadBlend) * poseAlpha;
 
       // Apply root position & yaw (controller yaw 0 faces -Z, matching rig forward -Z)
@@ -896,7 +914,9 @@ export class RemotePlayerManager {
                   ? 1 / 0.34
                   : op.handlingAction === 'INSPECT'
                     ? 1 / 2.6
-                    : op.handlingAction === 'GRENADE_DRAW'
+                    : op.handlingAction === 'CHAMBER_CYCLE'
+                      ? 1 / 0.88
+                      : op.handlingAction === 'GRENADE_DRAW'
                       ? 1 / 0.36
                       : op.handlingAction === 'GRENADE_PIN_PULL'
                         ? 1 / 0.56
@@ -978,6 +998,7 @@ export class RemotePlayerManager {
       pose.adsBlend = op.adsBlend;
       pose.pointAimBlend = op.pointAimBlend;
       pose.cantBlend = op.cantBlend;
+      pose.focusBlend = op.focusBlend;
       pose.reloadBlend = op.reloadBlend;
       pose.speedMps = speedMps;
       pose.walkCycle = op.walkCycle;

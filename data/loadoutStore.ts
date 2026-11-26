@@ -11,6 +11,8 @@ import { AmmoVariantId, getDefaultAmmoVariant, resolveBaseCaliberId } from './ca
 import { TacticalBeltSlot, TacticalEquipmentId } from './tacticalEquipment';
 import { tacticalEquipmentStore } from '../bodycam-sdk/equipment/TacticalEquipmentStore';
 import { resolveWeaponProfile, SDK_WEAPON_PROFILES } from '../bodycam-sdk/weaponProfiles';
+import type { BackpackTemplateId } from '../src/modes/openworld/inventory/TetrisInventoryTypes';
+import { isBackpackTemplateId } from '../src/modes/openworld/inventory/TetrisInventoryCore';
 
 export interface SavedWeaponBuild {
   weaponId: string;
@@ -29,6 +31,8 @@ export interface CustomLoadoutSlot {
   tacticalEquipmentId: TacticalEquipmentId;
   tacticalBeltSlot: TacticalBeltSlot;
   mountOnBelt: boolean;
+  /** Equipped tactical backpack tier (null = Chest Rig & Belt only) */
+  backpackId: BackpackTemplateId | null;
   /** Per-weapon builds persisted inside this loadout slot */
   weaponBuilds: Record<string, SavedWeaponBuild>;
 }
@@ -104,6 +108,7 @@ function createDefaultLoadoutSlots(): CustomLoadoutSlot[] {
     tacticalEquipmentId: p.tactical,
     tacticalBeltSlot: 'right_hip',
     mountOnBelt: true,
+    backpackId: null,
     weaponBuilds: {
       [p.primary]: createDefaultWeaponBuild(p.primary),
       [p.secondary]: createDefaultWeaponBuild(p.secondary),
@@ -184,6 +189,7 @@ class LoadoutStore {
             (s.tacticalEquipmentId as TacticalEquipmentId) || def.tacticalEquipmentId,
           tacticalBeltSlot: (s.tacticalBeltSlot as TacticalBeltSlot) || def.tacticalBeltSlot,
           mountOnBelt: typeof s.mountOnBelt === 'boolean' ? s.mountOnBelt : def.mountOnBelt,
+          backpackId: isBackpackTemplateId(s.backpackId) ? s.backpackId : null,
           weaponBuilds: normalizedBuilds,
         };
       });
@@ -315,6 +321,18 @@ class LoadoutStore {
       if (beltSlot) tacticalEquipmentStore.setBeltSlot(beltSlot);
       if (typeof mountOnBelt === 'boolean') tacticalEquipmentStore.setMountOnBelt(mountOnBelt);
     }
+    this.saveAndEmit();
+  }
+
+  public setSlotBackpack(index: number, backpackId: BackpackTemplateId | null): void {
+    if (index < 0 || index >= this.state.slots.length) return;
+    const normalized = backpackId && isBackpackTemplateId(backpackId) ? backpackId : null;
+    const nextSlots = [...this.state.slots];
+    nextSlots[index] = {
+      ...nextSlots[index],
+      backpackId: normalized,
+    };
+    this.state = { ...this.state, slots: nextSlots };
     this.saveAndEmit();
   }
 

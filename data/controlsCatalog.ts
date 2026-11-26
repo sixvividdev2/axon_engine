@@ -33,7 +33,13 @@ export const CONTROL_BINDING_GROUPS: readonly ControlBindingGroup[] = [
       { id: 'fire', keys: ['LMB'], action: 'Fire Weapon / Throw Ordnance' },
       { id: 'ads', keys: ['RMB'], action: 'Aim Down Sights (ADS)' },
       { id: 'hold_breath', keys: ['Shift'], action: 'Hold Breath (While ADS)' },
-      { id: 'point_aim', keys: ['MMB'], action: 'Toggle Point Aim' },
+      {
+        id: 'free_zoom',
+        keys: ['MMB'],
+        action: 'Free Zoom / Focus (Hold)',
+        detail: 'Subtle 13% FOV focus zoom; works anytime including sprint & stacks onto ADS',
+      },
+      { id: 'point_aim', keys: ['Alt'], action: 'Toggle Point Aim' },
       { id: 'canted', keys: ['B'], action: 'Toggle Canted Backup Optic' },
       {
         id: 'switch_fire_mode',
@@ -44,6 +50,12 @@ export const CONTROL_BINDING_GROUPS: readonly ControlBindingGroup[] = [
       { id: 'optic_zoom', keys: ['Wheel', '[ ]'], action: 'Variable Optic Magnification' },
       { id: 'reticle_illum', keys: ['N'], action: 'Toggle Optic Illumination' },
       { id: 'reload', keys: ['R'], action: 'Reload Weapon' },
+      {
+        id: 'cycle_chamber',
+        keys: ['Y'],
+        action: 'Cycle Chamber / Rack Bolt or Slide',
+        detail: 'Racks action to eject a live round onto the ground (pick up with F)',
+      },
       { id: 'suppressor', keys: ['G'], action: 'Attach / Detach Suppressor' },
       { id: 'inspect', keys: ['I'], action: 'Inspect Firearm' },
     ],

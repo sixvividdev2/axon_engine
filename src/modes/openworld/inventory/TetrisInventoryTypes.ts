@@ -181,11 +181,35 @@ export type ItemSourceLocator =
   | { zone: 'external_rig_grid'; instanceId: string }
   | { zone: 'external_belt'; slotIndex: number };
 
+export type BackpackTemplateId =
+  | 'pack_assault_20l'
+  | 'pack_rucksack_35l'
+  | 'pack_logistics_55l';
+
+export type EncumbranceTier = 'light' | 'moderate' | 'heavy' | 'overloaded';
+
+export interface OperatorEncumbranceState {
+  readonly totalWeightKg: number;
+  readonly comfortableKg: number;
+  readonly heavyKg: number;
+  readonly maxKg: number;
+  /** 0 at/below comfortableKg, 1 at maxKg, >1 when overloaded */
+  readonly ratio01: number;
+  readonly tier: EncumbranceTier;
+  readonly moveSpeedMult: number;
+  readonly staminaDrainMult: number;
+  readonly exertionRateMult: number;
+  readonly canSprint: boolean;
+}
+
 export interface QuickReloadCandidate {
   locator:
     | { zone: 'chest_rig_rifle'; slotIndex: number }
     | { zone: 'chest_rig_pistol'; slotIndex: number }
     | { zone: 'chest_rig_grid'; instanceId: string }
-    | { zone: 'belt'; slotIndex: number };
+    | { zone: 'belt'; slotIndex: number }
+    | { zone: 'backpack_grid'; instanceId: string };
   magazine: MagazineItem;
+  fromBackpack?: boolean;
+  reloadTimeMult?: number;
 }

@@ -383,6 +383,27 @@ export const HideoutView: React.FC<HideoutViewProps> = ({
           onOpenClassicHub={onOpenClassicHub}
           onLaunchPlayground={onLaunchPlayground}
           onLaunchTutorial={onLaunchTutorial}
+          onCloseInventory={() => hideoutControllerRef.current?.closeInventory(true)}
+          onMutateInventory={(nextInv, nextExternal, statusNote) =>
+            hideoutControllerRef.current?.applyInventoryMutation(nextInv, nextExternal, statusNote)
+          }
+          onTriggerDragReload={(slotKey, locator) =>
+            hideoutControllerRef.current?.triggerInventoryDragReload(slotKey, locator)
+          }
+          onUseMedicalItem={(locator, med) =>
+            hideoutControllerRef.current?.useMedicalItemFromInventory(locator, med)
+          }
+          onDropEquippedBackpack={() => {
+            hideoutControllerRef.current?.dropEquippedBackpack();
+          }}
+          onEquipGroundBackpack={(containerId) =>
+            hideoutControllerRef.current?.equipGroundBackpack(containerId) ?? {
+              ok: false,
+              error: 'Hideout controller not ready.',
+            }
+          }
+          onRestockBenchAmmo={() => hideoutControllerRef.current?.restockBenchAmmo()}
+          onMagPackTickAudio={() => hideoutControllerRef.current?.playMagPackTickAudio()}
         />
       )}
 
@@ -402,6 +423,27 @@ export const HideoutView: React.FC<HideoutViewProps> = ({
           onLaunchTutorial={onLaunchTutorial}
           onVolumeChange={(v) => zombiesControllerRef.current?.setMasterVolume(v)}
           onGraphicsChange={() => zombiesControllerRef.current?.applyGraphicsQuality()}
+          onCloseInventory={() => zombiesControllerRef.current?.closeInventory(true)}
+          onMutateInventory={(nextInv, nextExternal, statusNote) =>
+            zombiesControllerRef.current?.applyInventoryMutation(nextInv, nextExternal, statusNote)
+          }
+          onTriggerDragReload={(slotKey, locator) =>
+            zombiesControllerRef.current?.triggerInventoryDragReload(slotKey, locator)
+          }
+          onUseMedicalItem={(locator, med) =>
+            zombiesControllerRef.current?.useMedicalItemFromInventory(locator, med)
+          }
+          onDropEquippedBackpack={() => {
+            zombiesControllerRef.current?.dropEquippedBackpack();
+          }}
+          onEquipGroundBackpack={(containerId) =>
+            zombiesControllerRef.current?.equipGroundBackpack(containerId) ?? {
+              ok: false,
+              error: 'Outpost controller not ready.',
+            }
+          }
+          onRestockBenchAmmo={() => zombiesControllerRef.current?.restockBenchAmmo()}
+          onMagPackTickAudio={() => zombiesControllerRef.current?.playMagPackTickAudio()}
         />
       )}
 

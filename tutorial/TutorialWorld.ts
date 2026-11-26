@@ -423,7 +423,7 @@ export function buildTutorialWorld(
   // BAY 04 (z = -4.5 .. -12): Weapon Handling, Optics & Reload Bench
   // =========================================================================
   addBayPortal(-3.6, 5.2, 3.6);
-  addBaySign('04 · WEAPON HANDLING', 'B CANTED · MMB POINT AIM · R RELOAD · G SUPPRESSOR · 1/2/3', -6.22, 2.45, -7.8, Math.PI * 0.5);
+  addBaySign('04 · WEAPON HANDLING', 'B CANTED · ALT POINT AIM · R RELOAD · Y RACK · G SUPPRESSOR · 1/2/3', -6.22, 2.45, -7.8, Math.PI * 0.5);
 
   // Composite Ammo & Optics Prep Table
   addBox(3.4, 0.45, -7.8, 1.1, 0.9, 2.6, woodMat, 'wood', true, true);

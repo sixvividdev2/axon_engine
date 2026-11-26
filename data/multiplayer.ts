@@ -11,6 +11,10 @@ import {
   isValidBattleRule,
 } from '../maps/types';
 import { TacticalEquipmentId } from './tacticalEquipment';
+import type {
+  BackpackItem,
+  BackpackTemplateId,
+} from '../src/modes/openworld/inventory/TetrisInventoryTypes';
 
 export type { LobbyKillfeedPolicy };
 export type LobbyVisibility = 'public' | 'friends_only' | 'private';
@@ -454,6 +458,7 @@ export type SyncedHandlingAction =
   | 'LIGHT_PAD'
   | 'MAG_CHECK'
   | 'INSPECT'
+  | 'CHAMBER_CYCLE'
   | 'GRENADE_DRAW'
   | 'GRENADE_PIN_PULL'
   | 'GRENADE_COOK'
@@ -483,6 +488,7 @@ export const VALID_SYNCED_HANDLING_ACTIONS: ReadonlySet<SyncedHandlingAction> = 
   'LIGHT_PAD',
   'MAG_CHECK',
   'INSPECT',
+  'CHAMBER_CYCLE',
   'GRENADE_DRAW',
   'GRENADE_PIN_PULL',
   'GRENADE_COOK',
@@ -571,6 +577,7 @@ export interface GamePlayerStatePacket {
   isCanted: boolean;
   adsBlend: number; // 0..1
   pointAimBlend: number; // 0..1
+  focus?: number; // 0..1 free-zoom focus blend (head crane + eye squint)
   isFiring: boolean;
   isReloading: boolean;
   fireSeq: number;
@@ -585,6 +592,8 @@ export interface GamePlayerStatePacket {
   faceGear?: 'open_face' | 'neck_gaiter' | 'balaclava';
   eyewear?: 'none' | 'clear_glasses' | 'tinted_visor';
   facePreset?: 'face_01' | 'face_02' | 'face_03';
+  /** Equipped 3D backpack tier ID (null = none) */
+  bp?: BackpackTemplateId | null;
   lean: number; // -1..1
   weaponId: string;
   att?: SyncedWeaponAttachments;
@@ -686,6 +695,7 @@ export interface GamePlayerRespawnPacket {
   faceGear?: 'open_face' | 'neck_gaiter' | 'balaclava';
   eyewear?: 'none' | 'clear_glasses' | 'tinted_visor';
   facePreset?: 'face_01' | 'face_02' | 'face_03';
+  bp?: BackpackTemplateId | null;
   ts: number;
 }
 
@@ -710,6 +720,7 @@ export interface SyncedBotState {
   gc?: number;
   gts?: 'overhand' | 'underhand';
   sup?: boolean;
+  bp?: BackpackTemplateId | null;
   points?: number;
   reloading?: boolean;
   x: number;
@@ -1392,6 +1403,41 @@ export interface GameMortarSeatRejectedPacket {
   ts: number;
 }
 
+export interface GameBackpackDropPacket {
+  type: 'game:backpack_drop';
+  senderUserId?: string;
+  senderUsername?: string;
+  senderTeam?: LobbyTeamId;
+  senderIsHost?: boolean;
+  containerId: string;
+  x: number;
+  y: number;
+  z: number;
+  yaw: number;
+  ownerLabel?: string | null;
+  backpack: BackpackItem;
+  ts: number;
+}
+
+export interface GameBackpackSyncPacket {
+  type: 'game:backpack_sync';
+  senderUserId?: string;
+  senderUsername?: string;
+  senderTeam?: LobbyTeamId;
+  containerId: string;
+  backpack: BackpackItem;
+  ts: number;
+}
+
+export interface GameBackpackPickupPacket {
+  type: 'game:backpack_pickup';
+  senderUserId?: string;
+  senderUsername?: string;
+  senderTeam?: LobbyTeamId;
+  containerId: string;
+  ts: number;
+}
+
 export type GameSyncPacket =
   | GamePlayerStatePacket
   | GamePlayerFirePacket
@@ -1431,4 +1477,7 @@ export type GameSyncPacket =
   | GameFireSupportRejectedPacket
   | GameAirStrikeLaunchPacket
   | GameMortarLaunchPacket
-  | GameMortarSeatRejectedPacket;
+  | GameMortarSeatRejectedPacket
+  | GameBackpackDropPacket
+  | GameBackpackSyncPacket
+  | GameBackpackPickupPacket;

@@ -29,6 +29,7 @@ export interface ClassicHideoutStoreLike {
   setEquippedWeaponDirect: typeof hideoutStateStore.setEquippedWeaponDirect;
   getReserveForWeapon: typeof hideoutStateStore.getReserveForWeapon;
   consumeReserve: typeof hideoutStateStore.consumeReserve;
+  addReserve?: typeof hideoutStateStore.addReserve;
   resupplyAllAmmo: typeof hideoutStateStore.resupplyAllAmmo;
   setWeaponAmmoVariant: typeof hideoutStateStore.setWeaponAmmoVariant;
   setWeaponZeroDistance: typeof hideoutStateStore.setWeaponZeroDistance;
@@ -340,6 +341,14 @@ export class HideoutShardAdapter {
       return this.roster.consumeArsenalReserve(active.slotId, weaponId, rounds);
     }
     return this.classicHideout.consumeReserve(weaponId, rounds);
+  }
+
+  public addReserve(weaponId: string, rounds: number): number {
+    const active = this.roster.getActiveCharacter();
+    if (active) {
+      return this.roster.addArsenalReserve(active.slotId, weaponId, rounds);
+    }
+    return this.classicHideout.addReserve ? this.classicHideout.addReserve(weaponId, rounds) : 0;
   }
 
   public resupplyAllAmmo(): void {
