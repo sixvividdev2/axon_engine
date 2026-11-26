@@ -11,6 +11,7 @@ import {
   CINEMATIC_SEQUENCES,
   CINEMATIC_SKIP_HOLD_SEC,
   clampVehicleMouseLook,
+  computePrologueDisembarkCameraPosition,
   HELI_MOUSE_LOOK_MAX_PITCH_RAD,
   HELI_MOUSE_LOOK_MAX_YAW_RAD,
   HELI_MOUSE_LOOK_MIN_PITCH_RAD,
@@ -37,7 +38,11 @@ import {
 import {
   buildCorridorCombatVfx,
   buildWarzoneBattlefieldVfx,
+  computeHelicopterSmokeWakeImpulse,
+  HelicopterWakeEmitter,
+  WarzoneLightManager,
 } from '../../cinematics/CinematicWarzoneVfx';
+import { buildWarzoneGroundTargets } from '../../cinematics/CinematicGroundTargets';
 
 // Minimal headless 2D canvas stub so real CharacterSkeleton (fabric textures) can run in Node Vitest
 const _origDocument = (globalThis as { document?: unknown }).document;
@@ -366,6 +371,173 @@ describe('AAA Cinematics Suite (Prologue, Gun-Mounted Camera, Mouse-Look & Contr
     corridorVfx.update(0.05);
     corridorVfx.reset();
     corridorVfx.dispose();
+  });
+
+  it('manages dynamic warzone blast lights inside a strict zero-shadow pool and displaces smoke clouds via escort helicopter rotor wash', () => {
+    const lightMgr = new WarzoneLightManager(3);
+    expect(lightMgr.getPoolSize()).toBe(3);
+    lightMgr.triggerFlash(new THREE.Vector3(0, 5, -20), 0xff9a3c, 60, 80, 1.0, 10);
+    lightMgr.triggerFlash(new THREE.Vector3(10, 6, -30), 0xffd166, 40, 60, 0.5, 8);
+    lightMgr.triggerFlash(new THREE.Vector3(-10, 4, -25), 0xff9a3c, 50, 75, 0.8, 9);
+    lightMgr.triggerFlash(new THREE.Vector3(5, 8, -15), 0xff8c2b, 80, 95, 1.2, 12);
+    const activeCount = lightMgr.update(0.1);
+    expect(activeCount).toBeLessThanOrEqual(3);
+    expect(activeCount).toBe(3);
+    lightMgr.root.traverse((obj) => {
+      if ((obj as THREE.Light).isLight) {
+        expect((obj as THREE.Light).castShadow).toBe(false);
+      }
+    });
+
+    // Verify pure rotor-wash impulse is strong directly beneath a moving helicopter
+    const impulse = new THREE.Vector3();
+    const emitter: HelicopterWakeEmitter = {
+      position: new THREE.Vector3(-16, 10, -26),
+      velocity: new THREE.Vector3(8, -1, 6),
+      rotorRadiusM: 6.2,
+      downwashStrength: 1.5,
+    };
+    const mag = computeHelicopterSmokeWakeImpulse(new THREE.Vector3(-14, 5, -25), emitter, impulse);
+    expect(mag).toBeGreaterThan(5);
+
+    // Compare identical warzone VFX runs with vs. without escort helicopter wake emitter
+    const baseline = buildWarzoneBattlefieldVfx(true);
+    const withWake = buildWarzoneBattlefieldVfx(true);
+    let wakeDisplacementTotal = 0;
+    for (let step = 0; step < 30; step++) {
+      const t = step * 0.05;
+      emitter.position.set(-22 + step * 0.9, 9.5, -48 + step * 0.8);
+      baseline.update(t, 0.05);
+      const telemetry = withWake.update(t, 0.05, { wakeEmitters: [emitter] });
+      wakeDisplacementTotal += telemetry.smokeWakeDisplacementSum;
+    }
+    expect(wakeDisplacementTotal).toBeGreaterThan(2.0);
+    const basePos = baseline.getSmokeCloudPositions();
+    const wakePos = withWake.getSmokeCloudPositions();
+    let maxCloudDelta = 0;
+    for (let i = 0; i < basePos.length; i++) {
+      maxCloudDelta = Math.max(maxCloudDelta, basePos[i].distanceTo(wakePos[i]));
+    }
+    expect(maxCloudDelta).toBeGreaterThan(0.5);
+    baseline.dispose();
+    withWake.dispose();
+  });
+
+  it('drives smooth idle-to-firing crew transitions, 3-point cabin illumination, and world-space door-gunner tracking', () => {
+    const heli = buildCinematicHelicopter(true);
+    let cabinLightCount = 0;
+    heli.root.traverse((obj) => {
+      if ((obj as THREE.PointLight).isPointLight) {
+        expect((obj as THREE.PointLight).castShadow).toBe(false);
+        cabinLightCount += 1;
+      }
+    });
+    // 3 cabin lights + 1 door gun flash light = 4 non-shadow PointLights
+    expect(cabinLightCount).toBeGreaterThanOrEqual(4);
+
+    // Start in calm idle -> engage should remain low
+    for (let i = 0; i < 15; i++) {
+      heli.updateCrew(i * 0.05, {
+        dt: 0.05,
+        combatIntensity01: 0.05,
+        gunnerFiring: false,
+        squadmateFiring: false,
+      });
+    }
+    const idleState = heli.getCrewEngagementState();
+    expect(idleState.gunnerEngage01).toBeLessThan(0.15);
+    expect(idleState.squadEngage01).toBeLessThan(0.1);
+
+    // Ramp smoothly into active combat targeting a ground tank off port bow
+    const tankWorldPos = new THREE.Vector3(-35, 1.5, -28);
+    heli.root.position.set(-20, 14, -36);
+    heli.root.updateMatrixWorld(true);
+    for (let i = 0; i < 30; i++) {
+      heli.updateCrew(1.0 + i * 0.04, {
+        dt: 0.04,
+        combatIntensity01: 0.95,
+        gunnerFiring: true,
+        squadmateFiring: true,
+        aimTargetWorldPos: tankWorldPos,
+      });
+    }
+    const combatState = heli.getCrewEngagementState();
+    expect(combatState.gunnerEngage01).toBeGreaterThan(0.85);
+    expect(combatState.squadEngage01).toBeGreaterThan(0.85);
+
+    // Relax back toward calm idle when combat ends
+    for (let i = 0; i < 40; i++) {
+      heli.updateCrew(3.0 + i * 0.04, {
+        dt: 0.04,
+        combatIntensity01: 0.05,
+        gunnerFiring: false,
+        squadmateFiring: false,
+      });
+    }
+    const calmAgain = heli.getCrewEngagementState();
+    expect(calmAgain.gunnerEngage01).toBeLessThan(0.2);
+    expect(calmAgain.squadEngage01).toBeLessThan(0.2);
+    heli.dispose();
+  });
+
+  it('engages composite 3D hostile tanks, APCs, and infantry with mixed catastrophic explosions and non-explosive neutralizations', () => {
+    const targets = buildWarzoneGroundTargets(true);
+    const explodedKinds: string[] = [];
+    const neutralizedKinds: string[] = [];
+    let sparkBursts = 0;
+    let disableSmokePuffs = 0;
+    let engagedTargetCount = 0;
+    const seenIds = new Set<string>();
+
+    for (let t = 23.5; t <= 31.2; t += 0.05) {
+      const active = targets.update(t, 0.05, 'prologue_gunner', {
+        onHitSparks: () => {
+          sparkBursts += 1;
+        },
+        onExplode: (_pos, kind) => {
+          explodedKinds.push(kind);
+        },
+        onDisableSmoke: () => {
+          disableSmokePuffs += 1;
+        },
+        onNeutralize: (_pos, kind) => {
+          neutralizedKinds.push(kind);
+        },
+      });
+      if (active && !seenIds.has(active.targetId)) {
+        seenIds.add(active.targetId);
+        engagedTargetCount += 1;
+      }
+    }
+
+    // Door gunner must engage tanks, APCs, AND hostile infantry with both exploding & non-exploding outcomes!
+    expect(engagedTargetCount).toBeGreaterThanOrEqual(4);
+    expect(sparkBursts).toBeGreaterThanOrEqual(8);
+    expect(disableSmokePuffs).toBeGreaterThanOrEqual(2);
+    expect(explodedKinds).toContain('tank');
+    expect(explodedKinds).toContain('apc');
+    expect(neutralizedKinds).toContain('apc');
+    expect(neutralizedKinds).toContain('infantry');
+
+    const summaries = targets.getTargetSummaries().filter((s) =>
+      ['infantry_flank_1', 'infantry_flank_2', 'apc_west_column', 'tank_valley_lead', 'apc_ridge_rear'].includes(
+        s.id,
+      ),
+    );
+    expect(summaries.some((s) => s.state === 'exploded')).toBe(true);
+    expect(summaries.some((s) => s.state === 'neutralized')).toBe(true);
+    targets.dispose();
+  });
+
+  it('keeps the Act 3 Prologue disembark camera path completely clear of the landed helicopter nose and windshield', () => {
+    const camPos = new THREE.Vector3();
+    // Landed helicopter at (0, 0.08, 0) rotated PI has its forward nose ending at z <= 3.75m
+    const helicopterNoseFrontZ = 3.75;
+    for (let u = 0; u <= 1.001; u += 0.1) {
+      computePrologueDisembarkCameraPosition(u, 38.0 + u * 6.5, camPos);
+      expect(camPos.z).toBeGreaterThan(helicopterNoseFrontZ + 0.9);
+      expect(camPos.z).toBeLessThanOrEqual(9.0);
+    }
   });
 });
 

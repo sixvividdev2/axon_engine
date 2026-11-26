@@ -1241,7 +1241,7 @@ function evaluateHairMaskAndThickness(
 
   // Transition down over sideburns (az ~ 1.05..1.42) then arch cleanly ABOVE the ear (az ~ 1.45..1.85),
   // then curve down into the tapered rear nape (az > 1.95 -> y ~ 0.058..0.068).
-  const sideburnZone = gaussian(az - 1.18, 0.16);
+  const sideburnZone = gaussian(az - 1.18, p.variant === 'female' ? 0.12 : 0.16);
   const earArchZone = gaussian(az - 1.62, 0.22);
   const napeCurve = smoothstep(1.65, 2.35, az);
 
@@ -1253,15 +1253,20 @@ function evaluateHairMaskAndThickness(
     napeCurve,
   );
 
-  // Sculpted sideburn drop in front of ears
+  // Sculpted sideburn drop in front of ears (female cuts use a short upper-ear temple taper,
+  // never a long cheek-hugging sideburn that reads like facial hair in dim lighting)
   const sideburnDrop =
-    p.hairCut === 'male_high_tight'
-      ? 0.015
-      : p.hairCut === 'male_buzz_fade'
-        ? 0.018
-        : p.hairCut === 'male_short_crop'
-          ? 0.024
-          : 0.020;
+    p.variant === 'female'
+      ? p.hairCut === 'female_close_fade_bun'
+        ? 0.0075
+        : 0.0095
+      : p.hairCut === 'male_high_tight'
+        ? 0.015
+        : p.hairCut === 'male_buzz_fade'
+          ? 0.018
+          : p.hairCut === 'male_short_crop'
+            ? 0.024
+            : 0.018;
   boundaryY -= sideburnZone * sideburnDrop;
 
   // Clean arch over upper ear helix so hair cap never swallows the ear
@@ -1346,7 +1351,7 @@ export function getSharedHairCapGeometry(
   }
 
   const resolvedPreset = variant === 'zombie' ? DEFAULT_FACE_PRESET_ID : normalizeFacePresetId(facePreset);
-  const cacheKey = `${variant}_${resolvedPreset}_${variant === 'zombie' ? zombieHairStyle : 'std'}`;
+  const cacheKey = `${variant}_${resolvedPreset}_${variant === 'zombie' ? zombieHairStyle : 'std'}_v2`;
   const cached = sharedHairCapGeoCache.get(cacheKey);
   if (cached) return cached;
 
@@ -1787,7 +1792,7 @@ export function getSharedSkinTextures(
       : facePreset
         ? normalizeFacePresetId(facePreset)
         : pickFacePresetFromSeed(toneSeed);
-  const bucket = variant === 'zombie' ? 'zombie_v2' : `${variant}_${resolvedPreset}_v2`;
+  const bucket = variant === 'zombie' ? 'zombie_v3' : `${variant}_${resolvedPreset}_v3`;
   const existing = skinTextureCache.get(bucket);
   if (existing) return existing;
 
@@ -1889,17 +1894,29 @@ export function getSharedSkinTextures(
   ctx.arc(cx, noseTipY, W * 0.036, 0, Math.PI * 2);
   ctx.fill();
 
-  // Cooler olive/slate jaw & beard-shadow zone + higher roughness (~0.72, rgb 188) on jaw & neck
-  const jawCoolGrad = ctx.createRadialGradient(cx, H * 0.72, W * 0.03, cx, H * 0.72, W * 0.16);
-  jawCoolGrad.addColorStop(0, palette.jawCoolHex);
-  jawCoolGrad.addColorStop(1, 'rgba(0,0,0,0)');
-  ctx.globalAlpha = variant === 'male' ? 0.18 + palette.stubbleAlpha * 0.45 : variant === 'zombie' ? 0.32 : 0.08;
-  ctx.fillStyle = jawCoolGrad;
-  ctx.fillRect(cx - W * 0.20, H * 0.58, W * 0.40, H * 0.28);
+  // Cooler olive/slate jaw & beard-shadow zone (strictly male & zombie only — never tint female jaws!)
+  if (variant !== 'female') {
+    const jawCoolGrad = ctx.createRadialGradient(cx, H * 0.72, W * 0.03, cx, H * 0.72, W * 0.16);
+    jawCoolGrad.addColorStop(0, palette.jawCoolHex);
+    jawCoolGrad.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.globalAlpha = variant === 'male' ? 0.18 + palette.stubbleAlpha * 0.45 : 0.32;
+    ctx.fillStyle = jawCoolGrad;
+    ctx.fillRect(cx - W * 0.20, H * 0.58, W * 0.40, H * 0.28);
+  }
 
-  // Higher matte roughness along lower jaw & neck (0.72–0.75)
-  rctx.fillStyle = variant === 'zombie' ? 'rgb(228,228,228)' : 'rgb(190,190,190)';
-  rctx.fillRect(0, H * 0.70, W, H * 0.30);
+  // Smooth vertical roughness transition along lower jaw & neck (prevents hard horizontal beard-line seam)
+  const jawRoughGrad = rctx.createLinearGradient(0, H * 0.62, 0, H * 0.90);
+  jawRoughGrad.addColorStop(0, 'rgba(180,180,180,0)');
+  jawRoughGrad.addColorStop(
+    1,
+    variant === 'zombie'
+      ? 'rgba(228,228,228,0.95)'
+      : variant === 'female'
+        ? 'rgba(164,164,164,0.65)'
+        : 'rgba(190,190,190,0.92)',
+  );
+  rctx.fillStyle = jawRoughGrad;
+  rctx.fillRect(0, H * 0.62, W, H * 0.38);
 
   // Orbital depth AO, crease fold & dark lash line / inner-outer canthus shading
   for (const side of [-1, 1]) {
@@ -1948,7 +1965,7 @@ export function getSharedSkinTextures(
     ctx.ellipse(cx + side * W * 0.015, noseTipY + H * 0.011, W * 0.010, H * 0.0065, side * 0.22, 0, Math.PI * 2);
     ctx.fill();
   }
-  ctx.globalAlpha = 0.26;
+  ctx.globalAlpha = variant === 'female' ? 0.09 : 0.26;
   ctx.fillStyle = palette.shadowHex;
   ctx.beginPath();
   ctx.ellipse(cx, mouthY - H * 0.035, W * 0.009, H * 0.016, 0, 0, Math.PI * 2);
@@ -1979,8 +1996,8 @@ export function getSharedSkinTextures(
   ctx.quadraticCurveTo(cx, mouthY + H * 0.002, cx + W * 0.035, mouthY);
   ctx.stroke();
 
-  // Subtle shadow directly under lower lip (labiomental fold)
-  ctx.globalAlpha = 0.30;
+  // Subtle shadow directly under lower lip (labiomental fold; kept faint on female faces to avoid goatee shadow)
+  ctx.globalAlpha = variant === 'female' ? 0.10 : 0.30;
   ctx.fillStyle = palette.shadowHex;
   ctx.beginPath();
   ctx.ellipse(cx, mouthY + H * 0.028, W * 0.024, H * 0.007, 0, 0, Math.PI * 2);
@@ -2603,20 +2620,38 @@ export function buildAnatomicalHeadAssembly(
   if (includeGearAndEyewear) {
     const scaleX = variant === 'female' ? 0.94 : 1.0;
 
-    // 1. Neck Gaiter (sits over lower neck + chin line with generous mandibular clearance)
+    // 1. Neck Gaiter: on female heads, seat neatly around the neck & throat below the jawline so
+    // the dark fabric cuff never rides up over the chin like a chinstrap beard
+    const isFemaleHead = variant === 'female';
     const gaiterLower = new THREE.Mesh(
-      trackGeo(new THREE.CylinderGeometry(0.066 * scaleX, 0.069 * scaleX, 0.056, 16)),
+      trackGeo(
+        new THREE.CylinderGeometry(
+          (isFemaleHead ? 0.059 : 0.066) * scaleX,
+          (isFemaleHead ? 0.064 : 0.069) * scaleX,
+          isFemaleHead ? 0.050 : 0.056,
+          16,
+        ),
+      ),
       hoodMaterial,
     );
-    gaiterLower.scale.set(1.02, 1.0, 1.08);
-    gaiterLower.position.set(0, 0.008, -0.005);
+    gaiterLower.name = 'neck_gaiter_lower';
+    gaiterLower.scale.set(isFemaleHead ? 1.0 : 1.02, 1.0, isFemaleHead ? 1.04 : 1.08);
+    gaiterLower.position.set(0, isFemaleHead ? 0.002 : 0.008, isFemaleHead ? 0.002 : -0.005);
 
     const gaiterChin = new THREE.Mesh(
-      trackGeo(new THREE.CylinderGeometry(0.070 * scaleX, 0.066 * scaleX, 0.028, 16)),
+      trackGeo(
+        new THREE.CylinderGeometry(
+          (isFemaleHead ? 0.057 : 0.070) * scaleX,
+          (isFemaleHead ? 0.060 : 0.066) * scaleX,
+          isFemaleHead ? 0.018 : 0.028,
+          16,
+        ),
+      ),
       hoodMaterial,
     );
-    gaiterChin.scale.set(1.04, 1.0, 1.15);
-    gaiterChin.position.set(0, 0.036, -0.011);
+    gaiterChin.name = 'neck_gaiter_cuff';
+    gaiterChin.scale.set(isFemaleHead ? 1.0 : 1.04, 1.0, isFemaleHead ? 1.04 : 1.15);
+    gaiterChin.position.set(0, isFemaleHead ? 0.022 : 0.036, isFemaleHead ? 0.002 : -0.011);
     neckGaiterGroup.add(gaiterLower, gaiterChin);
     root.add(neckGaiterGroup);
     allMeshes.push(gaiterLower, gaiterChin);

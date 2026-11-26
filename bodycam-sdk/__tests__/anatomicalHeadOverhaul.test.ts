@@ -280,4 +280,52 @@ describe('Anatomical Cube-Sphere Head Overhaul & Multi-Face Roster', () => {
     expect(['tattered', 'bald']).toContain(resolveZombieHairStyleFromSeed(42));
     zombieLib.dispose();
   });
+
+  it('keeps female operators free of facial-hair artifacts (zero stubble, lowered neck gaiter, shorter sideburns)', () => {
+    const hoodMat = new THREE.MeshStandardMaterial({ color: 0x22262b });
+    const frameMat = new THREE.MeshStandardMaterial({ color: 0x15171a });
+
+    for (const preset of FACE_PRESET_IDS) {
+      const palette = getSkinTonePalette(0, 'female', preset);
+      expect(palette.stubbleAlpha).toBe(0);
+
+      const femaleHead = buildAnatomicalHeadAssembly({
+        variant: 'female',
+        toneSeed: 0,
+        facePreset: preset,
+        hoodMaterial: hoodMat,
+        frameMaterial: frameMat,
+        includeGearAndEyewear: true,
+      });
+
+      const cuff = femaleHead.faceGearGroups.neckGaiter.getObjectByName('neck_gaiter_cuff') as THREE.Mesh;
+      expect(cuff).toBeDefined();
+      // Neck gaiter upper cuff sits neatly around the neck below the chin rather than riding up to the lower lip
+      expect(cuff.position.y).toBeLessThanOrEqual(0.025);
+      expect(cuff.position.z).toBeGreaterThanOrEqual(0);
+    }
+
+    // Female hair cap sideburn zone stays noticeably higher than male short crop sideburns
+    const minSideburnY = (variant: 'male' | 'female', preset: (typeof FACE_PRESET_IDS)[number]): number => {
+      const geo = getSharedHairCapGeometry(variant, preset)!;
+      const pos = geo.getAttribute('position') as THREE.BufferAttribute;
+      let minY = Infinity;
+      for (let i = 0; i < pos.count; i++) {
+        const x = pos.getX(i);
+        const y = pos.getY(i);
+        const z = pos.getZ(i);
+        const az = Math.atan2(Math.abs(x), -z);
+        if (az >= 1.05 && az <= 1.32) {
+          minY = Math.min(minY, y);
+        }
+      }
+      return minY;
+    };
+
+    const maleSideburnMinY = minSideburnY('male', 'face_02');
+    for (const preset of FACE_PRESET_IDS) {
+      expect(minSideburnY('female', preset)).toBeGreaterThan(maleSideburnMinY);
+    }
+  });
 });
+

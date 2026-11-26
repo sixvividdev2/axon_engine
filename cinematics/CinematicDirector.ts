@@ -14,6 +14,11 @@ import {
   getVoiceCuesForSequence,
 } from './cinematicVoiceManifest';
 import {
+  buildWarzoneGroundTargets,
+  GroundTargetCombatCallbacks,
+  WarzoneGroundTargetSystem,
+} from './CinematicGroundTargets';
+import {
   ArmedCinematicOperator,
   buildArmedCinematicOperator,
   buildCinematicApc,
@@ -31,6 +36,9 @@ import {
   buildWarzoneBattlefieldVfx,
   CinematicWarzoneVfx,
   CorridorCombatVfx,
+  HelicopterWakeEmitter,
+  WarzoneCombatEvent,
+  WarzoneUpdateContext,
 } from './CinematicWarzoneVfx';
 
 export type CinematicCameraMode =
@@ -166,6 +174,27 @@ export function stepSkipHoldProgress(
   return { next01: decayed, skipped: false };
 }
 
+/**
+ * Pure helper computing the Act 3 Prologue disembark camera position from the landed helicopter
+ * flank cleanly across the helipad apron toward the Ops Commander at (0, 0, 11.2).
+ * Starts well clear of the helicopter's nose (z <= 3.74m) and windshield so zero canopy/cockpit
+ * geometry can ever intersect the sightline (verified in unit tests).
+ */
+export function computePrologueDisembarkCameraPosition(
+  walkU01: number,
+  timeSec: number,
+  out: THREE.Vector3,
+): THREE.Vector3 {
+  const u = THREE.MathUtils.clamp(walkU01, 0, 1);
+  const smooth = THREE.MathUtils.smoothstep(u, 0, 1);
+  const bob = u < 0.98 ? Math.abs(Math.sin(timeSec * 6.2)) * 0.03 * (1 - u * 0.5) : 0;
+  const sway = Math.sin(timeSec * 3.1) * 0.022 * (1 - u);
+  // Step out clear of starboard flank/nose at (1.75, 1.64, 4.75) and converge onto centerline (0, 1.64, 8.95)
+  const x = THREE.MathUtils.lerp(1.75, 0, THREE.MathUtils.smoothstep(u, 0, 0.72)) + sway;
+  const z = THREE.MathUtils.lerp(4.75, 8.95, smooth);
+  return out.set(x, 1.64 + bob, z);
+}
+
 interface GunCamHostileSlot {
   actor: ArmedCinematicOperator;
   coverX: number;
@@ -216,6 +245,7 @@ export class CinematicDirector {
   private apcRig: CinematicApcRig | null = null;
   private gunCamRig: GunCamRig | null = null;
   private warzoneVfx: CinematicWarzoneVfx | null = null;
+  private groundTargets: WarzoneGroundTargetSystem | null = null;
   private corridorVfx: CorridorCombatVfx | null = null;
   private escortNpc: CharacterSkeleton | null = null;
   private commanderNpc: CharacterSkeleton | null = null;
@@ -239,25 +269,29 @@ export class CinematicDirector {
   private lookCurrentPitch = 0;
   private mouseLookActive = false;
 
-  // Gun-cam firefight & foley event trackers
+  // Gun-cam firefight, helicopter combat sync & foley event trackers
   private shotsFiredMask = 0;
   private squadShotsMask = 0;
   private doorSlamMask = 0;
   private lastFootstepBucket = -1;
   private lastDoorGunnerBucket = -1;
+  private lastHeliSquadBucket = -1;
   private muzzleFlashTimer = 0;
   private squadFlashTimer = 0;
   private gunRecoilKick = 0;
   private squadRecoilKick = 0;
   private killConfirmedTimer = 0;
   private killCount = 0;
+  private warzoneCombatIntensity01 = 0.25;
+  private warzoneCombatPulseTimer = 0;
+  private hasPrevWakePos = false;
 
   private rafId = 0;
   private softwareTimerId = 0;
   private lastFrameMs = 0;
   private lastEmitMs = 0;
 
-  // Scratch vectors/quaternions (zero per-frame GC)
+  // Scratch vectors/quaternions & pre-allocated helicopter wake emitters (zero per-frame GC)
   private readonly _v1 = new THREE.Vector3();
   private readonly _v2 = new THREE.Vector3();
   private readonly _v3 = new THREE.Vector3();
@@ -265,6 +299,29 @@ export class CinematicDirector {
   private readonly _q1 = new THREE.Quaternion();
   private readonly _q2 = new THREE.Quaternion();
   private readonly _euler = new THREE.Euler(0, 0, 0, 'YXZ');
+  private readonly _prevEscortPos = new THREE.Vector3();
+  private readonly _prevHeliPos = new THREE.Vector3();
+  private readonly _escortMuzzlePos = new THREE.Vector3();
+  private readonly escortWakeEmitter: HelicopterWakeEmitter = {
+    position: new THREE.Vector3(),
+    velocity: new THREE.Vector3(),
+    rotorRadiusM: 6.2,
+    downwashStrength: 1.55,
+  };
+  private readonly heliWakeEmitter: HelicopterWakeEmitter = {
+    position: new THREE.Vector3(),
+    velocity: new THREE.Vector3(),
+    rotorRadiusM: 6.6,
+    downwashStrength: 1.25,
+  };
+  private readonly activeWakeEmitters: HelicopterWakeEmitter[] = [];
+  private readonly warzoneUpdateCtx: {
+    wakeEmitters: HelicopterWakeEmitter[];
+    escortMuzzleLightPos: THREE.Vector3 | null;
+    escortMuzzleIntensity: number;
+    onCombatEvent: (event: WarzoneCombatEvent) => void;
+  };
+  private readonly groundTargetCallbacks: GroundTargetCombatCallbacks;
 
   private currentCameraMode: CinematicCameraMode = 'drone_aerial';
   private currentFeedLabel = 'OVERWATCH FEED';
@@ -281,6 +338,42 @@ export class CinematicDirector {
     this.meta = CINEMATIC_SEQUENCES[sequence];
     this.callbacks = callbacks;
     this.cues = getVoiceCuesForSequence(sequence);
+
+    this.warzoneUpdateCtx = {
+      wakeEmitters: this.activeWakeEmitters,
+      escortMuzzleLightPos: null,
+      escortMuzzleIntensity: 0,
+      onCombatEvent: (event: WarzoneCombatEvent) => {
+        this.warzoneCombatPulseTimer = Math.max(
+          this.warzoneCombatPulseTimer,
+          event.kind === 'artillery_blast' ? 2.1 : 1.4,
+        );
+        if (this.currentCameraMode !== 'gun_cam') {
+          this.audio.playDistantArtillery(event.intensity01);
+        }
+      },
+    };
+
+    this.groundTargetCallbacks = {
+      onHitSparks: (worldPos, count) => {
+        this.warzoneVfx?.spawnGroundImpactSparks(worldPos, count);
+      },
+      onExplode: (worldPos) => {
+        this.warzoneVfx?.triggerVehicleExplosion(worldPos);
+        this.warzoneCombatPulseTimer = Math.max(this.warzoneCombatPulseTimer, 2.4);
+        if (this.currentCameraMode !== 'gun_cam') {
+          this.audio.playDistantArtillery(0.96);
+        }
+      },
+      onDisableSmoke: (worldPos) => {
+        this.warzoneVfx?.spawnDisableSmokePuff(worldPos);
+      },
+      onNeutralize: (worldPos, kind) => {
+        if (kind !== 'infantry') {
+          this.warzoneVfx?.spawnGroundImpactSparks(worldPos, 6);
+        }
+      },
+    };
 
     this.renderer = new THREE.WebGLRenderer({
       antialias: true,
@@ -419,8 +512,9 @@ export class CinematicDirector {
     hBar.position.set(0, 0.13, 0);
     terrain.add(hLeft, hRight, hBar);
 
+    // Offset perimeter lights by PI/8 so no pad lamp box sits on the direct centerline walkway (x=0, z=+8.3)
     for (let i = 0; i < 8; i++) {
-      const a = (i / 8) * Math.PI * 2;
+      const a = ((i + 0.5) / 8) * Math.PI * 2;
       const lamp = new THREE.Mesh(this.trackGeo(new THREE.BoxGeometry(0.22, 0.14, 0.22)), padLightGreenMat);
       lamp.position.set(Math.cos(a) * 8.3, 0.16, Math.sin(a) * 8.3);
       terrain.add(lamp);
@@ -470,10 +564,14 @@ export class CinematicDirector {
       terrain.add(tw, bc);
     }
 
-    // Active Combined-Arms Warzone VFX Layer (valley tracer crossfire, AA flak, artillery blasts,
-    // burning armored wrecks with smoke plumes, sweeping searchlights, and illumination flares)
+    // Active Combined-Arms Warzone VFX Layer (pooled dynamic lights, rotor-wash-reactive smoke clouds,
+    // valley tracer crossfire, AA flak, artillery blasts, ballistic embers, burning wrecks, searchlights, flares)
     this.warzoneVfx = buildWarzoneBattlefieldVfx(this.isSoftwareGl);
     terrain.add(this.warzoneVfx.root);
+
+    // Live Enemy Ground Combat Column (hostile tanks, armored APCs, and infantry squads with mixed outcomes)
+    this.groundTargets = buildWarzoneGroundTargets(this.isSoftwareGl);
+    terrain.add(this.groundTargets.root);
 
     // Build High-Contrast Backlit 34m Concrete Breach Corridor at Y = -40m for Gun-Cam Firefights
     if (this.meta.hasGunCamBeat) {
@@ -853,18 +951,11 @@ export class CinematicDirector {
     if (this.killConfirmedTimer > 0) {
       this.killConfirmedTimer = Math.max(0, this.killConfirmedTimer - dt);
     }
-
-    // Step warzone battlefield VFX (tracers, AA flak, artillery fireballs, smoke, searchlights, flares)
-    if (this.warzoneVfx) {
-      const exteriorActive = this.currentCameraMode !== 'gun_cam';
-      this.warzoneVfx.update(t, dt, (intensity) => {
-        if (exteriorActive) {
-          this.audio.playDistantArtillery(intensity);
-        }
-      });
+    if (this.warzoneCombatPulseTimer > 0) {
+      this.warzoneCombatPulseTimer = Math.max(0, this.warzoneCombatPulseTimer - dt);
     }
 
-    // Spin helicopter rotors (door gunner firing bursts are driven per-sequence below)
+    // Spin helicopter rotors (door gunner & squadmate firing transitions are driven per-sequence below)
     if (this.heliRig) {
       this.heliRig.mainRotorPivot.rotation.y += dt * 26.0;
       this.heliRig.tailRotorPivot.rotation.x += dt * 42.0;
@@ -891,6 +982,59 @@ export class CinematicDirector {
         this.stepHelicopterInsertion(t, dt);
         break;
     }
+
+    // Step Warzone Particle & Light Management System AFTER helicopter/escort transforms update
+    // so dynamic smoke clouds react physically to the escort & transport helicopters' live wake!
+    if (this.warzoneVfx) {
+      const invDt = 1 / Math.max(0.004, dt);
+      this.activeWakeEmitters.length = 0;
+
+      if (this.escortGunship) {
+        this.escortWakeEmitter.position.copy(this.escortGunship.root.position);
+        this.escortWakeEmitter.position.y += 2.5;
+        if (this.hasPrevWakePos) {
+          this.escortWakeEmitter.velocity
+            .subVectors(this.escortWakeEmitter.position, this._prevEscortPos)
+            .multiplyScalar(invDt)
+            .clampLength(0, 36);
+        } else {
+          this.escortWakeEmitter.velocity.set(0, 0, 0);
+        }
+        this._prevEscortPos.copy(this.escortWakeEmitter.position);
+        this.activeWakeEmitters.push(this.escortWakeEmitter);
+
+        if (this.escortGunship.isFiring()) {
+          this.escortGunship.getMuzzleWorldPosition(this._escortMuzzlePos);
+          this.warzoneUpdateCtx.escortMuzzleLightPos = this._escortMuzzlePos;
+          this.warzoneUpdateCtx.escortMuzzleIntensity = 34;
+        } else {
+          this.warzoneUpdateCtx.escortMuzzleLightPos = null;
+          this.warzoneUpdateCtx.escortMuzzleIntensity = 0;
+        }
+      } else {
+        this.warzoneUpdateCtx.escortMuzzleLightPos = null;
+        this.warzoneUpdateCtx.escortMuzzleIntensity = 0;
+      }
+
+      if (this.heliRig && this.heliRig.root.position.y > 0.5) {
+        this.heliWakeEmitter.position.copy(this.heliRig.root.position);
+        this.heliWakeEmitter.position.y += 3.2;
+        if (this.hasPrevWakePos) {
+          this.heliWakeEmitter.velocity
+            .subVectors(this.heliWakeEmitter.position, this._prevHeliPos)
+            .multiplyScalar(invDt)
+            .clampLength(0, 32);
+        } else {
+          this.heliWakeEmitter.velocity.set(0, 0, 0);
+        }
+        this._prevHeliPos.copy(this.heliWakeEmitter.position);
+        this.activeWakeEmitters.push(this.heliWakeEmitter);
+      }
+
+      this.hasPrevWakePos = true;
+      const telemetry = this.warzoneVfx.update(t, dt, this.warzoneUpdateCtx as WarzoneUpdateContext);
+      this.warzoneCombatIntensity01 = telemetry.combatIntensity01;
+    }
   }
 
   private triggerDoorGunnerFiringAudio(t: number, active: boolean): void {
@@ -899,6 +1043,15 @@ export class CinematicDirector {
     if (bucket !== this.lastDoorGunnerBucket) {
       this.lastDoorGunnerBucket = bucket;
       this.audio.playDoorGunnerBurst();
+    }
+  }
+
+  private triggerHeliSquadmateFiringAudio(t: number, active: boolean): void {
+    if (!active) return;
+    const bucket = Math.floor(t * 4.2);
+    if (bucket !== this.lastHeliSquadBucket) {
+      this.lastHeliSquadBucket = bucket;
+      this.audio.playGunshot(false, true);
     }
   }
 
@@ -1136,18 +1289,32 @@ export class CinematicDirector {
 
       if (this.heliRig) {
         this.heliRig.root.position.set(-48, 22, -52);
-        this.heliRig.updateCrew(t, false);
+        this.heliRig.updateCrew(t, {
+          dt,
+          combatIntensity01: this.warzoneCombatIntensity01,
+          gunnerFiring: false,
+          squadmateFiring: false,
+        });
       }
+      const aerialEngagement =
+        this.groundTargets?.update(t, dt, 'prologue_aerial', this.groundTargetCallbacks) ?? null;
+
       if (this.escortGunship) {
-        // Wingman gunship Valkyrie 2-2 sweeping across valley firing downward bursts!
+        // Wingman gunship Valkyrie 2-2 sweeping low through the valley smoke layer firing directly on enemy armor!
         this.escortGunship.root.position.set(
           THREE.MathUtils.lerp(-28, 16, smoothU),
-          THREE.MathUtils.lerp(17, 11.5, smoothU) + Math.sin(t * 1.4) * 0.8,
-          THREE.MathUtils.lerp(-60, -24, smoothU),
+          THREE.MathUtils.lerp(13.2, 8.4, smoothU) + Math.sin(t * 1.4) * 0.65,
+          THREE.MathUtils.lerp(-58, -24, smoothU),
         );
         this.escortGunship.root.rotation.set(-0.14, -0.78, -0.18);
-        const gunshipFiring = (t > 1.8 && t < 5.2) || (t > 7.0 && t < 10.6);
-        this.escortGunship.updateCombat(t, dt, gunshipFiring);
+        const gunshipFiring =
+          aerialEngagement !== null || (t > 1.8 && t < 5.2) || (t > 7.0 && t < 10.6);
+        this.escortGunship.updateCombat(
+          t,
+          dt,
+          gunshipFiring,
+          aerialEngagement?.aimWorldPos ?? null,
+        );
       }
       return;
     }
@@ -1160,16 +1327,11 @@ export class CinematicDirector {
     }
 
     if (t < 38.0 && this.heliRig) {
-      // ACT 2 (15s): Interactive First-Person Helicopter Ride WITH ACTIVE DOOR GUNNER + SEATED SQUADMATE + LIVE MOUSE-LOOK
+      // ACT 2 (15s): Interactive First-Person Helicopter Ride WITH LIVE TARGET-TRACKING DOOR GUNNER + JUMP-SEAT SQUADMATE
       this.audio.setAmbience('helicopter');
-      this.audio.setScoreIntensity(0.55);
+      this.audio.setScoreIntensity(0.58);
       const u = (t - 23.0) / 15.0;
       const descent = THREE.MathUtils.smoothstep(u, 0, 1);
-
-      // Door gunner engages valley targets in crisp bursts during descent (24.2-26.6s & 28.0-30.2s)
-      const gunnerFiring = (t >= 24.2 && t <= 26.6) || (t >= 28.0 && t <= 30.2);
-      this.heliRig.updateCrew(t, gunnerFiring);
-      this.triggerDoorGunnerFiringAudio(t, gunnerFiring);
 
       this.heliRig.root.position.set(
         THREE.MathUtils.lerp(-30, 0, descent),
@@ -1183,12 +1345,35 @@ export class CinematicDirector {
       );
       this.heliRig.root.updateMatrixWorld(true);
 
+      // Step valley ground targets (infantry, APCs, tanks) directly visible out the open port doorway!
+      const groundEngagement =
+        this.groundTargets?.update(t, dt, 'prologue_gunner', this.groundTargetCallbacks) ?? null;
+
+      const gunnerFiring = groundEngagement !== null;
+      // Jump-seat squadmate engages in synced bursts against infantry/APCs and during warzone artillery/flak flares
+      const squadmateFiring =
+        (groundEngagement !== null && (groundEngagement.kind === 'infantry' || groundEngagement.kind === 'apc')) ||
+        (t >= 24.4 && t <= 30.2 && this.warzoneCombatPulseTimer > 0.65);
+
+      this.heliRig.updateCrew(t, {
+        dt,
+        combatIntensity01: Math.max(
+          this.warzoneCombatIntensity01,
+          groundEngagement ? 0.92 : this.warzoneCombatPulseTimer > 0 ? 0.65 : 0.12,
+        ),
+        gunnerFiring,
+        squadmateFiring,
+        aimTargetWorldPos: groundEngagement?.aimWorldPos ?? null,
+      });
+      this.triggerDoorGunnerFiringAudio(t, gunnerFiring);
+      this.triggerHeliSquadmateFiringAudio(t, squadmateFiring);
+
       if (this.escortGunship) {
-        // Escort gunship flying wingman off port-forward bow visible through open doors & cockpit!
+        // Escort gunship flying low wingman off port-forward bow churning valley smoke clouds in view!
         this.escortGunship.root.position.set(
-          this.heliRig.root.position.x - 16,
-          this.heliRig.root.position.y + 4.2 + Math.sin(t * 1.3) * 0.7,
-          this.heliRig.root.position.z - 14,
+          this.heliRig.root.position.x - 15,
+          Math.max(7.6, this.heliRig.root.position.y + 1.8) + Math.sin(t * 1.3) * 0.6,
+          this.heliRig.root.position.z - 13,
         );
         this.escortGunship.root.rotation.set(-0.12, this.heliRig.root.rotation.y + 0.12, -0.1);
         this.escortGunship.updateCombat(t, dt, t < 33.5 && Math.sin(t * 1.4) > 0.15);
@@ -1232,7 +1417,7 @@ export class CinematicDirector {
       return;
     }
 
-    // ACT 3 (10s): Touchdown Disembark Walk & Ops Commander Airlock Briefing
+    // ACT 3 (10s): Clean Unobstructed Touchdown Disembark Walk & Ops Commander Airlock Briefing
     this.audio.setAmbience('bunker_hum');
     this.audio.setScoreIntensity(0.35);
     this.currentCameraMode = 'intake_briefing';
@@ -1244,12 +1429,18 @@ export class CinematicDirector {
     if (this.heliRig) {
       this.heliRig.root.position.set(0, 0.08, 0);
       this.heliRig.root.rotation.set(0, Math.PI, 0);
-      this.heliRig.updateCrew(t, false);
+      this.heliRig.updateCrew(t, {
+        dt,
+        combatIntensity01: 0.05,
+        gunnerFiring: false,
+        squadmateFiring: false,
+      });
     }
     if (this.escortGunship) {
-      this.escortGunship.root.position.set(-28, 18, -32);
+      this.escortGunship.root.position.set(-28, 16, -32);
       this.escortGunship.updateCombat(t, dt, false);
     }
+    this.groundTargets?.update(t, dt, null, this.groundTargetCallbacks);
     if (this.commanderNpc) {
       poseStandingNpcGesture(this.commanderNpc, 'briefing', t, {
         headYawRad: Math.sin(t * 0.9) * 0.07,
@@ -1261,9 +1452,8 @@ export class CinematicDirector {
     if (walkU < 0.98) {
       this.triggerFootstepCadence(t, 1.85, 'tarmac');
     }
-    const walkZ = THREE.MathUtils.lerp(3.2, 8.9, THREE.MathUtils.smoothstep(walkU, 0, 1));
-    const bob = walkU < 0.98 ? Math.abs(Math.sin(t * 6.2)) * 0.032 * (1 - walkU * 0.5) : 0;
-    this.camera.position.set(Math.sin(t * 3.1) * 0.025 * (1 - walkU), 1.64 + bob, walkZ);
+    computePrologueDisembarkCameraPosition(walkU, t, this._v2);
+    this.camera.position.copy(this._v2);
     this._v1.set(0, 1.56, 11.2);
     this.camera.lookAt(this._v1);
     this.camera.fov = 62;
@@ -1539,12 +1729,17 @@ export class CinematicDirector {
 
       this.heliRig.root.position.set(0, 0.08, 0);
       this.heliRig.root.rotation.set(0, 0, 0);
-      this.heliRig.updateCrew(t, false);
+      this.heliRig.updateCrew(t, {
+        dt,
+        combatIntensity01: 0.1,
+        gunnerFiring: false,
+        squadmateFiring: false,
+      });
       this.heliRig.root.updateMatrixWorld(true);
       this.heliRig.passengerSeatAnchor.getWorldPosition(this._v2);
 
       if (this.escortGunship) {
-        this.escortGunship.root.position.set(-22, 16, -34);
+        this.escortGunship.root.position.set(-22, 12.5, -34);
         this.escortGunship.root.rotation.set(-0.08, 0.35, -0.08);
         this.escortGunship.updateCombat(t, dt, true);
       }
@@ -1589,12 +1784,17 @@ export class CinematicDirector {
         THREE.MathUtils.lerp(0, -38, lift),
       );
       this.heliRig.root.rotation.set(-0.18 * u, 0.22 * u, 0.14 * u);
-      this.heliRig.updateCrew(t, false);
+      this.heliRig.updateCrew(t, {
+        dt,
+        combatIntensity01: this.warzoneCombatIntensity01,
+        gunnerFiring: false,
+        squadmateFiring: false,
+      });
 
       if (this.escortGunship) {
         this.escortGunship.root.position.set(
-          this.heliRig.root.position.x - 18,
-          this.heliRig.root.position.y + 6,
+          this.heliRig.root.position.x - 16,
+          Math.max(8.0, this.heliRig.root.position.y + 2.5),
           this.heliRig.root.position.z - 14,
         );
         this.escortGunship.root.rotation.set(-0.14, 0.25, 0.1);
@@ -1615,16 +1815,12 @@ export class CinematicDirector {
       return;
     }
 
-    // Phase 3: Fade back in inside Valkyrie 2-1 troop bay with ACTIVE DOOR GUNNER + SEATED SQUADMATE + mouse-look!
+    // Phase 3: Fade back in inside Valkyrie 2-1 troop bay with ACTIVE DOOR GUNNER + JUMP-SEAT SQUADMATE + LIVE TARGETS!
     this.audio.setAmbience('helicopter');
     this.audio.setScoreIntensity(isCombat ? 0.78 : 0.56);
     const flyDur = isCombat ? 16.5 - mid : this.meta.durationSec - mid;
     const u = Math.min(1, (t - mid) / Math.max(1, flyDur));
     const descent = THREE.MathUtils.smoothstep(u, 0, 1);
-
-    const gunnerFiring = t >= mid + 1.0 && t <= mid + 4.8;
-    this.heliRig.updateCrew(t, gunnerFiring);
-    this.triggerDoorGunnerFiringAudio(t, gunnerFiring);
 
     this.heliRig.root.position.set(
       THREE.MathUtils.lerp(20, 0, descent),
@@ -1638,10 +1834,31 @@ export class CinematicDirector {
     );
     this.heliRig.root.updateMatrixWorld(true);
 
+    const insertionEngagement =
+      this.groundTargets?.update(t, dt, 'insertion_gunner', this.groundTargetCallbacks) ?? null;
+    const gunnerFiring = insertionEngagement !== null;
+    const squadmateFiring =
+      (insertionEngagement !== null &&
+        (insertionEngagement.kind === 'apc' || insertionEngagement.kind === 'infantry')) ||
+      (t >= mid + 1.0 && t <= mid + 5.2 && this.warzoneCombatPulseTimer > 0.65);
+
+    this.heliRig.updateCrew(t, {
+      dt,
+      combatIntensity01: Math.max(
+        this.warzoneCombatIntensity01,
+        insertionEngagement ? 0.94 : this.warzoneCombatPulseTimer > 0 ? 0.65 : 0.15,
+      ),
+      gunnerFiring,
+      squadmateFiring,
+      aimTargetWorldPos: insertionEngagement?.aimWorldPos ?? null,
+    });
+    this.triggerDoorGunnerFiringAudio(t, gunnerFiring);
+    this.triggerHeliSquadmateFiringAudio(t, squadmateFiring);
+
     if (this.escortGunship) {
       this.escortGunship.root.position.set(
-        this.heliRig.root.position.x - 16,
-        this.heliRig.root.position.y + 4.0 + Math.sin(t * 1.2) * 0.7,
+        this.heliRig.root.position.x - 15,
+        Math.max(7.6, this.heliRig.root.position.y + 2.0) + Math.sin(t * 1.2) * 0.6,
         this.heliRig.root.position.z - 12,
       );
       this.escortGunship.root.rotation.set(-0.12, this.heliRig.root.rotation.y + 0.14, -0.08);
@@ -1735,6 +1952,7 @@ export class CinematicDirector {
     this.apcRig?.dispose();
     this.gunCamRig?.dispose();
     this.warzoneVfx?.dispose();
+    this.groundTargets?.dispose();
     this.corridorVfx?.dispose();
     this.escortNpc?.dispose();
     this.commanderNpc?.dispose();

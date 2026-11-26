@@ -222,6 +222,12 @@ export interface CinematicWarzoneVfx {
     dt: number,
     ctxOrCallback?: WarzoneUpdateContext | ((intensity01: number) => void),
   ) => WarzoneFrameTelemetry;
+  /** Triggers a catastrophic secondary explosion (fireball, shockwave, dynamic light, embers, blast smoke) at a destroyed vehicle. */
+  triggerVehicleExplosion: (worldPos: THREE.Vector3) => void;
+  /** Spawns bright orange-gold metallic ricochet/impact sparks when door-gunner rounds hit armor or ground cover. */
+  spawnGroundImpactSparks: (worldPos: THREE.Vector3, count?: number) => void;
+  /** Seeds a dark rising engine-kill smoke cloud at a neutralized/disabled vehicle (physically reactive to rotor wash!). */
+  spawnDisableSmokePuff: (worldPos: THREE.Vector3) => void;
   /** Read-only snapshot of active smoke cloud world positions (for testing rotor-wash displacement). */
   getSmokeCloudPositions: (out?: THREE.Vector3[]) => THREE.Vector3[];
   dispose: () => void;
@@ -547,6 +553,101 @@ export function buildWarzoneBattlefieldVfx(isSoftwareGl: boolean): CinematicWarz
     });
   }
 
+  // --- 4B. Pooled External Vehicle Detonation Slots (catastrophic tank/APC explosions) ---
+  interface VehicleBlastSlot {
+    active: boolean;
+    ageSec: number;
+    maxAgeSec: number;
+    origin: THREE.Vector3;
+    fireball: THREE.Mesh;
+    ring: THREE.Mesh;
+  }
+  const vehicleBlasts: VehicleBlastSlot[] = [];
+  for (let i = 0; i < 4; i++) {
+    const vfbMat = trackMat(
+      new THREE.MeshBasicMaterial({ color: 0xffa63b, transparent: true, opacity: 0.96 }),
+    );
+    const vFireball = new THREE.Mesh(fireballGeo, vfbMat);
+    vFireball.visible = false;
+    root.add(vFireball);
+
+    const vrMat = trackMat(
+      new THREE.MeshBasicMaterial({
+        color: 0xffedd5,
+        transparent: true,
+        opacity: 0.8,
+        side: THREE.DoubleSide,
+      }),
+    );
+    const vRing = new THREE.Mesh(ringGeo, vrMat);
+    vRing.visible = false;
+    root.add(vRing);
+
+    vehicleBlasts.push({
+      active: false,
+      ageSec: 0,
+      maxAgeSec: 1.45,
+      origin: new THREE.Vector3(),
+      fireball: vFireball,
+      ring: vRing,
+    });
+  }
+  let vehicleBlastCursor = 0;
+
+  const triggerVehicleExplosion = (worldPos: THREE.Vector3): void => {
+    const slot = vehicleBlasts[vehicleBlastCursor];
+    vehicleBlastCursor = (vehicleBlastCursor + 1) % vehicleBlasts.length;
+    slot.active = true;
+    slot.ageSec = 0;
+    slot.maxAgeSec = 1.45;
+    slot.origin.copy(worldPos);
+    slot.fireball.position.set(worldPos.x, worldPos.y + 1.4, worldPos.z);
+    slot.fireball.scale.setScalar(1.8);
+    slot.fireball.visible = true;
+    slot.ring.position.set(worldPos.x, Math.max(0.22, worldPos.y + 0.22), worldPos.z);
+    slot.ring.scale.setScalar(1.2);
+    slot.ring.visible = true;
+
+    _lightPos.set(worldPos.x, worldPos.y + 4.8, worldPos.z);
+    lightManager.triggerFlash(_lightPos, 0xff8c2b, 84, 105, 1.35, 12);
+    spawnArtilleryBurstParticles(worldPos);
+    rollingCombatHeat = Math.min(1, rollingCombatHeat + 0.65);
+    _primaryThreat.copy(worldPos);
+  };
+
+  const spawnGroundImpactSparks = (worldPos: THREE.Vector3, count = 4): void => {
+    const n = Math.min(isSoftwareGl ? 4 : 7, Math.max(1, count));
+    for (let i = 0; i < n; i++) {
+      const e = embers[emberCursor];
+      emberCursor = (emberCursor + 1) % embers.length;
+      const angle = (i / n) * Math.PI * 2 + (emberCursor % 5) * 0.55;
+      const horizSpd = 3.2 + (i % 3) * 2.1;
+      e.pos.set(worldPos.x, worldPos.y + 0.65, worldPos.z);
+      e.vel.set(Math.cos(angle) * horizSpd, 4.8 + (i % 3) * 2.4, Math.sin(angle) * horizSpd);
+      e.ageSec = 0;
+      e.maxAgeSec = 0.42 + (i % 2) * 0.16;
+      e.active = true;
+      e.mesh.position.copy(e.pos);
+      e.mesh.scale.setScalar(0.85);
+      e.mesh.visible = true;
+    }
+    _lightPos.set(worldPos.x, worldPos.y + 1.5, worldPos.z);
+    lightManager.triggerFlash(_lightPos, 0xffd166, 22, 26, 0.14, 5);
+  };
+
+  const spawnDisableSmokePuff = (worldPos: THREE.Vector3): void => {
+    const cloud = smokeClouds[smokeBurstCursor];
+    smokeBurstCursor = (smokeBurstCursor + 1) % smokeClouds.length;
+    cloud.origin.set(worldPos.x, worldPos.y + 1.4, worldPos.z);
+    cloud.pos.copy(cloud.origin);
+    cloud.vel.set(0.75, 2.8, 0.35);
+    cloud.ageSec = 0;
+    cloud.lifeSec = 5.6;
+    cloud.baseScale = 1.45;
+    cloud.maxScale = 4.6;
+    cloud.active = true;
+  };
+
   // --- 5. Mid-Air AA Flak Airbursts along Flight Approach (6 sky bursts) ---
   const flakSpecs: Array<{ pos: [number, number, number]; period: number; offset: number }> = [
     { pos: [-18, 19, -46], period: 4.4, offset: 0.9 },
@@ -758,6 +859,30 @@ export function buildWarzoneBattlefieldVfx(isSoftwareGl: boolean): CinematicWarz
       }
     }
 
+    // 2B. Step active external vehicle explosions (tanks & APC cook-offs)
+    for (let i = 0; i < vehicleBlasts.length; i++) {
+      const vb = vehicleBlasts[i];
+      if (!vb.active) continue;
+      vb.ageSec += safeDt;
+      if (vb.ageSec >= vb.maxAgeSec) {
+        vb.active = false;
+        vb.fireball.visible = false;
+        vb.ring.visible = false;
+      } else {
+        const u = vb.ageSec / vb.maxAgeSec;
+        const scale = 1.6 + Math.sin(u * Math.PI) * 6.8;
+        vb.fireball.visible = true;
+        vb.fireball.scale.set(scale, scale * 1.24, scale);
+        vb.fireball.position.set(vb.origin.x, vb.origin.y + 1.2 + u * 3.8, vb.origin.z);
+        (vb.fireball.material as THREE.MeshBasicMaterial).opacity = (1 - u) * 0.96;
+
+        vb.ring.visible = true;
+        const rScale = 1.2 + u * 18.5;
+        vb.ring.scale.set(rScale, rScale, rScale);
+        (vb.ring.material as THREE.MeshBasicMaterial).opacity = (1 - u) * 0.74;
+      }
+    }
+
     // 3. Update mid-air AA flak airbursts (flash + dynamic light + expanding black flak cloud)
     for (let i = 0; i < flakSlots.length; i++) {
       const fl = flakSlots[i];
@@ -931,6 +1056,9 @@ export function buildWarzoneBattlefieldVfx(isSoftwareGl: boolean): CinematicWarz
     root,
     lightManager,
     update,
+    triggerVehicleExplosion,
+    spawnGroundImpactSparks,
+    spawnDisableSmokePuff,
     getSmokeCloudPositions,
     dispose: () => {
       for (const g of geos) g.dispose();

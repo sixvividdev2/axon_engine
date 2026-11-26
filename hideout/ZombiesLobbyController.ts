@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import {
+  AdsMode,
   BallisticImpactEvent,
   BallisticsSolver,
   BodycamAudio,
@@ -26,6 +27,7 @@ import {
   ScopePassParams,
   ScopeRenderer,
   SDK_WEAPON_PROFILES,
+  solveZeroPitchRad,
   WeaponRig,
   WorldBackpackSystem,
 } from '../bodycam-sdk';
@@ -59,10 +61,18 @@ import type {
 import type { ExternalLootContext } from '../src/modes/openworld/ui/TacticalInventoryModal';
 import {
   computeDerivedWeaponStats,
+  getDefaultZeroDistanceM,
   normalizeWeaponAttachments,
   WeaponAttachments,
 } from '../data/attachments';
-import { BASE_CALIBERS, getDefaultAmmoVariant, resolveBaseCaliberId } from '../data/calibers';
+import {
+  AMMO_VARIANTS,
+  AmmoVariantDef,
+  AmmoVariantId,
+  BASE_CALIBERS,
+  getDefaultAmmoVariant,
+  resolveBaseCaliberId,
+} from '../data/calibers';
 import {
   fireModeStore,
   getEffectiveFireRpm,
@@ -193,6 +203,11 @@ export class ZombiesLobbyController {
   private contextLost = false;
   private disposed = false;
 
+  private readonly irIlluminatorLight: THREE.SpotLight;
+  private readonly irIlluminatorTarget: THREE.Object3D;
+  private nvgFlipped = false;
+  private irIlluminatorOn = false;
+  private readonly adsModeByWeapon: Record<string, AdsMode> = {};
   private equippedWeaponId = 'm4a1';
   private isFiring = false;
   private semiTriggerConsumed = false;
@@ -297,7 +312,24 @@ export class ZombiesLobbyController {
     this.world = buildZombiesOutpostWorld(this.scene, this.renderer, this.isSoftwareGl);
     this.ballistics = new BallisticsSolver(this.scene);
     this.ejectedLiveRounds = new EjectedLiveRoundPool(this.scene);
-    this.adapter = this.world.physics.createAdapter();
+    this.adapter = this.world.physics.createAdapter({
+      onMeleeHit: (ev) => {
+        const elecHit = this.world.electronics.handleImpact(
+          ev.object,
+          ev.point,
+          ev.normal,
+          this._camPos,
+        );
+        if (elecHit) {
+          if (!elecHit.alreadyBroken) {
+            this.showToast(`${elecHit.label} Damaged`);
+          }
+          this.emitSnapshot(true);
+        }
+        // Kick / bash impulse on nearby dynamic physics props in the Outpost yard
+        this.physicsProps.handleBlast(ev.point, 1.5, 4.5);
+      },
+    });
 
     this.audio = new BodycamAudio();
     this.audio.setSettings(
@@ -340,6 +372,16 @@ export class ZombiesLobbyController {
 
     this.animator = new CharacterAnimator(this.skeleton, this.weaponRig, this.audio);
     this.controller = new BodycamController(this.camera, this.weaponRig, this.audio);
+
+    // IR illuminator spotlight attached to helmet/camera when NVG + IR Flood active
+    this.irIlluminatorTarget = new THREE.Object3D();
+    this.irIlluminatorTarget.position.set(0, 0, -10);
+    this.camera.add(this.irIlluminatorTarget);
+    this.irIlluminatorLight = new THREE.SpotLight(0xd8ffd8, 7.5, 42, Math.PI * 0.28, 0.55, 1.25);
+    this.irIlluminatorLight.position.set(0.06, 0.04, 0);
+    this.irIlluminatorLight.target = this.irIlluminatorTarget;
+    this.irIlluminatorLight.visible = false;
+    this.camera.add(this.irIlluminatorLight);
 
     const activeSlot = loadoutStore.getActiveSlot();
     this.tacticalInventory = buildModeLoadoutTacticalInventory({
@@ -443,6 +485,12 @@ export class ZombiesLobbyController {
       this.skeleton.applyGearConfig(nextGear);
       this.skeleton.setFirstPersonHeadShadowOnly(true);
       this.skeleton.enableArmViewmodelLayer();
+      if (nextGear.nvgMount === 'none' && this.nvgFlipped) {
+        this.nvgFlipped = false;
+        this.irIlluminatorOn = false;
+      }
+      this.syncNvgRuntime();
+      this.emitSnapshot(true);
     });
 
     this.unsubLoadout = loadoutStore.subscribe(() => {
@@ -501,6 +549,7 @@ export class ZombiesLobbyController {
     this.animator.setSkeleton(this.skeleton);
     const bpId = this.tacticalInventory.backpack?.templateId ?? null;
     this.skeleton.setBackpack(bpId && isBackpackTemplateId(bpId) ? bpId : null);
+    this.syncNvgRuntime();
   }
 
   private seedOutpostPracticeBackpacks(): void {
@@ -904,8 +953,244 @@ export class ZombiesLobbyController {
     }
     const curMag = weaponId === 'unarmed' ? 0 : (this.magAmmoByWeapon[profile.id] ?? profile.magCapacity);
     this.weaponRig.setAmmoState(curMag, weaponId !== 'unarmed');
+    if (weaponId === 'unarmed') {
+      this.input.adsMode = 'PRIMARY';
+    } else {
+      this.input.adsMode = this.getArmedAdsMode(profile.id);
+    }
+    this.syncWeaponBallistics();
+    this.syncNvgRuntime();
     if (playCue) {
       this.audio.playGearRattle('weapon_swap', 0.5);
+    }
+  }
+
+  private getArmedAdsMode(weaponId = this.equippedWeaponId): AdsMode {
+    if (weaponId === 'unarmed') return 'PRIMARY';
+    const prof = resolveWeaponProfile(weaponId);
+    const stored = this.adsModeByWeapon[prof.id] ?? 'PRIMARY';
+    if (stored === 'CANTED' && !this.weaponRig.hasCantedOptic()) {
+      return 'PRIMARY';
+    }
+    return stored;
+  }
+
+  private cycleAimMode(): void {
+    if (
+      this.equippedWeaponId === 'unarmed' ||
+      this.swapChoreography.isActive() ||
+      this.weaponRig.isSuppressorActionActive()
+    ) {
+      return;
+    }
+    const prof = resolveWeaponProfile(this.equippedWeaponId);
+    const hasCanted = this.weaponRig.hasCantedOptic();
+    const order: AdsMode[] = hasCanted ? ['PRIMARY', 'CANTED', 'POINT_AIM'] : ['PRIMARY', 'POINT_AIM'];
+    const cur = this.getArmedAdsMode(prof.id);
+    const curIdx = order.indexOf(cur);
+    const next = order[(curIdx + 1) % order.length];
+    this.adsModeByWeapon[prof.id] = next;
+    this.input.adsMode = next;
+    this.audio.playTacticalSwitchClick(next !== 'PRIMARY');
+    const label =
+      next === 'POINT_AIM'
+        ? 'Point Aim Armed (RMB)'
+        : next === 'CANTED'
+          ? 'Canted Optic Armed (RMB)'
+          : 'Primary Optic ADS (RMB)';
+    this.showToast(label);
+    this.emitSnapshot(true);
+  }
+
+  private equipOutpostSlot(slot: 1 | 2 | 3): void {
+    if (this.swapChoreography.isActive() || this.weaponRig.isSuppressorActionActive()) return;
+    let nextId = 'unarmed';
+    if (slot === 1) {
+      const loadout = loadoutStore.getActiveSlot();
+      const classicId = this.callbacks.isWeaponUnlocked(loadout.primaryWeaponId)
+        ? loadout.primaryWeaponId
+        : 'm4a1';
+      nextId = hideoutShardAdapter.resolveQuickSlotWeaponId(1, classicId);
+    } else if (slot === 2) {
+      const loadout = loadoutStore.getActiveSlot();
+      const classicId = this.callbacks.isWeaponUnlocked(loadout.secondaryWeaponId)
+        ? loadout.secondaryWeaponId
+        : 'glock_17';
+      nextId = hideoutShardAdapter.resolveQuickSlotWeaponId(2, classicId);
+    }
+    if (nextId === this.equippedWeaponId) return;
+    this.input.ads = false;
+    this.isFiring = false;
+    this.semiTriggerConsumed = false;
+    if (this.weaponRig.isTubularReloading()) {
+      this.weaponRig.interruptTubularReload();
+    }
+    const nextRack = hideoutShardAdapter.setEquippedWeaponDirect(nextId);
+    this.world.syncGunWallSlots(nextRack);
+    this.applyEquippedWeaponRig(nextId, true);
+    const prof = resolveWeaponProfile(nextId);
+    this.showToast(nextId === 'unarmed' ? 'Unarmed (Fists)' : `Equipped ${prof.name}`);
+    this.emitSnapshot(true);
+  }
+
+  private syncNvgRuntime(): void {
+    const mount = this.localGear.nvgMount;
+    const active = mount !== 'none' && this.nvgFlipped;
+    const irActive = active && this.irIlluminatorOn;
+    this.skeleton.setNvgFlipped(active);
+    this.postProcess.setNvgState(mount, active, irActive);
+    this.irIlluminatorLight.visible = irActive;
+    this.weaponRig.setNvgOpticalActive(active);
+    this.weaponRig.setIrLaserActive(irActive);
+    this.audio.setNvgTubeHum(active);
+  }
+
+  private toggleNvg(): void {
+    if (this.localGear.nvgMount === 'none') {
+      this.showToast('No NVG Mounted — Equip NVG in Operator Gear');
+      return;
+    }
+    this.nvgFlipped = !this.nvgFlipped;
+    if (!this.nvgFlipped) {
+      this.irIlluminatorOn = false;
+    }
+    this.audio.playNvgFlipSound(this.nvgFlipped);
+    this.syncNvgRuntime();
+    const label = this.localGear.nvgMount === 'arnvg' ? 'RNVG-A (P45)' : 'PVS-7 NL2 (P43)';
+    this.showToast(this.nvgFlipped ? `${label} Deployed · [N] IR Flood` : `${label} Stowed`);
+    this.emitSnapshot(true);
+  }
+
+  private toggleIrOrReticle(): void {
+    if (this.nvgFlipped && this.localGear.nvgMount !== 'none') {
+      this.irIlluminatorOn = !this.irIlluminatorOn;
+      this.audio.playIrIlluminatorClick(this.irIlluminatorOn);
+      this.syncNvgRuntime();
+      this.showToast(this.irIlluminatorOn ? 'IR Illuminator + IR Laser: ON' : 'IR Illuminator: OFF');
+      this.emitSnapshot(true);
+      return;
+    }
+    if (this.equippedWeaponId !== 'unarmed') {
+      this.weaponRig.toggleReticleIllumination();
+      this.audio.playTacticalSwitchClick(this.weaponRig.reticleIlluminated);
+      this.showToast(
+        this.weaponRig.reticleIlluminated
+          ? 'Optic Reticle Illumination: ON'
+          : 'Optic Reticle Illumination: OFF',
+      );
+      this.emitSnapshot(true);
+    }
+  }
+
+  private toggleSuppressor(): void {
+    if (
+      this.equippedWeaponId === 'unarmed' ||
+      this.swapChoreography.isActive() ||
+      this.reloadTimer > 0 ||
+      this.weaponRig.isTubularReloading()
+    ) {
+      return;
+    }
+    const weaponId = this.equippedWeaponId;
+    const res = this.weaponRig.triggerFieldSuppressorToggle((nowAttached) => {
+      if (this.equippedWeaponId !== weaponId) return;
+      this.syncWeaponBallistics();
+      this.showToast(nowAttached ? 'Suppressor Attached' : 'Suppressor Stowed');
+      this.emitSnapshot(true);
+    });
+    if (res === 'no_suppressor') {
+      this.showToast('No Suppressor Equipped');
+      return;
+    }
+    if (res === 'busy') return;
+    this.isFiring = false;
+    this.input.ads = false;
+    this.showToast(res === 'started_attach' ? 'Attaching Suppressor...' : 'Stowing Suppressor...');
+    this.emitSnapshot(true);
+  }
+
+  private getActiveBaseCaliberId(weaponId = this.equippedWeaponId): string {
+    const base = resolveWeaponProfile(weaponId);
+    const derived = this.weaponRig.getDerivedStats();
+    if (weaponId === this.equippedWeaponId && derived.caliberOverride) {
+      return resolveBaseCaliberId(derived.caliberOverride);
+    }
+    return resolveBaseCaliberId(base.defaultCaliberId);
+  }
+
+  private getActiveAmmoVariant(weaponId = this.equippedWeaponId): AmmoVariantDef {
+    const calId = this.getActiveBaseCaliberId(weaponId);
+    const stored = hideoutShardAdapter.getAmmoVariantId(weaponId) as AmmoVariantId | undefined;
+    if (stored && AMMO_VARIANTS[stored]?.caliberId === calId) {
+      return AMMO_VARIANTS[stored];
+    }
+    return getDefaultAmmoVariant(calId);
+  }
+
+  private getZeroDistanceForWeapon(weaponId = this.equippedWeaponId): number {
+    if (weaponId === 'unarmed') return 100;
+    const base = resolveWeaponProfile(weaponId);
+    const stored = hideoutShardAdapter.getZeroDistance(base.id);
+    if (typeof stored === 'number' && Number.isFinite(stored)) return stored;
+    const att = loadoutStore.getActiveWeaponBuild(base.id).attachments;
+    return att.zeroDistanceM ?? getDefaultZeroDistanceM(base.category);
+  }
+
+  private syncWeaponBallistics(): void {
+    if (this.equippedWeaponId === 'unarmed') {
+      this.weaponRig.setZeroConfig(100, 0, 0);
+      return;
+    }
+    const base = resolveWeaponProfile(this.equippedWeaponId);
+    const derived = this.weaponRig.getDerivedStats();
+    const ammo = this.getActiveAmmoVariant(base.id);
+    const zeroDist = this.getZeroDistanceForWeapon(base.id);
+    const muzzleVelMs =
+      ammo.baseVelocityMs * (base.barrelVelocityMult ?? 1.0) * derived.velocityMult;
+    const hob = this.weaponRig.getHeightOverBoreM();
+    const zeroPitchRad = solveZeroPitchRad({
+      muzzleVelocityMs: muzzleVelMs,
+      bc: ammo.ballisticCoefficient,
+      heightOverBoreM: hob,
+      zeroDistanceM: zeroDist,
+      extraElevationMrad: 0,
+    });
+    this.weaponRig.setZeroConfig(zeroDist, 0, zeroPitchRad);
+  }
+
+  private cycleZeroDistance(dir: 1 | -1): void {
+    if (this.equippedWeaponId === 'unarmed' || this.swapChoreography.isActive()) return;
+    const presets = [25, 50, 100, 200];
+    const cur = this.getZeroDistanceForWeapon(this.equippedWeaponId);
+    let idx = presets.indexOf(cur);
+    if (idx < 0) {
+      idx = presets.findIndex((p) => p >= cur);
+      if (idx < 0) idx = presets.length - 1;
+    }
+    const nextIdx = (idx + dir + presets.length) % presets.length;
+    const nextDist = presets[nextIdx];
+    const prof = resolveWeaponProfile(this.equippedWeaponId);
+    hideoutShardAdapter.setWeaponZeroDistance(prof.id, nextDist);
+    this.syncWeaponBallistics();
+    this.weaponRig.triggerTurretClick();
+    this.audio.playTurretClick(dir > 0);
+    this.showToast(`Optic Zeroed: ${nextDist}m`);
+    this.emitSnapshot(true);
+  }
+
+  private cycleOpticZoom(dir: 1 | -1): void {
+    if (
+      this.equippedWeaponId === 'unarmed' ||
+      this.swapChoreography.isActive() ||
+      !this.weaponRig.hasVariableZoom()
+    ) {
+      return;
+    }
+    const prev = this.weaponRig.getTargetOpticZoomMult();
+    const next = this.weaponRig.cycleOpticZoom(dir, true);
+    if (Math.abs(next - prev) > 0.01) {
+      this.audio.playTurretClick(dir > 0);
+      this.emitSnapshot(true);
     }
   }
 
@@ -984,6 +1269,9 @@ export class ZombiesLobbyController {
     }
     const prof = this.getWeaponProfile(this.equippedWeaponId);
     const currentAmmo = this.magAmmoByWeapon[prof.id] ?? prof.magCapacity;
+    if (this.weaponRig.isTubularReloading() && currentAmmo > 0) {
+      this.weaponRig.interruptTubularReload();
+    }
     if (
       this.fireCooldown > 0 ||
       this.reloadTimer > 0 ||
@@ -1019,8 +1307,7 @@ export class ZombiesLobbyController {
     if (isSingle) this.semiTriggerConsumed = true;
 
     const derived = this.weaponRig.getDerivedStats();
-    const calId = resolveBaseCaliberId(derived.caliberOverride ?? prof.defaultCaliberId);
-    const ammo = getDefaultAmmoVariant(calId);
+    const ammo = this.getActiveAmmoVariant(prof.id);
     this.weaponRig.getMuzzleWorldTransform(this._muzzlePos, this._muzzleDir, true);
     this.ballistics.spawnShot({
       origin: this._muzzlePos,
@@ -1741,6 +2028,7 @@ export class ZombiesLobbyController {
     this.audio.ensureInitialized();
     const isFireBtn = keybindStore.matchesMouseButton(e.button, 'fire');
     const isAdsBtn = keybindStore.matchesMouseButton(e.button, 'ads');
+    const isPointAimBtn = keybindStore.matchesMouseButton(e.button, 'point_aim');
     const isFreeZoomBtn = keybindStore.matchesMouseButton(e.button, 'free_zoom');
     const isCycleChamberBtn = keybindStore.matchesMouseButton(e.button, 'cycle_chamber');
 
@@ -1748,15 +2036,20 @@ export class ZombiesLobbyController {
       this.freeZoomHeld = true;
       return;
     }
+    if (isPointAimBtn) {
+      this.cycleAimMode();
+      return;
+    }
     if (isCycleChamberBtn) {
       this.triggerChamberCycle();
       return;
     }
-    if (isAdsBtn && !this.swapChoreography.isActive()) {
+    if (isAdsBtn && !this.swapChoreography.isActive() && !this.weaponRig.isSuppressorActionActive()) {
       this.animator.interruptInspect();
       this.input.ads = true;
-    } else if (isFireBtn && !this.swapChoreography.isActive()) {
+    } else if (isFireBtn && !this.swapChoreography.isActive() && !this.weaponRig.isSuppressorActionActive()) {
       if (this.equippedWeaponId === 'unarmed') {
+        this.animator.interruptInspect();
         this.animator.triggerUnarmedPunch(this.controller, this.input.ads);
       } else {
         this.isFiring = true;
@@ -1798,6 +2091,11 @@ export class ZombiesLobbyController {
       this.activePrompt = { ...this.activePrompt, selectedIndex: this.selectedOptionIndex };
       this.audio.playWeaponCue('mode_toggle', { intensity: 0.2 });
       this.emitSnapshot(true);
+      return;
+    }
+    if (this.input.ads && this.weaponRig.hasVariableZoom()) {
+      e.preventDefault();
+      this.cycleOpticZoom(e.deltaY < 0 ? 1 : -1);
     }
   };
 
@@ -1833,6 +2131,13 @@ export class ZombiesLobbyController {
     }
     if (keybindStore.matchesKeyCode(e.code, 'free_zoom')) {
       this.freeZoomHeld = true;
+    }
+    if (keybindStore.matchesKeyCode(e.code, 'point_aim')) {
+      e.preventDefault();
+      if (!e.repeat) {
+        this.cycleAimMode();
+      }
+      return;
     }
 
     const code = keybindStore.resolveManagedInputCode(e.code);
@@ -1878,6 +2183,25 @@ export class ZombiesLobbyController {
           this.executeSelectedInteract();
         }
         break;
+      case 'KeyV':
+        if (!e.repeat && !this.swapChoreography.isActive() && !this.weaponRig.isSuppressorActionActive()) {
+          this.animator.interruptInspect();
+          this.input.ads = false;
+          if (this.equippedWeaponId === 'unarmed') {
+            this.animator.triggerUnarmedPunch(this.controller, false);
+          } else {
+            const prof = resolveWeaponProfile(this.equippedWeaponId);
+            this.animator.triggerArmedBash(this.controller, prof.holdClass);
+          }
+        }
+        break;
+      case 'KeyX':
+        if (!e.repeat && !this.swapChoreography.isActive() && !this.weaponRig.isSuppressorActionActive()) {
+          this.animator.interruptInspect();
+          this.input.ads = false;
+          this.animator.triggerPushKick(this.controller, DEFAULT_TRAUMA_MODIFIERS);
+        }
+        break;
       case 'KeyI':
         if (!e.repeat && this.equippedWeaponId !== 'unarmed' && !this.swapChoreography.isActive()) {
           this.weaponRig.weaponAnimator.triggerInspect();
@@ -1886,6 +2210,16 @@ export class ZombiesLobbyController {
       case 'KeyY':
         if (!e.repeat) {
           this.triggerChamberCycle();
+        }
+        break;
+      case 'KeyB':
+        if (
+          !e.repeat &&
+          this.equippedWeaponId !== 'unarmed' &&
+          !this.swapChoreography.isActive() &&
+          this.weaponRig.hasCantedOptic()
+        ) {
+          this.cycleAimMode();
         }
         break;
       case 'KeyK':
@@ -1906,7 +2240,8 @@ export class ZombiesLobbyController {
           this.equippedWeaponId !== 'unarmed' &&
           !this.swapChoreography.isActive() &&
           !this.weaponRig.isChamberCycling() &&
-          this.reloadTimer <= 0
+          this.reloadTimer <= 0 &&
+          !this.weaponRig.isTubularReloading()
         ) {
           const prof = resolveWeaponProfile(this.equippedWeaponId);
           const curMag = this.magAmmoByWeapon[prof.id] ?? prof.magCapacity;
@@ -1914,7 +2249,35 @@ export class ZombiesLobbyController {
           const bestMag = slotKey
             ? findBestReloadMagazine(this.tacticalInventory, prof.id)
             : null;
-          if (bestMag && curMag < prof.magCapacity) {
+          const reserve = hideoutShardAdapter.getReserveForWeapon(prof.id);
+          if (prof.holdClass === 'shotgun' && prof.fireMode === 'pump') {
+            if (curMag < prof.magCapacity && reserve > 0) {
+              const needed = Math.min(prof.magCapacity - curMag, reserve);
+              const started = this.weaponRig.triggerTubularReload(
+                needed,
+                curMag === 0,
+                () => {
+                  if (this.equippedWeaponId !== prof.id) return;
+                  const took = hideoutShardAdapter.consumeReserve(prof.id, 1);
+                  if (took > 0) {
+                    const nextAmmo = Math.min(
+                      prof.magCapacity,
+                      (this.magAmmoByWeapon[prof.id] ?? 0) + took,
+                    );
+                    this.magAmmoByWeapon[prof.id] = nextAmmo;
+                    this.weaponRig.setAmmoState(nextAmmo, true);
+                    this.emitSnapshot(true);
+                  }
+                },
+                () => {
+                  this.emitSnapshot(true);
+                },
+              );
+              if (started) this.emitSnapshot(true);
+            } else if (reserve <= 0 && curMag < prof.magCapacity) {
+              this.showToast('No Reserve Shells — Resupply at Ammo Box');
+            }
+          } else if (bestMag && curMag < prof.magCapacity) {
             const dur = prof.reloadDurationSec * (bestMag.reloadTimeMult ?? 1);
             this.reloadTimer = dur;
             this.pendingReloadWeaponId = prof.id;
@@ -1934,12 +2297,65 @@ export class ZombiesLobbyController {
           const on = this.weaponRig.flashlight.intensity <= 0.1;
           this.weaponRig.flashlight.intensity = on ? 6.5 : 0;
           this.audio.playTacticalSwitchClick(on);
+          this.showToast(on ? 'Weapon Light: ON' : 'Weapon Light: OFF');
         }
         break;
       case 'KeyL':
         if (!e.repeat && this.equippedWeaponId !== 'unarmed') {
           this.weaponRig.laserOn = !this.weaponRig.laserOn;
           this.audio.playTacticalSwitchClick(this.weaponRig.laserOn);
+          this.showToast(this.weaponRig.laserOn ? 'Laser Sight: ON' : 'Laser Sight: OFF');
+        }
+        break;
+      case 'KeyJ':
+        if (!e.repeat) {
+          this.toggleNvg();
+        }
+        break;
+      case 'KeyN':
+        if (!e.repeat) {
+          this.toggleIrOrReticle();
+        }
+        break;
+      case 'KeyG':
+        if (!e.repeat) {
+          this.toggleSuppressor();
+        }
+        break;
+      case 'BracketRight':
+        if (!e.repeat && !this.controller.isSprinting) {
+          this.cycleOpticZoom(1);
+        }
+        break;
+      case 'BracketLeft':
+        if (!e.repeat && !this.controller.isSprinting) {
+          this.cycleOpticZoom(-1);
+        }
+        break;
+      case 'PageUp':
+        if (!e.repeat) {
+          this.cycleZeroDistance(1);
+        }
+        break;
+      case 'PageDown':
+        if (!e.repeat) {
+          this.cycleZeroDistance(-1);
+        }
+        break;
+      case 'Digit1':
+        if (!e.repeat) {
+          this.equipOutpostSlot(1);
+        }
+        break;
+      case 'Digit2':
+        if (!e.repeat) {
+          this.equipOutpostSlot(2);
+        }
+        break;
+      case 'Digit3':
+      case 'Digit0':
+        if (!e.repeat) {
+          this.equipOutpostSlot(3);
         }
         break;
       case 'Space':
@@ -2075,15 +2491,33 @@ export class ZombiesLobbyController {
 
     if (!this.contextLost) {
       const swapping = this.swapChoreography.isActive();
+      const suppBusy = this.weaponRig.isSuppressorActionActive();
+      if (suppBusy) {
+        this.input.ads = false;
+      }
       const profile = this.getWeaponProfile(this.equippedWeaponId);
+      const baseAdsMode = this.getArmedAdsMode(profile.id);
+      const nodsForceCant =
+        this.nvgFlipped &&
+        this.localGear.nvgMount !== 'none' &&
+        this.input.ads &&
+        baseAdsMode === 'PRIMARY' &&
+        this.weaponRig.shouldForceNodsCantedAim(true);
+      this.input.adsMode = nodsForceCant ? 'POINT_AIM' : baseAdsMode;
       const firearmAdsBlocking = this.input.ads && this.equippedWeaponId !== 'unarmed';
       this.input.sprint =
+        !suppBusy &&
         this.encumbrance.canSprint &&
         this.shiftHeld &&
         this.input.forward &&
         !firearmAdsBlocking &&
         !swapping;
-      this.input.holdBreath = this.holdBreathHeld && this.input.ads && this.equippedWeaponId !== 'unarmed' && !swapping;
+      this.input.holdBreath =
+        !suppBusy &&
+        this.holdBreathHeld &&
+        this.input.ads &&
+        this.equippedWeaponId !== 'unarmed' &&
+        !swapping;
       this.input.freeZoom =
         this.freeZoomHeld &&
         this.pointerLocked &&
@@ -2376,6 +2810,9 @@ export class ZombiesLobbyController {
     this.postProcess.dispose();
     this.weaponRig.dispose();
     this.skeleton.dispose();
+    this.audio.setNvgTubeHum(false);
+    this.camera.remove(this.irIlluminatorLight);
+    this.camera.remove(this.irIlluminatorTarget);
     this.audio.dispose();
     this.world.dispose();
     this.renderer.dispose();
